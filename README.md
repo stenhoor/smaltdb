@@ -4,7 +4,9 @@
 It stores data in the [Origin Private File System (OPFS)](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system),
 can keep data in an optional in-memory cache for speed, and runs inside Web Workers so the main thread never blocks.
 
-> Status: **design phase**. This repository holds the design documents. No code has been written yet.
+> Status: **M0 (storage foundations) complete**. Pager, buffer pool, B+tree, and key encoding are done, plus a real-browser OPFS test
+> and a benchmark harness against SQLite WASM, PGlite, and DuckDB-WASM. There is no SQL yet; that is M1. See the [roadmap](docs/ROADMAP.md)
+> and the [M0 baseline](docs/research/m0-baseline.md).
 
 ## Goals
 
@@ -39,6 +41,20 @@ can keep data in an optional in-memory cache for speed, and runs inside Web Work
 | [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md) | Decisions that still need input |
 | [docs/adr/](docs/adr/) | Architecture Decision Records |
 | [docs/research/](docs/research/) | Benchmarks and investigations behind decisions |
+
+## Development
+
+Requires Node 20+.
+
+```bash
+npm install
+npm run check          # typecheck + unit/property tests
+npm run test:browser   # OPFS integration test in Chromium (Playwright)
+npm run bench          # storage micro-benchmarks (Node)
+npm run bench:browser  # smaltdb vs SQLite WASM / PGlite / DuckDB-WASM in Chromium
+```
+
+See [docs/TESTING.md](docs/TESTING.md) for details.
 
 ## Key decisions (see [ADR 0001](docs/adr/0001-initial-design-decisions.md))
 

@@ -1,8 +1,12 @@
 # Roadmap (draft)
 
+**Current:** M0 is complete. See [research/m0-baseline.md](research/m0-baseline.md). Still open from M0: run the browser
+tests and benchmarks on Firefox and WebKit, which are not installed in the current dev container.
+**Next:** M1 (minimal SQL).
+
 | Milestone | Scope |
 |---|---|
-| **M0: Foundations** | Repo tooling, VFS abstraction (memory + OPFS) with capability detection, pager, buffer pool, page format, B+tree with property tests, benchmark harness wired to SQLite WASM / DuckDB-WASM / PGlite |
+| **M0: Foundations** ✅ (2026-10-31) | Repo tooling, VFS abstraction (memory + OPFS) with capability detection, pager, buffer pool, page format, B+tree with property tests, benchmark harness wired to SQLite WASM / DuckDB-WASM / PGlite |
 | **M1: Minimal SQL** | Lexer/parser, catalog, CREATE TABLE/INDEX, INSERT/SELECT/UPDATE/DELETE, simple planner, row-at-a-time → vectorized executor, worker + client API |
 | **M2: Durability** | WAL, group commit, recovery, checkpointing, transactions/savepoints, crash tests |
 | **M3: Optimizer** | Statistics/ANALYZE, cost model, join ordering, access-path selection, EXPLAIN [ANALYZE], sqllogictest pass rate tracked |

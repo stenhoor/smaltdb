@@ -74,6 +74,9 @@ export interface PagerStats {
  * evicted) and are written by {@link commit}; {@link rollback} discards them. This is *not*
  * crash-atomic. The WAL (milestone M2) replaces the write-back step in `commit`.
  */
+/** Upper bound on a single coalesced write during commit. */
+const WRITE_BATCH_BYTES = 1024 * 1024;
+
 export class Pager {
   readonly pageSize: number;
   /** Bytes per page available to page formats (page size minus reserved trailer). */
@@ -324,11 +327,39 @@ export class Pager {
     if (!this.inTransaction) return;
     // The list may contain stale entries (discarded frames, or a frame listed twice after reuse);
     // only frames still flagged dirty are written, each once.
+    // Runs of consecutive pages are coalesced into one large write (far fewer OPFS calls).
     const dirty = this.dirtyList.sort((a, b) => a.pgno - b.pgno);
-    for (const f of dirty) {
-      if (!f.dirty) continue;
-      this.writePage(f.bytes, f.pgno);
-      f.dirty = false;
+    const ps = this.pageSize;
+    const maxRun = Math.max(1, Math.floor(WRITE_BATCH_BYTES / ps));
+    let i = 0;
+    while (i < dirty.length) {
+      const first = dirty[i];
+      if (!first.dirty) {
+        i++;
+        continue;
+      }
+      // Collect the run [i, j) of dirty frames with consecutive page numbers.
+      let j = i + 1;
+      let next = first.pgno + 1;
+      while (j < dirty.length && j - i < maxRun) {
+        const f = dirty[j];
+        if (!f.dirty || f.pgno !== next) break;
+        next++;
+        j++;
+      }
+      if (j - i === 1) {
+        this.writePage(first.bytes, first.pgno);
+      } else {
+        const batch = this.writeBuffer(j - i);
+        for (let k = i; k < j; k++) {
+          this.sealPage(dirty[k].bytes);
+          batch.set(dirty[k].bytes, (k - i) * ps);
+        }
+        this.file.write(batch.subarray(0, (j - i) * ps), first.pgno * ps);
+        this.stats.writes += j - i;
+      }
+      for (let k = i; k < j; k++) dirty[k].dirty = false;
+      i = j;
     }
     dirty.length = 0;
     this.hv.setUint32(DH_CHANGE_COUNTER, (this.changeCounter + 1) >>> 0, true);
@@ -361,15 +392,30 @@ export class Pager {
 
   // ---------------------------------------------------------------- internals
 
-  private writePage(bytes: Uint8Array, pgno: number): void {
+  /** Store the page checksum in its trailer. */
+  private sealPage(bytes: Uint8Array): void {
     const sumOff = this.pageSize - 4;
     const sum = crc32c(bytes, 0, sumOff);
     bytes[sumOff] = sum & 0xff;
     bytes[sumOff + 1] = (sum >>> 8) & 0xff;
     bytes[sumOff + 2] = (sum >>> 16) & 0xff;
     bytes[sumOff + 3] = sum >>> 24;
+  }
+
+  private writePage(bytes: Uint8Array, pgno: number): void {
+    this.sealPage(bytes);
     this.file.write(bytes, pgno * this.pageSize);
     this.stats.writes++;
+  }
+
+  private batchBuf: Uint8Array | null = null;
+
+  private writeBuffer(pages: number): Uint8Array {
+    const need = pages * this.pageSize;
+    if (this.batchBuf === null || this.batchBuf.length < need) {
+      this.batchBuf = new Uint8Array(Math.min(WRITE_BATCH_BYTES, Math.max(need, 64 * this.pageSize)));
+    }
+    return this.batchBuf;
   }
 
   /** Drop a frame's contents and return it to the free pool. Any dirty-list entry goes stale (see commit). */

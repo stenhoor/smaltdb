@@ -148,6 +148,20 @@ export class BTree {
     }
   }
 
+  /** Number of keys, summed from per-leaf cell counts along the leaf chain (no row decoding). */
+  count(): number {
+    const pager = this.pager;
+    let f = this.descendForCursor(null, false);
+    let n = 0;
+    for (;;) {
+      n += nCells(f);
+      const next = rightPtr(f);
+      pager.release(f);
+      if (next === 0) return n;
+      f = pager.get(next);
+    }
+  }
+
   cursor(): BTreeCursor {
     return new BTreeCursor(this);
   }

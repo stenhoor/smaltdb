@@ -13,9 +13,9 @@ Decisions from the first design interview (2026-10-31) are recorded in
 | Q-5 | Type system | **STRICT by default**, SQLite-style affinity via opt-in `LOOSE` tables | decided |
 | Q-6 | Multi-tab sharing | **Yes**: Web Locks leader election + failover | decided |
 | Q-7 | MV refresh in v1 | **Manual full refresh + `CONCURRENTLY`**. Incremental / on-commit deferred | decided |
-| Q-8 | Triggers | **Deferred** (future extension). FK enforcement stays in v1 scope (proposal) | decided |
+| Q-8 | Triggers / foreign keys | Triggers **deferred**; **foreign-key enforcement in v1** | decided |
 | Q-9 | Runtime codegen (`new Function`) | **Yes, with automatic fallback** to closures under strict CSP | decided |
-| Q-10 | ATTACH multiple databases | Proposal: post-v1 | open |
+| Q-10 | ATTACH multiple databases | **Post-v1** | decided |
 | Q-11 | Import/export formats | **CSV and JSON/NDJSON** in v1. SQL dump, SQLite import, Parquet/Arrow later | decided |
 | Q-12 | Optional modules (JSON, FTS, …) | **None in v1**. JSON functions are a planned future module | decided |
 | Q-13 | JS user-defined functions | **Deferred** (future extension) | decided |
@@ -36,5 +36,5 @@ Second-round decisions: [adr/0002-second-round-decisions.md](adr/0002-second-rou
 
 ## Remaining questions
 
-- Q-10 ATTACH (proposed post-v1, not yet confirmed).
-- FK enforcement in v1 (proposed yes, not yet confirmed).
+None open. Q-8 (FK enforcement in v1) and Q-10 (ATTACH post-v1) were confirmed on 2026-10-31 when M0 started.
+New questions will be added as M1 design work raises them.

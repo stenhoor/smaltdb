@@ -13,11 +13,14 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:browser": "node test/browser/run.mjs",
-    "bench": "vitest bench --run",
+    "bench": "node bench/run-node.mjs",
     "bench:browser": "node bench/browser/run.mjs",
     "check": "npm run typecheck && npm test"
   },
   "devDependencies": {
+    "@duckdb/duckdb-wasm": "^1.33.1-dev57.0",
+    "@electric-sql/pglite": "^0.5.14",
+    "@sqlite.org/sqlite-wasm": "^3.54.1-build1",
     "@types/node": "^22.20.5",
     "esbuild": "^0.28.2",
     "fast-check": "^4.10.2",

@@ -73,6 +73,7 @@ describe('BTree', () => {
     for (let i = 0; i < N; i++) tree.put(encodeKey([i]), encodeKey([`v${i}`]));
     const rep = tree.checkIntegrity();
     expect(rep.keys).toBe(N);
+    expect(tree.count()).toBe(N);
     expect(rep.depth).toBeGreaterThan(1);
 
     const c = tree.cursor();

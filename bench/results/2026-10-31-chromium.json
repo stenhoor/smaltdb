@@ -1,0 +1,184 @@
+{
+  "env": {
+    "browser": "chromium 153.0.8010.12",
+    "date": "2026-10-31T21:59:21.247Z",
+    "rows": 100000,
+    "lookups": 10000,
+    "smallTxns": 200
+  },
+  "results": [
+    {
+      "ok": true,
+      "engine": "smaltdb (M0 storage layer)",
+      "config": "OPFS sync handle, 8 KiB pages, 64 MiB cache, synchronous=full (flush per commit), no WAL yet",
+      "openMs": 14.254999999888241,
+      "results": [
+        {
+          "workload": "bulk insert 100000 rows (1 txn)",
+          "ops": 100000,
+          "ms": 273.20000000018626,
+          "opsPerSec": 366032.21083430387,
+          "usPerOp": 2.7320000000018627
+        },
+        {
+          "workload": "point lookup x10000 (random)",
+          "ops": 10000,
+          "ms": 12.34000000031665,
+          "opsPerSec": 810372.771454084,
+          "usPerOp": 1.2340000000316649
+        },
+        {
+          "workload": "full scan count",
+          "ops": 100000,
+          "ms": 0.2999999998137355,
+          "opsPerSec": 333333333.54029393,
+          "usPerOp": 0.002999999998137355
+        },
+        {
+          "workload": "full scan read values",
+          "ops": 100000,
+          "ms": 12.96999999973923,
+          "opsPerSec": 7710100.231458024,
+          "usPerOp": 0.1296999999973923
+        },
+        {
+          "workload": "200 single-row durable txns",
+          "ops": 200,
+          "ms": 168.56500000040978,
+          "opsPerSec": 1186.4859253078266,
+          "usPerOp": 842.8250000020489
+        }
+      ]
+    },
+    {
+      "ok": true,
+      "engine": "SQLite WASM",
+      "config": "opfs-sahpool VFS, locking_mode=EXCLUSIVE, journal_mode=TRUNCATE, synchronous=FULL, 64 MiB cache, prepared statements",
+      "openMs": 100.37999999988824,
+      "results": [
+        {
+          "workload": "bulk insert 100000 rows (1 txn)",
+          "ops": 100000,
+          "ms": 609.5100000002421,
+          "opsPerSec": 164066.21712516656,
+          "usPerOp": 6.095100000002422
+        },
+        {
+          "workload": "point lookup x10000 (random)",
+          "ops": 10000,
+          "ms": 39.4499999997206,
+          "opsPerSec": 253485.42458988144,
+          "usPerOp": 3.9449999999720604
+        },
+        {
+          "workload": "full scan count",
+          "ops": 100000,
+          "ms": 0.5499999998137355,
+          "opsPerSec": 181818181.87975687,
+          "usPerOp": 0.005499999998137355
+        },
+        {
+          "workload": "full scan read values",
+          "ops": 100000,
+          "ms": 114.61000000033528,
+          "opsPerSec": 872524.2125443456,
+          "usPerOp": 1.1461000000033528
+        },
+        {
+          "workload": "200 single-row durable txns",
+          "ops": 200,
+          "ms": 674.6199999996461,
+          "opsPerSec": 296.4631940946087,
+          "usPerOp": 3373.0999999982305
+        }
+      ],
+      "version": "3.54.1"
+    },
+    {
+      "ok": true,
+      "engine": "PGlite",
+      "config": "opfs-ahp storage, parameterized queries, lookups in one read-only txn, multi-row INSERT batches of 1000 for bulk load",
+      "openMs": 7331.860000000335,
+      "results": [
+        {
+          "workload": "bulk insert 100000 rows (1 txn)",
+          "ops": 100000,
+          "ms": 2077.850000000093,
+          "opsPerSec": 48126.66939384244,
+          "usPerOp": 20.778500000000932
+        },
+        {
+          "workload": "point lookup x10000 (random)",
+          "ops": 10000,
+          "ms": 7258.2599999997765,
+          "opsPerSec": 1377.7406706290913,
+          "usPerOp": 725.8259999999776
+        },
+        {
+          "workload": "full scan count",
+          "ops": 100000,
+          "ms": 11.794999999925494,
+          "opsPerSec": 8478168.715610994,
+          "usPerOp": 0.11794999999925494
+        },
+        {
+          "workload": "full scan read values",
+          "ops": 100000,
+          "ms": 194.91500000003725,
+          "opsPerSec": 513044.1474487899,
+          "usPerOp": 1.9491500000003725
+        },
+        {
+          "workload": "200 single-row durable txns",
+          "ops": 200,
+          "ms": 176.35499999998137,
+          "opsPerSec": 1134.076153213808,
+          "usPerOp": 881.7749999999069
+        }
+      ]
+    },
+    {
+      "ok": true,
+      "engine": "DuckDB-WASM",
+      "config": "eh build, OPFS database file, prepared statements, multi-row INSERT batches of 1000 for bulk load",
+      "openMs": 784.195000000298,
+      "results": [
+        {
+          "workload": "bulk insert 100000 rows (1 txn)",
+          "ops": 100000,
+          "ms": 1002.5449999999255,
+          "opsPerSec": 99746.14605828909,
+          "usPerOp": 10.025449999999255
+        },
+        {
+          "workload": "point lookup x10000 (random)",
+          "ops": 10000,
+          "ms": 10729.529999999795,
+          "opsPerSec": 932.0072733847793,
+          "usPerOp": 1072.9529999999795
+        },
+        {
+          "workload": "full scan count",
+          "ops": 100000,
+          "ms": 5.580000000074506,
+          "opsPerSec": 17921146.953165732,
+          "usPerOp": 0.05580000000074506
+        },
+        {
+          "workload": "full scan read values",
+          "ops": 100000,
+          "ms": 90.88500000024214,
+          "opsPerSec": 1100291.5772650444,
+          "usPerOp": 0.9088500000024214
+        },
+        {
+          "workload": "200 single-row durable txns",
+          "ops": 200,
+          "ms": 200.95999999996275,
+          "opsPerSec": 995.2229299364902,
+          "usPerOp": 1004.7999999998137
+        }
+      ]
+    }
+  ]
+}

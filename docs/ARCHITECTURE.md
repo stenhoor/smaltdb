@@ -72,20 +72,27 @@ See [WORKER_MODEL.md](WORKER_MODEL.md) for details.
 
 ## 5. Module layout (proposed)
 
+One npm package for now. It may split into client and engine packages once the client API exists (M1).
+
 ```
-packages/
-  smaltdb/            public client API (main thread)
-  smaltdb-engine/     worker entry, engine core
-    src/sql/          lexer, parser, AST
-    src/analyze/      binder, type checker
-    src/plan/         logical plan, rules, cost model, physical plan
-    src/exec/         operators, expression compiler, vectors
-    src/storage/      pager, WAL, btree, buffer pool, record format
-    src/catalog/      system tables, information_schema
-    src/txn/          MVCC, locks
-    src/vfs/          OPFS VFS, in-memory VFS (tests/Node)
-  smaltdb-bench/      benchmark harness
-  smaltdb-test/       sqllogictest runner, fuzzers
+src/
+  client/             public client API, main thread (M1)
+  engine/
+    vfs/              Vfs interface, MemoryVfs, OpfsVfs, capability detection     [M0]
+    storage/          pager + buffer pool, B+tree, key codec, CRC-32C, format     [M0]
+                      WAL, record format                                          (M1/M2)
+    sql/              lexer, parser, AST                                          (M1)
+    analyze/          binder, type checker                                        (M1)
+    plan/             logical plan, rules, cost model, physical plan              (M1/M3)
+    exec/             operators, expression compiler, vectors                     (M1)
+    catalog/          system tables, information_schema                           (M1/M4)
+    txn/              MVCC, locks                                                 (M2)
+    util/             byte helpers
+test/                 unit and property tests (Vitest, Node + MemoryVfs)
+test/browser/         real-browser tests via Playwright (OPFS, workers)
+bench/micro/          storage micro-benchmarks (Node)
+bench/browser/        engine comparison harness: smaltdb vs SQLite WASM, PGlite, DuckDB-WASM
+bench/results/        saved benchmark runs (JSON)
 ```
 
 ## 6. Key external constraints
