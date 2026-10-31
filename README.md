@@ -4,10 +4,10 @@
 It stores data in the [Origin Private File System (OPFS)](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system),
 can keep data in an optional in-memory cache for speed, and runs inside Web Workers so the main thread never blocks.
 
-> Status: **M1 (SQL) complete.** This is an early preview, not production-ready: there is no crash-safe WAL until M2.
+> Status: **M2 (durability) complete.** Commits are atomic and durable via a write-ahead log, verified by crash-injection tests.
+> This is still an early preview: no multi-tab support yet (M6), and the SQL coverage is listed below.
 > smaltdb runs SQLite-dialect queries, DML, and DDL in a Web Worker on OPFS, and is checked against SQLite with differential tests.
-> Performance: on par with or faster than SQLite WASM for inserts, point lookups and scans, but slower on small durable commits
-> (like-for-like) and on scan-heavy analytical queries. See the [benchmark methodology and results](docs/research/benchmark-methodology.md). See the [roadmap](docs/ROADMAP.md) and the
+> Performance against crash-safe SQLite WASM: faster on 8 of 10 benchmark workloads, and slower on scan-heavy analytical queries. See the [benchmark methodology and results](docs/research/benchmark-methodology.md). See the [roadmap](docs/ROADMAP.md) and the
 > [supported SQL](docs/SQL_DIALECT.md#7-implementation-status-m1).
 
 ## Quick start

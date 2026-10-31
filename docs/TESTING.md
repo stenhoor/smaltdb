@@ -33,6 +33,14 @@ What M0 covers:
 - **Browser (OPFS):** create, insert 50k, commit, reopen, verify; exclusive-lock behaviour (a second sync handle is rejected);
   small-commit latency; and capability detection.
 
+What M2 adds:
+- **Crash injection** (`test/crash.test.ts`, `test/crash-vfs.ts`). Every write, truncate, and flush to the database and WAL
+  files is logged. Storage is rebuilt at every crash point under three models: prefix, torn last write, and lost unflushed writes.
+  Each image is reopened and must pass `integrity_check` and equal a committed state. Run more seeds with
+  `CRASH_SEEDS=20 npm test -- crash`. A control test shows the no-WAL mode corrupts.
+- **Savepoints:** nested `SAVEPOINT` / `RELEASE` / `ROLLBACK TO`, DDL inside savepoints, and WAL pragmas.
+- **Read-ahead:** prefetched pages are served without extra reads, and corruption in a prefetched page is still detected on use.
+
 What M1 adds:
 - **Differential testing vs SQLite** (`test/differential.test.ts`). Random typed expressions run through filters, LEFT and inner joins,
   GROUP BY / HAVING / aggregates, IN / EXISTS / scalar subqueries, compound selects, derived tables, and fully ordered

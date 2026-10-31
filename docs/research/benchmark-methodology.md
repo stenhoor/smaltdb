@@ -58,3 +58,35 @@ Implications for M2's I/O layer:
 - SQLite's cold numbers imply fewer read calls than its page count suggests. We have not explained this yet.
 - The per-call cost may be specific to headless Chromium in this container. Re-measure on real hardware and on Firefox/Safari
   before relying on it.
+
+## Update after M2 (WAL + read-ahead), both sides crash-safe
+
+Raw data: [bench/results/2026-10-31-chromium-35ea267.json](../../bench/results/2026-10-31-chromium-35ea267.json). Same machine,
+5 repetitions. Each workload is compared against **the faster of SQLite's two crash-safe modes** (WAL or TRUNCATE), so smaltdb
+never gets credit for SQLite's weaker configuration. For example, SQLite WAL's cold lookups take 1.7 s.
+
+| Workload | smaltdb (WAL) | best crash-safe SQLite | ratio | verdict |
+|---|---|---|---|---|
+| Bulk insert 100k rows (1 txn) | 353 (330–394) | 601 (573–661) TRUNCATE | 1.70× | **faster** |
+| Point lookup ×10k (warm) | 30.8 (27.9–32.5) | 36.7 (36.1–47.4) TRUNCATE | 1.19× | **faster** |
+| Scan, read values (warm) | 60.7 (58.0–64.7) | 112 (103–140) TRUNCATE | 1.85× | **faster** |
+| 200 single-row durable txns | 109 (98–115) | 460 (434–484) WAL | 4.22× | **faster** |
+| Point lookup ×10k (cold) | 97.5 (92.7–105) | 134 (128–149) TRUNCATE | 1.37× | **faster** |
+| Scan, read values (cold) | 143 (140–178) | 230 (223–260) TRUNCATE | 1.61× | **faster** |
+| Load analytic table (200k rows) | 644 (632–649) | 1,171 (1,157–1,190) TRUNCATE | 1.82× | **faster** |
+| Analytic: filter + sum | 17.0 (14.9–19.8) | 10.4 (10.2–11.6) WAL | 0.61× | **slower** |
+| Analytic: GROUP BY (100 groups) | 25.7 (25.0–29.2) | 65.9 (65.1–72.4) WAL | 2.56× | **faster** |
+| Analytic: arithmetic filter + aggregate | 20.8 (20.3–22.4) | 8.6 (8.3–8.9) TRUNCATE | 0.41× | **slower** |
+
+What changed and why:
+- **Durable commits** went from 0.87 ms to 0.54 ms each. A WAL commit is one write plus one flush, instead of in-place page
+  writes plus a header write.
+- **Cold reads** went from 3× slower to 1.4–1.6× faster, thanks to 64 KiB read-ahead extents. Measured per-call OPFS read cost in this
+  environment: no read-ahead 211 µs × 1,543 calls; 64 KiB extents 289 µs × 193 calls.
+- **Bulk loads** got about 40% slower than in non-atomic mode (pages are written twice), but stay 1.7× faster than SQLite.
+
+**Still slower:** the two scan-heavy analytical queries. The cause is executor and expression overhead plus row decoding
+(see the vectorization analysis). It is the next performance priority.
+
+**Open question, unchanged:** the probe measured about 200 µs per OPFS read call, yet SQLite's cold numbers imply fewer or cheaper calls
+than its page count suggests. Re-measure on real hardware and on Firefox/Safari.

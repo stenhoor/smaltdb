@@ -992,6 +992,20 @@ export class Database implements FunctionContext {
           }
           return errors.length ? errors.map((e) => [e]) : [['ok']];
         });
+      case 'journal_mode':
+        return ro(['journal_mode'], () => [[this.pager.walStats ? 'wal' : 'off']]);
+      case 'wal_checkpoint':
+        return {
+          readonly: true,
+          columns: ['busy', 'log', 'checkpointed'],
+          columnTypes: ['int', 'int', 'int'],
+          rows: () => {
+            if (!this.autocommit) return [[1, -1, -1]];
+            const frames = Math.round(this.pager.walSize / (this.pager.pageSize + 24));
+            this.pager.checkpoint();
+            return [[0, frames, frames]];
+          },
+        };
       case 'foreign_keys':
         return ro(['foreign_keys'], () => [[0]]);
       default:

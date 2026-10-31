@@ -45,3 +45,17 @@ describe('SQL savepoints', () => {
     expect(d.query('PRAGMA integrity_check').rows).toEqual([['ok']]);
   });
 });
+
+describe('WAL pragmas', () => {
+  it('reports journal mode and checkpoints on demand', () => {
+    const d = open();
+    expect(d.query('PRAGMA journal_mode').rows).toEqual([['wal']]);
+    d.exec('CREATE TABLE t(x INT); INSERT INTO t VALUES (1)');
+    expect(d.pager.walSize).toBeGreaterThan(0);
+    const [[busy, log, done]] = d.query('PRAGMA wal_checkpoint').rows;
+    expect(busy).toBe(0);
+    expect(log).toBe(done);
+    expect(d.pager.walSize).toBe(0);
+    expect(d.query('SELECT x FROM t').rows).toEqual([[1]]);
+  });
+});

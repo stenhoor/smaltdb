@@ -1,9 +1,13 @@
 # Roadmap (draft)
 
-**Current:** M0 and M1 are complete. See [research/m0-baseline.md](research/m0-baseline.md) and
+**Current:** M0, M1 and M2 are complete. M2 delivered the WAL, crash recovery, checkpoints, savepoints, crash-injection tests,
+and OPFS read-ahead ([ADR 0004](adr/0004-wal-and-crash-safety.md)). Group commit across connections moves to M6, together with
+multiple connections.
+
+M1/M0 notes: M0 and M1 are complete. See [research/m0-baseline.md](research/m0-baseline.md) and
 [research/m1-baseline.md](research/m1-baseline.md). Performance versus SQLite WASM is mixed once measured like-for-like (see the correction in the M1 baseline): smaltdb is slower on small durable commits and on scan-heavy analytical queries.
 Still open: running the browser tests and benchmarks on Firefox and WebKit, which are not installed in the dev container.
-**Next:** M2 (durability: WAL, crash safety, savepoints).
+**Next:** M3 (optimizer), plus closing the analytical-scan gap (expression and pipeline overhead in the executor).
 
 Carried over from M1, by decision (see [ADR 0003](adr/0003-m1-executor-and-transactions.md)):
 - the vectorized executor (M1 shipped a register-based iterator executor);
@@ -14,7 +18,7 @@ Carried over from M1, by decision (see [ADR 0003](adr/0003-m1-executor-and-trans
 |---|---|
 | **M0: Foundations** ✅ (2026-10-31) | Repo tooling, VFS abstraction (memory + OPFS) with capability detection, pager, buffer pool, page format, B+tree with property tests, benchmark harness wired to SQLite WASM / DuckDB-WASM / PGlite |
 | **M1: Minimal SQL** ✅ (2026-10-31) | Lexer/parser, catalog, CREATE TABLE/INDEX, INSERT/SELECT/UPDATE/DELETE, simple planner, row-at-a-time → vectorized executor, worker + client API |
-| **M2: Durability** | WAL, group commit, recovery, checkpointing, transactions/savepoints, crash tests |
+| **M2: Durability** ✅ (2026-10-31, group commit → M6) | WAL, group commit, recovery, checkpointing, transactions/savepoints, crash tests |
 | **M3: Optimizer** | Statistics/ANALYZE, cost model, join ordering, access-path selection, EXPLAIN [ANALYZE], sqllogictest pass rate tracked |
 | **M4: Dialect breadth** | Window functions, CTEs (recursive), subquery decorrelation, ON CONFLICT, RETURNING, date/time, information_schema, sqlite_schema/pragmas, CSV/JSON import/export |
 | **M5: Materialized views** | Full refresh and `REFRESH … CONCURRENTLY` |

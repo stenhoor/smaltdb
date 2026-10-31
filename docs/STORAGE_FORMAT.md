@@ -112,8 +112,29 @@ For analytical (scan-heavy) tables, `CREATE TABLE … WITH (storage = 'column')`
 
 ## 6. Write-ahead log and durability
 
-> **M0 status:** commit writes pages in place and then the header. This is durable (flushed) but **not crash-atomic**.
-> The WAL below arrives in M2 and replaces the in-place write-back.
+> **Implemented in M2** (`src/engine/storage/wal.ts`; see [ADR 0004](adr/0004-wal-and-crash-safety.md)). The bullets below were the
+> original plan. The format as built is described first.
+
+**WAL file `<db>-wal` (little-endian):**
+
+| Part | Layout |
+|---|---|
+| Header (32 B) | magic `"smaltwal"` · u32 version (1) · u32 page size · u32 salt1 · u32 salt2 · u32 checkpoint sequence · u32 CRC-32C of bytes 0..28 |
+| Frame header (24 B) | u32 page number · u32 database page count if this is a commit frame (else 0) · u32 salt1 · u32 salt2 · u32 chained CRC · u32 reserved |
+| Frame body | the page (page size bytes, including its own page checksum) |
+
+- **Chained CRC**: CRC-32C over frame-header bytes 0..16 and the page, seeded with the previous frame's chained CRC; the first
+  frame is seeded with the header CRC.
+- **Commit**: all changed pages and page 0, last frame marked commit, written in one call, then one flush.
+- **Recovery**: scan frames while the salts match and the chain verifies, and keep only those up to the last commit frame.
+- **Checkpoint**: copy the latest frames to the main file in coalesced runs, flush, then truncate the WAL. A new generation
+  gets new salts. Automatic at 4 MiB, on close, and via `PRAGMA wal_checkpoint`.
+- No shared-memory index yet: the single connection keeps the page → frame map in memory. Concurrent snapshot readers come in M6.
+
+**Read-ahead:** a cache miss on the main file reads the aligned 64 KiB extent around the page, because OPFS read calls
+have a high fixed cost. Neighbours are cached at low priority and checksum-verified on first use (option `readAheadBytes`).
+
+Original plan:
 
 - **Physical page WAL** (like SQLite WAL mode): committed pages are appended to `main.wal` with a commit frame.
 - Readers use a WAL index (an in-memory hash of page → latest frame ≤ their snapshot LSN). This gives snapshot isolation for free.

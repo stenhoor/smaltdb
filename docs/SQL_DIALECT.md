@@ -92,9 +92,9 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
   `DELETE` (with a truncate fast path).
 - `CREATE` / `DROP TABLE` (`IF [NOT] EXISTS`, `INTEGER PRIMARY KEY` rowid alias, `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`,
   `CHECK`, `COLLATE`), `CREATE [UNIQUE] INDEX` (multi-column, `ASC`/`DESC`, collations), and `DROP INDEX`.
-- `BEGIN` / `COMMIT` / `ROLLBACK`, with statement-level atomicity inside transactions.
+- `BEGIN` / `COMMIT` / `ROLLBACK`, `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` (M2), with statement-level atomicity inside transactions.
 - `EXPLAIN QUERY PLAN`; `PRAGMA table_info / index_list / index_info / page_size / page_count / freelist_count /
-  schema_version / integrity_check`; `smalt_schema` (also `sqlite_schema` / `sqlite_master`).
+  schema_version / integrity_check / journal_mode / wal_checkpoint`; `smalt_schema` (also `sqlite_schema` / `sqlite_master`).
 
 **Type mapping (STRICT by default):** declared types map to storage types by SQLite's affinity rules. *INT* → INTEGER;
 *CHAR*/*CLOB*/*TEXT* → TEXT; *BLOB* → BLOB; *REAL*/*FLOA*/*DOUB* → REAL; `ANY` or no type → ANY; anything else
@@ -104,7 +104,7 @@ losslessly as SQLite STRICT tables do (`'5'` into an INTEGER column becomes 5), 
 
 **Not yet supported** (each gives a clear `SMALT_UNSUPPORTED` error): `WITH RECURSIVE`, window functions, `RIGHT` / `FULL` joins,
 views and materialized views (M4/M5), `RETURNING`, upsert (`ON CONFLICT ... DO`), `UPDATE ... FROM`, `ALTER TABLE`, expression and
-partial indexes, `INCLUDE` columns, `WITHOUT ROWID`, `LOOSE` tables, generated columns, TEMP tables, savepoints, date/time and JSON
+partial indexes, `INCLUDE` columns, `WITHOUT ROWID`, `LOOSE` tables, generated columns, TEMP tables, date/time and JSON
 functions, `ANALYZE`, and `VACUUM`. Foreign keys are parsed and stored but not yet enforced (M4).
 
 **Known deviations:**
@@ -114,3 +114,4 @@ functions, `ANALYZE`, and `VACUUM`. Foreign keys are parsed and stored but not y
   the largest row).
 - PRIMARY KEY columns are always NOT NULL.
 - `OR FAIL` behaves like `OR ABORT`.
+- Index keys must fit in about a quarter of a page (≈2 KB with 8 KiB pages); SQLite allows larger keys via overflow pages.
