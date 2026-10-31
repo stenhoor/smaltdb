@@ -551,22 +551,43 @@ export class Database implements FunctionContext {
     };
   }
 
-  /** Coerce, NOT NULL- and CHECK-validate a full row; `real[i]` marks semantically REAL values. */
-  private validateRow(table: TableSchema, row: SqlValue[], real: boolean[], checks: { fn: Fn; name: string }[], regs: SqlValue[], base: number): void {
+  /**
+   * Coerce, NOT NULL- and CHECK-validate a full row; `real[i]` marks semantically REAL values.
+   * Returns false when the row must be skipped (OR IGNORE). Under OR REPLACE a NOT NULL violation
+   * takes the column default, if there is one (SQLite semantics).
+   */
+  private validateRow(
+    table: TableSchema,
+    row: SqlValue[],
+    real: boolean[],
+    checks: { fn: Fn; name: string }[],
+    regs: SqlValue[],
+    base: number,
+    mode: ConflictMode,
+    defaults: (Fn | null)[],
+  ): boolean {
     for (let i = 0; i < table.columns.length; i++) {
       const col = table.columns[i];
       if (col.rowidAlias) continue;
-      const v = coerceForColumn(row[i], col, table.name, real[i]);
-      if (v === null && col.notNull) throw new ConstraintError('SMALT_CONSTRAINT_NOTNULL', `NOT NULL constraint failed: ${table.name}.${col.name}`);
+      let v = coerceForColumn(row[i], col, table.name, real[i]);
+      if (v === null && col.notNull) {
+        if (mode === 'IGNORE') return false;
+        if (mode === 'REPLACE' && defaults[i]) v = coerceForColumn(defaults[i]!(regs), col, table.name);
+        if (v === null) throw new ConstraintError('SMALT_CONSTRAINT_NOTNULL', `NOT NULL constraint failed: ${table.name}.${col.name}`);
+      }
       row[i] = v;
     }
     if (checks.length) {
       for (let i = 0; i < row.length; i++) regs[base + i] = row[i];
       for (const c of checks) {
         const v = c.fn(regs);
-        if (v !== null && truthy(v) === false) throw new ConstraintError('SMALT_CONSTRAINT_CHECK', `CHECK constraint failed: ${c.name}`);
+        if (v !== null && truthy(v) === false) {
+          if (mode === 'IGNORE') return false;
+          throw new ConstraintError('SMALT_CONSTRAINT_CHECK', `CHECK constraint failed: ${c.name}`);
+        }
       }
     }
+    return true;
   }
 
   private compileChecks(table: TableSchema, scope: CompileScope, sql: string): { fn: Fn; name: string }[] {
@@ -678,7 +699,7 @@ export class Database implements FunctionContext {
         else rowid = writer.newRowid();
         if (table.rowidAlias >= 0) row[table.rowidAlias] = rowid;
         r[rowidReg] = rowid;
-        this.validateRow(table, row, real, checks, r, base);
+        if (!this.validateRow(table, row, real, checks, r, base, mode, defaults)) return;
         if (!writer.resolveConflicts(row, rowid, null, mode)) return;
         writer.writeRow(row, rowid);
         changes++;
@@ -725,52 +746,53 @@ export class Database implements FunctionContext {
     }
     const mode: ConflictMode = stmt.or ?? 'ABORT';
     const ncols = table.columns.length;
+    const emptyScope = planner.compileScope(planner.newScope());
+    const defaults: (Fn | null)[] = table.columns.map((c) => (c.defaultExpr ? compileExpr(c.defaultExpr, emptyScope).fn : null));
     const base = planner.regs.alloc(ncols);
     const checkRowid = planner.regs.alloc();
     const checks = this.compileChecks(table, this.rowScope(table, stmt.alias, base, checkRowid, planner), planner.sqlText);
 
     return (r) => {
-      // Phase 1: collect target rows and new values (Halloween-safe).
-      const pending: { rowid: number | bigint; old: SqlValue[]; next: SqlValue[]; real: boolean[]; newRowid: SqlValue }[] = [];
+      // Two passes, like SQLite: collect target rowids first (Halloween-safe), then update them in
+      // ascending rowid order, computing new values from each row's *current* contents.
+      const rowids: (number | bigint)[] = [];
       root.open(r);
       try {
-        while (root.next()) {
-          const rowid = r[rowidReg] as number | bigint;
-          const old = colRegs.map((g) => r[g]);
-          const next = old.slice();
-          const real: boolean[] = new Array(ncols).fill(false);
-          let newRowid: SqlValue = rowid;
-          for (const s of sets) {
-            const v = s.c.fn(r);
-            if (s.col === -2) newRowid = v;
-            else {
-              next[s.col] = v;
-              real[s.col] = s.c.type === 'real';
-              if (s.col === table.rowidAlias) newRowid = v;
-            }
-          }
-          pending.push({ rowid, old, next, real, newRowid });
-        }
+        while (root.next()) rowids.push(r[rowidReg] as number | bigint);
       } finally {
         root.close();
       }
-      // Phase 2: apply.
+      rowids.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
       const writer = new TableWriter(table, this.pager);
       let changes = 0;
-      for (const p of pending) {
-        if (p.newRowid === null) {
+      for (const rowid of rowids) {
+        const old = writer.readRow(rowid);
+        if (old === null) continue; // removed by an earlier REPLACE in this statement
+        for (let i = 0; i < ncols; i++) r[colRegs[i]] = old[i];
+        r[rowidReg] = rowid;
+        const next = old.slice();
+        const real: boolean[] = new Array(ncols).fill(false);
+        let newRowidV: SqlValue = rowid;
+        for (const s of sets) {
+          const v = s.c.fn(r);
+          if (s.col === -2) newRowidV = v;
+          else {
+            next[s.col] = v;
+            real[s.col] = s.c.type === 'real';
+            if (s.col === table.rowidAlias) newRowidV = v;
+          }
+        }
+        if (newRowidV === null) {
           if (table.rowidAlias >= 0) throw new ConstraintError('SMALT_CONSTRAINT_NOTNULL', `NOT NULL constraint failed: ${table.name}.${table.columns[table.rowidAlias].name}`);
           throw new SmaltError('SMALT_MISMATCH', 'datatype mismatch');
         }
-        const newRowid = this.toRowid(p.newRowid, table);
-        if (table.rowidAlias >= 0) p.next[table.rowidAlias] = newRowid;
+        const newRowid = this.toRowid(newRowidV, table);
+        if (table.rowidAlias >= 0) next[table.rowidAlias] = newRowid;
         r[checkRowid] = newRowid;
-        this.validateRow(table, p.next, p.real, checks, r, base);
-        // The row may have been deleted by an earlier REPLACE in this statement.
-        if (!writer.rowExists(p.rowid)) continue;
-        if (!writer.resolveConflicts(p.next, newRowid, p.rowid, mode)) continue;
-        writer.deleteRow(p.rowid, p.old);
-        writer.writeRow(p.next, newRowid);
+        if (!this.validateRow(table, next, real, checks, r, base, mode, defaults)) continue;
+        if (!writer.resolveConflicts(next, newRowid, rowid, mode)) continue;
+        writer.deleteRow(rowid, old);
+        writer.writeRow(next, newRowid);
         changes++;
       }
       this.lastChanges = changes;

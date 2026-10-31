@@ -73,6 +73,8 @@ export interface ResultColumnInfo {
   /** Declared column type when the result is a direct column reference. */
   declType?: string;
   collation: Collation;
+  /** Affinity carried by derived-table columns (SQLite propagates column affinity). */
+  affinity: Affinity;
 }
 
 export interface QueryPlan {
@@ -415,6 +417,7 @@ export class Planner {
       type: compiled[i].type,
       declType: c.declType,
       collation: compiled[i].collSrc !== CollSrc.None ? compiled[i].collation : Collation.Binary,
+      affinity: compiled[i].affinity,
     }));
 
     // ORDER BY keys (single core only).
@@ -534,7 +537,7 @@ export class Planner {
     const cs = this.compileScope(scope);
     const compiled = rows.map((r) => r.map((e) => compileExpr(e, cs)));
     const regs = outRegs ?? compiled[0].map(() => this.regs.alloc());
-    const columns: ResultColumnInfo[] = compiled[0].map((c, i) => ({ name: `column${i + 1}`, type: c.type, collation: Collation.Binary }));
+    const columns: ResultColumnInfo[] = compiled[0].map((c, i) => ({ name: `column${i + 1}`, type: c.type, collation: Collation.Binary, affinity: 'NONE' as Affinity }));
     let root: Operator = new Values(compiled.map((r) => r.map((c) => c.fn)), regs);
     if (stmt && stmt.compound.length === 0 && stmt.orderBy.length) {
       const keys = stmt.orderBy.map((t) => {
@@ -767,7 +770,7 @@ export class Planner {
         reg: sub.outRegs[i],
         type: c.type,
         collation: c.collation,
-        affinity: 'NONE',
+        affinity: c.affinity,
         declType: c.declType ?? '',
         index: i,
       }));
