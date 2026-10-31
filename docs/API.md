@@ -35,5 +35,8 @@ await db.explain('SELECT ...', { analyze: true });
 await db.close();
 ```
 
-Open design points: result row shape (objects vs. arrays vs. columnar), bigint handling, the UDF API **[Q-13]**,
-change notifications / live queries **[Q-15]**, and framework bindings.
+Open design points: result row shape (objects vs. arrays vs. columnar) and bigint handling.
+Post-v1: UDF registration, live queries / change notifications, and framework bindings.
+
+Import/export (v1): `db.importCSV(table, source, opts)`, `db.importJSON(...)` (array or NDJSON stream),
+`db.exportCSV(query)`, `db.exportJSON(query)`.

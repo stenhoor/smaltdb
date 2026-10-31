@@ -1,6 +1,6 @@
 # Worker & Concurrency Model
 
-> Status: draft. The final shape depends on **[Q-4]** (cross-origin isolation) and **[Q-6]** (multi-tab).
+> Status: draft. Decided (ADR 0001): multi-tab sharing via leader election; parallel reader pool only when cross-origin isolated.
 
 ## 1. Constraints that shape the design
 

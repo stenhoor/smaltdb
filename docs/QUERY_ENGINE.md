@@ -28,7 +28,7 @@ or when statistics drift by more than a threshold.
 - View and CTE inlining (non-recursive, single-reference CTEs)
 - Transitive predicate inference (`a=b AND b=5` ⇒ `a=5`)
 - `LIMIT` pushdown and Top-N conversion (`ORDER BY … LIMIT k` becomes a heap)
-- **Materialized-view matching**: rewrite queries to read from a matching MV **[Q-7]**
+- **Materialized-view matching**: rewrite queries to read from a matching MV (post-v1)
 
 ## 3. Cost-based optimization
 

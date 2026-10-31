@@ -1,7 +1,7 @@
 # Storage Format
 
-> Status: draft proposal. The biggest open choice is the balance between row and column storage **[Q-2]**,
-> and whether the format must be compatible with SQLite files **[Q-3]**.
+> Status: draft. This is our own format, deliberately **not** SQLite-file compatible (ADR 0001).
+> Row B+trees ship in v1. Columnar segments come in a later milestone.
 
 ## 1. Files in OPFS
 
@@ -18,6 +18,7 @@
 - Fixed page size, **default 8 KiB** (configurable at creation: 4–64 KiB). OPFS throughput improves with larger I/O,
   so we may default to 16 KiB after benchmarking.
 - Every page has a 24-byte header: `page_type u8 | flags u8 | free_offset u16 | cell_count u16 | lsn u64 | checksum u32 | reserved`.
+- Header and page-tail bytes are reserved for a future encryption nonce and auth tag (AES-GCM through WebCrypto). Encryption is not in v1.
 - Checksum: xxHash32 or CRC32C over the page. It is verified on read when `PRAGMA checksum=on`.
 - **Page 0** is the database header: magic `"smaltdb\0"`, format version, page size, the freelist root, catalog root pages, the schema cookie, and the last checkpoint LSN.
 
@@ -48,7 +49,7 @@
   (order-preserving byte strings), so a key comparison is a single `Uint8Array` compare loop.
 - Supported: composite, unique, partial (`WHERE`), and expression indexes. Covering indexes are supported through `INCLUDE` columns, which is a non-SQLite extension.
 
-## 5. Optional columnar segments (proposal) **[Q-2]**
+## 5. Columnar segments (milestone M7)
 
 For analytical (scan-heavy) tables, `CREATE TABLE … WITH (storage = 'column')` would use this layout:
 - Rows are grouped into **row groups** of about 64K rows. Each column of a row group is a chunk spread over one or more pages.
@@ -62,7 +63,7 @@ For analytical (scan-heavy) tables, `CREATE TABLE … WITH (storage = 'column')`
 - Readers use a WAL index (an in-memory hash of page → latest frame ≤ their snapshot LSN). This gives snapshot isolation for free.
 - **Group commit**: several transactions committing in the same tick share one `flush()`.
 - **Checkpoint**: copies pages back to `main.db` once the WAL passes N MiB, or when the engine is idle.
-- Durability levels (`PRAGMA synchronous`): `full` (flush on every commit), `normal` (flush on checkpoint), `off`.
+- Durability levels (`PRAGMA synchronous`): **`full` (default)** flushes on every commit, `normal` flushes on checkpoint, and `off` never flushes.
 - Recovery: on open, scan the WAL, validate frame checksums, and replay up to the last valid commit frame.
 
 ## 7. Buffer pool and "memory cached" mode
@@ -83,4 +84,4 @@ For analytical (scan-heavy) tables, `CREATE TABLE … WITH (storage = 'column')`
 ## 9. Format versioning
 
 - A format version in the header. Engines refuse to write newer major versions, and minor versions must be backward compatible.
-- `smaltdb export` / `import` provide a logical dump (SQL or Arrow IPC/Parquet **[Q-11]**).
+- Logical import/export in v1: **CSV and JSON/NDJSON**. Later: SQL dump, SQLite file import, Arrow/Parquet.

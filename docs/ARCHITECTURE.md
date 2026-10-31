@@ -58,7 +58,7 @@
    and inserts are bulk-loaded where possible.
 4. **The planner decides, the executor follows.** Physical plans carry all decisions up front
    (algorithms, batch sizes, memory budgets), so execution has no branches it could have resolved earlier.
-5. **Pay for what you use.** The core is small. Features such as FTS, JSON, materialized views, and columnar storage load as optional modules **[Q-12]**.
+5. **Pay for what you use.** The core is small. Future features (JSON, UDFs, triggers, FTS, and columnar storage) plug into extensible function, catalog, and storage registries.
 
 ## 4. Process / threading model (summary)
 

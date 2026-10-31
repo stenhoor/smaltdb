@@ -1,6 +1,6 @@
 # Performance
 
-## 1. Targets (proposed, to be confirmed **[Q-1]**)
+## 1. Targets (proposed; sized for databases up to ~1 GB)
 
 The reference device is a mid-range 2024 laptop running Chrome stable, with a warm cache unless noted.
 
@@ -11,13 +11,14 @@ The reference device is a mid-range 2024 laptop running Chrome stable, with a wa
 | Full scan + filter + aggregate, 10M rows × 5 numeric cols | < 300 ms single worker; scales roughly linearly with reader workers |
 | Hash join 1M × 10M | < 1.5 s single worker |
 | Cold open of a 1 GB database | < 50 ms (lazy load; no full read) |
+| Commit latency, `synchronous=full`, single small txn | < 2 ms (group commit amortizes under load) |
 
 ## 2. Benchmarks
 
 - Comparison baselines: **SQLite WASM (OPFS VFS)**, **DuckDB-WASM**, and **PGlite**, where they apply.
 - Suites: micro (operators, B+tree, record decode), TPC-H SF 0.1/1 (analytical), a YCSB-like workload (OLTP),
   and an app-like mixed workload.
-- The suites run automatically in CI through Playwright on Chromium, Firefox, and WebKit. A regression of more than 5% fails the build.
+- The suites run automatically in CI through Playwright on Chromium, Firefox, and WebKit (all three are supported targets). A regression of more than 5% fails the build.
 
 ## 3. Engineering rules
 
