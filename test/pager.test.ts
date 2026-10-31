@@ -145,18 +145,21 @@ describe('Pager read-ahead', () => {
     pager.close();
     // Corrupt one page that will be prefetched as a neighbour of page 9.
     const raw = vfs.openSync('test.db');
-    raw.write(new Uint8Array([0x99]), 12 * 1024 + 500);
+    raw.write(new Uint8Array([0x99]), 44 * 1024 + 500);
+    // A later extent (pages 32..47), so offsets inside the extent differ from file offsets.
     const p2 = Pager.open(raw, { readAheadBytes: 16 * 1024 });
-    const a = p2.get(9);
-    expect(a.bytes[10]).toBe(8);
+    const a = p2.get(40);
+    expect(a.bytes[10]).toBe(39);
     p2.release(a);
-    expect(p2.stats.prefetched).toBeGreaterThan(0);
+    expect(p2.stats.prefetched).toBe(15);
     const readsBefore = p2.stats.reads;
-    const b = p2.get(10); // served from the prefetched extent
-    expect(b.bytes[10]).toBe(9);
-    p2.release(b);
+    for (const pg of [32, 41, 47]) {
+      const b = p2.get(pg); // served from the prefetched extent
+      expect(b.bytes[10]).toBe(pg - 1);
+      p2.release(b);
+    }
     expect(p2.stats.reads).toBe(readsBefore);
-    expect(() => p2.get(12)).toThrow(CorruptionError);
+    expect(() => p2.get(44)).toThrow(CorruptionError);
     expect(p2.pinnedCount()).toBe(0);
   });
 });

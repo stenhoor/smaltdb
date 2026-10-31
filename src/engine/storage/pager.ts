@@ -309,7 +309,7 @@ export class Pager {
     const n = Math.max(0, Math.min(ps, got - off));
     if (n > 0) f.bytes.set(buf.subarray(off, off + n));
     for (let q = start; q < start + count; q++) {
-      if (q === pgno || q === 0 || (q + 1) * ps > got || this.map.has(q)) continue;
+      if (q === pgno || q === 0 || (q - start + 1) * ps > got || this.map.has(q)) continue;
       if (this.wal !== null && this.wal.has(q)) continue;
       const g = this.takeFrame(q);
       g.bytes.set(buf.subarray((q - start) * ps, (q - start + 1) * ps));
