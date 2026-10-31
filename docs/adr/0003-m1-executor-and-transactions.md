@@ -42,3 +42,15 @@ correctness work, and differential testing showed the value of getting semantics
   and writes per run).
 - The register/iterator executor is already faster than SQLite WASM on the M0/M1 workloads. Vectorization is now an
   optimization for scans and aggregates, not a prerequisite.
+
+## Amendment (post-M2): expression code generation and integer representation
+
+- Expressions with arithmetic, numeric comparisons or boolean logic are compiled to generated JavaScript when allowed (ADR 0001
+  decision 5). The closure compiler remains the fallback and defines the semantics. On a 1M-row scan, `sum(b * 2 + d)` went from
+  about 45 ns to about 16 ns of expression cost per row.
+- **Integer invariant made explicit:** integers outside ±(2^53-1) are always `bigint`. A JS `number` outside that range is
+  therefore a REAL, even when integral. `isIntValue`, `typeof()`, text conversion and generated code all use
+  `Number.isSafeInteger`. This fixed int64-overflow results such as `-(-9223372036854775808)` being treated as INTEGER later on.
+- Fixed: REAL `%` with an int64 operand beyond 2^53 converted the operand through a double first; it now casts the original value.
+- A new differential test checks int64 extremes, the 2^53 boundary, division and modulo by 0 and -1, negative zero, and mixed
+  INTEGER/REAL/TEXT/ANY operands against SQLite, under both the generated-code and closure paths.

@@ -109,7 +109,7 @@ function typeName(v: SqlValue): string {
   if (v === null) return 'NULL';
   switch (typeof v) {
     case 'number':
-      return Number.isInteger(v) ? 'INTEGER' : 'REAL';
+      return Number.isSafeInteger(v) ? 'INTEGER' : 'REAL';
     case 'bigint':
       return 'INTEGER';
     case 'string':
@@ -153,7 +153,7 @@ export function formatReal(x: number): string {
 /** SQLite's text representation of a value (for CAST AS TEXT, ||, TEXT columns). */
 export function valueToText(v: number | bigint, isReal: boolean): string {
   if (typeof v === 'bigint') return v.toString();
-  if (isReal || !Number.isInteger(v)) return formatReal(v);
+  if (isReal || !Number.isSafeInteger(v)) return formatReal(v);
   return String(v);
 }
 
@@ -167,10 +167,13 @@ export function coerceForColumn(v: SqlValue, col: ColumnSchema, table: string, i
     case 'INTEGER': {
       if (typeof v === 'bigint') return v;
       if (typeof v === 'number') {
-        if (Number.isInteger(v)) return v;
+        if (Number.isSafeInteger(v)) return v;
+        // A REAL that converts to int64 losslessly (e.g. 1e17) is stored as INTEGER, like SQLite.
+        if (Number.isInteger(v) && Math.abs(v) < 9223372036854775808) return normalizeInt(BigInt(v));
       } else if (typeof v === 'string') {
         const n = textToNumber(v);
-        if (n !== undefined && (typeof n === 'bigint' || Number.isInteger(n))) return n;
+        if (n !== undefined && (typeof n === 'bigint' || Number.isSafeInteger(n))) return n;
+        if (typeof n === 'number' && Number.isInteger(n) && Math.abs(n) < 9223372036854775808) return normalizeInt(BigInt(n));
       }
       break;
     }

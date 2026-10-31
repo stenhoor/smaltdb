@@ -21,6 +21,7 @@ import {
   truthy,
 } from './convert.js';
 import { type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
+import { type CodegenHelpers, codegenEnabled, generate, isCodegenRoot } from './codegen.js';
 
 export type { Fn };
 
@@ -39,6 +40,8 @@ export interface Compiled {
   affinity: Affinity;
   /** Value does not depend on registers (literal or folded). */
   constant: boolean;
+  /** Set when the value is a plain register read (lets generated code inline it). */
+  reg?: number;
 }
 
 export interface ColumnBinding {
@@ -75,7 +78,7 @@ function literalType(v: SqlValue, isReal: boolean | undefined): StaticType {
   if (v === null) return 'null';
   switch (typeof v) {
     case 'number':
-      return isReal || !Number.isInteger(v) ? 'real' : 'int';
+      return isReal || !Number.isSafeInteger(v) ? 'real' : 'int';
     case 'bigint':
       return 'int';
     case 'string':
@@ -96,17 +99,72 @@ function isNumericType(t: StaticType): boolean {
   return t === 'int' || t === 'real' || t === 'num';
 }
 
+/**
+ * Compile an expression. Arithmetic / comparison / logic roots are compiled to generated
+ * JavaScript when allowed (see codegen.ts); everything else uses the closure compiler.
+ */
 export function compileExpr(e: Expr, scope: CompileScope): Compiled {
+  if (codegenEnabled() && isCodegenRoot(e) && hasRuntimeInputs(e) && !scope.groupRef?.(e)) {
+    const g = generate(
+      e,
+      CODEGEN_HELPERS,
+      (x) => compileNode(x, scope),
+      (x) => {
+        const b = scope.groupRef?.(x);
+        return b ? { reg: b.reg, type: b.type } : undefined;
+      },
+    );
+    return { fn: g.fn, type: g.type, collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
+  }
+  return compileNode(e, scope);
+}
+
+/** True if the expression reads registers (columns, parameters, aggregates, subqueries). */
+function hasRuntimeInputs(e: Expr): boolean {
+  let found = false;
+  const visit = (x: Expr): void => {
+    if (found) return;
+    switch (x.kind) {
+      case 'column':
+      case 'param':
+      case 'call':
+      case 'subquery':
+      case 'exists':
+      case 'inSelect':
+        found = true;
+        return;
+      case 'binary':
+        visit(x.left);
+        visit(x.right);
+        return;
+      case 'unary':
+        visit(x.operand);
+        return;
+      default:
+        found = true; // anything else: let the generator decide via fallback
+    }
+  };
+  visit(e);
+  return found;
+}
+
+const CODEGEN_HELPERS: CodegenHelpers = {
+  arith: Object.fromEntries(['+', '-', '*', '/', '%'].flatMap((op) => [[op, arithImpl(op, false)], [op + 'R', arithImpl(op, true)]])),
+  negate: (v) => negate(v),
+};
+
+/** The closure compiler (defines expression semantics). */
+export function compileNode(e: Expr, scope: CompileScope): Compiled {
   if (scope.groupRef) {
     const g = scope.groupRef(e);
-    if (g) return { fn: regReader(g.reg), type: g.type, collation: g.collation, collSrc: g.collation ? CollSrc.Column : CollSrc.None, affinity: g.affinity, constant: false };
+    if (g) return { fn: regReader(g.reg), type: g.type, collation: g.collation, collSrc: g.collation ? CollSrc.Column : CollSrc.None, affinity: g.affinity, constant: false, reg: g.reg };
   }
   switch (e.kind) {
     case 'literal':
       return konst(e.value, literalType(e.value, e.isReal));
     case 'param': {
       const reg = e.index - 1;
-      return { fn: (r) => r[reg], type: 'any', collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
+      return { fn: (r) => r[reg], type: 'any', collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false, reg };
     }
     case 'column': {
       const b = scope.resolveColumn(e);
@@ -118,37 +176,38 @@ export function compileExpr(e: Expr, scope: CompileScope): Compiled {
         collSrc: CollSrc.Column,
         affinity: b.affinity,
         constant: false,
+        reg: b.reg,
       };
     }
     case 'collate': {
-      const inner = compileExpr(e.expr, scope);
+      const inner = compileNode(e.expr, scope);
       const c = collationByName(e.collation);
       if (c === undefined) throw new SmaltError('SMALT_ERROR', `no such collation sequence: ${e.collation}`);
       return { ...inner, collation: c, collSrc: CollSrc.Explicit };
     }
     case 'unary':
-      return compileUnary(e.op, compileExpr(e.operand, scope));
+      return compileUnary(e.op, compileNode(e.operand, scope));
     case 'binary':
       return compileBinary(e.op, e.left, e.right, scope);
     case 'between': {
-      const x = compileExpr(e.expr, scope);
-      const lo = compileExpr(e.low, scope);
-      const hi = compileExpr(e.high, scope);
+      const x = compileNode(e.expr, scope);
+      const lo = compileNode(e.low, scope);
+      const hi = compileNode(e.high, scope);
       const ge = comparison('>=', x, lo);
       const le = comparison('<=', x, hi);
       const both = and(ge, le);
       return e.not ? compileUnary('NOT', both) : both;
     }
     case 'isNull': {
-      const x = compileExpr(e.expr, scope);
+      const x = compileNode(e.expr, scope);
       const f = x.fn;
       const not = e.not;
       return fold({ fn: (r) => ((f(r) === null) !== not ? 1 : 0), type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: x.constant });
     }
     case 'inList':
-      return compileInList(e.not, compileExpr(e.expr, scope), e.list.map((x) => compileExpr(x, scope)));
+      return compileInList(e.not, compileNode(e.expr, scope), e.list.map((x) => compileNode(x, scope)));
     case 'inSelect': {
-      const probe = compileExpr(e.expr, scope);
+      const probe = compileNode(e.expr, scope);
       const test = scope.inSubquery(e.select, probe);
       const fn: Fn = e.not
         ? (r) => {
@@ -166,11 +225,11 @@ export function compileExpr(e: Expr, scope: CompileScope): Compiled {
     case 'subquery':
       return scope.scalarSubquery(e.select);
     case 'like':
-      return compileLike(e.op, e.not, compileExpr(e.expr, scope), compileExpr(e.pattern, scope), e.escape ? compileExpr(e.escape, scope) : undefined);
+      return compileLike(e.op, e.not, compileNode(e.expr, scope), compileNode(e.pattern, scope), e.escape ? compileNode(e.escape, scope) : undefined);
     case 'case':
       return compileCase(e, scope);
     case 'cast':
-      return compileCast(compileExpr(e.expr, scope), e.type);
+      return compileCast(compileNode(e.expr, scope), e.type);
     case 'call':
       return compileCall(e, scope);
   }
@@ -275,8 +334,8 @@ function or(a: Compiled, b: Compiled): Compiled {
 // ------------------------------------------------------------------ binary operators
 
 function compileBinary(op: string, le: Expr, re: Expr, scope: CompileScope): Compiled {
-  const a = compileExpr(le, scope);
-  const b = compileExpr(re, scope);
+  const a = compileNode(le, scope);
+  const b = compileNode(re, scope);
   switch (op) {
     case 'AND':
       return and(a, b);
@@ -522,14 +581,8 @@ export function arithImpl(op: string, forceReal: boolean): (x: SqlValue, y: SqlV
         return realResult(x * y);
       case '/':
         return y === 0 ? null : realResult(x / y);
-      default: {
-        // SQLite: REAL % casts both operands to INTEGER, result is REAL.
-        const ix = realToInt(x);
-        let iy = realToInt(y);
-        if (iy === 0 || iy === 0n) return null;
-        if (iy === -1 || iy === -1n) iy = 1;
-        return Number(BigInt(ix) % BigInt(iy));
-      }
+      default:
+        return realMod(x, y);
     }
   };
   const intOp = (x: number | bigint, y: number | bigint): SqlValue => {
@@ -596,8 +649,19 @@ export function arithImpl(op: string, forceReal: boolean): (x: SqlValue, y: SqlV
     const nx = num(x);
     const ny = num(y);
     if (!forceReal && isIntValue(nx) && isIntValue(ny)) return intOp(nx, ny);
+    // REAL %: convert the *original* operands to int64 (converting a bigint through a double would lose precision).
+    if (op === '%') return realMod(nx, ny);
     return realOp(Number(nx), Number(ny));
   };
+}
+
+/** SQLite REAL `%`: both operands cast to INTEGER, remainder returned as REAL. */
+function realMod(x: number | bigint, y: number | bigint): SqlValue {
+  const ix = typeof x === 'bigint' ? x : realToInt(x);
+  let iy = typeof y === 'bigint' ? y : realToInt(y);
+  if (iy === 0 || iy === 0n) return null;
+  if (iy === -1 || iy === -1n) iy = 1;
+  return Number(BigInt(ix) % BigInt(iy));
 }
 
 function bitwise(op: string, a: Compiled, b: Compiled): Compiled {
@@ -818,13 +882,13 @@ function compileLike(op: string, not: boolean, x: Compiled, pat: Compiled, escap
 }
 
 function compileCase(e: Extract<Expr, { kind: 'case' }>, scope: CompileScope): Compiled {
-  const base = e.base ? compileExpr(e.base, scope) : undefined;
+  const base = e.base ? compileNode(e.base, scope) : undefined;
   const whens = e.whens.map((w) => {
-    const when = compileExpr(w.when, scope);
+    const when = compileNode(w.when, scope);
     const test = base ? comparison('=', base, when).fn : when.fn;
-    return { test, then: compileExpr(w.then, scope) };
+    return { test, then: compileNode(w.then, scope) };
   });
-  const els = e.else ? compileExpr(e.else, scope) : konst(null, 'null');
+  const els = e.else ? compileNode(e.else, scope) : konst(null, 'null');
   const thens = whens.map((w) => w.then.fn);
   const tests = whens.map((w) => w.test);
   const elseFn = els.fn;
@@ -881,7 +945,7 @@ function compileCall(e: CallExpr, scope: CompileScope): Compiled {
   if (isAgg) {
     if (!scope.aggregateRef) throw new SmaltError('SMALT_ERROR', `misuse of aggregate function ${name}()`);
     const b = scope.aggregateRef(e);
-    return { fn: regReader(b.reg), type: b.type, collation: b.collation, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
+    return { fn: regReader(b.reg), type: b.type, collation: b.collation, collSrc: CollSrc.None, affinity: 'NONE', constant: false, reg: b.reg };
   }
   if (e.distinct || e.star || e.filter) throw new SmaltError('SMALT_ERROR', `DISTINCT/FILTER/* is only valid with aggregate functions`);
   if (name === 'current_time' || name === 'current_date' || name === 'current_timestamp') {
@@ -894,7 +958,7 @@ function compileCall(e: CallExpr, scope: CompileScope): Compiled {
   if (!def) throw new SmaltError('SMALT_ERROR', `no such function: ${name}`);
   const n = e.args.length;
   if (n < def.minArgs || (def.maxArgs >= 0 && n > def.maxArgs)) throw new SmaltError('SMALT_ERROR', `wrong number of arguments to function ${name}()`);
-  const args = e.args.map((a) => compileExpr(a, scope));
+  const args = e.args.map((a) => compileNode(a, scope));
   const compiledArgs: CompiledArg[] = args.map((a) => ({ fn: a.fn, type: a.type, collation: a.collation }));
   const { fn, type } = def.compile(compiledArgs, scope.funcCtx);
   // Collation of a function result: from its first argument when that argument carries one.

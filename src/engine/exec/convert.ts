@@ -47,8 +47,12 @@ const I64_MAX = 2n ** 63n - 1n;
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
 
+/**
+ * True for INTEGER values. Integers outside ±(2^53-1) are always bigint in smaltdb, so a JS number
+ * outside that range (e.g. the REAL result of an int64 overflow) is a REAL even if integral.
+ */
 export function isIntValue(v: SqlValue): boolean {
-  return typeof v === 'bigint' || (typeof v === 'number' && Number.isInteger(v));
+  return typeof v === 'bigint' || (typeof v === 'number' && Number.isSafeInteger(v));
 }
 
 /** Parse the longest numeric prefix of `s` (SQLite arithmetic on text): '12abc' -> 12, 'abc' -> 0. */
@@ -119,7 +123,7 @@ export function toText(v: SqlValue, isReal = false): string | null {
   if (v === null) return null;
   if (typeof v === 'string') return v;
   if (typeof v === 'bigint') return v.toString();
-  if (typeof v === 'number') return isReal || !Number.isInteger(v) ? formatReal(v) : String(v);
+  if (typeof v === 'number') return isReal || !Number.isSafeInteger(v) ? formatReal(v) : String(v);
   return textDecoder.decode(v);
 }
 

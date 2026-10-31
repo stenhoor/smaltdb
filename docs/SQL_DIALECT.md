@@ -108,8 +108,9 @@ partial indexes, `INCLUDE` columns, `WITHOUT ROWID`, `LOOSE` tables, generated c
 functions, `ANALYZE`, and `VACUUM`. Foreign keys are parsed and stored but not yet enforced (M4).
 
 **Known deviations:**
-- An integral REAL flowing through an untyped expression reads back as INTEGER, which affects `typeof()` and text conversion
-  (ADR 0003, decision 2).
+- An integral REAL with magnitude below 2^53 stored in an `ANY`/`NUMERIC` column, or flowing through an untyped expression, reads back as
+  INTEGER. This affects `typeof()`, text conversion and integer division (ADR 0003, decision 2). REALs outside ±2^53, such as int64-overflow
+  results, are always treated as REAL, because smaltdb represents such integers as `bigint`.
 - `AUTOINCREMENT` is accepted but behaves like a plain `INTEGER PRIMARY KEY` (the max rowid + 1 can be reused after deleting
   the largest row).
 - PRIMARY KEY columns are always NOT NULL.

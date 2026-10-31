@@ -305,3 +305,56 @@ describe('differential DML vs SQLite', () => {
     });
   }
 });
+
+describe('arithmetic edge cases vs SQLite (code generation and closure paths)', () => {
+  it('agrees on overflow, division, modulo, signs and mixed types', () => {
+    const lite = new sqlite3.oo1.DB(':memory:');
+    const smalt = Database.openFile(new MemoryVfs().openSync('e.db'));
+    const ddl = 'CREATE TABLE e(i INTEGER, j INTEGER, x REAL, y REAL, t TEXT, a ANY)';
+    lite.exec(ddl + ' STRICT');
+    smalt.exec(ddl);
+    const ints = ['9223372036854775807', '-9223372036854775808', '9007199254740993', '9007199254740992', '-9007199254740993', '4611686018427387904', '2147483648', '-2147483648', '7', '-7', '3', '-1', '1', '0', 'NULL'];
+    const reals = ['0.5', '-0.0', '1e308', '-1e308', '3.5', '2.0', 'NULL'];
+    const texts = ["'12'", "'3.5'", "'abc'", "'-4x'", "''", 'NULL'];
+    const r = rng(99);
+    for (let n = 0; n < 120; n++) {
+      // ANY column: no integral REALs (known limitation, ADR 0003: they read back as INTEGER).
+      const anyVals = [...ints, '0.5', '-2.25', '3.5', ...texts];
+      const row = `(${pick(r, ints)}, ${pick(r, ints)}, ${pick(r, reals)}, ${pick(r, reals)}, ${pick(r, texts)}, ${pick(r, anyVals)})`;
+      lite.exec(`INSERT INTO e VALUES ${row}`);
+      smalt.exec(`INSERT INTO e VALUES ${row}`);
+    }
+    const exprs: string[] = [];
+    for (const op of ['+', '-', '*', '/', '%']) {
+      for (const [l, rr] of [['i', 'j'], ['i', 'x'], ['x', 'y'], ['i', 't'], ['t', 'j'], ['a', 'i'], ['a', 'x'], ['i', '2'], ['i', '-1'], ['x', '0'], ['i', '0'], ['j', '3.0']]) {
+        exprs.push(`${l} ${op} ${rr}`, `-(${l} ${op} ${rr})`, `(${l} ${op} ${rr}) ${pick(r, ['<', '=', '>=', '!='])} 0`);
+      }
+    }
+    exprs.push('i * j * 2', '(i + j) / 2', 'i % 3 = 1 AND x > 0', 'NOT (i > j) OR x IS NULL', '-i', '- x', 'i - -j');
+    const failures: string[] = [];
+    for (const ex of exprs) {
+      const sql = `SELECT ${ex} FROM e`;
+      let a: unknown;
+      let b: unknown;
+      try {
+        a = rowsCanon(lite.selectArrays(sql), true);
+      } catch (e) {
+        a = 'ERR ' + (e as Error).message;
+      }
+      try {
+        b = rowsCanon(smalt.query(sql).rows, true);
+      } catch (e) {
+        b = 'ERR ' + (e as Error).message;
+      }
+      if (typeof a === 'string' || typeof b === 'string') {
+        if ((typeof a === 'string') !== (typeof b === 'string')) failures.push(`${ex}: sqlite=${String(a).slice(0, 80)} smalt=${String(b).slice(0, 80)}`);
+        continue;
+      }
+      const sa = a as string[];
+      const sb = b as string[];
+      const diff = sa.findIndex((v, i) => v !== sb[i]);
+      if (diff >= 0 || sa.length !== sb.length) failures.push(`${ex}: row ${diff}: sqlite=${sa[diff]} smalt=${sb[diff]}`);
+    }
+    if (failures.length) throw new Error(`${failures.length} mismatches:\n${failures.slice(0, 15).join('\n')}`);
+  });
+});

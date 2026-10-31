@@ -73,7 +73,12 @@ or when statistics drift by more than a threshold.
 Source: `src/engine/exec/` — `planner.ts`, `operators.ts`, `expr.ts`, `functions.ts`, `write.ts`.
 
 - **Execution:** pull-based iterators (`open` / `next` / `close`) over a shared register file. Expressions compile to closures
-  over registers, with constant folding and a fast path for statically numeric comparisons. Zero allocation per row in scans,
+  over registers, with constant folding and a fast path for statically numeric comparisons.
+- **Expression code generation** (`codegen.ts`): when the CSP allows `new Function`, arithmetic, numeric comparisons and AND/OR/NOT
+  roots are emitted as straight-line JavaScript. Register reads and constants are inlined, and fast paths are chosen from static
+  types (INTEGER: exact safe-integer ops with overflow fallback; REAL: plain float ops). Each expression gets its own V8 type feedback,
+  which closures cannot have because instances of a closure literal share feedback. Other nodes, and every slow path, call the closure
+  compiler, which defines the semantics. Differential tests run in both modes (`SMALT_NO_CODEGEN=1` forces closures). Zero allocation per row in scans,
   filters, and joins. See [ADR 0003](adr/0003-m1-executor-and-transactions.md).
 - **Access paths** (heuristic, chosen per table from conjuncts that reference only that table and earlier ones): rowid
   equality / `IN` / range; index equality prefix plus a range on the next ASC column, used only when collation and affinity make

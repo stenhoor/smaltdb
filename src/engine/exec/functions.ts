@@ -190,7 +190,7 @@ function sqlTypeof(v: SqlValue, t: StaticType): string {
   if (v === null) return 'null';
   switch (typeof v) {
     case 'number':
-      return t === 'real' || !Number.isInteger(v) ? 'real' : 'integer';
+      return t === 'real' || !Number.isSafeInteger(v) ? 'real' : 'integer';
     case 'bigint':
       return 'integer';
     case 'string':
