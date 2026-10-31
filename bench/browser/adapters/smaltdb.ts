@@ -5,9 +5,8 @@ import { ANALYTIC_DDL, type Adapter, analyticRow, valueFor } from '../adapter.js
 /** smaltdb through its SQL layer, hosted in the benchmark worker and called synchronously (like SQLite). */
 export class SmaltdbAdapter implements Adapter {
   readonly name = 'smaltdb';
-  readonly config = 'OPFS sync handle, 8 KiB pages, 64 MiB cache, flush per commit, prepared statements';
-  /** Pre-M2: pages are written in place; becomes true once the WAL lands. */
-  readonly atomicCommits = false;
+  readonly config = 'OPFS sync handles, WAL (auto-checkpoint 4 MiB), 8 KiB pages, 64 MiB cache, flush per commit, prepared statements';
+  readonly atomicCommits = true;
   private vfs = new OpfsVfs({ rootDir: 'smaltdb-bench' });
   private db!: Database;
   private insert!: Statement;
@@ -15,6 +14,7 @@ export class SmaltdbAdapter implements Adapter {
 
   async open(): Promise<void> {
     await this.vfs.delete('bench.db');
+    await this.vfs.delete('bench.db-wal');
     this.db = await Database.open(this.vfs, 'bench.db', this.opts);
     this.db.exec('CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)');
     this.insert = this.db.prepare('INSERT INTO t(k, v) VALUES (?, ?)');
@@ -76,5 +76,6 @@ export class SmaltdbAdapter implements Adapter {
   async close(): Promise<void> {
     this.db.close();
     await this.vfs.delete('bench.db');
+    await this.vfs.delete('bench.db-wal');
   }
 }

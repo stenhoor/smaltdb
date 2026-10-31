@@ -25,7 +25,7 @@ const rows = Number(arg('rows', 100000));
 const lookups = Number(arg('lookups', 10000));
 const smallTxns = Number(arg('small-txns', 200));
 const analyticRows = Number(arg('analytic-rows', 200000));
-const baseline = arg('baseline', 'sqlite-off');
+const baseline = arg('baseline', 'sqlite-wal');
 const save = process.argv.includes('--save');
 
 const out = '.cache/bench-browser';

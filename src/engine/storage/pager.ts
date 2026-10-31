@@ -1,6 +1,7 @@
 import { CorruptionError, MisuseError, SmaltError } from '../errors.js';
 import type { VfsFile } from '../vfs/types.js';
 import { crc32c } from './crc32c.js';
+import { Wal, type WalStats } from './wal.js';
 import {
   DB_HEADER_SIZE,
   DEFAULT_PAGE_SIZE,
@@ -55,6 +56,8 @@ export interface PagerOptions {
   verifyChecksums?: boolean;
   /** Call `flush()` on commit (`synchronous=full`, default true). */
   syncOnCommit?: boolean;
+  /** Checkpoint automatically once the WAL holds this many bytes (default 4 MiB). */
+  walAutoCheckpointBytes?: number;
 }
 
 export interface PagerStats {
@@ -67,15 +70,28 @@ export interface PagerStats {
   overflowFrames: number;
 }
 
-/**
- * Page cache plus page allocation for a single database file.
- *
- * M0 transaction model: changes accumulate in dirty frames (no-steal: dirty frames are never
- * evicted) and are written by {@link commit}; {@link rollback} discards them. This is *not*
- * crash-atomic. The WAL (milestone M2) replaces the write-back step in `commit`.
- */
-/** Upper bound on a single coalesced write during commit. */
+/** Upper bound on a single coalesced write during commit (no-WAL mode). */
 const WRITE_BATCH_BYTES = 1024 * 1024;
+
+/** Undo information for one savepoint level (statement journal or SQL SAVEPOINT). */
+interface Savepoint {
+  /** Page images captured on first modification within this level. */
+  images: Map<number, Uint8Array>;
+  /** Uncaptured pages (re)allocated within this level; dropped on rollback. */
+  fresh: Set<number>;
+  pageCount: number;
+  /** Database header bytes (first DB_HEADER_SIZE) at the start of this level. */
+  header: Uint8Array;
+}
+
+/**
+ * Page cache, page allocation, transactions and savepoints for one database.
+ *
+ * Changes accumulate in dirty frames (no-steal: dirty frames are never evicted). With a WAL
+ * (default), {@link commit} appends the changed pages to the log and flushes it, which makes the
+ * commit atomic and durable; checkpoints copy pages back into the database file. Without a WAL
+ * (`journalMode: 'off'`), pages are written in place: durable but not crash-atomic.
+ */
 
 export class Pager {
   readonly pageSize: number;
@@ -97,9 +113,11 @@ export class Pager {
   private readonly committedHeader: Uint8Array;
   private headerDirty = false;
   private closed = false;
+  private readonly autoCheckpoint: number;
 
   private constructor(
     private readonly file: VfsFile,
+    private readonly wal: Wal | null,
     pageSize: number,
     reservedBytes: number,
     header: Uint8Array,
@@ -112,6 +130,7 @@ export class Pager {
     this.committedHeader = header.slice();
     this.verify = options.verifyChecksums ?? true;
     this.syncOnCommit = options.syncOnCommit ?? true;
+    this.autoCheckpoint = options.walAutoCheckpointBytes ?? 4 * 1024 * 1024;
     const budget = options.cacheSizeBytes ?? 16 * 1024 * 1024;
     this.targetFrames = Math.max(16, Math.floor(budget / pageSize));
     const arena = new Uint8Array(this.targetFrames * pageSize);
@@ -120,44 +139,57 @@ export class Pager {
     }
   }
 
-  /** Open (or initialize, if empty) a database file. */
-  static open(file: VfsFile, options: PagerOptions = {}): Pager {
-    const size = file.size();
-    if (size === 0) {
-      const pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
-      validatePageSize(pageSize);
-      const header = new Uint8Array(pageSize);
-      header.set(MAGIC, DH_MAGIC);
-      const v = new DataView(header.buffer);
-      v.setUint16(DH_FORMAT_MAJOR, FORMAT_MAJOR, true);
-      v.setUint16(DH_FORMAT_MINOR, FORMAT_MINOR, true);
-      v.setUint32(DH_PAGE_SIZE, pageSize, true);
-      v.setUint8(DH_RESERVED_BYTES, DEFAULT_RESERVED_BYTES);
-      v.setUint32(DH_PAGE_COUNT, 1, true);
-      const pager = new Pager(file, pageSize, DEFAULT_RESERVED_BYTES, header, options);
-      pager.headerDirty = true;
-      pager.commit();
-      return pager;
+  /**
+   * Open (or initialize, if empty) a database. With `walFile`, committed transactions are recovered
+   * from the write-ahead log first.
+   */
+  static open(file: VfsFile, options: PagerOptions = {}, walFile?: VfsFile): Pager {
+    const verify = options.verifyChecksums ?? true;
+    let pageSize: number | null = null;
+    let reserved = DEFAULT_RESERVED_BYTES;
+    if (file.size() > 0) {
+      const probe = new Uint8Array(DB_HEADER_SIZE);
+      if (file.read(probe, 0) < DB_HEADER_SIZE) throw new CorruptionError('file too small to be a smaltdb database');
+      ({ pageSize, reserved } = parseHeader(probe));
     }
-
-    const probe = new Uint8Array(DB_HEADER_SIZE);
-    if (file.read(probe, 0) < DB_HEADER_SIZE) throw new CorruptionError('file too small to be a smaltdb database');
-    for (let i = 0; i < MAGIC.length; i++) {
-      if (probe[DH_MAGIC + i] !== MAGIC[i]) throw new SmaltError('SMALT_NOTADB', 'file is not a smaltdb database');
-    }
-    const pv = new DataView(probe.buffer);
-    const major = pv.getUint16(DH_FORMAT_MAJOR, true);
-    if (major !== FORMAT_MAJOR) {
-      throw new SmaltError('SMALT_FORMAT', `unsupported format version ${major}.x (engine supports ${FORMAT_MAJOR}.x)`);
-    }
-    const pageSize = pv.getUint32(DH_PAGE_SIZE, true);
+    if (pageSize === null && walFile) pageSize = Wal.probePageSize(walFile);
+    if (pageSize === null) pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
     validatePageSize(pageSize);
-    const reserved = pv.getUint8(DH_RESERVED_BYTES);
-    if (reserved < 4 || reserved > 255) throw new CorruptionError(`invalid reserved byte count ${reserved}`);
+    const wal = walFile ? Wal.open(walFile, pageSize) : null;
+
     const header = new Uint8Array(pageSize);
-    if (file.read(header, 0) !== pageSize) throw new CorruptionError('truncated header page');
-    if (options.verifyChecksums ?? true) checkChecksum(header, 0);
-    return new Pager(file, pageSize, reserved, header, options);
+    let found = false;
+    if (wal && wal.read(0, header)) found = true;
+    else if (file.size() > 0) {
+      if (file.read(header, 0) !== pageSize) throw new CorruptionError('truncated header page');
+      found = true;
+    }
+    if (found) {
+      ({ reserved } = parseHeader(header));
+      if (verify) checkChecksum(header, 0);
+      return new Pager(file, wal, pageSize, reserved, header, options);
+    }
+    // New database.
+    header.set(MAGIC, DH_MAGIC);
+    const v = new DataView(header.buffer);
+    v.setUint16(DH_FORMAT_MAJOR, FORMAT_MAJOR, true);
+    v.setUint16(DH_FORMAT_MINOR, FORMAT_MINOR, true);
+    v.setUint32(DH_PAGE_SIZE, pageSize, true);
+    v.setUint8(DH_RESERVED_BYTES, DEFAULT_RESERVED_BYTES);
+    v.setUint32(DH_PAGE_COUNT, 1, true);
+    const pager = new Pager(file, wal, pageSize, DEFAULT_RESERVED_BYTES, header, options);
+    pager.headerDirty = true;
+    pager.commit();
+    return pager;
+  }
+
+  get walStats(): WalStats | null {
+    return this.wal?.stats ?? null;
+  }
+
+  /** Bytes currently held in the WAL (0 without a WAL). */
+  get walSize(): number {
+    return this.wal?.size ?? 0;
   }
 
   // ---------------------------------------------------------------- header fields
@@ -223,7 +255,7 @@ export class Pager {
     if (pgno <= 0 || pgno >= this.pageCount) throw new CorruptionError(`page ${pgno} out of range (pageCount=${this.pageCount})`);
     this.stats.misses++;
     const f = this.takeFrame(pgno);
-    const n = this.file.read(f.bytes, pgno * this.pageSize);
+    const n = this.wal !== null && this.wal.read(pgno, f.bytes) ? this.pageSize : this.file.read(f.bytes, pgno * this.pageSize);
     this.stats.reads++;
     if (n < this.pageSize) {
       f.bytes.fill(0, n);
@@ -243,9 +275,9 @@ export class Pager {
    * changed: inside a statement, the first call snapshots the page for {@link rollbackStatement}.
    */
   markDirty(f: Frame): void {
-    const images = this.stmtImages;
-    if (images !== null && f.pgno < this.stmtPageCount && !images.has(f.pgno) && !this.stmtFresh.has(f.pgno)) {
-      images.set(f.pgno, f.bytes.slice());
+    const sp = this.top;
+    if (sp !== undefined && f.pgno < sp.pageCount && !sp.images.has(f.pgno) && !sp.fresh.has(f.pgno)) {
+      sp.images.set(f.pgno, f.bytes.slice());
     }
     if (!f.dirty) {
       f.dirty = true;
@@ -260,54 +292,60 @@ export class Pager {
     }
   }
 
-  // ---------------------------------------------------------------- statement savepoints
+  // ---------------------------------------------------------------- savepoints
 
-  /** Page images captured on first modification within the current statement (null = no statement). */
-  private stmtImages: Map<number, Uint8Array> | null = null;
-  private stmtPageCount = 0;
-  private stmtHeader: Uint8Array | null = null;
-  /** Uncaptured pages (re)allocated during the statement; dropped on statement rollback. */
-  private readonly stmtFresh = new Set<number>();
+  /** Savepoint stack; the top level receives page snapshots. Statements are savepoints too. */
+  private readonly savepoints: Savepoint[] = [];
 
-  /** Begin a statement-level savepoint. Changes made until commitStatement/rollbackStatement can be undone. */
-  beginStatement(): void {
-    if (this.stmtImages !== null) throw new MisuseError('statement already active');
-    this.stmtImages = new Map();
-    this.stmtFresh.clear();
-    this.stmtPageCount = this.pageCount;
-    this.stmtHeader = this.header.slice(0, DB_HEADER_SIZE);
+  private get top(): Savepoint | undefined {
+    return this.savepoints[this.savepoints.length - 1];
   }
 
-  get inStatement(): boolean {
-    return this.stmtImages !== null;
+  /** Number of open savepoint levels. */
+  get savepointDepth(): number {
+    return this.savepoints.length;
   }
 
-  /** Keep the statement's changes (they remain part of the enclosing transaction). */
-  commitStatement(): void {
-    this.stmtFresh.clear();
-    this.stmtImages = null;
-    this.stmtHeader = null;
+  /** Open a savepoint level; returns its depth (1-based). */
+  beginSavepoint(): number {
+    this.savepoints.push({ images: new Map(), fresh: new Set(), pageCount: this.pageCount, header: this.header.slice(0, DB_HEADER_SIZE) });
+    return this.savepoints.length;
   }
 
-  /** Undo every change made since beginStatement. No page may be pinned. */
-  rollbackStatement(): void {
-    const images = this.stmtImages;
-    const header = this.stmtHeader;
-    if (images === null || header === null) throw new MisuseError('no active statement');
-    this.stmtImages = null;
-    this.stmtHeader = null;
-    for (const f of this.frames) {
-      if (f.pins > 0) throw new MisuseError(`statement rollback with pinned page ${f.pgno}`);
+  /** Keep changes made since savepoint `depth` (and any inner levels) and close those levels. */
+  releaseSavepoint(depth: number): void {
+    this.checkDepth(depth);
+    while (this.savepoints.length >= depth) {
+      const child = this.savepoints.pop()!;
+      const parent = this.top;
+      if (!parent) break;
+      for (const [pgno, img] of child.images) {
+        if (pgno < parent.pageCount && !parent.images.has(pgno) && !parent.fresh.has(pgno)) parent.images.set(pgno, img);
+      }
+      for (const pgno of child.fresh) if (pgno < parent.pageCount && !parent.images.has(pgno)) parent.fresh.add(pgno);
     }
-    // Pages allocated past the old end of file disappear; reused free pages revert to their stored image.
-    for (const f of this.frames) if (f.pgno >= this.stmtPageCount) this.discard(f);
-    for (const pgno of this.stmtFresh) {
-      if (images.has(pgno)) continue;
+  }
+
+  /**
+   * Undo every change made since savepoint `depth` was opened. With `keep`, that level stays open
+   * (SQL `ROLLBACK TO`); otherwise it is closed too. No page may be pinned.
+   */
+  rollbackToSavepoint(depth: number, keep: boolean): void {
+    this.checkDepth(depth);
+    for (const f of this.frames) if (f.pins > 0) throw new MisuseError(`savepoint rollback with pinned page ${f.pgno}`);
+    while (this.savepoints.length >= depth) this.restoreLevel(this.savepoints.pop()!);
+    if (keep) this.beginSavepoint();
+  }
+
+  private restoreLevel(sp: Savepoint): void {
+    // Pages allocated past the level's end of file disappear; reused free pages revert to their stored image.
+    for (const f of this.frames) if (f.pgno >= sp.pageCount) this.discard(f);
+    for (const pgno of sp.fresh) {
+      if (sp.images.has(pgno)) continue;
       const f = this.map.get(pgno);
       if (f !== undefined) this.discard(f);
     }
-    this.stmtFresh.clear();
-    for (const [pgno, image] of images) {
+    for (const [pgno, image] of sp.images) {
       let f = this.map.get(pgno);
       if (f === undefined) f = this.takeFrame(pgno);
       else f.pins++;
@@ -315,8 +353,32 @@ export class Pager {
       this.markDirtyNoCapture(f);
       this.release(f);
     }
-    this.header.set(header);
+    this.header.set(sp.header);
     this.headerDirty = true;
+  }
+
+  private checkDepth(depth: number): void {
+    if (depth < 1 || depth > this.savepoints.length) throw new MisuseError(`no savepoint at depth ${depth}`);
+  }
+
+  /** Begin a statement-level savepoint. */
+  beginStatement(): void {
+    this.beginSavepoint();
+  }
+
+  get inStatement(): boolean {
+    return this.savepoints.length > 0;
+  }
+
+  /** Keep the statement's changes (they remain part of the enclosing transaction or savepoint). */
+  commitStatement(): void {
+    this.releaseSavepoint(this.savepoints.length);
+  }
+
+  /** Undo every change made since beginStatement. */
+  rollbackStatement(): void {
+    if (this.savepoints.length === 0) throw new MisuseError('no active statement');
+    this.rollbackToSavepoint(this.savepoints.length, false);
   }
 
   /** Allocate a page (pinned, dirty, zero-filled), reusing the freelist when possible. */
@@ -353,7 +415,8 @@ export class Pager {
     // No snapshot needed: the page was free when the statement began, or it was freed during the
     // statement (then either captured, or clean, so its committed image is on disk). Remember it so
     // a statement rollback drops this frame instead of writing it.
-    if (this.stmtImages !== null && pgno < this.stmtPageCount && !this.stmtImages.has(pgno)) this.stmtFresh.add(pgno);
+    const sp = this.top;
+    if (sp !== undefined && pgno < sp.pageCount && !sp.images.has(pgno)) sp.fresh.add(pgno);
     f.bytes.fill(0);
     this.markDirtyNoCapture(f);
     return f;
@@ -390,7 +453,7 @@ export class Pager {
     if (cached !== undefined) {
       t = cached;
       t.pins++;
-    } else if (this.stmtImages !== null && pgno < this.stmtPageCount) {
+    } else if (this.top !== undefined && pgno < this.top.pageCount) {
       t = this.get(pgno); // read the current contents so the statement snapshot is correct
     } else {
       t = this.takeFrame(pgno);
@@ -407,11 +470,18 @@ export class Pager {
 
   // ---------------------------------------------------------------- transactions
 
-  /** Write all dirty pages and the header, then flush (if `syncOnCommit`). */
+  /**
+   * Make the transaction durable. With a WAL: append changed pages + header to the log and flush
+   * (atomic). Without: write pages in place and then the header, then flush.
+   */
   commit(): void {
     this.checkOpen();
-    if (this.stmtImages !== null) throw new MisuseError('commit inside an active statement');
+    if (this.savepoints.length > 0) throw new MisuseError('commit with open savepoints');
     if (!this.inTransaction) return;
+    if (this.wal !== null) {
+      this.commitToWal(this.wal);
+      return;
+    }
     // The list may contain stale entries (discarded frames, or a frame listed twice after reuse);
     // only frames still flagged dirty are written, each once.
     // Runs of consecutive pages are coalesced into one large write (far fewer OPFS calls).
@@ -457,12 +527,45 @@ export class Pager {
     this.trimOverflowFrames();
   }
 
+  private commitToWal(wal: Wal): void {
+    const dirty = this.dirtyList.sort((a, b) => a.pgno - b.pgno);
+    const pages: { pgno: number; bytes: Uint8Array }[] = [];
+    for (const f of dirty) {
+      if (!f.dirty) continue;
+      if (pages.length > 0 && pages[pages.length - 1].pgno === f.pgno) continue;
+      this.sealPage(f.bytes);
+      pages.push({ pgno: f.pgno, bytes: f.bytes });
+    }
+    this.hv.setUint32(DH_CHANGE_COUNTER, (this.changeCounter + 1) >>> 0, true);
+    this.sealPage(this.header);
+    pages.push({ pgno: 0, bytes: this.header });
+    wal.commit(pages, this.pageCount, this.syncOnCommit);
+    for (const f of dirty) f.dirty = false;
+    dirty.length = 0;
+    this.stats.writes += pages.length;
+    this.committedHeader.set(this.header);
+    this.headerDirty = false;
+    this.trimOverflowFrames();
+    if (wal.size >= this.autoCheckpoint) this.checkpoint();
+  }
+
+  /** Copy committed WAL pages into the database file and reset the log. No transaction may be open. */
+  checkpoint(): void {
+    this.checkOpen();
+    const wal = this.wal;
+    if (wal === null || wal.isEmpty) return;
+    if (this.inTransaction) throw new MisuseError('checkpoint inside a transaction');
+    wal.checkpoint(this.file, (pgno) => {
+      if (pgno === 0) return this.header;
+      const f = this.map.get(pgno);
+      return f !== undefined && !f.dirty ? f.bytes : null;
+    });
+  }
+
   /** Discard all uncommitted changes. No page may be pinned. */
   rollback(): void {
     this.checkOpen();
-    this.stmtFresh.clear();
-    this.stmtImages = null;
-    this.stmtHeader = null;
+    this.savepoints.length = 0;
     for (const f of this.dirtyList) {
       if (f.dirty && f.pins > 0) throw new MisuseError(`rollback with pinned page ${f.pgno}`);
     }
@@ -476,6 +579,10 @@ export class Pager {
   close(): void {
     if (this.closed) return;
     if (this.inTransaction) this.rollback();
+    if (this.wal !== null) {
+      this.checkpoint();
+      this.wal.close();
+    }
     this.file.close();
     this.closed = true;
   }
@@ -509,8 +616,9 @@ export class Pager {
   }
 
   private captureForStatement(f: Frame): void {
-    if (this.stmtImages !== null && f.pgno < this.stmtPageCount && !this.stmtImages.has(f.pgno) && !this.stmtFresh.has(f.pgno)) {
-      this.stmtImages.set(f.pgno, f.bytes.slice());
+    const sp = this.top;
+    if (sp !== undefined && f.pgno < sp.pageCount && !sp.images.has(f.pgno) && !sp.fresh.has(f.pgno)) {
+      sp.images.set(f.pgno, f.bytes.slice());
     }
   }
 
@@ -587,4 +695,18 @@ function checkChecksum(bytes: Uint8Array, pgno: number): void {
   if (crc32c(bytes, 0, off) === stored) return;
   // A never-written page inside the file (a hole left by a page freed in the same transaction it was allocated) is all zero.
   for (let i = 0; i < bytes.length; i++) if (bytes[i] !== 0) throw new CorruptionError(`page ${pgno}: checksum mismatch`);
+}
+
+function parseHeader(probe: Uint8Array): { pageSize: number; reserved: number } {
+  for (let i = 0; i < MAGIC.length; i++) {
+    if (probe[DH_MAGIC + i] !== MAGIC[i]) throw new SmaltError('SMALT_NOTADB', 'file is not a smaltdb database');
+  }
+  const pv = new DataView(probe.buffer, probe.byteOffset, probe.byteLength);
+  const major = pv.getUint16(DH_FORMAT_MAJOR, true);
+  if (major !== FORMAT_MAJOR) throw new SmaltError('SMALT_FORMAT', `unsupported format version ${major}.x (engine supports ${FORMAT_MAJOR}.x)`);
+  const pageSize = pv.getUint32(DH_PAGE_SIZE, true);
+  validatePageSize(pageSize);
+  const reserved = pv.getUint8(DH_RESERVED_BYTES);
+  if (reserved < 4) throw new CorruptionError(`invalid reserved byte count ${reserved}`);
+  return { pageSize, reserved };
 }

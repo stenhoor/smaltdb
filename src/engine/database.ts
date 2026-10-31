@@ -52,6 +52,8 @@ export type BindParams = readonly SqlValue[] | Readonly<Record<string, SqlValue>
 export interface DatabaseOptions extends PagerOptions {
   /** Prepared-statement cache entries for exec/query helpers (default 64). */
   statementCacheSize?: number;
+  /** 'wal' (default): atomic, durable commits via `<path>-wal`. 'off': in-place writes (not crash-atomic). */
+  journalMode?: 'wal' | 'off';
 }
 
 const CATALOG_SQL = 'CREATE TABLE smalt_schema(type TEXT, name TEXT, tbl_name TEXT, rootpage INTEGER, sql TEXT)';
@@ -103,8 +105,8 @@ export class Database implements FunctionContext {
   readonly activeCursors = new Set<RowCursor>();
   private closed = false;
 
-  private constructor(file: VfsFile, options: DatabaseOptions) {
-    this.pager = Pager.open(file, options);
+  private constructor(file: VfsFile, options: DatabaseOptions, walFile?: VfsFile) {
+    this.pager = Pager.open(file, options, walFile);
     this.cacheSize = options.statementCacheSize ?? 64;
     if (this.pager.catalogRoot === 0) {
       this.pager.catalogRoot = BTree.create(this.pager);
@@ -114,11 +116,20 @@ export class Database implements FunctionContext {
   }
 
   static async open(vfs: Vfs, path: string, options: DatabaseOptions = {}): Promise<Database> {
-    return new Database(await vfs.open(path), options);
+    const file = await vfs.open(path);
+    const wal = (options.journalMode ?? 'wal') === 'wal' ? await vfs.open(`${path}-wal`) : undefined;
+    return new Database(file, options, wal);
   }
 
-  static openFile(file: VfsFile, options: DatabaseOptions = {}): Database {
-    return new Database(file, options);
+  /** Open from already-open files (pass `walFile` for WAL mode). */
+  static openFile(file: VfsFile, options: DatabaseOptions = {}, walFile?: VfsFile): Database {
+    return new Database(file, options, walFile);
+  }
+
+  /** Copy the WAL into the database file (also happens automatically and on close). */
+  checkpoint(): void {
+    if (!this.autocommit) throw new SmaltError('SMALT_BUSY', 'cannot checkpoint inside a transaction');
+    this.pager.checkpoint();
   }
 
   /** Shared B+tree handle for a root page (BTree objects hold scratch buffers; reuse them). */
@@ -324,6 +335,8 @@ export class Database implements FunctionContext {
       case 'begin':
       case 'commit':
       case 'rollback':
+      case 'savepoint':
+      case 'release':
         return done({ exec: () => this.transactionControl(stmt), readonly: true, columns: [], columnTypes: [] });
       case 'explain': {
         if (stmt.analyze) throw new SmaltError('SMALT_UNSUPPORTED', 'EXPLAIN ANALYZE is not supported yet');
@@ -343,24 +356,66 @@ export class Database implements FunctionContext {
     }
   }
 
+  /** Open SQL savepoints, oldest first, with their pager depth. */
+  private readonly sqlSavepoints: { name: string; depth: number }[] = [];
+  /** The transaction was started by SAVEPOINT (releasing the outermost savepoint commits). */
+  private txnFromSavepoint = false;
+
   private transactionControl(stmt: Stmt): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
-    if (stmt.kind === 'begin') {
-      if (!this.autocommit) throw new SmaltError('SMALT_ERROR', 'cannot start a transaction within a transaction');
-      this.autocommit = false;
-    } else if (stmt.kind === 'commit') {
-      if (this.autocommit) throw new SmaltError('SMALT_ERROR', 'cannot commit - no transaction is active');
-      this.pager.commit();
-      this.autocommit = true;
-    } else if (stmt.kind === 'rollback') {
-      if (stmt.savepoint) throw new SmaltError('SMALT_UNSUPPORTED', 'savepoints are not supported yet');
-      if (this.autocommit) throw new SmaltError('SMALT_ERROR', 'cannot rollback - no transaction is active');
-      this.rollbackTransaction();
+    switch (stmt.kind) {
+      case 'begin':
+        if (!this.autocommit) throw new SmaltError('SMALT_ERROR', 'cannot start a transaction within a transaction');
+        this.autocommit = false;
+        this.txnFromSavepoint = false;
+        break;
+      case 'commit':
+        if (this.autocommit) throw new SmaltError('SMALT_ERROR', 'cannot commit - no transaction is active');
+        this.commitTransaction();
+        break;
+      case 'rollback':
+        if (this.autocommit) throw new SmaltError('SMALT_ERROR', 'cannot rollback - no transaction is active');
+        if (stmt.savepoint) {
+          const i = this.findSavepoint(stmt.savepoint);
+          this.pager.rollbackToSavepoint(this.sqlSavepoints[i].depth, true);
+          this.sqlSavepoints.length = i + 1;
+          this.loadSchema();
+        } else this.rollbackTransaction();
+        break;
+      case 'savepoint':
+        if (this.autocommit) {
+          this.autocommit = false;
+          this.txnFromSavepoint = true;
+        }
+        this.sqlSavepoints.push({ name: stmt.name, depth: this.pager.beginSavepoint() });
+        break;
+      case 'release': {
+        const i = this.findSavepoint(stmt.name);
+        this.pager.releaseSavepoint(this.sqlSavepoints[i].depth);
+        this.sqlSavepoints.length = i;
+        if (i === 0 && this.txnFromSavepoint) this.commitTransaction();
+        break;
+      }
     }
     return none;
   }
 
+  private findSavepoint(name: string): number {
+    for (let i = this.sqlSavepoints.length - 1; i >= 0; i--) if (this.sqlSavepoints[i].name.toLowerCase() === name.toLowerCase()) return i;
+    throw new SmaltError('SMALT_ERROR', `no such savepoint: ${name}`);
+  }
+
+  private commitTransaction(): void {
+    if (this.sqlSavepoints.length) this.pager.releaseSavepoint(1);
+    this.sqlSavepoints.length = 0;
+    this.pager.commit();
+    this.autocommit = true;
+    this.txnFromSavepoint = false;
+  }
+
   private rollbackTransaction(): void {
+    this.sqlSavepoints.length = 0;
+    this.txnFromSavepoint = false;
     this.pager.rollback();
     this.autocommit = true;
     // Reload the in-memory schema if DDL was rolled back.
