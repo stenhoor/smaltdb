@@ -275,7 +275,7 @@ export class Pager {
     this.stmtImages = new Map();
     this.stmtFresh.clear();
     this.stmtPageCount = this.pageCount;
-    this.stmtHeader = this.header.slice();
+    this.stmtHeader = this.header.slice(0, DB_HEADER_SIZE);
   }
 
   get inStatement(): boolean {

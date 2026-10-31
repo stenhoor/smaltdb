@@ -10,14 +10,15 @@
 - **Property tests** for the B+tree, key encoding (order preservation), and record format round trips.
 - **Benchmarks** as tests. See [PERFORMANCE.md](PERFORMANCE.md).
 
-## Running the tests (M0)
+## Running the tests
 
 | Command | What it runs |
 |---|---|
 | `npm test` | Unit, property, and model-based tests in Node (Vitest + fast-check) against `MemoryVfs` |
 | `BTREE_SEEDS=200 npm test -- btree` | Longer B+tree stress run: 200 seeds × 6,000 random operations, with reopen-from-storage checks |
+| `DIFF_QUERIES=20000 DIFF_DML=3000 npm test -- differential` | Differential testing against SQLite WASM (in Node): random queries and random writes; results and table contents must match |
 | `npm run typecheck` | `tsc --noEmit` over `src`, `test`, and `bench` |
-| `npm run test:browser` | OPFS integration test in a real browser (Playwright). `BROWSERS=chromium,firefox,webkit` picks the browsers |
+| `npm run test:browser` | Builds, then runs the OPFS storage test and the client API test (main thread → engine worker → OPFS) in a real browser (Playwright). `BROWSERS=chromium,firefox,webkit` picks the browsers |
 | `npm run bench` | Storage micro-benchmarks in Node |
 | `npm run bench:browser [-- --engines smaltdb,sqlite --rows 100000 --save]` | Engine comparison in a browser. `--save` writes `bench/results/<date>-<browser>.json` |
 
@@ -31,3 +32,15 @@ What M0 covers:
   Also tested: overflow values, oversized-key rejection, rollback, `destroy()`, and `count()`.
 - **Browser (OPFS):** create, insert 50k, commit, reopen, verify; exclusive-lock behaviour (a second sync handle is rejected);
   small-commit latency; and capability detection.
+
+What M1 adds:
+- **Differential testing vs SQLite** (`test/differential.test.ts`). Random typed expressions run through filters, LEFT and inner joins,
+  GROUP BY / HAVING / aggregates, IN / EXISTS / scalar subqueries, compound selects, derived tables, and fully ordered
+  `LIMIT` / `OFFSET` queries. Results are compared as multisets, or as exact sequences when fully ordered. Random
+  INSERT / UPDATE / DELETE statements, including constraint violations and `OR IGNORE` / `OR REPLACE`, are compared table-for-table
+  after every statement, ending with `PRAGMA integrity_check`. A default run covers about 3,000 queries and about 1,800 writes; it has
+  been run at 15,000 queries and 6,000 writes.
+- **Parser tests** (126): precedence, literals, parameters, spans, every statement form, and error messages.
+- **Statement savepoints:** model-based tests that interleave statement and transaction commits and rollbacks.
+- **Record format:** property tests for round trips and for rowid key ordering.
+- **SQL smoke tests:** constraints, transactions, persistence, `EXPLAIN QUERY PLAN`.

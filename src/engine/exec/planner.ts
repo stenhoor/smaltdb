@@ -31,6 +31,7 @@ import { type FunctionContext, aggregateFunctions } from './functions.js';
 import {
   type AggSpec,
   Compound,
+  CountRows,
   Distinct,
   type ExecState,
   Filter,
@@ -334,6 +335,8 @@ export class Planner {
    */
   private planCore(core: SelectCore, parent: Scope | null, outRegs: number[] | undefined, stmt: SelectStmt | null): QueryPlan {
     if (core.kind === 'values') return this.planValues(core.rows, parent, outRegs, stmt);
+    const fast = this.planCountStar(core, outRegs);
+    if (fast) return fast;
     const scope = new Scope(parent);
     let root = this.planFrom(core.from, core.where, scope);
 
@@ -475,6 +478,24 @@ export class Planner {
       root = new Sort(root, sortKeys, [...regs, ...extraRegs], limitHint);
     }
     return { root, outRegs: regs, columns, correlated: scope.correlated };
+  }
+
+  /** `SELECT count(*) FROM table` with nothing else: count leaf cells (like SQLite's OP_Count). */
+  private planCountStar(core: SelectCore, outRegs: number[] | undefined): QueryPlan | null {
+    if (core.kind !== 'select' || core.distinct || core.where || core.groupBy.length || core.having) return null;
+    if (core.columns.length !== 1 || !core.from || core.from.kind !== 'table' || core.from.indexedBy !== undefined) return null;
+    const rc = core.columns[0];
+    if (rc.kind !== 'expr' || rc.expr.kind !== 'call' || rc.expr.name !== 'count' || !rc.expr.star || rc.expr.filter || rc.expr.over) return null;
+    const table = this.env.getTable(core.from.name);
+    if (!table || this.env.getTable(core.from.name) === undefined) return null;
+    const reg = outRegs ? outRegs[0] : this.regs.alloc();
+    const name = rc.alias ?? this.sqlText.slice(rc.expr.pos, rc.expr.end);
+    return {
+      root: new CountRows(this.env.openTree(table.rootPage), table.name, reg),
+      outRegs: [reg],
+      columns: [{ name, type: 'int', collation: Collation.Binary, affinity: 'NONE' }],
+      correlated: false,
+    };
   }
 
   /** Register of the rowid if `e` names the rowid of the single source, else -1. */

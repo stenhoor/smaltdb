@@ -4,9 +4,26 @@
 It stores data in the [Origin Private File System (OPFS)](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system),
 can keep data in an optional in-memory cache for speed, and runs inside Web Workers so the main thread never blocks.
 
-> Status: **M0 (storage foundations) complete**. Pager, buffer pool, B+tree, and key encoding are done, plus a real-browser OPFS test
-> and a benchmark harness against SQLite WASM, PGlite, and DuckDB-WASM. There is no SQL yet; that is M1. See the [roadmap](docs/ROADMAP.md)
-> and the [M0 baseline](docs/research/m0-baseline.md).
+> Status: **M1 (SQL) complete.** This is an early preview, not production-ready: there is no crash-safe WAL until M2.
+> smaltdb runs SQLite-dialect queries, DML, and DDL in a Web Worker on OPFS. It is checked against SQLite with differential tests, and it beats
+> SQLite WASM on every workload in the [M1 benchmark](docs/research/m1-baseline.md). See the [roadmap](docs/ROADMAP.md) and the
+> [supported SQL](docs/SQL_DIALECT.md#7-implementation-status-m1).
+
+## Quick start
+
+```js
+import { open } from 'smaltdb';
+
+const db = await open('app'); // engine runs in a worker, data lives in OPFS
+await db.exec('CREATE TABLE IF NOT EXISTS todo(id INTEGER PRIMARY KEY, title TEXT NOT NULL, done INT DEFAULT 0)');
+await db.exec('INSERT INTO todo(title) VALUES (?)', ['write docs']);
+const rows = await db.query('SELECT id, title FROM todo WHERE done = 0'); // [{ id: 1, title: 'write docs' }]
+const cols = await db.query('SELECT id FROM todo', [], { rowMode: 'columnar' }); // { data: { id: Float64Array } }
+await db.transaction(async (tx) => {
+  await tx.exec('UPDATE todo SET done = 1 WHERE id = ?', [1]);
+});
+await db.close();
+```
 
 ## Goals
 

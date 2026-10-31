@@ -28,9 +28,10 @@ export class TableWriter {
   constructor(
     readonly table: TableSchema,
     pager: Pager,
+    treeFor: (root: number) => BTree = (root) => new BTree(pager, root),
   ) {
-    this.tree = new BTree(pager, table.rootPage);
-    this.indexTrees = table.indexes.map((i) => new BTree(pager, i.rootPage));
+    this.tree = treeFor(table.rootPage);
+    this.indexTrees = table.indexes.map((i) => treeFor(i.rootPage));
     this.enc = new RecordEncoder(table.layout);
     this.reader = new RecordReader(table.layout, table.recordDefaults);
   }
@@ -38,6 +39,11 @@ export class TableWriter {
   private key(rowid: number | bigint): Uint8Array {
     writeRowidKey(this.rowidKey, 0, rowid);
     return this.rowidKey;
+  }
+
+  /** Forget cached state at the start of a statement execution. */
+  resetStatement(): void {
+    this.maxRowid = null;
   }
 
   newRowid(): number | bigint {

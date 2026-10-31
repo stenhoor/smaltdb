@@ -37,4 +37,6 @@ Second-round decisions: [adr/0002-second-round-decisions.md](adr/0002-second-rou
 ## Remaining questions
 
 None open. Q-8 (FK enforcement in v1) and Q-10 (ATTACH post-v1) were confirmed on 2026-10-31 when M0 started.
-New questions will be added as M1 design work raises them.
+New questions will be added as later milestones raise them.
+
+M1 implementation decisions are recorded in [adr/0003-m1-executor-and-transactions.md](adr/0003-m1-executor-and-transactions.md).

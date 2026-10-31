@@ -433,6 +433,32 @@ export class Filter implements Operator {
   }
 }
 
+/** `SELECT count(*) FROM t`: sums per-leaf cell counts instead of visiting rows. */
+export class CountRows implements Operator {
+  readonly children: Operator[] = [];
+  private r!: SqlValue[];
+  private done = false;
+  constructor(
+    readonly tree: BTree,
+    readonly tableName: string,
+    readonly outReg: number,
+  ) {}
+  get detail(): string {
+    return `SCAN ${this.tableName} (count)`;
+  }
+  open(r: SqlValue[]): void {
+    this.r = r;
+    this.done = false;
+  }
+  next(): boolean {
+    if (this.done) return false;
+    this.done = true;
+    this.r[this.outReg] = this.tree.count();
+    return true;
+  }
+  close(): void {}
+}
+
 /** Emits exactly one empty row (SELECT without FROM). */
 export class SingleRow implements Operator {
   readonly children: Operator[] = [];

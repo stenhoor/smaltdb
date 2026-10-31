@@ -1,6 +1,7 @@
 # Query Engine
 
-> Status: draft.
+> Status: M1 implemented. Sections 1–2 describe the pipeline as built. The cost-based optimizer (§3) and vectorized
+> execution (§4) are M3/M7 targets; what M1 actually does is described in §6.
 
 ## 1. Pipeline
 
@@ -66,3 +67,27 @@ or when statistics drift by more than a threshold.
 - `EXPLAIN ANALYZE <stmt>`: the same tree with actual rows, time per operator, pages read, and cache hits.
 - `EXPLAIN QUERY PLAN`: SQLite-compatible summary output.
 - Plans are also available as JSON for tooling.
+
+## 6. What M1 implements
+
+Source: `src/engine/exec/` — `planner.ts`, `operators.ts`, `expr.ts`, `functions.ts`, `write.ts`.
+
+- **Execution:** pull-based iterators (`open` / `next` / `close`) over a shared register file. Expressions compile to closures
+  over registers, with constant folding and a fast path for statically numeric comparisons. Zero allocation per row in scans,
+  filters, and joins. See [ADR 0003](adr/0003-m1-executor-and-transactions.md).
+- **Access paths** (heuristic, chosen per table from conjuncts that reference only that table and earlier ones): rowid
+  equality / `IN` / range; index equality prefix plus a range on the next ASC column, used only when collation and affinity make
+  the index order match the comparison; otherwise a full scan. `x BETWEEN a AND b` is split into two bounds.
+- **Joins**, in FROM order (cost-based ordering comes in M3):
+  - index or rowid nested loop when the inner side can be probed with values from outer rows;
+  - otherwise a hash join on equality conjuncts, built once per execution, with affinity and collation applied to both key sides;
+  - otherwise a nested loop, with uncorrelated derived tables materialized.
+
+  LEFT JOIN is supported for all three.
+- **Predicate placement:** every conjunct is evaluated at the earliest join level where its tables are available. Filters
+  on the inner side of a LEFT JOIN stay in the join condition.
+- **Aggregation:** hash aggregation; GROUP BY expressions, aggregate calls, and bare columns are mapped to registers.
+- **Sorting:** in-memory stable sort with a top-N cap when `LIMIT` is known. `ORDER BY rowid` on a single-table scan uses the
+  table order, scanning in reverse for DESC.
+- **`count(*)` fast path:** summing leaf cell counts, as SQLite's `OP_Count` does.
+- **Subqueries:** uncorrelated ones are evaluated once per execution. Correlated ones re-run per outer row (decorrelation is M4).

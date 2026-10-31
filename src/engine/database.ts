@@ -71,6 +71,8 @@ interface Program {
   exec?: (r: SqlValue[]) => RunResult;
   /** Statement is read-only (no write transaction needed). */
   readonly: boolean;
+  /** Writes at most one row after all checks pass, so it needs no statement journal. */
+  singleRowWrite?: boolean;
   /** Result rows for utility statements (PRAGMA, EXPLAIN) computed at run time. */
   rows?: (r: SqlValue[]) => SqlValue[][];
   columns: string[];
@@ -95,6 +97,7 @@ export class Database implements FunctionContext {
   private total = 0;
   private readonly state: ExecState = { epoch: 0 };
   private readonly cache = new Map<string, Statement>();
+  private readonly trees = new Map<number, BTree>();
   private readonly cacheSize: number;
   /** Open read cursors (a write while one is open would invalidate it). */
   readonly activeCursors = new Set<RowCursor>();
@@ -116,6 +119,16 @@ export class Database implements FunctionContext {
 
   static openFile(file: VfsFile, options: DatabaseOptions = {}): Database {
     return new Database(file, options);
+  }
+
+  /** Shared B+tree handle for a root page (BTree objects hold scratch buffers; reuse them). */
+  tree(root: number): BTree {
+    let t = this.trees.get(root);
+    if (t === undefined) {
+      t = new BTree(this.pager, root);
+      this.trees.set(root, t);
+    }
+    return t;
   }
 
   // ---------------------------------------------------------------- FunctionContext
@@ -255,7 +268,7 @@ export class Database implements FunctionContext {
   }
 
   private catalogWriter(): TableWriter {
-    return new TableWriter(this.catalogTable, this.pager);
+    return new TableWriter(this.catalogTable, this.pager, (root) => this.tree(root));
   }
 
   private addCatalogRow(type: string, name: string, tblName: string, root: number, sql: string | null): void {
@@ -284,7 +297,7 @@ export class Database implements FunctionContext {
     const stmt = ps.stmt;
     const regs = new Registers(ps.paramCount);
     const planner = new Planner(
-      { getTable: (n) => this.getTable(n), openTree: (root) => new BTree(this.pager, root), funcCtx: this, state: this.state },
+      { getTable: (n) => this.getTable(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state },
       regs,
     );
     planner.sqlText = ps.text;
@@ -294,8 +307,10 @@ export class Database implements FunctionContext {
         const plan = planner.planSelect(stmt, null);
         return done({ plan, readonly: true, columns: plan.columns.map((c) => c.name), columnTypes: plan.columns.map((c) => c.type) });
       }
-      case 'insert':
-        return done({ exec: this.compileInsert(stmt, planner), readonly: false, columns: [], columnTypes: [] });
+      case 'insert': {
+        const single = stmt.source.kind === 'values' && stmt.source.rows.length === 1 && (stmt.or ?? 'ABORT') !== 'REPLACE' && this.getTable(stmt.table)?.indexes.length === 0;
+        return done({ exec: this.compileInsert(stmt, planner), readonly: false, singleRowWrite: single, columns: [], columnTypes: [] });
+      }
       case 'update':
         return done({ exec: this.compileUpdate(stmt, planner), readonly: false, columns: [], columnTypes: [] });
       case 'delete':
@@ -360,19 +375,20 @@ export class Database implements FunctionContext {
     this.state.epoch++;
     if (program.readonly) return body();
     const pager = this.pager;
-    pager.beginStatement();
+    // A statement journal is only needed inside an explicit transaction (autocommit failures roll
+    // back the whole transaction) and only for statements that can fail after writing.
+    const journal = !this.autocommit && !program.singleRowWrite;
+    if (journal) pager.beginStatement();
     let result: T;
     try {
       result = body();
     } catch (e) {
-      pager.rollbackStatement();
-      if (this.autocommit) {
-        pager.rollback();
-      }
+      if (journal) pager.rollbackStatement();
+      if (this.autocommit) pager.rollback();
       this.loadSchemaIfChanged();
       throw e;
     }
-    pager.commitStatement();
+    if (journal) pager.commitStatement();
     if (this.autocommit) pager.commit();
     return result;
   }
@@ -668,8 +684,11 @@ export class Database implements FunctionContext {
       };
     }
 
+    let writer: TableWriter | null = null;
     return (r) => {
-      const writer = new TableWriter(table, this.pager);
+      writer ??= new TableWriter(table, this.pager, (root) => this.tree(root));
+      writer.resetStatement();
+      const w = writer;
       let changes = 0;
       let last = this.lastRowid;
       rowsFn(r, (vals, reals) => {
@@ -696,12 +715,12 @@ export class Database implements FunctionContext {
         let rowid: number | bigint;
         if (table.rowidAlias >= 0 && row[table.rowidAlias] !== null) rowid = this.toRowid(row[table.rowidAlias], table);
         else if (explicitRowid !== null) rowid = this.toRowid(explicitRowid, table);
-        else rowid = writer.newRowid();
+        else rowid = w.newRowid();
         if (table.rowidAlias >= 0) row[table.rowidAlias] = rowid;
         r[rowidReg] = rowid;
         if (!this.validateRow(table, row, real, checks, r, base, mode, defaults)) return;
-        if (!writer.resolveConflicts(row, rowid, null, mode)) return;
-        writer.writeRow(row, rowid);
+        if (!w.resolveConflicts(row, rowid, null, mode)) return;
+        w.writeRow(row, rowid);
         changes++;
         last = rowid;
       });
@@ -763,7 +782,7 @@ export class Database implements FunctionContext {
         root.close();
       }
       rowids.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-      const writer = new TableWriter(table, this.pager);
+      const writer = new TableWriter(table, this.pager, (root) => this.tree(root));
       let changes = 0;
       for (const rowid of rowids) {
         const old = writer.readRow(rowid);
@@ -808,7 +827,7 @@ export class Database implements FunctionContext {
     const table = this.targetTable(stmt.table, stmt.schema);
     if (!stmt.where) {
       return () => {
-        const n = new TableWriter(table, this.pager).truncate();
+        const n = new TableWriter(table, this.pager, (root) => this.tree(root)).truncate();
         this.lastChanges = n;
         this.total += n;
         return { changes: n, lastInsertRowid: this.lastRowid };
@@ -823,7 +842,7 @@ export class Database implements FunctionContext {
       } finally {
         root.close();
       }
-      const writer = new TableWriter(table, this.pager);
+      const writer = new TableWriter(table, this.pager, (root) => this.tree(root));
       let changes = 0;
       for (const p of pending) if (writer.deleteRow(p.rowid, p.row)) changes++;
       this.lastChanges = changes;

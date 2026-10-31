@@ -1,4 +1,22 @@
-# Public API (draft)
+# Public API
+
+> Status: the M1 API is implemented in `src/client/index.ts`. Planned extensions are marked *(planned)*.
+
+**Implemented in M1:**
+- `open(name, { storage, pageSize, cacheMB, durable, worker })`
+- `db.query(sql, params?, { rowMode: 'object' | 'array' | 'columnar', batchSize })`
+- `db.exec(sql, params?)`, which returns `{ changes, lastInsertRowid }`. Without params it accepts a multi-statement script.
+- `db.prepare(sql)`, giving `stmt.query(params?, opts)`, `stmt.run(params?)`, and `stmt.finalize()`.
+- `db.transaction(async (tx) => ...)`: COMMIT on success, ROLLBACK on throw; other calls wait until it finishes.
+- `db.close()`.
+- Errors are `SmaltdbError` with a `code`, e.g. `SMALT_CONSTRAINT_UNIQUE`, `SMALT_SYNTAX`, `SMALT_UNSUPPORTED`.
+- Parameters are positional arrays, or objects keyed by name (`{ id: 1 }` matches `:id`, `@id`, `$id`).
+
+The synchronous engine is also available directly (`smaltdb/engine`: `Database.open(vfs, path)`, `db.query/run/exec/prepare`),
+for use inside your own worker or in Node.
+
+*(planned)* `workers`, `multiTab`, streaming iteration (`stmt.stream`), `insertColumns`, `explain`, and import/export helpers.
+The draft below shows the long-term shape.
 
 ```ts
 import { open } from 'smaltdb';

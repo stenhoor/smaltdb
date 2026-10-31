@@ -77,3 +77,40 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
 - `RIGHT`/`FULL OUTER JOIN` are supported.
 - Collations: `BINARY` (default), `NOCASE` (ASCII only), and `RTRIM`. No locale collations in v1.
 - Additions: `CREATE MATERIALIZED VIEW`, `INCLUDE` columns on indexes, `information_schema`, and `WITH (…)` storage options.
+
+## 7. Implementation status (M1)
+
+**Works today** (verified against SQLite with differential tests):
+- `SELECT` with `WHERE`, `[LEFT] JOIN ... ON/USING`, `NATURAL JOIN`, comma joins, `GROUP BY` / `HAVING`, aggregates
+  (`count`, `sum`, `total`, `avg`, `min`, `max`, `group_concat`, `string_agg`, `DISTINCT`, `FILTER`), `DISTINCT`, `ORDER BY`
+  (`ASC`/`DESC`, `NULLS FIRST/LAST`, ordinals, aliases), `LIMIT`/`OFFSET`, `UNION [ALL]` / `INTERSECT` / `EXCEPT`, `VALUES`,
+  derived tables, non-recursive CTEs, scalar / `EXISTS` / `IN` subqueries (correlated or not), and SQLite's bare-column rule for min/max.
+- Expressions: SQLite affinity and collation rules for comparisons, three-valued logic, int64-exact arithmetic with overflow to REAL,
+  `CASE`, `CAST`, `LIKE` / `GLOB` / `ESCAPE`, `IN` lists, `BETWEEN`, `IS [NOT]`, `||`, bitwise operators, and about 45 scalar functions
+  (string, numeric, `printf`/`format`, `typeof`, `quote`, `hex`, `coalesce`/`ifnull`/`iif`/`nullif`, `last_insert_rowid`, `changes`, …).
+- `INSERT` (VALUES, SELECT, DEFAULT VALUES, column lists, `OR IGNORE` / `OR REPLACE`), `UPDATE` (two-pass, SQLite order),
+  `DELETE` (with a truncate fast path).
+- `CREATE` / `DROP TABLE` (`IF [NOT] EXISTS`, `INTEGER PRIMARY KEY` rowid alias, `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`,
+  `CHECK`, `COLLATE`), `CREATE [UNIQUE] INDEX` (multi-column, `ASC`/`DESC`, collations), and `DROP INDEX`.
+- `BEGIN` / `COMMIT` / `ROLLBACK`, with statement-level atomicity inside transactions.
+- `EXPLAIN QUERY PLAN`; `PRAGMA table_info / index_list / index_info / page_size / page_count / freelist_count /
+  schema_version / integrity_check`; `smalt_schema` (also `sqlite_schema` / `sqlite_master`).
+
+**Type mapping (STRICT by default):** declared types map to storage types by SQLite's affinity rules. *INT* → INTEGER;
+*CHAR*/*CLOB*/*TEXT* → TEXT; *BLOB* → BLOB; *REAL*/*FLOA*/*DOUB* → REAL; `ANY` or no type → ANY; anything else
+(NUMERIC, DECIMAL, BOOLEAN, DATE, …) → NUMERIC, meaning ANY with numeric conversion of numeric-looking text. Values are converted
+losslessly as SQLite STRICT tables do (`'5'` into an INTEGER column becomes 5), and anything else is rejected with
+`cannot store TEXT value in INTEGER column t.c`.
+
+**Not yet supported** (each gives a clear `SMALT_UNSUPPORTED` error): `WITH RECURSIVE`, window functions, `RIGHT` / `FULL` joins,
+views and materialized views (M4/M5), `RETURNING`, upsert (`ON CONFLICT ... DO`), `UPDATE ... FROM`, `ALTER TABLE`, expression and
+partial indexes, `INCLUDE` columns, `WITHOUT ROWID`, `LOOSE` tables, generated columns, TEMP tables, savepoints, date/time and JSON
+functions, `ANALYZE`, and `VACUUM`. Foreign keys are parsed and stored but not yet enforced (M4).
+
+**Known deviations:**
+- An integral REAL flowing through an untyped expression reads back as INTEGER, which affects `typeof()` and text conversion
+  (ADR 0003, decision 2).
+- `AUTOINCREMENT` is accepted but behaves like a plain `INTEGER PRIMARY KEY` (the max rowid + 1 can be reused after deleting
+  the largest row).
+- PRIMARY KEY columns are always NOT NULL.
+- `OR FAIL` behaves like `OR ABORT`.

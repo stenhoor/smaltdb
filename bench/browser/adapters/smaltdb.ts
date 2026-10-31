@@ -1,66 +1,66 @@
-import { BTree } from '../../../src/engine/storage/btree.js';
-import { KeyEncoder } from '../../../src/engine/storage/key-codec.js';
-import { Pager } from '../../../src/engine/storage/pager.js';
+import { Database, type Statement } from '../../../src/engine/database.js';
 import { OpfsVfs } from '../../../src/engine/vfs/opfs.js';
 import { type Adapter, valueFor } from '../adapter.js';
 
 /**
- * smaltdb M0: the storage layer only (B+tree keyed by encoded integer, value = UTF-8 text).
- * No SQL layer yet, so these numbers are a lower bound on engine cost, not a like-for-like SQL comparison.
+ * smaltdb through its SQL layer (parser, planner, executor), hosted in the benchmark worker and
+ * called synchronously, exactly like the SQLite adapter. Prepared statements throughout.
  */
 export class SmaltdbAdapter implements Adapter {
-  readonly name = 'smaltdb (M0 storage layer)';
-  readonly config = 'OPFS sync handle, 8 KiB pages, 64 MiB cache, synchronous=full (flush per commit), no WAL yet';
+  readonly name = 'smaltdb (M1, SQL)';
+  readonly config = 'OPFS sync handle, 8 KiB pages, 64 MiB cache, synchronous=full (flush per commit), prepared statements, no WAL yet';
   private vfs = new OpfsVfs({ rootDir: 'smaltdb-bench' });
-  private pager!: Pager;
-  private tree!: BTree;
-  private enc = new KeyEncoder();
-  private te = new TextEncoder();
+  private db!: Database;
+  private insert!: Statement;
 
   async open(): Promise<void> {
     await this.vfs.delete('bench.db');
-    const file = await this.vfs.open('bench.db');
-    this.pager = Pager.open(file, { pageSize: 8192, cacheSizeBytes: 64 * 1024 * 1024 });
-    this.tree = new BTree(this.pager, BTree.create(this.pager));
-    this.pager.commit();
-  }
-
-  private key(k: number): Uint8Array {
-    return this.enc.reset().add(k).finish();
+    this.db = await Database.open(this.vfs, 'bench.db', { pageSize: 8192, cacheSizeBytes: 64 * 1024 * 1024 });
+    this.db.exec('CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)');
+    this.insert = this.db.prepare('INSERT INTO t(k, v) VALUES (?, ?)');
   }
 
   async bulkInsert(n: number): Promise<void> {
-    for (let k = 0; k < n; k++) this.tree.put(this.key(k), this.te.encode(valueFor(k)));
-    this.pager.commit();
+    this.db.exec('BEGIN');
+    const params: [number, string] = [0, ''];
+    for (let k = 0; k < n; k++) {
+      params[0] = k;
+      params[1] = valueFor(k);
+      this.insert.run(params);
+    }
+    this.db.exec('COMMIT');
   }
 
   async pointLookups(keys: Int32Array): Promise<number> {
+    const st = this.db.prepare('SELECT v FROM t WHERE k = ?');
     let found = 0;
-    for (let i = 0; i < keys.length; i++) if (this.tree.get(this.key(keys[i])) !== undefined) found++;
+    const p: [number] = [0];
+    for (let i = 0; i < keys.length; i++) {
+      p[0] = keys[i];
+      const c = st.cursor(p);
+      if (c.next() !== null) found++;
+      c.close();
+    }
     return found;
   }
 
   async scanCount(): Promise<number> {
-    return this.tree.count();
+    return this.db.query('SELECT count(*) FROM t').rows[0][0] as number;
   }
 
   async scanValues(): Promise<number> {
-    const c = this.tree.cursor();
+    const c = this.db.prepare('SELECT v FROM t').cursor();
     let total = 0;
-    for (let ok = c.first(); ok; ok = c.next()) total += c.value().length;
-    c.close();
+    for (let row = c.next(); row !== null; row = c.next()) total += (row[0] as string).length;
     return total;
   }
 
   async smallTxns(start: number, count: number): Promise<void> {
-    for (let i = 0; i < count; i++) {
-      this.tree.put(this.key(start + i), this.te.encode(valueFor(start + i)));
-      this.pager.commit();
-    }
+    for (let i = 0; i < count; i++) this.insert.run([start + i, valueFor(start + i)]);
   }
 
   async close(): Promise<void> {
-    this.pager.close();
+    this.db.close();
     await this.vfs.delete('bench.db');
   }
 }
