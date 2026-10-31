@@ -8,8 +8,8 @@ export class SqliteAdapter implements Adapter {
   private pool: any;
   private version = '';
 
-  constructor(private readonly journalMode: 'DELETE' | 'TRUNCATE' | 'PERSIST' = 'TRUNCATE') {
-    this.name = 'SQLite WASM';
+  constructor(private readonly journalMode: 'DELETE' | 'TRUNCATE' | 'PERSIST' | 'OFF' = 'TRUNCATE') {
+    this.name = journalMode === 'OFF' ? 'SQLite WASM (journal OFF)' : 'SQLite WASM';
     this.config = `opfs-sahpool VFS, locking_mode=EXCLUSIVE, journal_mode=${journalMode}, synchronous=FULL, 64 MiB cache, prepared statements`;
   }
 

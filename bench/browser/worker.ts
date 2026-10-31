@@ -8,6 +8,8 @@ import { SqliteAdapter } from './adapters/sqlite.js';
 const factories: Record<string, () => Adapter> = {
   smaltdb: () => new SmaltdbAdapter(),
   sqlite: () => new SqliteAdapter(),
+  // Like-for-like with smaltdb before M2: no rollback journal, so commits are not crash-atomic either.
+  'sqlite-nojournal': () => new SqliteAdapter('OFF'),
   pglite: () => new PgliteAdapter(),
   duckdb: () => new DuckdbAdapter(),
 };

@@ -1,7 +1,7 @@
 # Roadmap (draft)
 
 **Current:** M0 and M1 are complete. See [research/m0-baseline.md](research/m0-baseline.md) and
-[research/m1-baseline.md](research/m1-baseline.md). smaltdb now beats or matches SQLite WASM on every workload in the suite.
+[research/m1-baseline.md](research/m1-baseline.md). Performance versus SQLite WASM is mixed once measured like-for-like (see the correction in the M1 baseline): smaltdb is slower on small durable commits and on scan-heavy analytical queries.
 Still open: running the browser tests and benchmarks on Firefox and WebKit, which are not installed in the dev container.
 **Next:** M2 (durability: WAL, crash safety, savepoints).
 
