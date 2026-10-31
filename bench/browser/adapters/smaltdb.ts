@@ -1,22 +1,28 @@
 import { Database, type Statement } from '../../../src/engine/database.js';
 import { OpfsVfs } from '../../../src/engine/vfs/opfs.js';
-import { type Adapter, valueFor } from '../adapter.js';
+import { ANALYTIC_DDL, type Adapter, analyticRow, valueFor } from '../adapter.js';
 
-/**
- * smaltdb through its SQL layer (parser, planner, executor), hosted in the benchmark worker and
- * called synchronously, exactly like the SQLite adapter. Prepared statements throughout.
- */
+/** smaltdb through its SQL layer, hosted in the benchmark worker and called synchronously (like SQLite). */
 export class SmaltdbAdapter implements Adapter {
-  readonly name = 'smaltdb (M1, SQL)';
-  readonly config = 'OPFS sync handle, 8 KiB pages, 64 MiB cache, synchronous=full (flush per commit), prepared statements, no WAL yet';
+  readonly name = 'smaltdb';
+  readonly config = 'OPFS sync handle, 8 KiB pages, 64 MiB cache, flush per commit, prepared statements';
+  /** Pre-M2: pages are written in place; becomes true once the WAL lands. */
+  readonly atomicCommits = false;
   private vfs = new OpfsVfs({ rootDir: 'smaltdb-bench' });
   private db!: Database;
   private insert!: Statement;
+  private readonly opts = { pageSize: 8192, cacheSizeBytes: 64 * 1024 * 1024 };
 
   async open(): Promise<void> {
     await this.vfs.delete('bench.db');
-    this.db = await Database.open(this.vfs, 'bench.db', { pageSize: 8192, cacheSizeBytes: 64 * 1024 * 1024 });
+    this.db = await Database.open(this.vfs, 'bench.db', this.opts);
     this.db.exec('CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)');
+    this.insert = this.db.prepare('INSERT INTO t(k, v) VALUES (?, ?)');
+  }
+
+  async reopen(): Promise<void> {
+    this.db.close();
+    this.db = await Database.open(this.vfs, 'bench.db', this.opts);
     this.insert = this.db.prepare('INSERT INTO t(k, v) VALUES (?, ?)');
   }
 
@@ -44,10 +50,6 @@ export class SmaltdbAdapter implements Adapter {
     return found;
   }
 
-  async scanCount(): Promise<number> {
-    return this.db.query('SELECT count(*) FROM t').rows[0][0] as number;
-  }
-
   async scanValues(): Promise<number> {
     const c = this.db.prepare('SELECT v FROM t').cursor();
     let total = 0;
@@ -57,6 +59,18 @@ export class SmaltdbAdapter implements Adapter {
 
   async smallTxns(start: number, count: number): Promise<void> {
     for (let i = 0; i < count; i++) this.insert.run([start + i, valueFor(start + i)]);
+  }
+
+  async loadAnalytic(n: number): Promise<void> {
+    this.db.exec(ANALYTIC_DDL);
+    const st = this.db.prepare('INSERT INTO a VALUES (?, ?, ?, ?, ?)');
+    this.db.exec('BEGIN');
+    for (let i = 1; i <= n; i++) st.run(analyticRow(i));
+    this.db.exec('COMMIT');
+  }
+
+  async query(sql: string): Promise<unknown[][]> {
+    return this.db.query(sql).rows;
   }
 
   async close(): Promise<void> {

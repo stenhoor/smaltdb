@@ -1,16 +1,34 @@
-import { type Adapter, importUrl, valueFor } from '../adapter.js';
+import { ANALYTIC_DDL, type Adapter, analyticRow, importUrl, valueFor } from '../adapter.js';
 
-/** Official SQLite WASM build with the opfs-sahpool VFS (its fastest OPFS option; no COOP/COEP needed). */
+export type SqliteJournal = 'TRUNCATE' | 'WAL' | 'OFF';
+
+/**
+ * Official SQLite WASM build with the opfs-sahpool VFS (its fastest OPFS option; no COOP/COEP needed),
+ * exclusive locking (sahpool is single-connection anyway), synchronous=FULL, prepared statements.
+ */
 export class SqliteAdapter implements Adapter {
   readonly name: string;
   readonly config: string;
+  readonly atomicCommits: boolean;
   private db: any;
   private pool: any;
   private version = '';
 
-  constructor(private readonly journalMode: 'DELETE' | 'TRUNCATE' | 'PERSIST' | 'OFF' = 'TRUNCATE') {
-    this.name = journalMode === 'OFF' ? 'SQLite WASM (journal OFF)' : 'SQLite WASM';
-    this.config = `opfs-sahpool VFS, locking_mode=EXCLUSIVE, journal_mode=${journalMode}, synchronous=FULL, 64 MiB cache, prepared statements`;
+  constructor(private readonly journal: SqliteJournal) {
+    this.name = `SQLite WASM (journal ${journal})`;
+    this.atomicCommits = journal !== 'OFF';
+    this.config = `opfs-sahpool VFS, locking_mode=EXCLUSIVE, journal_mode=${journal}, synchronous=FULL, 64 MiB cache, prepared statements`;
+  }
+
+  get libVersion(): string {
+    return this.version;
+  }
+
+  private openDb(): void {
+    this.db = new this.pool.OpfsSAHPoolDb('/bench.db');
+    this.db.exec(`PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=${this.journal}; PRAGMA synchronous=FULL; PRAGMA cache_size=-65536;`);
+    const mode = String(this.db.selectValue('PRAGMA journal_mode')).toUpperCase();
+    if (mode !== this.journal) throw new Error(`SQLite refused journal_mode=${this.journal} (got ${mode})`);
   }
 
   async open(): Promise<void> {
@@ -18,13 +36,13 @@ export class SqliteAdapter implements Adapter {
     const sqlite3 = await mod.default({ print: () => {}, printErr: () => {} });
     this.version = sqlite3.version.libVersion;
     this.pool = await sqlite3.installOpfsSAHPoolVfs({ name: 'bench-sahpool', directory: '/sqlite-bench', clearOnInit: true });
-    this.db = new this.pool.OpfsSAHPoolDb('/bench.db');
-    this.db.exec(`PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=${this.journalMode}; PRAGMA synchronous=FULL; PRAGMA cache_size=-65536;`);
+    this.openDb();
     this.db.exec('CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)');
   }
 
-  get libVersion(): string {
-    return this.version;
+  async reopen(): Promise<void> {
+    this.db.close();
+    this.openDb();
   }
 
   async bulkInsert(n: number): Promise<void> {
@@ -50,10 +68,6 @@ export class SqliteAdapter implements Adapter {
     return found;
   }
 
-  async scanCount(): Promise<number> {
-    return this.db.selectValue('SELECT count(*) FROM t');
-  }
-
   async scanValues(): Promise<number> {
     const st = this.db.prepare('SELECT v FROM t');
     let total = 0;
@@ -66,6 +80,19 @@ export class SqliteAdapter implements Adapter {
     const st = this.db.prepare('INSERT INTO t(k, v) VALUES (?, ?)');
     for (let i = 0; i < count; i++) st.bind([start + i, valueFor(start + i)]).stepReset(); // autocommit
     st.finalize();
+  }
+
+  async loadAnalytic(n: number): Promise<void> {
+    this.db.exec(ANALYTIC_DDL);
+    const st = this.db.prepare('INSERT INTO a VALUES (?, ?, ?, ?, ?)');
+    this.db.exec('BEGIN');
+    for (let i = 1; i <= n; i++) st.bind(analyticRow(i)).stepReset();
+    this.db.exec('COMMIT');
+    st.finalize();
+  }
+
+  async query(sql: string): Promise<unknown[][]> {
+    return this.db.selectArrays(sql);
   }
 
   async close(): Promise<void> {

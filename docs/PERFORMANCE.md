@@ -40,4 +40,6 @@ These are re-baselined once the M0 harness exists.
 
 ## 4. Prior measurements
 
+- [Benchmark methodology and current results](research/benchmark-methodology.md): the rules every comparison must follow.
+
 - [Result row shape](research/result-shape-benchmark.md): the columnar wire format is 70–90× cheaper than cloning rows.

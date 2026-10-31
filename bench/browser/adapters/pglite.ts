@@ -1,20 +1,22 @@
-import { type Adapter, importUrl, valueFor } from '../adapter.js';
+import { ANALYTIC_DDL, type Adapter, analyticValues, importUrl, valueFor } from '../adapter.js';
 
 /** PGlite (Postgres compiled to WASM), OPFS access-handle-pool storage. */
 export class PgliteAdapter implements Adapter {
   readonly name = 'PGlite';
-  config = 'opfs-ahp storage, parameterized queries, lookups in one read-only txn, multi-row INSERT batches of 1000 for bulk load';
+  readonly atomicCommits = true;
+  config = 'opfs-ahp storage, parameterized queries, lookups in one read-only txn, 1000-row INSERT batches';
   private db: any;
+  private PGlite: any;
 
   async open(): Promise<void> {
-    const { PGlite } = await importUrl('/nm/@electric-sql/pglite/dist/index.js');
-    try {
-      this.db = await PGlite.create('opfs-ahp://pglite-bench');
-    } catch (e) {
-      this.config = `memory storage (opfs-ahp failed: ${(e as Error).message})`;
-      this.db = await PGlite.create();
-    }
-    await this.db.exec('DROP TABLE IF EXISTS t; CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)');
+    this.PGlite = (await importUrl('/nm/@electric-sql/pglite/dist/index.js')).PGlite;
+    this.db = await this.PGlite.create('opfs-ahp://pglite-bench');
+    await this.db.exec('DROP TABLE IF EXISTS t; DROP TABLE IF EXISTS a; CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)');
+  }
+
+  async reopen(): Promise<void> {
+    await this.db.close();
+    this.db = await this.PGlite.create('opfs-ahp://pglite-bench');
   }
 
   async bulkInsert(n: number): Promise<void> {
@@ -28,7 +30,6 @@ export class PgliteAdapter implements Adapter {
   }
 
   async pointLookups(keys: Int32Array): Promise<number> {
-    // One read-only transaction around the batch (autocommit adds ~0.7 ms per query with opfs-ahp).
     let found = 0;
     await this.db.exec('BEGIN READ ONLY');
     for (let i = 0; i < keys.length; i++) {
@@ -37,11 +38,6 @@ export class PgliteAdapter implements Adapter {
     }
     await this.db.exec('COMMIT');
     return found;
-  }
-
-  async scanCount(): Promise<number> {
-    const r = await this.db.query('SELECT count(*)::int AS n FROM t');
-    return r.rows[0].n;
   }
 
   async scanValues(): Promise<number> {
@@ -55,8 +51,22 @@ export class PgliteAdapter implements Adapter {
     for (let i = 0; i < count; i++) await this.db.query('INSERT INTO t(k, v) VALUES ($1, $2)', [start + i, valueFor(start + i)]);
   }
 
+  async loadAnalytic(n: number): Promise<void> {
+    await this.db.exec(ANALYTIC_DDL.replace('c REAL', 'c DOUBLE PRECISION'));
+    await this.db.exec('BEGIN');
+    for (let from = 1; from <= n; from += 1000) await this.db.exec(`INSERT INTO a VALUES ${analyticValues(from, Math.min(n, from + 999))}`);
+    await this.db.exec('COMMIT');
+  }
+
+  async query(sql: string): Promise<unknown[][]> {
+    // Postgres integer division/avg types differ from SQLite; cast to match SQLite's results.
+    const pg = sql.replace('avg(c)', 'avg(c)::float8').replace('avg(c * 1.1)', 'avg(c * 1.1)::float8').replace('sum(b * 2 + d)', 'sum(b * 2 + d)::int8');
+    const r = await this.db.query(pg, [], { rowMode: 'array' });
+    return r.rows;
+  }
+
   async close(): Promise<void> {
-    await this.db.exec('DROP TABLE t');
+    await this.db.exec('DROP TABLE t; DROP TABLE IF EXISTS a');
     await this.db.close();
   }
 }

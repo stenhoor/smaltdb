@@ -7,7 +7,7 @@ can keep data in an optional in-memory cache for speed, and runs inside Web Work
 > Status: **M1 (SQL) complete.** This is an early preview, not production-ready: there is no crash-safe WAL until M2.
 > smaltdb runs SQLite-dialect queries, DML, and DDL in a Web Worker on OPFS, and is checked against SQLite with differential tests.
 > Performance: on par with or faster than SQLite WASM for inserts, point lookups and scans, but slower on small durable commits
-> (like-for-like) and on scan-heavy analytical queries. See [M1 benchmark](docs/research/m1-baseline.md) and its corrections. See the [roadmap](docs/ROADMAP.md) and the
+> (like-for-like) and on scan-heavy analytical queries. See the [benchmark methodology and results](docs/research/benchmark-methodology.md). See the [roadmap](docs/ROADMAP.md) and the
 > [supported SQL](docs/SQL_DIALECT.md#7-implementation-status-m1).
 
 ## Quick start

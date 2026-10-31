@@ -20,7 +20,7 @@
 | `npm run typecheck` | `tsc --noEmit` over `src`, `test`, and `bench` |
 | `npm run test:browser` | Builds, then runs the OPFS storage test and the client API test (main thread → engine worker → OPFS) in a real browser (Playwright). `BROWSERS=chromium,firefox,webkit` picks the browsers |
 | `npm run bench` | Storage micro-benchmarks in Node |
-| `npm run bench:browser [-- --engines smaltdb,sqlite --rows 100000 --save]` | Engine comparison in a browser. `--save` writes `bench/results/<date>-<browser>.json` |
+| `npm run bench:browser [-- --reps 5 --engines smaltdb,sqlite-off,… or all --baseline sqlite-off --save]` | Repeated, like-for-like engine comparison in a browser, with cross-engine result checks (see [research/benchmark-methodology.md](research/benchmark-methodology.md)). `--save` writes `bench/results/<date>-<browser>-<commit>.json` |
 
 What M0 covers:
 - **Key codec:** property tests check that byte order equals a reference model of SQLite value ordering

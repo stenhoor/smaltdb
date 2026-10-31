@@ -11,8 +11,7 @@
 > 4. **Scan-heavy analytical queries are slower than SQLite.** In Node with both engines in memory, smaltdb takes 1.3× as long on
 >    filter+sum and 2.4× as long on expression-heavy aggregation. It is 3.2× faster on GROUP BY. These queries are not yet in this suite.
 >
-> Before quoting performance again, the harness needs repeated runs with medians and spread, like-for-like durability
-> configurations, cold-cache workloads, and analytical queries.
+> **Superseded by [benchmark-methodology.md](benchmark-methodology.md)**, which reports repeated, like-for-like measurements.
 
 - Date: 2026-10-31
 - Environment: Chromium 153 (Playwright, headless), 4-vCPU Xeon @ 2.3 GHz container. Same workload as [M0](m0-baseline.md).

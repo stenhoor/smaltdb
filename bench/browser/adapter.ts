@@ -1,28 +1,59 @@
 /**
- * Common workload interface for engine comparisons. All engines store the same table:
- *   t(k INTEGER PRIMARY KEY, v TEXT)  with v a 32-character string.
- * Every engine runs in its own dedicated worker and persists to OPFS where it supports it.
+ * Common workload interface for engine comparisons. All engines store the same tables:
+ *   t(k INTEGER PRIMARY KEY, v TEXT)                         OLTP-style, v is a 32-character string
+ *   a(id INTEGER PRIMARY KEY, b INT, c REAL, d INT, e TEXT)   analytical
+ * Every engine runs in its own dedicated worker and persists to OPFS.
  */
 export interface Adapter {
   readonly name: string;
   /** Human-readable configuration (VFS, journal mode, durability) reported with results. */
   readonly config: string;
+  /** Whether a commit survives a crash atomically (fairness: compare like with like). */
+  readonly atomicCommits: boolean;
   open(): Promise<void>;
-  /** Insert rows k = 0..n-1 in a single transaction and commit durably. */
+  /** Close and reopen the same database files, so later reads start with a cold engine cache. */
+  reopen(): Promise<void>;
+  /** Insert rows k = 0..n-1 into t in a single transaction and commit durably. */
   bulkInsert(n: number): Promise<void>;
-  /** Look up each key; return how many were found. */
+  /** Look up each key in t; return how many were found. */
   pointLookups(keys: Int32Array): Promise<number>;
-  /** Full scan counting rows. */
-  scanCount(): Promise<number>;
-  /** Full scan reading every value; return the total value length. */
+  /** Full scan of t reading every value; return the total value length. */
   scanValues(): Promise<number>;
-  /** `count` single-row insert transactions (keys start..start+count-1), each committed durably. */
+  /** `count` single-row insert transactions into t (keys start..start+count-1), each committed durably. */
   smallTxns(start: number, count: number): Promise<void>;
+  /** Load the analytical table `a` with n rows (see analyticRow) in one transaction. */
+  loadAnalytic(n: number): Promise<void>;
+  /** Run a read-only query and return its rows as value arrays. */
+  query(sql: string): Promise<unknown[][]>;
   close(): Promise<void>;
 }
 
 export function valueFor(k: number): string {
   return ('value-' + k).padEnd(32, '.');
+}
+
+/** Deterministic analytical row i (1-based): [id, b, c, d, e]. */
+export function analyticRow(i: number): [number, number, number, number, string] {
+  return [i, i % 1000, ((i * 7919) % 1000) + 0.5, i % 100, 'x' + (i % 50)];
+}
+
+export const ANALYTIC_DDL = 'CREATE TABLE a(id INTEGER PRIMARY KEY, b INT, c REAL, d INT, e TEXT)';
+
+/** Analytical queries (results are compared across engines). */
+export const ANALYTIC_QUERIES: Record<string, string> = {
+  'filter + sum': 'SELECT sum(b) FROM a WHERE c > 500',
+  'group by (100 groups)': 'SELECT d, count(*), avg(c), max(b) FROM a GROUP BY d',
+  'arith filter + aggregate': 'SELECT sum(b * 2 + d), avg(c * 1.1) FROM a WHERE b % 7 = 3 AND c < 900',
+};
+
+/** Multi-row VALUES batches for engines without a fast prepared-insert path. */
+export function analyticValues(from: number, to: number): string {
+  const rows: string[] = [];
+  for (let i = from; i <= to; i++) {
+    const [id, b, c, d, e] = analyticRow(i);
+    rows.push(`(${id},${b},${c},${d},'${e}')`);
+  }
+  return rows.join(',');
 }
 
 /** Dynamic import that bundlers leave alone (competitor libraries are served from /nm/). */

@@ -1,28 +1,36 @@
-import { type Adapter, valueFor } from '../adapter.js';
+import { ANALYTIC_DDL, type Adapter, analyticValues, valueFor } from '../adapter.js';
 
 /** DuckDB-WASM (EH build) with an OPFS-backed database file. */
 export class DuckdbAdapter implements Adapter {
   readonly name = 'DuckDB-WASM';
-  config = 'eh build, OPFS database file, prepared statements, multi-row INSERT batches of 1000 for bulk load';
+  readonly atomicCommits = true;
+  config = 'eh build, OPFS database file, prepared statements, 1000-row INSERT batches; reopen unsupported (cold rows are warm)';
   private db: any;
   private conn: any;
   private worker!: Worker;
 
-  async open(): Promise<void> {
+  private async openDb(): Promise<void> {
     // Bundled (its ESM build imports apache-arrow by bare specifier); worker and wasm load from /nm/.
     const duckdb = await import('@duckdb/duckdb-wasm');
     this.worker = new Worker('/nm/@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js');
     this.db = new duckdb.AsyncDuckDB(new duckdb.VoidLogger(), this.worker);
     await this.db.instantiate(new URL('/nm/@duckdb/duckdb-wasm/dist/duckdb-eh.wasm', location.href).href);
-    try {
-      await this.db.open({ path: 'opfs://duckdb-bench.db', accessMode: duckdb.DuckDBAccessMode.READ_WRITE });
-    } catch (e) {
-      this.config = `in-memory (OPFS open failed: ${(e as Error).message})`;
-    }
+    await this.db.open({ path: 'opfs://duckdb-bench.db', accessMode: duckdb.DuckDBAccessMode.READ_WRITE });
     this.conn = await this.db.connect();
+  }
+
+  async open(): Promise<void> {
+    await this.openDb();
     await this.conn.query('DROP TABLE IF EXISTS t');
+    await this.conn.query('DROP TABLE IF EXISTS a');
     await this.conn.query('CREATE TABLE t(k INTEGER PRIMARY KEY, v VARCHAR)');
   }
+
+  /**
+   * Not supported: with duckdb-wasm's OPFS mode, tables written in this session were gone after
+   * terminate + re-open (even after CHECKPOINT). Its "cold" rows are therefore warm-cache numbers.
+   */
+  async reopen(): Promise<void> {}
 
   async bulkInsert(n: number): Promise<void> {
     await this.conn.query('BEGIN TRANSACTION');
@@ -38,17 +46,9 @@ export class DuckdbAdapter implements Adapter {
   async pointLookups(keys: Int32Array): Promise<number> {
     const st = await this.conn.prepare('SELECT v FROM t WHERE k = ?');
     let found = 0;
-    for (let i = 0; i < keys.length; i++) {
-      const r = await st.query(keys[i]);
-      if (r.numRows > 0) found++;
-    }
+    for (let i = 0; i < keys.length; i++) if ((await st.query(keys[i])).numRows > 0) found++;
     await st.close();
     return found;
-  }
-
-  async scanCount(): Promise<number> {
-    const r = await this.conn.query('SELECT count(*)::INTEGER AS n FROM t');
-    return r.getChild('n').get(0);
   }
 
   async scanValues(): Promise<number> {
@@ -65,8 +65,27 @@ export class DuckdbAdapter implements Adapter {
     await st.close();
   }
 
+  async loadAnalytic(n: number): Promise<void> {
+    await this.conn.query(ANALYTIC_DDL.replace('c REAL', 'c DOUBLE'));
+    await this.conn.query('BEGIN TRANSACTION');
+    for (let from = 1; from <= n; from += 1000) await this.conn.query(`INSERT INTO a VALUES ${analyticValues(from, Math.min(n, from + 999))}`);
+    await this.conn.query('COMMIT');
+    await this.conn.query('CHECKPOINT');
+  }
+
+  async query(sql: string): Promise<unknown[][]> {
+    const r = await this.conn.query(sql);
+    const names = r.schema.fields.map((f: { name: string }) => f.name);
+    const out: unknown[][] = [];
+    // HUGEINT results (e.g. sum of INTEGER) arrive as Arrow objects that stringify with quotes.
+    const plain = (v: unknown): unknown => (v !== null && typeof v === 'object' && !(v instanceof Uint8Array) ? Number(String(v).replace(/"/g, '')) : v);
+    for (let i = 0; i < r.numRows; i++) out.push(names.map((n: string) => plain(r.getChild(n).get(i))));
+    return out;
+  }
+
   async close(): Promise<void> {
     await this.conn.query('DROP TABLE t');
+    await this.conn.query('DROP TABLE IF EXISTS a');
     await this.conn.close();
     await this.db.terminate();
     this.worker.terminate();
