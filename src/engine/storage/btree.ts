@@ -20,6 +20,7 @@ import type { Frame, Pager } from './pager.js';
  */
 
 const LEAF_HDR = 7;
+const EMPTY = new Uint8Array(0);
 const INT_HDR = 6;
 const FLAG_OVERFLOW = 1;
 const MAX_DEPTH = 40;
@@ -858,6 +859,45 @@ export class BTreeCursor {
   value(): Uint8Array {
     const f = this.current();
     return this.tree.readValue(f, slot(f, this.idx));
+  }
+
+  /** Zero-copy view of the current value; set by {@link loadValue}. Valid until the cursor moves. */
+  valueBytes: Uint8Array = EMPTY;
+  valueOffset = 0;
+  valueLength = 0;
+  /** Zero-copy view of the current key; set by {@link loadKey}. Valid until the cursor moves. */
+  keyBytes: Uint8Array = EMPTY;
+  keyOffset = 0;
+  keyLength = 0;
+  private overflowBuf: Uint8Array = EMPTY;
+
+  /** Point valueBytes/valueOffset/valueLength at the current value (overflow values are assembled into a private buffer). */
+  loadValue(): void {
+    const f = this.current();
+    const off = slot(f, this.idx);
+    const kl = f.view.getUint16(off, true);
+    const vl = f.view.getUint32(off + 3, true);
+    if (!(f.bytes[off + 2] & FLAG_OVERFLOW)) {
+      this.valueBytes = f.bytes;
+      this.valueOffset = off + LEAF_HDR + kl;
+      this.valueLength = vl;
+      return;
+    }
+    const copy = this.tree.readValue(f, off);
+    if (this.overflowBuf.length < vl) this.overflowBuf = new Uint8Array(Math.max(vl, this.overflowBuf.length * 2));
+    this.overflowBuf.set(copy);
+    this.valueBytes = this.overflowBuf;
+    this.valueOffset = 0;
+    this.valueLength = vl;
+  }
+
+  /** Point keyBytes/keyOffset/keyLength at the current key. */
+  loadKey(): void {
+    const f = this.current();
+    const off = slot(f, this.idx);
+    this.keyBytes = f.bytes;
+    this.keyOffset = off + LEAF_HDR;
+    this.keyLength = f.view.getUint16(off, true);
   }
 
   close(): void {

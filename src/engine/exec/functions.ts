@@ -1,0 +1,734 @@
+import { SmaltError } from '../errors.js';
+import { formatReal } from '../catalog/schema.js';
+import { Collation, type SqlValue, compareValues, normalizeInt } from '../values.js';
+import {
+  type StaticType,
+  asciiLower,
+  asciiUpper,
+  castToInteger,
+  isIntValue,
+  toBlob,
+  toNumeric,
+  toText,
+} from './convert.js';
+
+/** A compiled expression: reads the register file and returns a value. */
+export type Fn = (r: SqlValue[]) => SqlValue;
+
+export interface CompiledArg {
+  fn: Fn;
+  type: StaticType;
+  collation: Collation;
+}
+
+/** Engine state visible to functions such as last_insert_rowid(). */
+export interface FunctionContext {
+  lastInsertRowid(): number | bigint;
+  changes(): number;
+  totalChanges(): number;
+}
+
+export interface ScalarFunction {
+  minArgs: number;
+  /** -1 = variadic */
+  maxArgs: number;
+  /** False for random() etc. (never constant-folded). */
+  deterministic: boolean;
+  compile(args: CompiledArg[], ctx: FunctionContext): { fn: Fn; type: StaticType };
+}
+
+export interface AggregateState {
+  step(args: SqlValue[]): void;
+  final(): SqlValue;
+}
+
+export interface AggregateFunction {
+  minArgs: number;
+  maxArgs: number;
+  resultType(argTypes: StaticType[]): StaticType;
+  create(argTypes: StaticType[], collation: Collation): AggregateState;
+}
+
+const isRealType = (t: StaticType): boolean => t === 'real';
+
+// ------------------------------------------------------------------ helpers
+
+function simple(
+  min: number,
+  max: number,
+  type: StaticType | ((args: CompiledArg[]) => StaticType),
+  impl: (vals: SqlValue[], args: CompiledArg[], ctx: FunctionContext) => SqlValue,
+  deterministic = true,
+): ScalarFunction {
+  return {
+    minArgs: min,
+    maxArgs: max,
+    deterministic,
+    compile(args, ctx) {
+      const t = typeof type === 'function' ? type(args) : type;
+      const n = args.length;
+      if (n === 1) {
+        const a0 = args[0].fn;
+        const buf: SqlValue[] = [null];
+        return { type: t, fn: (r) => ((buf[0] = a0(r)), impl(buf, args, ctx)) };
+      }
+      if (n === 2) {
+        const a0 = args[0].fn;
+        const a1 = args[1].fn;
+        const buf: SqlValue[] = [null, null];
+        return { type: t, fn: (r) => ((buf[0] = a0(r)), (buf[1] = a1(r)), impl(buf, args, ctx)) };
+      }
+      const fns = args.map((a) => a.fn);
+      const buf: SqlValue[] = new Array(n).fill(null);
+      return {
+        type: t,
+        fn: (r) => {
+          for (let i = 0; i < n; i++) buf[i] = fns[i](r);
+          return impl(buf, args, ctx);
+        },
+      };
+    },
+  };
+}
+
+/** Count code points (SQLite measures text length in characters, not UTF-16 units). */
+function charLength(s: string): number {
+  let n = s.length;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      n--;
+      i++;
+    }
+  }
+  return n;
+}
+
+const SURROGATE = /[\uD800-\uDFFF]/;
+
+function toInt(v: SqlValue): number {
+  const n = castToInteger(v);
+  return n === null ? 0 : Number(n);
+}
+
+function substr(x: SqlValue, startV: SqlValue, lenV: SqlValue | undefined): SqlValue {
+  if (x === null || startV === null || lenV === null) return null;
+  let p1 = toInt(startV);
+  let p2: number;
+  let negP2 = false;
+  const isBlob = x instanceof Uint8Array;
+  const chars: string | string[] | Uint8Array = isBlob ? (x as Uint8Array) : typeof x === 'string' ? x : toText(x)!;
+  const useArray = !isBlob && SURROGATE.test(chars as string);
+  const seq: string | string[] | Uint8Array = useArray ? Array.from(chars as string) : chars;
+  const len = seq.length;
+  if (lenV !== undefined) {
+    p2 = toInt(lenV);
+    if (p2 < 0) {
+      p2 = -p2;
+      negP2 = true;
+    }
+  } else {
+    p2 = Number.MAX_SAFE_INTEGER;
+  }
+  if (p1 < 0) {
+    p1 += len;
+    if (p1 < 0) {
+      p2 += p1;
+      if (p2 < 0) p2 = 0;
+      p1 = 0;
+    }
+  } else if (p1 > 0) {
+    p1--;
+  } else if (p2 > 0) {
+    p2--;
+  }
+  if (negP2) {
+    p1 -= p2;
+    if (p1 < 0) {
+      p2 += p1;
+      p1 = 0;
+    }
+  }
+  const end = Math.min(len, p1 + p2);
+  if (p1 >= end) return isBlob ? new Uint8Array(0) : '';
+  if (isBlob) return (seq as Uint8Array).slice(p1, end);
+  if (useArray) return (seq as string[]).slice(p1, end).join('');
+  return (seq as string).slice(p1, end);
+}
+
+function trimImpl(mode: 0 | 1 | 2) {
+  return (v: SqlValue[]): SqlValue => {
+    const x = v[0];
+    if (x === null) return null;
+    const s = toText(x)!;
+    const set = v.length > 1 ? v[1] : ' ';
+    if (set === null) return null;
+    const chars = new Set(Array.from(toText(set)!));
+    const arr = Array.from(s);
+    let a = 0;
+    let b = arr.length;
+    if (mode !== 2) while (a < b && chars.has(arr[a])) a++;
+    if (mode !== 1) while (b > a && chars.has(arr[b - 1])) b--;
+    return arr.slice(a, b).join('');
+  };
+}
+
+function hex(b: Uint8Array): string {
+  let s = '';
+  for (let i = 0; i < b.length; i++) s += (b[i] < 16 ? '0' : '') + b[i].toString(16).toUpperCase();
+  return s;
+}
+
+function quote(v: SqlValue, isReal: boolean): string {
+  if (v === null) return 'NULL';
+  if (typeof v === 'string') return "'" + v.replace(/'/g, "''") + "'";
+  if (v instanceof Uint8Array) return "X'" + hex(v) + "'";
+  return toText(v, isReal)!;
+}
+
+function sqlTypeof(v: SqlValue, t: StaticType): string {
+  if (v === null) return 'null';
+  switch (typeof v) {
+    case 'number':
+      return t === 'real' || !Number.isInteger(v) ? 'real' : 'integer';
+    case 'bigint':
+      return 'integer';
+    case 'string':
+      return 'text';
+    default:
+      return 'blob';
+  }
+}
+
+function round(x: SqlValue, nV: SqlValue): SqlValue {
+  if (x === null) return null;
+  const n = nV === undefined ? 0 : Math.max(0, Math.min(30, nV === null ? 0 : toInt(nV)));
+  if (nV === null) return null;
+  const v = Number(toNumeric(x));
+  if (!Number.isFinite(v)) return v;
+  if (n === 0) {
+    if (Math.abs(v) < 4503599627370496) return v < 0 ? -Math.floor(-v + 0.5) : Math.floor(v + 0.5);
+    return v;
+  }
+  if (Math.abs(v) >= 1e21) return v;
+  return Number(v.toFixed(n));
+}
+
+/** Minimal printf: %d %i %u %f %e %E %g %G %x %X %o %c %s %q %Q %w %%, with flags, width, precision. */
+function printf(args: SqlValue[], types: CompiledArg[]): SqlValue {
+  if (args[0] === null) return null;
+  const fmt = toText(args[0])!;
+  let ai = 1;
+  const next = (): SqlValue => (ai < args.length ? args[ai++] : null);
+  let out = '';
+  for (let i = 0; i < fmt.length; i++) {
+    const c = fmt[i];
+    if (c !== '%') {
+      out += c;
+      continue;
+    }
+    let j = i + 1;
+    let flags = '';
+    while (j < fmt.length && '-+ 0#,!'.includes(fmt[j])) flags += fmt[j++];
+    let width = '';
+    while (j < fmt.length && /\d/.test(fmt[j])) width += fmt[j++];
+    if (fmt[j] === '*') {
+      width = String(toInt(next()));
+      j++;
+    }
+    let precision: number | undefined;
+    if (fmt[j] === '.') {
+      j++;
+      let p = '';
+      if (fmt[j] === '*') {
+        p = String(toInt(next()));
+        j++;
+      } else while (j < fmt.length && /\d/.test(fmt[j])) p += fmt[j++];
+      precision = p === '' ? 0 : Number(p);
+    }
+    while (fmt[j] === 'l' || fmt[j] === 'h') j++;
+    const conv = fmt[j];
+    i = j;
+    let s: string;
+    switch (conv) {
+      case '%':
+        out += '%';
+        continue;
+      case 'd':
+      case 'i':
+      case 'u': {
+        const v = castToInteger(next() ?? 0) ?? 0;
+        s = (typeof v === 'bigint' ? v : BigInt(v)).toString();
+        if (flags.includes(',')) s = s.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+        if (flags.includes('+') && !s.startsWith('-')) s = '+' + s;
+        else if (flags.includes(' ') && !s.startsWith('-')) s = ' ' + s;
+        break;
+      }
+      case 'f':
+      case 'e':
+      case 'E':
+      case 'g':
+      case 'G': {
+        const v = Number(toNumeric(next() ?? 0) ?? 0);
+        const p = precision ?? 6;
+        if (conv === 'f') s = v.toFixed(Math.min(p, 100));
+        else if (conv === 'e' || conv === 'E') s = v.toExponential(Math.min(p, 100)).replace(/e([+-])(\d)$/, 'e$10$2');
+        else {
+          s = v.toPrecision(Math.max(1, Math.min(p || 1, 100)));
+          if (!flags.includes('#') && s.includes('.') && !s.includes('e')) s = s.replace(/\.?0+$/, '');
+          s = s.replace(/e([+-])(\d)$/, 'e$10$2');
+        }
+        if (conv === 'E' || conv === 'G') s = s.toUpperCase();
+        if (flags.includes('+') && v >= 0) s = '+' + s;
+        break;
+      }
+      case 'x':
+      case 'X':
+      case 'o': {
+        const v = castToInteger(next() ?? 0) ?? 0;
+        const big = BigInt.asUintN(64, typeof v === 'bigint' ? v : BigInt(v));
+        s = big.toString(conv === 'o' ? 8 : 16);
+        if (conv === 'X') s = s.toUpperCase();
+        break;
+      }
+      case 'c': {
+        const t = toText(next()) ?? '';
+        s = Array.from(t)[0] ?? '';
+        break;
+      }
+      case 's':
+      case 'z': {
+        const v = next();
+        const ti = ai - 1;
+        s = v === null ? '' : toText(v, isRealType(types[ti]?.type ?? 'any'))!;
+        if (precision !== undefined) s = Array.from(s).slice(0, precision).join('');
+        break;
+      }
+      case 'q':
+      case 'Q':
+      case 'w': {
+        const v = next();
+        if (v === null) s = conv === 'Q' ? 'NULL' : '(NULL)';
+        else {
+          const t = toText(v)!;
+          s = conv === 'w' ? t.replace(/"/g, '""') : t.replace(/'/g, "''");
+          if (conv === 'Q') s = "'" + s + "'";
+        }
+        break;
+      }
+      default:
+        // Unknown conversion: emit verbatim.
+        out += fmt.slice(i - (j - i), j + 1);
+        continue;
+    }
+    const w = width === '' ? 0 : Number(width);
+    if (s.length < w) {
+      if (flags.includes('-')) s = s.padEnd(w);
+      else if (flags.includes('0') && /^[+-]?\d/.test(s)) {
+        const sign = /^[+-]/.test(s) ? s[0] : '';
+        s = sign + s.slice(sign.length).padStart(w - sign.length, '0');
+      } else s = s.padStart(w);
+    }
+    out += s;
+  }
+  return out;
+}
+
+function randomInt64(): number | bigint {
+  const b = new BigInt64Array(1);
+  crypto.getRandomValues(b);
+  return normalizeInt(b[0]);
+}
+
+const firstArgType = (args: CompiledArg[]): StaticType => args[0]?.type ?? 'any';
+
+/** Result type of coalesce-like functions: common type of arguments, else 'any'. */
+function commonType(args: CompiledArg[]): StaticType {
+  let t: StaticType | undefined;
+  for (const a of args) {
+    if (a.type === 'null') continue;
+    if (t === undefined) t = a.type;
+    else if (t !== a.type) {
+      if ((t === 'int' || t === 'real' || t === 'num') && (a.type === 'int' || a.type === 'real' || a.type === 'num')) t = 'num';
+      else return 'any';
+    }
+  }
+  return t ?? 'null';
+}
+
+// ------------------------------------------------------------------ scalar registry
+
+export const scalarFunctions = new Map<string, ScalarFunction>([
+  [
+    'abs',
+    simple(1, 1, firstArgType, ([x]) => {
+      if (x === null) return null;
+      if (typeof x === 'number') return Math.abs(x);
+      if (typeof x === 'bigint') {
+        if (x === -(2n ** 63n)) throw new SmaltError('SMALT_ERROR', 'integer overflow');
+        return x < 0n ? normalizeInt(-x) : x;
+      }
+      const n = toNumeric(x)!;
+      return typeof n === 'bigint' ? (n < 0n ? -n : n) : Math.abs(n);
+    }),
+  ],
+  [
+    'coalesce',
+    {
+      minArgs: 2,
+      maxArgs: -1,
+      deterministic: true,
+      compile(args) {
+        const fns = args.map((a) => a.fn);
+        return {
+          type: commonType(args),
+          fn: (r) => {
+            for (let i = 0; i < fns.length; i++) {
+              const v = fns[i](r);
+              if (v !== null) return v;
+            }
+            return null;
+          },
+        };
+      },
+    },
+  ],
+  [
+    'ifnull',
+    {
+      minArgs: 2,
+      maxArgs: 2,
+      deterministic: true,
+      compile([a, b]) {
+        const fa = a.fn;
+        const fb = b.fn;
+        return { type: commonType([a, b]), fn: (r) => fa(r) ?? fb(r) };
+      },
+    },
+  ],
+  [
+    'iif',
+    {
+      minArgs: 3,
+      maxArgs: 3,
+      deterministic: true,
+      compile([c, a, b]) {
+        const fc = c.fn;
+        const fa = a.fn;
+        const fb = b.fn;
+        return {
+          type: commonType([a, b]),
+          fn: (r) => {
+            const v = fc(r);
+            const t = v === null ? false : typeof v === 'number' ? v !== 0 : Number(toNumeric(v)) !== 0;
+            return t ? fa(r) : fb(r);
+          },
+        };
+      },
+    },
+  ],
+  ['nullif', simple(2, 2, firstArgType, ([a, b], args) => (a !== null && b !== null && compareValues(a, b, args[0].collation) === 0 ? null : a))],
+  [
+    'length',
+    simple(1, 1, 'int', ([x], args) => {
+      if (x === null) return null;
+      if (typeof x === 'string') return charLength(x);
+      if (x instanceof Uint8Array) return x.length;
+      return toText(x, isRealType(args[0].type))!.length;
+    }),
+  ],
+  [
+    'octet_length',
+    simple(1, 1, 'int', ([x], args) => {
+      if (x === null) return null;
+      if (x instanceof Uint8Array) return x.length;
+      return new TextEncoder().encode(toText(x, isRealType(args[0].type))!).length;
+    }),
+  ],
+  ['lower', simple(1, 1, 'text', ([x], args) => (x === null ? null : asciiLower(toText(x, isRealType(args[0].type))!)))],
+  ['upper', simple(1, 1, 'text', ([x], args) => (x === null ? null : asciiUpper(toText(x, isRealType(args[0].type))!)))],
+  ['substr', simple(2, 3, (a) => (a[0].type === 'blob' ? 'blob' : 'text'), (v) => substr(v[0], v[1], v.length > 2 ? v[2] : undefined))],
+  ['substring', simple(2, 3, (a) => (a[0].type === 'blob' ? 'blob' : 'text'), (v) => substr(v[0], v[1], v.length > 2 ? v[2] : undefined))],
+  ['trim', simple(1, 2, 'text', trimImpl(0))],
+  ['ltrim', simple(1, 2, 'text', trimImpl(1))],
+  ['rtrim', simple(1, 2, 'text', trimImpl(2))],
+  [
+    'replace',
+    simple(3, 3, 'text', ([x, y, z], args) => {
+      if (x === null || y === null || z === null) return null;
+      const s = toText(x, isRealType(args[0].type))!;
+      const find = toText(y, isRealType(args[1].type))!;
+      if (find === '') return s;
+      return s.split(find).join(toText(z, isRealType(args[2].type))!);
+    }),
+  ],
+  [
+    'instr',
+    simple(2, 2, 'int', ([x, y]) => {
+      if (x === null || y === null) return null;
+      if (x instanceof Uint8Array || y instanceof Uint8Array) {
+        const a = toBlob(x)!;
+        const b = toBlob(y)!;
+        outer: for (let i = 0; i + b.length <= a.length; i++) {
+          for (let j = 0; j < b.length; j++) if (a[i + j] !== b[j]) continue outer;
+          return i + 1;
+        }
+        return 0;
+      }
+      const s = toText(x)!;
+      const i = s.indexOf(toText(y)!);
+      return i < 0 ? 0 : charLength(s.slice(0, i)) + 1;
+    }),
+  ],
+  ['round', simple(1, 2, 'real', (v) => round(v[0], v.length > 1 ? v[1] : undefined as unknown as SqlValue))],
+  [
+    'typeof',
+    {
+      minArgs: 1,
+      maxArgs: 1,
+      deterministic: true,
+      compile([a]) {
+        const f = a.fn;
+        const t = a.type;
+        return { type: 'text', fn: (r) => sqlTypeof(f(r), t) };
+      },
+    },
+  ],
+  [
+    'hex',
+    simple(1, 1, 'text', ([x], args) => {
+      if (x === null) return '';
+      return hex(toBlob(x, isRealType(args[0].type))!);
+    }),
+  ],
+  ['quote', simple(1, 1, 'text', ([x], args) => quote(x, isRealType(args[0].type)))],
+  [
+    'char',
+    simple(0, -1, 'text', (v) => {
+      let s = '';
+      for (const x of v) if (x !== null) s += String.fromCodePoint(Math.max(0, Math.min(0x10ffff, toInt(x))));
+      return s;
+    }),
+  ],
+  [
+    'unicode',
+    simple(1, 1, 'int', ([x]) => {
+      if (x === null) return null;
+      const s = toText(x)!;
+      return s.length === 0 ? null : s.codePointAt(0)!;
+    }),
+  ],
+  [
+    'min',
+    simple(2, -1, commonType, (v, args) => {
+      let best: SqlValue = v[0];
+      if (best === null) return null;
+      for (let i = 1; i < v.length; i++) {
+        if (v[i] === null) return null;
+        if (compareValues(v[i], best, args[0].collation) < 0) best = v[i];
+      }
+      return best;
+    }),
+  ],
+  [
+    'max',
+    simple(2, -1, commonType, (v, args) => {
+      let best: SqlValue = v[0];
+      if (best === null) return null;
+      for (let i = 1; i < v.length; i++) {
+        if (v[i] === null) return null;
+        if (compareValues(v[i], best, args[0].collation) > 0) best = v[i];
+      }
+      return best;
+    }),
+  ],
+  ['random', simple(0, 0, 'int', () => randomInt64(), false)],
+  [
+    'randomblob',
+    simple(1, 1, 'blob', ([n]) => {
+      const b = new Uint8Array(Math.max(1, toInt(n)));
+      crypto.getRandomValues(b);
+      return b;
+    }, false),
+  ],
+  ['zeroblob', simple(1, 1, 'blob', ([n]) => new Uint8Array(Math.max(0, toInt(n))))],
+  [
+    'sign',
+    simple(1, 1, 'int', ([x]) => {
+      if (x === null) return null;
+      const n = typeof x === 'string' || x instanceof Uint8Array ? null : x;
+      if (n === null) return null;
+      return n > 0 ? 1 : n < 0 ? -1 : 0;
+    }),
+  ],
+  ['likely', simple(1, 1, firstArgType, ([x]) => x)],
+  ['unlikely', simple(1, 1, firstArgType, ([x]) => x)],
+  ['likelihood', simple(2, 2, firstArgType, ([x]) => x)],
+  ['printf', simple(1, -1, 'text', printf)],
+  ['format', simple(1, -1, 'text', printf)],
+  [
+    'concat',
+    simple(1, -1, 'text', (v, args) => {
+      let s = '';
+      for (let i = 0; i < v.length; i++) if (v[i] !== null) s += toText(v[i], isRealType(args[i].type));
+      return s;
+    }),
+  ],
+  [
+    'concat_ws',
+    simple(2, -1, 'text', (v, args) => {
+      if (v[0] === null) return null;
+      const sep = toText(v[0])!;
+      const parts: string[] = [];
+      for (let i = 1; i < v.length; i++) if (v[i] !== null) parts.push(toText(v[i], isRealType(args[i].type))!);
+      return parts.join(sep);
+    }),
+  ],
+  ['last_insert_rowid', simple(0, 0, 'int', (_v, _a, ctx) => ctx.lastInsertRowid(), false)],
+  ['changes', simple(0, 0, 'int', (_v, _a, ctx) => ctx.changes(), false)],
+  ['total_changes', simple(0, 0, 'int', (_v, _a, ctx) => ctx.totalChanges(), false)],
+  ['smaltdb_version', simple(0, 0, 'text', () => '0.1.0')],
+]);
+
+// ------------------------------------------------------------------ aggregates
+
+/** Neumaier-compensated sum with exact integer accumulation (SQLite 3.43+ semantics). */
+class SumState implements AggregateState {
+  private intSum: number | bigint = 0;
+  private isInt = true;
+  private real = 0;
+  private comp = 0;
+  private count = 0;
+  constructor(
+    private readonly mode: 'sum' | 'total' | 'avg',
+    private readonly argReal: boolean,
+  ) {}
+
+  step(args: SqlValue[]): void {
+    let v = args[0];
+    if (v === null) return;
+    if (typeof v === 'string' || v instanceof Uint8Array) v = toNumeric(v)!;
+    this.count++;
+    if (this.isInt && !this.argReal && isIntValue(v)) {
+      const s = this.intSum;
+      if (typeof s === 'number' && typeof v === 'number') {
+        const r = s + v;
+        if (Number.isSafeInteger(r)) {
+          this.intSum = r;
+          return;
+        }
+      }
+      const big = BigInt(s) + BigInt(v as number | bigint);
+      if (big > 2n ** 63n - 1n || big < -(2n ** 63n)) {
+        if (this.mode === 'sum') throw new SmaltError('SMALT_ERROR', 'integer overflow');
+        this.switchToReal();
+        this.addReal(Number(v));
+        return;
+      }
+      this.intSum = normalizeInt(big);
+      return;
+    }
+    if (this.isInt) this.switchToReal();
+    this.addReal(Number(v));
+  }
+
+  private switchToReal(): void {
+    this.isInt = false;
+    this.real = 0;
+    this.comp = 0;
+    this.addReal(Number(this.intSum));
+  }
+
+  private addReal(x: number): void {
+    const t = this.real + x;
+    if (Math.abs(this.real) >= Math.abs(x)) this.comp += this.real - t + x;
+    else this.comp += x - t + this.real;
+    this.real = t;
+  }
+
+  final(): SqlValue {
+    if (this.mode === 'total') return this.isInt ? Number(this.intSum) : this.real + this.comp;
+    if (this.count === 0) return null;
+    if (this.mode === 'avg') return (this.isInt ? Number(this.intSum) : this.real + this.comp) / this.count;
+    return this.isInt ? this.intSum : this.real + this.comp;
+  }
+}
+
+class CountState implements AggregateState {
+  n = 0;
+  constructor(private readonly star: boolean) {}
+  step(args: SqlValue[]): void {
+    if (this.star || args[0] !== null) this.n++;
+  }
+  final(): SqlValue {
+    return this.n;
+  }
+}
+
+class MinMaxState implements AggregateState {
+  private best: SqlValue = null;
+  /** Set when the last step() changed the result (used for bare columns in min/max queries). */
+  changed = false;
+  constructor(
+    private readonly sign: 1 | -1,
+    private readonly collation: Collation,
+  ) {}
+  step(args: SqlValue[]): void {
+    const v = args[0];
+    this.changed = false;
+    if (v === null) return;
+    if (this.best === null || this.sign * compareValues(v, this.best, this.collation) < 0) {
+      this.best = v;
+      this.changed = true;
+    }
+  }
+  final(): SqlValue {
+    return this.best;
+  }
+}
+
+class GroupConcatState implements AggregateState {
+  private parts: string[] | null = null;
+  private seps: string[] = [];
+  constructor(
+    private readonly argReal: boolean,
+    private readonly hasSep: boolean,
+  ) {}
+  step(args: SqlValue[]): void {
+    const v = args[0];
+    if (v === null) return;
+    if (this.parts === null) this.parts = [];
+    else this.seps.push(this.hasSep ? (args[1] === null ? '' : toText(args[1])!) : ',');
+    this.parts.push(toText(v, this.argReal)!);
+  }
+  final(): SqlValue {
+    if (this.parts === null) return null;
+    let s = this.parts[0];
+    for (let i = 1; i < this.parts.length; i++) s += this.seps[i - 1] + this.parts[i];
+    return s;
+  }
+}
+
+export { MinMaxState };
+
+export const aggregateFunctions = new Map<string, AggregateFunction>([
+  ['count', { minArgs: 0, maxArgs: 1, resultType: () => 'int', create: (t) => new CountState(t.length === 0) }],
+  [
+    'sum',
+    {
+      minArgs: 1,
+      maxArgs: 1,
+      resultType: (t) => (t[0] === 'int' ? 'int' : t[0] === 'real' ? 'real' : 'num'),
+      create: (t) => new SumState('sum', t[0] === 'real'),
+    },
+  ],
+  ['total', { minArgs: 1, maxArgs: 1, resultType: () => 'real', create: (t) => new SumState('total', t[0] === 'real') }],
+  ['avg', { minArgs: 1, maxArgs: 1, resultType: () => 'real', create: (t) => new SumState('avg', t[0] === 'real') }],
+  ['min', { minArgs: 1, maxArgs: 1, resultType: (t) => t[0], create: (_t, c) => new MinMaxState(1, c) }],
+  ['max', { minArgs: 1, maxArgs: 1, resultType: (t) => t[0], create: (_t, c) => new MinMaxState(-1, c) }],
+  ['group_concat', { minArgs: 1, maxArgs: 2, resultType: () => 'text', create: (t) => new GroupConcatState(t[0] === 'real', t.length > 1) }],
+  ['string_agg', { minArgs: 2, maxArgs: 2, resultType: () => 'text', create: (t) => new GroupConcatState(t[0] === 'real', true) }],
+]);
+
+/** Format helper re-exported for EXPLAIN and tests. */
+export { formatReal };

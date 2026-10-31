@@ -206,3 +206,47 @@ export function decodeKey(key: Uint8Array, cols?: readonly KeyColumn[]): SqlValu
   }
   return out;
 }
+
+// ------------------------------------------------------------------ rowid keys
+
+/**
+ * Table B+trees are keyed by rowid using a compact 8-byte big-endian int64 with the sign bit
+ * flipped (memcmp order = numeric order). Rowids are always integers, so no type tag is needed.
+ */
+export const ROWID_KEY_SIZE = 8;
+const TWO_32 = 4294967296;
+
+export function writeRowidKey(out: Uint8Array, off: number, rowid: number | bigint): void {
+  let hi: number;
+  let lo: number;
+  if (typeof rowid === 'number') {
+    hi = Math.floor(rowid / TWO_32);
+    lo = rowid - hi * TWO_32;
+  } else {
+    hi = Number(BigInt.asIntN(32, rowid >> 32n));
+    lo = Number(BigInt.asUintN(32, rowid));
+  }
+  hi = (hi ^ 0x80000000) >>> 0;
+  out[off] = hi >>> 24;
+  out[off + 1] = (hi >>> 16) & 0xff;
+  out[off + 2] = (hi >>> 8) & 0xff;
+  out[off + 3] = hi & 0xff;
+  out[off + 4] = lo >>> 24;
+  out[off + 5] = (lo >>> 16) & 0xff;
+  out[off + 6] = (lo >>> 8) & 0xff;
+  out[off + 7] = lo & 0xff;
+}
+
+export function encodeRowidKey(rowid: number | bigint): Uint8Array {
+  const out = new Uint8Array(8);
+  writeRowidKey(out, 0, rowid);
+  return out;
+}
+
+export function readRowidKey(b: Uint8Array, off: number): number | bigint {
+  const hi = (((b[off] << 24) | (b[off + 1] << 16) | (b[off + 2] << 8) | b[off + 3]) ^ 0x80000000) | 0;
+  const lo = ((b[off + 4] << 24) | (b[off + 5] << 16) | (b[off + 6] << 8) | b[off + 7]) >>> 0;
+  if (hi >= -2097152 && hi <= 2097151) return hi * TWO_32 + lo;
+  const big = (BigInt(hi) << 32n) | BigInt(lo);
+  return big >= BigInt(Number.MIN_SAFE_INTEGER) && big <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(big) : big;
+}

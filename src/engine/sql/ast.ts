@@ -9,12 +9,18 @@
  *   case-insensitive (ASCII), as in SQLite.
  * - Keywords/type names/function names are normalized: function names lower-case, type names
  *   upper-case with whitespace collapsed (e.g. `VARCHAR(20)`).
- * - `pos` is the 0-based offset of the node's first character in the source text.
+ * - `pos` is the 0-based offset of the node's first character in the source text; `end` is the
+ *   offset just past its last character.
  */
 import type { SqlValue } from '../values.js';
 
 export interface Node {
   pos: number;
+  /**
+   * Exclusive end offset: just past the node's last token, so `sql.slice(pos, end)` is its source
+   * text. A parenthesized expression's span includes the parentheses (`(a+1)` covers `(a+1)`).
+   */
+  end: number;
 }
 
 // ------------------------------------------------------------------ expressions
@@ -168,6 +174,8 @@ export interface CallExpr extends Node {
   filter?: Expr;
   /** Window function `OVER (...)` or `OVER name`. */
   over?: WindowSpec | string;
+  /** Aggregate argument ordering, e.g. `group_concat(x, ',' ORDER BY y)` (SQLite 3.44+). */
+  orderBy?: OrderingTerm[];
 }
 
 export interface WindowSpec extends Node {
@@ -334,6 +342,9 @@ export interface UpdateStmt extends Node {
   returning?: ResultColumn[];
   orderBy: OrderingTerm[];
   limit?: Expr;
+  offset?: Expr;
+  /** `INDEXED BY name` / `NOT INDEXED` hints. */
+  indexedBy?: string | null;
 }
 
 export interface DeleteStmt extends Node {
@@ -346,6 +357,9 @@ export interface DeleteStmt extends Node {
   returning?: ResultColumn[];
   orderBy: OrderingTerm[];
   limit?: Expr;
+  offset?: Expr;
+  /** `INDEXED BY name` / `NOT INDEXED` hints. */
+  indexedBy?: string | null;
 }
 
 // ------------------------------------------------------------------ DDL
