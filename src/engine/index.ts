@@ -1,0 +1,10 @@
+// Engine internals (M0: storage layer). The public client API arrives in M1.
+export * from './errors.js';
+export type { Vfs, VfsFile, OpenOptions } from './vfs/types.js';
+export { MemoryVfs } from './vfs/memory.js';
+export { OpfsVfs } from './vfs/opfs.js';
+export { detectCapabilities, type Capabilities } from './vfs/capabilities.js';
+export { Pager, Frame, type PagerOptions, type PagerStats } from './storage/pager.js';
+export { BTree, BTreeCursor, type IntegrityReport } from './storage/btree.js';
+export { KeyEncoder, encodeKey, decodeKey, Collation, type KeyColumn, type SqlValue } from './storage/key-codec.js';
+export { crc32c } from './storage/crc32c.js';

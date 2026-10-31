@@ -1,0 +1,27 @@
+{
+  "name": "smaltdb",
+  "version": "0.0.0",
+  "description": "Fast embedded SQL database engine for browsers (OPFS + Web Workers)",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:browser": "node test/browser/run.mjs",
+    "bench": "vitest bench --run",
+    "bench:browser": "node bench/browser/run.mjs",
+    "check": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "esbuild": "^0.28.2",
+    "fast-check": "^4.10.2",
+    "typescript": "5.9",
+    "vitest": "^5.0.5"
+  }
+}
