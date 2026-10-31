@@ -1,7 +1,10 @@
 import { SmaltError } from '../errors.js';
 import type { BTree, BTreeCursor } from '../storage/btree.js';
 import { KeyEncoder, ROWID_KEY_SIZE, decodeKey, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
-import type { RecordReader } from '../storage/record.js';
+import { type RecordReader, decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
+import { type LoaderHelpers, codegenEnabled, generateLoader } from './codegen.js';
+
+const LOADER_HELPERS: LoaderHelpers = { readInt64, utf8: decodeUtf8, tagged: decodeTagged, rowid: readRowidKey };
 import { Collation, type SqlValue, compareValues } from '../values.js';
 import { applyNumericAffinity, hashKey, hashKeyMulti, toNumeric } from './convert.js';
 import { type Fn, isTrue } from './expr.js';
@@ -62,8 +65,35 @@ export class TableAccess {
 
   readonly extraRowidRegs: number[] = [];
 
+  /** Generated decoder (built on first use, once the decode list is final). */
+  private fast: ((c: BTreeCursor, r: SqlValue[]) => boolean) | null | undefined;
+
   /** Load the cursor's current row into registers. */
   load(c: BTreeCursor, r: SqlValue[]): void {
+    let fast = this.fast;
+    if (fast === undefined) fast = this.fast = this.buildLoader();
+    if (fast !== null && fast(c, r)) return;
+    this.loadGeneric(c, r);
+  }
+
+  private buildLoader(): ((c: BTreeCursor, r: SqlValue[]) => boolean) | null {
+    if (!codegenEnabled()) return null;
+    const layout = this.reader.layout;
+    return generateLoader(
+      {
+        types: layout.types,
+        slots: layout.full.slot,
+        fixedSize: layout.full.fixedSize,
+        varCount: layout.full.varCount,
+        decode: this.decode,
+        rowidRegs: this.rowidReg >= 0 ? [this.rowidReg, ...this.extraRowidRegs] : [],
+      },
+      LOADER_HELPERS,
+    ) as unknown as (c: BTreeCursor, r: SqlValue[]) => boolean;
+  }
+
+  /** Generic decoder (always correct; used for overflow values, short records, and without codegen). */
+  loadGeneric(c: BTreeCursor, r: SqlValue[]): void {
     const d = this.decode;
     if (d.length > 0) {
       c.loadValue();

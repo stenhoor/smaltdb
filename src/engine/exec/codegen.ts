@@ -234,3 +234,92 @@ export function generate(
   }
   return { fn: factory(helpers, em.consts, truthy), type: g.type, source: body };
 }
+
+// ------------------------------------------------------------------ row decoders
+
+export interface LoaderSpec {
+  /** Storage type per table column. */
+  types: readonly string[];
+  /** Per column: offset within the fixed area (INTEGER/REAL) or index into the var table. */
+  slots: Int32Array;
+  fixedSize: number;
+  varCount: number;
+  /** [column, register] pairs to decode. */
+  decode: readonly number[];
+  /** Register(s) receiving the rowid, if any. */
+  rowidRegs: readonly number[];
+}
+
+export interface LoaderHelpers {
+  readInt64: (dv: DataView, off: number) => number | bigint;
+  utf8: (b: Uint8Array, start: number, end: number) => string;
+  tagged: (b: Uint8Array, dv: DataView, start: number, end: number) => SqlValue;
+  rowid: (b: Uint8Array, off: number) => number | bigint;
+}
+
+/** Cursor surface used by generated decoders. */
+export interface LoaderCursor {
+  readonly page: { readonly bytes: Uint8Array; readonly view: DataView };
+  cellOffset(): number;
+}
+
+type Loader = (c: LoaderCursor, r: SqlValue[]) => boolean;
+const loaderFactories = new Map<string, (H: LoaderHelpers) => Loader>();
+
+/**
+ * Generate a row decoder that reads directly from the leaf page bytes, with column offsets and
+ * types baked in. Returns false (caller uses the generic reader) for cells whose value is in
+ * overflow pages or whose record has a different column count (older rows after ADD COLUMN).
+ */
+export function generateLoader(spec: LoaderSpec, helpers: LoaderHelpers): Loader {
+  const n = spec.types.length;
+  const bitmap = (n + 7) >>> 3;
+  const L: string[] = [];
+  L.push('const p = c.page; const b = p.bytes; const dv = p.view; const off = c.cellOffset();');
+  L.push('if (b[off + 2] & 1) return false;'); // overflow value
+  L.push('const kl = b[off] | (b[off + 1] << 8); const vo = off + 7 + kl;');
+  if (spec.decode.length > 0) {
+    L.push(`if ((b[vo + 1] | (b[vo + 2] << 8)) !== ${n}) return false;`);
+    L.push(`const bm = vo + 3; const fx = bm + ${bitmap}; const vt = fx + ${spec.fixedSize};`);
+    const needsVar = spec.decode.some((_, i) => i % 2 === 0 && !(spec.types[spec.decode[i]] === 'INTEGER' || spec.types[spec.decode[i]] === 'REAL'));
+    if (needsVar) L.push(`const wide = (b[vo] & 1) === 1; const vd = vt + ${spec.varCount} * (wide ? 4 : 2);`);
+    for (let i = 0; i < spec.decode.length; i += 2) {
+      const col = spec.decode[i];
+      const reg = spec.decode[i + 1];
+      const t = spec.types[col];
+      const s = spec.slots[col];
+      const isNull = `(b[bm + ${col >>> 3}] & ${1 << (col & 7)}) !== 0`;
+      let value: string;
+      if (t === 'INTEGER') {
+        const o = `fx + ${s}`;
+        value =
+          // Values that fit in int32 are produced as int32 so V8 keeps them as small integers (fast % and /).
+          `{ const o = ${o}; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24);` +
+          ` r[${reg}] = (hi === 0 && lo >= 0) || (hi === -1 && lo < 0) ? lo : (hi >= -2097152 && hi <= 2097151) ? hi * 4294967296 + (lo >>> 0) : H.readInt64(dv, o); }`;
+      } else if (t === 'REAL') {
+        value = `r[${reg}] = dv.getFloat64(fx + ${s}, true);`;
+      } else {
+        const end = (j: number): string => `(wide ? dv.getUint32(vt + ${4 * j}, true) : (b[vt + ${2 * j}] | (b[vt + ${2 * j + 1}] << 8)))`;
+        const start = s === 0 ? 'vd' : `vd + ${end(s - 1)}`;
+        const fin = `vd + ${end(s)}`;
+        if (t === 'TEXT') value = `r[${reg}] = H.utf8(b, ${start}, ${fin});`;
+        else if (t === 'BLOB') value = `r[${reg}] = b.slice(${start}, ${fin});`;
+        else value = `r[${reg}] = H.tagged(b, dv, ${start}, ${fin});`;
+      }
+      L.push(`if (${isNull}) r[${reg}] = null; else ${value}`);
+    }
+  }
+  if (spec.rowidRegs.length > 0) {
+    L.push('const id = H.rowid(b, off + 7);');
+    for (const reg of spec.rowidRegs) L.push(`r[${reg}] = id;`);
+  }
+  L.push('return true;');
+  const body = L.join('\n');
+  let factory = loaderFactories.get(body);
+  if (factory === undefined) {
+    factory = new Function('H', `"use strict"; return function smaltLoad(c, r) {\n${body}\n};`) as (H: LoaderHelpers) => Loader;
+    if (loaderFactories.size > 500) loaderFactories.clear();
+    loaderFactories.set(body, factory);
+  }
+  return factory(helpers);
+}

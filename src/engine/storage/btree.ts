@@ -931,6 +931,16 @@ export class BTreeCursor {
     }
   }
 
+  /** @internal Current leaf frame (for generated row decoders). Valid until the cursor moves. */
+  get page(): Frame {
+    return this.current();
+  }
+
+  /** @internal Byte offset of the current cell within {@link page}. */
+  cellOffset(): number {
+    return slot(this.current(), this.idx);
+  }
+
   private current(): Frame {
     if (this.frame === null) throw new MisuseError('cursor is not positioned');
     return this.frame;

@@ -175,7 +175,7 @@ function writeInt64(dv: DataView, off: number, v: number | bigint): void {
   }
 }
 
-function readInt64(dv: DataView, off: number): number | bigint {
+export function readInt64(dv: DataView, off: number): number | bigint {
   const lo = dv.getUint32(off, true);
   const hi = dv.getInt32(off + 4, true);
   if (hi >= HI_SAFE_MIN && hi <= HI_SAFE_MAX) return hi * TWO_32 + lo;
@@ -206,6 +206,22 @@ function writeTagged(b: Uint8Array, dv: DataView, pos: number, v: SqlValue): num
       b.set(blob, pos + 1);
       return pos + 1 + blob.length;
     }
+  }
+}
+
+/** Decode an ANY/NUMERIC (tagged) value stored in [start, end). */
+export function decodeTagged(b: Uint8Array, dv: DataView, start: number, end: number): SqlValue {
+  switch (b[start]) {
+    case TAG_INT:
+      return readInt64(dv, start + 1);
+    case TAG_REAL:
+      return dv.getFloat64(start + 1, true);
+    case TAG_TEXT:
+      return decodeUtf8(b, start + 1, end);
+    case TAG_BLOB:
+      return b.slice(start + 1, end);
+    default:
+      throw new CorruptionError(`invalid value tag ${b[start]}`);
   }
 }
 
