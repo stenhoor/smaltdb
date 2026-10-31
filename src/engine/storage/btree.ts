@@ -217,6 +217,30 @@ export class BTree {
     this.freeSubtree(this.root);
   }
 
+  /** Remove all entries, keeping the (now empty) root page. */
+  clear(): void {
+    const pager = this.pager;
+    const f = pager.get(this.root);
+    const children: number[] = [];
+    try {
+      pager.markDirty(f);
+      if (isLeaf(f)) {
+        const n = nCells(f);
+        const offs: number[] = [];
+        for (let i = 0; i < n; i++) offs.push(slot(f, i));
+        for (const off of offs) this.freeCellOverflow(f, off);
+      } else {
+        const n = nCells(f);
+        for (let i = 0; i < n; i++) children.push(f.view.getUint32(slot(f, i), true));
+        children.push(rightPtr(f));
+      }
+      initPage(f, PageType.BTreeLeaf, this.usable);
+    } finally {
+      pager.release(f);
+    }
+    for (const c of children) this.freeSubtree(c);
+  }
+
   /**
    * Verify structural invariants: key order within and across pages, separator bounds, uniform
    * leaf depth, sibling links, and overflow chain lengths. Throws CorruptionError on violation.

@@ -46,6 +46,8 @@ export interface ColumnBinding {
   type: StaticType;
   collation: Collation;
   affinity: Affinity;
+  /** The name resolved to a select-list alias: use this compiled expression instead of a register. */
+  compiled?: Compiled;
 }
 
 /** Name resolution and planner callbacks used while compiling expressions. */
@@ -108,6 +110,7 @@ export function compileExpr(e: Expr, scope: CompileScope): Compiled {
     }
     case 'column': {
       const b = scope.resolveColumn(e);
+      if (b.compiled) return b.compiled;
       return {
         fn: regReader(b.reg),
         type: b.type,
