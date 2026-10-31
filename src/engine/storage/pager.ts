@@ -38,6 +38,8 @@ export class Frame {
   pins = 0;
   dirty = false;
   ref = false;
+  /** Prefetched by read-ahead; checksum not yet verified. */
+  unverified = false;
   readonly view: DataView;
   constructor(
     readonly index: number,
@@ -58,6 +60,11 @@ export interface PagerOptions {
   syncOnCommit?: boolean;
   /** Checkpoint automatically once the WAL holds this many bytes (default 4 MiB). */
   walAutoCheckpointBytes?: number;
+  /**
+   * On a cache miss, read the aligned extent of this many bytes around the page in one call
+   * (default 64 KiB; 0 disables). OPFS read calls have a high fixed cost, so neighbours are almost free.
+   */
+  readAheadBytes?: number;
 }
 
 export interface PagerStats {
@@ -68,6 +75,8 @@ export interface PagerStats {
   evictions: number;
   /** Frames allocated beyond the configured budget (no-steal overflow). */
   overflowFrames: number;
+  /** Pages loaded by read-ahead. */
+  prefetched: number;
 }
 
 /** Upper bound on a single coalesced write during commit (no-WAL mode). */
@@ -97,7 +106,7 @@ export class Pager {
   readonly pageSize: number;
   /** Bytes per page available to page formats (page size minus reserved trailer). */
   readonly usableSize: number;
-  readonly stats: PagerStats = { hits: 0, misses: 0, reads: 0, writes: 0, evictions: 0, overflowFrames: 0 };
+  readonly stats: PagerStats = { hits: 0, misses: 0, reads: 0, writes: 0, evictions: 0, overflowFrames: 0, prefetched: 0 };
 
   private readonly frames: Frame[] = [];
   private readonly map = new Map<number, Frame>();
@@ -114,6 +123,8 @@ export class Pager {
   private headerDirty = false;
   private closed = false;
   private readonly autoCheckpoint: number;
+  private readonly extentPages: number;
+  private extentBuf: Uint8Array | null = null;
 
   private constructor(
     private readonly file: VfsFile,
@@ -131,6 +142,7 @@ export class Pager {
     this.verify = options.verifyChecksums ?? true;
     this.syncOnCommit = options.syncOnCommit ?? true;
     this.autoCheckpoint = options.walAutoCheckpointBytes ?? 4 * 1024 * 1024;
+    this.extentPages = Math.max(1, Math.floor((options.readAheadBytes ?? 64 * 1024) / pageSize));
     const budget = options.cacheSizeBytes ?? 16 * 1024 * 1024;
     this.targetFrames = Math.max(16, Math.floor(budget / pageSize));
     const arena = new Uint8Array(this.targetFrames * pageSize);
@@ -250,12 +262,27 @@ export class Pager {
       cached.pins++;
       cached.ref = true;
       this.stats.hits++;
+      if (cached.unverified) {
+        cached.unverified = false;
+        if (this.verify) {
+          try {
+            checkChecksum(cached.bytes, pgno);
+          } catch (e) {
+            cached.pins--;
+            this.discard(cached);
+            throw e;
+          }
+        }
+      }
       return cached;
     }
     if (pgno <= 0 || pgno >= this.pageCount) throw new CorruptionError(`page ${pgno} out of range (pageCount=${this.pageCount})`);
     this.stats.misses++;
     const f = this.takeFrame(pgno);
-    const n = this.wal !== null && this.wal.read(pgno, f.bytes) ? this.pageSize : this.file.read(f.bytes, pgno * this.pageSize);
+    let n: number;
+    if (this.wal !== null && this.wal.read(pgno, f.bytes)) n = this.pageSize;
+    else if (this.extentPages > 1) n = this.readExtent(pgno, f);
+    else n = this.file.read(f.bytes, pgno * this.pageSize);
     this.stats.reads++;
     if (n < this.pageSize) {
       f.bytes.fill(0, n);
@@ -263,6 +290,35 @@ export class Pager {
       checkChecksum(f.bytes, pgno);
     }
     return f;
+  }
+
+  /**
+   * Read the aligned extent containing `pgno` with one call. The requested page goes into `f`;
+   * neighbours that are not cached (and not newer in the WAL) become low-priority cache entries,
+   * verified lazily on first use. Returns the bytes available for the requested page.
+   */
+  private readExtent(pgno: number, f: Frame): number {
+    const ps = this.pageSize;
+    const e = this.extentPages;
+    const start = pgno - (pgno % e);
+    const count = Math.min(e, this.pageCount - start);
+    if (this.extentBuf === null) this.extentBuf = new Uint8Array(e * ps);
+    const buf = this.extentBuf;
+    const got = this.file.read(buf.subarray(0, count * ps), start * ps);
+    const off = (pgno - start) * ps;
+    const n = Math.max(0, Math.min(ps, got - off));
+    if (n > 0) f.bytes.set(buf.subarray(off, off + n));
+    for (let q = start; q < start + count; q++) {
+      if (q === pgno || q === 0 || (q + 1) * ps > got || this.map.has(q)) continue;
+      if (this.wal !== null && this.wal.has(q)) continue;
+      const g = this.takeFrame(q);
+      g.bytes.set(buf.subarray((q - start) * ps, (q - start + 1) * ps));
+      g.unverified = true;
+      g.ref = false; // first candidates for eviction until actually used
+      g.pins = 0;
+      this.stats.prefetched++;
+    }
+    return n;
   }
 
   release(f: Frame): void {
@@ -279,6 +335,7 @@ export class Pager {
     if (sp !== undefined && f.pgno < sp.pageCount && !sp.images.has(f.pgno) && !sp.fresh.has(f.pgno)) {
       sp.images.set(f.pgno, f.bytes.slice());
     }
+    f.unverified = false; // contents of a dirty frame are authoritative
     if (!f.dirty) {
       f.dirty = true;
       this.dirtyList.push(f);
@@ -286,6 +343,7 @@ export class Pager {
   }
 
   private markDirtyNoCapture(f: Frame): void {
+    f.unverified = false;
     if (!f.dirty) {
       f.dirty = true;
       this.dirtyList.push(f);
@@ -417,6 +475,7 @@ export class Pager {
     // a statement rollback drops this frame instead of writing it.
     const sp = this.top;
     if (sp !== undefined && pgno < sp.pageCount && !sp.images.has(pgno)) sp.fresh.add(pgno);
+    f.unverified = false;
     f.bytes.fill(0);
     this.markDirtyNoCapture(f);
     return f;
@@ -459,6 +518,7 @@ export class Pager {
       t = this.takeFrame(pgno);
     }
     this.captureForStatement(t);
+    t.unverified = false;
     t.bytes.fill(0);
     t.bytes[0] = PageType.FreelistTrunk;
     t.view.setUint32(PH_RIGHT, head, true);
@@ -628,6 +688,7 @@ export class Pager {
     f.dirty = false;
     f.pgno = -1;
     f.ref = false;
+    f.unverified = false;
   }
 
   /** Release frames allocated beyond the budget once they are no longer pinned or dirty. */
@@ -674,6 +735,7 @@ export class Pager {
     victim.pgno = pgno;
     victim.pins = 1;
     victim.ref = true;
+    victim.unverified = false;
     this.map.set(pgno, victim);
     return victim;
   }

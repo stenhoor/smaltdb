@@ -129,3 +129,34 @@ describe('Pager', () => {
     expect(vfs.stats.flushes).toBe(before);
   });
 });
+
+describe('Pager read-ahead', () => {
+  it('prefetches neighbouring pages and still verifies them on first use', () => {
+    const vfs = new MemoryVfs();
+    const { pager } = openMemoryPager({ pageSize: 1024 }, vfs);
+    const pages: number[] = [];
+    for (let i = 0; i < 64; i++) {
+      const f = pager.allocate();
+      f.bytes[10] = i;
+      pages.push(f.pgno);
+      pager.release(f);
+    }
+    pager.commit();
+    pager.close();
+    // Corrupt one page that will be prefetched as a neighbour of page 9.
+    const raw = vfs.openSync('test.db');
+    raw.write(new Uint8Array([0x99]), 12 * 1024 + 500);
+    const p2 = Pager.open(raw, { readAheadBytes: 16 * 1024 });
+    const a = p2.get(9);
+    expect(a.bytes[10]).toBe(8);
+    p2.release(a);
+    expect(p2.stats.prefetched).toBeGreaterThan(0);
+    const readsBefore = p2.stats.reads;
+    const b = p2.get(10); // served from the prefetched extent
+    expect(b.bytes[10]).toBe(9);
+    p2.release(b);
+    expect(p2.stats.reads).toBe(readsBefore);
+    expect(() => p2.get(12)).toThrow(CorruptionError);
+    expect(p2.pinnedCount()).toBe(0);
+  });
+});
