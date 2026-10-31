@@ -1,6 +1,6 @@
-node_modules/
-dist/
-.cache/
-coverage/
 *.log
+.cache/
 bench/results/*.local.json
+coverage/
+dist/
+node_modules/

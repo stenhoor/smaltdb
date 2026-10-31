@@ -10,6 +10,9 @@ const playwright = loadPlaywright();
 const out = '.cache/browser-test';
 mkdirSync(out, { recursive: true });
 await build({ entryPoints: ['test/browser/opfs-worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/opfs-worker.js`, logLevel: 'warning' });
+await build({ entryPoints: ['test/browser/client-test.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/client-test.js`, logLevel: 'warning' });
+await build({ entryPoints: ['src/engine/worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/smaltdb-worker.js`, logLevel: 'warning' });
+writeFileSync(`${out}/client.html`, '<!doctype html><meta charset="utf-8"><title>smaltdb client test</title><script type="module" src="./client-test.js"></script>');
 writeFileSync(
   `${out}/index.html`,
   `<!doctype html><meta charset="utf-8"><title>smaltdb browser test</title><script type="module">
@@ -28,6 +31,16 @@ for (const name of names) {
   await page.goto(server.url + '/');
   await page.waitForFunction(() => window.__result !== undefined, null, { timeout: 120_000 });
   const result = await page.evaluate(() => window.__result);
+  // Client API test (main thread -> engine worker -> OPFS).
+  await page.goto(server.url + '/client.html');
+  await page.waitForFunction(() => window.__clientResult !== undefined, null, { timeout: 120_000 });
+  const client = await page.evaluate(() => window.__clientResult);
+  if (client.ok) {
+    result.checks?.push(...client.checks.map((c) => ({ ...c, name: 'client: ' + c.name })));
+    Object.assign(result.timings ?? {}, Object.fromEntries(Object.entries(client.timings).map(([k, v]) => ['client.' + k, v])));
+  } else if (result.ok) {
+    result.checks.push({ name: 'client test ran', ok: false, detail: client.error });
+  }
   const version = browser.version();
   await browser.close();
   console.log(`\n== ${name} ${version}`);

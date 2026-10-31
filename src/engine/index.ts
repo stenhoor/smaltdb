@@ -8,3 +8,5 @@ export { Pager, Frame, type PagerOptions, type PagerStats } from './storage/page
 export { BTree, BTreeCursor, type IntegrityReport } from './storage/btree.js';
 export { KeyEncoder, encodeKey, decodeKey, Collation, type KeyColumn, type SqlValue } from './storage/key-codec.js';
 export { crc32c } from './storage/crc32c.js';
+export { Database, Statement, RowCursor, type RunResult, type QueryResult, type BindParams, type DatabaseOptions } from './database.js';
+export { parse, parseOne, SqlSyntaxError } from './sql/parser.js';

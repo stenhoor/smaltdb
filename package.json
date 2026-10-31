@@ -12,10 +12,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:browser": "node test/browser/run.mjs",
+    "test:browser": "node scripts/build.mjs && node test/browser/run.mjs",
     "bench": "node bench/run-node.mjs",
     "bench:browser": "node bench/browser/run.mjs",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm test",
+    "build": "node scripts/build.mjs"
   },
   "devDependencies": {
     "@duckdb/duckdb-wasm": "^1.33.1-dev57.0",
@@ -26,5 +27,16 @@
     "fast-check": "^4.10.2",
     "typescript": "5.9",
     "vitest": "^5.0.5"
-  }
+  },
+  "exports": {
+    ".": "./dist/smaltdb.js",
+    "./engine": "./dist/engine.js",
+    "./worker": "./dist/smaltdb-worker.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "LICENSE",
+    "README.md"
+  ]
 }
