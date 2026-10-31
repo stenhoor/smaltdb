@@ -8,10 +8,13 @@ const db = await open('app', {
   cache: { mode: 'lru', sizeMB: 64 },   // or { mode: 'full' } = memory-cached
   workers: 'auto',          // number of reader workers; requires crossOriginIsolated
   multiTab: true,
+  // worker: new URL('./my-worker.js', import.meta.url)  // optional override; default auto-spawns
 });
 
-// One-shot
+// One-shot. The default returns an array of objects: [{ id, name }, ...]
 const rows = await db.query('SELECT id, name FROM users WHERE age > ?', [30]);
+const tuples = await db.query(sql, params, { rowMode: 'array' });     // [[id, name], ...] + .columns
+const cols   = await db.query(sql, params, { rowMode: 'columnar' });  // { id: Float64Array, name: string[] }
 
 // Prepared + streaming
 const stmt = await db.prepare('SELECT * FROM events WHERE ts BETWEEN :from AND :to');
@@ -35,7 +38,10 @@ await db.explain('SELECT ...', { analyze: true });
 await db.close();
 ```
 
-Open design points: result row shape (objects vs. arrays vs. columnar) and bigint handling.
+Result shape (ADR 0002): the engine always sends columnar batches with transferred buffers. Rows are built on the
+client by a generated, monomorphic factory for each result shape. See [research/result-shape-benchmark.md](research/result-shape-benchmark.md).
+
+Open design point: bigint handling (safe-range integers as `number` by default; `bigint: 'always' | 'auto' | 'never'`).
 Post-v1: UDF registration, live queries / change notifications, and framework bindings.
 
 Import/export (v1): `db.importCSV(table, source, opts)`, `db.importJSON(...)` (array or NDJSON stream),

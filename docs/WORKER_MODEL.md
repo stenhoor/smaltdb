@@ -33,6 +33,12 @@
   where available (it just passes ports along), with `BroadcastChannel` as the fallback.
 - **Single-tab mode**: if only one tab is ever expected, the election step is skipped.
 
+### Capability detection
+
+At startup the engine records a capability set: `syncAccessHandle`, `readwriteUnsafe`, `crossOriginIsolated`,
+`webLocks`, `sharedWorker`, and `cspEval`. The minimum supported browsers are Chrome 108, Firefox 111, and Safari 17,
+and they need only the baseline. Faster paths for newer browsers plug in behind these flags (ADR 0002).
+
 ## 3. Concurrency inside the engine
 
 | Mode | Requirements | Behaviour |
@@ -45,7 +51,7 @@
 - **Snapshot isolation** for readers via the WAL (each reader pins a WAL frame mark).
 - **Single writer** at a time. `BEGIN IMMEDIATE` acquires the write lock; `DEFERRED` upgrades it on the first write.
   Write-write conflicts cannot happen, so there is no write-skew beyond what SI normally allows.
-  Serializable mode could come later **[Q-14]**.
+  Serializable isolation is out of scope (ADR 0002).
 - Long-running readers can block checkpointing past their snapshot. The engine reports this through `PRAGMA wal_status`.
 
 ## 5. Messaging protocol

@@ -38,6 +38,7 @@ can keep data in an optional in-memory cache for speed, and runs inside Web Work
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Milestones |
 | [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md) | Decisions that still need input |
 | [docs/adr/](docs/adr/) | Architecture Decision Records |
+| [docs/research/](docs/research/) | Benchmarks and investigations behind decisions |
 
 ## Key decisions (see [ADR 0001](docs/adr/0001-initial-design-decisions.md))
 
@@ -46,7 +47,10 @@ can keep data in an optional in-memory cache for speed, and runs inside Web Work
 - STRICT typing by default. SQLite affinity is available through `LOOSE` tables.
 - TypeScript, no WASM. Supports Chromium, Firefox, and Safari/iOS.
 - Multi-tab sharing via leader election. Parallel workers when the page is cross-origin isolated.
-- Planned after v1: triggers, JSON functions, JS UDFs, live queries, encryption.
+- Snapshot isolation with a single writer. Minimum browsers: Chrome 108, Firefox 111, Safari 17.
+- Columnar wire protocol. `query()` returns objects by default.
+- Performance bar: beat SQLite WASM on every workload, and stay competitive with DuckDB-WASM on analytics ([ADR 0002](docs/adr/0002-second-round-decisions.md)).
+- Planned after v1: triggers, JSON functions, JS UDFs, live queries, encryption, newer-browser fast paths.
 
 ## License
 

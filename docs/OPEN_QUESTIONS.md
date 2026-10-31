@@ -19,18 +19,22 @@ Decisions from the first design interview (2026-10-31) are recorded in
 | Q-11 | Import/export formats | **CSV and JSON/NDJSON** in v1. SQL dump, SQLite import, Parquet/Arrow later | decided |
 | Q-12 | Optional modules (JSON, FTS, …) | **None in v1**. JSON functions are a planned future module | decided |
 | Q-13 | JS user-defined functions | **Deferred** (future extension) | decided |
-| Q-14 | Isolation level | Proposal: snapshot isolation (single writer). Serializable later if needed | open |
+| Q-14 | Isolation level | **Snapshot isolation**, single writer | decided |
 | Q-15 | Live queries / change notifications | **Deferred** (future extension) | decided |
 | Q-16 | Language | **TypeScript, no WASM** | decided |
 | Q-17 | Runtime support | **Chromium, Firefox, Safari/iOS** (current + previous stable). Node is used for unit tests only, not a supported target | decided |
 | Q-18 | License | **MIT** | decided |
 | Q-19 | Encryption at rest | **Not in v1**. Reserve header/page bytes so it can be added later | decided |
 | Q-20 | Default durability | **Full sync** (flush on every commit, with group commit) | decided |
+| Q-21 | Minimum browsers | **Chrome/Edge 108, Firefox 111, Safari 17**. Feature-detected fast paths for newer browsers may come later | decided |
+| Q-22 | Worker packaging | **Auto-spawn via `new URL(..., import.meta.url)`, with an override** | decided |
+| Q-23 | Default result shape | **Array of objects** built client-side from a **columnar wire format**; `rowMode: 'array' \| 'columnar'` options | decided |
+| Q-24 | Collations | **SQLite built-ins** (BINARY, NOCASE, RTRIM) | decided |
+| Q-25 | Performance bar | **Beat SQLite WASM on every workload**; competitive with DuckDB-WASM on analytics; PGlite as a baseline | decided |
 
-## Remaining questions for the next round
+Second-round decisions: [adr/0002-second-round-decisions.md](adr/0002-second-round-decisions.md).
 
-- Q-10 ATTACH, Q-14 isolation level.
-- Minimum browser versions, given the OPFS / sync access handle baselines (Safari ≥ 17?).
-- Package distribution: a single ESM package that spawns its own worker vs. user-provided worker URLs (bundler friendliness).
-- Default result row shape in the API (objects vs. arrays vs. columnar batches).
-- Collations beyond `BINARY`/`NOCASE`/`RTRIM` (ICU-like locale collation via `Intl.Collator`?).
+## Remaining questions
+
+- Q-10 ATTACH (proposed post-v1, not yet confirmed).
+- FK enforcement in v1 (proposed yes, not yet confirmed).

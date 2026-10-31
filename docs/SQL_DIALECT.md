@@ -75,4 +75,5 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
 - Tables are STRICT by default (`LOOSE` opt-in).
 - Identifiers: case-insensitive, as in SQLite. Double quotes are identifiers only; the SQLite double-quoted string-literal quirk is not supported.
 - `RIGHT`/`FULL OUTER JOIN` are supported.
+- Collations: `BINARY` (default), `NOCASE` (ASCII only), and `RTRIM`. No locale collations in v1.
 - Additions: `CREATE MATERIALIZED VIEW`, `INCLUDE` columns on indexes, `information_schema`, and `WITH (…)` storage options.
