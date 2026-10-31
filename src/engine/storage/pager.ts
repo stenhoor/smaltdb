@@ -238,12 +238,85 @@ export class Pager {
     f.pins--;
   }
 
-  /** Mark a pinned page as modified in the current transaction. */
+  /**
+   * Mark a pinned page as modified in the current transaction. Must be called *before* the page is
+   * changed: inside a statement, the first call snapshots the page for {@link rollbackStatement}.
+   */
   markDirty(f: Frame): void {
+    const images = this.stmtImages;
+    if (images !== null && f.pgno < this.stmtPageCount && !images.has(f.pgno) && !this.stmtFresh.has(f.pgno)) {
+      images.set(f.pgno, f.bytes.slice());
+    }
     if (!f.dirty) {
       f.dirty = true;
       this.dirtyList.push(f);
     }
+  }
+
+  private markDirtyNoCapture(f: Frame): void {
+    if (!f.dirty) {
+      f.dirty = true;
+      this.dirtyList.push(f);
+    }
+  }
+
+  // ---------------------------------------------------------------- statement savepoints
+
+  /** Page images captured on first modification within the current statement (null = no statement). */
+  private stmtImages: Map<number, Uint8Array> | null = null;
+  private stmtPageCount = 0;
+  private stmtHeader: Uint8Array | null = null;
+  /** Uncaptured pages (re)allocated during the statement; dropped on statement rollback. */
+  private readonly stmtFresh = new Set<number>();
+
+  /** Begin a statement-level savepoint. Changes made until commitStatement/rollbackStatement can be undone. */
+  beginStatement(): void {
+    if (this.stmtImages !== null) throw new MisuseError('statement already active');
+    this.stmtImages = new Map();
+    this.stmtFresh.clear();
+    this.stmtPageCount = this.pageCount;
+    this.stmtHeader = this.header.slice();
+  }
+
+  get inStatement(): boolean {
+    return this.stmtImages !== null;
+  }
+
+  /** Keep the statement's changes (they remain part of the enclosing transaction). */
+  commitStatement(): void {
+    this.stmtFresh.clear();
+    this.stmtImages = null;
+    this.stmtHeader = null;
+  }
+
+  /** Undo every change made since beginStatement. No page may be pinned. */
+  rollbackStatement(): void {
+    const images = this.stmtImages;
+    const header = this.stmtHeader;
+    if (images === null || header === null) throw new MisuseError('no active statement');
+    this.stmtImages = null;
+    this.stmtHeader = null;
+    for (const f of this.frames) {
+      if (f.pins > 0) throw new MisuseError(`statement rollback with pinned page ${f.pgno}`);
+    }
+    // Pages allocated past the old end of file disappear; reused free pages revert to their stored image.
+    for (const f of this.frames) if (f.pgno >= this.stmtPageCount) this.discard(f);
+    for (const pgno of this.stmtFresh) {
+      if (images.has(pgno)) continue;
+      const f = this.map.get(pgno);
+      if (f !== undefined) this.discard(f);
+    }
+    this.stmtFresh.clear();
+    for (const [pgno, image] of images) {
+      let f = this.map.get(pgno);
+      if (f === undefined) f = this.takeFrame(pgno);
+      else f.pins++;
+      f.bytes.set(image);
+      this.markDirtyNoCapture(f);
+      this.release(f);
+    }
+    this.header.set(header);
+    this.headerDirty = true;
   }
 
   /** Allocate a page (pinned, dirty, zero-filled), reusing the freelist when possible. */
@@ -259,7 +332,9 @@ export class Pager {
         trunk.view.setUint16(PH_CELL_COUNT, n - 1, true);
         this.release(trunk);
       } else {
+        // Reuse the empty trunk page itself. It holds freelist structure, so snapshot it.
         pgno = head;
+        this.captureForStatement(trunk);
         this.setHeaderU32(DH_FREELIST_HEAD, trunk.view.getUint32(PH_RIGHT, true));
         this.release(trunk);
       }
@@ -275,8 +350,12 @@ export class Pager {
     } else {
       f = this.takeFrame(pgno);
     }
+    // No snapshot needed: the page was free when the statement began, or it was freed during the
+    // statement (then either captured, or clean, so its committed image is on disk). Remember it so
+    // a statement rollback drops this frame instead of writing it.
+    if (this.stmtImages !== null && pgno < this.stmtPageCount && !this.stmtImages.has(pgno)) this.stmtFresh.add(pgno);
     f.bytes.fill(0);
-    this.markDirty(f);
+    this.markDirtyNoCapture(f);
     return f;
   }
 
@@ -296,8 +375,12 @@ export class Pager {
         trunk.view.setUint16(PH_CELL_COUNT, n + 1, true);
         this.release(trunk);
         this.setHeaderU32(DH_FREELIST_COUNT, this.freelistCount + 1);
-        // Contents of a freed leaf page are irrelevant; drop any cached copy so it is never written.
-        if (cached !== undefined) this.discard(cached);
+        // Contents of a freed page are irrelevant; drop any cached copy so it is never written.
+        // Inside a statement, keep its image first so a statement rollback can resurrect it.
+        if (cached !== undefined) {
+          if (cached.dirty) this.captureForStatement(cached);
+          this.discard(cached);
+        }
         return;
       }
       this.release(trunk);
@@ -307,9 +390,12 @@ export class Pager {
     if (cached !== undefined) {
       t = cached;
       t.pins++;
+    } else if (this.stmtImages !== null && pgno < this.stmtPageCount) {
+      t = this.get(pgno); // read the current contents so the statement snapshot is correct
     } else {
       t = this.takeFrame(pgno);
     }
+    this.captureForStatement(t);
     t.bytes.fill(0);
     t.bytes[0] = PageType.FreelistTrunk;
     t.view.setUint32(PH_RIGHT, head, true);
@@ -324,6 +410,7 @@ export class Pager {
   /** Write all dirty pages and the header, then flush (if `syncOnCommit`). */
   commit(): void {
     this.checkOpen();
+    if (this.stmtImages !== null) throw new MisuseError('commit inside an active statement');
     if (!this.inTransaction) return;
     // The list may contain stale entries (discarded frames, or a frame listed twice after reuse);
     // only frames still flagged dirty are written, each once.
@@ -373,6 +460,9 @@ export class Pager {
   /** Discard all uncommitted changes. No page may be pinned. */
   rollback(): void {
     this.checkOpen();
+    this.stmtFresh.clear();
+    this.stmtImages = null;
+    this.stmtHeader = null;
     for (const f of this.dirtyList) {
       if (f.dirty && f.pins > 0) throw new MisuseError(`rollback with pinned page ${f.pgno}`);
     }
@@ -416,6 +506,12 @@ export class Pager {
       this.batchBuf = new Uint8Array(Math.min(WRITE_BATCH_BYTES, Math.max(need, 64 * this.pageSize)));
     }
     return this.batchBuf;
+  }
+
+  private captureForStatement(f: Frame): void {
+    if (this.stmtImages !== null && f.pgno < this.stmtPageCount && !this.stmtImages.has(f.pgno) && !this.stmtFresh.has(f.pgno)) {
+      this.stmtImages.set(f.pgno, f.bytes.slice());
+    }
   }
 
   /** Drop a frame's contents and return it to the free pool. Any dirty-list entry goes stale (see commit). */
