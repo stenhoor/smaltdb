@@ -16,10 +16,9 @@ import { CorruptionError } from '../errors.js';
  * Each component is prefix-free, so a DESC column is encoded by inverting its bytes.
  */
 
-export type SqlValue = null | number | bigint | string | Uint8Array;
+import { Collation, type SqlValue } from '../values.js';
 
-export const Collation = { Binary: 0, NoCase: 1, RTrim: 2 } as const;
-export type Collation = (typeof Collation)[keyof typeof Collation];
+export { Collation, type SqlValue };
 
 export interface KeyColumn {
   desc?: boolean;
