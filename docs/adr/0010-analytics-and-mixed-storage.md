@@ -160,6 +160,10 @@ views by an implicit rowid zone (row-group base + count).
 - *Failures and cancellation:* a failed reader makes the owner answer the query itself. A cancel drops the partial
   rows.
 - *Switch:* `PRAGMA parallel_aggregates = 0` turns morsels off.
+- *Settings:* readers are separate connections. The owner sends its `work_mem` and `matview_rewrite` with every
+  query and morsel it hands to a reader, which applies them before running it, so a reader plans and spills as
+  the owner would. Reader spills go to the reader's own scratch file and do not count in the owner's
+  `PRAGMA spill_bytes`.
 
 ### 5. Materialized-view matching (M7.5)
 

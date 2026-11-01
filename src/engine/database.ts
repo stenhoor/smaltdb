@@ -24,6 +24,7 @@ import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from '.
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
 import { type MatviewCandidate, matchMatview } from './exec/mv-match.js';
 import { type ConflictMode, TableWriter } from './exec/write.js';
+import type { ReaderSettings } from '../shared/protocol.js';
 import type {
   AlterTableStmt,
   RefreshStmt,
@@ -1293,6 +1294,27 @@ export class Database implements FunctionContext {
       };
     });
     return m ? m.stmt : null;
+  }
+
+  private setMatviewRewrite(on: boolean): void {
+    if (on !== this.matviewRewriteOn) {
+      this.matviewRewriteOn = on;
+      this.schemaVersion++; // re-plan statements compiled under the other setting
+    }
+  }
+
+  /**
+   * This connection's settings that parallel readers must use too (they are separate connections):
+   * the server sends them with each query and morsel it hands to a reader.
+   */
+  get readerSettings(): ReaderSettings {
+    return { workMem: this.spill.workMem, matviewRewrite: this.matviewRewriteOn };
+  }
+
+  /** A reader: take the owner's settings before running a query or morsel for it. */
+  applyReaderSettings(s: ReaderSettings): void {
+    this.spill.workMem = s.workMem;
+    this.setMatviewRewrite(s.matviewRewrite);
   }
 
   /** `PRAGMA parallel_aggregates`: whether large aggregates may run as morsels on parallel readers. */
@@ -3227,12 +3249,7 @@ export class Database implements FunctionContext {
       case 'matview_rewrite': {
         if (stmt.value) {
           const on = pragmaBool();
-          return setter(() => {
-            if (on !== this.matviewRewriteOn) {
-              this.matviewRewriteOn = on;
-              this.schemaVersion++; // re-plan statements compiled under the other setting
-            }
-          });
+          return setter(() => this.setMatviewRewrite(on));
         }
         return ro(['matview_rewrite'], () => [[this.matviewRewriteOn ? 1 : 0]]);
       }

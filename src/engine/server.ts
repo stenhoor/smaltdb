@@ -21,7 +21,7 @@ import { type BindParams, Database, RowCursor, type Statement } from './database
 import { SmaltError } from './errors.js';
 import { exportCSV, exportJSON, importCSV, importJSON } from './io/import-export.js';
 import type { Vfs } from './vfs/types.js';
-import { type Request, type Response, encodeColumns } from '../shared/protocol.js';
+import { type ReaderSettings, type Request, type Response, encodeColumns } from '../shared/protocol.js';
 import type { SqlValue } from './values.js';
 
 /** Sends a response to a session. */
@@ -60,8 +60,11 @@ export interface ServerOptions {
 
 /** Parallel readers as seen by the owner's server. */
 export interface ReaderPool {
-  /** Hand a read-only query to an idle reader; false when none is idle. */
-  dispatch(session: string, req: Extract<Request, { op: 'query' }>): boolean;
+  /**
+   * Hand a read-only query to an idle reader; false when none is idle. The reader applies
+   * `settings` (the owner's PRAGMA settings) before it runs the query.
+   */
+  dispatch(session: string, req: Extract<Request, { op: 'query' }>, settings: ReaderSettings): boolean;
   /** Route a credit or cancel for a query a reader is serving; false if none is. */
   forward(session: string, req: Request): boolean;
   /** Readers idle right now (morsel parallelism needs at least two). */
@@ -79,6 +82,8 @@ export interface PartialTask {
   params?: unknown;
   lo: number;
   hi: number;
+  /** The owner's PRAGMA settings, applied by the reader before it runs the partial query. */
+  settings: ReaderSettings;
 }
 
 /** A query whose morsels are out on readers. */
@@ -386,7 +391,7 @@ export class EngineServer {
     // A reader pays for a snapshot refresh and a hand-off: worth it only when other requests are
     // waiting behind this one (concurrent demand). Alone, the owner answers fastest.
     if (this.queue.length === 0) return false;
-    return pool.dispatch(session, { op: 'query', id: req.id, sql, params: req.params as never, batchSize: req.batchSize, credit: req.credit });
+    return pool.dispatch(session, { op: 'query', id: req.id, sql, params: req.params as never, batchSize: req.batchSize, credit: req.credit }, this.db!.readerSettings);
   }
 
   /**
@@ -404,6 +409,7 @@ export class EngineServer {
     const ranges = db.parallelSplit(sql, idle);
     if (!ranges) return false;
     const job: MorselJob = { session, id: req.id, cancelled: false };
+    const settings = db.readerSettings;
     const release = db.holdReads();
     const partials: SqlValue[][][] = new Array(ranges.length);
     let pending = ranges.length;
@@ -436,7 +442,7 @@ export class EngineServer {
     this.morselJobs.push(job);
     this.watch(session);
     ranges.forEach((r, i) => {
-      const ok = pool.partial!({ sql, params: req.params, lo: r.lo, hi: r.hi }, (err, rows) => {
+      const ok = pool.partial!({ sql, params: req.params, lo: r.lo, hi: r.hi, settings }, (err, rows) => {
         if (err !== null) failed ??= err;
         else partials[i] = rows!;
         if (--pending === 0) finish();
