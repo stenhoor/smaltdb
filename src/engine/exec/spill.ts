@@ -12,6 +12,7 @@
  * knows the column count).
  */
 import type { VfsFile } from '../vfs/types.js';
+import { writeVarint } from '../storage/btree.js';
 import { decodeUtf8 } from '../storage/record.js';
 import type { SqlValue } from '../values.js';
 
@@ -161,13 +162,6 @@ export class RunWriter {
     this.view = new DataView(next.buffer);
   }
 
-  private varint(n: number): void {
-    while (n >= 0x80) {
-      this.buf[this.pos++] = (n & 0x7f) | 0x80;
-      n = Math.floor(n / 128);
-    }
-    this.buf[this.pos++] = n;
-  }
 
   /** Append `values[0..n)`. */
   add(values: readonly SqlValue[], n = values.length): void {
@@ -214,7 +208,7 @@ export class RunWriter {
       } else {
         this.ensure(6 + v.byteLength);
         this.buf[this.pos++] = T_BLOB;
-        this.varint(v.byteLength);
+        this.pos = writeVarint(this.buf, this.pos, v.byteLength);
         this.buf.set(v, this.pos);
         this.pos += v.byteLength;
       }

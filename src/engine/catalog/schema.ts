@@ -94,6 +94,11 @@ export interface TableSchema {
   columnar?: ColumnarTableInfo;
 }
 
+/** Columnar storage: a columnar materialized view or a columnar base table (scanned, zone maps, no indexes). */
+export function isColumnar(t: TableSchema): boolean {
+  return t.matview?.storage === 'columnar' || t.columnar !== undefined;
+}
+
 /** Storage of a columnar base table besides its delta store (roots in smalt_columnar). */
 export interface ColumnarTableInfo {
   /** Column store: the table's columns plus a final rowid column. */

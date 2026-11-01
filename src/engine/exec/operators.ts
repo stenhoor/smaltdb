@@ -605,23 +605,62 @@ export interface ZonePredicate {
  * comparison are skipped without reading any chunk; only the referenced columns are decoded.
  * Filters above still apply every predicate (zone maps only prune).
  */
+/**
+ * One execution of a column scan: its segments, zone-map comparison values and deleted rowids.
+ * Shared by the interpreted {@link ColumnScan} and the generated loops (planner columnarHelpers).
+ */
+export class ColumnScanRun {
+  readonly store: ColumnStore;
+  private readonly zoneVals: SqlValue[];
+  private readonly deleted: Set<number | bigint> | null;
+
+  constructor(
+    private readonly scan: ColumnScan,
+    r: SqlValue[],
+  ) {
+    this.store = scan.store();
+    this.zoneVals = scan.zones.map((z) => z.value(r));
+    this.deleted = scan.segments ? scan.segments.deleted() : null;
+  }
+
+  /** False when row group `rg`'s zone maps rule it out. */
+  keep(rg: number): boolean {
+    const zones = this.scan.zones;
+    if (zones.length === 0) return true;
+    const m = this.store.meta(rg);
+    for (let k = 0; k < zones.length; k++) {
+      const z = zones[k];
+      if (!zoneMayMatch(zoneOf(m, rg, z.col), m.rows, z.op, this.zoneVals[k], z.binaryText)) return false;
+    }
+    return true;
+  }
+
+  /** Columnar table: per-row deleted flags of row group `rg` (null: none deleted, or a view). */
+  deletedFlags(rg: number): Uint8Array | null {
+    const seg = this.scan.segments;
+    return seg === null ? null : deletedBitmap(this.store, rg, seg.rowidCol, this.deleted);
+  }
+
+  /** Columnar table: the stored rowids of row group `rg` (a view's are implicit: null). */
+  rowids(rg: number): ArrayLike<SqlValue> | null {
+    const seg = this.scan.segments;
+    return seg === null ? null : rowidsOf(this.store, rg, seg.rowidCol);
+  }
+}
+
 export class ColumnScan implements Operator {
   readonly children: Operator[] = [];
   private r!: SqlValue[];
-  private s!: ColumnStore;
+  private run!: ColumnScanRun;
   private rg = -1;
   private rgCount = 0;
   private i = 0;
   private n = 0;
   private base = 0;
   private chunks: Chunk[] = [];
-  private zoneVals: SqlValue[] = [];
-  /** Columnar table: deleted rowids of this scan, the current row group's deleted flags and rowids. */
-  private deleted: Set<number | bigint> | null = null;
+  /** The current row group's deleted flags and stored rowids (columnar table). */
   private gone: Uint8Array | null = null;
   private rowids: ArrayLike<SqlValue> | null = null;
-  /** Row groups skipped by zone maps in the last scan (EXPLAIN ANALYZE, tests). */
-  skipped = 0;
 
   constructor(
     readonly access: TableAccess,
@@ -646,13 +685,10 @@ export class ColumnScan implements Operator {
 
   open(r: SqlValue[]): void {
     this.r = r;
-    this.s = this.store();
+    this.run = new ColumnScanRun(this, r);
     this.rg = -1;
-    this.rgCount = this.s.rowGroups;
+    this.rgCount = this.run.store.rowGroups;
     this.i = this.n = 0;
-    this.skipped = 0;
-    this.zoneVals = this.zones.map((z) => z.value(r));
-    this.deleted = this.segments ? this.segments.deleted() : null;
     this.gone = null;
     this.rowids = null;
   }
@@ -660,30 +696,19 @@ export class ColumnScan implements Operator {
   next(): boolean {
     const d = this.access.decode;
     const a = this.access;
-    const seg = this.segments;
+    const run = this.run;
     for (;;) {
       while (this.i >= this.n) {
         if (++this.rg >= this.rgCount) return false;
-        const m = this.s.meta(this.rg);
-        let ok = true;
-        for (let k = 0; k < this.zones.length && ok; k++) {
-          const z = this.zones[k];
-          ok = zoneMayMatch(zoneOf(m, this.rg, z.col), m.rows, z.op, this.zoneVals[k], z.binaryText);
-        }
-        if (!ok) {
-          this.skipped++;
-          continue;
-        }
+        if (!run.keep(this.rg)) continue;
         const chunks = this.chunks;
         chunks.length = 0;
-        for (let k = 0; k < d.length; k += 2) chunks.push(this.s.chunk(this.rg, d[k]));
-        this.n = m.rows;
+        for (let k = 0; k < d.length; k += 2) chunks.push(run.store.chunk(this.rg, d[k]));
+        this.n = run.store.meta(this.rg).rows;
         this.i = 0;
         this.base = this.rg * ROW_GROUP_ROWS;
-        if (seg !== null) {
-          this.gone = deletedBitmap(this.s, this.rg, seg.rowidCol, this.deleted);
-          this.rowids = a.rowidReg >= 0 ? rowidsOf(this.s, this.rg, seg.rowidCol) : null;
-        }
+        this.gone = run.deletedFlags(this.rg);
+        this.rowids = a.rowidReg >= 0 ? run.rowids(this.rg) : null;
       }
       const i = this.i++;
       if (this.gone !== null && this.gone[i] === 1) continue;
@@ -1109,8 +1134,6 @@ export class HashAggregate implements Operator {
   private bytes = 0;
   private spilling = false;
   private pending: { run: Run; level: number }[] = [];
-  /** Partitions written (statistics, tests). */
-  spilledPartitions = 0;
 
   constructor(
     readonly child: Operator,
@@ -1159,7 +1182,6 @@ export class HashAggregate implements Operator {
       const run = w.finish();
       if (run.rows > 0) {
         this.pending.push({ run, level });
-        this.spilledPartitions++;
       }
     }
   }
@@ -1213,9 +1235,14 @@ export class HashAggregate implements Operator {
 
   /** Evaluate the current row into a spill record (keys, then per aggregate its inputs, then bare columns). */
   private record(keyVals: SqlValue[], rec: SqlValue[]): void {
+    for (let i = 0; i < keyVals.length; i++) rec[i] = keyVals[i];
+    this.inputs(rec);
+  }
+
+  /** The current row's aggregate inputs (FILTER flag, then arguments only if it passes) and bare columns, after the keys. */
+  private inputs(rec: SqlValue[]): void {
     const r = this.r;
-    let o = 0;
-    for (let i = 0; i < keyVals.length; i++) rec[o++] = keyVals[i];
+    let o = this.groupFns.length;
     for (const a of this.aggs) {
       let pass = true;
       if (a.filter !== undefined) {
@@ -1227,6 +1254,11 @@ export class HashAggregate implements Operator {
     for (let i = 0; i < this.bareRegs.length; i++) rec[o++] = r[this.bareRegs[i]];
   }
 
+  /**
+   * Step group `g` with the current row. The same accumulation as {@link stepRecord}, reading the
+   * registers directly: going through a record costs ~20% on in-memory GROUP BY (measured), so the
+   * two stay separate. Keep them in step.
+   */
   private step(g: Group): void {
     const r = this.r;
     const aggs = this.aggs;
@@ -1255,7 +1287,7 @@ export class HashAggregate implements Operator {
     }
   }
 
-  /** {@link step} from a spill record. */
+  /** Step group `g` with a record: aggregate inputs from offset `keys`, then bare columns. */
   private stepRecord(g: Group, rec: SqlValue[]): void {
     const aggs = this.aggs;
     let o = this.groupFns.length;
@@ -1384,8 +1416,6 @@ export class Sort implements Operator {
   private sources: MergeSource[] = [];
   private heap: number[] = [];
   private remaining = 0;
-  /** Runs written by the last open (statistics, tests). */
-  spilledRuns = 0;
 
   constructor(
     readonly child: Operator,
@@ -1421,7 +1451,6 @@ export class Sort implements Operator {
     this.r = r;
     this.i = 0;
     this.releaseSpill();
-    this.spilledRuns = 0;
     let rows: SqlValue[][] = [];
     const regs = this.regs;
     const n = regs.length;
@@ -1459,7 +1488,6 @@ export class Sort implements Operator {
     this.child.close();
     rows.sort(this.compare);
     if (cap >= 0 && rows.length > cap) rows.length = cap;
-    this.spilledRuns = runs.length;
     if (runs.length === 0) {
       this.rows = rows;
       return;

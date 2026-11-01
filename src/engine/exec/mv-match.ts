@@ -17,7 +17,9 @@
  * Expressions are compared structurally, after dropping table qualifiers and lower-casing names.
  */
 import type { ColumnExpr, Expr, FromItem, SelectStmt } from '../sql/ast.js';
-import { type MorselTableInfo, analyzeMorsels, exprKey } from './morsel.js';
+import { type MorselTableInfo, analyzeMorsels } from './morsel.js';
+import { andAll, anyNode, exprKey } from '../sql/ast-util.js';
+import { conjuncts } from './expr.js';
 import { isAggregateCall } from './planner.js';
 
 const NO_POS = { pos: 0, end: 0 };
@@ -51,16 +53,6 @@ function normalize<T>(x: T): T {
   ) as T;
 }
 
-function conjuncts(e: Expr | undefined): Expr[] {
-  if (!e) return [];
-  if (e.kind === 'binary' && e.op === 'AND') return [...conjuncts(e.left), ...conjuncts(e.right)];
-  return [e];
-}
-
-function andAll(list: Expr[]): Expr | undefined {
-  return list.reduce<Expr | undefined>((acc, e) => (acc ? ({ kind: 'binary', op: 'AND', left: acc, right: e, ...NO_POS } as Expr) : e), undefined);
-}
-
 /** A single-table SELECT core without the clauses a view or query must not have here. */
 function simpleCore(s: SelectStmt): (SelectStmt['core'] & { kind: 'select' }) | null {
   if (s.with || s.compound.length > 0) return null;
@@ -69,14 +61,6 @@ function simpleCore(s: SelectStmt): (SelectStmt['core'] & { kind: 'select' }) | 
   if (!c.from || c.from.kind !== 'table' || c.from.indexedBy !== undefined) return null;
   if (c.from.schema && c.from.schema.toLowerCase() !== 'main') return null;
   return c;
-}
-
-/** Whether an expression tree contains a node of one of `kinds` (or a call to an aggregate). */
-function contains(x: unknown, pred: (o: Record<string, unknown>) => boolean): boolean {
-  if (Array.isArray(x)) return x.some((y) => contains(y, pred));
-  if (typeof x !== 'object' || x === null || x instanceof Uint8Array) return false;
-  const o = x as Record<string, unknown>;
-  return pred(o) || Object.values(o).some((v) => contains(v, pred));
 }
 
 const isAggregate = (o: Record<string, unknown>): boolean => o.kind === 'call' && isAggregateCall(o as unknown as Expr);
@@ -116,24 +100,24 @@ function remap(e: Expr, map: Map<string, string>): Expr | null {
  */
 export function matchMatview(query: SelectStmt, text: string, views: MatviewCandidate[], info: (table: string) => MorselTableInfo | undefined): { stmt: SelectStmt; view: string } | null {
   const qc = simpleCore(query);
-  if (!qc || contains([qc.columns, qc.where, qc.groupBy, qc.having, query.orderBy, query.limit, query.offset], hasSubquery)) return null;
+  if (!qc || anyNode([qc.columns, qc.where, qc.groupBy, qc.having, query.orderBy, query.limit, query.offset], hasSubquery)) return null;
   const table = (qc.from as { name: string }).name.toLowerCase();
   const nq = normalize(query);
   const nqc = nq.core as typeof qc;
   const qConj = conjuncts(nqc.where);
-  const qAggregate = nqc.groupBy.length > 0 || contains(nqc.columns, isAggregate) || contains(nqc.having, isAggregate);
+  const qAggregate = nqc.groupBy.length > 0 || anyNode(nqc.columns, isAggregate) || anyNode(nqc.having, isAggregate);
   for (const v of views) {
     const vc = simpleCore(v.select);
     if (!vc || (vc.from as { name: string }).name.toLowerCase() !== table || vc.having || v.select.orderBy.length || v.select.limit) continue;
-    if (contains([vc.columns, vc.where, vc.groupBy], hasSubquery)) continue;
+    if (anyNode([vc.columns, vc.where, vc.groupBy], hasSubquery)) continue;
     const nv = normalize(v.select).core as typeof vc;
     // The view's filter must be part of the query's.
-    const qKeys = new Set(qConj.map(exprKey));
+    const qKeys = new Set(qConj.map((e) => exprKey(e)));
     const vConj = conjuncts(nv.where);
     if (!vConj.every((c) => qKeys.has(exprKey(c)))) continue;
-    const vKeys = new Set(vConj.map(exprKey));
+    const vKeys = new Set(vConj.map((e) => exprKey(e)));
     const extra = qConj.filter((c) => !vKeys.has(exprKey(c)));
-    const vAggregate = nv.groupBy.length > 0 || contains(nv.columns, isAggregate);
+    const vAggregate = nv.groupBy.length > 0 || anyNode(nv.columns, isAggregate);
     const r = qAggregate ? (vAggregate ? rollUp(query, text, nq, v, nv, extra, info) : null) : vAggregate ? null : project(nq, query, v, nv, extra);
     if (r) return { stmt: r, view: v.name };
   }
@@ -143,7 +127,7 @@ export function matchMatview(query: SelectStmt, text: string, views: MatviewCand
 /** View output columns that are plain expressions (not aggregates), by structural key -> column name. */
 function outputMap(nv: SelectStmt['core'] & { kind: 'select' }, v: MatviewCandidate, keysOnly: boolean): Map<string, string> | null {
   const map = new Map<string, string>();
-  const groupKeys = new Set(nv.groupBy.map(exprKey));
+  const groupKeys = new Set(nv.groupBy.map((e) => exprKey(e)));
   for (let i = 0; i < nv.columns.length; i++) {
     const rc = nv.columns[i];
     if (rc.kind !== 'expr') return null; // `*` handled by the caller

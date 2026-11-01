@@ -9,6 +9,7 @@ import {
   buildTableSchema,
   coerceForColumn,
   findColumn,
+  isColumnar,
   isConstantDefault,
   literalValue,
 } from './catalog/schema.js';
@@ -530,7 +531,7 @@ export class Database implements FunctionContext {
     this.touchTable(table);
     const c = table.columnar;
     const w = c
-      ? new ColumnarTableWriter(table, this.pager, (root) => this.tree(root), () => this.columnStoreOf(table, true), this.tree(c.delRoot), (dDelta, dDeleted) => {
+      ? new ColumnarTableWriter(table, this.pager, (root) => this.tree(root), () => this.storeOf(table, true), this.tree(c.delRoot), (dDelta, dDeleted) => {
           this.columnarTouched.add(table);
           if (dDeleted !== 0) c.delVersion = (c.delVersion ?? 0) + 1;
           if (c.counts) {
@@ -856,7 +857,8 @@ export class Database implements FunctionContext {
       virtualTable: (schema, n) => this.virtualTable(schema, n),
       openTree: (root) => this.tree(root),
       sampledStats: (t) => this.sampledStats(t),
-      columnStore: (t) => (t.columnar ? this.columnStoreOf(t, true) : (t.matview!.store ??= new ColumnStore(this.tree(t.rootPage)))),
+      columnStore: (t) => this.storeOf(t, true),
+      liveRows: (t) => this.liveRows(t),
       deletedRows: (t) => this.deletedRowsOf(t),
       funcCtx: this,
       state: this.state,
@@ -1230,23 +1232,34 @@ export class Database implements FunctionContext {
       this.memDirty = true;
       return;
     }
+    // populated: 0 = no, 1 = yes, 2 = yes and fresh (no base table changed since the refresh).
+    this.upsertMetaRow(t, name, meta && ((old) => [name, meta.layout ?? old?.[1] ?? null, meta.populated ? (meta.fresh ? 2 : 1) : 0, meta.refreshedAt]));
+  }
+
+  /**
+   * Replace (or with `row` null, delete) the row named `name` (column 0, case-insensitive) of the
+   * system table `t`, keeping its rowid. `row` gets the old row's values, if there was one.
+   */
+  private upsertMetaRow(t: TableSchema, name: string, row: ((old: SqlValue[] | null) => SqlValue[]) | null): void {
     const w = new TableWriter(t, this.pager, (root) => this.tree(root));
     const reader = new RecordReader(t.layout, t.recordDefaults);
-    let found: { rowid: number | bigint; layout: string } | null = null;
+    let found: { rowid: number | bigint; values: SqlValue[] } | null = null;
     const c = this.tree(t.rootPage).cursor();
-    for (let ok = c.first(); ok; ok = c.next()) {
-      c.loadValue();
-      reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
-      if (String(reader.column(0)).toLowerCase() === name.toLowerCase()) {
-        c.loadKey();
-        found = { rowid: readRowidKey(c.keyBytes, c.keyOffset), layout: String(reader.column(1)) };
-        break;
+    try {
+      for (let ok = c.first(); ok; ok = c.next()) {
+        c.loadValue();
+        reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+        if (String(reader.column(0)).toLowerCase() === name.toLowerCase()) {
+          c.loadKey();
+          found = { rowid: readRowidKey(c.keyBytes, c.keyOffset), values: t.columns.map((_, i) => reader.column(i)) };
+          break;
+        }
       }
+    } finally {
+      c.close();
     }
-    c.close();
     if (found) w.deleteRow(found.rowid);
-    // populated: 0 = no, 1 = yes, 2 = yes and fresh (no base table changed since the refresh).
-    if (meta) w.writeRow([name, meta.layout ?? found?.layout ?? null, meta.populated ? (meta.fresh ? 2 : 1) : 0, meta.refreshedAt], found?.rowid ?? w.newRowid());
+    if (row) w.writeRow(row(found?.values ?? null), found?.rowid ?? w.newRowid());
   }
 
   // ---------------------------------------------------------------- morsel parallelism (M7.4)
@@ -1326,7 +1339,7 @@ export class Database implements FunctionContext {
   /** Smallest and largest rowid of a table (numbers only), or null. */
   private rowidBounds(t: TableSchema): { min: number; max: number } | null {
     if (t.matview?.storage === 'columnar') {
-      const n = this.matviewStore(t).rows;
+      const n = this.storeOf(t).rows;
       return n > 0 ? { min: 1, max: n } : null;
     }
     let min = Infinity;
@@ -1344,7 +1357,7 @@ export class Database implements FunctionContext {
       c.close();
     }
     if (t.columnar) {
-      const store = this.columnStoreOf(t, true);
+      const store = this.storeOf(t, true);
       const rc = t.columns.length;
       for (let rg = 0; rg < store.rowGroups; rg++) {
         const z = store.meta(rg).zones[rc];
@@ -1357,9 +1370,6 @@ export class Database implements FunctionContext {
     return { min, max };
   }
 
-  private matviewStore(t: TableSchema): ColumnStore {
-    return (t.matview!.store ??= new ColumnStore(this.tree(t.rootPage)));
-  }
 
   /**
    * Morsel parallelism: when `sql` is an aggregate over one table of at least `minRows` rows whose
@@ -1373,12 +1383,7 @@ export class Database implements FunctionContext {
     // A fresh materialized view answers it more cheaply than any split of the base table.
     if (m.parsed.stmt.kind === 'select' && this.matviewRewrite(m.parsed.stmt, m.parsed.text)) return null;
     const t = this.getTable(m.q.table)!;
-    const rows =
-      t.matview?.storage === 'columnar'
-        ? this.matviewStore(t).rows
-        : t.columnar
-          ? this.columnStoreOf(t, true).rows + this.tree(t.rootPage).estimateCount()
-          : this.tree(t.rootPage).estimateCount();
+    const rows = this.liveRows(t);
     if (rows < minRows) return null;
     const b = this.rowidBounds(t);
     if (!b) return null;
@@ -1440,12 +1445,24 @@ export class Database implements FunctionContext {
   /** Columnar tables written by the running statement (compacted at its end). */
   private readonly columnarTouched = new Set<TableSchema>();
 
-  /** The segment reader of a columnar table (`fresh`: re-read the header, row groups may have been added). */
-  private columnStoreOf(t: TableSchema, fresh = false): ColumnStore {
-    const c = t.columnar!;
+  /**
+   * The segment reader of a columnar table or columnar materialized view. `fresh`: re-read the
+   * header (a columnar table's compaction appends row groups; a view's segments only change by
+   * refresh, which replaces the reader).
+   */
+  private storeOf(t: TableSchema, fresh = false): ColumnStore {
+    const c = t.columnar;
+    if (!c) return (t.matview!.store ??= new ColumnStore(this.tree(t.rootPage)));
     if (c.store === undefined) c.store = new ColumnStore(this.tree(c.segRoot));
     else if (fresh) c.store.refreshHeader();
     return c.store;
+  }
+
+  /** Estimated rows of a table (columnar: segment rows, plus the delta store for a columnar table). */
+  private liveRows(t: TableSchema): number {
+    if (t.matview?.storage === 'columnar') return this.storeOf(t).rows;
+    const tree = this.tree(t.rootPage).estimateCount();
+    return t.columnar ? this.storeOf(t, true).rows + tree : tree;
   }
 
   /**
@@ -1475,26 +1492,7 @@ export class Database implements FunctionContext {
 
   /** Upsert (or with `info` null, delete) a table's row in smalt_columnar. */
   private writeColumnarMeta(name: string, info: { segRoot: number; delRoot: number } | null): void {
-    const t = this.tables.get('smalt_columnar')!;
-    const w = new TableWriter(t, this.pager, (root) => this.tree(root));
-    const c = this.tree(t.rootPage).cursor();
-    let found: number | bigint | null = null;
-    const reader = new RecordReader(t.layout, t.recordDefaults);
-    try {
-      for (let ok = c.first(); ok; ok = c.next()) {
-        c.loadValue();
-        reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
-        if (String(reader.column(0)).toLowerCase() === name.toLowerCase()) {
-          c.loadKey();
-          found = readRowidKey(c.keyBytes, c.keyOffset);
-          break;
-        }
-      }
-    } finally {
-      c.close();
-    }
-    if (found !== null) w.deleteRow(found);
-    if (info) w.writeRow([name, info.segRoot, info.delRoot], found ?? w.newRowid());
+    this.upsertMetaRow(this.tables.get('smalt_columnar')!, name, info && (() => [name, info.segRoot, info.delRoot]));
   }
 
   /** Attach segment and deletion roots to columnar tables (from smalt_columnar). */
@@ -1550,7 +1548,7 @@ export class Database implements FunctionContext {
   private compactTouched(): void {
     for (const t of this.columnarTouched) {
       if (!t.columnar || this.getTable(t.name, 'main') !== t) continue; // dropped meanwhile
-      const store = this.columnStoreOf(t, true);
+      const store = this.storeOf(t, true);
       // Running counts (kept by the writer); counted once when missing (after a rollback or reload).
       const counts = (t.columnar.counts ??= { delta: this.tree(t.rootPage).count(), deleted: this.tree(t.columnar.delRoot).count() });
       const deltaCount = counts.delta;
@@ -1602,7 +1600,7 @@ export class Database implements FunctionContext {
         delta.delete(key);
       }
     }
-    this.columnStoreOf(t, true);
+    this.storeOf(t, true);
     return true;
   }
 
@@ -1615,7 +1613,7 @@ export class Database implements FunctionContext {
   private rewriteColumnar(t: TableSchema, keep: boolean): number {
     const c = t.columnar!;
     const ncols = t.columns.length;
-    const store = this.columnStoreOf(t, true);
+    const store = this.storeOf(t, true);
     const delTree = this.tree(c.delRoot);
     const delta = this.tree(t.rootPage);
     const deleted = loadDeleted(delTree);
@@ -1792,12 +1790,12 @@ export class Database implements FunctionContext {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     // Main tables only (shadowed ones included): statistics are stored in the file, keyed by name.
     const mainTables = [...this.tables.values(), ...this.shadowedMain.values()].filter((t) => !t.temp);
-    let tables = mainTables.filter((t) => !t.system && t.name.toLowerCase() !== 'smalt_stat' && t.matview?.storage !== 'columnar' && !t.columnar);
+    let tables = mainTables.filter((t) => !t.system && t.name.toLowerCase() !== 'smalt_stat' && !isColumnar(t));
     if (target) {
       const t = this.getTable(target, 'main');
       const idx = this.indexes.get(target.toLowerCase());
       if (!t && this.tempTables.has(target.toLowerCase())) return none; // TEMP tables are not analyzed
-      if (t) tables = t.matview?.storage === 'columnar' || t.columnar ? [] : [t];
+      if (t) tables = isColumnar(t) ? [] : [t];
       else if (idx) {
         const owner = this.tables.get(idx.table.toLowerCase())!;
         tables = owner.temp ? [] : [owner];
@@ -1846,7 +1844,7 @@ export class Database implements FunctionContext {
    * recomputed when the table's size (estimated from the tree shape) has changed 4x or more.
    */
   private sampledStats(t: TableSchema): TableStats | undefined {
-    if (t.name.toLowerCase().startsWith('smalt_') || t.matview?.storage === 'columnar' || t.columnar) return undefined;
+    if (t.name.toLowerCase().startsWith('smalt_') || isColumnar(t)) return undefined;
     const tree = this.tree(t.rootPage);
     const live = tree.estimateCount();
     const hit = this.sampled.get(t);
@@ -3170,6 +3168,18 @@ export class Database implements FunctionContext {
       const v = compileExpr(stmt.value, planner.compileScope(planner.newScope())).fn([]);
       return v === null ? undefined : String(v);
     };
+    /** A boolean setting's value, SQLite's spellings: 1 / on / true / yes (anything else is off). */
+    const pragmaBool = (): boolean => ['1', 'on', 'true', 'yes'].includes(arg()?.toLowerCase() ?? '');
+    /** A setting change: runs `apply` when executed, returns no rows. */
+    const setter = (apply: () => void): Omit<Program, 'regCount'> => ({
+      readonly: true,
+      columns: [],
+      columnTypes: [],
+      exec: () => {
+        apply();
+        return { changes: 0, lastInsertRowid: this.lastRowid };
+      },
+    });
     const tableArg = (): TableSchema => {
       const name = arg();
       const t = name ? this.getTable(name) : undefined;
@@ -3195,21 +3205,14 @@ export class Database implements FunctionContext {
       }
       case 'foreign_keys': {
         if (stmt.value) {
-          const v = arg()?.toLowerCase();
-          const on = v === '1' || v === 'on' || v === 'true' || v === 'yes';
-          return {
-            readonly: true,
-            columns: [],
-            columnTypes: [],
-            exec: () => {
-              // Like SQLite, the setting cannot change inside a transaction.
-              if (this.autocommit && on !== this.fk.enabled) {
-                this.fk.enabled = on;
-                this.schemaVersion++; // re-plan statements compiled under the other setting
-              }
-              return { changes: 0, lastInsertRowid: this.lastRowid };
-            },
-          };
+          const on = pragmaBool();
+          return setter(() => {
+            // Like SQLite, the setting cannot change inside a transaction.
+            if (this.autocommit && on !== this.fk.enabled) {
+              this.fk.enabled = on;
+              this.schemaVersion++; // re-plan statements compiled under the other setting
+            }
+          });
         }
         return ro(['foreign_keys'], () => [[this.fk.enabled ? 1 : 0]]);
       }
@@ -3217,34 +3220,26 @@ export class Database implements FunctionContext {
         if (stmt.value) {
           const v = Number(arg());
           if (!Number.isInteger(v) || v < 0) throw new SmaltError('SMALT_ERROR', 'work_mem must be a non-negative number of bytes');
-          return { readonly: true, columns: [], columnTypes: [], exec: () => ((this.spill.workMem = v), { changes: 0, lastInsertRowid: this.lastRowid }) };
+          return setter(() => void (this.spill.workMem = v));
         }
         return ro(['work_mem'], () => [[this.spill.workMem]]);
       }
       case 'matview_rewrite': {
         if (stmt.value) {
-          const v = arg()?.toLowerCase();
-          const on = v === '1' || v === 'on' || v === 'true' || v === 'yes';
-          return {
-            readonly: true,
-            columns: [],
-            columnTypes: [],
-            exec: () => {
-              if (on !== this.matviewRewriteOn) {
-                this.matviewRewriteOn = on;
-                this.schemaVersion++; // re-plan statements compiled under the other setting
-              }
-              return { changes: 0, lastInsertRowid: this.lastRowid };
-            },
-          };
+          const on = pragmaBool();
+          return setter(() => {
+            if (on !== this.matviewRewriteOn) {
+              this.matviewRewriteOn = on;
+              this.schemaVersion++; // re-plan statements compiled under the other setting
+            }
+          });
         }
         return ro(['matview_rewrite'], () => [[this.matviewRewriteOn ? 1 : 0]]);
       }
       case 'parallel_aggregates': {
         if (stmt.value) {
-          const v = arg()?.toLowerCase();
-          const on = v === '1' || v === 'on' || v === 'true' || v === 'yes';
-          return { readonly: true, columns: [], columnTypes: [], exec: () => ((this.parallelAggregates = on), { changes: 0, lastInsertRowid: this.lastRowid }) };
+          const on = pragmaBool();
+          return setter(() => void (this.parallelAggregates = on));
         }
         return ro(['parallel_aggregates'], () => [[this.parallelAggregates ? 1 : 0]]);
       }
