@@ -73,6 +73,8 @@ export interface PagerStats {
   reads: number;
   writes: number;
   evictions: number;
+  /** Automatic checkpoints that failed after a commit (retried later). */
+  failedCheckpoints: number;
   /** Frames allocated beyond the configured budget (no-steal overflow). */
   overflowFrames: number;
   /** Pages loaded by read-ahead. */
@@ -113,7 +115,7 @@ export class Pager {
   readonly pageSize: number;
   /** Bytes per page available to page formats (page size minus reserved trailer). */
   readonly usableSize: number;
-  readonly stats: PagerStats = { hits: 0, misses: 0, reads: 0, writes: 0, evictions: 0, overflowFrames: 0, prefetched: 0 };
+  readonly stats: PagerStats = { hits: 0, misses: 0, reads: 0, writes: 0, evictions: 0, failedCheckpoints: 0, overflowFrames: 0, prefetched: 0 };
 
   private readonly frames: Frame[] = [];
   private readonly map = new Map<number, Frame>();
@@ -781,7 +783,16 @@ export class Pager {
     this.committedHeader.set(this.header);
     this.headerDirty = false;
     this.trimOverflowFrames();
-    if (wal.size >= this.autoCheckpoint) this.checkpoint();
+    // Best-effort: the commit is durable in the WAL already. A failing checkpoint must not turn a
+    // committed transaction into an error (callers would treat it as not committed); it is retried
+    // at the next commit and on close.
+    if (wal.size >= this.autoCheckpoint) {
+      try {
+        this.checkpoint();
+      } catch {
+        this.stats.failedCheckpoints++;
+      }
+    }
   }
 
   /** Copy committed WAL pages into the database file and reset the log. No transaction may be open. */

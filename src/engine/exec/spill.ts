@@ -65,6 +65,8 @@ export class SpillArea {
   constructor(
     private readonly file: VfsFile | null,
     workMem = DEFAULT_WORK_MEM,
+    /** Called once the file is closed (frees its name for other handles). */
+    private readonly onClose: (() => void) | null = null,
   ) {
     this.workMem = workMem;
     file?.truncate(0);
@@ -106,7 +108,37 @@ export class SpillArea {
   close(): void {
     this.file?.truncate(0);
     this.file?.close();
+    this.onClose?.();
   }
+}
+
+/** Scratch file names in use, per VFS: two handles in one process must not share (and truncate) one. */
+const spillNamesInUse = new WeakMap<object, Set<string>>();
+
+/**
+ * Open a scratch file for a database handle: `base`, or `base-2`, `base-3`, … when another handle of
+ * this process (or, with OPFS, another worker holding an exclusive handle) has it. Null when none
+ * can be opened: the handle then never spills.
+ */
+export async function openSpillFile(vfs: { open(path: string): Promise<VfsFile> }, base: string): Promise<{ file: VfsFile; release: () => void } | null> {
+  let names = spillNamesInUse.get(vfs);
+  if (!names) spillNamesInUse.set(vfs, (names = new Set()));
+  for (let n = 1; n <= 8; n++) {
+    const path = n === 1 ? base : `${base}-${n}`;
+    if (names.has(path)) continue;
+    try {
+      const file = await vfs.open(path);
+      if (names.has(path)) {
+        file.close(); // taken while we were opening it
+        continue;
+      }
+      names.add(path);
+      return { file, release: () => names.delete(path) };
+    } catch {
+      // locked by someone else: try the next name
+    }
+  }
+  return null;
 }
 
 const textEncoder = new TextEncoder();
