@@ -19,10 +19,6 @@ jobs:
 
   browser:
     runs-on: ubuntu-latest
-    # WebKit is non-blocking: Playwright's Linux WebKit fails before the OPFS test worker reports a
-    # result (the runner now prints the worker error, console and page errors). Safari 17 remains a
-    # support target; re-enable as blocking once the cause is fixed.
-    continue-on-error: ${{ matrix.browser == 'webkit' }}
     strategy:
       fail-fast: false
       matrix:
