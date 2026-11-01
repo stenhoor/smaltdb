@@ -1,7 +1,9 @@
 import {
   ConstraintError,
   type IndexSchema,
+  type MatViewInfo,
   type TableSchema,
+  storageTypeFor,
   autoIndexName,
   buildIndexSchema,
   buildTableSchema,
@@ -19,6 +21,7 @@ import { Planner, type QueryPlan, Registers, markUnordered } from './exec/planne
 import { type ConflictMode, TableWriter } from './exec/write.js';
 import type {
   AlterTableStmt,
+  RefreshStmt,
   ColumnDef,
   ColumnExpr,
   CreateIndexStmt,
@@ -47,7 +50,7 @@ import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec
 import { type CatalogSnapshot, informationSchema } from './catalog/information-schema.js';
 import { type SchemaLookup, applyEdits, renameColumnEdits, renameTableEdits } from './catalog/alter.js';
 import { ForeignKeys } from './exec/fk.js';
-import type { SqlValue } from './values.js';
+import { Collation, type SqlValue } from './values.js';
 import type { Vfs, VfsFile } from './vfs/types.js';
 
 export interface RunResult {
@@ -88,7 +91,7 @@ interface Upsert {
 }
 
 interface CatalogEntry {
-  type: 'table' | 'index' | 'view';
+  type: 'table' | 'index' | 'view' | 'matview';
   name: string;
   rowid: number | bigint;
 }
@@ -419,6 +422,7 @@ export class Database implements FunctionContext {
       });
       this.tables.set(table.name.toLowerCase(), table);
     }
+    this.loadMatviews(rows.filter((r) => r.type === 'matview'));
     for (const r of rows) {
       if (r.type !== 'index' || r.sql === null) continue;
       const stmt = parseOne(r.sql).stmt as CreateIndexStmt;
@@ -485,7 +489,7 @@ export class Database implements FunctionContext {
     const stmt = ps.stmt;
     const regs = new Registers(ps.paramCount);
     const planner = new Planner(
-      { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), virtualTable: (schema, n) => this.virtualTable(schema, n), openTree: (root) => this.tree(root), sampledStats: (t) => this.sampledStats(t), funcCtx: this, state: this.state },
+      this.plannerDeps(),
       regs,
     );
     planner.sqlText = ps.text;
@@ -511,7 +515,7 @@ export class Database implements FunctionContext {
       case 'alterTable':
         return done({ exec: () => this.alterTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
       case 'createView':
-        if (stmt.materialized) throw new SmaltError('SMALT_UNSUPPORTED', 'materialized views are not supported yet (M5)');
+        if (stmt.materialized) return done({ exec: () => this.createMatview(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
         if (stmt.schema && !['main', 'temp'].includes(stmt.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
         return done({ exec: () => this.createView(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
       case 'drop':
@@ -545,9 +549,30 @@ export class Database implements FunctionContext {
         return done(this.compilePragma(stmt, planner));
       case 'analyze':
         return done({ exec: () => this.analyze(stmt.target), readonly: false, columns: [], columnTypes: [] });
+      case 'refresh':
+        return done({ exec: () => this.refreshMatview(stmt), readonly: false, columns: [], columnTypes: [] });
       default:
         throw new SmaltError('SMALT_UNSUPPORTED', `${stmt.kind} statements are not supported yet`);
     }
+  }
+
+  /** What the planner reads from the database. Unpopulated materialized views cannot be read. */
+  private plannerDeps(): ConstructorParameters<typeof Planner>[0] {
+    return {
+      getTable: (n) => {
+        const t = this.getTable(n);
+        if (t?.matview && !t.matview.populated) {
+          throw new SmaltError('SMALT_ERROR', `materialized view "${t.name}" has not been populated (use REFRESH MATERIALIZED VIEW)`);
+        }
+        return t;
+      },
+      getView: (n) => this.getView(n),
+      virtualTable: (schema, n) => this.virtualTable(schema, n),
+      openTree: (root) => this.tree(root),
+      sampledStats: (t) => this.sampledStats(t),
+      funcCtx: this,
+      state: this.state,
+    };
   }
 
   /** Program for a write statement; with RETURNING it produces rows (and still counts changes). */
@@ -681,6 +706,201 @@ export class Database implements FunctionContext {
   private dirtySchema = false;
 
   // ---------------------------------------------------------------- statistics
+
+  // ---------------------------------------------------------------- materialized views
+
+  private static readonly MATVIEW_SQL = 'CREATE TABLE smalt_matview(name TEXT, layout TEXT, populated INTEGER, refreshed_at TEXT)';
+
+  /**
+   * CREATE MATERIALIZED VIEW: the result columns become a table (types from the query), filled by
+   * running the query unless `WITH NO DATA`.
+   */
+  private createMatview(stmt: CreateViewStmt, sql: string): RunResult {
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    if (stmt.temp || stmt.schema?.toLowerCase() === 'temp') throw new SmaltError('SMALT_ERROR', 'materialized views cannot be temporary');
+    if (stmt.ifNotExists && this.catalog.get(stmt.name.toLowerCase())?.type === 'matview') return none;
+    const opts = stmt.with ?? {};
+    for (const k of Object.keys(opts)) if (k !== 'storage' && k !== 'refresh') throw new SmaltError('SMALT_ERROR', `unknown materialized view option: ${k}`);
+    const storage = String(opts.storage ?? 'row').toLowerCase();
+    if (storage !== 'row' && storage !== 'columnar') throw new SmaltError('SMALT_ERROR', `storage must be 'row' or 'columnar'`);
+    if (storage === 'columnar') throw new SmaltError('SMALT_UNSUPPORTED', 'columnar materialized views are not supported yet');
+    const refresh = String(opts.refresh ?? 'manual').toLowerCase();
+    if (refresh !== 'manual') throw new SmaltError('SMALT_UNSUPPORTED', `refresh = '${refresh}' is not supported yet (only 'manual')`);
+    this.checkNewName(stmt.name, 'materialized view');
+    this.dirtySchema = true;
+    const layout = this.matviewLayout(stmt.name, stmt.select, sql, stmt.columns);
+    if (!this.tables.has('smalt_matview')) {
+      this.createTable(parseOne(Database.MATVIEW_SQL).stmt as CreateTableStmt, Database.MATVIEW_SQL, true);
+    }
+    const root = BTree.create(this.pager);
+    const { table } = buildTableSchema(parseOne(layout).stmt as CreateTableStmt, layout, root);
+    table.matview = { sql, select: stmt.select, storage, populated: false, refreshedAt: null };
+    this.addCatalogRow('matview', table.name, table.name, root, sql);
+    this.tables.set(table.name.toLowerCase(), table);
+    this.writeMatviewMeta(table.name, { layout, populated: false, refreshedAt: null });
+    let changes = 0;
+    if (stmt.withData !== false) changes = this.fillMatview(table);
+    this.schemaChanged();
+    return { changes, lastInsertRowid: this.lastRowid };
+  }
+
+  /** REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]. */
+  private refreshMatview(stmt: RefreshStmt): RunResult {
+    if (stmt.schema && stmt.schema.toLowerCase() !== 'main') throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
+    const mv = this.tables.get(stmt.name.toLowerCase());
+    if (!mv?.matview) throw new SmaltError('SMALT_ERROR', `no such materialized view: ${stmt.name}`);
+    if (stmt.concurrently && !stmt.withData) throw new SmaltError('SMALT_ERROR', 'REFRESH ... CONCURRENTLY cannot be used with WITH NO DATA');
+    this.dirtySchema = true;
+    let changes = 0;
+    if (stmt.withData) changes = this.fillMatview(mv);
+    else {
+      this.swapMatviewTrees(mv, BTree.create(this.pager), mv.indexes.map(() => BTree.create(this.pager)));
+      mv.matview.populated = false;
+      this.writeMatviewMeta(mv.name, { populated: false, refreshedAt: mv.matview.refreshedAt });
+    }
+    this.schemaChanged();
+    return { changes, lastInsertRowid: this.lastRowid };
+  }
+
+  /**
+   * Recompute a materialized view into new trees, then swap them in (copy-on-write: the old rows
+   * stay intact until the swap, which is what makes REFRESH ... CONCURRENTLY safe for readers).
+   * Returns the number of rows.
+   */
+  private fillMatview(mv: TableSchema): number {
+    const info = mv.matview!;
+    const root = BTree.create(this.pager);
+    const target: TableSchema = { ...mv, rootPage: root, indexes: [] };
+    const w = new TableWriter(target, this.pager, (r) => this.tree(r));
+    const cols = mv.columns;
+    let rowid = 0;
+    this.runSelect(info.select, info.sql, (vals) => {
+      if (vals.length !== cols.length) throw new SmaltError('SMALT_ERROR', `materialized view ${mv.name}: the query now returns ${vals.length} columns, the view has ${cols.length}`);
+      for (let i = 0; i < cols.length; i++) {
+        if (!fitsStorage(vals[i], cols[i].type)) {
+          throw new SmaltError('SMALT_MISMATCH', `materialized view ${mv.name}: column ${cols[i].name} is ${cols[i].type} but the query produced ${describeValue(vals[i])} (add a CAST to the view)`);
+        }
+      }
+      w.writeRow(vals, ++rowid);
+    });
+    const indexRoots = mv.indexes.map((idx) => {
+      const r = BTree.create(this.pager);
+      const copy: IndexSchema = { ...idx, rootPage: r };
+      this.populateIndex(target, copy, r);
+      if (idx.unique) this.checkUniqueIndex(target, copy);
+      return r;
+    });
+    this.swapMatviewTrees(mv, root, indexRoots);
+    info.populated = true;
+    info.refreshedAt = new Date().toISOString();
+    this.writeMatviewMeta(mv.name, { populated: true, refreshedAt: info.refreshedAt });
+    return rowid;
+  }
+
+  /** Point a materialized view (and its indexes) at new trees and free the old ones. */
+  private swapMatviewTrees(mv: TableSchema, root: number, indexRoots: number[]): void {
+    new BTree(this.pager, mv.rootPage).destroy();
+    mv.rootPage = root;
+    this.setCatalogRoot(mv.name, root);
+    mv.indexes.forEach((idx, i) => {
+      new BTree(this.pager, idx.rootPage).destroy();
+      idx.rootPage = indexRoots[i];
+      this.setCatalogRoot(idx.name, indexRoots[i]);
+    });
+  }
+
+  private setCatalogRoot(name: string, root: number): void {
+    const e = this.catalog.get(name.toLowerCase())!;
+    const w = this.catalogWriter();
+    const row = w.readRow(e.rowid)!;
+    row[3] = root;
+    w.writeRow(row, e.rowid);
+  }
+
+  /** The storage table definition (CREATE TABLE text) for a materialized view's query. */
+  private matviewLayout(name: string, select: SelectStmt, sql: string, names?: string[]): string {
+    const planner = new Planner(this.plannerDeps(), new Registers(0));
+    planner.sqlText = sql;
+    const plan = planner.planSelect(select, null);
+    if (names && names.length !== plan.columns.length) {
+      throw new SmaltError('SMALT_ERROR', `materialized view ${name} has ${names.length} column names but its query returns ${plan.columns.length} columns`);
+    }
+    const seen = new Set<string>();
+    const q = (x: string): string => `"${x.replace(/"/g, '""')}"`;
+    const defs = plan.columns.map((c, i) => {
+      const colName = names?.[i] ?? c.name;
+      if (seen.has(colName.toLowerCase())) throw new SmaltError('SMALT_ERROR', `column "${colName}" specified more than once (name it with AS)`);
+      seen.add(colName.toLowerCase());
+      // A column copied from a table keeps its declared type; computed values get their static type.
+      const st = c.declType ? storageTypeFor(c.declType) : ({ int: 'INTEGER', real: 'REAL', text: 'TEXT', blob: 'BLOB' } as Record<string, string>)[c.type] ?? 'ANY';
+      const coll = c.collation === Collation.NoCase ? ' COLLATE NOCASE' : c.collation === Collation.RTrim ? ' COLLATE RTRIM' : '';
+      return `${q(colName)} ${st}${coll}`;
+    });
+    return `CREATE TABLE ${q(name)}(${defs.join(', ')})`;
+  }
+
+  /** Run a query to completion, passing each result row (a fresh array) to `emit`. */
+  private runSelect(select: SelectStmt, sql: string, emit: (vals: SqlValue[]) => void): void {
+    const regs = new Registers(0);
+    const planner = new Planner(this.plannerDeps(), regs);
+    planner.sqlText = sql;
+    const plan = planner.planSelect(select, null);
+    const r: SqlValue[] = new Array(regs.count).fill(null);
+    const root = plan.root;
+    root.open(r);
+    try {
+      while (root.next()) emit(plan.outRegs.map((g) => r[g]));
+    } finally {
+      root.close();
+    }
+  }
+
+  /** Upsert (or with `meta` null, delete) a view's row in smalt_matview. */
+  private writeMatviewMeta(name: string, meta: { layout?: string; populated: boolean; refreshedAt: string | null } | null): void {
+    const t = this.tables.get('smalt_matview');
+    if (!t) return;
+    const w = new TableWriter(t, this.pager, (root) => this.tree(root));
+    const reader = new RecordReader(t.layout, t.recordDefaults);
+    let found: { rowid: number | bigint; layout: string } | null = null;
+    const c = this.tree(t.rootPage).cursor();
+    for (let ok = c.first(); ok; ok = c.next()) {
+      c.loadValue();
+      reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+      if (String(reader.column(0)).toLowerCase() === name.toLowerCase()) {
+        c.loadKey();
+        found = { rowid: readRowidKey(c.keyBytes, c.keyOffset), layout: String(reader.column(1)) };
+        break;
+      }
+    }
+    c.close();
+    if (found) w.deleteRow(found.rowid);
+    if (meta) w.writeRow([name, meta.layout ?? found?.layout ?? null, meta.populated ? 1 : 0, meta.refreshedAt], found?.rowid ?? w.newRowid());
+  }
+
+  /** Build materialized views' table schemas from catalog rows and smalt_matview. */
+  private loadMatviews(rows: { name: string; rootpage: number; sql: string | null }[]): void {
+    if (rows.length === 0) return;
+    const t = this.tables.get('smalt_matview');
+    if (!t) throw new SmaltError('SMALT_CORRUPT', 'materialized views without smalt_matview');
+    const meta = new Map<string, { layout: string; populated: boolean; refreshedAt: string | null }>();
+    const reader = new RecordReader(t.layout, t.recordDefaults);
+    const c = this.tree(t.rootPage).cursor();
+    for (let ok = c.first(); ok; ok = c.next()) {
+      c.loadValue();
+      reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+      meta.set(String(reader.column(0)).toLowerCase(), { layout: String(reader.column(1)), populated: reader.column(2) === 1, refreshedAt: reader.column(3) as string | null });
+    }
+    c.close();
+    for (const r of rows) {
+      const m = meta.get(r.name.toLowerCase());
+      if (!m) throw new SmaltError('SMALT_CORRUPT', `missing metadata for materialized view ${r.name}`);
+      const def = parseOne(r.sql!).stmt as CreateViewStmt;
+      const { table } = buildTableSchema(parseOne(m.layout).stmt as CreateTableStmt, m.layout, r.rootpage);
+      const storage = String(def.with?.storage ?? 'row').toLowerCase() as MatViewInfo['storage'];
+      table.matview = { sql: r.sql!, select: def.select, storage, populated: m.populated, refreshedAt: m.refreshedAt };
+      this.tables.set(table.name.toLowerCase(), table);
+    }
+  }
 
   private static readonly STAT_SQL = 'CREATE TABLE smalt_stat(tbl TEXT, idx TEXT, stat TEXT)';
 
@@ -840,7 +1060,20 @@ export class Database implements FunctionContext {
     const root = BTree.create(this.pager);
     const idx = buildIndexSchema(stmt, sql, table, root);
     this.prepareIndex(table, idx);
-    // Populate from existing rows (expression values computed, partial-index rows filtered).
+    this.populateIndex(table, idx, root);
+    table.indexes.push(idx);
+    this.indexes.set(idx.name.toLowerCase(), idx);
+    if (idx.unique) this.checkUniqueIndex(table, idx); // existing rows may already collide
+    this.addCatalogRow('index', idx.name, table.name, root, sql);
+    this.schemaChanged();
+    return none;
+  }
+
+  /**
+   * Fill the empty index tree at `root` from the rows of `table` (expression values computed,
+   * partial-index rows filtered): entries are packed, sorted and bulk-loaded.
+   */
+  private populateIndex(table: TableSchema, idx: IndexSchema, root: number): void {
     const tree = new BTree(this.pager, table.rootPage);
     const itree = new BTree(this.pager, root);
     const reader = new RecordReader(table.layout, table.recordDefaults);
@@ -894,12 +1127,6 @@ export class Database implements FunctionContext {
     }
     // Sort, then build the tree bottom-up from the sorted entries.
     itree.bulkLoadKeys(keys, offs, sortPackedKeys(keys, offs, count));
-    table.indexes.push(idx);
-    this.indexes.set(idx.name.toLowerCase(), idx);
-    if (idx.unique) this.checkUniqueIndex(table, idx); // existing rows may already collide
-    this.addCatalogRow('index', idx.name, table.name, root, sql);
-    this.schemaChanged();
-    return none;
   }
 
   /**
@@ -992,8 +1219,28 @@ export class Database implements FunctionContext {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const lower = stmt.name.toLowerCase();
     const existing = this.catalog.get(lower);
-    if (existing && (stmt.objectType === 'table' || stmt.objectType === 'view') && existing.type !== stmt.objectType && existing.type !== 'index') {
-      throw new SmaltError('SMALT_ERROR', `use DROP ${existing.type.toUpperCase()} to delete ${existing.type} ${existing.name}`);
+    const kindOf = (t: CatalogEntry['type']): string => (t === 'matview' ? 'materialized view' : t);
+    if (existing && stmt.objectType !== 'index' && existing.type !== 'index' && kindOf(existing.type) !== stmt.objectType) {
+      throw new SmaltError('SMALT_ERROR', `use DROP ${kindOf(existing.type).toUpperCase()} to delete ${kindOf(existing.type)} ${existing.name}`);
+    }
+    if (stmt.objectType === 'materialized view') {
+      const mv = this.tables.get(lower);
+      if (!mv?.matview) {
+        if (stmt.ifExists) return none;
+        throw new SmaltError('SMALT_ERROR', `no such materialized view: ${stmt.name}`);
+      }
+      this.dirtySchema = true;
+      for (const idx of mv.indexes) {
+        new BTree(this.pager, idx.rootPage).destroy();
+        this.removeCatalogRow(idx.name);
+        this.indexes.delete(idx.name.toLowerCase());
+      }
+      new BTree(this.pager, mv.rootPage).destroy();
+      this.removeCatalogRow(mv.name);
+      this.writeMatviewMeta(mv.name, null);
+      this.tables.delete(lower);
+      this.schemaChanged();
+      return none;
     }
     if (stmt.objectType === 'view' && this.tempViews.has(lower) && (!stmt.schema || stmt.schema.toLowerCase() === 'temp')) {
       this.tempViews.delete(lower);
@@ -1069,6 +1316,7 @@ export class Database implements FunctionContext {
     }
     const table = this.tables.get(lower);
     if (!table) throw new SmaltError('SMALT_ERROR', `no such table: ${stmt.table}`);
+    if (table.matview) throw new SmaltError('SMALT_ERROR', `materialized view ${table.name} may not be altered`);
     this.dirtySchema = true;
     const a = stmt.action;
     switch (a.kind) {
@@ -1309,12 +1557,13 @@ export class Database implements FunctionContext {
   private targetTable(name: string, schema?: string): TableSchema {
     if (schema && schema.toLowerCase() !== 'main') throw new SmaltError('SMALT_ERROR', `unknown database ${schema}`);
     const lower = name.toLowerCase();
-    if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat') throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
+    if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat' || lower === 'smalt_matview') throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
     const t = this.tables.get(lower);
     if (!t) {
       if (this.views.has(lower)) throw new SmaltError('SMALT_ERROR', `cannot modify ${name} because it is a view`);
       throw new SmaltError('SMALT_ERROR', `no such table: ${name}`);
     }
+    if (t.matview) throw new SmaltError('SMALT_ERROR', `cannot change materialized view "${t.name}" (use REFRESH MATERIALIZED VIEW)`);
     return t;
   }
 
@@ -2335,3 +2584,25 @@ function aggregateCallName(e: Expr): string | undefined {
   return hit;
 }
 
+/** A value can be stored in a column of this type without conversion (materialized views keep query results exact). */
+function fitsStorage(v: SqlValue, t: string): boolean {
+  if (v === null) return true;
+  switch (t) {
+    case 'INTEGER':
+      return typeof v === 'bigint' || (typeof v === 'number' && Number.isInteger(v));
+    case 'REAL':
+      return typeof v === 'number';
+    case 'TEXT':
+      return typeof v === 'string';
+    case 'BLOB':
+      return v instanceof Uint8Array;
+    default:
+      return true;
+  }
+}
+
+function describeValue(v: SqlValue): string {
+  if (typeof v === 'string') return 'TEXT';
+  if (v instanceof Uint8Array) return 'BLOB';
+  return typeof v === 'number' && !Number.isInteger(v) ? 'REAL' : 'INTEGER';
+}

@@ -1168,7 +1168,8 @@ class Parser {
     if (materialized && this.acceptKw('WITH')) w = this.withOptions();
     this.expectKw('AS');
     const select = this.selectStmt(undefined);
-    return { kind: 'createView', pos, temp, materialized, ifNotExists, schema: q.schema, name: q.name, columns, with: w, select, end: this.ends[this.p - 1] };
+    const withData = materialized ? this.optWithData() : undefined;
+    return { kind: 'createView', pos, temp, materialized, ifNotExists, schema: q.schema, name: q.name, columns, with: w, select, withData, end: this.ends[this.p - 1] };
   }
 
   private dropStmt(): A.DropStmt {
@@ -1238,7 +1239,22 @@ class Parser {
     }
     const q = this.qualifiedName();
     if (this.acceptKw('CONCURRENTLY')) concurrently = true;
-    return { kind: 'refresh', pos, concurrently, schema: q.schema, name: q.name, end: this.ends[this.p - 1] };
+    const withData = this.optWithData() ?? true;
+    return { kind: 'refresh', pos, concurrently, withData, schema: q.schema, name: q.name, end: this.ends[this.p - 1] };
+  }
+
+  /** Optional `WITH DATA` / `WITH NO DATA` (materialized views); undefined when absent. */
+  private optWithData(): boolean | undefined {
+    if (!this.isKw('WITH')) return undefined;
+    if (this.kws[this.p + 1] === 'DATA') {
+      this.p += 2;
+      return true;
+    }
+    if (this.kws[this.p + 1] === 'NO' && this.kws[this.p + 2] === 'DATA') {
+      this.p += 3;
+      return false;
+    }
+    return undefined;
   }
 
   private beginStmt(): A.BeginStmt {

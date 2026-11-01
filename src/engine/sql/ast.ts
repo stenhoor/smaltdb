@@ -445,6 +445,8 @@ export interface CreateViewStmt extends Node {
   name: string;
   columns?: string[];
   with?: Record<string, SqlValue>;
+  /** Materialized views: `WITH NO DATA` creates the view unpopulated (PostgreSQL). */
+  withData?: boolean;
   select: SelectStmt;
 }
 
@@ -470,6 +472,8 @@ export interface AlterTableStmt extends Node {
 export interface RefreshStmt extends Node {
   kind: 'refresh';
   concurrently: boolean;
+  /** `WITH NO DATA` empties the view and marks it unpopulated (PostgreSQL). */
+  withData: boolean;
   schema?: string;
   name: string;
 }

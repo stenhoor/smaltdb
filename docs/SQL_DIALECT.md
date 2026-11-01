@@ -60,7 +60,7 @@ SQLite compatibility: `sqlite_schema` / `sqlite_master`, `pragma_table_info()`, 
 > **Implemented in M4** (`src/engine/catalog/information-schema.ts`): `schemata`, `tables`, `columns`, `views`, `table_constraints`,
 > `key_column_usage`, `referential_constraints`, `check_constraints`, `routines` (built-in functions) and `statistics`.
 > Constraints without a name get PostgreSQL-style names (`t_pkey`, `t_col_key`, `t_col_fkey`, `t_check1`). Internal tables
-> (`smalt_*`) are not listed. Not yet: `parameters` (no per-function signatures), `materialized_views` (M5), TEMP objects.
+> (`smalt_*`) are not listed. Not yet: `parameters` (no per-function signatures), TEMP objects. `materialized_views` (extension) arrived with M5.
 > Table-valued pragmas: `pragma_table_info`, `pragma_table_xinfo`, `pragma_index_list`, `pragma_index_info`,
 > `pragma_index_xinfo`, `pragma_foreign_key_list`; their arguments may reference earlier FROM sources
 > (`FROM sqlite_schema m JOIN pragma_table_info(m.name)`), which plans them as lateral joins.
@@ -74,6 +74,19 @@ AS SELECT day, sum(amount) AS total, count(*) AS n FROM sales GROUP BY day;
 
 REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
 ```
+
+> **Implemented in M5.** `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name [(columns)] [WITH (storage = 'row' | 'columnar',
+> refresh = 'manual')] AS select [WITH [NO] DATA]`, `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]`,
+> `DROP MATERIALIZED VIEW [IF EXISTS] name`.
+> - Column types come from the query: a column copied from a table keeps its declared type (and collation); computed
+>   values get their static type (INTEGER, REAL, TEXT, BLOB) or ANY. A refresh that produces a value its column cannot
+>   hold exactly fails and leaves the old rows (add a CAST to the view).
+> - Every refresh builds new trees and then swaps them in (copy-on-write). `CONCURRENTLY` therefore never blocks
+>   readers and, unlike PostgreSQL, needs no unique index. The two forms differ only once concurrent readers arrive (M6).
+> - `WITH NO DATA` leaves the view unpopulated; reading it is an error until it is refreshed (PostgreSQL behaviour).
+> - The view is read-only (INSERT/UPDATE/DELETE/ALTER fail) and can have indexes, which every refresh rebuilds.
+> - Catalog: `sqlite_schema` lists it with type `matview`; `information_schema.tables` reports `MATERIALIZED VIEW`, and
+>   `information_schema.materialized_views` gives the definition, storage, population state and last refresh time.
 
 - Stored as a regular table with a hidden catalog link to its definition. MVs can have indexes.
 - **v1**: `manual` refresh, which is a full recompute.

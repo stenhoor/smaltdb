@@ -67,7 +67,7 @@ export function informationSchema(name: string, cat: CatalogSnapshot): VirtualTa
       return {
         columns: [t('table_catalog'), t('table_schema'), t('table_name'), t('table_type'), t('is_insertable_into')],
         rows: () => [
-          ...userTables().map((x) => [CATALOG, SCHEMA, x.name, 'BASE TABLE', 'YES']),
+          ...userTables().map((x) => [CATALOG, SCHEMA, x.name, x.matview ? 'MATERIALIZED VIEW' : 'BASE TABLE', x.matview ? 'NO' : 'YES']),
           ...cat.views.map((v) => [CATALOG, SCHEMA, v.name, 'VIEW', 'NO']),
         ],
       };
@@ -111,6 +111,18 @@ export function informationSchema(name: string, cat: CatalogSnapshot): VirtualTa
           }
           return out;
         },
+      };
+    case 'materialized_views':
+      // smaltdb extension (PostgreSQL has pg_matviews).
+      return {
+        columns: [t('table_catalog'), t('table_schema'), t('table_name'), t('view_definition'), t('storage'), t('refresh_mode'), t('is_populated'), t('last_refresh')],
+        rows: () =>
+          userTables()
+            .filter((x) => x.matview)
+            .map((x) => {
+              const m = x.matview!;
+              return [CATALOG, SCHEMA, x.name, m.sql.slice(m.select.pos, m.select.end), m.storage, 'MANUAL', yesNo(m.populated), m.refreshedAt];
+            }),
       };
     case 'views':
       return {

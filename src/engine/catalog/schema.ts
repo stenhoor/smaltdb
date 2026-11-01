@@ -83,6 +83,20 @@ export interface TableSchema {
   system?: boolean;
   /** Statistics from ANALYZE (absent until analyzed). */
   stats?: import('../exec/stats.js').TableStats;
+  /** Set for materialized views: the table holds the view's stored rows. */
+  matview?: MatViewInfo;
+}
+
+/** A materialized view's definition and refresh state (its rows live in the table's tree). */
+export interface MatViewInfo {
+  /** CREATE MATERIALIZED VIEW text. */
+  sql: string;
+  select: import('../sql/ast.js').SelectStmt;
+  storage: 'row' | 'columnar';
+  /** False after `WITH NO DATA` until the first REFRESH; reading it is an error. */
+  populated: boolean;
+  /** ISO timestamp of the last refresh, null if never refreshed. */
+  refreshedAt: string | null;
 }
 
 /** Automatic index name for the n-th (1-based) UNIQUE/PRIMARY KEY constraint of a table. */
