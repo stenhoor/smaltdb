@@ -72,6 +72,11 @@ export interface DatabaseOptions extends PagerOptions {
   statementCacheSize?: number;
   /** 'wal' (default): atomic, durable commits via `<path>-wal`. 'off': in-place writes (not crash-atomic). */
   journalMode?: 'wal' | 'off';
+  /**
+   * Open the files with shared (OPFS `readwrite-unsafe`) handles so reader workers can open them
+   * too (parallel readers). Exclusive access must then be ensured otherwise (the multi-tab lock).
+   */
+  sharedHandles?: boolean;
 }
 
 const CATALOG_SQL = 'CREATE TABLE smalt_schema(type TEXT, name TEXT, tbl_name TEXT, rootpage INTEGER, sql TEXT)';
@@ -142,10 +147,11 @@ export class Database implements FunctionContext {
   readonly activeCursors = new Set<RowCursor>();
   private closed = false;
 
-  private constructor(file: VfsFile | null, options: DatabaseOptions, walFile?: VfsFile) {
-    this.pager = file === null ? Pager.openMemory(options) : Pager.open(file, options, walFile);
+  private constructor(file: VfsFile | null, options: DatabaseOptions, walFile?: VfsFile, reader = false) {
+    this.pager = file === null ? Pager.openMemory(options) : reader ? Pager.openReader(file, walFile!, options) : Pager.open(file, options, walFile);
     this.cacheSize = options.statementCacheSize ?? 64;
     if (this.pager.catalogRoot === 0) {
+      if (reader) throw new SmaltError('SMALT_CANTOPEN', 'reader: the database has no catalog yet');
       this.pager.catalogRoot = BTree.create(this.pager);
       this.pager.commit();
     }
@@ -155,9 +161,30 @@ export class Database implements FunctionContext {
   /** `path` ':memory:' opens a new in-memory database (see {@link openMemory}). */
   static async open(vfs: Vfs, path: string, options: DatabaseOptions = {}): Promise<Database> {
     if (path === ':memory:') return Database.openMemory(options);
-    const file = await vfs.open(path);
-    const wal = (options.journalMode ?? 'wal') === 'wal' ? await vfs.open(`${path}-wal`) : undefined;
+    const shared = options.sharedHandles === true;
+    const file = await vfs.open(path, { shared });
+    const wal = (options.journalMode ?? 'wal') === 'wal' ? await vfs.open(`${path}-wal`, { shared }) : undefined;
     return new Database(file, options, wal);
+  }
+
+  /**
+   * A read-only snapshot reader of a WAL-mode database written by another handle (parallel reader
+   * workers). Call {@link refreshSnapshot} before each query to see the latest commit.
+   */
+  static async openReader(vfs: Vfs, path: string, options: DatabaseOptions = {}): Promise<Database> {
+    const file = await vfs.open(path, { shared: true, create: false });
+    const wal = await vfs.open(`${path}-wal`, { shared: true, create: false });
+    return new Database(file, options, wal, true);
+  }
+
+  /** Reader: move to the latest committed state (reloads the schema if it changed). */
+  refreshSnapshot(): void {
+    if (this.pager.refreshSnapshot()) this.loadSchemaIfChanged();
+  }
+
+  /** Parallel readers: checkpoints are skipped while `gate` returns false. */
+  setCheckpointGate(gate: (() => boolean) | null): void {
+    this.pager.checkpointGate = gate;
   }
 
   /**

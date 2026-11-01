@@ -86,7 +86,7 @@ export class OpfsVfs implements Vfs {
     }
     let handle: SyncAccessHandle;
     try {
-      handle = await (fileHandle as unknown as FileHandleWithSync).createSyncAccessHandle();
+      handle = await (fileHandle as unknown as FileHandleWithSync).createSyncAccessHandle(options.shared ? { mode: 'readwrite-unsafe' } : undefined);
     } catch (e) {
       // NoModificationAllowedError: another worker/tab holds the exclusive handle.
       throw new SmaltError('SMALT_BUSY', `cannot lock ${path}: ${(e as Error).message}`);

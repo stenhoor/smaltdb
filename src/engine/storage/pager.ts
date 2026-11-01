@@ -242,6 +242,50 @@ export class Pager {
     return this.memory;
   }
 
+  /** Read-only snapshot reader (parallel reader workers): never writes. */
+  private readOnly = false;
+
+  /**
+   * Open a read-only reader of a database that another handle writes (in WAL mode). Its view is
+   * the committed state at open time; {@link refreshSnapshot} moves it to the latest commit.
+   */
+  static openReader(file: VfsFile, walFile: VfsFile, options: PagerOptions = {}): Pager {
+    if (file.size() === 0 && Wal.probePageSize(walFile) === null) throw new SmaltError('SMALT_CANTOPEN', 'reader: the database does not exist yet');
+    const p = Pager.open(file, options, walFile);
+    p.readOnly = true;
+    return p;
+  }
+
+  /**
+   * Reader: move the snapshot to the latest commit in the WAL. Only pages changed since the last
+   * snapshot leave the cache (all of them after a checkpoint started a new log). Returns whether
+   * anything changed. No page may be pinned.
+   */
+  refreshSnapshot(): boolean {
+    const wal = this.wal;
+    if (!this.readOnly || wal === null) throw new MisuseError('refreshSnapshot needs a WAL reader');
+    const before = this.changeCounter;
+    const r = wal.refresh();
+    let changed: Set<number> | null;
+    if (r === 'no-log') {
+      // Only the file: unchanged unless commits (and a checkpoint) happened since the last look.
+      const h = new Uint8Array(this.pageSize);
+      this.file!.read(h, 0);
+      // (A checkpoint alone only moves the same page contents from the log into the file.)
+      if (new DataView(h.buffer).getUint32(DH_CHANGE_COUNTER, true) === before) return false;
+      changed = null;
+    } else changed = r;
+    if (changed !== null && changed.size === 0) return false;
+    for (const f of this.frames) {
+      if (f.pgno === -1) continue;
+      if (changed === null || changed.has(f.pgno)) this.discard(f);
+    }
+    // The header (page 0): the newest copy is in the log, else in the file.
+    if (!wal.read(0, this.header)) this.file!.read(this.header, 0);
+    this.committedHeader.set(this.header);
+    return true;
+  }
+
   private newLevel(): Savepoint {
     return { images: new Map(), fresh: new Set(), pageCount: this.pageCount, header: this.header.slice(0, DB_HEADER_SIZE) };
   }
@@ -438,6 +482,7 @@ export class Pager {
    * changed: inside a statement, the first call snapshots the page for {@link rollbackStatement}.
    */
   markDirty(f: Frame): void {
+    if (this.readOnly) throw new SmaltError('SMALT_READONLY', 'attempt to write a read-only snapshot');
     if (this.txn !== null && !f.dirty) this.captureTxn(f);
     const sp = this.top;
     if (sp !== undefined && f.pgno < sp.pageCount && !sp.images.has(f.pgno) && !sp.fresh.has(f.pgno)) {
@@ -549,6 +594,7 @@ export class Pager {
 
   /** Allocate a page (pinned, dirty, zero-filled), reusing the freelist when possible. */
   allocate(): Frame {
+    if (this.readOnly) throw new SmaltError('SMALT_READONLY', 'attempt to write a read-only snapshot');
     const head = this.hv.getUint32(DH_FREELIST_HEAD, true);
     let pgno: number;
     if (head !== 0) {
@@ -643,6 +689,9 @@ export class Pager {
    * Make the transaction durable. With a WAL: append changed pages + header to the log and flush
    * (atomic). Without: write pages in place and then the header, then flush.
    */
+  /** Parallel readers: checkpoints wait while this returns false (a reader is reading the files). */
+  checkpointGate: (() => boolean) | null = null;
+
   commit(): void {
     this.checkOpen();
     if (this.savepoints.length > 0) throw new MisuseError('commit with open savepoints');
@@ -733,6 +782,9 @@ export class Pager {
     this.checkOpen();
     const wal = this.wal;
     if (wal === null || wal.isEmpty) return;
+    if (this.readOnly) return;
+    // Readers are reading the files: keep the log (it is replayed on the next open if need be).
+    if (this.checkpointGate !== null && !this.checkpointGate()) return;
     if (this.inTransaction) throw new MisuseError('checkpoint inside a transaction');
     wal.checkpoint(this.file!, (pgno) => {
       if (pgno === 0) return this.header;
@@ -770,7 +822,7 @@ export class Pager {
     if (this.closed) return;
     if (this.inTransaction) this.rollback();
     if (this.wal !== null) {
-      this.checkpoint();
+      if (!this.readOnly) this.checkpoint();
       this.wal.close();
     }
     this.file?.close();

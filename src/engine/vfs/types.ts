@@ -21,6 +21,11 @@ export interface VfsFile {
 export interface OpenOptions {
   /** Create the file if it does not exist (default true). */
   create?: boolean;
+  /**
+   * OPFS: open with a shared `readwrite-unsafe` sync access handle (several workers may open the
+   * file at once; the caller coordinates writers). Ignored by other VFSs.
+   */
+  shared?: boolean;
 }
 
 export interface Vfs {

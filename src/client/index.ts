@@ -167,11 +167,20 @@ export class Database implements Queryable {
   epoch = 0;
   /** Multi-tab: this tab owns the engine worker. */
   isLeader = true;
+  /** Queries answered by parallel reader workers / by the owner (diagnostics). */
+  readonly stats = { readerQueries: 0, ownerQueries: 0 };
+  /** Set while this client's transaction runs: other calls on this Database wait for it. */
+  private txRunning: Promise<void> | null = null;
   private onClose: (() => void)[] = [];
 
   /** @internal */
   attachWorker(worker: Worker, openReq: Extract<RequestBody, { op: 'open' }>, bus: string | undefined): void {
-    worker.onmessage = (e: MessageEvent<Response>) => this.onMessage(e.data);
+    worker.onmessage = (e: MessageEvent<Response>) => {
+      const m = e.data;
+      // A parallel reader's direct channel: its results arrive there.
+      if (m.kind === 'port') m.port.onmessage = (pe: MessageEvent<Response>) => this.onMessage(pe.data);
+      else this.onMessage(m);
+    };
     worker.onerror = (e) => this.failAll(new SmaltdbError('SMALT_WORKER', e.message || 'engine worker failed'));
     if (typeof SharedArrayBuffer !== 'undefined' && (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated) {
       const sab = new SharedArrayBuffer(4);
@@ -275,6 +284,10 @@ export class Database implements Queryable {
   private onMessage(msg: Response): void {
     const p = this.pending.get(msg.id);
     if (!p) return;
+    if (msg.kind === 'columns') {
+      if (msg.reader) this.stats.readerQueries++;
+      else this.stats.ownerQueries++;
+    }
     if (p.onMessage) {
       if (msg.kind === 'error' || msg.kind === 'done' || msg.kind === 'ok') this.pending.delete(msg.id);
       p.onMessage(msg);
@@ -363,7 +376,13 @@ export class Database implements Queryable {
     params?: Params,
     options: QueryOptions & { rowMode?: M } = {},
   ): Promise<QueryResultFor<M, T>> {
-    return this.withLock(() => this.rawQuery(sql, params, options)) as Promise<QueryResultFor<M, T>>;
+    // Reads may run concurrently (on parallel readers); they only wait for this client's transaction.
+    return this.afterTransaction(() => this.rawQuery(sql, params, options)) as Promise<QueryResultFor<M, T>>;
+  }
+
+  private async afterTransaction<T>(fn: () => Promise<T>): Promise<T> {
+    while (this.txRunning) await this.txRunning;
+    return fn();
   }
 
   /** Execute one statement (with params) or a script of statements (without). */
@@ -485,6 +504,19 @@ export class Database implements Queryable {
    */
   transaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
     return this.withLock(async () => {
+      let done!: () => void;
+      this.txRunning = new Promise<void>((r) => (done = r));
+      try {
+        return await this.runTransaction(fn);
+      } finally {
+        this.txRunning = null;
+        done();
+      }
+    });
+  }
+
+  private async runTransaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
+    {
       await this.rawExec('BEGIN', undefined);
       const tx: Queryable = {
         query: (sql, params, options = {}) => this.rawQuery(sql, params, options) as never,
@@ -498,7 +530,7 @@ export class Database implements Queryable {
         await this.rawExec('ROLLBACK', undefined).catch(() => undefined);
         throw e;
       }
-    });
+    }
   }
 
   /**

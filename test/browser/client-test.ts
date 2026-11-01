@@ -73,17 +73,20 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   }
   const afterBreak = await db.exec("UPDATE items SET qty = qty WHERE id = 1");
   check('breaking out of a stream releases it (writes allowed again)', early === 100 && afterBreak.changes === 1, early);
-  // While a stream is open, this tab's own writes fail fast instead of deadlocking.
+  // A stream served by the owner holds a cursor there: this tab's own writes fail fast instead of
+  // deadlocking. A stream served by a parallel reader reads a snapshot: writes go ahead.
+  const before = db.stats.readerQueries;
   const it = db.stream('SELECT id FROM items', undefined, { batchSize: 10, highWaterMark: 1 });
   await it.next();
+  const onReader = db.stats.readerQueries > before;
   let busy = '';
   try {
-    await db.exec("UPDATE items SET qty = 0 WHERE id = 1");
+    await db.exec("UPDATE items SET qty = qty WHERE id = 1");
   } catch (e) {
     busy = (e as { code: string }).code;
   }
   await it.return!();
-  check('own write during an open stream is SMALT_BUSY', busy === 'SMALT_BUSY', busy);
+  check(`own write during an open stream (${onReader ? 'reader: proceeds' : 'owner: SMALT_BUSY'})`, onReader ? busy === '' : busy === 'SMALT_BUSY', busy);
 
   // Cancellation: a running statement is interrupted (shared-memory flag) and rolled back.
   await db.exec('CREATE TABLE big(a INT, b TEXT)');
@@ -110,6 +113,49 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
     preCode = (e as { code: string }).code;
   }
   check('already-aborted signal rejects at once', preCode === 'SMALT_INTERRUPT', preCode);
+  // Parallel readers (Chromium: shared OPFS handles): concurrent queries agree with serial ones.
+  const qs = [
+    'SELECT count(*), sum(a) FROM big WHERE a % 3 = 0',
+    'SELECT count(*), max(b) FROM big WHERE a > 1000',
+    'SELECT a % 7, count(*) FROM big GROUP BY 1 ORDER BY 1',
+    'SELECT sum(length(b)) FROM big',
+  ];
+  const all = [...qs, ...qs];
+  const serial: unknown[] = [];
+  t0 = performance.now();
+  for (const q of all) serial.push(await db.query(q, undefined, { rowMode: 'array' }));
+  timings.serial8QueriesMs = performance.now() - t0;
+  const r0 = db.stats.readerQueries;
+  t0 = performance.now();
+  const parallel = await Promise.all(all.map((q) => db.query(q, undefined, { rowMode: 'array' })));
+  timings.concurrent8QueriesMs = performance.now() - t0;
+  timings.servedByReaders = db.stats.readerQueries - r0;
+  // Warm: readers have their caches and compiled code now.
+  for (let round = 0; round < 2; round++) {
+    t0 = performance.now();
+    await Promise.all(all.map((q) => db.query(q, undefined, { rowMode: 'array' })));
+    timings[`concurrent8WarmMs${round}`] = performance.now() - t0;
+  }
+  t0 = performance.now();
+  for (const q of all) await db.query(q, undefined, { rowMode: 'array' });
+  timings.serial8WarmMs = performance.now() - t0;
+  check('concurrent queries return the same results', JSON.stringify(parallel) === JSON.stringify(serial));
+  const caps = (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated;
+  if (timings.servedByReaders > 0) {
+    // Snapshot isolation: a reader's stream keeps its snapshot while the owner commits.
+    // A second request queued behind the stream is concurrent demand: the stream goes to a reader.
+    const r1 = db.stats.readerQueries;
+    const s2 = db.stream<{ n: number }>('SELECT a AS n FROM big ORDER BY a', undefined, { batchSize: 1000, highWaterMark: 1 });
+    const other = db.query('SELECT 1');
+    const firstBatch = (await s2.next()).value as { n: number }[];
+    await other;
+    check('a stream issued under concurrent demand is served by a reader', db.stats.readerQueries > r1);
+    await db.exec('UPDATE big SET a = -a');
+    let total = firstBatch.reduce((x, r) => x + r.n, 0);
+    for await (const rows of s2) for (const r of rows) total += r.n;
+    const now = await db.query('SELECT sum(a) AS s FROM big');
+    check('a reader stream keeps its snapshot while the owner writes', total === 20000100000 && now[0].s === -20000100000, [total, now]);
+  } else check(`parallel readers not available here (isolated: ${caps})`, true);
   await db.exec('DROP TABLE big');
   await db.close();
 

@@ -23,6 +23,7 @@
 import { CorruptionError } from '../errors.js';
 import type { SqlValue } from '../values.js';
 import type { BTree } from './btree.js';
+import { decodeUtf8 } from './record.js';
 
 export const ROW_GROUP_ROWS = 8192;
 
@@ -512,7 +513,7 @@ function decodeChunk(b: Uint8Array): Chunk {
       p += 4 * (dn + 1);
       const strBase = p;
       const dict: string[] = [];
-      for (let i = 0; i < dn; i++) dict.push(textDecoder.decode(b.subarray(strBase + v.getUint32(offs + 4 * i, true), strBase + v.getUint32(offs + 4 * i + 4, true))));
+      for (let i = 0; i < dn; i++) dict.push(decodeUtf8(b, strBase + v.getUint32(offs + 4 * i, true), strBase + v.getUint32(offs + 4 * i + 4, true)));
       p = strBase + v.getUint32(offs + 4 * dn, true);
       p = (p + 3) & ~3;
       out.dict = dict;
@@ -528,7 +529,7 @@ function decodeChunk(b: Uint8Array): Chunk {
       for (let i = 0; i < n; i++) {
         const s = dataBase + v.getUint32(offs + 4 * i, true);
         const e = dataBase + v.getUint32(offs + 4 * i + 4, true);
-        vals[i] = enc === ENC_STR ? textDecoder.decode(b.subarray(s, e)) : b.slice(s, e);
+        vals[i] = enc === ENC_STR ? decodeUtf8(b, s, e) : b.slice(s, e);
       }
       out.vals = vals;
       break;

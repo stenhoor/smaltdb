@@ -41,6 +41,14 @@ export type Request = { id: number } & (
   | { op: 'cancel'; target: number }
 );
 
+/** Owner worker <-> parallel reader worker. */
+export type ReaderMessage =
+  | { type: 'init'; name: string; pageSize?: number; cacheSizeBytes?: number; reader: number; port: MessagePort; bus?: string; interrupt?: SharedArrayBuffer }
+  | { type: 'job'; session: string; req: Request }
+  | { type: 'ready'; reader: number }
+  | { type: 'idle'; reader: number }
+  | { type: 'failed'; reader: number; message: string };
+
 /** Messages on a multi-tab BroadcastChannel. */
 export type BusMessage =
   | { type: 'hello'; session: string }
@@ -59,10 +67,13 @@ export type WireColumn =
 
 export type Response =
   | { id: number; kind: 'ok'; changes?: number; lastInsertRowid?: number | bigint; stmt?: number; columns?: string[]; paramCount?: number; capabilities?: unknown; text?: string }
-  | { id: number; kind: 'columns'; columns: string[] }
+  /** `reader`: which parallel reader worker serves the result (absent: the owner). */
+  | { id: number; kind: 'columns'; columns: string[]; reader?: number }
   | { id: number; kind: 'batch'; length: number; cols: WireColumn[] }
   | { id: number; kind: 'done' }
-  | { id: number; kind: 'error'; code: string; message: string };
+  | { id: number; kind: 'error'; code: string; message: string }
+  /** A direct channel from a parallel reader worker to this client (results bypass the owner). */
+  | { id: 0; kind: 'port'; port: MessagePort };
 
 /** Encode a batch of column arrays; returns the columns and the buffers to transfer. */
 export function encodeColumns(cols: SqlValue[][], length: number): { cols: WireColumn[]; transfer: ArrayBuffer[] } {

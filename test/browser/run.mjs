@@ -42,7 +42,7 @@ for (const name of names) {
   const log = [];
   page.on('console', (m) => log.push(`console.${m.type()}: ${m.text()}`));
   page.on('pageerror', (e) => log.push(`pageerror: ${e.stack ?? e.message}`));
-  page.on('worker', (w) => log.push(`worker started: ${w.url()}`));
+  page.on('worker', (w) => { log.push(`worker started: ${w.url()}`); w.on('console', (m) => process.env.WORKER_LOG && console.log('W', m.text())); });
   page.on('requestfailed', (r) => log.push(`request failed: ${r.url()} ${r.failure()?.errorText ?? ''}`));
   const waitFor = async (expr, what) => {
     try {

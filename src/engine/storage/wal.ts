@@ -101,13 +101,22 @@ export class Wal {
     this.salt1 = v.getUint32(16, true);
     this.salt2 = v.getUint32(20, true);
     this.seq = v.getUint32(24, true);
-    let crc = v.getUint32(28, true);
-    this.lastCrc = crc;
+    this.lastCrc = v.getUint32(28, true);
     this.end = WAL_HEADER_SIZE;
+    this.scan(null);
+  }
+
+  /**
+   * Scan frames after `end`, adding complete transactions to the index. `changed` (if given)
+   * collects the page numbers of newly committed frames.
+   */
+  private scan(changed: Set<number> | null): void {
+    const file = this.file;
+    let crc = this.lastCrc;
     const fs = this.frameSize;
     const size = file.size();
     const pending = new Map<number, number>();
-    let off = WAL_HEADER_SIZE;
+    let off = this.end;
     let buf = new Uint8Array(0);
     let bufStart = 0;
     while (off + fs <= size) {
@@ -129,7 +138,10 @@ export class Wal {
       const commit = fv.getUint32(4, true);
       off += fs;
       if (commit !== 0) {
-        for (const [pg, o] of pending) this.index.set(pg, o);
+        for (const [pg, o] of pending) {
+          this.index.set(pg, o);
+          changed?.add(pg);
+        }
         this.stats.recoveredFrames += pending.size;
         pending.clear();
         this.committedPageCount = commit;
@@ -137,6 +149,34 @@ export class Wal {
         this.lastCrc = crc;
       }
     }
+  }
+
+  /**
+   * Reader snapshots (parallel readers, ADR 0009): catch up with transactions another handle has
+   * committed since the last scan. Returns the pages they changed, or null when the log was
+   * checkpointed and restarted (a new generation): then every cached page may be stale.
+   */
+  refresh(): Set<number> | null | 'no-log' {
+    const h = new Uint8Array(WAL_HEADER_SIZE);
+    const valid = this.file.read(h, 0) === WAL_HEADER_SIZE && this.headerValid(h);
+    const v = new DataView(h.buffer);
+    // No log (checkpointed and not restarted yet): the database file alone is current. Whether it
+    // changed since this reader looked is for the caller to tell (from the header's change counter).
+    if (!valid) {
+      this.index.clear();
+      this.committedPageCount = 0;
+      this.end = 0;
+      return 'no-log';
+    }
+    if (v.getUint32(16, true) !== this.salt1 || v.getUint32(20, true) !== this.salt2 || v.getUint32(24, true) !== this.seq) {
+      this.index.clear();
+      this.committedPageCount = 0;
+      this.recover();
+      return null;
+    }
+    const changed = new Set<number>();
+    this.scan(changed);
+    return changed;
   }
 
   private headerValid(h: Uint8Array): boolean {

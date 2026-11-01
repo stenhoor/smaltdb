@@ -50,6 +50,16 @@ export interface ServerOptions {
   capabilities?: () => unknown;
   /** Called when a session starts holding state (transaction or stream), to watch for its disappearance. */
   watchSession?(session: string): void;
+  /** Parallel reader workers: may take a read-only query (returns false when none is idle). */
+  readers?: ReaderPool;
+}
+
+/** Parallel readers as seen by the owner's server. */
+export interface ReaderPool {
+  /** Hand a read-only query to an idle reader; false when none is idle. */
+  dispatch(session: string, req: Extract<Request, { op: 'query' }>): boolean;
+  /** Route a credit or cancel for a query a reader is serving; false if none is. */
+  forward(session: string, req: Request): boolean;
 }
 
 /** Work done between yields to the event loop, in milliseconds. */
@@ -77,6 +87,7 @@ export class EngineServer {
 
   /** A request from `session`. Credits and cancellations act immediately; the rest queue. */
   receive(session: string, req: Request): void {
+    if ((req.op === 'credit' || req.op === 'cancel') && this.options.readers?.forward(session, req)) return;
     if (req.op === 'credit') {
       const s = this.streams.find((x) => x.session === session && x.id === req.target);
       if (s) s.credit += req.n;
@@ -141,7 +152,9 @@ export class EngineServer {
   private kick(): void {
     if (!this.pumping) {
       this.pumping = true;
-      void this.pump();
+      // Start on a fresh task: messages that already arrived (e.g. a batch of concurrent queries)
+      // are queued first, so routing sees the real demand.
+      nextTask(() => void this.pump());
     }
   }
 
@@ -257,6 +270,7 @@ export class EngineServer {
       }
       case 'query': {
         const st = this.requireDb().prepare(req.sql);
+        if (this.toReader(session, st, req.sql, req)) return;
         this.startStream(session, id, st.cursor(req.params as BindParams | undefined), req.batchSize ?? 4096, req.credit);
         return;
       }
@@ -275,6 +289,7 @@ export class EngineServer {
       }
       case 'stmtQuery': {
         const st = this.statement(req.stmt);
+        if (this.toReader(session, st, st.sql, req)) return;
         this.startStream(session, id, st.cursor(req.params as BindParams | undefined), req.batchSize ?? 4096, req.credit);
         return;
       }
@@ -311,6 +326,19 @@ export class EngineServer {
         this.send(session, { id, kind: 'ok' });
         return;
     }
+  }
+
+  /**
+   * Parallel readers: a read-only query outside any transaction runs on an idle reader worker's
+   * snapshot of the latest commit (the reader answers the session directly).
+   */
+  private toReader(session: string, st: Statement, sql: string, req: { id: number; params?: unknown; batchSize?: number; credit?: number }): boolean {
+    const pool = this.options.readers;
+    if (!pool || this.txOwner !== null || this.db?.inTransaction || !st.readonly) return false;
+    // A reader pays for a snapshot refresh and a hand-off: worth it only when other requests are
+    // waiting behind this one (concurrent demand). Alone, the owner answers fastest.
+    if (this.queue.length === 0) return false;
+    return pool.dispatch(session, { op: 'query', id: req.id, sql, params: req.params as never, batchSize: req.batchSize, credit: req.credit });
   }
 
   private statement(id: number): Statement {
@@ -364,8 +392,26 @@ export class EngineServer {
 
 /** Let pending messages (credits, cancels, other sessions) be delivered. */
 function yieldToEventLoop(): Promise<void> {
-  return new Promise((r) => setTimeout(r, 0));
+  return new Promise((r) => nextTask(r));
 }
+
+/**
+ * Run `fn` as a new task, after messages already waiting (MessageChannel: no timer clamping, so
+ * microseconds rather than setTimeout's milliseconds).
+ */
+const nextTask: (fn: () => void) => void = (() => {
+  if (typeof MessageChannel === 'undefined') return (fn: () => void) => void setTimeout(fn, 0);
+  const ch = new MessageChannel();
+  const queue: (() => void)[] = [];
+  ch.port1.onmessage = () => queue.shift()?.();
+  // Node: do not keep the process alive for this channel.
+  (ch.port1 as { unref?: () => void }).unref?.();
+  (ch.port2 as { unref?: () => void }).unref?.();
+  return (fn: () => void) => {
+    queue.push(fn);
+    ch.port2.postMessage(0);
+  };
+})();
 
 /** Default opener: OPFS file `<name>.db` (with WAL) or an in-memory database. */
 export function defaultOpen(vfs: () => Vfs): ServerOptions['open'] {
