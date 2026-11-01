@@ -4,3 +4,4 @@ bench/results/*.local.json
 coverage/
 dist/
 node_modules/
+.claude/worktrees/
