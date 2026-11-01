@@ -4,6 +4,7 @@ import { EngineServer, type PartialTask, type ReaderPool } from '../src/engine/s
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
 import type { Request, Response } from '../src/shared/protocol.js';
 import { columnValue } from '../src/shared/protocol.js';
+import { until } from './helpers/wait.js';
 import type { SqlValue } from '../src/engine/values.js';
 
 /** In-process stand-ins for reader workers: snapshot readers answering after a delay. */
@@ -58,7 +59,6 @@ async function setup() {
     server.receive(session, { ...body, id: rid } as Request);
     return rid;
   };
-  const settle = () => new Promise((r) => setTimeout(r, 60));
   const of = (session: string, rid: number) => log.filter((m) => m.session === session && m.msg.id === rid).map((m) => m.msg);
   const rows = (session: string, rid: number): unknown[][] => {
     const out: unknown[][] = [];
@@ -68,21 +68,9 @@ async function setup() {
     }
     return out;
   };
-  send(EngineServer.LOCAL, { op: 'open', name: 'db', storage: 'opfs' });
-  await settle();
-  return { db, server, readers, send, settle, of, rows };
-}
-
-/**
- * Wait until `done()` holds (polling): server responses arrive after reader callbacks and
- * scheduling ticks, whose timing varies with machine load (fixed sleeps flaked on CI).
- */
-async function until(what: string, done: () => boolean, ms = 8000): Promise<void> {
-  const end = Date.now() + ms;
-  while (!done()) {
-    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
-    await new Promise((r) => setTimeout(r, 5));
-  }
+  const open = send(EngineServer.LOCAL, { op: 'open', name: 'db', storage: 'opfs' });
+  await until('open', () => of(EngineServer.LOCAL, open).length > 0);
+  return { db, server, readers, send, of, rows };
 }
 
 const SQL = 'SELECT g, count(*), sum(x), avg(x) FROM t GROUP BY g ORDER BY g';

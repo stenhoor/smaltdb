@@ -155,12 +155,24 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   if (timings.servedByReaders > 0) {
     // Snapshot isolation: a reader's stream keeps its snapshot while the owner commits.
     // A second request queued behind the stream is concurrent demand: the stream goes to a reader.
-    const r1 = db.stats.readerQueries;
-    const s2 = db.stream<{ n: number }>('SELECT a AS n FROM big ORDER BY a', undefined, { batchSize: 1000, highWaterMark: 1 });
-    const other = db.query('SELECT 1');
-    const firstBatch = (await s2.next()).value as { n: number }[];
-    await other;
-    check('a stream issued under concurrent demand is served by a reader', db.stats.readerQueries > r1);
+    // Whether the second request is still queued when the owner picks the stream up depends on
+    // message timing between page and worker, so a stream that lands on the owner is closed and
+    // the attempt repeated. (The concurrent request is a PRAGMA, which always runs on the owner,
+    // so the reader count tells exactly where the stream went.)
+    let s2: AsyncIterableIterator<{ n: number }[]> | null = null;
+    let firstBatch: { n: number }[] = [];
+    for (let attempt = 0; attempt < 10 && s2 === null; attempt++) {
+      const r1 = db.stats.readerQueries;
+      const s = db.stream<{ n: number }>('SELECT a AS n FROM big ORDER BY a', undefined, { batchSize: 1000, highWaterMark: 1 });
+      const first = s.next();
+      const other = db.query('PRAGMA page_size');
+      firstBatch = (await first).value as { n: number }[];
+      await other;
+      if (db.stats.readerQueries > r1) s2 = s;
+      else await s.return?.(undefined); // served by the owner this time: close it and try again
+    }
+    check('a stream issued under concurrent demand is served by a reader', s2 !== null);
+    if (s2 === null) throw new Error('no stream was served by a reader in 10 attempts');
     await db.exec('UPDATE big SET a = -a');
     let total = firstBatch.reduce((x, r) => x + r.n, 0);
     for await (const rows of s2) for (const r of rows) total += r.n;
@@ -175,13 +187,32 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
     await db.exec('PRAGMA parallel_aggregates = 0');
     const ownerRows = await db.query(ownerSql, undefined, { rowMode: 'array' });
     await db.exec('PRAGMA parallel_aggregates = 1');
-    await db.query(aggSql, undefined, { rowMode: 'array' });
-    const m0 = db.stats.morselQueries;
-    t0 = performance.now();
+    // Morsels need at least two idle readers. Readers report "idle" asynchronously, so a query
+    // right after another one may find them still busy and run on the owner: each measured run
+    // retries (after a pause) until it was served as morsels, and only morsel runs are timed.
+    const morselRun = async (): Promise<{ rows: unknown[][]; ms: number } | null> => {
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const m0 = db.stats.morselQueries;
+        const t = performance.now();
+        const rows = await db.query(aggSql, undefined, { rowMode: 'array' });
+        const ms = performance.now() - t;
+        if (db.stats.morselQueries > m0) return { rows, ms };
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      return null;
+    };
+    await morselRun(); // warm-up
     let morselRows: unknown[][] = [];
-    for (let i = 0; i < 3; i++) morselRows = await db.query(aggSql, undefined, { rowMode: 'array' });
-    timings.morselAggregateMs = (performance.now() - t0) / 3;
-    const usedMorsels = db.stats.morselQueries - m0;
+    let usedMorsels = 0;
+    let morselMs = 0;
+    for (let i = 0; i < 3; i++) {
+      const run = await morselRun();
+      if (!run) break;
+      usedMorsels++;
+      morselMs += run.ms;
+      morselRows = run.rows;
+    }
+    timings.morselAggregateMs = morselMs / Math.max(1, usedMorsels);
     await db.exec('PRAGMA parallel_aggregates = 0');
     t0 = performance.now();
     for (let i = 0; i < 3; i++) await db.query(ownerSql, undefined, { rowMode: 'array' });

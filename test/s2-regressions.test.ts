@@ -8,6 +8,7 @@ import { EngineServer, type PartialTask, type ReaderPool } from '../src/engine/s
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
 import type { Request, Response } from '../src/shared/protocol.js';
 import { columnValue } from '../src/shared/protocol.js';
+import { until } from './helpers/wait.js';
 import type { SqlValue } from '../src/engine/values.js';
 
 const fileDb = () => Database.open(new MemoryVfs(), 'db');
@@ -213,7 +214,6 @@ async function server() {
     srv.receive(session, { ...body, id: rid } as Request);
     return rid;
   };
-  const settle = (ms = 60) => new Promise((r) => setTimeout(r, ms));
   const of = (session: string, rid: number) => log.filter((m) => m.session === session && m.msg.id === rid).map((m) => m.msg);
   const kinds = (session: string, rid: number) => of(session, rid).map((m) => m.kind);
   const rows = (session: string, rid: number): unknown[][] => {
@@ -221,21 +221,9 @@ async function server() {
     for (const m of of(session, rid)) if (m.kind === 'batch') for (let i = 0; i < m.length; i++) out.push(m.cols.map((c) => columnValue(c, i)));
     return out;
   };
-  send(EngineServer.LOCAL, { op: 'open', name: 'db', storage: 'opfs' });
-  await settle();
-  return { db, srv, readers, send, settle, of, kinds, rows };
-}
-
-/**
- * Wait until `done()` holds (polling): server responses arrive after reader callbacks and
- * scheduling ticks, whose timing varies with machine load (fixed sleeps flaked on CI).
- */
-async function until(what: string, done: () => boolean, ms = 8000): Promise<void> {
-  const end = Date.now() + ms;
-  while (!done()) {
-    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
-    await new Promise((r) => setTimeout(r, 5));
-  }
+  const open = send(EngineServer.LOCAL, { op: 'open', name: 'db', storage: 'opfs' });
+  await until('open', () => kinds(EngineServer.LOCAL, open).length > 0);
+  return { db, srv, readers, send, of, kinds, rows };
 }
 
 const AGG = 'SELECT g, count(*), sum(x) FROM t GROUP BY g ORDER BY g';
