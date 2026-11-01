@@ -298,7 +298,7 @@ export class Database implements FunctionContext {
    */
   usesMemoryObjects(parsed: ParsedStatement): boolean {
     if (parsed.stmt.kind === 'pragma') return true;
-    if (this.tempTables.size === 0 && this.memViews.size === 0) return false;
+    if (this.tempTables.size === 0 && this.memViews.size === 0 && this.tempViews.size === 0) return false;
     const seen = new Set<string>();
     const walk = (x: unknown): boolean => {
       if (Array.isArray(x)) return x.some(walk);
@@ -308,6 +308,7 @@ export class Database implements FunctionContext {
         const lower = o.name.toLowerCase();
         const t = this.tables.get(lower);
         if (t && t.rootPage >= MEM_BASE) return true;
+        if (!o.schema && this.tempViews.has(lower)) return true; // TEMP views exist in this connection only
         const v = this.getView(lower);
         if (v && !seen.has(lower)) {
           seen.add(lower);
@@ -569,7 +570,8 @@ export class Database implements FunctionContext {
       // The partial aggregates being merged (morsel parallelism).
       const m = this.morsel;
       const columns = [...Array.from({ length: m.keys }, (_, i) => `k${i}`), ...Array.from({ length: m.width - m.keys }, (_, i) => `a${i}`)];
-      return { columns: columns.map((c) => ({ name: c, type: 'any' as StaticType })), rows: () => m.rows };
+      // Typed like the partial query's columns: a REAL partial (max(x) = 2.0) stays REAL when merged.
+      return { columns: columns.map((c, i) => ({ name: c, type: m.types[i] ?? ('any' as StaticType) })), rows: () => m.rows };
     }
     if (schema === 'information_schema') {
       const vt = informationSchema(name, this.catalogSnapshot());
@@ -598,7 +600,7 @@ export class Database implements FunctionContext {
 
   private catalogSnapshot(): CatalogSnapshot {
     return {
-      tables: [...this.tables.values()],
+      tables: [...this.tables.values(), ...this.shadowedMain.values()],
       views: [...this.views.values()].map((v) => ({ name: v.name, sql: v.sql, selectPos: v.select.pos })),
       viewColumns: (name) => {
         const v = this.views.get(name.toLowerCase());
@@ -1003,6 +1005,8 @@ export class Database implements FunctionContext {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     if (stmt.temp || stmt.schema?.toLowerCase() === 'temp') throw new SmaltError('SMALT_ERROR', 'materialized views cannot be temporary');
     if (stmt.ifNotExists && this.catalog.get(stmt.name.toLowerCase())?.type === 'matview') return none;
+    const tempDep = this.tempDependency(stmt.select);
+    if (tempDep) throw new SmaltError('SMALT_ERROR', `materialized view ${stmt.name} cannot reference TEMP object ${tempDep}`);
     const opts = stmt.with ?? {};
     for (const k of Object.keys(opts)) if (k !== 'storage' && k !== 'refresh' && k !== 'location') throw new SmaltError('SMALT_ERROR', `unknown materialized view option: ${k}`);
     const location = String(opts.location ?? 'file').toLowerCase();
@@ -1231,7 +1235,8 @@ export class Database implements FunctionContext {
       // A TEMP table or view shadowing something the view read: the query's names mean the temp object.
       const deps = (m.deps ??= this.selectDeps(m.select));
       if ([...deps].some((d) => this.tempTables.has(d) || this.tempViews.has(d))) continue;
-      views.push({ name: t.name, select: m.select, columns: t.columns.map((c) => c.name) });
+      const from = m.select.core.kind === 'select' && m.select.core.from?.kind === 'table' ? this.getTable(m.select.core.from.name, m.select.core.from.schema) : undefined;
+      views.push({ name: t.name, select: m.select, columns: t.columns.map((c) => c.name), baseColumns: from ? from.columns.map((c) => c.name) : [] });
     }
     if (views.length === 0) return null;
     const m = matchMatview(stmt, text, views, (name) => {
@@ -1252,7 +1257,7 @@ export class Database implements FunctionContext {
   private parallelAggregates = true;
   private morselCache = new Map<string, { version: number; parsed: ParsedStatement; q: MorselQuery } | null>();
   /** Partial rows being merged: the `smalt_partials()` source of the merge query. */
-  private morsel: { rows: SqlValue[][]; keys: number; width: number } | null = null;
+  private morsel: { rows: SqlValue[][]; keys: number; width: number; types: StaticType[] } | null = null;
 
   private morselQuery(sql: string): { parsed: ParsedStatement; q: MorselQuery } | null {
     const hit = this.morselCache.get(sql);
@@ -1363,7 +1368,8 @@ export class Database implements FunctionContext {
   mergePartials(sql: string, params: BindParams | undefined, partials: SqlValue[][]): QueryResult {
     const m = this.morselQuery(sql);
     if (!m) throw new SmaltError('SMALT_ERROR', 'statement cannot run as partial aggregates');
-    this.morsel = { rows: partials, keys: m.q.final.core.kind === 'select' ? m.q.final.core.groupBy.length : 0, width: m.q.width };
+    const types = new Statement(this, { ...m.parsed, stmt: m.q.partial(0, 1) }, sql).columnTypes;
+    this.morsel = { rows: partials, keys: m.q.keyCount, width: m.q.width, types };
     try {
       const st = new Statement(this, { ...m.parsed, stmt: m.q.final }, sql);
       return { columns: st.columns, rows: st.all(params) as SqlValue[][] };
@@ -1718,12 +1724,18 @@ export class Database implements FunctionContext {
   /** ANALYZE [table]: gather optimizer statistics and store them in smalt_stat. */
   private analyze(target: string | undefined): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
-    let tables = [...this.tables.values()].filter((t) => !t.system && t.name.toLowerCase() !== 'smalt_stat' && t.matview?.storage !== 'columnar' && !t.columnar);
+    // Main tables only (shadowed ones included): statistics are stored in the file, keyed by name.
+    const mainTables = [...this.tables.values(), ...this.shadowedMain.values()].filter((t) => !t.temp);
+    let tables = mainTables.filter((t) => !t.system && t.name.toLowerCase() !== 'smalt_stat' && t.matview?.storage !== 'columnar' && !t.columnar);
     if (target) {
-      const t = this.tables.get(target.toLowerCase());
+      const t = this.getTable(target, 'main');
       const idx = this.indexes.get(target.toLowerCase());
+      if (!t && this.tempTables.has(target.toLowerCase())) return none; // TEMP tables are not analyzed
       if (t) tables = t.matview?.storage === 'columnar' || t.columnar ? [] : [t];
-      else if (idx) tables = [this.tables.get(idx.table.toLowerCase())!];
+      else if (idx) {
+        const owner = this.tables.get(idx.table.toLowerCase())!;
+        tables = owner.temp ? [] : [owner];
+      }
       else throw new SmaltError('SMALT_ERROR', `no such table or index: ${target}`);
     }
     if (!this.tables.has('smalt_stat')) {
@@ -1788,7 +1800,7 @@ export class Database implements FunctionContext {
       for (let ok = c.first(); ok; ok = c.next()) {
         c.loadValue();
         reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
-        const tbl = this.tables.get(String(reader.column(0)).toLowerCase());
+        const tbl = this.getTable(String(reader.column(0)), 'main');
         const idxName = reader.column(1);
         const json = reader.column(2);
         if (!tbl || typeof json !== 'string') continue;
@@ -1817,9 +1829,18 @@ export class Database implements FunctionContext {
     if (existing) throw new SmaltError('SMALT_ERROR', `${existing.type === kind ? kind : existing.type} ${name} already exists`);
   }
 
+  /** A TEMP table or view that `select` reads (directly or through views), if any. */
+  private tempDependency(select: SelectStmt): string | undefined {
+    if (this.tempTables.size === 0 && this.tempViews.size === 0) return undefined;
+    return [...this.selectDeps(select)].find((d) => this.tempTables.has(d) || this.tempViews.has(d));
+  }
+
   private createView(stmt: CreateViewStmt, sql: string): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
-    if (stmt.temp || stmt.schema?.toLowerCase() === 'temp') {
+    // A view over TEMP objects is itself TEMP (as in SQLite); asked for in main, it is an error.
+    const tempDep = stmt.temp || stmt.schema?.toLowerCase() === 'temp' ? undefined : this.tempDependency(stmt.select);
+    if (tempDep && stmt.schema?.toLowerCase() === 'main') throw new SmaltError('SMALT_ERROR', `view ${stmt.name} cannot reference TEMP object ${tempDep}`);
+    if (stmt.temp || stmt.schema?.toLowerCase() === 'temp' || tempDep) {
       const lower = stmt.name.toLowerCase();
       if (this.tempViews.has(lower)) {
         if (stmt.ifNotExists) return none;
@@ -1916,7 +1937,11 @@ export class Database implements FunctionContext {
     if (table.columnar) throw new SmaltError('SMALT_UNSUPPORTED', `columnar table ${table.name} cannot be indexed (zone maps prune its scans)`);
     if (table.temp) {
       if (this.indexes.has(stmt.name.toLowerCase())) throw new SmaltError('SMALT_ERROR', `index ${stmt.name} already exists`);
-    } else this.checkNewName(stmt.name, 'index');
+    } else {
+      this.checkNewName(stmt.name, 'index');
+      // One namespace with TEMP indexes too (DROP INDEX resolves names through it).
+      if (this.indexes.has(stmt.name.toLowerCase())) throw new SmaltError('SMALT_ERROR', `index ${stmt.name} already exists`);
+    }
     this.dirtySchema = !table.temp;
     // A temp index changes in-memory schema only: if anything below fails (a UNIQUE violation), the
     // statement's failure path must restore the temp maps along with the rolled-back pages.
@@ -2218,8 +2243,10 @@ export class Database implements FunctionContext {
     if (this.views.has(lower)) {
       throw new SmaltError('SMALT_ERROR', stmt.action.kind === 'addColumn' ? 'Cannot add a column to a view' : `view ${stmt.table} may not be altered`);
     }
-    const table = this.tables.get(lower);
+    const table = this.getTable(lower, stmt.schema);
     if (!table) throw new SmaltError('SMALT_ERROR', `no such table: ${stmt.table}`);
+    // TEMP tables have no catalog rows for ALTER to rewrite (main.t reaches a shadowed main table).
+    if (table.temp) throw new SmaltError('SMALT_UNSUPPORTED', `ALTER TABLE is not supported for TEMP table ${table.name}`);
     if (table.matview) throw new SmaltError('SMALT_ERROR', `materialized view ${table.name} may not be altered`);
     if (table.columnar) throw new SmaltError('SMALT_UNSUPPORTED', `ALTER TABLE is not supported for columnar table ${table.name} yet`);
     this.objectChanged(table.name);
@@ -3180,7 +3207,8 @@ export class Database implements FunctionContext {
             }
           };
           let pages = 1 + check(this.pager.catalogRoot, 'smalt_schema');
-          for (const t of this.tables.values()) {
+          // Main tables shadowed by a TEMP table of the same name still own their pages.
+          for (const t of [...this.tables.values(), ...this.shadowedMain.values()]) {
             pages += check(t.rootPage, `table ${t.name}`);
             if (t.columnar) {
               pages += check(t.columnar.segRoot, `segments of ${t.name}`);

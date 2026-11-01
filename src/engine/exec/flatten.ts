@@ -193,7 +193,9 @@ function expand(select: SelectStmt, columnNames: string[] | undefined, refName: 
   const rename = (e: Expr | undefined): Expr | undefined => (e ? mapColumns(e, qualify, () => decline()) : undefined);
   const outLinks: Link[] = links.map((l, i) => {
     if (hasSubquery(l.on)) decline();
-    const item: TableRef = { kind: 'table', schema: 'main', name: leaves[i].table.name, alias: leaves[i].alias, pos: l.item.pos, end: l.item.end };
+    // Qualified (an outer CTE of the same name must not capture it) with the schema of the table the
+    // view resolved to: a TEMP table and a main table may share the name.
+    const item: TableRef = { kind: 'table', schema: leaves[i].table.temp ? 'temp' : 'main', name: leaves[i].table.name, alias: leaves[i].alias, pos: l.item.pos, end: l.item.end };
     return { item, joinType: l.joinType, on: rename(l.on) };
   });
   // Output columns (expanding * and t.*).

@@ -132,6 +132,15 @@ export function analyzeMorsels(stmt: SelectStmt, text: string, info: (table: str
     if (!ok) return null;
   }
   const keyIndex = new Map(keys.map((k, i) => [exprKey(k), i]));
+  // The rowid range filter needs a rowid name no user column has taken.
+  const rowidName = ['rowid', '_rowid_', 'oid'].find((n) => !t.hasColumn(n));
+  if (rowidName === undefined) return null;
+  /** min/max merge by BINARY comparison: an argument compared with another collation cannot be merged. */
+  const binaryArg = (x: Expr): boolean => {
+    if (x.kind === 'collate') return x.collation.toLowerCase() === 'binary';
+    if (x.kind === 'column') return t.binaryColumn(x.name);
+    return true; // expressions other than a column carry BINARY collation
+  };
 
   const aliases = new Set(core.columns.flatMap((c) => (c.kind === 'expr' && c.alias ? [c.alias.toLowerCase()] : [])));
   // Partial columns: keys, then each distinct aggregate's inputs.
@@ -139,8 +148,13 @@ export function analyzeMorsels(stmt: SelectStmt, text: string, info: (table: str
   const aggIndex = new Map<string, Expr>();
   let hasAggregate = false;
 
-  /** Rewrite an expression of the output for the merge query; null when it cannot be merged. */
-  const rewrite = (e: Expr, allowAlias: boolean): Expr | null => {
+  /**
+   * Rewrite an expression of the output for the merge query; null when it cannot be merged.
+   * `names`: how a bare name resolves: 'select' (columns only), 'having' (a table column before an
+   * output alias, as the planner resolves it) or 'order' (an output alias first).
+   */
+  const rewrite = (e: Expr, names: 'select' | 'having' | 'order'): Expr | null => {
+    const allowAlias = names !== 'select';
     const ki = keyIndex.get(exprKey(e));
     if (ki !== undefined) return { ...col(`k${ki}`), pos: e.pos, end: e.end };
     const a = aggregateCall(e);
@@ -149,6 +163,7 @@ export function analyzeMorsels(stmt: SelectStmt, text: string, info: (table: str
       const key = exprKey(a);
       let merged = aggIndex.get(key);
       if (merged === undefined) {
+        if ((a.name === 'min' || a.name === 'max') && !binaryArg(a.args[0])) return null;
         const add = (x: Expr): ColumnExpr => {
           partialCols.push(x);
           return col(`a${partialCols.length - keys.length - 1}`);
@@ -159,7 +174,8 @@ export function analyzeMorsels(stmt: SelectStmt, text: string, info: (table: str
           const n = add(filtered(call('count', a.args)));
           merged = { kind: 'binary', op: '/', left: call('total', [s]), right: call('sum', [n]), ...NO_POS } as Expr;
         } else if (a.name === 'count') {
-          merged = call('sum', [add(a)]);
+          // Merged over zero partial rows (an empty MV roll-up), sum() is NULL: a count is 0.
+          merged = call('coalesce', [call('sum', [add(a)]), lit(0)]);
         } else {
           merged = call(a.name, [add(a)]);
         }
@@ -169,7 +185,8 @@ export function analyzeMorsels(stmt: SelectStmt, text: string, info: (table: str
     }
     if (e.kind === 'column') {
       // An output alias (HAVING / ORDER BY may name one); any other column is a bare column.
-      return allowAlias && !e.table && aliases.has(e.name.toLowerCase()) ? e : null;
+      if (!allowAlias || e.table || !aliases.has(e.name.toLowerCase())) return null;
+      return names === 'having' && t.hasColumn(e.name) ? null : e;
     }
     // Any other aggregate (group_concat, string_agg, json_group_*, …) cannot be merged from partials,
     // whatever its arguments: over constants or keys it would run once per partial row, not per row.
@@ -186,20 +203,20 @@ export function analyzeMorsels(stmt: SelectStmt, text: string, info: (table: str
       if (Array.isArray(v)) {
         out[k] = v.map((x) => {
           if (isExpr(x)) {
-            const r = rewrite(x, allowAlias);
+            const r = rewrite(x, names);
             if (r === null) failed = true;
             return r;
           }
           if (x && typeof x === 'object' && 'when' in x && 'then' in x) {
-            const w = rewrite((x as { when: Expr }).when, allowAlias);
-            const th = rewrite((x as { then: Expr }).then, allowAlias);
+            const w = rewrite((x as { when: Expr }).when, names);
+            const th = rewrite((x as { then: Expr }).then, names);
             if (w === null || th === null) failed = true;
             return { when: w, then: th };
           }
           return x;
         });
       } else if (isExpr(v)) {
-        const r = rewrite(v, allowAlias);
+        const r = rewrite(v, names);
         if (r === null) failed = true;
         out[k] = r;
       } else out[k] = v;
@@ -210,14 +227,14 @@ export function analyzeMorsels(stmt: SelectStmt, text: string, info: (table: str
   const finalColumns: ResultColumn[] = [];
   for (const rc of core.columns) {
     if (rc.kind !== 'expr') return null;
-    const r = rewrite(rc.expr, false);
+    const r = rewrite(rc.expr, 'select');
     if (r === null) return null;
     const name = rc.alias ?? (rc.expr.kind === 'column' ? rc.expr.name : text.slice(rc.expr.pos, rc.expr.end));
     finalColumns.push({ ...rc, expr: r, alias: name });
   }
   let having: Expr | undefined;
   if (core.having) {
-    const r = rewrite(core.having, true);
+    const r = rewrite(core.having, 'having');
     if (r === null) return null;
     having = r;
   }
@@ -227,7 +244,7 @@ export function analyzeMorsels(stmt: SelectStmt, text: string, info: (table: str
       orderBy.push(o);
       continue;
     }
-    const r = rewrite(o.expr, true);
+    const r = rewrite(o.expr, 'order');
     if (r === null) return null;
     orderBy.push({ ...o, expr: r });
   }
@@ -249,8 +266,8 @@ export function analyzeMorsels(stmt: SelectStmt, text: string, info: (table: str
     const range: Expr = {
       kind: 'binary',
       op: 'AND',
-      left: { kind: 'binary', op: '>=', left: col('rowid'), right: lit(lo), ...NO_POS } as Expr,
-      right: { kind: 'binary', op: '<', left: col('rowid'), right: lit(hi), ...NO_POS } as Expr,
+      left: { kind: 'binary', op: '>=', left: col(rowidName), right: lit(lo), ...NO_POS } as Expr,
+      right: { kind: 'binary', op: '<', left: col(rowidName), right: lit(hi), ...NO_POS } as Expr,
       ...NO_POS,
     } as Expr;
     const where: Expr = core.where ? ({ kind: 'binary', op: 'AND', left: core.where, right: range, ...NO_POS } as Expr) : range;

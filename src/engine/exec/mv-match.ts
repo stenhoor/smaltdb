@@ -28,6 +28,11 @@ export interface MatviewCandidate {
   select: SelectStmt;
   /** The view's column names, in order. */
   columns: string[];
+  /**
+   * The base table's column names, in order. A `SELECT *` view holds them under the view's column
+   * names, which differ when the view renames them (`CREATE MATERIALIZED VIEW v(x, y) AS SELECT * …`).
+   */
+  baseColumns: string[];
 }
 
 /** Copy of `x` with column qualifiers removed and column names lower-cased (single-table queries). */
@@ -224,8 +229,9 @@ function project(nq: SelectStmt, query: SelectStmt, v: MatviewCandidate, nv: Sel
   const map = new Map<string, string>();
   for (let i = 0; i < nv.columns.length; i++) {
     const rc = nv.columns[i];
-    if (rc.kind === 'star') {
-      for (const c of v.columns) map.set(exprKey({ kind: 'column', name: c.toLowerCase(), ...NO_POS }), c);
+    if (rc.kind === 'star' || rc.kind === 'tableStar') {
+      if (v.baseColumns.length !== v.columns.length) return null;
+      v.baseColumns.forEach((c, j) => map.set(exprKey({ kind: 'column', name: c.toLowerCase(), ...NO_POS }), v.columns[j]));
       continue;
     }
     if (rc.kind !== 'expr' || rc.expr.kind !== 'column') return null;
@@ -237,9 +243,10 @@ function project(nq: SelectStmt, query: SelectStmt, v: MatviewCandidate, nv: Sel
   for (let i = 0; i < qc.columns.length; i++) {
     const rc = qc.columns[i];
     if (rc.kind !== 'expr') {
-      // `*` over the view is the table's columns only if the view has all of them in order.
-      if (!(nv.columns.length === 1 && nv.columns[0].kind === 'star')) return null;
-      columns.push(rc);
+      // `*` / `t.*` over the view is the table's columns only if the view has all of them in order.
+      // Spelled out, so the view's (possibly renamed) columns come back under the table's names.
+      if (!(nv.columns.length === 1 && nv.columns[0].kind !== 'expr') || v.baseColumns.length !== v.columns.length) return null;
+      v.baseColumns.forEach((c, j) => columns.push({ kind: 'expr' as const, expr: { kind: 'column' as const, name: v.columns[j], ...NO_POS }, alias: c, ...NO_POS }));
       continue;
     }
     const r = remap(rc.expr, map);
