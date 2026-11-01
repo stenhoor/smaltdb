@@ -1,4 +1,16 @@
 import type { TableStats } from './stats.js';
+import { flattenCore } from './flatten.js';
+
+let flattenOff: boolean | undefined;
+/** SMALT_NO_FLATTEN=1 disables query flattening (tests compare both paths). */
+function flattenDisabledCheck(): boolean {
+  if (flattenOff === undefined) {
+    const g = globalThis as { process?: { env?: Record<string, string | undefined> } };
+    flattenOff = !!g.process?.env?.SMALT_NO_FLATTEN;
+  }
+  return flattenOff;
+}
+const flatteningDisabled = flattenDisabledCheck;
 import { SmaltError } from '../errors.js';
 import { type TableSchema, findColumn } from '../catalog/schema.js';
 import type {
@@ -65,6 +77,8 @@ import {
 
 export interface PlannerEnv {
   getTable(name: string): TableSchema | undefined;
+  /** A view's definition, expanded where the view is referenced. */
+  getView?(name: string): { name: string; sql: string; columns?: string[]; select: SelectStmt } | undefined;
   openTree(rootPage: number): BTree;
   /** On-demand statistics for a table without ANALYZE results (sampled; cached by the database). */
   sampledStats?(table: TableSchema): TableStats | undefined;
@@ -310,15 +324,18 @@ export class Planner {
     if (stmt.with) this.registerCtes(stmt.with, withScope);
     const base = stmt.with ? withScope : parent;
 
-    if (stmt.compound.length === 0) return this.planCoreWithOrder(stmt.core, stmt, base, outRegs);
+    if (stmt.compound.length === 0) {
+      const f = this.flatten(stmt.core, stmt.orderBy, base);
+      return this.planCoreWithOrder(f.core, f.changed ? { ...stmt, core: f.core, orderBy: f.orderBy } : stmt, base, outRegs);
+    }
 
     // Compound: every core writes the same registers.
-    const first = this.planCore(stmt.core, base, outRegs, null);
+    const first = this.planCore(this.flatten(stmt.core, [], base).core, base, outRegs, null);
     const regs = first.outRegs;
     let root: Operator = first.root;
     let correlated = first.correlated;
     for (const c of stmt.compound) {
-      const next = this.planCore(c.core, base, regs, null);
+      const next = this.planCore(this.flatten(c.core, [], base).core, base, regs, null);
       if (next.outRegs.length !== regs.length) {
         throw new SmaltError('SMALT_ERROR', `SELECTs to the left and right of ${c.op} do not have the same number of result columns`);
       }
@@ -334,6 +351,17 @@ export class Planner {
     }
     root = this.applyLimit(root, stmt, base);
     return { root, outRegs: regs, columns: first.columns, correlated };
+  }
+
+  /** Merge simple views / FROM subqueries into the core (see flatten.ts). */
+  private flatten(core: SelectCore, orderBy: OrderingTerm[], scope: Scope | null): { core: SelectCore; orderBy: OrderingTerm[]; changed: boolean } {
+    if (core.kind !== 'select' || !core.from || flatteningDisabled()) return { core, orderBy, changed: false };
+    return flattenCore(core, orderBy, {
+      getTable: (n) => this.env.getTable(n),
+      getView: (n) => this.env.getView?.(n),
+      isCte: (n) => scope?.findCte(n) !== undefined,
+      text: this.sqlText,
+    });
   }
 
   private registerCtes(w: WithClause, scope: Scope): void {
@@ -957,20 +985,45 @@ export class Planner {
   private addSource(item: FromItem, joinType: JoinType, scope: Scope): void {
     const position = scope.sources.length;
     if (item.kind === 'function') throw new SmaltError('SMALT_UNSUPPORTED', `table-valued function ${item.name}() is not supported yet`);
-    if (item.kind === 'subquery' || (item.kind === 'table' && !item.schema && scope.findCte(item.name))) {
+    const view =
+      item.kind === 'table' && (!item.schema || item.schema.toLowerCase() === 'main') && !(!item.schema && scope.findCte(item.name)) && !this.env.getTable(item.name)
+        ? this.env.getView?.(item.name)
+        : undefined;
+    if (item.kind === 'subquery' || view || (item.kind === 'table' && !item.schema && scope.findCte(item.name))) {
       let select: SelectStmt;
       let names: string[] | undefined;
       let alias: string | undefined;
+      let sub: QueryPlan;
       if (item.kind === 'subquery') {
         select = item.select;
         alias = item.alias;
+        sub = this.planSelect(select, scope.parent, undefined);
+      } else if (view) {
+        // A view body sees only the schema (not the referencing query's CTEs or columns).
+        const key = view.name.toLowerCase();
+        if (this.expandingViews.has(key)) throw new SmaltError('SMALT_ERROR', `view ${view.name} is circularly defined`);
+        this.expandingViews.add(key);
+        // Result-column names come from the view's own SQL text.
+        const outerText = this.sqlText;
+        this.sqlText = view.sql;
+        try {
+          sub = this.planSelect(view.select, null, undefined);
+        } finally {
+          this.sqlText = outerText;
+          this.expandingViews.delete(key);
+        }
+        names = view.columns;
+        alias = (item as { alias?: string }).alias ?? (item as { name: string }).name;
+        if (names && names.length !== sub.columns.length) {
+          throw new SmaltError('SMALT_ERROR', `expected ${names.length} columns for '${view.name}' but got ${sub.columns.length}`);
+        }
       } else {
-        const cte = scope.findCte(item.name)!;
+        const cte = scope.findCte((item as { name: string }).name)!;
         select = cte.select;
         names = cte.columns;
-        alias = item.alias ?? item.name;
+        alias = (item as { alias?: string }).alias ?? (item as { name: string }).name;
+        sub = this.planSelect(select, scope.parent, undefined);
       }
-      const sub = this.planSelect(select, scope.parent, undefined);
       if (sub.correlated) scope.correlated = true;
       if (names && names.length !== sub.columns.length) {
         throw new SmaltError('SMALT_ERROR', `table ${alias} has ${sub.columns.length} values for ${names.length} columns`);
@@ -1229,6 +1282,9 @@ export class Planner {
     }
     return src.estRows;
   }
+
+  /** Views being expanded (detects circular definitions). */
+  private readonly expandingViews = new Set<string>();
 
   /** Planner row estimates per operator (per loop for inner sides), shown by EXPLAIN ANALYZE. */
   readonly estimates = new WeakMap<Operator, number>();

@@ -27,6 +27,10 @@ or when statistics drift by more than a threshold.
 - Subquery decorrelation (`EXISTS`/`IN`/scalar subqueries become semi/anti/outer joins)
 - Outer-to-inner join conversion when null-rejecting predicates allow it
 - View and CTE inlining (non-recursive, single-reference CTEs)
+- **Subquery/view flattening** (implemented in M4, `src/engine/exec/flatten.ts`): a view or FROM subquery whose body is a plain
+  projection/filter/join over tables is merged into the outer query. Its tables are renamed to unique aliases, its WHERE
+  is ANDed in (into the ON clause for a single-table LEFT JOIN source), and outer references are replaced by its column
+  expressions. Anything else, or anything ambiguous, is planned as a sub-plan. `SMALT_NO_FLATTEN=1` disables it for tests.
 - Transitive predicate inference (`a=b AND b=5` ⇒ `a=5`)
 - `LIMIT` pushdown and Top-N conversion (`ORDER BY … LIMIT k` becomes a heap)
 - **Materialized-view matching**: rewrite queries to read from a matching MV (post-v1)

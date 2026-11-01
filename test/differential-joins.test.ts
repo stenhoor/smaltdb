@@ -225,3 +225,116 @@ describe('differential multi-table joins vs SQLite', () => {
     }
   }
 });
+
+// ------------------------------------------------------------------ views and derived tables (flattening)
+
+const VIEWS = `
+  CREATE VIEW v_big AS SELECT id, k, g AS grp, s FROM big WHERE k IS NOT NULL;
+  CREATE VIEW v_join AS SELECT m.id AS mid, b.k, m.h, b.s FROM mid m JOIN big b ON b.id = m.big_id;
+  CREATE VIEW v_left AS SELECT s.id, s.h, s.name, t.label FROM small s LEFT JOIN tiny t ON t.g = s.h;
+  CREATE VIEW v_agg AS SELECT g, count(*) AS n FROM big GROUP BY g;
+  CREATE VIEW v_star AS SELECT * FROM small WHERE id > 3;
+  CREATE VIEW v_v(a, b) AS SELECT k, grp FROM v_big WHERE grp < 4;
+`;
+
+const VREL: Record<string, { num: string[]; text: string[] }> = {
+  big: { num: ['id', 'k', 'g'], text: ['s'] },
+  mid: { num: ['id', 'big_id', 'h'], text: ['t'] },
+  small: { num: ['id', 'h'], text: ['name'] },
+  tiny: { num: ['g'], text: ['label'] },
+  v_big: { num: ['id', 'k', 'grp'], text: ['s'] },
+  v_join: { num: ['mid', 'k', 'h'], text: ['s'] },
+  v_left: { num: ['id', 'h'], text: ['name', 'label'] },
+  v_agg: { num: ['g', 'n'], text: [] },
+  v_star: { num: ['id', 'h'], text: ['name'] },
+  v_v: { num: ['a', 'b'], text: [] },
+};
+
+function genViewQuery(r: () => number): string {
+  const n = 1 + Math.floor(r() * 3);
+  const names = Object.keys(VREL);
+  const rels = Array.from({ length: n }, (_, i) => {
+    const kind = r();
+    const table = pick(r, names);
+    // Sometimes wrap a relation in a FROM subquery.
+    const src = kind < 0.2 ? `(SELECT * FROM ${table} WHERE ${pick(r, VREL[table].num)} IS NOT NULL)` : table;
+    return { alias: `q${i}`, table, src, ...VREL[table] };
+  });
+  let sql = `FROM ${rels[0].src} ${rels[0].alias}`;
+  const where: string[] = [];
+  for (let i = 1; i < n; i++) {
+    const x = rels[i];
+    const p = rels[Math.floor(r() * i)];
+    const pred = `${p.alias}.${pick(r, p.num)} = ${x.alias}.${pick(r, x.num)}`;
+    const k = r();
+    if (k < 0.4) sql += ` JOIN ${x.src} ${x.alias} ON ${pred}`;
+    else if (k < 0.7) sql += ` LEFT JOIN ${x.src} ${x.alias} ON ${pred}`;
+    else {
+      sql += `, ${x.src} ${x.alias}`;
+      where.push(pred);
+    }
+  }
+  if (r() < 0.7) {
+    const x = pick(r, rels);
+    where.push(`${x.alias}.${pick(r, x.num)} ${pick(r, ['<', '>', '=', '!=', 'IS NOT'])} ${r() < 0.15 ? 'NULL' : Math.floor(r() * 12)}`);
+  }
+  const w = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+  const k = r();
+  if (k < 0.2) return `SELECT count(*) ${sql}${w}`;
+  if (k < 0.35) return `SELECT * ${sql}${w}`;
+  if (k < 0.5) {
+    const x = rels[0];
+    const col = pick(r, x.num);
+    return `SELECT ${x.alias}.${col}, count(*) ${sql}${w} GROUP BY ${x.alias}.${col}`;
+  }
+  const proj = rels.flatMap((x) => [`${x.alias}.${x.num[0]}`, ...(x.text.length ? [`${x.alias}.${pick(r, x.text)}`] : [])]);
+  // Unqualified references exercise name resolution through flattened views.
+  if (n === 1 && r() < 0.5) return `SELECT ${rels[0].num.join(', ')} ${sql}${w}`;
+  return `SELECT ${proj.join(', ')} ${sql}${w}`;
+}
+
+describe('differential views and FROM subqueries vs SQLite', () => {
+  const total = Number(process.env.DIFF_VIEWS ?? 600);
+  for (let s = 1; s <= 2; s++) {
+    it(`view queries agree with SQLite (seed ${s})`, () => {
+      const r = rng(s * 7907);
+      const lite = new sqlite3.oo1.DB(':memory:');
+      const smalt = Database.openFile(new MemoryVfs().openSync('d.db'));
+      lite.exec(SCHEMA + VIEWS);
+      smalt.exec(SCHEMA.replaceAll(' STRICT', '') + VIEWS);
+      for (const q of buildData(r)) {
+        lite.exec(q);
+        smalt.exec(q);
+      }
+      const failures: string[] = [];
+      let compared = 0;
+      for (let i = 0; i < Math.ceil(total / 2) && failures.length < 5; i++) {
+        const sql = genViewQuery(r);
+        let a: unknown[][] | Error;
+        let b: SqlValue[][] | Error;
+        try {
+          a = lite.selectArrays(sql);
+        } catch (e) {
+          a = e as Error;
+        }
+        try {
+          b = smalt.query(sql).rows;
+        } catch (e) {
+          b = e as Error;
+        }
+        if (a instanceof Error || b instanceof Error) {
+          if (a instanceof Error && b instanceof Error) continue;
+          failures.push(`${sql}\n  sqlite: ${a instanceof Error ? 'ERROR ' + a.message : a.length + ' rows'}\n  smalt:  ${b instanceof Error ? 'ERROR ' + b.message : b.length + ' rows'}`);
+          continue;
+        }
+        compared++;
+        const ca = a.map((row) => row.map(canon).join('|')).sort();
+        const cb = b.map((row) => row.map(canon).join('|')).sort();
+        if (ca.length !== cb.length || ca.some((x, j) => x !== cb[j])) failures.push(`${sql}\n  rows sqlite=${ca.length} smalt=${cb.length}\n  e.g. sqlite ${ca.find((x) => !cb.includes(x))} smalt ${cb.find((x) => !ca.includes(x))}`);
+      }
+      if (failures.length) throw new Error(`${failures.length} mismatches:\n\n${failures.join('\n\n')}`);
+      expect(compared).toBeGreaterThan(total / 4);
+    }, 60_000);
+  }
+});
+

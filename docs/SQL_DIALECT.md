@@ -92,6 +92,10 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
   `DELETE` (with a truncate fast path).
 - `CREATE` / `DROP TABLE` (`IF [NOT] EXISTS`, `INTEGER PRIMARY KEY` rowid alias, `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`,
   `CHECK`, `COLLATE`), `CREATE [UNIQUE] INDEX` (multi-column, `ASC`/`DESC`, collations), and `DROP INDEX`.
+- `CREATE VIEW [IF NOT EXISTS] name [(columns)] AS select` and `DROP VIEW [IF EXISTS]` (M4). As in SQLite, a view's body is
+  resolved when the view is used, not when it is created, and views cannot be modified or indexed. Simple views and FROM
+  subqueries (no aggregates, DISTINCT, LIMIT, ORDER BY, compound, window functions or subquery expressions) are flattened
+  into the referencing query, so their tables join and use indexes like tables written out directly.
 - `BEGIN` / `COMMIT` / `ROLLBACK`, `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` (M2), with statement-level atomicity inside transactions.
 - `EXPLAIN QUERY PLAN`, `EXPLAIN ANALYZE` (SELECT; estimated vs actual rows, loops and time per operator), and `ANALYZE [table]`
   (statistics in `smalt_stat`; M3); `PRAGMA table_info / index_list / index_info / page_size / page_count / freelist_count /
@@ -104,7 +108,7 @@ losslessly as SQLite STRICT tables do (`'5'` into an INTEGER column becomes 5), 
 `cannot store TEXT value in INTEGER column t.c`.
 
 **Not yet supported** (each gives a clear `SMALT_UNSUPPORTED` error): `WITH RECURSIVE`, window functions, `RIGHT` / `FULL` joins,
-views and materialized views (M4/M5), `RETURNING`, upsert (`ON CONFLICT ... DO`), `UPDATE ... FROM`, `ALTER TABLE`, expression and
+TEMP views, materialized views (M5), `RETURNING`, upsert (`ON CONFLICT ... DO`), `UPDATE ... FROM`, `ALTER TABLE`, expression and
 partial indexes, `INCLUDE` columns, `WITHOUT ROWID`, `LOOSE` tables, generated columns, TEMP tables, date/time and JSON
 functions, and `VACUUM`. Plain `EXPLAIN` returns the `EXPLAIN QUERY PLAN` output (there is no bytecode to list). Foreign keys are parsed and stored but not yet enforced (M4).
 

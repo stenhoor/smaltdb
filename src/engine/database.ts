@@ -18,6 +18,7 @@ import { type ConflictMode, TableWriter } from './exec/write.js';
 import type {
   CreateIndexStmt,
   CreateTableStmt,
+  CreateViewStmt,
   DeleteStmt,
   DropStmt,
   Expr,
@@ -60,8 +61,16 @@ export interface DatabaseOptions extends PagerOptions {
 const CATALOG_SQL = 'CREATE TABLE smalt_schema(type TEXT, name TEXT, tbl_name TEXT, rootpage INTEGER, sql TEXT)';
 const CATALOG_NAMES = new Set(['smalt_schema', 'sqlite_schema', 'sqlite_master']);
 
+/** A view: its defining SELECT, expanded by the planner wherever the view is referenced. */
+export interface ViewSchema {
+  name: string;
+  sql: string;
+  columns?: string[];
+  select: SelectStmt;
+}
+
 interface CatalogEntry {
-  type: 'table' | 'index';
+  type: 'table' | 'index' | 'view';
   name: string;
   rowid: number | bigint;
 }
@@ -93,6 +102,7 @@ export class Database implements FunctionContext {
   private readonly tables = new Map<string, TableSchema>();
   private readonly indexes = new Map<string, IndexSchema>();
   private readonly catalog = new Map<string, CatalogEntry>();
+  private readonly views = new Map<string, ViewSchema>();
   private catalogTable!: TableSchema;
   /** Incremented on every schema change (prepared statements recompile). */
   schemaVersion = 0;
@@ -219,6 +229,11 @@ export class Database implements FunctionContext {
     return this.tables.get(lower);
   }
 
+  /** @internal View by name (for the planner). */
+  getView(name: string): ViewSchema | undefined {
+    return this.views.get(name.toLowerCase());
+  }
+
   tableNames(): string[] {
     return [...this.tables.values()].map((t) => t.name);
   }
@@ -226,6 +241,7 @@ export class Database implements FunctionContext {
   private loadSchema(): void {
     this.tables.clear();
     this.indexes.clear();
+    this.views.clear();
     this.catalog.clear();
     const catStmt = parseOne(CATALOG_SQL).stmt as CreateTableStmt;
     this.catalogTable = { ...buildTableSchema(catStmt, CATALOG_SQL, this.pager.catalogRoot).table, system: true };
@@ -233,7 +249,12 @@ export class Database implements FunctionContext {
     const autoRoots = new Map<string, number>();
     for (const r of rows) if (r.type === 'index' && r.sql === null) autoRoots.set(r.name.toLowerCase(), r.rootpage);
     for (const r of rows) {
-      this.catalog.set(r.name.toLowerCase(), { type: r.type as 'table' | 'index', name: r.name, rowid: r.rowid });
+      this.catalog.set(r.name.toLowerCase(), { type: r.type as CatalogEntry['type'], name: r.name, rowid: r.rowid });
+      if (r.type === 'view') {
+        const v = parseOne(r.sql!).stmt as CreateViewStmt;
+        this.views.set(r.name.toLowerCase(), { name: r.name, sql: r.sql!, columns: v.columns, select: v.select });
+        continue;
+      }
       if (r.type !== 'table') continue;
       const stmt = parseOne(r.sql!).stmt as CreateTableStmt;
       const { table, implicitIndexes } = buildTableSchema(stmt, r.sql!, r.rootpage);
@@ -290,7 +311,7 @@ export class Database implements FunctionContext {
     const w = this.catalogWriter();
     const rowid = w.newRowid();
     w.writeRow([type, name, tblName, root, sql], rowid);
-    this.catalog.set(name.toLowerCase(), { type: type as 'table' | 'index', name, rowid });
+    this.catalog.set(name.toLowerCase(), { type: type as CatalogEntry['type'], name, rowid });
   }
 
   private removeCatalogRow(name: string): void {
@@ -312,7 +333,7 @@ export class Database implements FunctionContext {
     const stmt = ps.stmt;
     const regs = new Registers(ps.paramCount);
     const planner = new Planner(
-      { getTable: (n) => this.getTable(n), openTree: (root) => this.tree(root), sampledStats: (t) => this.sampledStats(t), funcCtx: this, state: this.state },
+      { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), sampledStats: (t) => this.sampledStats(t), funcCtx: this, state: this.state },
       regs,
     );
     planner.sqlText = ps.text;
@@ -334,6 +355,11 @@ export class Database implements FunctionContext {
         return done({ exec: () => this.createTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
       case 'createIndex':
         return done({ exec: () => this.createIndex(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
+      case 'createView':
+        if (stmt.materialized) throw new SmaltError('SMALT_UNSUPPORTED', 'materialized views are not supported yet (M5)');
+        if (stmt.temp) throw new SmaltError('SMALT_UNSUPPORTED', 'TEMP views are not supported yet');
+        if (stmt.schema && stmt.schema.toLowerCase() !== 'main') throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
+        return done({ exec: () => this.createView(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
       case 'drop':
         return done({ exec: () => this.drop(stmt), readonly: false, columns: [], columnTypes: [] });
       case 'begin':
@@ -579,6 +605,18 @@ export class Database implements FunctionContext {
     if (existing) throw new SmaltError('SMALT_ERROR', `${existing.type === kind ? kind : existing.type} ${name} already exists`);
   }
 
+  private createView(stmt: CreateViewStmt, sql: string): RunResult {
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    if (stmt.ifNotExists && this.catalog.get(stmt.name.toLowerCase())?.type === 'view') return none;
+    this.checkNewName(stmt.name, 'view');
+    this.dirtySchema = true;
+    // Like SQLite, the body is not resolved until the view is used (it may reference tables created later).
+    this.addCatalogRow('view', stmt.name, stmt.name, 0, sql);
+    this.views.set(stmt.name.toLowerCase(), { name: stmt.name, sql, columns: stmt.columns, select: stmt.select });
+    this.schemaChanged();
+    return none;
+  }
+
   private createTable(stmt: CreateTableStmt, sql: string, internal = false): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     if (stmt.temp) throw new SmaltError('SMALT_UNSUPPORTED', 'TEMP tables are not supported yet');
@@ -605,7 +643,7 @@ export class Database implements FunctionContext {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     if (stmt.ifNotExists && this.catalog.has(stmt.name.toLowerCase())) return none;
     const table = this.tables.get(stmt.table.toLowerCase());
-    if (!table) throw new SmaltError('SMALT_ERROR', `no such table: ${stmt.table}`);
+    if (!table) throw new SmaltError('SMALT_ERROR', this.views.has(stmt.table.toLowerCase()) ? 'views may not be indexed' : `no such table: ${stmt.table}`);
     this.checkNewName(stmt.name, 'index');
     if (stmt.where) throw new SmaltError('SMALT_UNSUPPORTED', 'partial indexes are not supported yet');
     this.dirtySchema = true;
@@ -662,6 +700,22 @@ export class Database implements FunctionContext {
   private drop(stmt: DropStmt): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const lower = stmt.name.toLowerCase();
+    const existing = this.catalog.get(lower);
+    if (existing && (stmt.objectType === 'table' || stmt.objectType === 'view') && existing.type !== stmt.objectType && existing.type !== 'index') {
+      throw new SmaltError('SMALT_ERROR', `use DROP ${existing.type.toUpperCase()} to delete ${existing.type} ${existing.name}`);
+    }
+    if (stmt.objectType === 'view') {
+      const view = this.views.get(lower);
+      if (!view) {
+        if (stmt.ifExists) return none;
+        throw new SmaltError('SMALT_ERROR', `no such view: ${stmt.name}`);
+      }
+      this.dirtySchema = true;
+      this.removeCatalogRow(view.name);
+      this.views.delete(lower);
+      this.schemaChanged();
+      return none;
+    }
     if (stmt.objectType === 'table') {
       const table = this.tables.get(lower);
       if (!table) {
@@ -706,7 +760,10 @@ export class Database implements FunctionContext {
     const lower = name.toLowerCase();
     if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat') throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
     const t = this.tables.get(lower);
-    if (!t) throw new SmaltError('SMALT_ERROR', `no such table: ${name}`);
+    if (!t) {
+      if (this.views.has(lower)) throw new SmaltError('SMALT_ERROR', `cannot modify ${name} because it is a view`);
+      throw new SmaltError('SMALT_ERROR', `no such table: ${name}`);
+    }
     return t;
   }
 

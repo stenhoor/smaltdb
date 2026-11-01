@@ -99,3 +99,31 @@ SQLite's two crash-safe modes. Values are median (min–max) in ms. All engines 
 - J2's repeat is not a clear win: its range overlaps SQLite's because of one 1.78 ms outlier.
 - Next steps for first runs: cheaper sampling (hash raw column bytes instead of decoding), and deferring sampling until a
   plan choice actually depends on the estimate.
+
+## Follow-up: first-run cost (2026-11-01)
+
+Raw data: [bench/results/2026-11-01-chromium-3479344.json](../../bench/results/2026-11-01-chromium-3479344.json)
+(smaltdb vs SQLite WAL, 5 repetitions; the working tree included the changes below).
+
+Where a first execution's time goes. Node, in-process timers, J2 run after J1 on the same tables:
+- Sampling is about 0.3–1 ms per table, once per session.
+- Planning is about 0.4–1.7 ms. It is diffuse: a CPU profile shows no function above 15%, just code that has never run before
+  (index probes, join operators, the planner itself).
+- Generated code for a new statement starts in V8's interpreter.
+
+What was changed:
+1. **Sampler**: 512 uniformly random rows instead of runs of consecutive rows, hashed from raw record bytes. Runs
+   underestimated clustered columns by up to 100× in simulation (runs of equal values in insertion order), and evenly spaced
+   positions alias with periodic data. The cost stays about 1 ms; the estimates are much better (customer_id 10,132 vs 10,000).
+2. **Generated pipelines cached by source.** Statements with the same shape share optimized code. J3 with a different literal
+   each time went from 2.15 to 0.42 ms. A re-prepared J3 went from 0.51 to 0.39 ms.
+
+What was tried and rejected: **warming up** the engine by running representative queries on a scratch in-memory
+database. It cost 239 ms, cut first runs only modestly (J2 5.1 → 3.7 ms) and *slowed steady state*
+(J1 repeat 39 → 51 ms, J4 64 → 74 ms), because the warm-up's type feedback made shared code polymorphic.
+
+Result: first runs of millisecond join queries in a fresh worker are still slower than SQLite, by an absolute 0.4–2.4 ms
+(J2 5.0 vs 2.6 ms, J3 2.2 vs 0.7 ms, J5 0.69 vs 0.31 ms). SQLite WASM ships ahead-of-time compiled code and has no
+per-path warm-up. Every other row of the run is faster or overlaps:
+- repeat runs: J2 overlaps; J3 3.4×, J5 2.5×, J1 4.2×, J4 4.1×, J6 9.0× and J7 8.8× faster;
+- warm point lookups: overlap.
