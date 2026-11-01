@@ -1,6 +1,6 @@
 import { CorruptionError, MisuseError } from '../errors.js';
 import { compareKeyAt, compareRanges } from '../util/bytes.js';
-import { PAGE_HEADER_SIZE as H, PH_CELL_COUNT, PH_CONTENT_START, PH_FRAG_BYTES, PH_PREV, PH_RIGHT, PageType } from './format.js';
+import { PAGE_HEADER_SIZE as H, PH_CELL_COUNT, PH_CONTENT_START, PH_FRAG_BYTES, PH_FREEBLOCK, PH_PREV, PH_RIGHT, PageType } from './format.js';
 import type { Frame, Pager } from './pager.js';
 
 /*
@@ -9,8 +9,10 @@ import type { Frame, Pager } from './pager.js';
  * Page body is a slotted page: a u16 slot directory grows up from the header, cell content grows
  * down from `usableSize`.
  *
- *   leaf cell:      u16 keyLen | u8 flags | u32 valueLen | key | value            (inline)
- *                   u16 keyLen | u8 flags | u32 valueLen | key | u32 overflowHead (flags & OVERFLOW)
+ *   leaf cell:      varint keyLen | varint (valueLen × 2 + overflow) | key | value          (inline)
+ *                   varint keyLen | varint (valueLen × 2 + 1)        | key | u32 overflowHead
+ *                   (varints: 7 bits per byte, least significant first, high bit = more bytes;
+ *                   an index entry's header is 2 bytes, a table row's usually 2 or 3)
  *   interior cell:  u32 child | u16 keyLen | key
  *
  * Interior page with cells (k0,c0)..(kn-1,cn-1) and right pointer r: child ci holds keys < ki,
@@ -19,10 +21,136 @@ import type { Frame, Pager } from './pager.js';
  * The root page number never changes: root splits move the root's content into new children.
  */
 
-const LEAF_HDR = 7;
+/** Largest leaf cell header: 3-byte key length + 5-byte value field. */
+const MAX_LEAF_HDR = 8;
 const EMPTY = new Uint8Array(0);
 const INT_HDR = 6;
-const FLAG_OVERFLOW = 1;
+
+// ------------------------------------------------------------------ leaf cell headers
+
+/** Results of {@link readLeafHdr} (module scratch: no allocation per cell). */
+let cKo = 0; // key offset
+let cKl = 0; // key length
+let cVl = 0; // value length
+let cOv = false; // value in overflow pages
+
+/** Parse the leaf cell header at `off`. */
+function readLeafHdr(b: Uint8Array, off: number): void {
+  const x0 = b[off];
+  const y0 = b[off + 1];
+  if ((x0 | y0) < 128) {
+    // Common case: 1-byte key length and value field.
+    cKl = x0;
+    cOv = (y0 & 1) === 1;
+    cVl = y0 >>> 1;
+    cKo = off + 2;
+    return;
+  }
+  readLeafHdrSlow(b, off);
+}
+
+function readLeafHdrSlow(b: Uint8Array, off: number): void {
+  let p = off;
+  let x = b[p++];
+  let kl = x & 0x7f;
+  if (x & 0x80) {
+    x = b[p++];
+    kl |= (x & 0x7f) << 7;
+    if (x & 0x80) {
+      x = b[p++];
+      kl |= (x & 0x7f) << 14;
+    }
+  }
+  x = b[p++];
+  let v = x & 0x7f;
+  if (x & 0x80) {
+    let mul = 128;
+    do {
+      x = b[p++];
+      v += (x & 0x7f) * mul;
+      mul *= 128;
+    } while (x & 0x80);
+  }
+  cKl = kl;
+  cOv = v % 2 === 1;
+  cVl = Math.floor(v / 2);
+  cKo = p;
+}
+
+/**
+ * Key position of the leaf cell at `off`, packed as keyOffset * 65536 + keyLength (no shared
+ * state, so V8 keeps it in registers). Unpack with `>>> 16` and `& 0xffff`.
+ */
+function leafKey(b: Uint8Array, off: number): number {
+  const x0 = b[off];
+  if ((x0 | b[off + 1]) < 128) return (off + 2) * 65536 + x0;
+  return leafKeySlow(b, off);
+}
+
+function leafKeySlow(b: Uint8Array, off: number): number {
+  let p = off;
+  let x = b[p++];
+  let kl = x & 0x7f;
+  if (x & 0x80) {
+    x = b[p++];
+    kl |= (x & 0x7f) << 7;
+    if (x & 0x80) {
+      x = b[p++];
+      kl |= (x & 0x7f) << 14;
+    }
+  }
+  while (b[p++] & 0x80);
+  return p * 65536 + kl;
+}
+
+function varintLen(v: number): number {
+  let n = 1;
+  while (v >= 128) {
+    v = Math.floor(v / 128);
+    n++;
+  }
+  return n;
+}
+
+function writeVarint(b: Uint8Array, p: number, v: number): number {
+  while (v >= 128) {
+    b[p++] = (v % 128) | 0x80;
+    v = Math.floor(v / 128);
+  }
+  b[p++] = v;
+  return p;
+}
+
+/** Write a leaf cell header at `p`; returns the key offset. */
+function writeLeafHdr(b: Uint8Array, p: number, kl: number, vl: number, overflow: boolean): number {
+  p = writeVarint(b, p, kl);
+  return writeVarint(b, p, vl * 2 + (overflow ? 1 : 0));
+}
+
+/** Size of a leaf cell header. */
+function leafHdrLen(kl: number, vl: number): number {
+  return varintLen(kl) + varintLen(vl * 2 + 1);
+}
+
+/**
+ * @internal Decoded header of the leaf cell at `off` (for row loaders outside this module).
+ * The returned object is shared and overwritten by the next call.
+ */
+export function leafCell(b: Uint8Array, off: number): { keyOffset: number; keyLength: number; valueLength: number; overflow: boolean } {
+  readLeafHdr(b, off);
+  LEAF_CELL.keyOffset = cKo;
+  LEAF_CELL.keyLength = cKl;
+  LEAF_CELL.valueLength = cVl;
+  LEAF_CELL.overflow = cOv;
+  return LEAF_CELL;
+}
+const LEAF_CELL = { keyOffset: 0, keyLength: 0, valueLength: 0, overflow: false };
+
+/** memcmp(key, key of the leaf cell at `off`). */
+function cmpLeafKey(key: Uint8Array, p: PageBuf, off: number): number {
+  const k = leafKey(p.bytes, off);
+  return compareKeyAt(key, p.bytes, k >>> 16, k & 0xffff);
+}
 const MAX_DEPTH = 40;
 
 /** Minimal page-buffer shape shared by frames and scratch buffers. */
@@ -57,8 +185,8 @@ function isLeaf(p: PageBuf): boolean {
 
 function cellSizeAt(p: PageBuf, off: number, leaf: boolean): number {
   if (leaf) {
-    const kl = p.view.getUint16(off, true);
-    return p.bytes[off + 2] & FLAG_OVERFLOW ? LEAF_HDR + kl + 4 : LEAF_HDR + kl + p.view.getUint32(off + 3, true);
+    readLeafHdr(p.bytes, off);
+    return cKo - off + cKl + (cOv ? 4 : cVl);
   }
   return INT_HDR + p.view.getUint16(off + 4, true);
 }
@@ -102,7 +230,7 @@ export class BTree {
   ) {
     this.usable = pager.usableSize;
     this.maxLocal = Math.floor((this.usable - H) / 4) - 2;
-    this.maxKeySize = this.maxLocal - LEAF_HDR - 4;
+    this.maxKeySize = this.maxLocal - MAX_LEAF_HDR - 4;
     this.overflowCapacity = this.usable - H;
     const s = new Uint8Array(pager.pageSize);
     this.scratch = { bytes: s, view: new DataView(s.buffer) };
@@ -127,7 +255,7 @@ export class BTree {
       const i = this.leafLowerBound(leaf, key);
       if (i < nCells(leaf)) {
         const off = slot(leaf, i);
-        if (compareKeyAt(key, leaf.bytes, off + LEAF_HDR, leaf.view.getUint16(off, true)) === 0) {
+        if (cmpLeafKey(key, leaf, off) === 0) {
           return this.readValue(leaf, off);
         }
       }
@@ -143,7 +271,7 @@ export class BTree {
       const i = this.leafLowerBound(leaf, key);
       if (i >= nCells(leaf)) return false;
       const off = slot(leaf, i);
-      return compareKeyAt(key, leaf.bytes, off + LEAF_HDR, leaf.view.getUint16(off, true)) === 0;
+      return cmpLeafKey(key, leaf, off) === 0;
     } finally {
       this.pager.release(leaf);
     }
@@ -202,10 +330,10 @@ export class BTree {
       const i = this.leafLowerBound(leaf, key);
       if (i < nCells(leaf)) {
         const off = slot(leaf, i);
-        if (compareKeyAt(key, leaf.bytes, off + LEAF_HDR, leaf.view.getUint16(off, true)) === 0) {
+        if (cmpLeafKey(key, leaf, off) === 0) {
           // Same-size replacement without overflow (typical UPDATE): overwrite in place, no fragmentation.
-          const local = LEAF_HDR + key.length + value.length;
-          if (local <= this.maxLocal && !(leaf.bytes[off + 2] & FLAG_OVERFLOW) && cellSizeAt(leaf, off, true) === local) {
+          const local = leafHdrLen(key.length, value.length) + key.length + value.length;
+          if (local <= this.maxLocal && cellSizeAt(leaf, off, true) === local && !cOv) {
             this.buildLeafCell(key, value);
             leaf.bytes.set(this.cellBuf.subarray(0, local), off);
             return;
@@ -251,7 +379,7 @@ export class BTree {
       const n = nCells(leaf);
       if (n > 0) {
         const off = slot(leaf, n - 1);
-        if (compareKeyAt(key, leaf.bytes, off + LEAF_HDR, leaf.view.getUint16(off, true)) <= 0) throw new MisuseError('append: key out of order');
+        if (cmpLeafKey(key, leaf, off) <= 0) throw new MisuseError('append: key out of order');
       }
       const size = this.buildLeafCell(key, value);
       if (!this.insertCell(leaf, n, this.cellBuf, size)) this.splitLeaf(leaf, n, this.cellBuf.slice(0, size));
@@ -291,7 +419,7 @@ export class BTree {
       const start = offs[e];
       const kl = offs[e + 1] - start;
       if (kl > this.maxKeySize) throw new MisuseError(`key too large (${kl} > ${this.maxKeySize} bytes)`);
-      const size = LEAF_HDR + kl;
+      const size = varintLen(kl) + 1 + kl;
       if (page === null || cs - size < H + 2 * (n + 1)) {
         const next = pager.allocate();
         initPage(next, PageType.BTreeLeaf, usable);
@@ -311,12 +439,8 @@ export class BTree {
       }
       cs -= size;
       const b = page.bytes;
-      const v = page.view;
-      v.setUint16(cs, kl, true);
-      b[cs + 2] = 0;
-      v.setUint32(cs + 3, 0, true);
-      b.set(keys.subarray(start, start + kl), cs + LEAF_HDR);
-      v.setUint16(H + 2 * n, cs, true);
+      b.set(keys.subarray(start, start + kl), writeLeafHdr(b, cs, kl, 0, false));
+      page.view.setUint16(H + 2 * n, cs, true);
       n++;
       prevStart = start;
       prevLen = kl;
@@ -395,7 +519,7 @@ export class BTree {
       const i = this.leafLowerBound(leaf, key);
       if (i >= nCells(leaf)) return false;
       const off = slot(leaf, i);
-      if (compareKeyAt(key, leaf.bytes, off + LEAF_HDR, leaf.view.getUint16(off, true)) !== 0) return false;
+      if (cmpLeafKey(key, leaf, off) !== 0) return false;
       pager.markDirty(leaf);
       this.freeCellOverflow(leaf, off);
       this.removeCell(leaf, i, true);
@@ -487,8 +611,10 @@ export class BTree {
         const size = cellSizeAt(f, off, leaf);
         if (off < cs || off + size > this.usable) throw new CorruptionError(`page ${pg}: cell ${i} out of bounds`);
         used += size;
-        const ko = leaf ? off + LEAF_HDR : off + INT_HDR;
-        const kl = leaf ? f.view.getUint16(off, true) : f.view.getUint16(off + 4, true);
+        if (leaf) readLeafHdr(f.bytes, off);
+        const ko = leaf ? cKo : off + INT_HDR;
+        const kl = leaf ? cKl : f.view.getUint16(off + 4, true);
+        const ovLen = cOv ? cVl : -1;
         const key = f.bytes.slice(ko, ko + kl);
         if (prevKey !== null) {
           const c = compareRanges(key, 0, kl, prevKey, 0, prevKey.length);
@@ -500,9 +626,7 @@ export class BTree {
         }
         if (leaf) {
           report.keys++;
-          if (f.bytes[off + 2] & FLAG_OVERFLOW) {
-            overflow.push([f.view.getUint32(ko + kl, true), f.view.getUint32(off + 3, true)]);
-          }
+          if (ovLen >= 0) overflow.push([f.view.getUint32(ko + kl, true), ovLen]);
         } else {
           children.push([f.view.getUint32(off, true), prevKey, key]);
         }
@@ -510,6 +634,15 @@ export class BTree {
       }
       const frag = f.view.getUint16(PH_FRAG_BYTES, true);
       if (used + frag !== this.usable - cs) throw new CorruptionError(`page ${pg}: space accounting mismatch`);
+      // Free blocks: inside the content area, within the free byte count, no cycles.
+      let fbTotal = 0;
+      let steps = 0;
+      for (let fb = f.view.getUint16(PH_FREEBLOCK, true); fb !== 0; fb = f.view.getUint16(fb, true)) {
+        const size = f.view.getUint16(fb + 2, true);
+        if (fb < cs || fb + size > this.usable || size < 4 || ++steps > this.usable) throw new CorruptionError(`page ${pg}: invalid free block at ${fb}`);
+        fbTotal += size;
+      }
+      if (fbTotal > frag) throw new CorruptionError(`page ${pg}: free blocks exceed free bytes`);
       if (leaf) {
         report.leaves++;
         leaves.push(pg);
@@ -599,16 +732,18 @@ export class BTree {
       while (lo < hi) {
         const mid = (lo + hi) >>> 1;
         const off = view.getUint16(H + 2 * mid, true);
-        const len = view.getUint16(off, true);
+        const k = leafKey(bytes, off);
+        const ko = k >>> 16;
+        const len = k & 0xffff;
         let c: number;
         if (len >= 8) {
-          const ch = view.getUint32(off + LEAF_HDR, false);
+          const ch = view.getUint32(ko, false);
           if (kh !== ch) c = kh > ch ? 1 : -1;
           else {
-            const cl = view.getUint32(off + LEAF_HDR + 4, false);
+            const cl = view.getUint32(ko + 4, false);
             c = kl !== cl ? (kl > cl ? 1 : -1) : 8 - len;
           }
-        } else c = compareKeyAt(key, bytes, off + LEAF_HDR, len);
+        } else c = compareKeyAt(key, bytes, ko, len);
         if (c > 0) lo = mid + 1;
         else hi = mid;
       }
@@ -617,7 +752,8 @@ export class BTree {
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
       const off = view.getUint16(H + 2 * mid, true);
-      if (compareKeyAt(key, bytes, off + LEAF_HDR, view.getUint16(off, true)) > 0) lo = mid + 1;
+      const k = leafKey(bytes, off);
+      if (compareKeyAt(key, bytes, k >>> 16, k & 0xffff) > 0) lo = mid + 1;
       else hi = mid;
     }
     return lo;
@@ -663,27 +799,26 @@ export class BTree {
 
   private buildLeafCell(key: Uint8Array, value: Uint8Array): number {
     const buf = this.cellBuf;
-    const v = this.cellView;
     const kl = key.length;
-    v.setUint16(0, kl, true);
-    v.setUint32(3, value.length, true);
-    buf.set(key, LEAF_HDR);
-    if (LEAF_HDR + kl + value.length <= this.maxLocal) {
-      buf[2] = 0;
-      buf.set(value, LEAF_HDR + kl);
-      return LEAF_HDR + kl + value.length;
+    const vl = value.length;
+    if (leafHdrLen(kl, vl) + kl + vl <= this.maxLocal) {
+      const ko = writeLeafHdr(buf, 0, kl, vl, false);
+      buf.set(key, ko);
+      buf.set(value, ko + kl);
+      return ko + kl + vl;
     }
-    buf[2] = FLAG_OVERFLOW;
-    v.setUint32(LEAF_HDR + kl, this.writeOverflow(value), true);
-    return LEAF_HDR + kl + 4;
+    const ko = writeLeafHdr(buf, 0, kl, vl, true);
+    buf.set(key, ko);
+    this.cellView.setUint32(ko + kl, this.writeOverflow(value), true);
+    return ko + kl + 4;
   }
 
   /** @internal Copy of the value stored in leaf cell at `off`. */
   readValue(p: PageBuf, off: number): Uint8Array {
-    const kl = p.view.getUint16(off, true);
-    const vl = p.view.getUint32(off + 3, true);
-    const start = off + LEAF_HDR + kl;
-    if (!(p.bytes[off + 2] & FLAG_OVERFLOW)) return p.bytes.slice(start, start + vl);
+    readLeafHdr(p.bytes, off);
+    const vl = cVl;
+    const start = cKo + cKl;
+    if (!cOv) return p.bytes.slice(start, start + vl);
     const out = new Uint8Array(vl);
     let pg = p.view.getUint32(start, true);
     let pos = 0;
@@ -718,8 +853,9 @@ export class BTree {
   }
 
   private freeCellOverflow(p: PageBuf, off: number): void {
-    if (!(p.bytes[off + 2] & FLAG_OVERFLOW)) return;
-    let pg = p.view.getUint32(off + LEAF_HDR + p.view.getUint16(off, true), true);
+    readLeafHdr(p.bytes, off);
+    if (!cOv) return;
+    let pg = p.view.getUint32(cKo + cKl, true);
     while (pg !== 0) {
       const f = this.pager.get(pg);
       const next = rightPtr(f);
@@ -729,24 +865,63 @@ export class BTree {
     }
   }
 
-  /** Insert a cell at slot i. Returns false if it does not fit even after defragmentation. */
+  /**
+   * Insert a cell at slot i: from the gap between slots and content, else from a free block, else
+   * after compacting the page. Returns false if it does not fit even then.
+   */
   private insertCell(p: PageBuf, i: number, src: Uint8Array, size: number): boolean {
     const view = p.view;
     const n = nCells(p);
     let cs = view.getUint16(PH_CONTENT_START, true);
     const gap = cs - (H + 2 * (n + 1));
-    if (gap < size) {
-      if (gap + view.getUint16(PH_FRAG_BYTES, true) < size) return false;
-      this.defragment(p);
-      cs = view.getUint16(PH_CONTENT_START, true);
+    let at = -1;
+    if (gap >= size) {
+      cs -= size;
+      at = cs;
+      view.setUint16(PH_CONTENT_START, cs, true);
+    } else {
+      const frag = view.getUint16(PH_FRAG_BYTES, true);
+      if (gap < 0 || gap + frag < size) {
+        if (gap + frag < size) return false;
+      } else {
+        at = this.takeFreeBlock(p, size);
+        if (at >= 0) view.setUint16(PH_FRAG_BYTES, frag - size, true);
+      }
+      if (at < 0) {
+        this.defragment(p);
+        cs = view.getUint16(PH_CONTENT_START, true) - size;
+        at = cs;
+        view.setUint16(PH_CONTENT_START, cs, true);
+      }
     }
-    cs -= size;
-    p.bytes.set(size === src.length ? src : src.subarray(0, size), cs);
+    p.bytes.set(size === src.length ? src : src.subarray(0, size), at);
     if (i < n) p.bytes.copyWithin(H + 2 * (i + 1), H + 2 * i, H + 2 * n);
-    view.setUint16(H + 2 * i, cs, true);
+    view.setUint16(H + 2 * i, at, true);
     view.setUint16(PH_CELL_COUNT, n + 1, true);
-    view.setUint16(PH_CONTENT_START, cs, true);
     return true;
+  }
+
+  /**
+   * First free block that holds `size` bytes: the cell takes its end; a remainder of 4+ bytes stays
+   * a free block, a smaller one becomes fragment bytes. Returns the cell offset, or -1.
+   */
+  private takeFreeBlock(p: PageBuf, size: number): number {
+    const view = p.view;
+    let prev = -1;
+    for (let fb = view.getUint16(PH_FREEBLOCK, true); fb !== 0; ) {
+      const fs = view.getUint16(fb + 2, true);
+      const next = view.getUint16(fb, true);
+      if (fs >= size) {
+        const rest = fs - size;
+        if (rest >= 4) view.setUint16(fb + 2, rest, true);
+        else if (prev < 0) view.setUint16(PH_FREEBLOCK, next, true);
+        else view.setUint16(prev, next, true);
+        return fb + rest;
+      }
+      prev = fb;
+      fb = next;
+    }
+    return -1;
   }
 
   private removeCell(p: PageBuf, i: number, leaf: boolean): void {
@@ -759,9 +934,16 @@ export class BTree {
     if (n === 1) {
       view.setUint16(PH_CONTENT_START, this.usable, true);
       view.setUint16(PH_FRAG_BYTES, 0, true);
+      view.setUint16(PH_FREEBLOCK, 0, true);
     } else if (off === view.getUint16(PH_CONTENT_START, true)) {
       view.setUint16(PH_CONTENT_START, off + size, true);
     } else {
+      // A hole of 4+ bytes joins the free block list; smaller ones are only counted.
+      if (size >= 4) {
+        view.setUint16(off, view.getUint16(PH_FREEBLOCK, true), true);
+        view.setUint16(off + 2, size, true);
+        view.setUint16(PH_FREEBLOCK, off, true);
+      }
       view.setUint16(PH_FRAG_BYTES, view.getUint16(PH_FRAG_BYTES, true) + size, true);
     }
   }
@@ -781,6 +963,7 @@ export class BTree {
     }
     p.view.setUint16(PH_CONTENT_START, pos, true);
     p.view.setUint16(PH_FRAG_BYTES, 0, true);
+    p.view.setUint16(PH_FREEBLOCK, 0, true);
   }
 
   private usedBytes(p: PageBuf): number {
@@ -813,10 +996,9 @@ export class BTree {
     const m = appending ? n : splitPoint(cells);
     const lastLeft = cells[m - 1];
     const firstRight = cells[m];
-    const sep = shortestSeparator(
-      lastLeft, LEAF_HDR, lastLeft[0] | (lastLeft[1] << 8),
-      firstRight, LEAF_HDR, firstRight[0] | (firstRight[1] << 8),
-    );
+    const lk = leafKey(lastLeft, 0);
+    const rk = leafKey(firstRight, 0);
+    const sep = shortestSeparator(lastLeft, lk >>> 16, lk & 0xffff, firstRight, rk >>> 16, rk & 0xffff);
 
     if (leaf.pgno === this.root) {
       const left = pager.allocate();
@@ -1068,8 +1250,7 @@ function shortestSeparator(
  */
 /** Whether the last key of leaf `p` (with n > 0 cells) is >= `key`. */
 function lastKeyAtLeast(p: PageBuf, n: number, key: Uint8Array): boolean {
-  const off = slot(p, n - 1);
-  return compareKeyAt(key, p.bytes, off + LEAF_HDR, p.view.getUint16(off, true)) <= 0;
+  return cmpLeafKey(key, p, slot(p, n - 1)) <= 0;
 }
 
 export class BTreeCursor {
@@ -1145,15 +1326,14 @@ export class BTreeCursor {
 
   key(): Uint8Array {
     const f = this.current();
-    const off = slot(f, this.idx);
-    return f.bytes.slice(off + LEAF_HDR, off + LEAF_HDR + f.view.getUint16(off, true));
+    const k = leafKey(f.bytes, slot(f, this.idx));
+    return f.bytes.slice(k >>> 16, (k >>> 16) + (k & 0xffff));
   }
 
   /** Compare the current key with `key` without copying (memcmp order; current - key). */
   compareKey(key: Uint8Array): number {
     const f = this.current();
-    const off = slot(f, this.idx);
-    return -compareKeyAt(key, f.bytes, off + LEAF_HDR, f.view.getUint16(off, true));
+    return -cmpLeafKey(key, f, slot(f, this.idx));
   }
 
   value(): Uint8Array {
@@ -1175,11 +1355,11 @@ export class BTreeCursor {
   loadValue(): void {
     const f = this.current();
     const off = slot(f, this.idx);
-    const kl = f.view.getUint16(off, true);
-    const vl = f.view.getUint32(off + 3, true);
-    if (!(f.bytes[off + 2] & FLAG_OVERFLOW)) {
+    readLeafHdr(f.bytes, off);
+    const vl = cVl;
+    if (!cOv) {
       this.valueBytes = f.bytes;
-      this.valueOffset = off + LEAF_HDR + kl;
+      this.valueOffset = cKo + cKl;
       this.valueLength = vl;
       return;
     }
@@ -1194,10 +1374,10 @@ export class BTreeCursor {
   /** Point keyBytes/keyOffset/keyLength at the current key. */
   loadKey(): void {
     const f = this.current();
-    const off = slot(f, this.idx);
     this.keyBytes = f.bytes;
-    this.keyOffset = off + LEAF_HDR;
-    this.keyLength = f.view.getUint16(off, true);
+    const k = leafKey(f.bytes, slot(f, this.idx));
+    this.keyOffset = k >>> 16;
+    this.keyLength = k & 0xffff;
   }
 
   close(): void {

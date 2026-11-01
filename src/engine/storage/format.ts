@@ -7,7 +7,7 @@
  * Multi-byte page fields are little-endian; index keys are big-endian (memcmp-comparable).
  */
 
-export const FORMAT_MAJOR = 2;
+export const FORMAT_MAJOR = 3;
 export const FORMAT_MINOR = 0;
 export const MAGIC = new Uint8Array([0x73, 0x6d, 0x61, 0x6c, 0x74, 0x64, 0x62, 0x00]); // "smaltdb\0"
 
@@ -33,7 +33,8 @@ export const PH_CONTENT_START = 4; // u16 (offset of first byte of cell content 
 export const PH_FRAG_BYTES = 6; // u16 (bytes in holes inside the content area)
 export const PH_RIGHT = 8; // u32 (interior: rightmost child; leaf: next sibling; overflow/trunk: next page)
 export const PH_PREV = 12; // u32 (leaf: previous sibling)
-export const PH_LSN = 16; // u64 (WAL LSN of last modification; used from M2)
+export const PH_FREEBLOCK = 16; // u16 (b-tree pages: offset of the first free block, 0 = none; format 3)
+// bytes 18..23: reserved (zero)
 
 // ---- database header (page 0) ----
 export const DB_HEADER_SIZE = 128;

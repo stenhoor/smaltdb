@@ -36,7 +36,8 @@
 | 6 | u16 | fragmented free bytes inside the content area |
 | 8 | u32 | interior: rightmost child · leaf: next sibling · overflow / freelist trunk: next page |
 | 12 | u32 | leaf: previous sibling |
-| 16 | u64 | LSN of the last modification (used from M2) |
+| 16 | u16 | B-tree pages: offset of the first free block in the content area (0 = none; format 3) |
+| 18 | 6 bytes | reserved (zero) |
 
 ### Page 0: database header (first 128 bytes)
 
@@ -82,8 +83,9 @@
 Pages are slotted: a u16 slot directory grows up from the 24-byte header, and cell content grows down from the end of the usable area.
 
 ```
-leaf cell:      u16 keyLen | u8 flags | u32 valueLen | key | value                (inline)
-                u16 keyLen | u8 flags | u32 valueLen | key | u32 firstOverflowPage (flags & 1)
+leaf cell:      varint keyLen | varint (valueLen*2 + 0) | key | value               (inline)
+                varint keyLen | varint (valueLen*2 + 1) | key | u32 firstOverflowPage
+free block:     u16 next free block (0 = end) | u16 size     (freed cells of 4+ bytes; list head at page header offset 16)
 interior cell:  u32 child | u16 keyLen | key
 ```
 
@@ -176,7 +178,7 @@ Original plan:
 
 ## 9. Format versioning
 
-- Current format: **2** (format 1 used 11-byte numeric key components; ADR 0006).
+- Current format: **3**. Format 1 used 11-byte numeric key components (ADR 0006); format 2 used 7-byte fixed leaf cell headers and no free blocks (ADR 0007).
 
 - A format version in the header. Engines refuse to write newer major versions, and minor versions must be backward compatible.
 - Logical import/export in v1: **CSV and JSON/NDJSON**. Later: SQL dump, SQLite file import, Arrow/Parquet.

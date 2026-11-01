@@ -384,7 +384,8 @@ type PreDecode = (bounds: (col: number) => ColBounds) => string[];
 function emitDecode(spec: LoaderSpec, L: string[], assign: Assign = toRegister, pre?: PreDecode): void {
   const n = spec.types.length;
   const bitmap = (n + 7) >>> 3;
-  L.push('const kl = b[off] | (b[off + 1] << 8); const vo = off + 7 + kl;');
+  // Leaf cell header (see btree.ts): 1-byte key length (rowid keys are 8), 1- or 2-byte value field.
+  L.push('const ko = off + (b[off + 1] < 128 ? 2 : 3); const vo = ko + b[off];');
   if (spec.decode.length > 0) {
     L.push(`const bm = vo + 3; const fx = bm + ${bitmap}; const vt = fx + ${spec.fixedSize};`);
     const needsVar = spec.decode.some((_, i) => i % 2 === 0 && !(spec.types[spec.decode[i]] === 'INTEGER' || spec.types[spec.decode[i]] === 'REAL'));
@@ -419,7 +420,7 @@ function emitDecode(spec: LoaderSpec, L: string[], assign: Assign = toRegister, 
     }
   }
   if (spec.rowidRegs.length > 0) {
-    L.push('{ const id = H.rowid(b, off + 7);');
+    L.push('{ const id = H.rowid(b, ko);');
     for (const reg of spec.rowidRegs) L.push(assign(reg, 'id'));
     L.push('}');
   }
@@ -427,8 +428,11 @@ function emitDecode(spec: LoaderSpec, L: string[], assign: Assign = toRegister, 
 
 /** JS condition: the cell at `off` can be decoded by emitDecode (inline value, full-width record). */
 function cellIsFast(spec: LoaderSpec): string {
-  if (spec.decode.length === 0) return '!(b[off + 2] & 1)';
-  return `!(b[off + 2] & 1) && (b[off + 7 + (b[off] | (b[off + 1] << 8)) + 1] | (b[off + 7 + (b[off] | (b[off + 1] << 8)) + 2] << 8)) === ${spec.types.length}`;
+  // Key length < 128, value field of at most 2 bytes without the overflow bit.
+  const hdr = '(b[off] < 128 && (b[off + 1] & 1) === 0 && (b[off + 1] < 128 || b[off + 2] < 128))';
+  if (spec.decode.length === 0) return hdr;
+  const vo = '(off + (b[off + 1] < 128 ? 2 : 3) + b[off])';
+  return `${hdr} && (b[${vo} + 1] | (b[${vo} + 2] << 8)) === ${spec.types.length}`;
 }
 
 /**

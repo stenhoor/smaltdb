@@ -1,5 +1,6 @@
 import { SmaltError } from '../errors.js';
-import type { BTree, BTreeCursor } from '../storage/btree.js';
+import { type BTree, type BTreeCursor, leafCell } from '../storage/btree.js';
+import { compareKeyAt } from '../util/bytes.js';
 import { KeyEncoder, type KeyColumn, KEY_AFTER_NULL, ROWID_KEY_SIZE, decodeKey, readIndexRowid, readRowidKey, rowidSuffixStart, writeRowidKey } from '../storage/key-codec.js';
 import { type RecordReader, decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
 import { type LoaderHelpers, type LoaderSpec, type ScanState, codegenEnabled, generateLoader } from './codegen.js';
@@ -97,13 +98,13 @@ export class TableAccess {
   /** Generic decode of the cell at `off` in leaf `page` (for generated scans' slow path). */
   loadCell(page: { bytes: Uint8Array; view: DataView }, off: number, r: SqlValue[]): void {
     const d = this.decode;
+    const cell = leafCell(page.bytes, off);
+    const ko = cell.keyOffset;
     if (d.length > 0) {
-      const b = page.bytes;
-      const kl = b[off] | (b[off + 1] << 8);
-      let bytes = b;
-      let start = off + 7 + kl;
-      let len = page.view.getUint32(off + 3, true);
-      if (b[off + 2] & 1) {
+      let bytes = page.bytes;
+      let start = ko + cell.keyLength;
+      let len = cell.valueLength;
+      if (cell.overflow) {
         bytes = this.tree.readValue(page, off);
         start = 0;
         len = bytes.length;
@@ -113,7 +114,7 @@ export class TableAccess {
       for (let i = 0; i < d.length; i += 2) r[d[i + 1]] = rd.column(d[i]);
     }
     if (this.rowidReg >= 0) {
-      const id = readRowidKey(page.bytes, off + 7);
+      const id = readRowidKey(page.bytes, ko);
       r[this.rowidReg] = id;
       for (const x of this.extraRowidRegs) r[x] = id;
     }
@@ -477,10 +478,11 @@ export class IndexScan implements Operator {
       if (!this.bounds()) return (this.done = true), false;
       ok = c.seek(this.lower!);
     } else ok = c.next();
-    if (!ok || c.compareKey(this.upper!) >= 0) return (this.done = true), false;
-    // The rowid is the key's suffix (see key-codec).
+    if (!ok) return (this.done = true), false;
     c.loadKey();
     const kb = c.keyBytes;
+    if (compareKeyAt(this.upper!, kb, c.keyOffset, c.keyLength) <= 0) return (this.done = true), false;
+    // The rowid is the key's suffix (see key-codec).
     const end = c.keyOffset + c.keyLength;
     const rowid = readIndexRowid(kb, end);
     const cover = this.cover;
@@ -546,11 +548,15 @@ export class IndexScan implements Operator {
         }
         ok = c.seek(this.lower!);
       } else ok = c.next();
-      if (!ok || c.compareKey(this.upper!) >= 0) {
+      if (!ok) {
         this.idxDone = true;
         break;
       }
       c.loadKey();
+      if (compareKeyAt(this.upper!, c.keyBytes, c.keyOffset, c.keyLength) <= 0) {
+        this.idxDone = true;
+        break;
+      }
       const rowid = readIndexRowid(c.keyBytes, c.keyOffset + c.keyLength);
       if (big === null && typeof rowid === 'bigint') big = Array.from(batch.subarray(0, n));
       if (big !== null) big.push(rowid);

@@ -219,7 +219,7 @@ describe('BTree.bulkLoadKeys', () => {
       for (let i = 0; i < Math.min(2000, count); i++) {
         const k = sorted[Math.floor(r() * sorted.length)];
         if (r() < 0.5) tree.delete(k);
-        else tree.put(new Uint8Array([...k, 9]), new Uint8Array(0));
+        else if (k.length < tree.maxKeySize) tree.put(new Uint8Array([...k, 9]), new Uint8Array(0));
       }
       checkAccounting(pager, tree);
       expect(pager.pinnedCount()).toBe(0);
