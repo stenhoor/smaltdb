@@ -149,6 +149,29 @@ export class BTree {
     }
   }
 
+  /**
+   * Estimated number of keys from the tree shape: follow the middle child at each level and multiply
+   * the fanouts by the leaf's cell count. Reads only `depth` pages. Used when no ANALYZE stats exist.
+   */
+  estimateCount(): number {
+    const pager = this.pager;
+    let pg = this.root;
+    let mult = 1;
+    for (;;) {
+      const f = pager.get(pg);
+      const n = nCells(f);
+      if (isLeaf(f)) {
+        pager.release(f);
+        return Math.max(n, 0) * mult;
+      }
+      mult *= n + 1;
+      const mid = n >>> 1;
+      const child = mid < n ? f.view.getUint32(slot(f, mid), true) : rightPtr(f);
+      pager.release(f);
+      pg = child;
+    }
+  }
+
   /** Number of keys, summed from per-leaf cell counts along the leaf chain (no row decoding). */
   count(): number {
     const pager = this.pager;

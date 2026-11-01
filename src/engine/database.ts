@@ -33,6 +33,7 @@ import { BTree } from './storage/btree.js';
 import { KeyEncoder, decodeKey, readRowidKey } from './storage/key-codec.js';
 import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordReader } from './storage/record.js';
+import { analyzeIndex, analyzeTable } from './exec/stats.js';
 import type { SqlValue } from './values.js';
 import type { Vfs, VfsFile } from './vfs/types.js';
 
@@ -75,6 +76,8 @@ interface Program {
   readonly: boolean;
   /** Writes at most one row after all checks pass, so it needs no statement journal. */
   singleRowWrite?: boolean;
+  /** Table sizes the cost-based plan assumed (root page -> estimated rows). */
+  rowAssumptions?: Map<number, number>;
   /** Result rows for utility statements (PRAGMA, EXPLAIN) computed at run time. */
   rows?: (r: SqlValue[]) => SqlValue[][];
   columns: string[];
@@ -253,6 +256,7 @@ export class Database implements FunctionContext {
       table.indexes.push(idx);
       this.indexes.set(idx.name.toLowerCase(), idx);
     }
+    this.loadStats();
     this.schemaVersion++;
   }
 
@@ -312,7 +316,7 @@ export class Database implements FunctionContext {
       regs,
     );
     planner.sqlText = ps.text;
-    const done = (p: Omit<Program, 'regCount'>): Program => ({ ...p, regCount: regs.count });
+    const done = (p: Omit<Program, 'regCount'>): Program => ({ ...p, regCount: regs.count, rowAssumptions: planner.rowAssumptions });
     switch (stmt.kind) {
       case 'select': {
         const plan = planner.planSelect(stmt, null);
@@ -351,6 +355,8 @@ export class Database implements FunctionContext {
       }
       case 'pragma':
         return done(this.compilePragma(stmt, planner));
+      case 'analyze':
+        return done({ exec: () => this.analyze(stmt.target), readonly: false, columns: [], columnTypes: [] });
       default:
         throw new SmaltError('SMALT_UNSUPPORTED', `${stmt.kind} statements are not supported yet`);
     }
@@ -459,6 +465,85 @@ export class Database implements FunctionContext {
   }
   private dirtySchema = false;
 
+  // ---------------------------------------------------------------- statistics
+
+  private static readonly STAT_SQL = 'CREATE TABLE smalt_stat(tbl TEXT, idx TEXT, stat TEXT)';
+
+  /** ANALYZE [table]: gather optimizer statistics and store them in smalt_stat. */
+  private analyze(target: string | undefined): RunResult {
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    let tables = [...this.tables.values()].filter((t) => !t.system && t.name.toLowerCase() !== 'smalt_stat');
+    if (target) {
+      const t = this.tables.get(target.toLowerCase());
+      const idx = this.indexes.get(target.toLowerCase());
+      if (t) tables = [t];
+      else if (idx) tables = [this.tables.get(idx.table.toLowerCase())!];
+      else throw new SmaltError('SMALT_ERROR', `no such table or index: ${target}`);
+    }
+    if (!this.tables.has('smalt_stat')) {
+      this.createTable(parseOne(Database.STAT_SQL).stmt as CreateTableStmt, Database.STAT_SQL, true);
+    }
+    const stat = this.tables.get('smalt_stat')!;
+    const w = new TableWriter(stat, this.pager, (root) => this.tree(root));
+    // Remove old rows for these tables.
+    const names = new Set(tables.map((t) => t.name.toLowerCase()));
+    const reader = new RecordReader(stat.layout, stat.recordDefaults);
+    const stale: (number | bigint)[] = [];
+    const c = this.tree(stat.rootPage).cursor();
+    for (let ok = c.first(); ok; ok = c.next()) {
+      c.loadValue();
+      reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+      if (names.has(String(reader.column(0)).toLowerCase())) {
+        c.loadKey();
+        stale.push(readRowidKey(c.keyBytes, c.keyOffset));
+      }
+    }
+    c.close();
+    for (const id of stale) w.deleteRow(id);
+    for (const t of tables) {
+      const ts = analyzeTable(this.tree(t.rootPage), t);
+      w.writeRow([t.name, null, JSON.stringify(ts)], w.newRowid());
+      t.stats = ts;
+      for (const ix of t.indexes) {
+        const is = analyzeIndex(this.tree(ix.rootPage), ix);
+        w.writeRow([t.name, ix.name, JSON.stringify(is)], w.newRowid());
+        ix.stats = is;
+      }
+    }
+    this.schemaChanged();
+    return none;
+  }
+
+  /** Attach persisted statistics (smalt_stat) to the in-memory schema. */
+  private loadStats(): void {
+    const stat = this.tables.get('smalt_stat');
+    if (!stat) return;
+    const reader = new RecordReader(stat.layout, stat.recordDefaults);
+    const c = this.tree(stat.rootPage).cursor();
+    try {
+      for (let ok = c.first(); ok; ok = c.next()) {
+        c.loadValue();
+        reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+        const tbl = this.tables.get(String(reader.column(0)).toLowerCase());
+        const idxName = reader.column(1);
+        const json = reader.column(2);
+        if (!tbl || typeof json !== 'string') continue;
+        try {
+          const parsed = JSON.parse(json);
+          if (idxName === null) tbl.stats = parsed;
+          else {
+            const ix = tbl.indexes.find((i) => i.name.toLowerCase() === String(idxName).toLowerCase());
+            if (ix) ix.stats = parsed;
+          }
+        } catch {
+          /* ignore malformed stats */
+        }
+      }
+    } finally {
+      c.close();
+    }
+  }
+
   // ---------------------------------------------------------------- DDL
 
   private checkNewName(name: string, kind: string): void {
@@ -468,11 +553,11 @@ export class Database implements FunctionContext {
     if (existing) throw new SmaltError('SMALT_ERROR', `${existing.type === kind ? kind : existing.type} ${name} already exists`);
   }
 
-  private createTable(stmt: CreateTableStmt, sql: string): RunResult {
+  private createTable(stmt: CreateTableStmt, sql: string, internal = false): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     if (stmt.temp) throw new SmaltError('SMALT_UNSUPPORTED', 'TEMP tables are not supported yet');
     if (stmt.ifNotExists && this.catalog.has(stmt.name.toLowerCase())) return none;
-    this.checkNewName(stmt.name, 'table');
+    if (!internal) this.checkNewName(stmt.name, 'table');
     this.dirtySchema = true;
     const root = BTree.create(this.pager);
     const { table, implicitIndexes } = buildTableSchema(stmt, sql, root);
@@ -593,7 +678,7 @@ export class Database implements FunctionContext {
   private targetTable(name: string, schema?: string): TableSchema {
     if (schema && schema.toLowerCase() !== 'main') throw new SmaltError('SMALT_ERROR', `unknown database ${schema}`);
     const lower = name.toLowerCase();
-    if (CATALOG_NAMES.has(lower)) throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
+    if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat') throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
     const t = this.tables.get(lower);
     if (!t) throw new SmaltError('SMALT_ERROR', `no such table: ${name}`);
     return t;
@@ -1035,12 +1120,30 @@ export class Statement {
     readonly sql: string,
   ) {}
 
+  private checkedAt = -1;
+
   private prog(): Program {
-    if (this.program === null || this.version !== this.db.schemaVersion) {
+    if (this.program === null || this.version !== this.db.schemaVersion || this.statsDrifted(this.program)) {
       this.program = this.db.compile(this.parsed);
       this.version = this.db.schemaVersion;
+      this.checkedAt = this.db.pager.changeCounter;
     }
     return this.program;
+  }
+
+  /**
+   * After data changes (checked at most once per commit), re-plan if any table the plan costed has
+   * grown or shrunk 4x or more: a plan made for an empty table should not survive it filling up.
+   */
+  private statsDrifted(p: Program): boolean {
+    const cc = this.db.pager.changeCounter;
+    if (cc === this.checkedAt || !p.rowAssumptions || p.rowAssumptions.size === 0) return false;
+    this.checkedAt = cc;
+    for (const [root, assumed] of p.rowAssumptions) {
+      const now = this.db.tree(root).estimateCount();
+      if (Math.max(now, 64) >= Math.max(assumed, 64) * 4 || Math.max(assumed, 64) >= Math.max(now, 64) * 4) return true;
+    }
+    return false;
   }
 
   get columns(): string[] {

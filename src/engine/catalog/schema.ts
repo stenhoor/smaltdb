@@ -43,6 +43,8 @@ export interface IndexSchema {
   where?: Expr;
   /** CREATE INDEX text (undefined for automatic indexes). */
   sql?: string;
+  /** Statistics from ANALYZE. */
+  stats?: import('../exec/stats.js').IndexStats;
 }
 
 export interface TableSchema {
@@ -60,6 +62,8 @@ export interface TableSchema {
   recordDefaults: SqlValue[];
   /** System tables cannot be modified by user DML. */
   system?: boolean;
+  /** Statistics from ANALYZE (absent until analyzed). */
+  stats?: import('../exec/stats.js').TableStats;
 }
 
 /** Automatic index name for the n-th (1-based) UNIQUE/PRIMARY KEY constraint of a table. */

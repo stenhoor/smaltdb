@@ -17,8 +17,14 @@ describe('SQL smoke', () => {
     expect(d.query('SELECT name FROM users WHERE age > 26 ORDER BY name').rows).toEqual([['ann'], ['cy']]);
     expect(d.query('SELECT count(*), sum(age), avg(score) FROM users').rows).toEqual([[3, 96, 1.75]]);
     expect(d.query('SELECT name FROM users WHERE id = 2').rows).toEqual([['bob']]);
-    const ex = d.query('EXPLAIN QUERY PLAN SELECT name FROM users WHERE age = 30').rows.map((r) => r[3]);
-    expect(ex.join()).toMatch(/INDEX users_age/);
+    // Cost-based: a 3-row table is cheaper to scan than to probe through an index...
+    expect(d.query('EXPLAIN QUERY PLAN SELECT name FROM users WHERE age = 30').rows.map((r) => r[3]).join()).toMatch(/SCAN users/);
+    // ...but with many rows the index wins.
+    d.exec('BEGIN');
+    for (let i = 0; i < 3000; i++) d.run('INSERT INTO users(name, age) VALUES (?, ?)', ['u' + i, 100 + (i % 500)]);
+    d.exec('COMMIT');
+    expect(d.query('EXPLAIN QUERY PLAN SELECT name FROM users WHERE age = 30').rows.map((r) => r[3]).join()).toMatch(/INDEX users_age/);
+    expect(d.query('SELECT name FROM users WHERE age = 30').rows).toEqual([['ann']]);
   });
 
   it('enforces constraints and rolls back failed statements', () => {

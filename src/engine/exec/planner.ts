@@ -120,6 +120,8 @@ interface Source {
   /** Lower-cased column names merged by USING/NATURAL (hidden from unqualified lookup and *). */
   hidden: Set<string>;
   position: number;
+  /** Cached row-count estimate. */
+  estRows?: number;
 }
 
 const ROWID_NAMES = new Set(['rowid', 'oid', '_rowid_']);
@@ -259,6 +261,38 @@ interface AccessChoice {
   /** Supports ORDER BY rowid elimination. */
   scan?: TableScan;
 }
+
+/** One way to read a source, with estimated cost per open and rows produced per open (before local filters). */
+interface AccessOption {
+  label: string;
+  cost: number;
+  rows: number;
+  dependsOnOuter: boolean;
+  build: () => AccessChoice;
+}
+
+/**
+ * Cost model constants, in approximate nanoseconds on the reference container (calibrated against
+ * bench/micro/joins.ts). Only their ratios matter.
+ */
+const COST = {
+  /** Sequential scan, per row (fused decode + filter). */
+  scanRow: 30,
+  /** One B+tree descent (rowid lookup or index seek). */
+  probe: 1500,
+  /** Per index entry: advance plus table row fetch by rowid. */
+  fetch: 1200,
+  /** Hash join: per build row, per probe row. */
+  hashBuild: 80,
+  hashProbe: 60,
+  /** Nested loop over a materialized inner side, per inner row visited. */
+  nlRow: 20,
+  /** Per output row of a join. */
+  outRow: 10,
+};
+
+/** Default rows for derived tables (unknown cardinality). */
+const SUBQUERY_ROWS = 1000;
 
 export class Planner {
   constructor(
@@ -808,14 +842,19 @@ export class Planner {
     for (const src of scope.sources) if (src.joinType !== 'LEFT') for (const c of src.on) addPool(c);
 
     const cs = this.compileScope(scope);
+    const order = this.joinOrder(scope, pool, cs);
+    const multi = scope.sources.length > 1;
+    const placed = new Set<number>();
+    let outerRows = 1;
     let root: Operator | null = null;
-    for (let p = 0; p < scope.sources.length; p++) {
+    for (const p of order) {
       const src = scope.sources[p];
       const isLeft = src.joinType === 'LEFT';
-      const onInfos: ConjunctInfo[] = isLeft ? src.on.flatMap((e) => splitBetween(e)).map((e) => ({ expr: e, deps: this.deps(e, scope), placed: false })) : [];
-      const candidates = (isLeft ? onInfos : pool).filter((c) => !c.placed && c.deps !== null && c.deps.has(p) && maxDep(c.deps) === p);
-      const access = this.chooseAccess(src, p, candidates, scope, cs);
-      if (p === 0 && access.scan) this.lastScan = access.scan;
+      const onInfos: ConjunctInfo[] = isLeft ? this.leftOnInfos(src, scope) : [];
+      const step = this.joinStep(src, placed, outerRows, isLeft ? onInfos : pool, scope, cs);
+      const candidates = step.candidates;
+      const access = step.option.build();
+      if (!multi && access.scan) this.lastScan = access.scan;
 
       // Filters local to this source (depend only on it and outer scopes).
       let leaf = access.leaf;
@@ -824,18 +863,21 @@ export class Planner {
         leaf = new Filter(leaf, compileExpr(c.expr, cs).fn, c.expr);
         c.placed = true;
       }
+      // In joins, standalone full scans of this source run as generated scan + filter pipelines.
+      if (multi && !access.dependsOnOuter) leaf = this.tryFuseScanFilter(leaf, scope);
 
       if (root === null) {
         root = leaf;
       } else {
         const innerRegs = (): number[] => this.sourceRegs(src);
         const rest = isLeft ? onInfos.filter((c) => !c.placed) : [];
-        if (access.dependsOnOuter) {
+        const method = access.dependsOnOuter ? 'inl' : step.method;
+        if (method === 'inl') {
           root = new NestedLoopJoin(root, leaf, isLeft, innerRegs, this.andAll(rest, cs));
           rest.forEach((c) => (c.placed = true));
         } else {
-          const eqs = (isLeft ? onInfos : pool).filter((c) => !c.placed && c.deps !== null && c.deps.has(p) && maxDep(c.deps) === p && c.deps.size > 1);
-          const hash = this.hashKeys(eqs, p, scope, cs);
+          const eqs = candidates.filter((c) => !c.placed && c.deps!.size > 1);
+          const hash = method === 'hash' ? this.hashKeys(eqs, p, scope, cs) : null;
           if (hash) {
             hash.used.forEach((c) => (c.placed = true));
             const residual = isLeft ? rest.filter((c) => !c.placed) : [];
@@ -843,16 +885,18 @@ export class Planner {
             const correlated = scope.correlated;
             root = new HashJoin(root, leaf, hash.build, hash.probe, hash.colls, innerRegs, isLeft, this.env.state, correlated, this.andAll(residual, cs));
           } else {
-            // Re-running an uncorrelated derived table per outer row is wasteful: cache its rows.
-            const inner = src.sub && !src.sub.correlated ? new Materialize(leaf, innerRegs, this.env.state, false) : leaf;
+            // Nested loop: materialize an uncorrelated inner side once instead of re-reading it per outer row.
+            const inner = (src.sub && !src.sub.correlated) || (!src.sub && !scope.correlated) ? new Materialize(leaf, innerRegs, this.env.state, false) : leaf;
             root = new NestedLoopJoin(root, inner, isLeft, innerRegs, this.andAll(rest, cs));
             rest.forEach((c) => (c.placed = true));
           }
         }
       }
+      placed.add(p);
+      outerRows = isLeft ? Math.max(outerRows, step.rows) : step.rows;
       // Remaining WHERE / inner-ON conjuncts whose dependencies are now all available.
       for (const c of pool) {
-        if (c.placed || c.deps === null || c.deps.size === 0 || maxDep(c.deps) !== p) continue;
+        if (c.placed || c.deps === null || c.deps.size === 0 || ![...c.deps].every((d) => placed.has(d))) continue;
         root = new Filter(root, compileExpr(c.expr, cs).fn, c.expr);
         c.placed = true;
       }
@@ -1003,10 +1047,13 @@ export class Planner {
 
   // ---------------------------------------------------------------- access paths
 
-  private chooseAccess(src: Source, p: number, candidates: ConjunctInfo[], scope: Scope, cs: CompileScope): AccessChoice {
+  /** Enumerate ways to read `src` using the given candidate conjuncts, with estimated costs. */
+  private accessOptions(src: Source, p: number, candidates: ConjunctInfo[], scope: Scope, cs: CompileScope): AccessOption[] {
     if (src.sub) {
-      return { leaf: src.sub.root, dependsOnOuter: src.sub.correlated };
+      const sub = src.sub;
+      return [{ label: 'subquery', cost: SUBQUERY_ROWS * COST.scanRow, rows: SUBQUERY_ROWS, dependsOnOuter: sub.correlated, build: () => ({ leaf: sub.root, dependsOnOuter: sub.correlated }) }];
     }
+    const N = this.tableRows(src);
     const table = src.table!;
     const access = src.access!;
     type Probe = { op: string; other: Expr; deps: Set<number>; col: number | 'rowid'; colExpr: Expr; conj: ConjunctInfo; list?: Expr[] };
@@ -1043,34 +1090,41 @@ export class Planner {
     }
 
     const outerDep = (list: Probe[]): boolean => list.some((x) => x.deps.size > 0);
-    let best: { score: number; build: () => AccessChoice } = {
-      score: 0,
-      build: () => {
-        const scan = new TableScan(access);
-        return { leaf: scan, dependsOnOuter: false, scan };
+    const options: AccessOption[] = [
+      {
+        label: 'scan',
+        cost: N * COST.scanRow,
+        rows: N,
+        dependsOnOuter: false,
+        build: () => {
+          const scan = new TableScan(access);
+          return { leaf: scan, dependsOnOuter: false, scan };
+        },
       },
-    };
-    const consider = (score: number, build: () => AccessChoice): void => {
-      if (score > best.score) best = { score, build };
+    ];
+    const consider = (label: string, cost: number, rows: number, dependsOnOuter: boolean, build: () => AccessChoice): void => {
+      options.push({ label, cost, rows, dependsOnOuter, build });
     };
 
     // Rowid equality / IN / range.
     for (const pr of probes) {
       if (pr.col !== 'rowid') continue;
       if (pr.op === '=') {
-        consider(100, () => {
+        consider('rowid=', COST.probe, 1, pr.deps.size > 0, () => {
           const leaf = new RowidLookup(access, [compileExpr(pr.other, cs).fn]);
           return { leaf, dependsOnOuter: pr.deps.size > 0 };
         });
       } else if (pr.op === 'in') {
-        consider(95, () => ({ leaf: new RowidLookup(access, pr.list!.map((x) => compileExpr(x, cs).fn)), dependsOnOuter: pr.deps.size > 0 }));
+        const k = pr.list!.length;
+        consider('rowid in', k * COST.probe, k, pr.deps.size > 0, () => ({ leaf: new RowidLookup(access, pr.list!.map((x) => compileExpr(x, cs).fn)), dependsOnOuter: pr.deps.size > 0 }));
       }
     }
     const rowidRange = probes.filter((x) => x.col === 'rowid' && ['<', '<=', '>', '>='].includes(x.op));
     if (rowidRange.length) {
       const lo = rowidRange.find((x) => x.op === '>' || x.op === '>=');
       const hi = rowidRange.find((x) => x.op === '<' || x.op === '<=');
-      consider(40, () => {
+      const rangeRows = N * (lo && hi ? 0.25 : 0.33);
+      consider('rowid range', COST.probe + rangeRows * COST.scanRow, rangeRows, outerDep([lo, hi].filter((x): x is Probe => !!x)), () => {
         const scan = new TableScan(
           access,
           lo ? { fn: compileExpr(lo.other, cs).fn, inclusive: lo.op === '>=' } : undefined,
@@ -1130,8 +1184,17 @@ export class Planner {
       }
       if (k === 0 && !lo && !hi) continue;
       const unique = idx.unique && k === idx.columns.length;
-      const score = unique ? 90 : k > 0 ? 50 + k * 5 + (lo || hi ? 2 : 0) : 30;
-      consider(score, () => {
+      let matches: number;
+      if (unique) matches = 1;
+      else if (k > 0 && idx.stats) matches = idx.stats.avg[k - 1];
+      else {
+        matches = N;
+        for (let j = 0; j < k; j++) matches /= this.ndv(src, idx.columns[j].column);
+      }
+      if (lo || hi) matches *= lo && hi ? 0.25 : 0.33;
+      matches = Math.max(1, matches);
+      const deps = outerDep([...eqs, ...(lo ? [lo] : []), ...(hi ? [hi] : [])]);
+      consider(`index ${idx.name}`, COST.probe + matches * COST.fetch, matches, deps, () => {
         const spec = {
           indexName: idx.name,
           tree: this.env.openTree(idx.rootPage),
@@ -1141,11 +1204,236 @@ export class Planner {
           hi: hi ? { fn: compileExpr(hi.other, cs).fn, inclusive: hi.op === '<=' } : undefined,
           convert: [...converters, ...(rangeConv ? [rangeConv] : [])],
         };
-        return { leaf: new IndexScan(access, spec), dependsOnOuter: outerDep([...eqs, ...(lo ? [lo] : []), ...(hi ? [hi] : [])]) };
+        return { leaf: new IndexScan(access, spec), dependsOnOuter: deps };
       });
     }
-    return best.build();
+    return options;
   }
+
+  // ---------------------------------------------------------------- estimates
+
+  /** Estimated rows of a source (ANALYZE stats, else B+tree shape). */
+  private tableRows(src: Source): number {
+    if (src.sub) return SUBQUERY_ROWS;
+    if (src.estRows === undefined) {
+      const live = src.access!.tree.estimateCount();
+      src.estRows = Math.max(1, src.table!.stats?.rows ?? live);
+      // Remember what the plan assumed, so the statement can re-plan if the table grows or shrinks a lot.
+      this.rowAssumptions.set(src.table!.rootPage, live);
+    }
+    return src.estRows;
+  }
+
+  /** Root page -> row estimate (from the tree shape) each costed table had when this plan was made. */
+  readonly rowAssumptions = new Map<number, number>();
+
+  /** Estimated distinct values of a column (ANALYZE, unique/rowid, index stats, else rows/10). */
+  private ndv(src: Source, col: number | 'rowid'): number {
+    const n = this.tableRows(src);
+    const t = src.table;
+    if (!t) return Math.max(1, n / 10);
+    if (col === 'rowid' || col === t.rowidAlias) return n;
+    if (t.stats) return Math.max(1, t.stats.ndv[col] || 1);
+    for (const ix of t.indexes) {
+      if (ix.columns[0].column !== col) continue;
+      if (ix.unique && ix.columns.length === 1) return n;
+      if (ix.stats) return Math.max(1, n / ix.stats.avg[0]);
+    }
+    return Math.max(1, n / 10);
+  }
+
+  /** Column reference -> (source, column) in the current scope, if `e` is one. */
+  private colRef(e: Expr, scope: Scope): { src: Source; col: number | 'rowid' } | null {
+    if (e.kind === 'collate') return this.colRef(e.expr, scope);
+    if (e.kind !== 'column') return null;
+    const p = this.findSourcePosition(e, scope);
+    if (p < 0) return null;
+    const src = scope.sources[p];
+    const col = this.columnOf(e, src, scope);
+    return col === null ? null : { src, col };
+  }
+
+  /** Estimated fraction of rows for which a conjunct is true. */
+  private selectivity(e: Expr, scope: Scope): number {
+    switch (e.kind) {
+      case 'binary': {
+        if (e.op === 'AND') return this.selectivity(e.left, scope) * this.selectivity(e.right, scope);
+        if (e.op === 'OR') {
+          const a = this.selectivity(e.left, scope);
+          const b = this.selectivity(e.right, scope);
+          return a + b - a * b;
+        }
+        const l = this.colRef(e.left, scope);
+        const r = this.colRef(e.right, scope);
+        if (e.op === '=' || e.op === 'IS') {
+          if (l && r && l.src !== r.src) return 1 / Math.max(this.ndv(l.src, l.col), this.ndv(r.src, r.col));
+          const c = l ?? r;
+          return c ? 1 / this.ndv(c.src, c.col) : 0.33;
+        }
+        if (e.op === '!=' || e.op === 'IS NOT') return 0.9;
+        if (['<', '<=', '>', '>='].includes(e.op)) return 0.33;
+        return 0.33;
+      }
+      case 'inList': {
+        const c = this.colRef(e.expr, scope);
+        const s = c ? Math.min(1, e.list.length / this.ndv(c.src, c.col)) : 0.33;
+        return e.not ? 1 - s : s;
+      }
+      case 'isNull': {
+        const c = this.colRef(e.expr, scope);
+        let s = 0.05;
+        if (c && c.col !== 'rowid' && c.src.table?.stats) s = c.src.table.stats.nulls[c.col] / Math.max(1, c.src.table.stats.rows);
+        else if (c?.col === 'rowid') s = 0;
+        return e.not ? 1 - s : s;
+      }
+      case 'between':
+        return e.not ? 0.75 : 0.25;
+      case 'like':
+        return e.not ? 0.75 : 0.25;
+      case 'unary':
+        return e.op === 'NOT' ? 1 - this.selectivity(e.operand, scope) : 0.33;
+      default:
+        return 0.33;
+    }
+  }
+
+  /** Pick the cheapest standalone (not outer-dependent) access option. */
+  private bestStandalone(opts: AccessOption[]): AccessOption {
+    let best: AccessOption | undefined;
+    for (const o of opts) if (!o.dependsOnOuter && (!best || o.cost < best.cost)) best = o;
+    return best ?? opts[0];
+  }
+
+  /**
+   * Cost of joining source `t` after `placed` sources producing `outerRows` rows. Returns the chosen
+   * method and estimates; used both by join ordering and by operator construction.
+   */
+  private joinStep(
+    t: Source,
+    placed: Set<number>,
+    outerRows: number,
+    pool: ConjunctInfo[],
+    scope: Scope,
+    cs: CompileScope,
+  ): { cost: number; rows: number; method: 'first' | 'inl' | 'hash' | 'nl'; option: AccessOption; candidates: ConjunctInfo[] } {
+    const p = t.position;
+    const avail = (c: ConjunctInfo): boolean => c.deps !== null && c.deps.has(p) && [...c.deps].every((d) => d === p || placed.has(d));
+    const candidates = pool.filter((c) => !c.placed && avail(c));
+    const local = candidates.filter((c) => c.deps!.size === 1);
+    const joins = candidates.filter((c) => c.deps!.size > 1);
+    let filtered = this.tableRows(t);
+    for (const c of local) filtered *= this.selectivity(c.expr, scope);
+    let joinSel = 1;
+    for (const c of joins) joinSel *= this.selectivity(c.expr, scope);
+    const opts = this.accessOptions(t, p, candidates, scope, cs);
+    const standalone = this.bestStandalone(opts);
+    if (placed.size === 0) {
+      return { cost: standalone.cost, rows: Math.max(1, filtered), method: 'first', option: standalone, candidates };
+    }
+    const outRows = Math.max(1, outerRows * filtered * joinSel);
+    let best: { cost: number; method: 'inl' | 'hash' | 'nl'; option: AccessOption } = {
+      cost: standalone.cost + outerRows * Math.max(1, filtered) * COST.nlRow,
+      method: 'nl',
+      option: standalone,
+    };
+    for (const o of opts) {
+      if (!o.dependsOnOuter) continue;
+      const c = outerRows * o.cost;
+      if (c < best.cost) best = { cost: c, method: 'inl', option: o };
+    }
+    const hasEquiJoin = joins.some((c) => c.expr.kind === 'binary' && c.expr.op === '=');
+    if (hasEquiJoin) {
+      const c = standalone.cost + filtered * COST.hashBuild + outerRows * COST.hashProbe;
+      if (c < best.cost) best = { cost: c, method: 'hash', option: standalone };
+    }
+    return { cost: best.cost + outRows * COST.outRow, rows: outRows, method: best.method, option: best.option, candidates };
+  }
+
+  /**
+   * Choose the join order. Runs of INNER-joined sources are reordered by dynamic programming over
+   * subsets (greedy above 8 sources); LEFT-joined sources keep their position (and therefore
+   * everything before them is joined first), which preserves outer-join semantics.
+   */
+  private joinOrder(scope: Scope, pool: ConjunctInfo[], cs: CompileScope): number[] {
+    const n = scope.sources.length;
+    if (n <= 1) return n === 1 ? [0] : [];
+    const order: number[] = [];
+    const placed = new Set<number>();
+    let rows = 1;
+    let segment: number[] = [];
+    const flush = (): void => {
+      if (segment.length === 0) return;
+      const best = segment.length <= 8 ? this.orderSegmentDP(segment, placed, rows, pool, scope, cs) : this.orderSegmentGreedy(segment, placed, rows, pool, scope, cs);
+      for (const p of best.order) {
+        order.push(p);
+        placed.add(p);
+      }
+      rows = best.rows;
+      segment = [];
+    };
+    for (let p = 0; p < n; p++) {
+      if (scope.sources[p].joinType === 'LEFT') {
+        flush();
+        const step = this.joinStep(scope.sources[p], placed, rows, this.leftOnInfos(scope.sources[p], scope), scope, cs);
+        rows = Math.max(rows, step.rows); // a left join never drops outer rows
+        order.push(p);
+        placed.add(p);
+      } else segment.push(p);
+    }
+    flush();
+    return order;
+  }
+
+  private leftOnInfos(src: Source, scope: Scope): ConjunctInfo[] {
+    return src.on.flatMap((e) => splitBetween(e)).map((e) => ({ expr: e, deps: this.deps(e, scope), placed: false }));
+  }
+
+  private orderSegmentDP(segment: number[], prefix: Set<number>, prefixRows: number, pool: ConjunctInfo[], scope: Scope, cs: CompileScope): { order: number[]; rows: number } {
+    const m = segment.length;
+    type St = { cost: number; rows: number; order: number[] };
+    const best = new Array<St | undefined>(1 << m);
+    best[0] = { cost: 0, rows: prefixRows, order: [] };
+    for (let mask = 0; mask < 1 << m; mask++) {
+      const cur = best[mask];
+      if (!cur) continue;
+      const placed = new Set(prefix);
+      for (const p of cur.order) placed.add(p);
+      for (let j = 0; j < m; j++) {
+        if (mask & (1 << j)) continue;
+        const step = this.joinStep(scope.sources[segment[j]], placed, cur.rows, pool, scope, cs);
+        // Avoid cross products while a connected choice exists: penalize joins without any join conjunct.
+        const connected = placed.size === 0 || step.candidates.some((c) => c.deps!.size > 1);
+        const cost = cur.cost + step.cost * (connected ? 1 : 4);
+        const next = mask | (1 << j);
+        if (!best[next] || cost < best[next]!.cost) best[next] = { cost, rows: step.rows, order: [...cur.order, segment[j]] };
+      }
+    }
+    return best[(1 << m) - 1]!;
+  }
+
+  private orderSegmentGreedy(segment: number[], prefix: Set<number>, prefixRows: number, pool: ConjunctInfo[], scope: Scope, cs: CompileScope): { order: number[]; rows: number } {
+    const left = new Set(segment);
+    const placed = new Set(prefix);
+    const order: number[] = [];
+    let rows = prefixRows;
+    while (left.size > 0) {
+      let pick = -1;
+      let pickStep: ReturnType<Planner['joinStep']> | null = null;
+      for (const p of left) {
+        const step = this.joinStep(scope.sources[p], placed, rows, pool, scope, cs);
+        if (!pickStep || step.cost < pickStep.cost) {
+          pick = p;
+          pickStep = step;
+        }
+      }
+      order.push(pick);
+      placed.add(pick);
+      left.delete(pick);
+      rows = pickStep!.rows;
+    }
+    return { order, rows };
+  }
+
 
   /** If `e` is a plain reference to a column of `src`, return its column index or 'rowid'. */
   private columnOf(e: Expr, src: Source, scope: Scope): number | 'rowid' | null {
