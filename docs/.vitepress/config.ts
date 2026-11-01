@@ -81,6 +81,7 @@ export default defineConfig({
           { text: '0008 Materialized views & columnar', link: '/adr/0008-materialized-views-and-columnar-segments' },
           { text: '0009 Concurrency', link: '/adr/0009-concurrency' },
           { text: '0010 Analytics & mixed storage', link: '/adr/0010-analytics-and-mixed-storage' },
+          { text: '0011 External tables (proposed)', link: '/adr/0011-external-tables' },
         ],
       },
       {
@@ -94,6 +95,7 @@ export default defineConfig({
           { text: 'M4 performance', link: '/research/m4-performance' },
           { text: 'Index engine work', link: '/research/index-engine-work' },
           { text: 'M5 materialized views', link: '/research/m5-materialized-views' },
+          { text: 'M8 external tables', link: '/research/m8-external-tables' },
           { text: 'Result row shape', link: '/research/result-shape-benchmark' },
           { text: 'Columnar vs. MVs', link: '/research/columnar-mv-assessment' },
           { text: 'Vectorization review', link: '/research/vectorization-review' },
