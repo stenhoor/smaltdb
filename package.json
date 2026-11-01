@@ -1,10 +1,30 @@
 {
   "name": "smaltdb",
-  "version": "0.0.0",
+  "version": "0.8.3",
   "description": "Fast embedded SQL database engine for browsers (OPFS + Web Workers)",
+  "keywords": [
+    "sql",
+    "database",
+    "sqlite",
+    "opfs",
+    "web-worker",
+    "browser",
+    "embedded",
+    "indexeddb-alternative",
+    "parquet",
+    "csv"
+  ],
+  "author": "stenhoor",
+  "homepage": "https://github.com/stenhoor/smaltdb#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stenhoor/smaltdb.git"
+  },
+  "bugs": {
+    "url": "https://github.com/stenhoor/smaltdb/issues"
+  },
   "license": "MIT",
   "type": "module",
-  "private": true,
   "engines": {
     "node": ">=20"
   },
@@ -17,10 +37,12 @@
     "bench": "node bench/run-node.mjs",
     "bench:browser": "node bench/browser/run.mjs",
     "check": "npm run typecheck && npm test",
-    "build": "node scripts/build.mjs",
+    "build": "node scripts/build.mjs && npm run build:types",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
-    "docs:preview": "vitepress preview docs"
+    "docs:preview": "vitepress preview docs",
+    "prepublishOnly": "npm run typecheck && npm test && node scripts/build.mjs --minify && npm run build:types",
+    "build:types": "tsc -p tsconfig.build.json"
   },
   "devDependencies": {
     "@duckdb/duckdb-wasm": "^1.33.1-dev57.0",
@@ -36,9 +58,16 @@
     "vitest": "^5.0.5"
   },
   "exports": {
-    ".": "./dist/smaltdb.js",
-    "./engine": "./dist/engine.js",
-    "./worker": "./dist/smaltdb-worker.js"
+    ".": {
+      "types": "./dist/types/client/index.d.ts",
+      "default": "./dist/smaltdb.js"
+    },
+    "./engine": {
+      "types": "./dist/types/engine/index.d.ts",
+      "default": "./dist/engine.js"
+    },
+    "./worker": "./dist/smaltdb-worker.js",
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
@@ -57,5 +86,6 @@
     "hyparquet-compressors": {
       "optional": true
     }
-  }
+  },
+  "types": "./dist/types/client/index.d.ts"
 }

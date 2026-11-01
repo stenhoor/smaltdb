@@ -11,11 +11,26 @@
 It stores data in the [Origin Private File System (OPFS)](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system),
 can keep data in an optional in-memory cache for speed, and runs inside Web Workers so the main thread never blocks.
 
-> Status: **M2 (durability) complete.** Commits are atomic and durable via a write-ahead log, verified by crash-injection tests.
-> This is still an early preview: no multi-tab support yet (M6), and the SQL coverage is listed below.
-> smaltdb runs SQLite-dialect queries, DML, and DDL in a Web Worker on OPFS, and is checked against SQLite with differential tests.
-> Performance against crash-safe SQLite WASM: faster on 8 of 10 benchmark workloads, and slower on scan-heavy analytical queries. See the [benchmark methodology and results](docs/research/benchmark-methodology.md). See the [roadmap](docs/ROADMAP.md) and the
-> [supported SQL](docs/SQL_DIALECT.md#7-implementation-status-m1).
+> **Status: 0.8.3, preview.** Durable, atomic commits on OPFS (write-ahead log, crash-injection tested), a
+> cost-based planner, views and materialized views, columnar tables, multi-tab access with parallel readers, spilling
+> sorts and aggregates, and external tables over CSV, JSON and Parquet files on HTTP, S3 and Azure Blob Storage
+> (milestones M0–M8.3 of the [roadmap](docs/ROADMAP.md)). The SQL dialect follows SQLite and is checked against it with
+> differential tests and a sqllogictest subset; see the [supported SQL](docs/SQL_DIALECT.md). Benchmarks against
+> crash-safe SQLite WASM: [methodology and results](docs/research/benchmark-methodology.md). The on-disk format may
+> still change before 1.0.
+
+## Install
+
+```sh
+npm install smaltdb
+```
+
+The engine runs in a module worker, `dist/smaltdb-worker.js` (with its `dist/chunks/`), which the client loads with
+`new URL('./smaltdb-worker.js', import.meta.url)`: Vite and webpack 5 bundle it from there. With other setups, copy
+those files to your site and pass the worker's URL: `open('app', { worker: new URL('/smaltdb-worker.js', location.href) })`.
+Storage works on any page; interrupting a running statement uses `SharedArrayBuffer`, which needs a cross-origin
+isolated page (COOP / COEP headers). Parquet support needs `npm install hyparquet` (and `hyparquet-compressors` for
+codecs other than Snappy).
 
 ## Quick start
 
@@ -43,10 +58,10 @@ await db.close();
 5. **Off the main thread.** The engine runs in Web Workers, and it can run several queries at once.
 6. **Durable local storage** on OPFS, with an optional memory-cached mode for hot data.
 
-## Non-goals (initially)
+## Non-goals (for now)
 
-- Network replication or sync.
-- Server-side runtimes (Node/Deno/Bun). Node is used only to run unit tests.
+- Replication or sync (a separate `smaltdb-sync` plugin is planned; external tables are its groundwork).
+- Server-side use as the main target: the synchronous engine (`smaltdb/engine`) runs in Node, mainly for tests and tools.
 - Reading or writing SQLite database files.
 - Full SQLite compatibility (extensions, virtual-table modules, every pragma).
 
