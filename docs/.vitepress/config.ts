@@ -12,6 +12,8 @@ export default defineConfig({
   base: '/smaltdb/',
   cleanUrls: true,
   srcExclude: ['brand/**'],
+  // adr/README.md is the folder's landing page on GitHub; publish it at /adr/ too.
+  rewrites: { 'adr/README.md': 'adr/index.md' },
   lastUpdated: false,
   // docs/brand holds the logo files; serve them from the site root.
   vite: { publicDir: path.resolve(here, '../brand') },
