@@ -907,6 +907,8 @@ export class HashJoin implements Operator {
   }
 
   close(): void {
+    // Children consumed in open() are closed here too, so an error part-way releases their pages.
+    this.build.close();
     this.outer.close();
   }
 }
@@ -947,7 +949,10 @@ export class Materialize implements Operator {
     for (let k = 0; k < regs.length; k++) this.r[regs[k]] = row[k];
     return true;
   }
-  close(): void {}
+  close(): void {
+    // The rows stay cached; closing the child releases its pages if the build stopped part-way.
+    this.child.close();
+  }
 }
 
 export class Project implements Operator {
@@ -1111,6 +1116,8 @@ export class HashAggregate implements Operator {
   }
 
   close(): void {
+    // Children consumed in open() are closed here too, so an error part-way releases their pages.
+    this.child.close();
     this.groups = [];
   }
 }
@@ -1191,6 +1198,8 @@ export class Sort implements Operator {
   }
 
   close(): void {
+    // Children consumed in open() are closed here too, so an error part-way releases their pages.
+    this.child.close();
     this.rows = [];
   }
 }
@@ -1439,8 +1448,8 @@ export class OuterJoin implements Operator {
     const rows: SqlValue[][] = [];
     const table = this.buildKeys.length ? new Map<unknown, number[]>() : null;
     const inner = this.inner;
-    inner.open(r);
     try {
+      inner.open(r);
       while (inner.next()) {
         rows.push(this.innerRegs.map((g) => r[g]));
         if (table) {
@@ -1513,6 +1522,8 @@ export class OuterJoin implements Operator {
   }
 
   close(): void {
+    // Children consumed in open() are closed here too, so an error part-way releases their pages.
+    this.inner.close();
     this.outer.close();
     this.rows = [];
     this.table = null;
@@ -1611,8 +1622,8 @@ export class RecursiveCte implements Operator {
 
   private runInto(op: Operator): void {
     const r = this.r;
-    op.open(r);
     try {
+      op.open(r);
       while (op.next()) this.add(this.outRegs.map((g) => r[g]));
     } finally {
       op.close();
@@ -1706,6 +1717,9 @@ export class RecursiveCte implements Operator {
   }
 
   close(): void {
+    // Children consumed in open() are closed here too, so an error part-way releases their pages.
+    this.initial.close();
+    for (const op of this.recursive) op.close();
     this.queue = [];
     this.seen = new Set();
     this.working.row = null;
@@ -1802,8 +1816,8 @@ export function explainAnalyze(root: Operator, r: SqlValue[], estimates: WeakMap
   };
   walk(root, 0);
   try {
-    root.open(r);
     try {
+      root.open(r);
       while (root.next());
     } finally {
       root.close();

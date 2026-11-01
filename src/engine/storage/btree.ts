@@ -407,7 +407,7 @@ export class BTree {
    * key is copied, so callers may reuse their buffer), then `finish`. Leaves are filled completely
    * and linked; interior levels are built at the end. No descents, no splits (refresh, CREATE INDEX).
    */
-  bulkLoader(): { add(key: Uint8Array, kOff: number, kLen: number, value: Uint8Array): void; finish(): void } {
+  bulkLoader(): { add(key: Uint8Array, kOff: number, kLen: number, value: Uint8Array): void; finish(): void; abort(): void } {
     const pager = this.pager;
     const usable = this.usable;
     const root = pager.get(this.root);
@@ -463,7 +463,12 @@ export class BTree {
       pager.release(page);
       this.bulkFinish(pages, seps);
     };
-    return { add, finish };
+    // On failure: release the leaf being filled (the pages themselves are reclaimed by the rollback).
+    const abort = (): void => {
+      if (page !== null) pager.release(page);
+      page = null;
+    };
+    return { add, finish, abort };
   }
 
   /** Build the interior levels over leaf pages `pages` (seps[i] separates i and i+1) and move the top into the root. */
@@ -1227,16 +1232,19 @@ export class BTree {
     const f = pager.get(pg);
     const children: number[] = [];
     const overflowCells: number[] = [];
-    if (isLeaf(f)) {
-      const n = nCells(f);
-      for (let i = 0; i < n; i++) overflowCells.push(slot(f, i));
-      for (const off of overflowCells) this.freeCellOverflow(f, off);
-    } else if (f.bytes[0] === PageType.BTreeInterior) {
-      const n = nCells(f);
-      for (let i = 0; i < n; i++) children.push(f.view.getUint32(slot(f, i), true));
-      children.push(rightPtr(f));
+    try {
+      if (isLeaf(f)) {
+        const n = nCells(f);
+        for (let i = 0; i < n; i++) overflowCells.push(slot(f, i));
+        for (const off of overflowCells) this.freeCellOverflow(f, off);
+      } else if (f.bytes[0] === PageType.BTreeInterior) {
+        const n = nCells(f);
+        for (let i = 0; i < n; i++) children.push(f.view.getUint32(slot(f, i), true));
+        children.push(rightPtr(f));
+      }
+    } finally {
+      pager.release(f);
     }
-    pager.release(f);
     for (const c of children) this.freeSubtree(c);
     pager.free(pg);
   }
@@ -1433,10 +1441,9 @@ export class BTreeCursor {
     while (this.idx >= nCells(f)) {
       const next = rightPtr(f);
       pager.release(f);
-      if (next === 0) {
-        this.frame = null;
-        return false;
-      }
+      // Forget the released leaf first: if the next fetch throws (I/O, interrupt), close() must not release it again.
+      this.frame = null;
+      if (next === 0) return false;
       f = pager.get(next);
       this.frame = f;
       this.idx = 0;
@@ -1450,10 +1457,9 @@ export class BTreeCursor {
     while (this.idx < 0) {
       const prev = prevPtr(f);
       pager.release(f);
-      if (prev === 0) {
-        this.frame = null;
-        return false;
-      }
+      // Forget the released leaf first: if the next fetch throws (I/O, interrupt), close() must not release it again.
+      this.frame = null;
+      if (prev === 0) return false;
       f = pager.get(prev);
       this.frame = f;
       this.idx = nCells(f) - 1;

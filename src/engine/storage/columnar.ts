@@ -143,6 +143,11 @@ export class ColumnStoreWriter {
     return this.total;
   }
 
+  /** Stop after an error: release the page being filled. */
+  abort(): void {
+    this.loader.abort();
+  }
+
   private put(key: Uint8Array, value: Uint8Array): void {
     this.loader.add(key, 0, key.length, value);
   }

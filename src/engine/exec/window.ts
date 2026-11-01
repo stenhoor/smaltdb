@@ -158,6 +158,8 @@ export class Window implements Operator {
   }
 
   close(): void {
+    // Children consumed in open() are closed here too, so an error part-way releases their pages.
+    this.child.close();
     this.snaps = [];
     this.results = [];
   }

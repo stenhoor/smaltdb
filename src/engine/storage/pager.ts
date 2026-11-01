@@ -106,6 +106,9 @@ interface Savepoint {
  * images. Rollback restores the images captured on each page's first modification.
  */
 
+/** Page fetches between interrupt checks. */
+const INTERRUPT_EVERY = 256;
+
 export class Pager {
   readonly pageSize: number;
   /** Bytes per page available to page formats (page size minus reserved trailer). */
@@ -323,6 +326,11 @@ export class Pager {
     return false;
   }
 
+  /** Drop every pin (after a failed write statement, when no cursor can hold one). */
+  releaseAllPins(): void {
+    for (const f of this.frames) f.pins = 0;
+  }
+
   /** Number of currently pinned frames (should be 0 between operations; used by tests). */
   pinnedCount(): number {
     let n = 0;
@@ -337,8 +345,20 @@ export class Pager {
 
   // ---------------------------------------------------------------- page access
 
+  /**
+   * Called every {@link INTERRUPT_EVERY} page fetches while set; throws to abort the running
+   * statement (cancellation). Page fetches happen throughout scans, lookups and writes, so this
+   * bounds how long a statement runs after it is cancelled.
+   */
+  interrupt: (() => void) | null = null;
+  private fetches = 0;
+
   /** Fetch a page (pinned). Page 0 (the database header) is not accessible here. */
   get(pgno: number): Frame {
+    if (this.interrupt !== null && ++this.fetches >= INTERRUPT_EVERY) {
+      this.fetches = 0;
+      this.interrupt();
+    }
     const cached = this.map.get(pgno);
     if (cached !== undefined) {
       cached.pins++;

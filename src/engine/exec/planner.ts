@@ -831,10 +831,13 @@ export class Planner {
       ...CODEGEN_HELPERS_FOR_FUSION,
       first: () => tree.descendForCursor(null, false),
       next: (page) => {
+        // Fetch the next leaf before releasing this one: if the fetch throws, the caller still
+        // holds (and releases) exactly one pin.
         const f = page as Frame;
         const nx = f.view.getUint32(PH_RIGHT, true);
+        const g = nx === 0 ? null : pager.get(nx);
         pager.release(f);
-        return nx === 0 ? null : pager.get(nx);
+        return g;
       },
       release: (page) => pager.release(page as Frame),
       slow: (page, off, r) => access.loadCell(page, off, r),
@@ -904,10 +907,13 @@ export class Planner {
         return f;
       },
       next: (page) => {
+        // Fetch the next leaf before releasing this one: if the fetch throws, the caller still
+        // holds (and releases) exactly one pin.
         const f = page as Frame;
         const nx = f.view.getUint32(PH_RIGHT, true);
+        const g = nx === 0 ? null : pager.get(nx);
         pager.release(f);
-        return nx === 0 ? null : pager.get(nx);
+        return g;
       },
       release: (page) => pager.release(page as Frame),
       slow: (page, off, r) => access.loadCell(page, off, r),
@@ -2160,9 +2166,13 @@ export class Planner {
     const correlated = plan.correlated;
     const fn: Fn = (r) => {
       if (!correlated && epoch === state.epoch) return cached;
-      root.open(r);
-      const v = root.next() ? r[out] : null;
-      root.close();
+      let v: SqlValue;
+      try {
+        root.open(r);
+        v = root.next() ? r[out] : null;
+      } finally {
+        root.close();
+      }
       if (!correlated) {
         cached = v;
         epoch = state.epoch;
@@ -2301,8 +2311,8 @@ export class Planner {
     const build = (r: SqlValue[]): void => {
       table = new Map();
       const root = plan.root;
-      root.open(r);
       try {
+        root.open(r);
         outer: while (root.next()) {
           const vals: SqlValue[] = [];
           for (let i = 0; i < n; i++) {
@@ -2318,9 +2328,12 @@ export class Planner {
         root.close();
       }
       if (emptyPlan) {
-        emptyPlan.root.open(r);
-        emptyValue = emptyPlan.root.next() ? r[emptyPlan.outRegs[0]] : null;
-        emptyPlan.root.close();
+        try {
+          emptyPlan.root.open(r);
+          emptyValue = emptyPlan.root.next() ? r[emptyPlan.outRegs[0]] : null;
+        } finally {
+          emptyPlan.root.close();
+        }
       }
       epoch = state.epoch;
     };
@@ -2359,9 +2372,13 @@ export class Planner {
     const correlated = plan.correlated;
     return (r) => {
       if (!correlated && epoch === state.epoch) return cached;
-      root.open(r);
-      const v = root.next() ? 1 : 0;
-      root.close();
+      let v: number;
+      try {
+        root.open(r);
+        v = root.next() ? 1 : 0;
+      } finally {
+        root.close();
+      }
       if (!correlated) {
         cached = v;
         epoch = state.epoch;

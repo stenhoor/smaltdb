@@ -206,6 +206,16 @@ export class Database implements FunctionContext {
   }
   private stmtNow: number | undefined;
 
+  /**
+   * Install a check that runs periodically while statements execute (every few hundred page
+   * fetches). Throwing from it aborts the statement like any error (it is rolled back); throw a
+   * SmaltError with code SMALT_INTERRUPT to signal cancellation. The check must clear its own
+   * trigger before throwing, so the rollback is not interrupted again.
+   */
+  setInterruptCheck(check: (() => void) | null): void {
+    this.pager.interrupt = check;
+  }
+
   get inTransaction(): boolean {
     return !this.autocommit;
   }
@@ -319,8 +329,8 @@ export class Database implements FunctionContext {
       }
       const root = p.plan!.root;
       const out: SqlValue[][] = [];
-      root.open(regs);
       try {
+        root.open(regs);
         while (root.next()) out.push(p.plan!.outRegs.map((g) => regs[g]));
       } finally {
         root.close();
@@ -686,6 +696,9 @@ export class Database implements FunctionContext {
     } catch (e) {
       this.fk.stmt = 0;
       this.fk.deferred = this.autocommit ? 0 : deferredBefore;
+      // Writes never run while a read cursor is open, so no page may legitimately stay pinned: a
+      // failure part-way through B+tree maintenance (an interrupt, an I/O error) can leave pins.
+      pager.releaseAllPins();
       if (journal) pager.rollbackStatement();
       if (this.autocommit) pager.rollback();
       this.loadSchemaIfChanged();
@@ -783,24 +796,31 @@ export class Database implements FunctionContext {
     const vals: SqlValue[] = new Array(ncols).fill(null);
     const key = new Uint8Array(ROWID_KEY_SIZE);
     let rowid = 0;
-    this.runSelect(info.select, info.sql, (r, outRegs) => {
-      if (outRegs.length !== ncols) throw new SmaltError('SMALT_ERROR', `materialized view ${mv.name}: the query now returns ${outRegs.length} columns, the view has ${ncols}`);
-      for (let i = 0; i < ncols; i++) {
-        const v = r[outRegs[i]];
-        if (v !== null && !fitsStorage(v, types[i])) {
-          throw new SmaltError('SMALT_MISMATCH', `materialized view ${mv.name}: column ${cols[i].name} is ${types[i]} but the query produced ${describeValue(v)} (add a CAST to the view)`);
+    try {
+      this.runSelect(info.select, info.sql, (r, outRegs) => {
+        if (outRegs.length !== ncols) throw new SmaltError('SMALT_ERROR', `materialized view ${mv.name}: the query now returns ${outRegs.length} columns, the view has ${ncols}`);
+        for (let i = 0; i < ncols; i++) {
+          const v = r[outRegs[i]];
+          if (v !== null && !fitsStorage(v, types[i])) {
+            throw new SmaltError('SMALT_MISMATCH', `materialized view ${mv.name}: column ${cols[i].name} is ${types[i]} but the query produced ${describeValue(v)} (add a CAST to the view)`);
+          }
+          if (!columnar) vals[i] = v;
         }
-        if (!columnar) vals[i] = v;
-      }
-      rowid++;
-      if (columnar) columnar.addFrom(r, outRegs);
-      else {
-        writeRowidKey(key, 0, rowid);
-        loader!.add(key, 0, ROWID_KEY_SIZE, enc!.encode(vals));
-      }
-    });
-    if (columnar) columnar.finish();
-    else loader!.finish();
+        rowid++;
+        if (columnar) columnar.addFrom(r, outRegs);
+        else {
+          writeRowidKey(key, 0, rowid);
+          loader!.add(key, 0, ROWID_KEY_SIZE, enc!.encode(vals));
+        }
+      });
+      if (columnar) columnar.finish();
+      else loader!.finish();
+    } catch (e) {
+      // Release the page being filled; the rollback reclaims the rest.
+      if (columnar) columnar.abort();
+      else loader!.abort();
+      throw e;
+    }
     const indexRoots = mv.indexes.map((idx) => {
       const r = BTree.create(this.pager);
       const copy: IndexSchema = { ...idx, rootPage: r };
@@ -866,8 +886,8 @@ export class Database implements FunctionContext {
     const plan = planner.planSelect(select, null);
     const r: SqlValue[] = new Array(regs.count).fill(null);
     const root = plan.root;
-    root.open(r);
     try {
+      root.open(r);
       const out = plan.outRegs;
       while (root.next()) emit(r, out);
     } finally {
@@ -1765,13 +1785,16 @@ export class Database implements FunctionContext {
         if (selfRef) {
           // Read everything first: the SELECT reads the table being written.
           const buf: SqlValue[][] = [];
-          root.open(r);
-          while (root.next()) buf.push(plan.outRegs.map((g) => r[g]));
-          root.close();
+          try {
+            root.open(r);
+            while (root.next()) buf.push(plan.outRegs.map((g) => r[g]));
+          } finally {
+            root.close();
+          }
           for (const v of buf) emit(v, reals);
         } else {
-          root.open(r);
           try {
+            root.open(r);
             while (root.next()) emit(plan.outRegs.map((g) => r[g]), reals);
           } finally {
             root.close();
@@ -2012,8 +2035,8 @@ export class Database implements FunctionContext {
       // values are computed during the join (from the first matching FROM row, as SQLite does).
       const rowids: (number | bigint)[] = [];
       const fromValues = new Map<number | bigint, SqlValue[]>();
-      root.open(r);
       try {
+        root.open(r);
         while (root.next()) {
           const id = r[rowidReg] as number | bigint;
           if (withFrom) {
@@ -2087,8 +2110,8 @@ export class Database implements FunctionContext {
         return { changes: n, lastInsertRowid: this.lastRowid };
       }
       const pending: (number | bigint)[] = [];
-      root.open(r);
       try {
+        root.open(r);
         while (root.next()) pending.push(r[rowidReg] as number | bigint);
       } finally {
         root.close();
@@ -2445,8 +2468,8 @@ export class Statement {
     this.db.execute(p, () => {
       if (p.rows) return p.rows(regs);
       const root = p.plan!.root;
-      root.open(regs);
       try {
+        root.open(regs);
         while (root.next());
       } finally {
         root.close();
@@ -2507,7 +2530,13 @@ export class RowCursor {
     readonly columns: string[],
   ) {
     if (plan) {
-      plan.root.open(regs);
+      try {
+        plan.root.open(regs);
+      } catch (e) {
+        // Operators that work in open() (sorts, hash builds) may hold pages: release them.
+        plan.root.close();
+        throw e;
+      }
       this.open = true;
       db.activeCursors.add(this);
     }

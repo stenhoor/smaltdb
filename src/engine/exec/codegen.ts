@@ -792,7 +792,7 @@ export function generateScanFilter(
     '    k++;',
     `    if (k === ${cap}) { st.i = i + 1; return k; }`,
     '  }',
-    '  st.f = null; f = H.next(f); st.f = f; i = 0; st.i = 0;',
+    '  f = H.next(f); st.f = f; i = 0; st.i = 0;',
     '}',
     'return k;',
   ].join('\n');

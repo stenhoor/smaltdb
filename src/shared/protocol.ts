@@ -14,20 +14,39 @@ export interface OpenRequest {
   pageSize?: number;
   cacheSizeBytes?: number;
   syncOnCommit?: boolean;
+  /**
+   * Interrupt flag (cross-origin isolated pages): Int32 slot 0 holds the id of a request to stop.
+   * The engine checks it while statements run (every few hundred page fetches).
+   */
+  interrupt?: SharedArrayBuffer;
+  /** Multi-tab: BroadcastChannel name on which the engine also serves other tabs. */
+  bus?: string;
 }
 
 export type Request = { id: number } & (
   | OpenRequest
   | { op: 'exec'; sql: string; params?: Params }
-  | { op: 'query'; sql: string; params?: Params; batchSize?: number }
+  /** `credit`: batches to send before waiting for a 'credit' request (backpressure); omitted = all. */
+  | { op: 'query'; sql: string; params?: Params; batchSize?: number; credit?: number }
   | { op: 'prepare'; sql: string }
   | { op: 'stmtRun'; stmt: number; params?: Params }
-  | { op: 'stmtQuery'; stmt: number; params?: Params; batchSize?: number }
+  | { op: 'stmtQuery'; stmt: number; params?: Params; batchSize?: number; credit?: number }
   | { op: 'finalize'; stmt: number }
   | { op: 'import'; format: 'csv' | 'json'; table: string; data: Uint8Array; options?: Record<string, unknown> }
   | { op: 'export'; format: 'csv' | 'json'; sql: string; params?: Params; options?: Record<string, unknown> }
   | { op: 'close' }
+  /** Grant `n` more batches to the stream of request `target`. */
+  | { op: 'credit'; target: number; n: number }
+  /** Stop request `target`: dequeue it or close its stream (running statements: interrupt flag). */
+  | { op: 'cancel'; target: number }
 );
+
+/** Messages on a multi-tab BroadcastChannel. */
+export type BusMessage =
+  | { type: 'hello'; session: string }
+  | { type: 'leader'; leader: string }
+  | { type: 'req'; session: string; leader: string; req: Request }
+  | { type: 'res'; session: string; res: Response };
 
 /** A request without its id (distributive over the union). */
 export type RequestBody = Request extends infer R ? (R extends { id: number } ? Omit<R, 'id'> : never) : never;
