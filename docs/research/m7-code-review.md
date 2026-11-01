@@ -14,7 +14,7 @@ memory store and TEMP tables, spilling, columnar base tables, morsel parallelism
 
 There is no CLAUDE.md, so no conventions findings were possible.
 
-**Status:** S1 items 1–5 and S2 items 6–19 are fixed, each with regression tests (`test/s1-regressions.test.ts`, `test/s2-regressions.test.ts`); S3, performance and cleanup items are open. Each item below records how it was reproduced and the suggested direction. Severity:
+**Status:** all 25 confirmed defects (S1, S2, S3) are fixed, each with regression tests (`test/s1-regressions.test.ts`, `test/s2-regressions.test.ts`, `test/s3-regressions.test.ts`); the performance and cleanup items are open. Each item below records how it was reproduced and the suggested direction. Severity:
 **S1** corrupts data or returns wrong results silently; **S2** wrong results or errors in specific shapes; **S3**
 lifecycle, robustness and edge cases; **P** performance; **C** cleanup.
 
@@ -196,7 +196,7 @@ lifecycle, robustness and edge cases; **P** performance; **C** cleanup.
 
 ### S3: lifecycle, robustness and edge cases
 
-20. **Reopening a database with memory views leaves writes uncommitted in the main pager.**
+20. **Fixed. Reopening a database with memory views leaves writes uncommitted in the main pager.**
     - *Where:* `database.ts:228`.
     - *Cause:* `rebuildMemoryViews` runs outside a transaction. `fillMatview` calls `touchTable`, which writes
       `smalt_matview` and bumps the cookie on the main pager when a file MV depends on a memory MV, but only the
@@ -205,28 +205,34 @@ lifecycle, robustness and edge cases; **P** performance; **C** cleanup.
       the next successful write commits it, and `checkpoint()` throws while the WAL is non-empty.
     - *Ordering:* views rebuild in catalog order, so after DROP and re-CREATE of a base memory view, a memory view
       over it stays unpopulated after reopen.
-21. **A re-opened fused GROUP BY can leak a spill hold.**
+   - *Fix (done):* the rebuild at open runs in dependency order (a memory view over pending memory views waits for them) and marks nothing stale. It recomputes the same rows from the same committed data, so the main file is not written and `pager.inTransaction` stays false.
+21. **Fixed. A re-opened fused GROUP BY can leak a spill hold.**
     - *Where:* `exec/operators.ts:2350`.
     - *Cause:* `FusedGroupAggregate.open` resets `delegated` without closing the fallback `HashAggregate`.
     - *Trigger:* a correlated derived table on the inner side of a nested loop, where one re-open spills and the
       next does not. Reproduced only with a non-deterministic filter (`random()`).
     - *Effect:* the `-spill` file is never truncated and keeps growing.
     - *Fix:* close the fallback first in `open()`.
-22. **The multi-pass external sort is not stable.**
+   - *Fix (done):* `open()` closes a fallback still delegated from the previous open.
+22. **Fixed. The multi-pass external sort is not stable.**
     - *Where:* `exec/operators.ts` (Sort merge passes).
     - *Cause:* with more than 64 runs, the merged run holding the earliest input is appended after later runs, so
       ties favor later input. The code comment claims stability.
     - *Fix:* replace the merged group at the front of `runs`, not the end.
-23. **Two writer handles on one VFS without locking share the scratch file.**
+   - *Fix (done):* merge passes replace each group of runs in place, keeping input order.
+23. **Fixed. Two writer handles on one VFS without locking share the scratch file.**
     - *Where:* `database.ts:245`, `exec/spill.ts`.
     - *Effect:* the second handle truncates the shared `db-spill` file, and the first fails with "spill file: short
       read". This is not reachable with OPFS: exclusive handles make the second spill open fall back to no spilling.
-24. **`Database.close()` never closes the memory pager.** Only cleanup is affected: memory is reclaimed by the
+   - *Fix (done):* scratch file names are registered per VFS. A second handle (or a worker whose exclusive OPFS open fails) takes `<db>-spill-2`, `-3`, … and the name is freed on close.
+24. **Fixed. `Database.close()` never closes the memory pager.** Only cleanup is affected: memory is reclaimed by the
     garbage collector.
-25. **The two-pager transaction facade has no compensation.**
+   - *Fix (done):* `close()` closes the memory pager.
+25. **Fixed. The two-pager transaction facade has no compensation.**
     - *Where:* `database.ts:352–391`.
     - *Risk:* if the main pager commits and the auto-checkpoint after it throws, the memory pager never commits.
       This was not reproduced; it is an ordering hazard.
+   - *Fix (done):* the automatic checkpoint after a WAL commit is best-effort (counted in `stats.failedCheckpoints`, retried at the next commit and on close). A committed transaction no longer surfaces as an error, and the memory store's commit always follows the main one.
 
 ## Refuted on verification
 

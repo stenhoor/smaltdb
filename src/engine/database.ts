@@ -18,7 +18,7 @@ import { type CompileScope, type Compiled, type Fn, compileExpr } from './exec/e
 import { type FunctionContext, aggregateFunctions, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
 import { Planner, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
-import { DEFAULT_WORK_MEM, SpillArea } from './exec/spill.js';
+import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
 import { type MatviewCandidate, matchMatview } from './exec/mv-match.js';
@@ -207,9 +207,9 @@ export class Database implements FunctionContext {
   /** Scratch area for sorts and hash aggregates that outgrow work_mem (M7.2). */
   private readonly spill: SpillArea;
 
-  private constructor(file: VfsFile | null, options: DatabaseOptions, walFile?: VfsFile, reader = false, spillFile: VfsFile | null = null) {
+  private constructor(file: VfsFile | null, options: DatabaseOptions, walFile?: VfsFile, reader = false, spillFile: { file: VfsFile; release: () => void } | null = null) {
     this.pager = file === null ? Pager.openMemory(options) : reader ? Pager.openReader(file, walFile!, options) : Pager.open(file, options, walFile);
-    this.spill = new SpillArea(spillFile, options.workMem ?? DEFAULT_WORK_MEM);
+    this.spill = new SpillArea(spillFile?.file ?? null, options.workMem ?? DEFAULT_WORK_MEM, spillFile?.release ?? null);
     this.mem = file === null ? null : Pager.openMemory({ pageSize: this.pager.pageSize });
     this.cacheSize = options.statementCacheSize ?? 64;
     if (this.pager.catalogRoot === 0) {
@@ -228,16 +228,33 @@ export class Database implements FunctionContext {
    */
   private rebuildMemoryViews(): void {
     if (!this.mem) return;
-    for (const t of this.tables.values()) {
-      if (!t.matview || t.rootPage < MEM_BASE || t.matview.populated) continue;
-      try {
-        this.fillMatview(t);
-      } catch {
-        // leave it unpopulated: reading it reports why it needs a refresh
+    let pending = [...this.tables.values()].filter((t) => t.matview && t.rootPage >= MEM_BASE && !t.matview.populated);
+    // The rebuild recomputes the rows the views held (their committed inputs are unchanged), so
+    // views over them stay as fresh as they were: nothing is marked stale and the file is not written.
+    this.rebuilding = true;
+    try {
+      while (pending.length > 0) {
+        // Views over other pending memory views wait for those (dependency order, not catalog order).
+        const waiting = new Set(pending.map((t) => t.name.toLowerCase()));
+        const ready = pending.filter((t) => ![...this.selectDeps(t.matview!.select)].some((d) => d !== t.name.toLowerCase() && waiting.has(d)));
+        const batch = ready.length > 0 ? ready : pending; // a cycle: try the rest anyway
+        for (const t of batch) {
+          try {
+            this.fillMatview(t);
+          } catch {
+            // leave it unpopulated: reading it reports why it needs a refresh
+          }
+        }
+        pending = pending.filter((t) => !batch.includes(t));
       }
+    } finally {
+      this.rebuilding = false;
     }
     this.mem.commit();
   }
+
+  /** Memory views are being rebuilt at open (see {@link rebuildMemoryViews}). */
+  private rebuilding = false;
 
   /** `path` ':memory:' opens a new in-memory database (see {@link openMemory}). */
   static async open(vfs: Vfs, path: string, options: DatabaseOptions = {}): Promise<Database> {
@@ -259,13 +276,8 @@ export class Database implements FunctionContext {
   }
 
   /** The scratch file, or null (none wanted, or it cannot be opened: then nothing spills). */
-  private static async openSpill(vfs: Vfs, path: string | false): Promise<VfsFile | null> {
-    if (path === false) return null;
-    try {
-      return await vfs.open(path);
-    } catch {
-      return null;
-    }
+  private static async openSpill(vfs: Vfs, path: string | false): Promise<{ file: VfsFile; release: () => void } | null> {
+    return path === false ? null : openSpillFile(vfs, path);
   }
 
   /** Reader: move to the latest committed state (reloads the schema if it changed). */
@@ -457,6 +469,7 @@ export class Database implements FunctionContext {
     if (this.closed) return;
     for (const c of [...this.activeCursors]) c.close();
     this.pager.close();
+    this.mem?.close();
     this.spill.close();
     this.closed = true;
   }
@@ -1705,6 +1718,7 @@ export class Database implements FunctionContext {
 
   /** Mark fresh materialized views that read the object named `lower` stale. */
   private touchName(lower: string): void {
+    if (this.rebuilding) return;
     let changed = false;
     for (const t of this.tables.values()) {
       const m = t.matview;

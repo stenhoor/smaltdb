@@ -1429,7 +1429,7 @@ export class Sort implements Operator {
     const area = this.spill;
     const budget = area !== null && area.enabled ? area.workMem : Infinity;
     let bytes = 0;
-    const runs: Run[] = [];
+    let runs: Run[] = [];
     this.child.open(r);
     while (this.child.next()) {
       const row = new Array(n);
@@ -1464,12 +1464,21 @@ export class Sort implements Operator {
       return;
     }
     // Merge passes until the runs fit one merge, then merge lazily as rows are read.
+    // Merge passes keep the runs in input order (ties go to the earlier run: a stable sort).
     while (runs.length + 1 > SORT_FAN_IN) {
-      const group = runs.splice(0, SORT_FAN_IN);
-      const w = new RunWriter(area!);
-      this.startMerge(group, [], -1);
-      while (this.pop()) w.add(this.out, n);
-      runs.push(w.finish());
+      const merged: Run[] = [];
+      for (let i = 0; i < runs.length; i += SORT_FAN_IN) {
+        const group = runs.slice(i, i + SORT_FAN_IN);
+        if (group.length === 1) {
+          merged.push(group[0]);
+          continue;
+        }
+        const w = new RunWriter(area!);
+        this.startMerge(group, [], -1);
+        while (this.pop()) w.add(this.out, n);
+        merged.push(w.finish());
+      }
+      runs = merged;
     }
     this.startMerge(runs, rows, cap);
   }
@@ -2349,6 +2358,9 @@ export class FusedGroupAggregate implements Operator {
     this.run ??= this.build();
     this.r = r;
     this.gi = 0;
+    // Re-opened without close (the inner side of a nested loop): end the previous delegation, or
+    // the fallback's spill hold would outlive the statement.
+    if (this.delegated) this.fallback!.close();
     this.delegated = false;
     const order: { keys: SqlValue[]; st: AggregateState[] }[] = [];
     if (this.budget) {
