@@ -67,6 +67,7 @@ import {
   Limit,
   Materialize,
   NestedLoopJoin,
+  OuterJoin,
   type Operator,
   Project,
   RowidLookup,
@@ -290,6 +291,8 @@ interface ConjunctInfo {
   /** Positions of current-scope sources referenced; null = depends on everything (subqueries). */
   deps: Set<number> | null;
   placed: boolean;
+  /** RIGHT/FULL JOIN: earliest step (FROM position) at which this WHERE conjunct may be applied. */
+  minStep?: number;
 }
 
 interface AccessChoice {
@@ -1054,19 +1057,62 @@ export class Planner {
       for (const c of splitBetween(e)) pool.push({ expr: c, deps: this.deps(c, scope), placed: false });
     };
     for (const c of conjuncts(where)) addPool(c);
-    for (const src of scope.sources) if (src.joinType !== 'LEFT') for (const c of src.on) addPool(c);
+    // RIGHT / FULL JOIN make every earlier source NULL-extendable: WHERE conjuncts reading those
+    // sources must not be pushed below the join (FROM order is kept; see OuterJoin).
+    const outerAt = scope.sources.flatMap((s, i) => (s.joinType === 'RIGHT' || s.joinType === 'FULL' ? [i] : []));
+    const hasOuter = outerAt.length > 0;
+    if (hasOuter) {
+      if (items.some((it, i) => (it.using || it.natural) && (scope.sources[i].joinType === 'RIGHT' || scope.sources[i].joinType === 'FULL'))) {
+        throw new SmaltError('SMALT_UNSUPPORTED', 'USING / NATURAL with RIGHT or FULL JOIN is not supported yet');
+      }
+      for (const c of pool) {
+        let m = -1;
+        for (const d of c.deps ?? scope.sources.map((s) => s.position)) for (const k of outerAt) if (d < k || (d === k && scope.sources[k].joinType === 'FULL')) m = Math.max(m, k);
+        c.minStep = m;
+      }
+    }
+    for (const src of scope.sources) if (src.joinType === 'INNER' || src.joinType === 'CROSS') for (const c of src.on) addPool(c);
 
     const cs = this.compileScope(scope);
-    const order = this.joinOrder(scope, pool, cs);
+    const order = hasOuter ? scope.sources.map((_, i) => i) : this.joinOrder(scope, pool, cs);
     const multi = scope.sources.length > 1;
     const placed = new Set<number>();
     let outerRows = 1;
     let root: Operator | null = null;
     for (const p of order) {
       const src = scope.sources[p];
+      if (src.joinType === 'RIGHT' || src.joinType === 'FULL') {
+        // The inner side is read whole (its rows must survive even without a match).
+        let leaf = this.bestStandalone(this.accessOptions(src, p, [], scope, cs)).build().leaf;
+        if (!src.sub) leaf = this.tryFuseScanFilter(leaf, scope);
+        const on = this.leftOnInfos(src, scope);
+        const hash = this.hashKeys(on.filter((c) => c.deps !== null && c.deps.size > 1 && c.deps.has(p)), p, scope, cs);
+        const residual = on.filter((c) => !hash?.used.includes(c));
+        const before = [...placed];
+        root = new OuterJoin(
+          root!,
+          leaf,
+          () => this.sourceRegs(src),
+          () => before.flatMap((q) => this.sourceRegs(scope.sources[q])),
+          src.joinType === 'FULL',
+          this.andAll(residual, cs),
+          hash?.build,
+          hash?.probe,
+          hash?.colls,
+        );
+        placed.add(p);
+        outerRows = Math.max(outerRows, this.tableRows(src));
+        for (const c of pool) {
+          if (c.placed || c.deps === null || c.deps.size === 0 || (c.minStep ?? -1) > p || ![...c.deps].every((d) => placed.has(d))) continue;
+          root = new Filter(root, compileExpr(c.expr, cs).fn, c.expr);
+          c.placed = true;
+        }
+        continue;
+      }
       const isLeft = src.joinType === 'LEFT';
       const onInfos: ConjunctInfo[] = isLeft ? this.leftOnInfos(src, scope) : [];
-      const step = this.joinStep(src, placed, outerRows, isLeft ? onInfos : pool, scope, cs);
+      const allowed = hasOuter ? pool.filter((c) => (c.minStep ?? -1) <= p) : pool;
+      const step = this.joinStep(src, placed, outerRows, isLeft ? onInfos : allowed, scope, cs);
       const candidates = step.candidates;
       const access = step.option.build();
       if (!multi && access.scan) this.lastScan = access.scan;
@@ -1114,7 +1160,7 @@ export class Planner {
       if (root !== leaf) this.estimates.set(root, outerRows);
       // Remaining WHERE / inner-ON conjuncts whose dependencies are now all available.
       for (const c of pool) {
-        if (c.placed || c.deps === null || c.deps.size === 0 || ![...c.deps].every((d) => placed.has(d))) continue;
+        if (c.placed || c.deps === null || c.deps.size === 0 || (c.minStep ?? -1) > p || ![...c.deps].every((d) => placed.has(d))) continue;
         root = new Filter(root, compileExpr(c.expr, cs).fn, c.expr);
         c.placed = true;
       }
@@ -1152,7 +1198,6 @@ export class Planner {
     out: { item: FromItem; joinType: JoinType; on?: Expr; using?: string[]; natural: boolean }[],
   ): void {
     if (item.kind === 'join') {
-      if (item.joinType === 'RIGHT' || item.joinType === 'FULL') throw new SmaltError('SMALT_UNSUPPORTED', `${item.joinType} JOIN is not supported yet`);
       this.flattenFrom(item.left, joinType, on, using, natural, out);
       if (item.right.kind === 'join') {
         if (item.joinType === 'LEFT') throw new SmaltError('SMALT_UNSUPPORTED', 'LEFT JOIN with a parenthesized join on the right is not supported yet');

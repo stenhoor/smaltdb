@@ -120,6 +120,8 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
   to the altered table/column change; quoting style is kept); every object is re-validated and the ALTER fails with
   SQLite's "error in view v after drop column: …" style messages; `ADD COLUMN` takes a constant default and existing
   rows read it without being rewritten; `DROP COLUMN` rewrites the rows.
+- (M4) `RIGHT [OUTER] JOIN` and `FULL [OUTER] JOIN` (hash-matched on equality conditions, with any residual ON
+  condition; WHERE conditions are not pushed below them, and FROM order is kept in queries that use them).
 - (M4) Window functions: `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`,
   `first_value`, `last_value`, `nth_value`, and every aggregate (with `FILTER`) over a window; `PARTITION BY`, `ORDER BY`,
   `ROWS` / `RANGE` / `GROUPS` frames with `UNBOUNDED` / `n PRECEDING|FOLLOWING` / `CURRENT ROW` bounds and `EXCLUDE`
@@ -145,7 +147,7 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
 losslessly as SQLite STRICT tables do (`'5'` into an INTEGER column becomes 5), and anything else is rejected with
 `cannot store TEXT value in INTEGER column t.c`.
 
-**Not yet supported** (each gives a clear `SMALT_UNSUPPORTED` error): `RIGHT` / `FULL` joins,
+**Not yet supported** (each gives a clear `SMALT_UNSUPPORTED` error): `USING` / `NATURAL` with `RIGHT` / `FULL` joins,
 TEMP views, materialized views (M5), `ON CONFLICT` targets with WHERE, row-value assignments (`SET (a, b) = …`), expression and
 partial indexes, `INCLUDE` columns, `WITHOUT ROWID`, `LOOSE` tables, generated columns, TEMP tables, JSON
 functions, and `VACUUM`. Plain `EXPLAIN` returns the `EXPLAIN QUERY PLAN` output (there is no bytecode to list).

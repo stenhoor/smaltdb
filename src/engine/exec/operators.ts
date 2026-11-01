@@ -6,7 +6,7 @@ import { type LoaderHelpers, type LoaderSpec, type ScanState, codegenEnabled, ge
 
 const LOADER_HELPERS: LoaderHelpers = { readInt64, utf8: decodeUtf8, tagged: decodeTagged, rowid: readRowidKey };
 import { Collation, type SqlValue, compareValues } from '../values.js';
-import { applyNumericAffinity, hashKey, hashKeyMulti, toNumeric } from './convert.js';
+import { applyNumericAffinity, hashKey, hashKeyMulti, toNumeric, truthy } from './convert.js';
 import { type Fn, isTrue } from './expr.js';
 import { type AggregateFunction, type AggregateState, MinMaxState } from './functions.js';
 
@@ -1157,6 +1157,147 @@ export function explainRows(root: Operator): { id: number; parent: number; detai
   };
   walk(root, 0);
   return out;
+}
+
+/**
+ * RIGHT and FULL OUTER JOIN. The inner (right-hand) side is materialized, hashed on equality keys
+ * when there are any, and every inner row carries a "matched" flag. Outer rows are joined as usual
+ * (FULL also emits an unmatched outer row with the inner registers NULL); once the outer side is
+ * exhausted, every inner row that never matched is emitted with all outer registers NULL.
+ */
+export class OuterJoin implements Operator {
+  readonly children: Operator[];
+  private r!: SqlValue[];
+  private rows: SqlValue[][] = [];
+  private matchedFlags = new Uint8Array(0);
+  private table: Map<unknown, number[]> | null = null;
+  private candidates: number[] | null = null;
+  private ci = 0;
+  private outerActive = false;
+  private outerMatched = false;
+  private draining = false;
+  private di = 0;
+  private innerRegs: number[] = [];
+  private outerRegs: number[] = [];
+
+  constructor(
+    readonly outer: Operator,
+    readonly inner: Operator,
+    readonly innerRegsFn: () => number[],
+    readonly outerRegsFn: () => number[],
+    readonly full: boolean,
+    readonly cond: Fn | undefined,
+    readonly buildKeys: Fn[] = [],
+    readonly probeKeys: Fn[] = [],
+    readonly collations: Collation[] = [],
+  ) {
+    this.children = [outer, inner];
+  }
+
+  get detail(): string {
+    return `${this.full ? 'FULL' : 'RIGHT'} OUTER ${this.buildKeys.length ? 'HASH ' : ''}JOIN`;
+  }
+
+  private key(fns: Fn[]): unknown {
+    const r = this.r;
+    if (fns.length === 1) {
+      const v = fns[0](r);
+      return v === null ? undefined : hashKey(v, this.collations[0]);
+    }
+    const vals: SqlValue[] = [];
+    for (const f of fns) {
+      const v = f(r);
+      if (v === null) return undefined;
+      vals.push(v);
+    }
+    return hashKeyMulti(vals, this.collations);
+  }
+
+  open(r: SqlValue[]): void {
+    this.r = r;
+    this.innerRegs = this.innerRegsFn();
+    this.outerRegs = this.outerRegsFn();
+    const rows: SqlValue[][] = [];
+    const table = this.buildKeys.length ? new Map<unknown, number[]>() : null;
+    const inner = this.inner;
+    inner.open(r);
+    try {
+      while (inner.next()) {
+        rows.push(this.innerRegs.map((g) => r[g]));
+        if (table) {
+          const k = this.key(this.buildKeys);
+          if (k === undefined) continue; // NULL keys never match
+          let list = table.get(k);
+          if (!list) table.set(k, (list = []));
+          list.push(rows.length - 1);
+        }
+      }
+    } finally {
+      inner.close();
+    }
+    this.rows = rows;
+    this.table = table;
+    this.matchedFlags = new Uint8Array(rows.length);
+    this.outerActive = false;
+    this.draining = false;
+    this.di = 0;
+    this.outer.open(r);
+  }
+
+  private setInner(j: number): void {
+    const row = this.rows[j];
+    for (let i = 0; i < this.innerRegs.length; i++) this.r[this.innerRegs[i]] = row[i];
+  }
+
+  next(): boolean {
+    const r = this.r;
+    if (!this.draining) {
+      for (;;) {
+        if (!this.outerActive) {
+          if (!this.outer.next()) {
+            this.draining = true;
+            break;
+          }
+          this.outerActive = true;
+          this.outerMatched = false;
+          this.ci = 0;
+          if (this.table) {
+            const k = this.key(this.probeKeys);
+            this.candidates = k === undefined ? null : (this.table.get(k) ?? null);
+          } else this.candidates = null;
+        }
+        const n = this.table ? (this.candidates?.length ?? 0) : this.rows.length;
+        while (this.ci < n) {
+          const j = this.table ? this.candidates![this.ci++] : this.ci++;
+          this.setInner(j);
+          if (this.cond && truthy(this.cond(r)) !== true) continue;
+          this.matchedFlags[j] = 1;
+          this.outerMatched = true;
+          return true;
+        }
+        this.outerActive = false;
+        if (this.full && !this.outerMatched) {
+          for (const g of this.innerRegs) r[g] = null;
+          return true;
+        }
+      }
+    }
+    // Inner rows that never matched, with the outer side NULL.
+    while (this.di < this.rows.length) {
+      const j = this.di++;
+      if (this.matchedFlags[j]) continue;
+      this.setInner(j);
+      for (const g of this.outerRegs) r[g] = null;
+      return true;
+    }
+    return false;
+  }
+
+  close(): void {
+    this.outer.close();
+    this.rows = [];
+    this.table = null;
+  }
 }
 
 /** The self-reference of a WITH RECURSIVE CTE: yields the row the recursion is expanding, once per open. */
