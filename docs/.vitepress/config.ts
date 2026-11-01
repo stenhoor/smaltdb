@@ -96,6 +96,7 @@ export default defineConfig({
           { text: 'Index engine work', link: '/research/index-engine-work' },
           { text: 'M5 materialized views', link: '/research/m5-materialized-views' },
           { text: 'M8 external tables', link: '/research/m8-external-tables' },
+          { text: 'M7 code review', link: '/research/m7-code-review' },
           { text: 'Result row shape', link: '/research/result-shape-benchmark' },
           { text: 'Columnar vs. MVs', link: '/research/columnar-mv-assessment' },
           { text: 'Vectorization review', link: '/research/vectorization-review' },
