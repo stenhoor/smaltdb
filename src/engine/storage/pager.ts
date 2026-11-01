@@ -118,6 +118,8 @@ export class Pager {
   private readonly frames: Frame[] = [];
   private readonly map = new Map<number, Frame>();
   private readonly dirtyList: Frame[] = [];
+  /** Frames currently dirty (dirtyList may also hold stale entries of discarded frames). */
+  private dirtyCount = 0;
   private hand = 0;
   private readonly targetFrames: number;
   private readonly verify: boolean;
@@ -491,6 +493,7 @@ export class Pager {
     f.unverified = false; // contents of a dirty frame are authoritative
     if (!f.dirty) {
       f.dirty = true;
+      this.dirtyCount++;
       this.dirtyList.push(f);
     }
   }
@@ -499,6 +502,7 @@ export class Pager {
     f.unverified = false;
     if (!f.dirty) {
       f.dirty = true;
+      this.dirtyCount++;
       this.dirtyList.push(f);
     }
   }
@@ -699,6 +703,7 @@ export class Pager {
     if (this.memory) {
       for (const f of this.dirtyList) f.dirty = false;
       this.dirtyList.length = 0;
+    this.dirtyCount = 0;
       this.hv.setUint32(DH_CHANGE_COUNTER, (this.changeCounter + 1) >>> 0, true);
       this.committedHeader.set(this.header);
       this.headerDirty = false;
@@ -747,6 +752,7 @@ export class Pager {
       i = j;
     }
     dirty.length = 0;
+    this.dirtyCount = 0;
     this.hv.setUint32(DH_CHANGE_COUNTER, (this.changeCounter + 1) >>> 0, true);
     this.writePage(this.header, 0);
     this.committedHeader.set(this.header);
@@ -770,6 +776,7 @@ export class Pager {
     wal.commit(pages, this.pageCount, this.syncOnCommit);
     for (const f of dirty) f.dirty = false;
     dirty.length = 0;
+    this.dirtyCount = 0;
     this.stats.writes += pages.length;
     this.committedHeader.set(this.header);
     this.headerDirty = false;
@@ -805,6 +812,7 @@ export class Pager {
       this.restoreLevel(this.txn!);
       for (const f of this.dirtyList) f.dirty = false;
       this.dirtyList.length = 0;
+    this.dirtyCount = 0;
       this.header.set(this.committedHeader);
       this.headerDirty = false;
       this.txn = this.newLevel();
@@ -813,6 +821,7 @@ export class Pager {
     }
     for (const f of this.dirtyList) if (f.dirty) this.discard(f);
     this.dirtyList.length = 0;
+    this.dirtyCount = 0;
     this.header.set(this.committedHeader);
     this.headerDirty = false;
     this.trimOverflowFrames();
@@ -869,6 +878,7 @@ export class Pager {
   private discard(f: Frame): void {
     if (this.memory && f.pgno !== -1) this.spare.push(f);
     this.map.delete(f.pgno);
+    if (f.dirty) this.dirtyCount--;
     f.dirty = false;
     f.pgno = -1;
     f.ref = false;
@@ -906,7 +916,10 @@ export class Pager {
     const frames = this.frames;
     const n = frames.length;
     let victim: Frame | undefined;
-    for (let scanned = 0; scanned < 2 * n; scanned++) {
+    // No-steal: dirty frames stay until commit. When (nearly) all are dirty, sweeping the clock
+    // for the few clean ones costs O(frames) per miss: grow instead (trimmed after commit).
+    const sweep = this.dirtyCount < n - (n >>> 3) ? 2 * n : 0;
+    for (let scanned = 0; scanned < sweep; scanned++) {
       const f = frames[this.hand];
       this.hand = this.hand + 1 === n ? 0 : this.hand + 1;
       if (f.pgno === -1) {
