@@ -593,10 +593,27 @@ class Parser {
     }
     const q = this.qualifiedName();
     if (this.acceptOp('(')) {
-      const args = this.isOp(')') ? [] : this.exprList();
+      // Positional arguments, then named ones (`header => false`).
+      const args: A.Expr[] = [];
+      let named: Record<string, A.Expr> | undefined;
+      if (!this.isOp(')')) {
+        do {
+          if ((this.isNameAt(this.p) || this.kws[this.p]) && this.isOpAt(this.p + 1, '=>')) {
+            // Any word names an option, keywords included (`null => 'NA'`).
+            const key = String(this.vals[this.p++]).toLowerCase();
+            this.p++; // =>
+            (named ??= {})[key] = this.expr();
+          } else {
+            if (named) this.fail(); // positional after named
+            args.push(this.expr());
+          }
+        } while (this.acceptOp(','));
+      }
       this.expectOp(')');
       const name = q.schema !== undefined ? `${q.schema}.${q.name}` : q.name;
-      return { kind: 'function', pos, name: name.toLowerCase(), args, alias: this.optAlias(), end: this.ends[this.p - 1] };
+      const ref: A.FunctionRef = { kind: 'function', pos, name: name.toLowerCase(), args, alias: this.optAlias(), end: this.ends[this.p - 1] };
+      if (named) ref.named = named;
+      return ref;
     }
     const alias = this.optAlias();
     return { kind: 'table', pos, schema: q.schema, name: q.name, alias, indexedBy: this.optIndexedBy(), end: this.ends[this.p - 1] };
@@ -787,6 +804,11 @@ class Parser {
         return this.createIndex(pos, unique);
       }
       default:
+        if (!temp && this.acceptWord('CONNECTION')) return this.createConnection(pos);
+        if (!temp && this.acceptWord('EXTERNAL')) {
+          this.expectKw('TABLE');
+          return this.createExternalTable(pos);
+        }
         this.fail();
     }
   }
@@ -846,6 +868,40 @@ class Parser {
     }
     stmt.end = this.ends[this.p - 1];
     return stmt;
+  }
+
+  /** A contextual word (an identifier, not a keyword) such as CONNECTION or EXTERNAL. */
+  private acceptWord(word: string): boolean {
+    if (this.kinds[this.p] === TK_ID && (this.vals[this.p] as string).toUpperCase() === word) {
+      this.p++;
+      return true;
+    }
+    return false;
+  }
+
+  /** `CREATE CONNECTION [IF NOT EXISTS] name WITH (options)` (M8). */
+  private createConnection(pos: number): A.CreateConnectionStmt {
+    const ifNotExists = this.optIfNotExists();
+    const name = this.name();
+    this.expectKw('WITH');
+    const w = this.withOptions();
+    return { kind: 'createConnection', pos, ifNotExists, name, with: w, end: this.ends[this.p - 1] };
+  }
+
+  /** `CREATE EXTERNAL TABLE [IF NOT EXISTS] name [(column type, …)] WITH (options)` (M8). */
+  private createExternalTable(pos: number): A.CreateExternalTableStmt {
+    const ifNotExists = this.optIfNotExists();
+    const q = this.qualifiedName();
+    if (q.schema !== undefined && q.schema.toLowerCase() !== 'main') this.fail();
+    const columns: A.ColumnDef[] = [];
+    if (this.acceptOp('(')) {
+      do columns.push(this.columnDef());
+      while (this.acceptOp(','));
+      this.expectOp(')');
+    }
+    this.expectKw('WITH');
+    const w = this.withOptions();
+    return { kind: 'createExternalTable', pos, ifNotExists, name: q.name, columns, with: w, end: this.ends[this.p - 1] };
   }
 
   /** smaltdb `( key = literal, ... )` storage options (after WITH). Keys are lower-cased. */
@@ -1195,7 +1251,13 @@ class Parser {
         objectType = 'materialized view';
         break;
       default:
-        this.fail();
+        if (this.acceptWord('CONNECTION')) {
+          objectType = 'connection';
+          this.p--; // the shared `this.p++` below steps over it
+        } else if (this.acceptWord('EXTERNAL')) {
+          if (!this.isKw('TABLE')) this.fail();
+          objectType = 'external table';
+        } else this.fail();
     }
     this.p++;
     const ifExists = this.optIfExists();

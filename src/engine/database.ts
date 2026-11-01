@@ -18,7 +18,7 @@ import { type StaticType, truthy } from './exec/convert.js';
 import { type CompileScope, type Compiled, type Fn, compileExpr } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
-import { Planner, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
+import { EXTERNAL_FUNCTIONS, type ExternalScan, Planner, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
@@ -34,6 +34,8 @@ import type {
   FromItem,
   CreateTableStmt,
   CreateViewStmt,
+  CreateConnectionStmt,
+  CreateExternalTableStmt,
   DeleteStmt,
   DropStmt,
   Expr,
@@ -47,6 +49,19 @@ import type {
   WithClause,
 } from './sql/ast.js';
 import { parse, parseOne } from './sql/parser.js';
+import {
+  AsyncRequiredError,
+  type ConnectionInfo,
+  type CredentialProvider,
+  type ExternalColumn,
+  type ExternalSource,
+  ExternalRegistry,
+  type FetchFn,
+  type FileSource,
+  checkReaderOptions,
+  externalError,
+  formatOf,
+} from './external/external.js';
 import { BTree } from './storage/btree.js';
 import { ColumnStore, ColumnStoreAppender, ColumnStoreWriter, ROW_GROUP_ROWS, chunkValue } from './storage/columnar.js';
 import { KeyEncoder, type KeyColumn, ROWID_KEY_SIZE, decodeKey, readRowidKey, rowidSuffixStart, writeRowidKey } from './storage/key-codec.js';
@@ -113,8 +128,22 @@ interface Upsert {
   update: { sets: { col: number; c: Compiled }[]; where: Fn | null; oldBase: number; oldRowid: number } | null;
 }
 
+/** An external table (M8): columns as declared or inferred at creation, and its WITH options. */
+interface ExternalTableDef {
+  name: string;
+  columns: ExternalColumn[];
+  options: Record<string, SqlValue>;
+  sql: string;
+}
+
+/** Catalog key of a connection (connections have their own namespace). */
+const connectionKey = (name: string): string => `\u0000connection:${name.toLowerCase()}`;
+const quoteIdent = (name: string): string => '"' + name.replace(/"/g, '""') + '"';
+const sqlLiteral = (v: SqlValue): string => (v === null ? 'NULL' : typeof v === 'string' ? `'${v.replace(/'/g, "''")}'` : String(v));
+const CONNECTION_OPTIONS = new Set(['type', 'url', 'credentials']);
+
 interface CatalogEntry {
-  type: 'table' | 'index' | 'view' | 'matview';
+  type: 'table' | 'index' | 'view' | 'matview' | 'external' | 'connection';
   name: string;
   rowid: number | bigint;
 }
@@ -131,6 +160,8 @@ interface Program {
   singleRowWrite?: boolean;
   /** Table sizes the cost-based plan assumed (root page -> estimated rows). */
   rowAssumptions?: Map<number, number>;
+  /** External sources the statement reads (M8): loaded by the async API before it runs. */
+  externals?: ExternalSource[];
   /** Result rows for utility statements (PRAGMA, EXPLAIN) computed at run time. */
   rows?: (r: SqlValue[]) => SqlValue[][];
   columns: string[];
@@ -150,6 +181,11 @@ export class Database implements FunctionContext {
   private readonly indexes = new Map<string, IndexSchema>();
   private readonly catalog = new Map<string, CatalogEntry>();
   private readonly views = new Map<string, ViewSchema>();
+  /** M8: connections and external tables (lower-cased names). */
+  private readonly connections = new Map<string, ConnectionInfo & { sql: string }>();
+  private readonly externals = new Map<string, ExternalTableDef>();
+  /** M8: registered files, credential providers and the data loaded for running statements. */
+  readonly external = new ExternalRegistry();
   /** TEMP views: this connection only, never stored (they shadow main-schema views, like SQLite's temp schema). */
   private readonly tempViews = new Map<string, ViewSchema>();
   private catalogTable!: TableSchema;
@@ -475,6 +511,94 @@ export class Database implements FunctionContext {
     return this.cached(sql).run(params);
   }
 
+  // ---------------------------------------------------------------- external data (M8)
+
+  /**
+   * Run one statement that may read external tables or `read_csv` / `read_json`, returning all
+   * rows. Its sources are fetched first (concurrently), then it runs like `query`.
+   */
+  async queryAsync(sql: string, params?: BindParams, options: { signal?: AbortSignal } = {}): Promise<QueryResult> {
+    this.checkOpen();
+    const st = this.prepare(sql);
+    return this.withExternal(options.signal, st, () => ({ columns: st.columns, rows: st.all(params) }));
+  }
+
+  /** `run` for a statement that may read external data. */
+  async runAsync(sql: string, params?: BindParams, options: { signal?: AbortSignal } = {}): Promise<RunResult> {
+    this.checkOpen();
+    const st = this.prepare(sql);
+    return this.withExternal(options.signal, st, () => st.run(params));
+  }
+
+  /** `exec` for statements that may read external data (CREATE EXTERNAL TABLE, materialized views over it, …). */
+  async execAsync(sql: string, params?: BindParams, options: { signal?: AbortSignal } = {}): Promise<void> {
+    this.checkOpen();
+    const stmts = parse(sql);
+    if (params !== undefined && stmts.length > 1) throw new MisuseError('parameters can only be bound with a single statement');
+    for (const ps of stmts) {
+      const st = new Statement(this, ps, ps.text);
+      await this.withExternal(options.signal, st, () => st.run(params));
+    }
+  }
+
+  /**
+   * Load the external sources `st` reads, then `run` it. A source discovered only while running
+   * (a view over `read_csv`, a materialized view's query) is loaded and the statement retried; each
+   * attempt is atomic, so a retry starts from a clean state.
+   */
+  private async withExternal<T>(signal: AbortSignal | undefined, st: Statement, run: () => T): Promise<T> {
+    const held = new Set<string>();
+    const load = async (sources: ExternalSource[]): Promise<boolean> => {
+      const need = sources.filter((s) => !held.has(s.key));
+      if (need.length === 0) return false;
+      for (const k of await this.external.acquire(need, signal)) held.add(k);
+      return true;
+    };
+    try {
+      // First round: every source known before running, fetched together. `read_csv('…')` calls with
+      // constant arguments are found in the statement text (planning needs their columns).
+      const first = this.literalExternalSources(st.parsed.stmt);
+      try {
+        first.push(...st.externalSources);
+      } catch (e) {
+        if (!(e instanceof AsyncRequiredError)) throw e;
+        first.push(...e.sources);
+      }
+      await load(first);
+      for (;;) {
+        try {
+          await load(st.externalSources);
+          return run();
+        } catch (e) {
+          // Retry only when it is new data that is missing (never loop on the same sources).
+          if (!(e instanceof AsyncRequiredError) || !(await load(e.sources))) throw e;
+        }
+      }
+    } finally {
+      this.external.release([...held]);
+    }
+  }
+
+  /** Make `file` readable as `file:<name>` (a File, Blob, file handle, bytes or text); null removes it. */
+  registerFile(name: string, file: FileSource | null): void {
+    if (file === null) this.external.files.delete(name);
+    else this.external.files.set(name, file);
+  }
+
+  /**
+   * Credentials a connection refers to by name (`credentials = 'name'`): headers for requests to
+   * URLs that start with `provider.endpoint` (never sent elsewhere). null removes them.
+   */
+  registerCredentials(name: string, provider: CredentialProvider | null): void {
+    if (provider === null) this.external.credentials.delete(name);
+    else this.external.credentials.set(name, provider);
+  }
+
+  /** Transport for http(s) sources (default: the global fetch). */
+  setFetch(fetchFn: FetchFn | null): void {
+    this.external.fetchFn = fetchFn;
+  }
+
   close(): void {
     if (this.closed) return;
     for (const c of [...this.activeCursors]) c.close();
@@ -652,6 +776,26 @@ export class Database implements FunctionContext {
         ...[...scalarFunctions].map(([name, f]) => ({ name, kind: 'FUNCTION' as const, deterministic: f.deterministic })),
         ...[...aggregateFunctions.keys()].map((name) => ({ name, kind: 'AGGREGATE' as const, deterministic: true })),
       ].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
+      externals: [...this.externals.values()].map((x) => {
+        const { location, format, connection, ...rest } = x.options;
+        // The format in effect (given, or from the file extension; tsv reads as csv with tabs).
+        let fmt: string | null = format === undefined || format === null ? null : String(format).toLowerCase();
+        if (fmt === null) {
+          try {
+            const f = formatOf(String(location), x.options, x.name);
+            fmt = f.delimiter === '\t' ? 'tsv' : f.format;
+          } catch {
+            fmt = null;
+          }
+        }
+        return { name: x.name, columns: x.columns, location: String(location), format: fmt, connection: connection === undefined || connection === null ? null : String(connection), options: JSON.stringify(rest) };
+      }),
+      connections: [...this.connections.values()].map((c) => ({
+        name: c.name,
+        type: String(c.options.type ?? 'http'),
+        url: c.options.url === undefined || c.options.url === null ? null : String(c.options.url),
+        credentials: c.options.credentials === undefined || c.options.credentials === null ? null : String(c.options.credentials),
+      })),
     };
   }
 
@@ -668,6 +812,8 @@ export class Database implements FunctionContext {
     this.tables.clear();
     this.indexes.clear();
     this.views.clear();
+    this.connections.clear();
+    this.externals.clear();
     this.catalog.clear();
     const catStmt = parseOne(CATALOG_SQL).stmt as CreateTableStmt;
     this.catalogTable = { ...buildTableSchema(catStmt, CATALOG_SQL, this.pager.catalogRoot).table, system: true };
@@ -675,7 +821,18 @@ export class Database implements FunctionContext {
     const autoRoots = new Map<string, number>();
     for (const r of rows) if (r.type === 'index' && r.sql === null) autoRoots.set(r.name.toLowerCase(), r.rootpage);
     for (const r of rows) {
+      if (r.type === 'connection') {
+        const c = parseOne(r.sql!).stmt as CreateConnectionStmt;
+        this.catalog.set(connectionKey(r.name), { type: 'connection', name: r.name, rowid: r.rowid });
+        this.connections.set(r.name.toLowerCase(), { name: r.name, options: c.with, sql: r.sql! });
+        continue;
+      }
       this.catalog.set(r.name.toLowerCase(), { type: r.type as CatalogEntry['type'], name: r.name, rowid: r.rowid });
+      if (r.type === 'external') {
+        const x = parseOne(r.sql!).stmt as CreateExternalTableStmt;
+        this.externals.set(r.name.toLowerCase(), { name: r.name, columns: x.columns.map((c) => ({ name: c.name, declType: c.type ?? '' })), options: x.with, sql: r.sql! });
+        continue;
+      }
       if (r.type === 'view') {
         const v = parseOne(r.sql!).stmt as CreateViewStmt;
         this.views.set(r.name.toLowerCase(), { name: r.name, sql: r.sql!, columns: v.columns, select: v.select });
@@ -751,18 +908,18 @@ export class Database implements FunctionContext {
     return new TableWriter(this.catalogTable, this.pager, (root) => this.tree(root));
   }
 
-  private addCatalogRow(type: string, name: string, tblName: string, root: number, sql: string | null): void {
+  private addCatalogRow(type: string, name: string, tblName: string, root: number, sql: string | null, key = name.toLowerCase()): void {
     const w = this.catalogWriter();
     const rowid = w.newRowid();
     w.writeRow([type, name, tblName, root, sql], rowid);
-    this.catalog.set(name.toLowerCase(), { type: type as CatalogEntry['type'], name, rowid });
+    this.catalog.set(key, { type: type as CatalogEntry['type'], name, rowid });
   }
 
-  private removeCatalogRow(name: string): void {
-    const e = this.catalog.get(name.toLowerCase());
+  private removeCatalogRow(name: string, key = name.toLowerCase()): void {
+    const e = this.catalog.get(key);
     if (!e) return;
     this.catalogWriter().deleteRow(e.rowid);
-    this.catalog.delete(name.toLowerCase());
+    this.catalog.delete(key);
   }
 
   private schemaChanged(): void {
@@ -778,7 +935,7 @@ export class Database implements FunctionContext {
     const regs = new Registers(ps.paramCount);
     const planner = new Planner(this.plannerDeps(this.rewritePolicy(stmt)), regs);
     planner.sqlText = ps.text;
-    const done = (p: Omit<Program, 'regCount'>): Program => ({ ...p, regCount: regs.count, rowAssumptions: planner.rowAssumptions });
+    const done = (p: Omit<Program, 'regCount'>): Program => ({ ...p, regCount: regs.count, rowAssumptions: planner.rowAssumptions, externals: planner.externals });
     switch (stmt.kind) {
       case 'select': {
         const plan = planner.planSelect(stmt, null);
@@ -799,6 +956,10 @@ export class Database implements FunctionContext {
         return done({ exec: () => this.createIndex(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
       case 'alterTable':
         return done({ exec: () => this.alterTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
+      case 'createConnection':
+        return done({ exec: () => this.createConnection(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
+      case 'createExternalTable':
+        return done({ exec: () => this.createExternalTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
       case 'createView':
         if (stmt.materialized) return done({ exec: () => this.createMatview(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
         if (stmt.schema && !['main', 'temp'].includes(stmt.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
@@ -858,6 +1019,8 @@ export class Database implements FunctionContext {
   private plannerDeps(rewrite: { exclude: string | null } | null = null): ConstructorParameters<typeof Planner>[0] {
     return {
       rewriteSelect: rewrite ? (select, text) => this.matviewRewrite(select, text, rewrite.exclude) : undefined,
+      externalTable: (n) => this.externalTableScan(n),
+      externalFunction: (n, args, named) => this.externalFunctionScan(n, args, named),
       getTable: (n, schema) => {
         const t = this.getTable(n, schema);
         if (t?.matview && !t.matview.populated) {
@@ -1291,6 +1454,8 @@ export class Database implements FunctionContext {
       if ([...deps].some((d) => this.tempTables.has(d) || this.tempViews.has(d))) continue;
       // A view over the table the statement writes (INSERT … SELECT into its base table).
       if (exclude !== null && deps.has(exclude)) continue;
+      // External data changes without the database noticing: such a view is a cache, refreshed explicitly.
+      if (this.externals.size > 0 && [...deps].some((d) => this.externals.has(d))) continue;
       const from = m.select.core.kind === 'select' && m.select.core.from?.kind === 'table' ? this.getTable(m.select.core.from.name, m.select.core.from.schema) : undefined;
       views.push({ name: t.name, select: m.select, columns: t.columns.map((c) => c.name), baseColumns: from ? from.columns.map((c) => c.name) : [] });
     }
@@ -1925,13 +2090,164 @@ export class Database implements FunctionContext {
     const lower = name.toLowerCase();
     if (lower.startsWith('smalt_') || lower.startsWith('sqlite_')) throw new SmaltError('SMALT_ERROR', `object name reserved for internal use: ${name}`);
     const existing = this.catalog.get(lower);
-    if (existing) throw new SmaltError('SMALT_ERROR', `${existing.type === kind ? kind : existing.type} ${name} already exists`);
+    const label = (t: string): string => (t === 'external' ? 'external table' : t === 'matview' ? 'materialized view' : t);
+    if (existing) throw new SmaltError('SMALT_ERROR', `${label(existing.type === kind ? kind : existing.type)} ${name} already exists`);
   }
 
   /** A TEMP table or view that `select` reads (directly or through views), if any. */
   private tempDependency(select: SelectStmt): string | undefined {
     if (this.tempTables.size === 0 && this.tempViews.size === 0) return undefined;
     return [...this.selectDeps(select)].find((d) => this.tempTables.has(d) || this.tempViews.has(d));
+  }
+
+  // ---------------------------------------------------------------- connections and external tables (M8)
+
+  private createConnection(stmt: CreateConnectionStmt, sql: string): RunResult {
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    const lower = stmt.name.toLowerCase();
+    if (this.connections.has(lower)) {
+      if (stmt.ifNotExists) return none;
+      throw new SmaltError('SMALT_ERROR', `connection ${stmt.name} already exists`);
+    }
+    for (const k of Object.keys(stmt.with)) if (!CONNECTION_OPTIONS.has(k)) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: unknown option '${k}' (type, url, credentials)`);
+    const type = String(stmt.with.type ?? 'http').toLowerCase();
+    if (type !== 'http' && type !== 'https') throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: type '${type}' is not supported yet (http)`);
+    const url = stmt.with.url;
+    if (url !== undefined && url !== null && !/^https?:\/\//i.test(String(url))) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: url must be an http(s) URL`);
+    this.dirtySchema = true;
+    this.addCatalogRow('connection', stmt.name, stmt.name, 0, sql, connectionKey(stmt.name));
+    this.connections.set(lower, { name: stmt.name, options: stmt.with, sql });
+    this.schemaChanged();
+    return none;
+  }
+
+  private dropConnection(stmt: DropStmt): RunResult {
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    const c = this.connections.get(stmt.name.toLowerCase());
+    if (!c) {
+      if (stmt.ifExists) return none;
+      throw new SmaltError('SMALT_ERROR', `no such connection: ${stmt.name}`);
+    }
+    const user = [...this.externals.values()].find((x) => String(x.options.connection ?? '').toLowerCase() === c.name.toLowerCase());
+    if (user) throw new SmaltError('SMALT_ERROR', `connection ${c.name} is used by external table ${user.name}`);
+    this.dirtySchema = true;
+    this.removeCatalogRow(c.name, connectionKey(c.name));
+    this.connections.delete(c.name.toLowerCase());
+    this.schemaChanged();
+    return none;
+  }
+
+  /** The connection named by an external table's or table function's `connection` option. */
+  private connectionOf(options: Record<string, SqlValue>, label: string): ConnectionInfo | undefined {
+    const name = options.connection;
+    if (name === undefined || name === null) return undefined;
+    const c = this.connections.get(String(name).toLowerCase());
+    if (!c) throw new SmaltError('SMALT_ERROR', `${label}: no such connection: ${name}`);
+    return { name: c.name, options: c.options };
+  }
+
+  /** What to fetch for an external table (reader options without location / connection). */
+  private externalSourceOf(def: Omit<ExternalTableDef, 'sql' | 'columns'>, columns: ExternalColumn[] | undefined): ExternalSource {
+    const { location, connection: _c, ...options } = def.options;
+    if (typeof location !== 'string' || location === '') throw new SmaltError('SMALT_ERROR', `external table ${def.name}: location is required`);
+    const fmt = formatOf(location, def.options, def.name);
+    return { key: `table:${def.name.toLowerCase()}`, label: def.name, location, format: fmt.format, options, connection: this.connectionOf(def.options, def.name), columns };
+  }
+
+  private createExternalTable(stmt: CreateExternalTableStmt, sql: string): RunResult {
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    const lower = stmt.name.toLowerCase();
+    if (stmt.ifNotExists && this.externals.has(lower)) return none;
+    this.checkNewName(stmt.name, 'external');
+    checkReaderOptions(stmt.with, new Set(['location', 'connection']), stmt.name);
+    const seen = new Set<string>();
+    for (const c of stmt.columns) {
+      if (c.constraints.length > 0) throw new SmaltError('SMALT_ERROR', `external table ${stmt.name}: columns cannot have constraints`);
+      if (seen.has(c.name.toLowerCase())) throw new SmaltError('SMALT_ERROR', `duplicate column name: ${c.name}`);
+      seen.add(c.name.toLowerCase());
+    }
+    let columns: ExternalColumn[] = stmt.columns.map((c) => ({ name: c.name, declType: c.type ?? '' }));
+    const source = this.externalSourceOf({ name: stmt.name, options: stmt.with }, columns.length ? columns : undefined);
+    let text = sql;
+    if (columns.length === 0) {
+      // Columns inferred from the source now (fetched by the async API), and stored with the table.
+      const data = this.external.data(source);
+      if (data.columns.length === 0) throw externalError(source, 'no columns found (the source is empty)');
+      columns = data.columns.map((c) => ({ name: c.name, declType: c.declType || 'ANY' }));
+      const cols = columns.map((c) => `${quoteIdent(c.name)} ${c.declType}`).join(', ');
+      const opts = Object.entries(stmt.with).map(([k, v]) => `${k} = ${sqlLiteral(v)}`).join(', ');
+      text = `CREATE EXTERNAL TABLE ${quoteIdent(stmt.name)} (${cols}) WITH (${opts})`;
+    }
+    this.dirtySchema = true;
+    this.addCatalogRow('external', stmt.name, stmt.name, 0, text);
+    this.externals.set(lower, { name: stmt.name, columns, options: stmt.with, sql: text });
+    this.objectChanged(stmt.name);
+    this.schemaChanged();
+    return none;
+  }
+
+  /** @internal An external table as the planner scans it. */
+  private externalTableScan(name: string): ExternalScan | undefined {
+    const def = this.externals.get(name.toLowerCase());
+    if (!def) return undefined;
+    const source = this.externalSourceOf(def, def.columns);
+    return {
+      label: `${def.name} (${source.location})`,
+      source,
+      // Declared types are conversions, not guarantees (text that does not convert stays text).
+      columns: def.columns.map((c) => ({ name: c.name, declType: c.declType, type: 'any' as StaticType })),
+      rows: () => this.external.data(source).rows,
+    };
+  }
+
+  /** @internal `read_csv(location, …)` / `read_json(location, …)`: columns come from the loaded data. */
+  private externalFunctionScan(name: string, args: SqlValue[], named: Record<string, SqlValue>): ExternalScan | undefined {
+    const source = this.externalFunctionSource(name, args, named);
+    const data = this.external.data(source);
+    return { label: source.label, source, columns: data.columns, rows: () => this.external.data(source).rows };
+  }
+
+  /**
+   * `read_csv` / `read_json` calls with literal arguments in `stmt` (not inside views): fetched up
+   * front with the statement's other sources, instead of one by one as planning reaches them.
+   */
+  private literalExternalSources(stmt: Stmt): ExternalSource[] {
+    const out: ExternalSource[] = [];
+    const lit = (e: { kind: string; value?: SqlValue }): boolean => e.kind === 'literal';
+    const walk = (x: unknown): void => {
+      if (Array.isArray(x)) return x.forEach(walk);
+      if (typeof x !== 'object' || x === null || Object.getPrototypeOf(x) !== Object.prototype) return;
+      const o = x as Record<string, unknown>;
+      if (o.kind === 'function' && EXTERNAL_FUNCTIONS.has(o.name as string)) {
+        const f = o as unknown as { name: string; args: { kind: string; value?: SqlValue }[]; named?: Record<string, { kind: string; value?: SqlValue }> };
+        const named = Object.entries(f.named ?? {});
+        if (f.args.every(lit) && named.every(([, e]) => lit(e))) {
+          try {
+            out.push(this.externalFunctionSource(f.name, f.args.map((a) => a.value!), Object.fromEntries(named.map(([k, e]) => [k, e.value!]))));
+          } catch {
+            // Planning reports it.
+          }
+        }
+      }
+      for (const k of Object.keys(o)) walk(o[k]);
+    };
+    walk(stmt);
+    return out;
+  }
+
+  /** What a `read_csv` / `read_json` call reads. */
+  private externalFunctionSource(name: string, args: SqlValue[], named: Record<string, SqlValue>): ExternalSource {
+    if (args.length !== 1 || typeof args[0] !== 'string') throw new SmaltError('SMALT_ERROR', `${name}() takes a location (text) and named options`);
+    const location = args[0];
+    const label = `${name}('${location}')`;
+    checkReaderOptions(named, new Set(['connection']), label);
+    const { connection: _c, ...options } = named;
+    if (options.format === undefined || options.format === null) {
+      options.format = name === 'read_json' ? 'json' : /\.tsv([?#]|$)/i.test(location) ? 'tsv' : 'csv';
+    }
+    const fmt = formatOf(location, options, label);
+    const key = `fn:${name}:${JSON.stringify([location, Object.entries(named).sort()], (_k, v) => (typeof v === 'bigint' ? `${v}n` : v))}`;
+    return { key, label, location, format: fmt.format, options, connection: this.connectionOf(named, label) };
   }
 
   private createView(stmt: CreateViewStmt, sql: string): RunResult {
@@ -2217,9 +2533,23 @@ export class Database implements FunctionContext {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const lower = stmt.name.toLowerCase();
     const existing = this.catalog.get(lower);
-    const kindOf = (t: CatalogEntry['type']): string => (t === 'matview' ? 'materialized view' : t);
+    const kindOf = (t: CatalogEntry['type']): string => (t === 'matview' ? 'materialized view' : t === 'external' ? 'external table' : t);
+    if (stmt.objectType === 'connection') return this.dropConnection(stmt);
     if (existing && stmt.objectType !== 'index' && existing.type !== 'index' && kindOf(existing.type) !== stmt.objectType) {
       throw new SmaltError('SMALT_ERROR', `use DROP ${kindOf(existing.type).toUpperCase()} to delete ${kindOf(existing.type)} ${existing.name}`);
+    }
+    if (stmt.objectType === 'external table') {
+      const x = this.externals.get(lower);
+      if (!x) {
+        if (stmt.ifExists) return none;
+        throw new SmaltError('SMALT_ERROR', `no such external table: ${stmt.name}`);
+      }
+      this.dirtySchema = true;
+      this.objectChanged(x.name);
+      this.removeCatalogRow(x.name);
+      this.externals.delete(lower);
+      this.schemaChanged();
+      return none;
     }
     if (stmt.objectType === 'materialized view') {
       const mv = this.tables.get(lower);
@@ -3459,6 +3789,14 @@ export class Statement {
 
   get columns(): string[] {
     return this.prog().columns;
+  }
+
+  /**
+   * External sources this statement reads (M8). Throws SMALT_ASYNC_REQUIRED when planning itself
+   * needs external data (a `read_csv` call, whose columns come from the file).
+   */
+  get externalSources(): ExternalSource[] {
+    return this.prog().externals ?? [];
   }
 
   /** Static result types ('int', 'real', 'text', ... or 'any' when unknown). */

@@ -15,6 +15,8 @@ await build({ entryPoints: ['test/browser/opfs-worker.ts'], bundle: true, format
 await build({ entryPoints: ['test/browser/client-test.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/client-test.js`, logLevel: 'warning' });
 await build({ entryPoints: ['test/browser/tab-test.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/tab-test.js`, logLevel: 'warning' });
 await build({ entryPoints: ['src/engine/worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/smaltdb-worker.js`, logLevel: 'warning' });
+// External data (M8): a CSV the client test reads over HTTP from this server.
+writeFileSync(`${out}/prices.csv`, 'id,name,price\n1,apple,1.5\n2,"pear, green",2\n3,plum,\n');
 writeFileSync(`${out}/tab.html`, '<!doctype html><meta charset="utf-8"><title>smaltdb tab</title><script type="module" src="./tab-test.js"></script>');
 writeFileSync(`${out}/client.html`, '<!doctype html><meta charset="utf-8"><title>smaltdb client test</title><script type="module" src="./client-test.js"></script>');
 writeFileSync(

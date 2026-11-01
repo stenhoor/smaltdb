@@ -314,7 +314,12 @@ export function tokenize(src: string): Tokens {
           i += val.length;
           break;
         }
-        case 0x3d: // = ==
+        case 0x3d: // = == =>
+          if (src.charCodeAt(i + 1) === 0x3e) {
+            val = '=>'; // named argument of a table-valued function
+            i += 2;
+            break;
+          }
           val = '=';
           i += src.charCodeAt(i + 1) === 0x3d ? 2 : 1;
           break;

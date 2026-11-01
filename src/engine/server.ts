@@ -19,6 +19,7 @@
  */
 import { type BindParams, Database, RowCursor, type Statement } from './database.js';
 import { SmaltError } from './errors.js';
+import { AsyncRequiredError } from './external/external.js';
 import { exportCSV, exportJSON, importCSV, importJSON } from './io/import-export.js';
 import type { Vfs } from './vfs/types.js';
 import { type ReaderSettings, type Request, type Response, encodeColumns } from '../shared/protocol.js';
@@ -106,6 +107,8 @@ export class EngineServer {
   private pumping = false;
   private current: Job | null = null;
   private interruptFlag: Int32Array | null = null;
+  /** Aborts the external fetches (M8) of the request running now, when it is cancelled. */
+  private currentAbort: { session: string; id: number; controller: AbortController } | null = null;
   private readonly watched = new Set<string>();
   /** Queries split into morsels, waiting for their partials (writes wait for them). */
   private readonly morselJobs: MorselJob[] = [];
@@ -174,6 +177,8 @@ export class EngineServer {
       this.fail(session, target, new SmaltError('SMALT_INTERRUPT', 'interrupted'));
       return;
     }
+    const cur = this.currentAbort;
+    if (cur && cur.session === session && cur.id === target) cur.controller.abort(); // stops its fetches
     const si = this.streams.findIndex((s) => s.session === session && s.id === target);
     if (si >= 0) {
       const [s] = this.streams.splice(si, 1);
@@ -305,16 +310,33 @@ export class EngineServer {
       case 'exec': {
         const d = this.requireDb();
         if (req.params !== undefined) {
-          const r = d.run(req.sql, req.params as BindParams);
+          let r: { changes: number; lastInsertRowid: number | bigint };
+          try {
+            r = d.run(req.sql, req.params as BindParams); // cached statement: the common case
+          } catch (e) {
+            // It reads external data (M8): the attempt was rolled back; fetch, then run it.
+            if (!(e instanceof AsyncRequiredError)) throw e;
+            r = await this.withAbort(session, id, (signal) => d.runAsync(req.sql, req.params as BindParams, { signal }));
+          }
           this.send(session, { id, kind: 'ok', changes: r.changes, lastInsertRowid: r.lastInsertRowid });
         } else {
-          d.exec(req.sql);
+          // Statement by statement; those that read external data (M8) fetch it first.
+          await this.withAbort(session, id, (signal) => d.execAsync(req.sql, undefined, { signal }));
           this.send(session, { id, kind: 'ok', changes: d.changes(), lastInsertRowid: d.lastInsertRowid() });
         }
         return;
       }
+      case 'registerFile':
+        this.requireDb().registerFile(req.name, req.file);
+        this.send(session, { id, kind: 'ok' });
+        return;
+      case 'registerCredentials':
+        this.requireDb().registerCredentials(req.name, req.provider);
+        this.send(session, { id, kind: 'ok' });
+        return;
       case 'query': {
         const st = this.requireDb().prepare(req.sql);
+        if (this.readsExternal(st)) return this.queryExternal(session, req.sql, req);
         if (this.toMorsels(session, st, req.sql, req)) return;
         if (this.toReader(session, st, req.sql, req)) return;
         this.startStream(session, id, st.cursor(req.params as BindParams | undefined), req.batchSize ?? 4096, req.credit);
@@ -324,17 +346,23 @@ export class EngineServer {
         const st = this.requireDb().prepare(req.sql);
         const sid = this.nextStmt++;
         this.statements.set(sid, st);
-        this.send(session, { id, kind: 'ok', stmt: sid, columns: st.columns, paramCount: st.paramCount });
+        // A `read_csv` call's columns are known only once the file has been read (at the first run).
+        const columns = this.readsExternal(st) ? this.columnsIfKnown(st) : st.columns;
+        this.send(session, { id, kind: 'ok', stmt: sid, columns, paramCount: st.paramCount });
         return;
       }
       case 'stmtRun': {
         const st = this.statement(req.stmt);
-        const r = st.run(req.params as BindParams | undefined);
+        const d = this.requireDb();
+        const r = this.readsExternal(st)
+          ? await this.withAbort(session, id, (signal) => d.runAsync(st.sql, req.params as BindParams | undefined, { signal }))
+          : st.run(req.params as BindParams | undefined);
         this.send(session, { id, kind: 'ok', changes: r.changes, lastInsertRowid: r.lastInsertRowid });
         return;
       }
       case 'stmtQuery': {
         const st = this.statement(req.stmt);
+        if (this.readsExternal(st)) return this.queryExternal(session, st.sql, req);
         if (this.toMorsels(session, st, st.sql, req)) return;
         if (this.toReader(session, st, st.sql, req)) return;
         this.startStream(session, id, st.cursor(req.params as BindParams | undefined), req.batchSize ?? 4096, req.credit);
@@ -379,6 +407,47 @@ export class EngineServer {
         this.send(session, { id, kind: 'ok' });
         return;
     }
+  }
+
+  /** Whether `st` reads external tables or `read_csv` / `read_json` (M8): those run on the async path. */
+  private readsExternal(st: Statement): boolean {
+    try {
+      return st.externalSources.length > 0;
+    } catch (e) {
+      if (e instanceof AsyncRequiredError) return true; // planning it needs the data
+      throw e;
+    }
+  }
+
+  private columnsIfKnown(st: Statement): string[] {
+    try {
+      return st.columns;
+    } catch (e) {
+      if (e instanceof AsyncRequiredError) return [];
+      throw e;
+    }
+  }
+
+  /** Run `fn` with an AbortSignal that a 'cancel' for this request triggers. */
+  private async withAbort<T>(session: string, id: number, fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const controller = new AbortController();
+    this.currentAbort = { session, id, controller };
+    try {
+      return await fn(controller.signal);
+    } finally {
+      this.currentAbort = null;
+    }
+  }
+
+  /**
+   * A query over external data: its sources are fetched (concurrently) on this worker, then it runs
+   * and its rows stream like a merged morsel result (they hold no read cursor). Never on parallel
+   * readers, which have neither the registered files nor the credentials.
+   */
+  private async queryExternal(session: string, sql: string, req: { id: number; params?: unknown; batchSize?: number; credit?: number }): Promise<void> {
+    const d = this.requireDb();
+    const result = await this.withAbort(session, req.id, (signal) => d.queryAsync(sql, req.params as BindParams | undefined, { signal }));
+    this.startStream(session, req.id, new RowCursor(d, null, result.rows, [], result.columns), req.batchSize ?? 4096, req.credit);
   }
 
   /**

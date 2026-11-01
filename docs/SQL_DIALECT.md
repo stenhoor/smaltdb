@@ -54,6 +54,7 @@ These are read-only views over the internal catalog and follow the SQL-standard 
 | `information_schema.routines`, `parameters` | built-in and user-defined functions |
 | `information_schema.statistics` (non-standard, like MySQL) | indexes and index columns |
 | `information_schema.materialized_views` (extension) | refresh mode, last refresh time, staleness |
+| `information_schema.external_tables`, `connections` (extensions, M8) | location, format, connection and reader options of external tables; connection endpoints and the names of their credentials (never secrets) |
 
 SQLite compatibility: `sqlite_schema` / `sqlite_master`, `pragma_table_info()`, `pragma_index_list()`, and the related table-valued pragma functions.
 
@@ -99,6 +100,53 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
   - `on_commit`: incremental maintenance runs inside the writing transaction.
 - `REFRESH … CONCURRENTLY` builds a new copy and swaps it in, so readers are never blocked.
 - The optimizer can optionally rewrite queries to use a fresh MV.
+
+## 5a. External data (M8.1)
+
+Data that lives elsewhere — files, URLs — queried with the same SQL as local tables
+([ADR 0011](adr/0011-external-tables.md)). Read-only.
+
+```sql
+-- An endpoint; `credentials` names a provider the application registers at runtime (no secrets in SQL).
+CREATE CONNECTION [IF NOT EXISTS] api WITH (url = 'https://data.example.com/v1', credentials = 'api-token');
+
+-- Columns declared, or inferred from the source when the table is created (and stored with it).
+CREATE EXTERNAL TABLE [IF NOT EXISTS] prices [(id INTEGER, name TEXT, price REAL)]
+  WITH (location = 'prices.csv', connection = 'api' [, format = 'csv', header = true, delimiter = ',', …]);
+
+-- Ad hoc, without a catalog entry.
+SELECT * FROM read_csv('https://example.com/rates.csv', delimiter => ';', null => 'NA');
+SELECT * FROM read_json('file:upload', format => 'ndjson');
+
+-- A local cache (offline, fast repeat reads); REFRESH re-reads the source.
+CREATE MATERIALIZED VIEW prices_local WITH (storage = 'columnar') AS SELECT * FROM prices;
+
+DROP EXTERNAL TABLE [IF EXISTS] prices;   -- catalog entry only: never touches the source
+DROP CONNECTION [IF EXISTS] api;          -- fails while an external table uses it
+```
+
+- **Locations:** `http://` / `https://` URLs (relative to the connection's `url` when one is given); `file:<name>` for a
+  file the application registered (`registerFile`: a browser `File`, `Blob` or file handle, or bytes/text); a local path
+  in Node. S3, globs and partitioned paths come in M8.2, Parquet in M8.3, remote databases in M8.5.
+- **Formats:** `csv`, `tsv`, `json` (an array of objects, or of arrays with declared columns), `ndjson`; taken from
+  `format` or the file extension.
+- **Reader options:** `header` (default true), `delimiter`, `quote`, `null` (text read as NULL; unquoted empty fields are
+  NULL anyway), `skip` (leading records), `encoding` (default utf-8). Unknown options are errors.
+- **Types:** declared columns convert values by affinity (text that does not convert stays text). Inferred columns are
+  INTEGER, REAL or TEXT for CSV (ANY when JSON values mix). Header names that repeat get a suffix (`a_2`); missing ones
+  are `column1`, `column2`, …
+- **Running:** a statement that reads external data is fetched first (all its sources concurrently, each once), then
+  runs as usual. In-process this needs `queryAsync` / `runAsync` / `execAsync`; the synchronous API fails with
+  `SMALT_ASYNC_REQUIRED`. The worker client is asynchronous anyway and needs nothing different. Such statements run on
+  the owner, never on parallel readers.
+- **Behaviour:** external tables work in joins, subqueries, views and `INSERT … SELECT`. They have no indexes and are
+  re-read by every statement; for repeat reads, cache them in a materialized view. A view over external data is never
+  used to answer queries implicitly (`matview_rewrite`), since the source can change without the database knowing.
+  `read_csv` / `read_json` arguments must be constants.
+- **Errors:** `SMALT_EXTERNAL` names the source and the HTTP status, the CSV line or the JSON item; a network failure
+  mentions CORS. A cancelled request aborts its fetches (`SMALT_INTERRUPT`).
+- **Catalog:** `sqlite_schema` lists them with types `external` and `connection`; `information_schema.tables` reports
+  `EXTERNAL`.
 
 ## 6. Known deviations from SQLite (proposed)
 
