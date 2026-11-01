@@ -98,7 +98,7 @@ import {
 import { type ColumnStore, ROW_GROUP_ROWS, zoneMayMatch } from '../storage/columnar.js';
 import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
 import { deletedBitmap, rowidsOf, zoneOf } from './columnar-table.js';
-import { exprKey } from '../sql/ast-util.js';
+import { anyNode, exprKey } from '../sql/ast-util.js';
 
 export interface PlannerEnv {
   /** A table by name; `schema` 'main' / 'temp' picks that schema when a TEMP table shadows a main one. */
@@ -123,6 +123,11 @@ export interface PlannerEnv {
   state: ExecState;
   /** Scratch file for sorts and hash aggregates that outgrow work_mem (M7.2). */
   spill?: SpillArea | null;
+  /**
+   * Materialized-view matching (M7.5): `select` (SQL text `text`) rewritten to read a fresh
+   * materialized view, or null. Absent when the statement may not use views.
+   */
+  rewriteSelect?(select: SelectStmt, text: string): SelectStmt | null;
 }
 
 export class Registers {
@@ -385,7 +390,50 @@ export class Planner {
 
   // ================================================================ SELECT
 
+  /**
+   * Any SELECT this planner plans (the statement, subqueries, CTE bodies, view bodies, INSERT
+   * sources) may be answered from a materialized view. Not when its table name means a CTE, and not
+   * when it reads the enclosing query's columns: the matcher compares column names without
+   * qualifiers, so an outer `o.x` would turn into the view's `x`.
+   */
+  private matviewRewrite(stmt: SelectStmt, parent: Scope | null): SelectStmt | null {
+    const rewrite = this.env.rewriteSelect;
+    const core = stmt.core;
+    if (!rewrite || stmt.with || stmt.compound.length > 0 || core.kind !== 'select' || core.from?.kind !== 'table') return null;
+    const from = core.from;
+    if (!from.schema && parent?.findCte(from.name)) return null;
+    if (parent !== null && !this.readsOnlyItsTable(stmt, from)) return null;
+    return rewrite(stmt, this.sqlText);
+  }
+
+  /** One SELECT of a compound (UNION / INTERSECT / EXCEPT) answered from a materialized view. */
+  private matviewCore(core: SelectCore, parent: Scope | null): SelectCore {
+    if (!this.env.rewriteSelect) return core;
+    const r = this.matviewRewrite({ kind: 'select', core, compound: [], orderBy: [], pos: core.pos, end: core.end }, parent);
+    // A rewrite keeps a single core without ORDER BY / LIMIT when the input had none.
+    return r && !r.with && r.compound.length === 0 && r.orderBy.length === 0 && !r.limit ? r.core : core;
+  }
+
+  /** Every column reference of `stmt` is to its single FROM table `from` (or a bare result alias in ORDER BY). */
+  private readsOnlyItsTable(stmt: SelectStmt, from: Extract<FromItem, { kind: 'table' }>): boolean {
+    const t = this.env.getTable(from.name, from.schema);
+    if (!t) return false;
+    const qualifier = (from.alias ?? from.name).toLowerCase();
+    const names = new Set([...t.columns.map((c) => c.name.toLowerCase()), ...ROWID_NAMES]);
+    const own = (n: Record<string, unknown>): boolean => {
+      const c = n as unknown as ColumnExpr;
+      if (c.schema) return false;
+      return c.table ? c.table.toLowerCase() === qualifier : names.has(c.name.toLowerCase());
+    };
+    const core = stmt.core as SelectCoreSelect;
+    const aliases = new Set(core.columns.flatMap((c) => (c.kind === 'expr' && c.alias ? [c.alias.toLowerCase()] : [])));
+    const orderAliases = stmt.orderBy.filter((o) => o.expr.kind === 'column' && !o.expr.table && aliases.has(o.expr.name.toLowerCase()) && !names.has(o.expr.name.toLowerCase()));
+    const rest = { ...stmt, orderBy: stmt.orderBy.filter((o) => !orderAliases.includes(o)) };
+    return !anyNode(rest, (n) => n.kind === 'column' && !own(n));
+  }
+
   planSelect(stmt: SelectStmt, parent: Scope | null, outRegs?: number[]): QueryPlan {
+    stmt = this.matviewRewrite(stmt, parent) ?? stmt;
     const withScope = new Scope(parent);
     if (stmt.with) this.registerCtes(stmt.with, withScope);
     const base = stmt.with ? withScope : parent;
@@ -396,12 +444,12 @@ export class Planner {
     }
 
     // Compound: every core writes the same registers.
-    const first = this.planCore(this.flatten(stmt.core, [], base).core, base, outRegs, null);
+    const first = this.planCore(this.flatten(this.matviewCore(stmt.core, base), [], base).core, base, outRegs, null);
     const regs = first.outRegs;
     let root: Operator = first.root;
     let correlated = first.correlated;
     for (const c of stmt.compound) {
-      const next = this.planCore(this.flatten(c.core, [], base).core, base, regs, null);
+      const next = this.planCore(this.flatten(this.matviewCore(c.core, base), [], base).core, base, regs, null);
       if (next.outRegs.length !== regs.length) {
         throw new SmaltError('SMALT_ERROR', `SELECTs to the left and right of ${c.op} do not have the same number of result columns`);
       }

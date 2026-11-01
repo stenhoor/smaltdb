@@ -776,15 +776,12 @@ export class Database implements FunctionContext {
   compile(ps: ParsedStatement): Program {
     const stmt = ps.stmt;
     const regs = new Registers(ps.paramCount);
-    const planner = new Planner(
-      this.plannerDeps(),
-      regs,
-    );
+    const planner = new Planner(this.plannerDeps(this.rewritePolicy(stmt)), regs);
     planner.sqlText = ps.text;
     const done = (p: Omit<Program, 'regCount'>): Program => ({ ...p, regCount: regs.count, rowAssumptions: planner.rowAssumptions });
     switch (stmt.kind) {
       case 'select': {
-        const plan = planner.planSelect(this.matviewRewrite(stmt, ps.text) ?? stmt, null);
+        const plan = planner.planSelect(stmt, null);
         return done({ plan, readonly: true, columns: plan.columns.map((c) => c.name), columnTypes: plan.columns.map((c) => c.type) });
       }
       case 'insert': {
@@ -816,7 +813,7 @@ export class Database implements FunctionContext {
         return done({ exec: () => this.transactionControl(stmt), readonly: true, columns: [], columnTypes: [] });
       case 'explain': {
         if (stmt.stmt.kind !== 'select') throw new SmaltError('SMALT_UNSUPPORTED', 'EXPLAIN is only supported for SELECT statements');
-        const plan = planner.planSelect(this.matviewRewrite(stmt.stmt as SelectStmt, ps.text) ?? (stmt.stmt as SelectStmt), null);
+        const plan = planner.planSelect(stmt.stmt as SelectStmt, null);
         if (stmt.analyze) {
           const round = (x: number): number => Math.round(x * 1000) / 1000;
           return done({
@@ -844,9 +841,23 @@ export class Database implements FunctionContext {
     }
   }
 
+  /**
+   * Whether the SELECTs a statement plans (top level, subqueries, CTEs, views) may be answered from
+   * materialized views, and which tables' views are excluded. SELECT and EXPLAIN: yes. INSERT …
+   * SELECT: yes, except views over the table being written (the statement changes it while it
+   * reads) and when foreign keys may change other tables. UPDATE, DELETE and the rest: no.
+   */
+  private rewritePolicy(stmt: Stmt): { exclude: string | null } | null {
+    if (!this.matviewRewriteOn) return null;
+    if (stmt.kind === 'select' || (stmt.kind === 'explain' && stmt.stmt.kind === 'select')) return { exclude: null };
+    if (stmt.kind === 'insert' && stmt.source.kind === 'select' && !this.fkInvolvedNow(stmt.table)) return { exclude: stmt.table.toLowerCase() };
+    return null;
+  }
+
   /** What the planner reads from the database. Unpopulated materialized views cannot be read. */
-  private plannerDeps(): ConstructorParameters<typeof Planner>[0] {
+  private plannerDeps(rewrite: { exclude: string | null } | null = null): ConstructorParameters<typeof Planner>[0] {
     return {
+      rewriteSelect: rewrite ? (select, text) => this.matviewRewrite(select, text, rewrite.exclude) : undefined,
       getTable: (n, schema) => {
         const t = this.getTable(n, schema);
         if (t?.matview && !t.matview.populated) {
@@ -1269,7 +1280,7 @@ export class Database implements FunctionContext {
   private matviewRewriteOn = false;
 
   /** The query rewritten to read a fresh materialized view, when one provably answers it. */
-  private matviewRewrite(stmt: SelectStmt, text: string): SelectStmt | null {
+  private matviewRewrite(stmt: SelectStmt, text: string, exclude: string | null = null): SelectStmt | null {
     if (!this.matviewRewriteOn) return null;
     const views: MatviewCandidate[] = [];
     for (const t of this.tables.values()) {
@@ -1278,6 +1289,8 @@ export class Database implements FunctionContext {
       // A TEMP table or view shadowing something the view read: the query's names mean the temp object.
       const deps = (m.deps ??= this.selectDeps(m.select));
       if ([...deps].some((d) => this.tempTables.has(d) || this.tempViews.has(d))) continue;
+      // A view over the table the statement writes (INSERT … SELECT into its base table).
+      if (exclude !== null && deps.has(exclude)) continue;
       const from = m.select.core.kind === 'select' && m.select.core.from?.kind === 'table' ? this.getTable(m.select.core.from.name, m.select.core.from.schema) : undefined;
       views.push({ name: t.name, select: m.select, columns: t.columns.map((c) => c.name), baseColumns: from ? from.columns.map((c) => c.name) : [] });
     }

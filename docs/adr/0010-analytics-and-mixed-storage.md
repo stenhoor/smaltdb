@@ -189,6 +189,16 @@ views over a single table and rewrites the query at compile time, so EXPLAIN sho
 - *Comparison:* expressions are compared structurally after normalization: qualifiers dropped, names lower-cased,
   keys canonical. Output names stay as the query wrote them.
 - *Interaction with morsels:* a query a fresh view answers is not split into morsels.
+- *Where it applies:* every SELECT the planner plans (`Planner.planSelect`): the statement itself, derived tables,
+  scalar / `IN` / `EXISTS` subqueries, CTE bodies, view bodies (result names from the view's own text), each branch
+  of a compound, and the source of `INSERT … SELECT`. Decorrelated subqueries match too: their GROUP BY over the
+  inner table is self-contained.
+- *Where it does not:*
+  - a SELECT that reads the enclosing query's columns (a correlated subquery). Matching drops qualifiers, so an
+    outer `o.g` would become the view's `g`;
+  - a table name that means a CTE;
+  - `UPDATE` and `DELETE`, and `INSERT … SELECT` with views over the table being written or when foreign keys may
+    write other tables: the statement changes base tables while it reads.
 
 ## Consequences
 

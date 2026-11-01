@@ -323,7 +323,9 @@ unchanged: all suites pass, and `bench/micro/m7-perf.ts` plus an interpreted GRO
   - *Implicit rowid zone (-1):* kept, and the stated consequence does not occur. A materialized view's storage layout
     never declares an INTEGER PRIMARY KEY, so views have no rowid alias that could go unpruned.
   - **Follow-up features, not cleanup** (they change behavior):
-    - MV rewrite inside subqueries, CTEs, views and INSERT … SELECT, by hooking it into `planSelect`;
+    - MV rewrite inside subqueries, CTEs, views and INSERT … SELECT, by hooking it into `planSelect`. **Done:**
+      every SELECT the planner plans can be matched, except correlated ones, CTE names and statements that write
+      a view's base tables (ADR 0010, section 5). Tests: `test/mv-rewrite-nested.test.ts`;
     - passing PRAGMA settings (`work_mem`, `matview_rewrite`) to parallel readers. **Done:** the owner sends its
       settings (`Database.readerSettings`) with each query and morsel handed to a reader, which applies them first
       (`applyReaderSettings`). Tests: `test/reader-settings.test.ts`, plus a browser check that a reader answers from
