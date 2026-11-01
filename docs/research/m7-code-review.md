@@ -245,16 +245,19 @@ lifecycle, robustness and edge cases; **P** performance; **C** cleanup.
 
 ## Performance
 
-| Issue | Where | Suggested direction |
-|---|---|---|
-| Every write statement to a columnar table runs `count()` over the delta and deletion trees, which is O(n²) over an 8192-row batch of single-row inserts | `database.ts:1470` | Keep running counters in the writer, or check `estimateCount()` first |
-| UPDATE and DELETE of segment rows run `locateInSegments`: zone checks plus a linear rowid search per row | `columnar-table.ts:84` | Have the scan pass (row group, row) or the row itself; build a lazy rowid map per writer |
-| Every columnar scan rebuilds the deleted-rowid `Set`, and the deleted bitmaps per row group | `database.ts:814`, `operators.ts:682`, `planner.ts:1000` | Cache by deletion version; skip row groups whose rowid zone holds no deletions |
-| `snapshotMem()` runs before every write statement on file databases | `database.ts:932` | Snapshot lazily the first time a statement sets `memDirty` |
-| `rowBytes` is computed for every sorted row, even under a 256 MiB limit that rarely triggers | `operators.ts` Sort | Sample every Nth row |
-| `touchTable` loops over all tables on every DML writer; marking a view stale recompiles every cached statement | `database.ts:1645` | Keep a reverse map from base table to dependent fresh MVs; track freshness outside the schema version |
-| `usesMemoryObjects` walks the AST per request; `morselQuery` cache-clears at 64 entries; partial and merge statements are compiled per morsel | `database.ts:298`, `:1236`, `:1334` | Memoize per statement; use an LRU; cache compiled partial and merge programs |
-| TEMP-table growth never triggers re-planning: `statsDrifted` watches only the main pager's change counter | `database.ts:3251` | Also watch the memory pager's change counter |
+Status: all eight items are addressed. Measured with `npx tsx bench/micro/m7-perf.ts` (Node, file database on
+MemoryVfs, median of 5). Invariant tests are in `test/perf-invariants.test.ts`.
+
+| Issue | Fix | Before | After |
+|---|---|---|---|
+| Every write statement to a columnar table runs `count()` over the delta and deletion trees | Exact running counts kept by the writer (dropped on rollback, recounted when missing) | 8000 single-row INSERTs: 354 ms | 309 ms (a row table takes 282–309 ms: the rest is the per-statement WAL commit) |
+| UPDATE and DELETE of segment rows run `locateInSegments` with a linear rowid search | Binary search in row groups whose rowids ascend (normal after compaction; checked once per chunk) | UPDATE / DELETE 5k segment rows: 56.7 / 42.6 ms | 42.4 / 30.8 ms |
+| Every columnar scan rebuilds the deleted-rowid `Set` and the per-row-group bitmaps | Set cached per table, keyed by commit counter, local deletion version and deletion root. Bitmaps cached per set; row groups whose rowid range holds no deletion are skipped | GROUP BY / selective filter with 5k deletions: 14.5 / 0.91 ms | 5.3 / 0.31 ms |
+| `snapshotMem()` runs before every write statement | Already reduced in the S1 fixes: a shared empty snapshot when there are no memory objects | — | — |
+| `rowBytes` computed for every sorted row | Sampled every 16th row | Sort 300k rows: 328 ms | 322 ms (the accounting was a small share) |
+| `touchTable` loops over all tables on every DML writer | Loops over a per-schema-version list of materialized views only. (Marking a view stale still recompiles cached statements once per refresh cycle; left as is.) | 5000 INSERT + UPDATE with 20 tables: 62.7 ms | 62.4 ms (the loop was a small share) |
+| `usesMemoryObjects` walks the AST per request; `morselQuery` cache-clears at 64 entries; merge statements compiled per run | Memoized per statement and schema version. The morsel cache is an LRU. Partial column types and the merge statement are compiled once per query text and schema; `smalt_partials()` reads the current rows at run time | 20000 checks with a TEMP table present: 25.2 ms | 0.04 ms |
+| TEMP-table growth never triggers re-planning | Statements re-check row assumptions when the memory pager's commit counter moves too (`Database.changeStamp`) | Plan kept after a TEMP table grew 1→20000 rows | Re-planned |
 
 ## Cleanup
 

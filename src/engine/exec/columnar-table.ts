@@ -60,15 +60,55 @@ export function rowidsOf(store: ColumnStore, rg: number, rowidCol: number): Arra
   return out;
 }
 
+/**
+ * Deleted flags per row group, cached per deletion set: a set is replaced whenever deletions change,
+ * and a row group's rows never change in place (a rewrite replaces the set too).
+ */
+const bitmaps = new WeakMap<Set<Rowid>, Map<number, Uint8Array | null>>();
+
 /** Per-row deleted flags of row group `rg` (1 = deleted), or null when none of its rows are deleted. */
 export function deletedBitmap(store: ColumnStore, rg: number, rowidCol: number, deleted: Set<Rowid> | null): Uint8Array | null {
   if (deleted === null) return null;
+  let cache = bitmaps.get(deleted);
+  if (cache === undefined) bitmaps.set(deleted, (cache = new Map()));
+  let bm = cache.get(rg);
+  if (bm === undefined) cache.set(rg, (bm = computeBitmap(store, rg, rowidCol, deleted)));
+  return bm;
+}
+
+function computeBitmap(store: ColumnStore, rg: number, rowidCol: number, deleted: Set<Rowid>): Uint8Array | null {
+  // No deleted rowid within the row group's rowid range: nothing to look up. (Only worth it while
+  // the set is smaller than the group; otherwise looking up each row is cheaper.)
+  const m = store.meta(rg);
+  const z = m.zones[rowidCol];
+  if (deleted.size < m.rows && z.numMin !== undefined && z.numMax !== undefined) {
+    let any = false;
+    for (const d of deleted) {
+      if (d >= z.numMin && d <= z.numMax) {
+        any = true;
+        break;
+      }
+    }
+    if (!any) return null;
+  }
   const ids = rowidsOf(store, rg, rowidCol);
   let out: Uint8Array | null = null;
   for (let i = 0; i < ids.length; i++) {
     if (deleted.has(ids[i] as Rowid)) (out ??= new Uint8Array(ids.length))[i] = 1;
   }
   return out;
+}
+
+/** Whether a row group's rowids are ascending (cached per rowid array: chunks are immutable). */
+const ascending = new WeakMap<object, boolean>();
+function isAscending(ids: ArrayLike<SqlValue>): boolean {
+  let r = ascending.get(ids);
+  if (r === undefined) {
+    r = true;
+    for (let i = 1; i < ids.length && r; i++) r = (ids[i - 1] as Rowid) < (ids[i] as Rowid);
+    ascending.set(ids, r);
+  }
+  return r;
 }
 
 /** Where a rowid lives in the segments (ignoring deletions), or null. */
@@ -78,6 +118,20 @@ export function locateInSegments(store: ColumnStore, rowidCol: number, rowid: Ro
     const m = store.meta(rg);
     if (!zoneMayMatch(m.zones[rowidCol], m.rows, '=', rowid, true)) continue;
     const ids = rowidsOf(store, rg, rowidCol);
+    if (isAscending(ids)) {
+      // Compaction appends delta rows in rowid order: binary search.
+      let lo = 0;
+      let hi = ids.length - 1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >>> 1;
+        const v = ids[mid] as Rowid;
+        // eslint-disable-next-line eqeqeq
+        if (v == rowid) return { rg, i: mid };
+        if (v < rowid) lo = mid + 1;
+        else hi = mid - 1;
+      }
+      continue;
+    }
     for (let i = 0; i < ids.length; i++) {
       // eslint-disable-next-line eqeqeq
       if (ids[i] == rowid) return { rg, i };
@@ -122,8 +176,11 @@ export class ColumnarTableWriter extends TableWriter {
     /** The table's current segment reader (re-read each statement: compaction and rollbacks replace it). */
     private readonly storeFor: () => ColumnStore,
     private readonly del: BTree,
-    /** Called once the table has been written (compaction is checked at statement end). */
-    private readonly touched: () => void,
+    /**
+     * Called on every change, with the change in delta-store rows and in deletion-tree entries
+     * (the database keeps running counts for its compaction check at statement end).
+     */
+    private readonly changed: (deltaRows: number, deletions: number) => void,
   ) {
     super(table, pager, treeFor);
     this.rowidCol = table.columns.length;
@@ -180,24 +237,26 @@ export class ColumnarTableWriter extends TableWriter {
 
   override writeRow(row: SqlValue[], rowid: Rowid): void {
     super.writeRow(row, rowid);
-    this.touched();
+    this.changed(1, 0);
   }
 
   override updateRow(old: readonly SqlValue[], oldRowid: Rowid, next: SqlValue[], newRowid: Rowid): void {
     if (super.rowExists(oldRowid)) {
+      // In place, or (new rowid) through this.deleteRow / this.writeRow, which count themselves.
       super.updateRow(old, oldRowid, next, newRowid);
+      this.changed(0, 0);
     } else {
       // A segment row: hide it there, write the new version to the delta store.
       this.del.put(this.delKeyOf(oldRowid), EMPTY);
       super.writeRow(next, newRowid);
+      this.changed(1, 1);
     }
-    this.touched();
   }
 
   override deleteRow(rowid: Rowid, knownRow?: readonly SqlValue[], silent = false, replace = false): boolean {
     if (super.rowExists(rowid)) {
       const ok = super.deleteRow(rowid, knownRow, silent, replace);
-      this.touched();
+      if (ok) this.changed(-1, 0);
       return ok;
     }
     const row = knownRow ?? this.readRow(rowid);
@@ -205,7 +264,7 @@ export class ColumnarTableWriter extends TableWriter {
     if (!silent) this.beforeDelete?.(row);
     this.del.put(this.delKeyOf(rowid), EMPTY);
     if (!silent) this.onDelete?.(row, replace);
-    this.touched();
+    this.changed(0, 1);
     return true;
   }
 

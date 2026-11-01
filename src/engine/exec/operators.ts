@@ -1440,7 +1440,8 @@ export class Sort implements Operator {
         bytes = budget === Infinity ? 0 : Math.ceil((bytes * cap) / rows.length);
         rows.length = cap;
       }
-      if (budget !== Infinity && (bytes += rowBytes(row, n)) > budget) {
+      // Memory accounting samples every 16th row (the estimate is coarse anyway): no per-row cost.
+      if (budget !== Infinity && (rows.length & 15) === 0 && (bytes += 16 * rowBytes(row, n)) > budget) {
         // Memory is full: write it out as a sorted run.
         if (!this.spilling) {
           area!.acquire();
