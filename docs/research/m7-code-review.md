@@ -285,6 +285,27 @@ Measured directly in Node (15 fresh databases each) it is equal: 16.0–16.5 ms 
 
 Saved baselines: `bench/results/2026-11-01-chromium-f42b0bc.json` and `bench/results/2026-11-01-chromium-f42b0bc-cpu.json`.
 
+### Regression check after the follow-ups
+
+`main` after the HAVING / correlated-subquery fix, reader PRAGMA settings and nested materialized-view matching
+(e05378c) against the baseline above (f42b0bc), run back to back on the same machine, same rule.
+
+| Suite | Result |
+|---|---|
+| Storage micro-benchmarks | Flat (the new commit came out faster on every B-tree case; no storage code changed). |
+| Joins vs SQLite in Node (J1–J7) | Flat. J6 9.0–9.8 ms against 8.8–9.9 ms (4 runs each). |
+| `bench/micro/m7-perf.ts` | Flat. |
+| Browser, OPFS (47 workloads) | Geometric mean +1.2%, against −0.7% for SQLite on the same runs. |
+| Browser, CPU only (45 workloads) | Geometric mean +1.5%, against +2.5% for SQLite. |
+
+One case came out outside the ranges once: `index: create on 2 columns` on OPFS, 91.0 → 97.7 ms. It did not hold
+up: the CPU-only runs give 63.0 → 61.6 ms, the saved runs 93.1 → 94.3 ms (OPFS, overlapping) and 60.9 → 60.9 ms
+(CPU only), and Node (11 fresh databases each, two rounds) 66.6–67.6 ms against 65.2–65.6 ms. None of the
+changes touch index builds. With `matview_rewrite` off (the default, and in every benchmark) the new matching
+hook is not installed.
+
+Saved baselines: `bench/results/2026-11-01-chromium-e05378c.json` and `bench/results/2026-11-01-chromium-e05378c-cpu.json`.
+
 ## Cleanup
 
 Status: done, except two items kept on purpose and two that are behavior changes (follow-up features). Behavior is
