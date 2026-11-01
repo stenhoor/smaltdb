@@ -33,6 +33,13 @@ export interface Adapter {
    * statement; each run returns one row. Returns the sum of the first column (a checksum).
    */
   lookups(sql: string, keys: (number | string)[]): Promise<number>;
+  /**
+   * Materialize `select` as `name` for analytical reads: smaltdb builds a columnar materialized
+   * view; other engines (no materialized views) create a table with CREATE TABLE ... AS.
+   */
+  projection?(name: string, select: string): Promise<void>;
+  /** Recompute a projection: REFRESH for smaltdb; DELETE + INSERT ... SELECT in one transaction elsewhere. */
+  refreshProjection?(name: string, select: string): Promise<void>;
   /** Execute a statement without results (e.g. CREATE INDEX). */
   exec(sql: string): Promise<void>;
   /** Run a read-only query and return its rows as value arrays. */

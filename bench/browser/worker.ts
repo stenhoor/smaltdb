@@ -44,8 +44,8 @@ async function timed(out: WorkloadResult[], workload: string, ops: number, fn: (
   out.push({ workload, ops, ms, check: Array.isArray(r) ? canon(r as unknown[][]) : String(r) });
 }
 
-self.onmessage = async (e: MessageEvent<{ engine: string; rows: number; lookups: number; smallTxns: number; analyticRows: number; joins: boolean; indexes: boolean }>) => {
-  const { engine, rows: N, lookups, smallTxns, analyticRows, joins, indexes } = e.data;
+self.onmessage = async (e: MessageEvent<{ engine: string; rows: number; lookups: number; smallTxns: number; analyticRows: number; joins: boolean; indexes: boolean; matviews: boolean }>) => {
+  const { engine, rows: N, lookups, smallTxns, analyticRows, joins, indexes, matviews } = e.data;
   try {
     const a = factories[engine]();
     const results: WorkloadResult[] = [];
@@ -77,6 +77,36 @@ self.onmessage = async (e: MessageEvent<{ engine: string; rows: number; lookups:
       for (let i = 0; i < 5; i++) await timed(reps, 'x', analyticRows, () => a.query(sql));
       const sorted = reps.map((x) => x.ms).sort((x, y) => x - y);
       results.push({ workload: `analytic: ${name} (repeat, median of 5)`, ops: analyticRows, ms: sorted[2], check: reps[0].check });
+    }
+    if (matviews) {
+      // Columnar projection of `a` (smaltdb: columnar materialized view; others: CREATE TABLE AS).
+      const sel = 'SELECT * FROM a';
+      const projection = a.projection ? (n: string, q: string) => a.projection!(n, q) : (n: string, q: string) => a.exec(`CREATE TABLE ${n} AS ${q}`);
+      const refresh = a.refreshProjection
+        ? (n: string, q: string) => a.refreshProjection!(n, q)
+        : async (n: string, q: string) => {
+            await a.exec('BEGIN');
+            await a.exec(`DELETE FROM ${n}`);
+            await a.exec(`INSERT INTO ${n} ${q}`);
+            await a.exec('COMMIT');
+          };
+      await timed(results, `mv: build projection of a (${analyticRows} rows)`, analyticRows, () => projection('a_proj', sel));
+      for (const [name, sql] of Object.entries(ANALYTIC_QUERIES)) {
+        const q = sql.replace('FROM a', 'FROM a_proj');
+        await timed(results, `mv: ${name} on projection (first run)`, analyticRows, () => a.query(q));
+        const reps: WorkloadResult[] = [];
+        for (let i = 0; i < 5; i++) await timed(reps, 'x', analyticRows, () => a.query(q));
+        const sorted = reps.map((x) => x.ms).sort((x, y) => x - y);
+        results.push({ workload: `mv: ${name} on projection (repeat, median of 5)`, ops: analyticRows, ms: sorted[2], check: reps[0].check });
+      }
+      const starts = Array.from({ length: 20 }, (_, i) => 1 + ((i * 7919) % Math.max(1, analyticRows - analyticRows / 20)));
+      await timed(results, 'mv: clustered range x20 on projection (5% of rows each)', 20, () =>
+        a.lookups(`SELECT sum(b) FROM a_proj WHERE id >= ?1 AND id < ?1 + ${Math.floor(analyticRows / 20)}`, starts),
+      );
+      await timed(results, `mv: refresh projection (${analyticRows} rows)`, analyticRows, async () => {
+        await refresh('a_proj', sel);
+        return a.query('SELECT count(*), sum(b) FROM a_proj');
+      });
     }
     if (indexes) {
       // Secondary indexes on the analytic table `a` (b = i % 1000, d = i % 100, e = 'x' || i % 50).

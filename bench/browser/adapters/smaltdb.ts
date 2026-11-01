@@ -115,6 +115,14 @@ export class SmaltdbAdapter implements Adapter {
     return this.db.query(sql).rows;
   }
 
+  async projection(name: string, select: string): Promise<void> {
+    this.db.exec(`CREATE MATERIALIZED VIEW ${name} WITH (storage = 'columnar') AS ${select}`);
+  }
+
+  async refreshProjection(name: string): Promise<void> {
+    this.db.exec(`REFRESH MATERIALIZED VIEW ${name}`);
+  }
+
   async close(): Promise<void> {
     this.db.close();
     if (this.memory) return;

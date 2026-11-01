@@ -1,7 +1,7 @@
 // Engine comparison in a real browser.
 //
 //   npm run bench:browser -- [--engines smaltdb,sqlite-off,sqlite-journal] [--reps 5] [--rows 100000]
-//                            [--analytic-rows 200000] [--no-joins] [--no-indexes] [--save] [--baseline sqlite-off]
+//                            [--analytic-rows 200000] [--no-joins] [--no-indexes] [--no-matviews] [--save] [--baseline sqlite-off]
 //
 // CPU-only view (no storage I/O or durability work on either side):
 //   npm run bench:browser -- --engines smaltdb-mem,sqlite-mem --baseline sqlite-mem
@@ -75,7 +75,7 @@ const failures = [];
 for (let rep = 0; rep < reps; rep++) {
   const order = engines.map((_, i) => engines[(i + rep) % engines.length]);
   for (const engine of order) {
-    const r = await page.evaluate((msg) => window.runEngine(msg), { engine, rows, lookups, smallTxns, analyticRows, joins: !process.argv.includes('--no-joins'), indexes: !process.argv.includes('--no-indexes') });
+    const r = await page.evaluate((msg) => window.runEngine(msg), { engine, rows, lookups, smallTxns, analyticRows, joins: !process.argv.includes('--no-joins'), indexes: !process.argv.includes('--no-indexes'), matviews: !process.argv.includes('--no-matviews') });
     if (r.ok) runs[engine].push(r);
     else failures.push({ engine, rep, error: r.error });
     process.stdout.write(r.ok ? '.' : 'x');
