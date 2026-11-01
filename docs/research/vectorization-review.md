@@ -47,3 +47,35 @@ slower than fused generated loops and adds a second execution engine to maintain
 Caveats: Node/V8 only. Browser V8 behaves the same, but Firefox (SpiderMonkey) and Safari (JavaScriptCore) need measuring, because
 JIT behaviour around typed arrays, `new Function` and boxing differs. V3 is a best case: real columnar storage adds null bitmaps,
 encodings and page boundaries. Expect roughly 5–10× over today rather than 8.4×.
+
+## Follow-up (2026-11-01): what step 1 actually needed
+
+Moving decoded columns into JS locals (recommendation 1) alone gave almost nothing, about 23 → 22 ns/row. Hand-written variants showed
+the real cost was **representation**: a variable that can hold either `null` or a double forces V8 to box every double
+(V1b 12.2 → V1d 15.8 → V1c 17.2 ns/row). The exact SQLite `sum()` semantics (int-exact, Neumaier) cost only about 0.6 ns/row (V1 vs V1b).
+The generator now carries SQL NULL in a separate boolean next to each numeric value, with a 0 placeholder, for columns, arithmetic
+and comparisons. Numeric variables therefore stay unboxed. The fused arithmetic query went from ~22 to **18.7 ns/row** (SQLite: ~40). The rest of the
+gap to the hand-written loop (~11) is per-row generality (overflow/short-record checks, int64 high words, `-0` normalization).
+
+## GPU (WebGPU) and typed-array libraries
+
+**WebGPU is not suitable for exact SQL arithmetic:**
+- WGSL has no `f64` and no `i64` (only f32/i32/u32). SQL INTEGER sums must be exact to 2^63 and REAL is binary64. f32 sums are wrong
+  beyond 2^24. Emulating 64-bit with paired 32-bit values costs several times the work.
+- The workloads are memory-bound with a few operations per row. Uploading about 20 MB of columns for 1M rows costs milliseconds, and readback
+  requires async `mapAsync` (about 0.1–1 ms latency). The columnar CPU loop does the whole query in 1.25–2.8 ms.
+- Readback is async, but the engine is synchronous by design.
+- WebGPU shipped in Chrome 113, Safari 26 and Firefox 141 (Windows first), so it is mostly absent from the supported minimum (Chrome 108, Firefox 111, Safari 17).
+- This container has no GPU. Chromium only exposes WebGPU via the SwiftShader software adapter when forced, so we could not time it.
+
+Possible future niche: approximate analytics or vector/ML functions over data kept resident on the GPU, as an optional extension.
+
+**Typed-array libraries vs. generated loops:** same query, 1M rows, columnar typed arrays, identical results:
+| | ms |
+|---|---|
+| Fused typed-array loop (what smaltdb's codegen would emit for M7 columnar tables) | 1.25 |
+| Arquero 8 (optimized typed-array dataframe library) | 14.2 |
+
+General-purpose libraries evaluate one operator at a time and materialize intermediate arrays (the V4 pattern). That is about 10× slower than
+a loop generated per query. Typed arrays are the right storage for M7; a library on top would add overhead rather than remove it.
+Apache Arrow remains interesting as an **interchange format** (zero-copy result export), not as a compute engine.
