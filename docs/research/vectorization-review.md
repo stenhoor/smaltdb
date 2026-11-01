@@ -79,3 +79,10 @@ Possible future niche: approximate analytics or vector/ML functions over data ke
 General-purpose libraries evaluate one operator at a time and materialize intermediate arrays (the V4 pattern). That is about 10× slower than
 a loop generated per query. Typed arrays are the right storage for M7; a library on top would add overhead rather than remove it.
 Apache Arrow remains interesting as an **interchange format** (zero-copy result export), not as a compute engine.
+
+## Follow-up: recommendation 2 done (2026-11-01)
+
+Fusion now also covers scan + filter feeding any consumer (rows handed over in batches of 256) and GROUP BY (key computation,
+hash lookup and aggregate steps inline). Node, 200k rows: GROUP BY 16.3 → 8.3 ms (7.4× faster than SQLite), filtered GROUP BY with
+arithmetic 11.3 → 5.1 ms, filter + arithmetic projection 7.2 → 4.7 ms (9.7× faster than SQLite). The next step is recommendation 3,
+columnar tables (M7).

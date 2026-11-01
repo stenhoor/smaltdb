@@ -96,3 +96,8 @@ Source: `src/engine/exec/` — `planner.ts`, `operators.ts`, `expr.ts`, `functio
   table order, scanning in reverse for DESC.
 - **`count(*)` fast path:** summing leaf cell counts, as SQLite's `OP_Count` does.
 - **Subqueries:** uncorrelated ones are evaluated once per execution. Correlated ones re-run per outer row (decorrelation is M4).
+- **Fused pipelines** (generated per query when code generation is allowed). Single-table full scans with WHERE compile into one function
+  that walks leaf pages, decodes the needed columns into per-row locals (numeric values with separate NULL flags, so they stay unboxed) and
+  evaluates the conjuncts. Three consumers are fused: ungrouped aggregates (`FusedScanAggregate`), GROUP BY with an inline hash aggregate
+  (`FusedGroupAggregate`), and anything else via row batches (`FusedScanFilter`). Range/index scans, joins, DISTINCT aggregates,
+  predicates with subqueries and bare columns in aggregates keep the operator-at-a-time plan.

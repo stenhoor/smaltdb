@@ -138,3 +138,20 @@ full scan now compile into one generated function per pipeline. Versus the faste
 
 All other workloads are unchanged (1.2–4.8× faster). smaltdb is now faster than or tied with crash-safe SQLite WASM on every workload in the
 suite. See also [vectorization-review.md](vectorization-review.md).
+
+## Update: fused pipelines for scan + filter and GROUP BY (2026-11-01)
+
+Raw data: [bench/results/2026-11-01-chromium-5ba5455.json](../../bench/results/2026-11-01-chromium-5ba5455.json). Single-table scans with WHERE
+(non-aggregate queries) and GROUP BY aggregations now also run as one generated function per query. Versus the faster crash-safe SQLite mode:
+
+| Analytical query | first run | repeat (median of 5) |
+|---|---|---|
+| Filter + sum | **1.42× faster** | **3.66× faster** |
+| GROUP BY (100 groups) | **5.44× faster** (was 3.37×) | **8.08× faster** (was 3.49×) |
+| Arithmetic filter + aggregate | **1.24× faster** (was a tie) | **2.29× faster** |
+
+**smaltdb is now faster than crash-safe SQLite WASM on every workload in the suite, including first runs, with non-overlapping ranges.**
+
+Caveat on cold reads: in this run smaltdb's cold point lookups measured 97 ms (90–103) while running after the other engines. Re-run alone
+they measured 59–63 ms, matching earlier runs, and one standalone repetition spiked to 98 ms. Cold OPFS I/O in this shared container is noisy
+and sensitive to the I/O of preceding engines. Cold-read comparisons should be confirmed on dedicated hardware.
