@@ -40,6 +40,7 @@ import type {
 import { parse, parseOne } from './sql/parser.js';
 import { BTree } from './storage/btree.js';
 import { KeyEncoder, decodeKey, readRowidKey } from './storage/key-codec.js';
+import { compareBytes } from './util/bytes.js';
 import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordReader } from './storage/record.js';
 import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec/stats.js';
@@ -485,7 +486,7 @@ export class Database implements FunctionContext {
         return done({ plan, readonly: true, columns: plan.columns.map((c) => c.name), columnTypes: plan.columns.map((c) => c.type) });
       }
       case 'insert': {
-        const single = stmt.source.kind === 'values' && stmt.source.rows.length === 1 && (stmt.or ?? 'ABORT') !== 'REPLACE' && this.getTable(stmt.table)?.indexes.length === 0 && !stmt.upsert.length && !this.fkInvolvedNow(stmt.table);
+        const single = stmt.source.kind === 'values' && stmt.source.rows.length === 1 && (stmt.or ?? 'ABORT') !== 'REPLACE' && !stmt.upsert.length && !this.fkInvolvedNow(stmt.table);
         const c = this.compileInsert(stmt, planner);
         return done(this.dmlProgram(c, single));
       }
@@ -859,7 +860,10 @@ export class Database implements FunctionContext {
     } finally {
       c.close();
     }
-    for (const k of entries) itree.put(k, new Uint8Array(0));
+    // Insert in key order: appends to the rightmost leaf keep pages full and avoid splits mid-tree.
+    entries.sort(compareBytes);
+    const empty = new Uint8Array(0);
+    for (const k of entries) itree.append(k, empty);
     table.indexes.push(idx);
     this.indexes.set(idx.name.toLowerCase(), idx);
     if (idx.unique) this.checkUniqueIndex(table, idx); // existing rows may already collide
@@ -1626,8 +1630,7 @@ export class Database implements FunctionContext {
       r[rowidReg] = newRowid;
       this.validateRow(table, next, real, checks, r, base, 'ABORT', defaults);
       w.resolveConflicts(next, newRowid, other, 'ABORT');
-      w.deleteRow(other, old, true);
-      w.writeRow(next, newRowid);
+      w.updateRow(old, other, next, newRowid);
       if (this.fk.involved(table)) this.fk.afterUpdate(table, old, next);
       return { row: next, rowid: newRowid };
     }
@@ -1650,10 +1653,9 @@ export class Database implements FunctionContext {
     const root = planner.planFrom(item, where, scope);
     const cs = planner.compileScope(scope);
     const q = alias ?? table.name;
-    const colRegs = table.columns.map((c) => {
-      const b = cs.resolveColumn({ kind: 'column', table: q, name: c.name, pos: 0, end: 0 });
-      return b.reg;
-    });
+    // Rows are re-read by rowid before they change, so the scan only decodes what WHERE (and, with
+    // FROM, the SET expressions evaluated during the join) reference.
+    const colRegs = planner.untracked(() => table.columns.map((c) => cs.resolveColumn({ kind: 'column', table: q, name: c.name, pos: 0, end: 0 }).reg));
     const rowidReg = cs.resolveColumn({ kind: 'column', table: q, name: 'rowid', pos: 0, end: 0 }).reg;
     return { root, colRegs, rowidReg, scope: cs };
   }
@@ -1731,8 +1733,7 @@ export class Database implements FunctionContext {
         r[checkRowid] = newRowid;
         if (!this.validateRow(table, next, real, checks, r, base, mode, defaults)) continue;
         if (!writer.resolveConflicts(next, newRowid, rowid, mode)) continue;
-        writer.deleteRow(rowid, old, true);
-        writer.writeRow(next, newRowid);
+        writer.updateRow(old, rowid, next, newRowid);
         if (this.fk.involved(table)) this.fk.afterUpdate(table, old, next);
         changes++;
         if (ret && out) {
@@ -1765,21 +1766,22 @@ export class Database implements FunctionContext {
         this.total += n;
         return { changes: n, lastInsertRowid: this.lastRowid };
       }
-      const pending: { rowid: number | bigint; row: SqlValue[] }[] = [];
+      const pending: (number | bigint)[] = [];
       root.open(r);
       try {
-        while (root.next()) pending.push({ rowid: r[rowidReg] as number | bigint, row: colRegs.map((g) => r[g]) });
+        while (root.next()) pending.push(r[rowidReg] as number | bigint);
       } finally {
         root.close();
       }
       const writer = this.writerFor(table);
       let changes = 0;
-      for (const p of pending) {
-        if (!writer.deleteRow(p.rowid, p.row)) continue;
+      for (const rowid of pending) {
+        const row = writer.readRow(rowid);
+        if (row === null || !writer.deleteRow(rowid, row)) continue;
         changes++;
         if (ret && out) {
-          for (let i = 0; i < ncols; i++) r[oldBase + i] = p.row[i];
-          r[oldRowid] = p.rowid;
+          for (let i = 0; i < ncols; i++) r[oldBase + i] = row[i];
+          r[oldRowid] = rowid;
           out.push(ret.fns.map((f) => f(r)));
         }
       }

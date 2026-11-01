@@ -217,9 +217,20 @@ export class TableWriter {
     if (alias >= 0) row[alias] = saved;
   }
 
+  private readonly newKeys: (Uint8Array | null)[] = [];
+
   /** Write a row whose conflicts were already resolved. */
   writeRow(row: SqlValue[], rowid: number | bigint): void {
     const t = this.table;
+    // Index keys first: evaluating an index expression or an oversized key fails before anything
+    // is written, so a single-row INSERT needs no statement journal (Database.compile).
+    const keys = this.newKeys;
+    keys.length = 0;
+    for (let i = 0; i < t.indexes.length; i++) {
+      const k = this.indexKey(t.indexes[i], row, rowid);
+      if (k && k.length > this.indexTrees[i].maxKeySize) throw new SmaltError('SMALT_TOOBIG', `index key too large for index ${t.indexes[i].name}`);
+      keys.push(k && (t.indexes.length === 1 ? k : k.slice()));
+    }
     const alias = t.rowidAlias;
     let saved: SqlValue = null;
     if (alias >= 0) {
@@ -228,11 +239,41 @@ export class TableWriter {
     }
     this.tree.put(this.key(rowid), this.enc.encode(row));
     if (alias >= 0) row[alias] = saved;
-    for (let i = 0; i < t.indexes.length; i++) {
-      const k = this.indexKey(t.indexes[i], row, rowid);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
       if (k) this.indexTrees[i].put(k, EMPTY);
     }
     this.noteRowid(rowid);
+  }
+
+  /**
+   * Replace row `oldRowid` (currently `old`, conflicts already resolved) with `next`. Index entries
+   * whose key is unchanged are left alone and a same-size record is overwritten in place.
+   */
+  updateRow(old: readonly SqlValue[], oldRowid: number | bigint, next: SqlValue[], newRowid: number | bigint): void {
+    if (oldRowid !== newRowid) {
+      this.deleteRow(oldRowid, old, true);
+      this.writeRow(next, newRowid);
+      return;
+    }
+    const t = this.table;
+    for (let i = 0; i < t.indexes.length; i++) {
+      const ok = this.indexKey(t.indexes[i], old, oldRowid);
+      const oldKey = ok && ok.slice();
+      const nk = this.indexKey(t.indexes[i], next, newRowid);
+      if (oldKey && nk && oldKey.length === nk.length && oldKey.every((b, j) => b === nk[j])) continue;
+      const newKey = nk && nk.slice();
+      if (oldKey) this.indexTrees[i].delete(oldKey);
+      if (newKey) this.indexTrees[i].put(newKey, EMPTY);
+    }
+    const alias = t.rowidAlias;
+    let saved: SqlValue = null;
+    if (alias >= 0) {
+      saved = next[alias];
+      next[alias] = null;
+    }
+    this.tree.put(this.key(newRowid), this.enc.encode(next));
+    if (alias >= 0) next[alias] = saved;
   }
 
   /** Foreign-key hooks around a deletion (not called for the delete half of an UPDATE). */

@@ -37,7 +37,8 @@ import type {
   WindowSpec,
   WithClause,
 } from '../sql/ast.js';
-import type { BTree } from '../storage/btree.js';
+import { type BTree, BTreeCursor } from '../storage/btree.js';
+import { decodeKey } from '../storage/key-codec.js';
 import { RecordReader } from '../storage/record.js';
 import { Collation, type SqlValue } from '../values.js';
 import { type Affinity, type StaticType, affinityOfStorage, hashKey, hashKeyMulti, staticTypeOfStorage, truthy } from './convert.js';
@@ -1563,7 +1564,7 @@ export class Planner {
         // Expression columns have no statistics: assume ~10 rows per value, like SQLite without ANALYZE.
         for (let j = 0; j < k; j++) matches /= idx.columns[j].column < 0 ? Math.max(1, N / 10) : this.ndv(src, idx.columns[j].column);
       }
-      if (lo || hi) matches *= lo && hi ? 0.25 : 0.33;
+      if (lo || hi) matches *= (k === 0 ? this.rangeFraction(idx, lo, hi) : undefined) ?? (lo && hi ? 0.25 : 0.33);
       // A partial index only holds rows matching its WHERE.
       if (idx.where) for (const w of conjuncts(idx.where)) matches *= this.selectivity(w, scope);
       matches = Math.max(1, matches);
@@ -1615,6 +1616,16 @@ export class Planner {
   /** >0 while compiling expressions only to inspect them (column use is not recorded). */
   private dryCompile = 0;
 
+  /** Run `fn` without recording column use (the scan will not decode the columns it resolves). */
+  untracked<T>(fn: () => T): T {
+    this.dryCompile++;
+    try {
+      return fn();
+    } finally {
+      this.dryCompile--;
+    }
+  }
+
   /** Views being expanded (detects circular definitions). */
   private readonly expandingViews = new Set<string>();
 
@@ -1632,6 +1643,56 @@ export class Planner {
   }
 
   /** Estimated distinct values of a column (rowid/unique, ANALYZE, index stats, sample, else rows/10). */
+  /**
+   * Fraction of an index's first column covered by a range, from the column's current min/max (two
+   * O(log n) probes). Handles constant bounds and bounds of fixed width over the same unknown
+   * (`x >= ?1 AND x < ?1 + 10`). Undefined when it cannot tell (non-numeric, unknown bounds).
+   */
+  private rangeFraction(idx: TableSchema['indexes'][number], lo: { other: Expr; op: string } | undefined, hi: { other: Expr; op: string } | undefined): number | undefined {
+    const linear = (e: Expr): { base: string; off: number } | undefined => {
+      if (e.kind === 'literal') return typeof e.value === 'number' ? { base: '', off: e.value } : undefined;
+      if (e.kind === 'unary' && e.op === '-' && e.operand.kind === 'literal' && typeof e.operand.value === 'number') return { base: '', off: -e.operand.value };
+      if (e.kind === 'binary' && (e.op === '+' || e.op === '-') && e.right.kind === 'literal' && typeof e.right.value === 'number') {
+        const inner = linear(e.left);
+        const d = e.op === '+' ? e.right.value : -e.right.value;
+        return inner ? { base: inner.base, off: inner.off + d } : { base: exprShapeKey(e.left), off: d };
+      }
+      return { base: exprShapeKey(e), off: 0 };
+    };
+    const l = lo && linear(lo.other);
+    const h = hi && linear(hi.other);
+    if ((lo && !l) || (hi && !h)) return undefined;
+    const known = (x: { base: string } | undefined): boolean => !x || x.base === '';
+    // Only constant bounds, or a pair sharing the same unknown.
+    if (!(known(l) && known(h)) && !(l && h && l.base === h.base)) return undefined;
+    const mm = this.indexMinMax(idx);
+    if (!mm) return undefined;
+    const span = mm.max - mm.min;
+    if (span <= 0) return undefined;
+    let width: number;
+    if (l && h && l.base !== '') width = h.off - l.off;
+    else width = (h ? Math.min(h.off, mm.max) : mm.max) - (l ? Math.max(l.off, mm.min) : mm.min);
+    // Integer-valued ranges include an endpoint; never estimate below a sliver.
+    return Math.min(1, Math.max(1 / (span + 1), (Math.max(0, width) + 1) / (span + 1)));
+  }
+
+  private indexMinMax(idx: TableSchema['indexes'][number]): { min: number; max: number } | undefined {
+    const tree = this.env.openTree(idx.rootPage);
+    const cur = new BTreeCursor(tree);
+    const cols = idx.columns.map((c) => ({ desc: c.desc, collation: c.collation }));
+    try {
+      // 0x06 sorts after every NULL key: the first non-NULL value.
+      if (!cur.seek(new Uint8Array([0x06]))) return undefined;
+      const min = decodeKey(cur.key(), cols)[0];
+      if (!cur.last()) return undefined;
+      const max = decodeKey(cur.key(), cols)[0];
+      if (typeof min !== 'number' || typeof max !== 'number') return undefined;
+      return { min, max };
+    } finally {
+      cur.close();
+    }
+  }
+
   private ndv(src: Source, col: number | 'rowid'): number {
     const n = this.tableRows(src);
     const t = src.table;

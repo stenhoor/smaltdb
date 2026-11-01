@@ -87,7 +87,7 @@ async function main(): Promise<void> {
   for (const [name, a, b] of work) {
     const [ta, va] = time(a);
     const [tb, vb] = time(b);
-    console.log(name.padEnd(34), ta.toFixed(1).padStart(10), tb.toFixed(1).padStart(10), (tb / ta).toFixed(2).padStart(7) + 'x', va === vb || (va === undefined && vb === undefined) ? ' ok' : ` DIFF ${va} ${vb}`);
+    console.log(name.padEnd(34), ta.toFixed(1).padStart(10), tb.toFixed(1).padStart(10), (tb / ta).toFixed(2).padStart(7) + 'x', typeof va !== 'number' ? ' -' : va === vb ? ' ok' : ` DIFF ${va} ${vb}`);
   }
   for (const q of ['EXPLAIN QUERY PLAN SELECT count(*) FROM a WHERE b = 5', 'EXPLAIN QUERY PLAN SELECT sum(d) FROM a WHERE b >= 5 AND b < 15', 'EXPLAIN QUERY PLAN SELECT count(*) FROM a WHERE d = 5 AND c > 500', "EXPLAIN QUERY PLAN SELECT count(*) FROM a WHERE lower(e) = 'x5'"]) {
     console.log(q.slice(19), '\n   smalt:', d.query(q).rows.map((r) => r[3]).join(' | '), '\n   lite: ', s.selectArrays(q).map((r: unknown[]) => r[3]).join(' | '));

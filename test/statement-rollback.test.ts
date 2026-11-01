@@ -75,3 +75,38 @@ describe('Pager statement savepoints', () => {
     });
   }
 });
+
+describe('single-row INSERT without a statement journal', () => {
+  const open = async () => {
+    const { Database } = await import('../src/engine/database.js');
+    const { MemoryVfs } = await import('../src/engine/vfs/memory.js');
+    return Database.openFile(new MemoryVfs().openSync('x.db'));
+  };
+
+  it('an index expression error leaves no partial row inside a transaction', async () => {
+    const db = await open();
+    db.exec('CREATE TABLE t(id INTEGER PRIMARY KEY, j INT); CREATE INDEX tj ON t(abs(j)); BEGIN; INSERT INTO t VALUES (1, 5)');
+    expect(() => db.exec('INSERT INTO t VALUES (2, -9223372036854775808)')).toThrow(/integer overflow/);
+    expect(db.query('SELECT * FROM t').rows).toEqual([[1, 5]]);
+    db.exec('COMMIT');
+    expect(db.query('PRAGMA integrity_check').rows).toEqual([['ok']]);
+  });
+
+  it('an oversized index key leaves no partial row inside a transaction', async () => {
+    const db = await open();
+    db.exec('CREATE TABLE u(id INTEGER PRIMARY KEY, s TEXT); CREATE INDEX us ON u(s); BEGIN');
+    expect(() => db.prepare('INSERT INTO u VALUES (1, ?)').run(['x'.repeat(5000)])).toThrow(/index key too large/);
+    expect(db.query('SELECT count(*) FROM u').rows).toEqual([[0]]);
+    db.exec('COMMIT');
+    expect(db.query('PRAGMA integrity_check').rows).toEqual([['ok']]);
+  });
+
+  it('UPDATE keeps unchanged index entries and rewrites changed ones', async () => {
+    const db = await open();
+    db.exec("CREATE TABLE a(id INTEGER PRIMARY KEY, b INT, c TEXT); CREATE INDEX ab ON a(b); CREATE INDEX ac ON a(c); INSERT INTO a VALUES (1, 1, 'x'), (2, 2, 'y'), (3, 3, 'z')");
+    db.exec("UPDATE a SET b = b + 10 WHERE id >= 2; UPDATE a SET c = 'longer text value' WHERE id = 1");
+    expect(db.query('SELECT id FROM a INDEXED BY ab WHERE b > 5 ORDER BY id').rows).toEqual([[2], [3]]);
+    expect(db.query("SELECT b FROM a INDEXED BY ac WHERE c = 'longer text value'").rows).toEqual([[1]]);
+    expect(db.query('PRAGMA integrity_check').rows).toEqual([['ok']]);
+  });
+});

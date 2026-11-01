@@ -203,12 +203,58 @@ export class BTree {
       if (i < nCells(leaf)) {
         const off = slot(leaf, i);
         if (compareKeyAt(key, leaf.bytes, off + LEAF_HDR, leaf.view.getUint16(off, true)) === 0) {
+          // Same-size replacement without overflow (typical UPDATE): overwrite in place, no fragmentation.
+          const local = LEAF_HDR + key.length + value.length;
+          if (local <= this.maxLocal && !(leaf.bytes[off + 2] & FLAG_OVERFLOW) && cellSizeAt(leaf, off, true) === local) {
+            this.buildLeafCell(key, value);
+            leaf.bytes.set(this.cellBuf.subarray(0, local), off);
+            return;
+          }
           this.freeCellOverflow(leaf, off);
           this.removeCell(leaf, i, true);
         }
       }
       const size = this.buildLeafCell(key, value);
       if (!this.insertCell(leaf, i, this.cellBuf, size)) this.splitLeaf(leaf, i, this.cellBuf.slice(0, size));
+    } finally {
+      pager.release(leaf);
+    }
+  }
+
+  /**
+   * Insert a key greater than every key in the tree (bulk loads of sorted keys, e.g. CREATE INDEX):
+   * no key comparisons on the way down, and full pages are left full.
+   */
+  append(key: Uint8Array, value: Uint8Array): void {
+    if (key.length > this.maxKeySize) throw new MisuseError(`key too large (${key.length} > ${this.maxKeySize} bytes)`);
+    const pager = this.pager;
+    let pg = this.root;
+    let d = 0;
+    let leaf: Frame;
+    for (;;) {
+      const f = pager.get(pg);
+      if (isLeaf(f)) {
+        leaf = f;
+        break;
+      }
+      if (d >= MAX_DEPTH) throw new CorruptionError('b-tree too deep');
+      this.pathPg[d] = pg;
+      this.pathIdx[d] = nCells(f);
+      d++;
+      const child = rightPtr(f);
+      pager.release(f);
+      pg = child;
+    }
+    this.depth = d;
+    try {
+      pager.markDirty(leaf);
+      const n = nCells(leaf);
+      if (n > 0) {
+        const off = slot(leaf, n - 1);
+        if (compareKeyAt(key, leaf.bytes, off + LEAF_HDR, leaf.view.getUint16(off, true)) <= 0) throw new MisuseError('append: key out of order');
+      }
+      const size = this.buildLeafCell(key, value);
+      if (!this.insertCell(leaf, n, this.cellBuf, size)) this.splitLeaf(leaf, n, this.cellBuf.slice(0, size));
     } finally {
       pager.release(leaf);
     }
@@ -420,6 +466,28 @@ export class BTree {
     let hi = nCells(p);
     const bytes = p.bytes;
     const view = p.view;
+    if (key.length === 8) {
+      // Rowid keys: compare as two big-endian 32-bit words.
+      const kh = ((key[0] << 24) | (key[1] << 16) | (key[2] << 8) | key[3]) >>> 0;
+      const kl = ((key[4] << 24) | (key[5] << 16) | (key[6] << 8) | key[7]) >>> 0;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        const off = view.getUint16(H + 2 * mid, true);
+        const len = view.getUint16(off, true);
+        let c: number;
+        if (len >= 8) {
+          const ch = view.getUint32(off + LEAF_HDR, false);
+          if (kh !== ch) c = kh > ch ? 1 : -1;
+          else {
+            const cl = view.getUint32(off + LEAF_HDR + 4, false);
+            c = kl !== cl ? (kl > cl ? 1 : -1) : 8 - len;
+          }
+        } else c = compareKeyAt(key, bytes, off + LEAF_HDR, len);
+        if (c > 0) lo = mid + 1;
+        else hi = mid;
+      }
+      return lo;
+    }
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
       const off = view.getUint16(H + 2 * mid, true);
@@ -435,6 +503,27 @@ export class BTree {
     let hi = nCells(p);
     const bytes = p.bytes;
     const view = p.view;
+    if (key.length === 8) {
+      const kh = ((key[0] << 24) | (key[1] << 16) | (key[2] << 8) | key[3]) >>> 0;
+      const kl = ((key[4] << 24) | (key[5] << 16) | (key[6] << 8) | key[7]) >>> 0;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        const off = view.getUint16(H + 2 * mid, true);
+        const len = view.getUint16(off + 4, true);
+        let c: number;
+        if (len >= 8) {
+          const ch = view.getUint32(off + INT_HDR, false);
+          if (kh !== ch) c = kh > ch ? 1 : -1;
+          else {
+            const cl = view.getUint32(off + INT_HDR + 4, false);
+            c = kl !== cl ? (kl > cl ? 1 : -1) : 8 - len;
+          }
+        } else c = compareKeyAt(key, bytes, off + INT_HDR, len);
+        if (c < 0) hi = mid;
+        else lo = mid + 1;
+      }
+      return lo;
+    }
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
       const off = view.getUint16(H + 2 * mid, true);
