@@ -1,6 +1,7 @@
 import { SmaltError } from '../errors.js';
 import { type BTree, type BTreeCursor, leafCell } from '../storage/btree.js';
 import { compareKeyAt } from '../util/bytes.js';
+import { type Chunk, type ColumnStore, ROW_GROUP_ROWS, chunkValue, zoneMayMatch } from '../storage/columnar.js';
 import { KeyEncoder, type KeyColumn, KEY_AFTER_NULL, ROWID_KEY_SIZE, decodeKey, readIndexRowid, readRowidKey, rowidSuffixStart, writeRowidKey } from '../storage/key-codec.js';
 import { type RecordReader, decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
 import { type LoaderHelpers, type LoaderSpec, type ScanState, codegenEnabled, generateLoader } from './codegen.js';
@@ -580,6 +581,95 @@ function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
   out.set(a);
   out.set(b, a.length);
   return out;
+}
+
+// ------------------------------------------------------------------ columnar scan
+
+/** A zone-map test pushed into a columnar scan: `column op value` (value constant per open). */
+export interface ZonePredicate {
+  col: number;
+  op: string;
+  value: Fn;
+  /** TEXT comparisons use BINARY order (zone maps hold BINARY min/max). */
+  binaryText: boolean;
+  /** For EXPLAIN. */
+  label: string;
+}
+
+/**
+ * Full scan of a columnar materialized view: row groups whose zone maps rule out a pushed-down
+ * comparison are skipped without reading any chunk; only the referenced columns are decoded.
+ * Filters above still apply every predicate (zone maps only prune).
+ */
+export class ColumnScan implements Operator {
+  readonly children: Operator[] = [];
+  private r!: SqlValue[];
+  private s!: ColumnStore;
+  private rg = -1;
+  private rgCount = 0;
+  private i = 0;
+  private n = 0;
+  private base = 0;
+  private chunks: Chunk[] = [];
+  private zoneVals: SqlValue[] = [];
+  /** Row groups skipped by zone maps in the last scan (EXPLAIN ANALYZE, tests). */
+  skipped = 0;
+
+  constructor(
+    readonly access: TableAccess,
+    private readonly store: () => ColumnStore,
+    readonly zones: ZonePredicate[],
+  ) {}
+
+  get detail(): string {
+    return `SCAN ${this.access.tableName} (columnar${this.zones.length ? `, zone maps: ${this.zones.map((z) => z.label).join(' AND ')}` : ''})`;
+  }
+
+  open(r: SqlValue[]): void {
+    this.r = r;
+    this.s = this.store();
+    this.rg = -1;
+    this.rgCount = this.s.rowGroups;
+    this.i = this.n = 0;
+    this.skipped = 0;
+    this.zoneVals = this.zones.map((z) => z.value(r));
+  }
+
+  next(): boolean {
+    const d = this.access.decode;
+    while (this.i >= this.n) {
+      if (++this.rg >= this.rgCount) return false;
+      const m = this.s.meta(this.rg);
+      let ok = true;
+      for (let k = 0; k < this.zones.length && ok; k++) {
+        const z = this.zones[k];
+        ok = zoneMayMatch(m.zones[z.col], m.rows, z.op, this.zoneVals[k], z.binaryText);
+      }
+      if (!ok) {
+        this.skipped++;
+        continue;
+      }
+      const chunks = this.chunks;
+      chunks.length = 0;
+      for (let k = 0; k < d.length; k += 2) chunks.push(this.s.chunk(this.rg, d[k]));
+      this.n = m.rows;
+      this.i = 0;
+      this.base = this.rg * ROW_GROUP_ROWS;
+    }
+    const i = this.i++;
+    const r = this.r;
+    const chunks = this.chunks;
+    for (let k = 0; k < d.length; k += 2) r[d[k + 1]] = chunkValue(chunks[k >>> 1], i);
+    const a = this.access;
+    if (a.rowidReg >= 0) {
+      const id = this.base + i + 1;
+      r[a.rowidReg] = id;
+      for (const x of a.extraRowidRegs) r[x] = id;
+    }
+    return true;
+  }
+
+  close(): void {}
 }
 
 // ------------------------------------------------------------------ relational operators

@@ -42,6 +42,7 @@ import type {
 } from './sql/ast.js';
 import { parse, parseOne } from './sql/parser.js';
 import { BTree } from './storage/btree.js';
+import { ColumnStore, ColumnStoreWriter } from './storage/columnar.js';
 import { KeyEncoder, type KeyColumn, decodeKey, readRowidKey, rowidSuffixStart } from './storage/key-codec.js';
 import { compareRanges } from './util/bytes.js';
 import { Pager, type PagerOptions } from './storage/pager.js';
@@ -570,6 +571,7 @@ export class Database implements FunctionContext {
       virtualTable: (schema, n) => this.virtualTable(schema, n),
       openTree: (root) => this.tree(root),
       sampledStats: (t) => this.sampledStats(t),
+      columnStore: (t) => (t.matview!.store ??= new ColumnStore(this.tree(t.rootPage))),
       funcCtx: this,
       state: this.state,
     };
@@ -723,7 +725,6 @@ export class Database implements FunctionContext {
     for (const k of Object.keys(opts)) if (k !== 'storage' && k !== 'refresh') throw new SmaltError('SMALT_ERROR', `unknown materialized view option: ${k}`);
     const storage = String(opts.storage ?? 'row').toLowerCase();
     if (storage !== 'row' && storage !== 'columnar') throw new SmaltError('SMALT_ERROR', `storage must be 'row' or 'columnar'`);
-    if (storage === 'columnar') throw new SmaltError('SMALT_UNSUPPORTED', 'columnar materialized views are not supported yet');
     const refresh = String(opts.refresh ?? 'manual').toLowerCase();
     if (refresh !== 'manual') throw new SmaltError('SMALT_UNSUPPORTED', `refresh = '${refresh}' is not supported yet (only 'manual')`);
     this.checkNewName(stmt.name, 'materialized view');
@@ -771,6 +772,7 @@ export class Database implements FunctionContext {
     const info = mv.matview!;
     const root = BTree.create(this.pager);
     const target: TableSchema = { ...mv, rootPage: root, indexes: [] };
+    const columnar = info.storage === 'columnar' ? new ColumnStoreWriter(this.tree(root), mv.columns.length) : null;
     const w = new TableWriter(target, this.pager, (r) => this.tree(r));
     const cols = mv.columns;
     let rowid = 0;
@@ -781,8 +783,12 @@ export class Database implements FunctionContext {
           throw new SmaltError('SMALT_MISMATCH', `materialized view ${mv.name}: column ${cols[i].name} is ${cols[i].type} but the query produced ${describeValue(vals[i])} (add a CAST to the view)`);
         }
       }
-      w.writeRow(vals, ++rowid);
+      if (columnar) {
+        columnar.add(vals);
+        ++rowid;
+      } else w.writeRow(vals, ++rowid);
     });
+    columnar?.finish();
     const indexRoots = mv.indexes.map((idx) => {
       const r = BTree.create(this.pager);
       const copy: IndexSchema = { ...idx, rootPage: r };
@@ -799,6 +805,7 @@ export class Database implements FunctionContext {
 
   /** Point a materialized view (and its indexes) at new trees and free the old ones. */
   private swapMatviewTrees(mv: TableSchema, root: number, indexRoots: number[]): void {
+    mv.matview!.store = undefined; // cached chunks belong to the old segments
     new BTree(this.pager, mv.rootPage).destroy();
     mv.rootPage = root;
     this.setCatalogRoot(mv.name, root);
@@ -907,11 +914,11 @@ export class Database implements FunctionContext {
   /** ANALYZE [table]: gather optimizer statistics and store them in smalt_stat. */
   private analyze(target: string | undefined): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
-    let tables = [...this.tables.values()].filter((t) => !t.system && t.name.toLowerCase() !== 'smalt_stat');
+    let tables = [...this.tables.values()].filter((t) => !t.system && t.name.toLowerCase() !== 'smalt_stat' && t.matview?.storage !== 'columnar');
     if (target) {
       const t = this.tables.get(target.toLowerCase());
       const idx = this.indexes.get(target.toLowerCase());
-      if (t) tables = [t];
+      if (t) tables = t.matview?.storage === 'columnar' ? [] : [t];
       else if (idx) tables = [this.tables.get(idx.table.toLowerCase())!];
       else throw new SmaltError('SMALT_ERROR', `no such table or index: ${target}`);
     }
@@ -957,7 +964,7 @@ export class Database implements FunctionContext {
    * recomputed when the table's size (estimated from the tree shape) has changed 4x or more.
    */
   private sampledStats(t: TableSchema): TableStats | undefined {
-    if (t.name.toLowerCase().startsWith('smalt_')) return undefined;
+    if (t.name.toLowerCase().startsWith('smalt_') || t.matview?.storage === 'columnar') return undefined;
     const tree = this.tree(t.rootPage);
     const live = tree.estimateCount();
     const hit = this.sampled.get(t);
@@ -1055,6 +1062,7 @@ export class Database implements FunctionContext {
     if (stmt.ifNotExists && this.catalog.has(stmt.name.toLowerCase())) return none;
     const table = this.tables.get(stmt.table.toLowerCase());
     if (!table) throw new SmaltError('SMALT_ERROR', this.views.has(stmt.table.toLowerCase()) ? 'views may not be indexed' : `no such table: ${stmt.table}`);
+    if (table.matview?.storage === 'columnar') throw new SmaltError('SMALT_ERROR', `columnar materialized view ${table.name} cannot be indexed (zone maps prune its scans)`);
     this.checkNewName(stmt.name, 'index');
     this.dirtySchema = true;
     const root = BTree.create(this.pager);

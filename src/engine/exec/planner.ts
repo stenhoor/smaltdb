@@ -64,6 +64,7 @@ const FUSABLE_AGGS = new Set(['count', 'sum', 'total', 'avg', 'min', 'max']);
 import {
   type AggSpec,
   Compound,
+  ColumnScan,
   CountRows,
   Distinct,
   type ExecState,
@@ -90,7 +91,9 @@ import {
   RecursiveCte,
   VirtualScan,
   WorkingScan,
+  type ZonePredicate,
 } from './operators.js';
+import type { ColumnStore } from '../storage/columnar.js';
 
 export interface PlannerEnv {
   getTable(name: string): TableSchema | undefined;
@@ -104,6 +107,8 @@ export interface PlannerEnv {
   openTree(rootPage: number): BTree;
   /** On-demand statistics for a table without ANALYZE results (sampled; cached by the database). */
   sampledStats?(table: TableSchema): TableStats | undefined;
+  /** Reader for a columnar materialized view's segments. */
+  columnStore?(table: TableSchema): ColumnStore;
   funcCtx: FunctionContext;
   state: ExecState;
 }
@@ -777,7 +782,7 @@ export class Planner {
     const rc = core.columns[0];
     if (rc.kind !== 'expr' || rc.expr.kind !== 'call' || rc.expr.name !== 'count' || !rc.expr.star || rc.expr.filter || rc.expr.over) return null;
     const table = this.env.getTable(core.from.name);
-    if (!table || this.env.getTable(core.from.name) === undefined) return null;
+    if (!table || this.env.getTable(core.from.name) === undefined || table.matview?.storage === 'columnar') return null;
     const reg = outRegs ? outRegs[0] : this.regs.alloc();
     const name = rc.alias ?? this.sqlText.slice(rc.expr.pos, rc.expr.end);
     return {
@@ -1449,6 +1454,7 @@ export class Planner {
     }
 
     const outerDep = (list: Probe[]): boolean => list.some((x) => x.deps.size > 0);
+    if (table.matview?.storage === 'columnar') return this.columnarOptions(src, table, access, probes, cs, N);
     const options: AccessOption[] = [
       {
         label: 'scan',
@@ -1619,12 +1625,50 @@ export class Planner {
   private tableRows(src: Source): number {
     if (src.sub) return SUBQUERY_ROWS;
     if (src.estRows === undefined) {
-      const live = src.access!.tree.estimateCount();
+      const t = src.table!;
+      const live = t.matview?.storage === 'columnar' ? this.env.columnStore!(t).rows : src.access!.tree.estimateCount();
       src.estRows = Math.max(1, src.table!.stats?.rows ?? live);
       // Remember what the plan assumed, so the statement can re-plan if the table grows or shrinks a lot.
-      this.rowAssumptions.set(src.table!.rootPage, live);
+      // (Columnar views change only on refresh, which re-plans anyway.)
+      if (t.matview?.storage !== 'columnar') this.rowAssumptions.set(t.rootPage, live);
     }
     return src.estRows;
+  }
+
+  /**
+   * A columnar materialized view has one access path: a columnar scan. Comparisons of a column with
+   * a constant or parameter become zone-map tests (the filter still applies them).
+   */
+  private columnarOptions(
+    src: Source,
+    table: TableSchema,
+    access: TableAccess,
+    probes: { op: string; other: Expr; deps: Set<number>; col: number | 'rowid'; colExpr: Expr }[],
+    cs: CompileScope,
+    N: number,
+  ): AccessOption[] {
+    if (typeof src.indexedBy === 'string') throw new SmaltError('SMALT_ERROR', `no such index: ${src.indexedBy}`);
+    const zones: ZonePredicate[] = [];
+    for (const pr of probes) {
+      if (typeof pr.col !== 'number' || pr.col < 0 || pr.deps.size > 0 || !['=', '<', '<=', '>', '>='].includes(pr.op)) continue;
+      this.dryCompile++;
+      try {
+        const colC = compileExpr(pr.colExpr, cs);
+        const otherC = compileExpr(pr.other, cs);
+        zones.push({
+          col: pr.col,
+          op: pr.op,
+          value: otherC.fn,
+          binaryText: comparisonCollation(colC, otherC) === Collation.Binary,
+          label: `${table.columns[pr.col].name} ${pr.op} ?`,
+        });
+      } finally {
+        this.dryCompile--;
+      }
+    }
+    const store = (): ColumnStore => this.env.columnStore!(table);
+    // Decoding typed column chunks is cheaper per row than record decoding.
+    return [{ label: 'columnar scan', cost: N * COST.scanRow * 0.5, rows: N, dependsOnOuter: false, build: () => ({ leaf: new ColumnScan(access, store, zones), dependsOnOuter: false }) }];
   }
 
   /** >0 while compiling expressions only to inspect them (column use is not recorded). */
