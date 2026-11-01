@@ -41,7 +41,7 @@ first change in a transaction are kept in memory for rollback.
 - **Parallel readers (Chromium).** With multi-tab on and OPFS `readwrite-unsafe` handles available, concurrent
   read-only queries outside transactions run on up to three reader workers, each reading a snapshot of the latest
   commit. They run in parallel and do not block writers. Nothing changes in the API: `db.stats.readerQueries` counts
-  the queries readers served. In other browsers, reads run on the owning worker (a shared buffer pool is planned as M8).
+  the queries readers served. In other browsers, reads run on the owning worker (a shared buffer pool is planned as M9).
 
 *(planned)* `insertColumns`, `explain`.
 The draft below shows the long-term shape.

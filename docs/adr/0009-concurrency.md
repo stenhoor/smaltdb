@@ -74,7 +74,7 @@ exclusive. Nothing could be cancelled.
      starts processing on a fresh task, so requests that arrived together are all queued before the first is routed.
    - *Results:* readers answer the client directly over a `MessagePort`, or the BroadcastChannel for other tabs.
      Credits and cancels are forwarded to them, and they share the interrupt flag.
-   - *Other browsers:* there are no parallel readers. A shared buffer pool is planned as M8.
+   - *Other browsers:* there are no parallel readers. A shared buffer pool is planned (originally M8, now M9 after the 2026-11-01 roadmap change).
 
 ## Found on the way: text decoding contended across Chromium workers
 
