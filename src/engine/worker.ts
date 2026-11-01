@@ -103,7 +103,8 @@ self.onmessage = (e: MessageEvent<Request>) => {
   chain = chain.then(() =>
     handle(req).catch((err: unknown) => {
       const code = err instanceof SmaltError ? err.code : 'SMALT_INTERNAL';
-      post({ id: req.id, kind: 'error', code, message: err instanceof Error ? err.message : String(err) });
+      // Some engines (WebKit) raise DOMExceptions with an empty message: keep the name then.
+      post({ id: req.id, kind: 'error', code, message: err instanceof Error ? err.message || err.name : String(err) });
     }),
   );
 };

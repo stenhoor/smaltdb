@@ -1,7 +1,9 @@
 // Runs the OPFS integration test in a real browser via Playwright: `npm run test:browser`.
 // Uses the pre-installed Chromium; set BROWSERS=chromium,firefox,webkit when those are installed.
 import { build } from 'esbuild';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { loadPlaywright } from './playwright.mjs';
 import { serve } from './serve.mjs';
 
@@ -28,8 +30,12 @@ const server = await serve({ '/': out });
 const names = (process.env.BROWSERS ?? 'chromium').split(',');
 let failed = false;
 for (const name of names) {
-  const browser = await playwright[name].launch();
-  const page = await browser.newPage();
+  // WebKit's default contexts are ephemeral (like private browsing), where OPFS may be unavailable:
+  // use a persistent profile there.
+  const persistent = name === 'webkit' || !!process.env.PERSISTENT_CONTEXT;
+  const browser = persistent ? null : await playwright[name].launch();
+  const context = persistent ? await playwright[name].launchPersistentContext(mkdtempSync(join(tmpdir(), 'smaltdb-' + name + '-'))) : await browser.newContext();
+  const page = context.pages()[0] ?? (await context.newPage());
   // Collected for diagnostics: printed when a test fails or times out.
   const log = [];
   page.on('console', (m) => log.push(`console.${m.type()}: ${m.text()}`));
@@ -61,8 +67,9 @@ for (const name of names) {
   } else if (result.ok) {
     result.checks.push({ name: 'client test ran', ok: false, detail: client.error });
   }
-  const version = browser.version();
-  await browser.close();
+  const version = browser ? browser.version() : `${playwright[name].name()} (persistent profile)`;
+  await context.close();
+  await browser?.close();
   console.log(`\n== ${name} ${version}`);
   if (!result.ok) {
     console.log('FAIL  ' + (result.error || JSON.stringify(result)));

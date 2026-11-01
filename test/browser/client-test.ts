@@ -63,5 +63,5 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
 
 run().then(
   (r) => ((window as unknown as { __clientResult: unknown }).__clientResult = { ok: true, ...r }),
-  (e) => ((window as unknown as { __clientResult: unknown }).__clientResult = { ok: false, error: String(e?.stack ?? e) }),
+  (e) => ((window as unknown as { __clientResult: unknown }).__clientResult = { ok: false, error: `${e?.name ?? 'Error'}: ${e?.message ?? String(e)}${e?.code ? ' [' + e.code + ']' : ''}${e?.stack ? '\n' + e.stack : ''}` }),
 );

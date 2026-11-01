@@ -73,5 +73,11 @@ async function run(): Promise<{ checks: Check[]; capabilities: unknown; timings:
 
 run().then(
   (r) => postMessage({ ok: true, ...r }),
-  (e) => postMessage({ ok: false, error: String((e as Error)?.stack ?? e) }),
+  (e) => postMessage({ ok: false, error: describe(e) }),
 );
+
+/** WebKit's `stack` omits the name and message (V8 includes them). */
+function describe(e: unknown): string {
+  const x = e as Error;
+  return x instanceof Error || (x && typeof x === 'object' && 'name' in x) ? `${x.name}: ${x.message}${x.stack ? '\n' + x.stack : ''}` : String(e);
+}
