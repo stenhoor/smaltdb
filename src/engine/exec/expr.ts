@@ -62,6 +62,8 @@ export interface CompileScope {
   /** Post-aggregation context: maps an aggregate call (or GROUP BY expression) to its register. */
   aggregateRef?(call: CallExpr): ColumnBinding;
   groupRef?(e: Expr): ColumnBinding | undefined;
+  /** Result-column context of a query with window functions: maps an `f(...) OVER (...)` call to its register. */
+  windowRef?(call: CallExpr): ColumnBinding;
   scalarSubquery(select: SelectStmt): Compiled;
   existsSubquery(select: SelectStmt): Fn;
   /** Returns membership test: 1, 0, or NULL (SQL IN semantics) for a probe value. */
@@ -942,7 +944,11 @@ function compileCast(x: Compiled, typeName: string): Compiled {
 }
 
 function compileCall(e: CallExpr, scope: CompileScope): Compiled {
-  if (e.over !== undefined) throw new SmaltError('SMALT_UNSUPPORTED', 'window functions are not supported yet');
+  if (e.over !== undefined) {
+    if (!scope.windowRef) throw new SmaltError('SMALT_ERROR', `misuse of window function ${e.name}()`);
+    const b = scope.windowRef(e);
+    return { fn: regReader(b.reg), type: b.type, collation: b.collation, collSrc: CollSrc.None, affinity: 'NONE', constant: false, reg: b.reg };
+  }
   const name = e.name;
   const isAgg = aggregateFunctions.has(name) && !((name === 'min' || name === 'max') && e.args.length > 1);
   if (isAgg) {

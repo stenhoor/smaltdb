@@ -1,5 +1,6 @@
 import type { TableStats } from './stats.js';
 import { flattenCore } from './flatten.js';
+import { type FrameSpec, NAVIGATION, RANKING, WINDOW_ARITY, Window, type WindowCallKind, type WindowDef } from './window.js';
 
 let flattenOff: boolean | undefined;
 /** SMALT_NO_FLATTEN=1 disables query flattening (tests compare both paths). */
@@ -22,7 +23,9 @@ import type {
   OrderingTerm,
   ResultColumn,
   SelectCore,
+  SelectCoreSelect,
   SelectStmt,
+  WindowSpec,
   WithClause,
 } from '../sql/ast.js';
 import type { BTree } from '../storage/btree.js';
@@ -41,7 +44,7 @@ import {
   comparisonConverters,
   conjuncts,
 } from './expr.js';
-import { type AggregateState, type FunctionContext, aggregateFunctions } from './functions.js';
+import { type AggregateState, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type FusedAggSpec, type FusedHelpers, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter } from './codegen.js';
 import { CODEGEN_HELPERS_FOR_FUSION } from './expr.js';
 import type { Frame } from '../storage/pager.js';
@@ -556,6 +559,15 @@ export class Planner {
       exprScope = this.compileScope(scope);
     }
 
+    // Window functions: result columns and ORDER BY terms may call f(...) OVER (...).
+    const noWindowScope = exprScope;
+    const windowDefs: WindowDef[] = [];
+    const hasWindows = resultCols.some((c) => containsWindow(c.expr)) || (stmt?.orderBy.some((t) => containsWindow(t.expr)) ?? false);
+    if (hasWindows) {
+      const seen: { ast: CallExpr; binding: ColumnBinding }[] = [];
+      exprScope = { ...exprScope, windowRef: (call) => this.windowRef(call, core as SelectCoreSelect, noWindowScope, windowDefs, seen) };
+    }
+
     // Result expressions.
     const compiled = resultCols.map((c) => compileExpr(c.expr, exprScope));
     const regs = outRegs ?? compiled.map(() => this.regs.alloc());
@@ -596,7 +608,7 @@ export class Planner {
     let having: Fn | undefined;
     if (core.having) {
       if (!agg) throw new SmaltError('SMALT_ERROR', 'a GROUP BY clause is required before HAVING');
-      having = compileExpr(core.having, exprScope).fn;
+      having = compileExpr(core.having, noWindowScope).fn;
     }
 
     if (agg) {
@@ -625,6 +637,13 @@ export class Planner {
     }
 
     if (!agg) root = this.tryFuseScanFilter(root, scope);
+    if (windowDefs.length) {
+      // Registers the projection reads from each input row (restored by the Window operator).
+      const snap = agg
+        ? [...agg.groupRegs, ...agg.aggs.map((a) => a.outReg), ...agg.bare]
+        : scope.sources.flatMap((src) => [...src.cols.map((c) => c.reg), ...(src.rowidReg >= 0 ? [src.rowidReg] : [])]);
+      root = new Window(root, [...new Set(snap)], windowDefs);
+    }
     root = new Project(root, [...compiled.map((c) => c.fn), ...extraFns], [...regs, ...extraRegs]);
     if (core.distinct) root = new Distinct(root, regs, columns.map((c) => c.collation));
     if (sortNeeded) {
@@ -632,6 +651,104 @@ export class Planner {
       root = new Sort(root, sortKeys, [...regs, ...extraRegs], limitHint);
     }
     return { root, outRegs: regs, columns, correlated: scope.correlated };
+  }
+
+  /** Resolve `OVER name` / `OVER (base ...)` against the core's WINDOW clause, like SQLite. */
+  private resolveWindowSpec(over: WindowSpec | string, core: SelectCoreSelect): WindowSpec {
+    const named = (name: string): WindowSpec => {
+      const w = core.windows.find((x) => sameName(x.name, name));
+      if (!w) throw new SmaltError('SMALT_ERROR', `no such window: ${name}`);
+      return w.spec.base ? this.resolveWindowSpec(w.spec, core) : w.spec;
+    };
+    if (typeof over === 'string') return named(over);
+    if (!over.base) return over;
+    const base = named(over.base);
+    if (over.partitionBy.length) throw new SmaltError('SMALT_ERROR', `cannot override PARTITION clause of window: ${over.base}`);
+    if (over.orderBy.length && base.orderBy.length) throw new SmaltError('SMALT_ERROR', `cannot override ORDER BY clause of window: ${over.base}`);
+    if (base.frame) throw new SmaltError('SMALT_ERROR', `cannot override frame specification of window: ${over.base}`);
+    return { ...over, base: undefined, partitionBy: base.partitionBy, orderBy: over.orderBy.length ? over.orderBy : base.orderBy };
+  }
+
+  /** Register a window function call (see window.ts) and return the register holding its value. */
+  private windowRef(call: CallExpr, core: SelectCoreSelect, scope: CompileScope, defs: WindowDef[], seen: { ast: CallExpr; binding: ColumnBinding }[]): ColumnBinding {
+    const hit = seen.find((x) => exprEquals(x.ast, call));
+    if (hit) return hit.binding;
+    const name = call.name;
+    const aggDef = aggregateFunctions.get(name);
+    const builtin = WINDOW_ARITY[name];
+    if (!builtin && !aggDef) {
+      if (scalarFunctions.has(name)) throw new SmaltError('SMALT_ERROR', `${name}() may not be used as a window function`);
+      throw new SmaltError('SMALT_ERROR', `no such function: ${name}`);
+    }
+    const n = call.args.length;
+    const [minA, maxA] = builtin ?? [aggDef!.minArgs, aggDef!.maxArgs];
+    if (call.star ? name !== 'count' : n < minA || n > maxA || (name === 'count' && n === 0)) {
+      throw new SmaltError('SMALT_ERROR', `wrong number of arguments to function ${name}()`);
+    }
+    if (call.distinct) throw new SmaltError('SMALT_ERROR', 'DISTINCT is not supported for window functions');
+    if (builtin && call.filter) throw new SmaltError('SMALT_ERROR', `FILTER clause may only be used with aggregate window functions`);
+    for (const a of call.args) if (containsWindow(a)) throw new SmaltError('SMALT_ERROR', `misuse of window function ${name}()`);
+    const spec = this.resolveWindowSpec(call.over!, core);
+    const args = call.args.map((a) => compileExpr(a, scope));
+    // One WindowDef per distinct (PARTITION BY, ORDER BY, frame).
+    const strip = (x: unknown): string => JSON.stringify(x, (k, v) => (k === 'pos' || k === 'end' ? undefined : typeof v === 'bigint' ? `${v}n` : v instanceof Uint8Array ? [...v] : v));
+    const key = strip({ p: spec.partitionBy, o: spec.orderBy, f: spec.frame });
+    let defIndex = defs.findIndex((d) => (d as WindowDef & { key?: string }).key === key);
+    if (defIndex < 0) {
+      const part = spec.partitionBy.map((e) => compileExpr(e, scope));
+      const order = spec.orderBy.map((t) => {
+        const c = compileExpr(t.expr, scope);
+        return { fn: c.fn, desc: t.desc, nullsFirst: t.nulls ? t.nulls === 'FIRST' : !t.desc, collation: c.collSrc !== CollSrc.None ? c.collation : Collation.Binary };
+      });
+      const f = spec.frame;
+      const frame: FrameSpec = f
+        ? {
+            unit: f.unit,
+            start: { kind: f.start.kind, offset: 'offset' in f.start ? compileExpr(f.start.offset, scope).fn : undefined },
+            end: f.end ? { kind: f.end.kind, offset: 'offset' in f.end ? compileExpr(f.end.offset, scope).fn : undefined } : { kind: 'currentRow' },
+            exclude: f.exclude ?? 'NO OTHERS',
+          }
+        : order.length
+          ? { unit: 'RANGE', start: { kind: 'unboundedPreceding' }, end: { kind: 'currentRow' }, exclude: 'NO OTHERS' }
+          : { unit: 'ROWS', start: { kind: 'unboundedPreceding' }, end: { kind: 'unboundedFollowing' }, exclude: 'NO OTHERS' };
+      const rank = (k: string): number => ['unboundedPreceding', 'preceding', 'currentRow', 'following', 'unboundedFollowing'].indexOf(k);
+      if (frame.start.kind === 'unboundedFollowing' || frame.end.kind === 'unboundedPreceding' || rank(frame.start.kind) > rank(frame.end.kind)) {
+        throw new SmaltError('SMALT_ERROR', 'unsupported frame specification');
+      }
+      if (frame.unit === 'RANGE' && (frame.start.offset || frame.end.offset) && order.length !== 1) {
+        throw new SmaltError('SMALT_ERROR', 'RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression');
+      }
+      const def: WindowDef & { key?: string } = { partition: part.map((c) => c.fn), partitionColls: part.map((c) => (c.collSrc !== CollSrc.None ? c.collation : Collation.Binary)), order, frame, calls: [], key };
+      defs.push(def);
+      defIndex = defs.length - 1;
+    }
+    const outReg = this.regs.alloc();
+    const kind: WindowCallKind = builtin ? (name as WindowCallKind) : 'aggregate';
+    defs[defIndex].calls.push({
+      kind,
+      name,
+      args: args.map((a) => a.fn),
+      filter: call.filter ? compileExpr(call.filter, scope).fn : undefined,
+      outReg,
+      agg: aggDef && !builtin ? { def: aggDef, argTypes: args.map((a) => a.type), collation: args[0]?.collSrc ? args[0].collation : Collation.Binary, star: call.star } : undefined,
+    });
+    const type: StaticType =
+      kind === 'aggregate'
+        ? aggDef!.resultType(args.map((a) => a.type))
+        : kind === 'percent_rank' || kind === 'cume_dist'
+          ? 'real'
+          : RANKING.has(kind)
+            ? 'int'
+            : (args[0]?.type ?? 'any') === 'null'
+              ? 'any'
+              : kind === 'lag' || kind === 'lead'
+                ? args.length > 2 && args[2].type !== args[0].type
+                  ? 'any'
+                  : args[0].type
+                : args[0].type;
+    const binding: ColumnBinding = { reg: outReg, type, collation: args[0]?.collSrc && NAVIGATION.has(kind) ? args[0].collation : Collation.Binary, affinity: 'NONE' };
+    seen.push({ ast: call, binding });
+    return binding;
   }
 
   /** `SELECT count(*) FROM table` with nothing else: count leaf cells (like SQLite's OP_Count). */
@@ -1901,5 +2018,17 @@ function coreReferences(core: SelectCore, name: string): boolean {
 function selectReferences(s: SelectStmt, name: string): boolean {
   if (s.with?.ctes.some((c) => sameName(c.name, name))) return false; // shadowed
   return coreReferences(s.core, name) || s.compound.some((c) => coreReferences(c.core, name));
+}
+
+function containsWindow(e: Expr | undefined): boolean {
+  if (!e) return false;
+  let found = false;
+  walk(e, (x) => {
+    if (x.kind === 'call' && x.over !== undefined) {
+      found = true;
+      return false;
+    }
+  });
+  return found;
 }
 
