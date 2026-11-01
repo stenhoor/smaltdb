@@ -124,7 +124,7 @@ describe('external tables', () => {
       ['k', 'INTEGER'],
       ['v', 'INTEGER'],
     ]);
-    expect(db.query('SELECT * FROM information_schema.connections').rows).toEqual([['api', 'http', 'https://api.example.com/v1', 'tok']]);
+    expect(db.query('SELECT * FROM information_schema.connections').rows).toEqual([['api', 'http', 'https://api.example.com/v1', 'tok', '{}']]);
     db.close();
     const again = await Database.open(vfs, 'db');
     const stored = again.query("SELECT group_concat(sql, ' | ') FROM smalt_schema WHERE type IN ('external', 'connection')").rows[0][0] as string;
@@ -155,7 +155,9 @@ describe('external tables', () => {
     expect((await errorOf(() => db.exec("CREATE EXTERNAL TABLE e (a INT) WITH (location = 'file:f.xlsx')"))).message).toMatch(/cannot tell the format/);
     expect((await errorOf(() => db.exec("CREATE EXTERNAL TABLE e (a INT PRIMARY KEY) WITH (location = 'file:f', format = 'csv')"))).message).toMatch(/cannot have constraints/);
     expect((await errorOf(() => db.exec("CREATE EXTERNAL TABLE e (a INT) WITH (location = 'file:f', format = 'csv', connection = 'none')"))).message).toMatch(/no such connection: none/);
-    expect((await errorOf(() => db.exec("CREATE CONNECTION c WITH (type = 's3')"))).message).toMatch(/type 's3' is not supported yet/);
+    expect((await errorOf(() => db.exec("CREATE CONNECTION c WITH (type = 'gcs')"))).message).toMatch(/type 'gcs' is not supported \(http, s3, azure\)/);
+    expect((await errorOf(() => db.exec("CREATE CONNECTION c WITH (type = 's3', url = 'https://x')"))).message).toMatch(/unknown option 'url' for type s3/);
+    expect((await errorOf(() => db.exec("CREATE CONNECTION c WITH (type = 'azure', container = 'x')"))).message).toMatch(/needs account/);
     db.exec("CREATE CONNECTION c WITH (url = 'https://example.com'); CREATE EXTERNAL TABLE e (a INT) WITH (location = 'f.csv', connection = 'c')");
     expect((await errorOf(() => db.exec('CREATE TABLE e(x)'))).message).toBe('external table e already exists');
     expect((await errorOf(() => db.exec('DROP TABLE e'))).message).toBe('use DROP EXTERNAL TABLE to delete external table e');

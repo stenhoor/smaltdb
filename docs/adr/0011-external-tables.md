@@ -65,7 +65,8 @@ Rules for external tables:
 | Local file (Node) | a path | `fs`, ranged reads |
 | Local file (browser) | `file:<name>`, where the app registers a `File` or `FileSystemFileHandle` under that name | `Blob.slice`, ranged reads |
 | HTTP(S) | URL | `fetch` with `Range`; ETag / Last-Modified for freshness |
-| S3 and compatible | `s3://bucket/key`, or a key relative to a connection | SigV4 via `aws4fetch`, or presigned URLs from a provider |
+| S3 and compatible | `s3://bucket/key`, or a key relative to a connection | SigV4 (on WebCrypto, in the core), or presigned URLs from a provider |
+| Azure Blob Storage (added with M8.2) | `az://container/path`, or a path relative to a connection | SAS tokens, Shared Key signing (account key, on WebCrypto) or Entra ID bearer tokens |
 | Remote database | `connection` + `remote_table` (or a remote query) | connector interface (decision 5) |
 
 Globs (`*.parquet`, `year=*/`) expand to several files of one table. Hive-style `key=value` path segments become
@@ -183,7 +184,8 @@ interface and the dialect printers.
 Optional packages, loaded with dynamic `import()` inside the engine worker on first use:
 - `@smaltdb/parquet`
 - `@smaltdb/excel`
-- `@smaltdb/s3`
+- ~~`@smaltdb/s3`~~: SigV4 and Azure Shared Key turned out to be about 150 lines on WebCrypto, so object-store
+  signing is in the core (no `aws4fetch` dependency).
 - `@smaltdb/connector-neon`
 - `@smaltdb/connector-planetscale`
 - `@smaltdb/connector-libsql`
@@ -210,7 +212,7 @@ Bidirectional sync, conflict policies and resolvers belong to the plugin.
 | Part | Scope |
 |---|---|
 | M8.1 ✅ | `CREATE CONNECTION` / `CREATE EXTERNAL TABLE`, catalog and information_schema, async fetch phase, `file:` and HTTP sources, CSV and JSON readers, `read_csv` / `read_json`, caching through materialized views. Follow-ups ✅: freshness of such caches (`REFRESH … IF CHANGED` revalidates the recorded ETag / Last-Modified / file times with HEAD requests or stats), refresh policies (`refresh_every`, `refresh_on_reconnect`) run by the engine worker, credential callbacks across the worker boundary, export over external data |
-| M8.2 | S3 (aws4fetch, credential providers, presigned URLs), globs and partitioned paths |
+| M8.2 ✅ | S3 and S3-compatible stores and Azure Blob Storage (signing on WebCrypto in the core, credential providers with AWS keys / Azure SAS, account key or bearer tokens / presigned URLs, also as callbacks across the worker), globs over listings, local directories and registered files, Hive partitions with pruning from WHERE conditions |
 | M8.3 | Parquet: footer, column chunks, row-group pruning, ranged fetches, `read_parquet` |
 | M8.4 | Excel: sheets, A1 ranges, tables and defined names, dates, `read_excel`. **Deferred** (after M8.5; library to be chosen then) |
 | M8.5 | Connector interface, dialect printers, the Neon / PlanetScale / libSQL / D1 connectors, `smaltdb-gateway` on Kysely, filter / projection / limit pushdown |
