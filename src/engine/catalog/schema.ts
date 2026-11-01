@@ -381,7 +381,8 @@ export function buildTableSchema(
     foreignKeys: fks,
     sql,
     layout: new RecordLayout(types),
-    recordDefaults: columns.map(() => null),
+    // Rows written before ALTER TABLE ADD COLUMN lack the new column: they read its (constant) default.
+    recordDefaults: columns.map((c) => literalValue(c.defaultExpr)),
   };
   return { table, implicitIndexes: filtered };
 }
@@ -403,3 +404,22 @@ export function buildIndexSchema(stmt: CreateIndexStmt, sql: string, table: Tabl
   });
   return { name: stmt.name, table: table.name, rootPage, columns, unique: stmt.unique, origin: 'c', where: stmt.where, sql };
 }
+
+/** Value of a constant default (literal, or signed numeric literal); null otherwise. */
+export function literalValue(e: Expr | undefined): SqlValue {
+  if (!e) return null;
+  if (e.kind === 'literal') return e.value;
+  if (e.kind === 'unary' && (e.op === '-' || e.op === '+') && e.operand.kind === 'literal') {
+    const v = e.operand.value;
+    if (typeof v === 'number') return e.op === '-' ? -v : v;
+    if (typeof v === 'bigint') return e.op === '-' ? normalizeInt(-v) : v;
+  }
+  return null;
+}
+
+/** Whether a default is constant in SQLite's ALTER TABLE ADD COLUMN sense. */
+export function isConstantDefault(e: Expr): boolean {
+  if (e.kind === 'literal') return true;
+  return e.kind === 'unary' && (e.op === '-' || e.op === '+') && e.operand.kind === 'literal' && (typeof e.operand.value === 'number' || typeof e.operand.value === 'bigint');
+}
+

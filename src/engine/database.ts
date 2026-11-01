@@ -7,6 +7,8 @@ import {
   buildTableSchema,
   coerceForColumn,
   findColumn,
+  isConstantDefault,
+  literalValue,
 } from './catalog/schema.js';
 import { MisuseError, SmaltError } from './errors.js';
 import { type StaticType, truthy } from './exec/convert.js';
@@ -16,6 +18,8 @@ import { type ExecState, type Operator, explainAnalyze, explainRows } from './ex
 import { Planner, type QueryPlan, Registers } from './exec/planner.js';
 import { type ConflictMode, TableWriter } from './exec/write.js';
 import type {
+  AlterTableStmt,
+  ColumnDef,
   ColumnExpr,
   CreateIndexStmt,
   FromItem,
@@ -39,6 +43,7 @@ import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordReader } from './storage/record.js';
 import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec/stats.js';
 import { type CatalogSnapshot, informationSchema } from './catalog/information-schema.js';
+import { type SchemaLookup, applyEdits, renameColumnEdits, renameTableEdits } from './catalog/alter.js';
 import type { SqlValue } from './values.js';
 import type { Vfs, VfsFile } from './vfs/types.js';
 
@@ -424,6 +429,8 @@ export class Database implements FunctionContext {
         return done({ exec: () => this.createTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
       case 'createIndex':
         return done({ exec: () => this.createIndex(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
+      case 'alterTable':
+        return done({ exec: () => this.alterTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
       case 'createView':
         if (stmt.materialized) throw new SmaltError('SMALT_UNSUPPORTED', 'materialized views are not supported yet (M5)');
         if (stmt.temp) throw new SmaltError('SMALT_UNSUPPORTED', 'TEMP views are not supported yet');
@@ -837,6 +844,256 @@ export class Database implements FunctionContext {
       return none;
     }
     throw new SmaltError('SMALT_UNSUPPORTED', `DROP ${stmt.objectType.toUpperCase()} is not supported yet`);
+  }
+
+
+  // ---------------------------------------------------------------- ALTER TABLE
+
+  private alterTable(stmt: AlterTableStmt, sql: string): RunResult {
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    if (stmt.schema && stmt.schema.toLowerCase() !== 'main') throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
+    const lower = stmt.table.toLowerCase();
+    if (CATALOG_NAMES.has(lower) || lower.startsWith('smalt_') || lower.startsWith('sqlite_')) {
+      throw new SmaltError('SMALT_ERROR', `table ${CATALOG_NAMES.has(lower) ? 'sqlite_master' : stmt.table} may not be altered`);
+    }
+    if (this.views.has(lower)) {
+      throw new SmaltError('SMALT_ERROR', stmt.action.kind === 'addColumn' ? 'Cannot add a column to a view' : `view ${stmt.table} may not be altered`);
+    }
+    const table = this.tables.get(lower);
+    if (!table) throw new SmaltError('SMALT_ERROR', `no such table: ${stmt.table}`);
+    this.dirtySchema = true;
+    const a = stmt.action;
+    switch (a.kind) {
+      case 'renameTable':
+        this.renameTable(table, a.newName);
+        break;
+      case 'renameColumn':
+        this.renameColumn(table, a.column, a.newName);
+        break;
+      case 'addColumn':
+        this.addColumn(table, a.column, sql);
+        break;
+      case 'dropColumn':
+        this.dropColumn(table, a.column);
+        break;
+    }
+    this.schemaChanged();
+    return none;
+  }
+
+  /** Column names per table, for resolving references while rewriting SQL text. */
+  private schemaLookup(): SchemaLookup {
+    return {
+      tableColumns: (name) => {
+        const t = this.tables.get(name.toLowerCase());
+        return t ? new Set(t.columns.map((c) => c.name.toLowerCase())) : undefined;
+      },
+    };
+  }
+
+  /** Rewrite catalog rows; `f` returns the new (type, name, tbl_name, sql) or null to keep a row. */
+  private rewriteCatalog(f: (row: { type: string; name: string; tbl_name: string; rootpage: number; sql: string | null }) => { name?: string; tbl_name?: string; sql?: string | null } | null): void {
+    const w = this.catalogWriter();
+    for (const row of this.scanCatalog()) {
+      const change = f(row);
+      if (!change) continue;
+      const next = [row.type, change.name ?? row.name, change.tbl_name ?? row.tbl_name, row.rootpage, change.sql === undefined ? row.sql : change.sql];
+      w.deleteRow(row.rowid);
+      w.writeRow(next, row.rowid);
+    }
+  }
+
+  /**
+   * Reload the schema from the (rewritten) catalog and check every object still resolves, reporting
+   * the first failure the way SQLite does ("error in view v after drop column: ...").
+   */
+  private validateAfterAlter(suffix: string, viewSuffix = suffix): void {
+    const rows = this.scanCatalog();
+    const built = new Map<string, TableSchema>();
+    for (const r of rows) {
+      if (r.type !== 'table' || r.sql === null) continue;
+      try {
+        const { table } = buildTableSchema(parseOne(r.sql).stmt as CreateTableStmt, r.sql, r.rootpage);
+        const planner = new Planner({ getTable: (n) => this.getTable(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state }, new Registers(0));
+        const base = planner.regs.alloc(table.columns.length);
+        this.compileChecks(table, this.rowScope(table, undefined, base, planner.regs.alloc(), planner), '');
+        built.set(r.name.toLowerCase(), table);
+      } catch (e) {
+        throw new SmaltError('SMALT_ERROR', `error in table ${r.name}${suffix}: ${(e as Error).message}`);
+      }
+    }
+    for (const r of rows) {
+      if (r.type !== 'index' || r.sql === null) continue;
+      try {
+        const t = built.get(r.tbl_name.toLowerCase());
+        if (!t) throw new SmaltError('SMALT_ERROR', `no such table: ${r.tbl_name}`);
+        buildIndexSchema(parseOne(r.sql).stmt as CreateIndexStmt, r.sql, t, r.rootpage);
+      } catch (e) {
+        throw new SmaltError('SMALT_ERROR', `error in index ${r.name}${suffix}: ${(e as Error).message}`);
+      }
+    }
+    this.loadSchema();
+    for (const v of this.views.values()) {
+      try {
+        const planner = new Planner(
+          { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state },
+          new Registers(0),
+        );
+        planner.sqlText = v.sql;
+        planner.planSelect(v.select, null);
+      } catch (e) {
+        // A view that was already broken (e.g. dangling) stays as it was, like SQLite.
+        if (!this.viewWasValid.has(v.name.toLowerCase())) continue;
+        throw new SmaltError('SMALT_ERROR', `error in view ${v.name}${viewSuffix}: ${(e as Error).message}`);
+      }
+    }
+  }
+
+  /** Views that plan successfully right now (only those must keep working after an ALTER). */
+  private viewWasValid = new Set<string>();
+  private noteValidViews(): void {
+    this.viewWasValid = new Set();
+    for (const v of this.views.values()) {
+      try {
+        const planner = new Planner(
+          { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state },
+          new Registers(0),
+        );
+        planner.sqlText = v.sql;
+        planner.planSelect(v.select, null);
+        this.viewWasValid.add(v.name.toLowerCase());
+      } catch {
+        /* already broken */
+      }
+    }
+  }
+
+  private renameTable(table: TableSchema, newName: string): void {
+    const lower = newName.toLowerCase();
+    if (lower.startsWith('smalt_') || lower.startsWith('sqlite_')) throw new SmaltError('SMALT_ERROR', `object name reserved for internal use: ${newName}`);
+    if (this.catalog.has(lower) && lower !== table.name.toLowerCase()) {
+      throw new SmaltError('SMALT_ERROR', `there is already another table or index with this name: ${newName}`);
+    }
+    this.noteValidViews();
+    const old = table.name;
+    const lookup = this.schemaLookup();
+    const autoPrefix = `smalt_autoindex_${old}_`.toLowerCase();
+    this.rewriteCatalog((row) => {
+      const ownRow = row.tbl_name.toLowerCase() === old.toLowerCase();
+      const sql = row.sql === null ? null : applyEdits(row.sql, renameTableEdits(row.sql, old, newName, lookup));
+      const name =
+        row.type === 'table' && ownRow
+          ? newName
+          : row.type === 'index' && row.name.toLowerCase().startsWith(autoPrefix)
+            ? autoIndexName(newName, Number(row.name.slice(autoPrefix.length)))
+            : undefined;
+      if (sql === row.sql && !ownRow) return null;
+      return { name, tbl_name: ownRow ? newName : undefined, sql };
+    });
+    this.deleteStats(old);
+    this.validateAfterAlter('', '');
+  }
+
+  private renameColumn(table: TableSchema, column: string, newName: string): void {
+    const ci = findColumn(table, column);
+    if (ci < 0) throw new SmaltError('SMALT_ERROR', `no such column: "${column}"`);
+    const dup = findColumn(table, newName);
+    if (dup >= 0 && dup !== ci) throw new SmaltError('SMALT_ERROR', `error in table ${table.name} after rename: duplicate column name: ${newName}`);
+    this.noteValidViews();
+    const lookup = this.schemaLookup();
+    const colName = table.columns[ci].name;
+    this.rewriteCatalog((row) => {
+      if (row.sql === null) return null;
+      const edits = renameColumnEdits(row.sql, table.name, colName, newName, lookup);
+      return edits.length ? { sql: applyEdits(row.sql, edits) } : null;
+    });
+    this.validateAfterAlter(' after rename', '');
+  }
+
+  private addColumn(table: TableSchema, def: ColumnDef, alterSql: string): void {
+    if (findColumn(table, def.name) >= 0) throw new SmaltError('SMALT_ERROR', `duplicate column name: ${def.name}`);
+    const cons = def.constraints;
+    if (cons.some((c) => c.kind === 'primaryKey')) throw new SmaltError('SMALT_ERROR', 'Cannot add a PRIMARY KEY column');
+    if (cons.some((c) => c.kind === 'unique')) throw new SmaltError('SMALT_ERROR', 'Cannot add a UNIQUE column');
+    if (cons.some((c) => c.kind === 'generated')) throw new SmaltError('SMALT_UNSUPPORTED', 'generated columns are not supported yet');
+    const dflt = cons.find((c) => c.kind === 'default') as { expr: Expr } | undefined;
+    if (dflt && !isConstantDefault(dflt.expr)) throw new SmaltError('SMALT_ERROR', 'Cannot add a column with non-constant default');
+    if (cons.some((c) => c.kind === 'notNull') && literalValue(dflt?.expr) === null) {
+      throw new SmaltError('SMALT_ERROR', 'Cannot add a NOT NULL column with default value NULL');
+    }
+    this.noteValidViews();
+    const stmt = parseOne(table.sql).stmt as CreateTableStmt;
+    const lastDef = stmt.columns[stmt.columns.length - 1];
+    const defText = alterSql.slice(def.pos, def.end);
+    const sql = table.sql.slice(0, lastDef.end) + ', ' + defText + table.sql.slice(lastDef.end);
+    this.rewriteCatalog((row) => (row.type === 'table' && row.name.toLowerCase() === table.name.toLowerCase() ? { sql } : null));
+    this.deleteStats(table.name);
+    this.validateAfterAlter('');
+    // Existing rows keep their shorter records: readers fill in the new column's constant default.
+  }
+
+  private dropColumn(table: TableSchema, column: string): void {
+    const ci = findColumn(table, column);
+    if (ci < 0) throw new SmaltError('SMALT_ERROR', `no such column: "${column}"`);
+    const col = table.columns[ci];
+    const stmt = parseOne(table.sql).stmt as CreateTableStmt;
+    const def = stmt.columns[ci];
+    if (col.primaryKey) throw new SmaltError('SMALT_ERROR', `cannot drop PRIMARY KEY column: "${col.name}"`);
+    if (def.constraints.some((c) => c.kind === 'unique')) throw new SmaltError('SMALT_ERROR', `cannot drop UNIQUE column: "${col.name}"`);
+    if (table.columns.length === 1) throw new SmaltError('SMALT_ERROR', `cannot drop column "${col.name}": no other columns exist`);
+    this.noteValidViews();
+    // Remove the column definition and the comma that separates it from its neighbour.
+    const sql =
+      ci > 0 ? table.sql.slice(0, stmt.columns[ci - 1].end) + table.sql.slice(def.end) : table.sql.slice(0, def.pos) + table.sql.slice(stmt.columns[1].pos);
+    const oldTable = table;
+    this.rewriteCatalog((row) => (row.type === 'table' && row.name.toLowerCase() === table.name.toLowerCase() ? { sql } : null));
+    this.deleteStats(table.name);
+    this.validateAfterAlter(' after drop column');
+    // Rewrite every row without the column (index entries do not depend on record layout).
+    const newTable = this.tables.get(oldTable.name.toLowerCase())!;
+    const reader = new RecordReader(oldTable.layout, oldTable.recordDefaults);
+    const rows: { rowid: number | bigint; row: SqlValue[] }[] = [];
+    const c = this.tree(oldTable.rootPage).cursor();
+    try {
+      for (let ok = c.first(); ok; ok = c.next()) {
+        c.loadValue();
+        reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+        const row: SqlValue[] = [];
+        for (let i = 0; i < oldTable.columns.length; i++) if (i !== ci) row.push(reader.column(i));
+        c.loadKey();
+        rows.push({ rowid: readRowidKey(c.keyBytes, c.keyOffset), row });
+      }
+    } finally {
+      c.close();
+    }
+    const w = new TableWriter(newTable, this.pager, (root) => this.tree(root));
+    for (const r of rows) {
+      if (newTable.rowidAlias >= 0) r.row[newTable.rowidAlias] = r.rowid;
+      w.rewriteRecord(r.row, r.rowid);
+    }
+  }
+
+  /** Drop ANALYZE statistics of a table (they describe the old shape). */
+  private deleteStats(tableName: string): void {
+    const stat = this.tables.get('smalt_stat');
+    if (!stat) return;
+    const reader = new RecordReader(stat.layout, stat.recordDefaults);
+    const stale: (number | bigint)[] = [];
+    const c = this.tree(stat.rootPage).cursor();
+    try {
+      for (let ok = c.first(); ok; ok = c.next()) {
+        c.loadValue();
+        reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+        if (String(reader.column(0)).toLowerCase() === tableName.toLowerCase()) {
+          c.loadKey();
+          stale.push(readRowidKey(c.keyBytes, c.keyOffset));
+        }
+      }
+    } finally {
+      c.close();
+    }
+    const w = new TableWriter(stat, this.pager, (root) => this.tree(root));
+    for (const id of stale) w.deleteRow(id);
   }
 
   // ---------------------------------------------------------------- DML

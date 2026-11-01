@@ -1829,7 +1829,9 @@ export class Planner {
       }
     }
     const name = e.table ? `${e.table}.${e.name}` : e.name;
-    throw new SmaltError('SMALT_ERROR', `no such column: ${name}`);
+    // Like SQLite: a double-quoted name that resolves to nothing may have been meant as a string.
+    const quoted = !e.table && this.sqlText[e.pos] === '"';
+    throw new SmaltError('SMALT_ERROR', quoted ? `no such column: "${e.name}" - should this be a string literal in single-quotes?` : `no such column: ${name}`);
   }
 
   private readonly expandingAliases = new Set<string>();

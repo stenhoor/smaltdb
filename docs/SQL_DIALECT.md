@@ -107,6 +107,11 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
 - (M4) `RETURNING` on INSERT/UPDATE/DELETE (`*`, expressions, aliases; aggregates rejected like SQLite);
   upsert `ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET … [WHERE …]` with `excluded.*`, several clauses tried in order;
   `UPDATE … FROM` (joined sources; with several matching FROM rows the first one wins, as in SQLite).
+- (M4) `ALTER TABLE … RENAME TO | RENAME COLUMN | ADD COLUMN | DROP COLUMN`, like SQLite: renames rewrite the
+  stored SQL of the table, its indexes, other tables' `REFERENCES` clauses and views (only references that resolve
+  to the altered table/column change; quoting style is kept); every object is re-validated and the ALTER fails with
+  SQLite's "error in view v after drop column: …" style messages; `ADD COLUMN` takes a constant default and existing
+  rows read it without being rewritten; `DROP COLUMN` rewrites the rows.
 - (M4) Window functions: `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`,
   `first_value`, `last_value`, `nth_value`, and every aggregate (with `FILTER`) over a window; `PARTITION BY`, `ORDER BY`,
   `ROWS` / `RANGE` / `GROUPS` frames with `UNBOUNDED` / `n PRECEDING|FOLLOWING` / `CURRENT ROW` bounds and `EXCLUDE`
@@ -133,7 +138,7 @@ losslessly as SQLite STRICT tables do (`'5'` into an INTEGER column becomes 5), 
 `cannot store TEXT value in INTEGER column t.c`.
 
 **Not yet supported** (each gives a clear `SMALT_UNSUPPORTED` error): `RIGHT` / `FULL` joins,
-TEMP views, materialized views (M5), `ON CONFLICT` targets with WHERE, row-value assignments (`SET (a, b) = …`), `ALTER TABLE`, expression and
+TEMP views, materialized views (M5), `ON CONFLICT` targets with WHERE, row-value assignments (`SET (a, b) = …`), expression and
 partial indexes, `INCLUDE` columns, `WITHOUT ROWID`, `LOOSE` tables, generated columns, TEMP tables, JSON
 functions, and `VACUUM`. Plain `EXPLAIN` returns the `EXPLAIN QUERY PLAN` output (there is no bytecode to list). Foreign keys are parsed and stored but not yet enforced (M4).
 

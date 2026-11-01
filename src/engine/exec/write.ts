@@ -179,6 +179,18 @@ export class TableWriter {
     return null;
   }
 
+  /** Re-encode a row's record in place (index entries are left untouched; ALTER TABLE DROP COLUMN). */
+  rewriteRecord(row: SqlValue[], rowid: number | bigint): void {
+    const alias = this.table.rowidAlias;
+    let saved: SqlValue = null;
+    if (alias >= 0) {
+      saved = row[alias];
+      row[alias] = null;
+    }
+    this.tree.put(this.key(rowid), this.enc.encode(row));
+    if (alias >= 0) row[alias] = saved;
+  }
+
   /** Write a row whose conflicts were already resolved. */
   writeRow(row: SqlValue[], rowid: number | bigint): void {
     const t = this.table;
