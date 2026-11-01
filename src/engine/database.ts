@@ -186,6 +186,7 @@ export class Database implements FunctionContext {
   private memSnapshots: MemSnapshot[] = [];
 
   private snapshotMem(): MemSnapshot {
+    if (this.tempTables.size === 0 && this.memViews.size === 0) return EMPTY_MEM_SNAPSHOT;
     return {
       temps: [...this.tempTables].map(([k, t]) => [k, t, [...t.indexes]]),
       views: [...this.memViews].map(([k, v]) => [k, { ...v, indexRoots: new Map(v.indexRoots) }]),
@@ -478,11 +479,22 @@ export class Database implements FunctionContext {
 
   // ---------------------------------------------------------------- schema
 
-  getTable(name: string): TableSchema | undefined {
+  /**
+   * A table by name. Unqualified names see a TEMP table before a main table of the same name;
+   * `schema` 'main' or 'temp' asks for that schema's table only.
+   */
+  getTable(name: string, schema?: string): TableSchema | undefined {
     const lower = name.toLowerCase();
     if (CATALOG_NAMES.has(lower)) return this.catalogTable;
-    return this.tables.get(lower);
+    const t = this.tables.get(lower);
+    const s = schema?.toLowerCase();
+    if (s === 'main') return t?.temp ? this.shadowedMain.get(lower) : t;
+    if (s === 'temp') return t?.temp ? t : undefined;
+    return t;
   }
+
+  /** Main tables currently shadowed by a TEMP table of the same name (reachable as `main.name`). */
+  private shadowedMain = new Map<string, TableSchema>();
 
   private fkInvolvedNow(name: string): boolean {
     const t = this.tables.get(name.toLowerCase());
@@ -496,7 +508,7 @@ export class Database implements FunctionContext {
     this.touchTable(table);
     const c = table.columnar;
     const w = c
-      ? new ColumnarTableWriter(table, this.pager, (root) => this.tree(root), this.columnStoreOf(table), this.tree(c.delRoot), () => this.columnarTouched.add(table))
+      ? new ColumnarTableWriter(table, this.pager, (root) => this.tree(root), () => this.columnStoreOf(table, true), this.tree(c.delRoot), () => this.columnarTouched.add(table))
       : new TableWriter(table, this.pager, (root) => this.tree(root));
     w.beforeDelete = (row) => {
       if (this.fk.involved(table)) this.fk.beforeDelete(table, row);
@@ -669,7 +681,10 @@ export class Database implements FunctionContext {
       this.indexes.set(idx.name.toLowerCase(), idx);
     }
     // TEMP tables live outside the catalog: re-add them (they shadow main tables of the same name).
+    this.shadowedMain.clear();
     for (const [lower, t] of this.tempTables) {
+      const main = this.tables.get(lower);
+      if (main) this.shadowedMain.set(lower, main);
       this.tables.set(lower, t);
       for (const idx of t.indexes) this.indexes.set(idx.name.toLowerCase(), idx);
     }
@@ -799,8 +814,8 @@ export class Database implements FunctionContext {
   /** What the planner reads from the database. Unpopulated materialized views cannot be read. */
   private plannerDeps(): ConstructorParameters<typeof Planner>[0] {
     return {
-      getTable: (n) => {
-        const t = this.getTable(n);
+      getTable: (n, schema) => {
+        const t = this.getTable(n, schema);
         if (t?.matview && !t.matview.populated) {
           throw new SmaltError('SMALT_ERROR', `materialized view "${t.name}" has not been populated (use REFRESH MATERIALIZED VIEW)`);
         }
@@ -928,8 +943,9 @@ export class Database implements FunctionContext {
     const journal = !this.autocommit && !program.singleRowWrite;
     if (journal) pager.beginStatement();
     let result: T;
-    // Temp DDL and memory-view refreshes are not in the pages alone: restore them on failure.
-    const memBefore = this.mem ? this.snapshotMem() : null;
+    // Temp DDL and memory-view refreshes are not in the pages alone: restore them on failure. (In
+    // an in-memory database temp tables live in the main pager, but their maps still need this.)
+    const memBefore = this.snapshotMem();
     this.memDirty = false;
     this.fk.sync(this.schemaVersion);
     this.fk.stmt = 0;
@@ -950,7 +966,7 @@ export class Database implements FunctionContext {
       pager.releaseAllPins();
       if (journal) pager.rollbackStatement();
       if (this.autocommit) pager.rollback();
-      if (this.memDirty && memBefore) {
+      if (this.memDirty) {
         this.restoreMem(memBefore);
         this.memDirty = false;
         this.loadSchema();
@@ -1210,7 +1226,12 @@ export class Database implements FunctionContext {
     if (!this.matviewRewriteOn) return null;
     const views: MatviewCandidate[] = [];
     for (const t of this.tables.values()) {
-      if (t.matview?.populated && t.matview.fresh) views.push({ name: t.name, select: t.matview.select, columns: t.columns.map((c) => c.name) });
+      const m = t.matview;
+      if (!m?.populated || !m.fresh) continue;
+      // A TEMP table or view shadowing something the view read: the query's names mean the temp object.
+      const deps = (m.deps ??= this.selectDeps(m.select));
+      if ([...deps].some((d) => this.tempTables.has(d) || this.tempViews.has(d))) continue;
+      views.push({ name: t.name, select: m.select, columns: t.columns.map((c) => c.name) });
     }
     if (views.length === 0) return null;
     const m = matchMatview(stmt, text, views, (name) => {
@@ -1615,27 +1636,57 @@ export class Database implements FunctionContext {
     }
   }
 
-  /** Base tables a SELECT reads, through views (lower-case names; CTE names excluded). */
+  /**
+   * Tables and views a SELECT reads (lower-case names), through views. CTE references are
+   * excluded where the CTE is in scope: a CTE's name is visible to the CTEs after it and the
+   * statement body, and inside its own body only when it is RECURSIVE (otherwise `WITH t AS
+   * (SELECT * FROM t)` reads the table t).
+   */
   private selectDeps(select: SelectStmt, seen = new Set<string>()): Set<string> {
     const out = new Set<string>();
-    const ctes = new Set<string>();
-    const visit = (x: unknown): void => {
-      if (Array.isArray(x)) return x.forEach(visit);
+    const visit = (x: unknown, ctes: ReadonlySet<string>): void => {
+      if (Array.isArray(x)) {
+        for (const y of x) visit(y, ctes);
+        return;
+      }
       if (typeof x !== 'object' || x === null || x instanceof Uint8Array) return;
       const o = x as Record<string, unknown>;
-      if (o.kind === 'select' && o.with && typeof o.with === 'object') for (const c of (o.with as { ctes: { name: string }[] }).ctes) ctes.add(c.name.toLowerCase());
+      if (o.kind === 'select' && 'core' in o && o.with) {
+        const w = o.with as { recursive: boolean; ctes: { name: string; select: SelectStmt }[] };
+        const inner = new Set(ctes);
+        if (w.recursive) for (const c of w.ctes) inner.add(c.name.toLowerCase());
+        for (const c of w.ctes) {
+          visit(c.select, inner);
+          inner.add(c.name.toLowerCase());
+        }
+        for (const [k, v] of Object.entries(o)) if (k !== 'with') visit(v, inner);
+        return;
+      }
       if (o.kind === 'table' && typeof o.name === 'string') {
         const n = o.name.toLowerCase();
-        const view = this.getView(n);
-        if (view && !seen.has(n)) {
-          seen.add(n);
-          for (const d of this.selectDeps(view.select, seen)) out.add(d);
-        } else if (!ctes.has(n)) out.add(n);
+        if (o.schema || !ctes.has(n)) {
+          out.add(n);
+          const view = this.getView(n);
+          if (view && !seen.has(n)) {
+            seen.add(n);
+            for (const d of this.selectDeps(view.select, seen)) out.add(d);
+          }
+        }
       }
-      for (const v of Object.values(o)) visit(v);
+      for (const v of Object.values(o)) visit(v, ctes);
     };
-    visit(select);
+    visit(select, new Set());
     return out;
+  }
+
+  /**
+   * An object named `name` was created, dropped, renamed or redefined: materialized views that
+   * read that name are no longer known to be fresh, and cached dependencies (which expand views)
+   * are recomputed.
+   */
+  private objectChanged(name: string): void {
+    for (const t of this.tables.values()) if (t.matview) t.matview.deps = undefined;
+    this.touchName(name.toLowerCase());
   }
 
   /**
@@ -1643,7 +1694,11 @@ export class Database implements FunctionContext {
    * transaction, so a rollback makes them fresh again). Readers reload the schema to notice.
    */
   private touchTable(table: TableSchema): void {
-    const lower = table.name.toLowerCase();
+    this.touchName(table.name.toLowerCase());
+  }
+
+  /** Mark fresh materialized views that read the object named `lower` stale. */
+  private touchName(lower: string): void {
     let changed = false;
     for (const t of this.tables.values()) {
       const m = t.matview;
@@ -1780,6 +1835,7 @@ export class Database implements FunctionContext {
     // Like SQLite, the body is not resolved until the view is used (it may reference tables created later).
     this.addCatalogRow('view', stmt.name, stmt.name, 0, sql);
     this.views.set(stmt.name.toLowerCase(), { name: stmt.name, sql, columns: stmt.columns, select: stmt.select });
+    this.objectChanged(stmt.name);
     this.schemaChanged();
     return none;
   }
@@ -1843,6 +1899,8 @@ export class Database implements FunctionContext {
     });
     this.tempTables.set(lower, table);
     this.memDirty = true;
+    const main = this.tables.get(lower);
+    if (main && !main.temp) this.shadowedMain.set(lower, main);
     this.tables.set(lower, table);
     for (const idx of table.indexes) this.indexes.set(idx.name.toLowerCase(), idx);
     this.schemaVersion++;
@@ -1860,6 +1918,9 @@ export class Database implements FunctionContext {
       if (this.indexes.has(stmt.name.toLowerCase())) throw new SmaltError('SMALT_ERROR', `index ${stmt.name} already exists`);
     } else this.checkNewName(stmt.name, 'index');
     this.dirtySchema = !table.temp;
+    // A temp index changes in-memory schema only: if anything below fails (a UNIQUE violation), the
+    // statement's failure path must restore the temp maps along with the rolled-back pages.
+    if (table.temp) this.memDirty = true;
     const memory = table.rootPage >= MEM_BASE;
     const root = this.createTree(memory);
     const idx = buildIndexSchema(stmt, sql, table, root);
@@ -1869,7 +1930,6 @@ export class Database implements FunctionContext {
     this.indexes.set(idx.name.toLowerCase(), idx);
     if (idx.unique) this.checkUniqueIndex(table, idx); // existing rows may already collide
     if (table.temp) {
-      this.memDirty = true;
       this.schemaVersion++;
       return none;
     }
@@ -2049,6 +2109,7 @@ export class Database implements FunctionContext {
         this.removeCatalogRow(idx.name);
         this.indexes.delete(idx.name.toLowerCase());
       }
+      this.objectChanged(mv.name);
       this.freshTree(mv.rootPage).destroy();
       this.removeCatalogRow(mv.name);
       this.writeMatviewMeta(mv.name, null);
@@ -2069,6 +2130,7 @@ export class Database implements FunctionContext {
         throw new SmaltError('SMALT_ERROR', `no such view: ${stmt.name}`);
       }
       this.dirtySchema = true;
+      this.objectChanged(view.name);
       this.removeCatalogRow(view.name);
       this.views.delete(lower);
       this.schemaChanged();
@@ -2084,7 +2146,8 @@ export class Database implements FunctionContext {
       return none;
     }
     if (stmt.objectType === 'table') {
-      const table = this.tables.get(lower);
+      // Not a temp table (handled above): the main table, also when a TEMP table shadows it.
+      const table = stmt.schema?.toLowerCase() === 'temp' ? undefined : this.getTable(lower, 'main');
       if (!table) {
         if (stmt.ifExists) return none;
         throw new SmaltError('SMALT_ERROR', `no such table: ${stmt.name}`);
@@ -2092,13 +2155,14 @@ export class Database implements FunctionContext {
       // Like SQLite, dropping a parent table first deletes its rows (applying foreign-key actions).
       if (this.fk.enabled && this.tables.size > 1 && [...this.tables.values()].some((t) => t !== table && t.foreignKeys.some((f) => f.table.toLowerCase() === lower))) {
         this.fk.sync(this.schemaVersion);
-        this.internal(`DELETE FROM "${table.name.replace(/"/g, '""')}"`, []);
+        this.internal(`DELETE FROM main."${table.name.replace(/"/g, '""')}"`, []);
       }
       this.dirtySchema = true;
+      this.objectChanged(table.name);
       for (const idx of table.indexes) {
         this.freshTree(idx.rootPage).destroy();
         this.removeCatalogRow(idx.name);
-        this.indexes.delete(idx.name.toLowerCase());
+        if (this.indexes.get(idx.name.toLowerCase()) === idx) this.indexes.delete(idx.name.toLowerCase());
       }
       this.freshTree(table.rootPage).destroy();
       if (table.columnar) {
@@ -2107,7 +2171,8 @@ export class Database implements FunctionContext {
         this.writeColumnarMeta(table.name, null);
       }
       this.removeCatalogRow(table.name);
-      this.tables.delete(lower);
+      if (this.tables.get(lower) === table) this.tables.delete(lower);
+      else this.shadowedMain.delete(lower); // a TEMP table of the same name stays
       this.schemaChanged();
       return none;
     }
@@ -2157,7 +2222,8 @@ export class Database implements FunctionContext {
     if (!table) throw new SmaltError('SMALT_ERROR', `no such table: ${stmt.table}`);
     if (table.matview) throw new SmaltError('SMALT_ERROR', `materialized view ${table.name} may not be altered`);
     if (table.columnar) throw new SmaltError('SMALT_UNSUPPORTED', `ALTER TABLE is not supported for columnar table ${table.name} yet`);
-    this.touchTable(table);
+    this.objectChanged(table.name);
+    if (stmt.action.kind === 'renameTable') this.objectChanged(stmt.action.newName);
     this.dirtySchema = true;
     const a = stmt.action;
     switch (a.kind) {
@@ -2399,7 +2465,7 @@ export class Database implements FunctionContext {
     if (schema && schema.toLowerCase() !== 'main') throw new SmaltError('SMALT_ERROR', `unknown database ${schema}`);
     const lower = name.toLowerCase();
     if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat' || lower === 'smalt_matview' || lower === 'smalt_columnar') throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
-    const t = this.tables.get(lower);
+    const t = this.getTable(lower, schema);
     if (!t) {
       if (this.views.has(lower)) throw new SmaltError('SMALT_ERROR', `cannot modify ${name} because it is a view`);
       throw new SmaltError('SMALT_ERROR', `no such table: ${name}`);
@@ -2788,7 +2854,8 @@ export class Database implements FunctionContext {
     w?: WithClause,
   ): { root: Operator; colRegs: number[]; rowidReg: number; scope: CompileScope } {
     const scope = planner.newScope(w ? planner.cteScope(w) : null);
-    const target: FromItem = { kind: 'table', schema: 'main', name: table.name, alias, pos: 0, end: 0 };
+    // The resolved target's own schema: a TEMP table and a main table may share the name.
+    const target: FromItem = { kind: 'table', schema: table.temp ? 'temp' : 'main', name: table.name, alias, pos: 0, end: 0 };
     // UPDATE ... FROM: the target joined with the FROM sources (the WHERE holds the join conditions).
     const item: FromItem = from ? { kind: 'join', joinType: 'INNER', natural: false, left: target, right: from, pos: 0, end: 0 } : target;
     const root = planner.planFrom(item, where, scope);
@@ -3538,3 +3605,6 @@ function tableStorage(stmt: CreateTableStmt): 'row' | 'columnar' {
   if (storage !== 'row' && storage !== 'columnar') throw new SmaltError('SMALT_ERROR', `storage must be 'row' or 'columnar'`);
   return storage;
 }
+
+/** Snapshot of no memory objects (shared: restoring it creates fresh maps). */
+const EMPTY_MEM_SNAPSHOT: MemSnapshot = { temps: [], views: [] };
