@@ -1159,6 +1159,199 @@ export function explainRows(root: Operator): { id: number; parent: number; detai
   return out;
 }
 
+/** The self-reference of a WITH RECURSIVE CTE: yields the row the recursion is expanding, once per open. */
+export class WorkingScan implements Operator {
+  readonly children: Operator[] = [];
+  /** Set by RecursiveCte before each recursive step. */
+  row: SqlValue[] | null = null;
+  private done = false;
+  private r!: SqlValue[];
+
+  constructor(
+    readonly name: string,
+    private readonly regs: number[],
+  ) {}
+
+  get detail(): string {
+    return `SCAN ${this.name} (recursive step)`;
+  }
+
+  open(r: SqlValue[]): void {
+    this.r = r;
+    this.done = false;
+  }
+
+  next(): boolean {
+    if (this.done || this.row === null) return false;
+    this.done = true;
+    const row = this.row;
+    for (let j = 0; j < this.regs.length; j++) this.r[this.regs[j]] = row[j];
+    return true;
+  }
+
+  close(): void {}
+}
+
+/**
+ * WITH RECURSIVE, evaluated like SQLite: the initial SELECT seeds a queue; each step takes one row
+ * from the queue, outputs it, and runs the recursive SELECT(s) with that row as the working table,
+ * queueing their results. UNION (not ALL) discards rows already seen. An ORDER BY on the CTE makes
+ * the queue a priority queue (FIFO among equal keys); LIMIT stops the recursion, OFFSET skips output.
+ */
+export class RecursiveCte implements Operator {
+  readonly children: Operator[];
+  private r!: SqlValue[];
+  private queue: { row: SqlValue[]; seq: number }[] = [];
+  private head = 0;
+  private seq = 0;
+  private seen = new Set<string>();
+  private produced = 0;
+  private skip = 0;
+  private limit = -1;
+
+  constructor(
+    private readonly name: string,
+    private readonly initial: Operator,
+    private readonly recursive: Operator[],
+    private readonly outRegs: number[],
+    private readonly working: WorkingScan,
+    private readonly distinct: boolean,
+    private readonly collations: Collation[],
+    private readonly order: { index: number; desc: boolean; nullsFirst: boolean; collation: Collation }[] | null,
+    private readonly limitFn?: Fn,
+    private readonly offsetFn?: Fn,
+  ) {
+    this.children = [initial, ...recursive];
+  }
+
+  get detail(): string {
+    return `RECURSIVE CTE ${this.name}${this.distinct ? ' (UNION)' : ''}`;
+  }
+
+  open(r: SqlValue[]): void {
+    this.r = r;
+    this.queue = [];
+    this.head = 0;
+    this.seq = 0;
+    this.seen = new Set();
+    this.produced = 0;
+    this.limit = -1;
+    this.skip = 0;
+    if (this.limitFn) {
+      const v = this.limitFn(r);
+      this.limit = typeof v === 'number' || typeof v === 'bigint' ? Number(v) : -1;
+    }
+    if (this.offsetFn) {
+      const v = this.offsetFn(r);
+      this.skip = typeof v === 'number' || typeof v === 'bigint' ? Math.max(0, Number(v)) : 0;
+    }
+    if (this.limit === 0) return;
+    this.runInto(this.initial);
+  }
+
+  private runInto(op: Operator): void {
+    const r = this.r;
+    op.open(r);
+    try {
+      while (op.next()) this.add(this.outRegs.map((g) => r[g]));
+    } finally {
+      op.close();
+    }
+  }
+
+  private add(row: SqlValue[]): void {
+    if (this.distinct) {
+      const k = hashKeyMulti(row, this.collations);
+      if (this.seen.has(k)) return;
+      this.seen.add(k);
+    }
+    const item = { row, seq: this.seq++ };
+    if (!this.order) {
+      this.queue.push(item);
+      return;
+    }
+    // Binary heap on the CTE's ORDER BY, insertion order breaking ties.
+    const q = this.queue;
+    q.push(item);
+    let i = q.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (this.cmp(q[i], q[p]) >= 0) break;
+      [q[i], q[p]] = [q[p], q[i]];
+      i = p;
+    }
+  }
+
+  private cmp(a: { row: SqlValue[]; seq: number }, b: { row: SqlValue[]; seq: number }): number {
+    for (const k of this.order!) {
+      const x = a.row[k.index];
+      const y = b.row[k.index];
+      if (x === null || y === null) {
+        if (x === y) continue;
+        return (x === null) === k.nullsFirst ? -1 : 1;
+      }
+      const c = compareValues(x, y, k.collation);
+      if (c !== 0) return k.desc ? -c : c;
+    }
+    return a.seq - b.seq;
+  }
+
+  private pop(): SqlValue[] | null {
+    if (!this.order) {
+      if (this.head >= this.queue.length) return null;
+      const row = this.queue[this.head++].row;
+      if (this.head > 1024 && this.head * 2 > this.queue.length) {
+        this.queue = this.queue.slice(this.head);
+        this.head = 0;
+      }
+      return row;
+    }
+    const q = this.queue;
+    if (q.length === 0) return null;
+    const top = q[0];
+    const last = q.pop()!;
+    if (q.length > 0) {
+      q[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1;
+        const rr = l + 1;
+        let m = i;
+        if (l < q.length && this.cmp(q[l], q[m]) < 0) m = l;
+        if (rr < q.length && this.cmp(q[rr], q[m]) < 0) m = rr;
+        if (m === i) break;
+        [q[i], q[m]] = [q[m], q[i]];
+        i = m;
+      }
+    }
+    return top.row;
+  }
+
+  next(): boolean {
+    for (;;) {
+      if (this.limit >= 0 && this.produced >= this.limit) return false;
+      const row = this.pop();
+      if (row === null) return false;
+      this.working.row = row;
+      for (const op of this.recursive) this.runInto(op);
+      if (this.skip > 0) {
+        this.skip--;
+        continue;
+      }
+      const r = this.r;
+      for (let j = 0; j < this.outRegs.length; j++) r[this.outRegs[j]] = row[j];
+      this.produced++;
+      return true;
+    }
+  }
+
+  close(): void {
+    this.queue = [];
+    this.seen = new Set();
+    this.working.row = null;
+  }
+}
+
 /** Rows of a virtual table (information_schema, table-valued pragma functions), computed at open. */
 export class VirtualScan implements Operator {
   readonly children: Operator[] = [];

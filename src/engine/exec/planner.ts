@@ -73,7 +73,9 @@ import {
   TableAccess,
   TableScan,
   Values,
+  RecursiveCte,
   VirtualScan,
+  WorkingScan,
 } from './operators.js';
 
 export interface PlannerEnv {
@@ -149,6 +151,14 @@ interface Source {
   estRows?: number;
 }
 
+/** A CTE visible in a scope. `working` marks the self-reference inside a recursive step. */
+interface CteEntry {
+  select: SelectStmt;
+  columns?: string[];
+  recursive?: boolean;
+  working?: { scan: WorkingScan; regs: number[]; columns: ResultColumnInfo[] };
+}
+
 const ROWID_NAMES = new Set(['rowid', 'oid', '_rowid_']);
 
 class Scope {
@@ -156,10 +166,10 @@ class Scope {
   correlated = false;
   /** Select-list aliases usable as a fallback in WHERE/GROUP BY/HAVING/ORDER BY. */
   aliases: Map<string, Expr> | null = null;
-  ctes = new Map<string, { select: SelectStmt; columns?: string[] }>();
+  ctes = new Map<string, CteEntry>();
   constructor(readonly parent: Scope | null) {}
 
-  findCte(name: string): { select: SelectStmt; columns?: string[] } | undefined {
+  findCte(name: string): CteEntry | undefined {
     const lower = name.toLowerCase();
     for (let s: Scope | null = this; s; s = s.parent) {
       const c = s.ctes.get(lower);
@@ -373,8 +383,57 @@ export class Planner {
   }
 
   private registerCtes(w: WithClause, scope: Scope): void {
-    if (w.recursive) throw new SmaltError('SMALT_UNSUPPORTED', 'WITH RECURSIVE is not supported yet');
-    for (const c of w.ctes) scope.ctes.set(c.name.toLowerCase(), { select: c.select, columns: c.columns });
+    for (const c of w.ctes) {
+      const recursive = w.recursive && selectReferences(c.select, c.name);
+      scope.ctes.set(c.name.toLowerCase(), { select: c.select, columns: c.columns, recursive });
+    }
+  }
+
+  /** Plan a WITH RECURSIVE CTE as a RecursiveCte operator (see operators.ts). */
+  private planRecursiveCte(name: string, cte: CteEntry, parent: Scope | null): QueryPlan {
+    const select = cte.select;
+    const cores = [select.core, ...select.compound.map((c) => c.core)];
+    const refs = cores.map((c) => coreReferences(c, name));
+    const k = refs.indexOf(true);
+    if (k <= 0) throw new SmaltError('SMALT_ERROR', `recursive reference in a subquery: ${name}`);
+    for (let i = k; i < cores.length; i++) {
+      if (!refs[i]) throw new SmaltError('SMALT_ERROR', `circular reference: ${name}`);
+    }
+    const ops = select.compound.slice(k - 1).map((c) => c.op);
+    if (ops.some((op) => op !== 'UNION' && op !== 'UNION ALL')) throw new SmaltError('SMALT_ERROR', `recursive reference in a subquery: ${name}`);
+    const distinct = ops.includes('UNION');
+    // The initial (non-recursive) part, itself possibly a compound.
+    const init: SelectStmt = { ...select, with: undefined, core: select.core, compound: select.compound.slice(0, k - 1), orderBy: [], limit: undefined, offset: undefined };
+    const initPlan = this.planSelect(init, parent);
+    const outRegs = initPlan.outRegs;
+    if (cte.columns && cte.columns.length !== outRegs.length) {
+      throw new SmaltError('SMALT_ERROR', `table ${name} has ${outRegs.length} values for ${cte.columns.length} columns`);
+    }
+    const columns = initPlan.columns.map((c, i) => ({ ...c, name: cte.columns?.[i] ?? c.name }));
+    const wregs = outRegs.map(() => this.regs.alloc());
+    const scan = new WorkingScan(name, wregs);
+    let correlated = initPlan.correlated;
+    const steps = cores.slice(k).map((core) => {
+      const s = new Scope(parent);
+      s.ctes.set(name.toLowerCase(), { select, columns: cte.columns, working: { scan, regs: wregs, columns } });
+      const plan = this.planCore(core, s, outRegs, null);
+      if (plan.outRegs.length !== outRegs.length) {
+        throw new SmaltError('SMALT_ERROR', `SELECTs to the left and right of ${ops[0]} do not have the same number of result columns`);
+      }
+      correlated ||= plan.correlated;
+      return plan.root;
+    });
+    const order = select.orderBy.length
+      ? select.orderBy.map((t) => {
+          const idx = this.compoundOrderIndex(t, columns, select.core);
+          return { index: idx, desc: t.desc, nullsFirst: t.nulls ? t.nulls === 'FIRST' : !t.desc, collation: columns[idx].collation };
+        })
+      : null;
+    const ls = this.compileScope(new Scope(parent));
+    const limitFn = select.limit ? compileExpr(select.limit, ls).fn : undefined;
+    const offsetFn = select.offset ? compileExpr(select.offset, ls).fn : undefined;
+    const root = new RecursiveCte(name, initPlan.root, steps, outRegs, scan, distinct, columns.map((c) => c.collation), order, limitFn, offsetFn);
+    return { root, outRegs, columns, correlated };
   }
 
   private compoundOrderIndex(t: OrderingTerm, cols: ResultColumnInfo[], core: SelectCore): number {
@@ -1057,11 +1116,21 @@ export class Planner {
           throw new SmaltError('SMALT_ERROR', `expected ${names.length} columns for '${view.name}' but got ${sub.columns.length}`);
         }
       } else {
-        const cte = scope.findCte((item as { name: string }).name)!;
+        const cteName = (item as { name: string }).name;
+        const cte = scope.findCte(cteName)!;
         select = cte.select;
         names = cte.columns;
-        alias = (item as { alias?: string }).alias ?? (item as { name: string }).name;
-        sub = this.planSelect(select, scope.parent, undefined);
+        alias = (item as { alias?: string }).alias ?? cteName;
+        if (cte.working) {
+          // The recursive step's working table: one row, re-read on every step (never cached).
+          const w = cte.working;
+          const cols: SourceColumn[] = w.columns.map((c, i) => ({ name: c.name, reg: w.regs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '', index: i }));
+          const ws: QueryPlan = { root: w.scan, outRegs: w.regs, columns: w.columns, correlated: true };
+          scope.sources.push({ name: alias, cols, rowidReg: -1, sub: ws, joinType, on: [], hidden: new Set(), position });
+          return;
+        }
+        sub = cte.recursive ? this.planRecursiveCte(cteName, cte, scope.parent) : this.planSelect(select, scope.parent, undefined);
+        if (cte.recursive) names = undefined; // already applied to the plan's columns
       }
       if (sub.correlated) scope.correlated = true;
       if (names && names.length !== sub.columns.length) {
@@ -1808,3 +1877,29 @@ function splitBetween(e: Expr): Expr[] {
 }
 
 export type { Scope };
+
+/** Whether a FROM tree (or a nested FROM subquery) names `name` as a table. */
+function fromReferences(f: FromItem | undefined, name: string): boolean {
+  if (!f) return false;
+  switch (f.kind) {
+    case 'table':
+      return !f.schema && sameName(f.name, name);
+    case 'join':
+      return fromReferences(f.left, name) || fromReferences(f.right, name);
+    case 'subquery':
+      return selectReferences(f.select, name);
+    default:
+      return false;
+  }
+}
+
+function coreReferences(core: SelectCore, name: string): boolean {
+  return core.kind === 'select' && fromReferences(core.from, name);
+}
+
+/** Whether a SELECT reads table `name` in one of its FROM clauses (the recursion of a CTE). */
+function selectReferences(s: SelectStmt, name: string): boolean {
+  if (s.with?.ctes.some((c) => sameName(c.name, name))) return false; // shadowed
+  return coreReferences(s.core, name) || s.compound.some((c) => coreReferences(c.core, name));
+}
+
