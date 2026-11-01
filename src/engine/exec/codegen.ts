@@ -18,6 +18,9 @@ export interface FallbackNode {
   constant: boolean;
   /** Set when the node is a plain register read. */
   reg?: number;
+  /** Collation and affinity the closure compiler derived (for comparisons emitted here). */
+  collation?: number;
+  affinity?: string;
 }
 
 export interface CodegenHelpers {
@@ -58,6 +61,7 @@ function orNull(a: string, b: string): string {
 }
 
 const ARITH = new Set(['+', '-', '*', '/', '%']);
+const utf8Encoder = new TextEncoder();
 const CMP = new Set(['=', '!=', '<', '<=', '>', '>=']);
 const isNum = (t: StaticType): boolean => t === 'int' || t === 'real' || t === 'num';
 
@@ -155,6 +159,14 @@ class Emitter {
             this.lines.push(...inner);
             return this.compare(e.op, a, b);
           }
+          if ((e.op === '=' || e.op === '!=') && a.type === 'text' && b.type === 'text' && this.binaryTextOperands(e.left, e.right)) {
+            // Text = text under BINARY: UTF-16 equality is UTF-8 byte equality, so compare JS strings.
+            this.lines.push(...inner);
+            const v = this.tmp();
+            const nul = orNull(nullOf(a), nullOf(b));
+            this.lines.push(`const ${v}n = ${nul}; const ${v} = ${v}n ? 0 : (${a.v} ${e.op === '=' ? '===' : '!=='} ${b.v} ? 1 : 0);`);
+            return { v, nul: `${v}n`, type: 'int' };
+          }
           return this.viaFallback(e);
         }
         return this.viaFallback(e);
@@ -224,6 +236,24 @@ class Emitter {
         ` ${v} = ${tb} === ${short} ? ${shortVal} : (${ta} === null || ${tb} === null) ? null : ${longVal}; }`,
     );
     return { v, type: 'int' };
+  }
+
+  /** The closure compiler's view of `e` (type, register, collation, affinity). */
+  fallbackOf(e: Expr): FallbackNode {
+    return this.fallback(e);
+  }
+
+  /** Register a constant; returns its JS expression. */
+  constant(x: unknown): string {
+    return this.konst(x);
+  }
+
+  /** Both comparison operands use BINARY collation and neither applies numeric affinity. */
+  binaryTextOperands(l: Expr, r: Expr): boolean {
+    const ok = (c: FallbackNode): boolean => (c.collation ?? 0) === 0 && (c.affinity === undefined || c.affinity === 'TEXT' || c.affinity === 'NONE' || c.affinity === 'BLOB');
+    const cl = this.fallback(l);
+    const cr = this.fallback(r);
+    return cl.collation !== undefined && cr.collation !== undefined && ok(cl) && ok(cr);
   }
 
   private compare(op: string, a: Gen, b: Gen): Gen {
@@ -341,7 +371,17 @@ const loaderFactories = new Map<string, (H: LoaderHelpers) => Loader>();
 type Assign = (reg: number, expr: string) => string;
 const toRegister: Assign = (reg, expr) => `r[${reg}] = ${expr};`;
 
-function emitDecode(spec: LoaderSpec, L: string[], assign: Assign = toRegister): void {
+/** Byte bounds of a var-length column in the record being decoded (valid after the decode header). */
+interface ColBounds {
+  isNull: string;
+  st: string;
+  fin: string;
+}
+
+/** Called after the decode header with a bounds accessor; returns statements run before any column is decoded. */
+type PreDecode = (bounds: (col: number) => ColBounds) => string[];
+
+function emitDecode(spec: LoaderSpec, L: string[], assign: Assign = toRegister, pre?: PreDecode): void {
   const n = spec.types.length;
   const bitmap = (n + 7) >>> 3;
   L.push('const kl = b[off] | (b[off + 1] << 8); const vo = off + 7 + kl;');
@@ -349,6 +389,12 @@ function emitDecode(spec: LoaderSpec, L: string[], assign: Assign = toRegister):
     L.push(`const bm = vo + 3; const fx = bm + ${bitmap}; const vt = fx + ${spec.fixedSize};`);
     const needsVar = spec.decode.some((_, i) => i % 2 === 0 && !(spec.types[spec.decode[i]] === 'INTEGER' || spec.types[spec.decode[i]] === 'REAL'));
     if (needsVar) L.push(`const wide = (b[vo] & 1) === 1; const vd = vt + ${spec.varCount} * (wide ? 4 : 2);`);
+    const endOf = (j: number): string => `(wide ? dv.getUint32(vt + ${4 * j}, true) : (b[vt + ${2 * j}] | (b[vt + ${2 * j + 1}] << 8)))`;
+    const bounds = (col: number): ColBounds => {
+      const sl = spec.slots[col];
+      return { isNull: `(b[bm + ${col >>> 3}] & ${1 << (col & 7)}) !== 0`, st: sl === 0 ? 'vd' : `vd + ${endOf(sl - 1)}`, fin: `vd + ${endOf(sl)}` };
+    };
+    if (pre && needsVar) L.push(...pre(bounds));
     for (let i = 0; i < spec.decode.length; i += 2) {
       const col = spec.decode[i];
       const reg = spec.decode[i + 1];
@@ -364,9 +410,7 @@ function emitDecode(spec: LoaderSpec, L: string[], assign: Assign = toRegister):
       } else if (t === 'REAL') {
         value = assign(reg, `dv.getFloat64(fx + ${sl}, true)`);
       } else {
-        const endOf = (j: number): string => `(wide ? dv.getUint32(vt + ${4 * j}, true) : (b[vt + ${2 * j}] | (b[vt + ${2 * j + 1}] << 8)))`;
-        const st = sl === 0 ? 'vd' : `vd + ${endOf(sl - 1)}`;
-        const fin = `vd + ${endOf(sl)}`;
+        const { st, fin } = bounds(col);
         if (t === 'TEXT') value = assign(reg, `H.utf8(b, ${st}, ${fin})`);
         else if (t === 'BLOB') value = assign(reg, `b.slice(${st}, ${fin})`);
         else value = assign(reg, `H.tagged(b, dv, ${st}, ${fin})`);
@@ -453,12 +497,31 @@ class Pipeline {
     return l;
   }
 
+  /** `column = 'text literal'` conjuncts (BINARY): checked on the raw UTF-8 bytes before decoding. */
+  private readonly textEq: { reg: number; bytes: Uint8Array }[] = [];
+
   /** WHERE: every conjunct must be true (NULL counts as false). */
   addPredicates(preds: Expr[]): void {
     for (const p of preds) {
+      const eq = this.textEqualityConjunct(p);
+      if (eq) this.textEq.push(eq);
       const g = this.em.gen(p);
       this.rowLines.push(...this.take(), `if (!${this.em.isTrue(g)}) continue;`);
     }
+  }
+
+  private textEqualityConjunct(p: Expr): { reg: number; bytes: Uint8Array } | null {
+    if (p.kind !== 'binary' || p.op !== '=') return null;
+    for (const [col, lit] of [
+      [p.left, p.right],
+      [p.right, p.left],
+    ] as const) {
+      if (lit.kind !== 'literal' || typeof lit.value !== 'string') continue;
+      const c = this.em.fallbackOf(col);
+      if (c.reg === undefined || c.type !== 'text' || !this.em.binaryTextOperands(col, lit)) continue;
+      return { reg: c.reg, bytes: utf8Encoder.encode(lit.value) };
+    }
+    return null;
   }
 
   /** Read a decoded register as a nullable JS value expression. */
@@ -480,7 +543,22 @@ class Pipeline {
       return expr === 'null' ? `c${reg}n = true; c${reg} = 0;${m}` : `c${reg}n = false; c${reg} = ${expr};${m}`;
     };
     const dec: string[] = [];
-    emitDecode(spec, dec, assign);
+    const textCol = new Map<number, number>(); // reg -> TEXT column decoded into it
+    for (let i = 0; i < spec.decode.length; i += 2) if (spec.types[spec.decode[i]] === 'TEXT') textCol.set(spec.decode[i + 1], spec.decode[i]);
+    const prefilters = this.textEq.filter((t) => textCol.has(t.reg));
+    const pre: PreDecode | undefined = prefilters.length
+      ? (bounds) =>
+          prefilters.map((t) => {
+            const bd = bounds(textCol.get(t.reg)!);
+            const k = this.em.constant(t.bytes);
+            const L = t.bytes.length;
+            // NULL or a different byte string: the conjunct is not true, skip the row undecoded.
+            const head = `if (${bd.isNull}) continue; { const s = ${bd.st}; if (${bd.fin} - s !== ${L}) continue;`;
+            if (L <= 16) return `${head}${L ? ` if (!(${Array.from(t.bytes, (x, j) => `b[s + ${j}] === ${x}`).join(' && ')})) continue;` : ''} }`;
+            return `${head} const q = ${k}; let j = 0; while (j < ${L} && b[s + j] === q[j]) j++; if (j !== ${L}) continue; }`;
+          })
+      : undefined;
+    emitDecode(spec, dec, assign, pre);
     // Registers referenced but not decoded here (e.g. outer-query columns) come from the register file.
     const outer = [...localRegs.keys()].filter((reg) => !decodedRegs.has(reg));
     const locals = [...localRegs.keys()].filter((reg) => decodedRegs.has(reg));

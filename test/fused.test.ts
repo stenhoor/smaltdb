@@ -101,3 +101,37 @@ describe('fused scan + filter and fused GROUP BY', () => {
     expect(d.pager.pinnedCount()).toBe(0);
   });
 });
+
+describe('raw-byte prefilter for text = literal', () => {
+  it('matches SQLite for NULLs, empty, multi-byte, long literals and non-BINARY collations', () => {
+    const d = Database.openFile(new MemoryVfs().openSync('p.db'), { pageSize: 1024 });
+    const ddl = 'CREATE TABLE p(id INTEGER PRIMARY KEY, s TEXT, n TEXT COLLATE NOCASE, k INT, big TEXT)';
+    d.exec(ddl);
+    lite.exec(ddl + ' STRICT');
+    const vals = ["'abc'", "'ABC'", "''", 'NULL', "'héllo'", "'日本語'", "'😀x'", `'${'long-string-'.repeat(3)}'`, `'${'long-string-'.repeat(3)}!'`, "'abc '"];
+    const rows: string[] = [];
+    for (let i = 1; i <= 800; i++) {
+      const big = i % 50 === 0 ? `'${'y'.repeat(1500)}'` : 'NULL'; // overflow cells take the slow path
+      rows.push(`(${i}, ${vals[i % vals.length]}, ${vals[(i * 3) % vals.length]}, ${i % 5}, ${big})`);
+    }
+    const ins = `INSERT INTO p VALUES ${rows.join(',')}`;
+    d.exec(ins);
+    lite.exec(ins);
+    const lits = ["'abc'", "''", "'héllo'", "'日本語'", "'😀x'", `'${'long-string-'.repeat(3)}'`, "'nope'", "'ABC'"];
+    for (const lit of lits) {
+      for (const q of [
+        `SELECT id, s FROM p WHERE s = ${lit}`,
+        `SELECT id FROM p WHERE ${lit} = s AND k > 1`,
+        `SELECT count(*) FROM p WHERE s = ${lit}`,
+        `SELECT k, count(*) FROM p WHERE s = ${lit} GROUP BY k`,
+        `SELECT id FROM p WHERE n = ${lit}`, // NOCASE column: no byte prefilter
+        `SELECT id FROM p WHERE s = ${lit} COLLATE NOCASE`,
+        `SELECT id FROM p WHERE s = ${lit} OR k = 0`,
+      ]) {
+        const a = JSON.stringify(lite.selectArrays(q).map(String).sort());
+        const b = JSON.stringify(d.query(q).rows.map(String).sort());
+        expect(b, q).toBe(a);
+      }
+    }
+  });
+});

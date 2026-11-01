@@ -1,6 +1,6 @@
 import { SmaltError } from '../errors.js';
 import type { BTree, BTreeCursor } from '../storage/btree.js';
-import { KeyEncoder, ROWID_KEY_SIZE, decodeKey, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
+import { KeyEncoder, ROWID_KEY_SIZE, readNumericKeyAt, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
 import { type RecordReader, decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
 import { type LoaderHelpers, type LoaderSpec, type ScanState, codegenEnabled, generateLoader } from './codegen.js';
 
@@ -437,7 +437,7 @@ export class IndexScan implements Operator {
     c.loadKey();
     const kb = c.keyBytes;
     const end = c.keyOffset + c.keyLength;
-    const rowid = decodeKey(kb.subarray(end - 11, end))[0] as number | bigint;
+    const rowid = readNumericKeyAt(kb, end - 11);
     writeRowidKey(this.keyBuf, 0, rowid);
     const t = this.tab!;
     if (!t.seek(this.keyBuf) || t.compareKey(this.keyBuf) !== 0) {

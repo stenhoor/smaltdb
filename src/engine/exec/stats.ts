@@ -1,6 +1,6 @@
 import type { IndexSchema, TableSchema } from '../catalog/schema.js';
 import { BTree } from '../storage/btree.js';
-import { decodeKey } from '../storage/key-codec.js';
+import { decodeKey, encodeRowidKey, readRowidKey } from '../storage/key-codec.js';
 import { RecordReader } from '../storage/record.js';
 import type { SqlValue } from '../values.js';
 import { hashKey } from './convert.js';
@@ -146,6 +146,87 @@ function sameKey(a: SqlValue, b: SqlValue): boolean {
   if (a instanceof Uint8Array && b instanceof Uint8Array) return a.length === b.length && a.every((x, i) => x === b[i]);
   // eslint-disable-next-line eqeqeq
   return (typeof a === 'number' || typeof a === 'bigint') && (typeof b === 'number' || typeof b === 'bigint') && a == b;
+}
+
+// ------------------------------------------------------------------ sampling
+
+/** Tables up to this many (estimated) rows are analyzed exactly instead of sampled. */
+export const EXACT_STATS_ROWS = 4096;
+const SAMPLE_RUNS = 32;
+const SAMPLE_RUN_ROWS = 48;
+
+/**
+ * Statistics for tables that have never been ANALYZEd, computed on demand by the planner.
+ * Small tables are scanned exactly; larger ones are sampled with {@link SAMPLE_RUNS} short runs of
+ * consecutive rows (~1.5k rows, a few dozen page reads). Run starts are jittered within evenly
+ * spaced strata, since exactly periodic positions alias with periodic data (every run can land on
+ * the same values). Per-column distinct counts are scaled up with the Duj1 estimator
+ * (Haas & Stokes 1998): D = n·d / (n − f1 + f1·n/N), where d is the distinct values in the sample
+ * and f1 the values seen exactly once; it gives N for all-distinct samples and d when nothing is
+ * a singleton.
+ */
+export function sampleTable(tree: BTree, table: TableSchema, estimatedRows: number): TableStats {
+  if (estimatedRows <= EXACT_STATS_ROWS) return analyzeTable(tree, table);
+  const n = table.columns.length;
+  const freq = Array.from({ length: n }, () => new Map<number, number>());
+  const nulls = new Array(n).fill(0);
+  const reader = new RecordReader(table.layout, table.recordDefaults);
+  let sampled = 0;
+  const c = tree.cursor();
+  try {
+    if (!c.first()) return { rows: 0, ndv: new Array(n).fill(0), nulls };
+    c.loadKey();
+    const lo = Number(readRowidKey(c.keyBytes, c.keyOffset));
+    c.last();
+    c.loadKey();
+    const hi = Number(readRowidKey(c.keyBytes, c.keyOffset));
+    let seen = -Infinity; // highest rowid sampled so far (runs must not overlap)
+    let seed = (table.rootPage * 0x9e3779b1) >>> 0 || 1; // deterministic jitter (xorshift32)
+    for (let r = 0; r < SAMPLE_RUNS; r++) {
+      seed ^= seed << 13;
+      seed ^= seed >>> 17;
+      seed ^= seed << 5;
+      seed >>>= 0;
+      const u = seed / 4294967296;
+      const target = Math.max(Math.floor(lo + ((hi - lo) * (r + u)) / SAMPLE_RUNS), seen + 1);
+      if (!Number.isSafeInteger(target) || !c.seek(encodeRowidKey(target))) break;
+      for (let i = 0; i < SAMPLE_RUN_ROWS; i++) {
+        c.loadKey();
+        seen = Number(readRowidKey(c.keyBytes, c.keyOffset));
+        c.loadValue();
+        reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+        sampled++;
+        for (let k = 0; k < n; k++) {
+          if (k === table.rowidAlias) continue;
+          const v = reader.column(k);
+          if (v === null) nulls[k]++;
+          else {
+            const h = hashValue(v);
+            const m = freq[k];
+            m.set(h, (m.get(h) ?? 0) + 1);
+          }
+        }
+        if (!c.next()) break;
+      }
+      if (!c.valid) break;
+    }
+  } finally {
+    c.close();
+  }
+  const N = Math.max(estimatedRows, sampled);
+  const ns = Math.max(1, sampled);
+  const ndv = freq.map((m, k) => {
+    if (k === table.rowidAlias) return N;
+    let f1 = 0;
+    for (const cnt of m.values()) if (cnt === 1) f1++;
+    const d = m.size;
+    const nonNull = Math.round(N * (1 - nulls[k] / ns));
+    const sampleNonNull = ns - nulls[k];
+    if (sampleNonNull <= 0) return 0;
+    const est = (sampleNonNull * d) / (sampleNonNull - f1 + (f1 * sampleNonNull) / Math.max(1, nonNull));
+    return Math.max(d, Math.min(Math.round(est), nonNull));
+  });
+  return { rows: N, ndv, nulls: nulls.map((x) => Math.round((x / ns) * N)) };
 }
 
 /**

@@ -1,3 +1,4 @@
+import type { TableStats } from './stats.js';
 import { SmaltError } from '../errors.js';
 import { type TableSchema, findColumn } from '../catalog/schema.js';
 import type {
@@ -65,6 +66,8 @@ import {
 export interface PlannerEnv {
   getTable(name: string): TableSchema | undefined;
   openTree(rootPage: number): BTree;
+  /** On-demand statistics for a table without ANALYZE results (sampled; cached by the database). */
+  sampledStats?(table: TableSchema): TableStats | undefined;
   funcCtx: FunctionContext;
   state: ExecState;
 }
@@ -1227,18 +1230,24 @@ export class Planner {
   /** Root page -> row estimate (from the tree shape) each costed table had when this plan was made. */
   readonly rowAssumptions = new Map<number, number>();
 
-  /** Estimated distinct values of a column (ANALYZE, unique/rowid, index stats, else rows/10). */
+  /** Statistics for a source's table: ANALYZE results, else sampled on demand. */
+  private statsOf(src: Source): TableStats | undefined {
+    const t = src.table;
+    if (!t) return undefined;
+    return t.stats ?? this.env.sampledStats?.(t);
+  }
+
+  /** Estimated distinct values of a column (rowid/unique, ANALYZE, index stats, sample, else rows/10). */
   private ndv(src: Source, col: number | 'rowid'): number {
     const n = this.tableRows(src);
     const t = src.table;
     if (!t) return Math.max(1, n / 10);
     if (col === 'rowid' || col === t.rowidAlias) return n;
+    for (const ix of t.indexes) if (ix.unique && ix.columns.length === 1 && ix.columns[0].column === col) return n;
     if (t.stats) return Math.max(1, t.stats.ndv[col] || 1);
-    for (const ix of t.indexes) {
-      if (ix.columns[0].column !== col) continue;
-      if (ix.unique && ix.columns.length === 1) return n;
-      if (ix.stats) return Math.max(1, n / ix.stats.avg[0]);
-    }
+    for (const ix of t.indexes) if (ix.columns[0].column === col && ix.stats) return Math.max(1, n / ix.stats.avg[0]);
+    const sampled = this.statsOf(src);
+    if (sampled) return Math.max(1, Math.min(n, sampled.ndv[col] || 1));
     return Math.max(1, n / 10);
   }
 
@@ -1282,7 +1291,8 @@ export class Planner {
       case 'isNull': {
         const c = this.colRef(e.expr, scope);
         let s = 0.05;
-        if (c && c.col !== 'rowid' && c.src.table?.stats) s = c.src.table.stats.nulls[c.col] / Math.max(1, c.src.table.stats.rows);
+        const st = c && c.col !== 'rowid' ? this.statsOf(c.src) : undefined;
+        if (c && c.col !== 'rowid' && st) s = st.nulls[c.col] / Math.max(1, st.rows);
         else if (c?.col === 'rowid') s = 0;
         return e.not ? 1 - s : s;
       }

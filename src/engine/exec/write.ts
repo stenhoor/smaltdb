@@ -1,7 +1,7 @@
 import { ConstraintError, type IndexSchema, type TableSchema } from '../catalog/schema.js';
 import { SmaltError } from '../errors.js';
 import { BTree } from '../storage/btree.js';
-import { KeyEncoder, ROWID_KEY_SIZE, decodeKey, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
+import { KeyEncoder, ROWID_KEY_SIZE, readNumericKeyAt, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
 import { RecordEncoder, RecordReader } from '../storage/record.js';
 import type { Pager } from '../storage/pager.js';
 import type { SqlValue } from '../values.js';
@@ -109,7 +109,7 @@ export class TableWriter {
         if (c.keyLength < prefix.length) return null;
         for (let j = 0; j < prefix.length; j++) if (c.keyBytes[c.keyOffset + j] !== prefix[j]) return null;
         const end = c.keyOffset + c.keyLength;
-        const rowid = decodeKey(c.keyBytes.subarray(end - 11, end))[0] as number | bigint;
+        const rowid = readNumericKeyAt(c.keyBytes, end - 11);
         // eslint-disable-next-line eqeqeq
         if (except !== null && rowid == except) continue;
         return rowid;

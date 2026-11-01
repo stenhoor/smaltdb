@@ -207,6 +207,26 @@ export function decodeKey(key: Uint8Array, cols?: readonly KeyColumn[]): SqlValu
   return out;
 }
 
+const numScratch = new Uint8Array(8);
+const numScratchView = new DataView(numScratch.buffer);
+
+/**
+ * Decode the ascending numeric key component whose tag byte is at `key[pos]` (11 bytes), without
+ * allocating — e.g. the rowid suffix of an index entry. Same results as {@link decodeKey}.
+ */
+export function readNumericKeyAt(key: Uint8Array, pos: number): number | bigint {
+  if (key[pos] !== TAG_NUM) throw new CorruptionError(`expected a numeric key component, found tag 0x${key[pos].toString(16)}`);
+  if (key[pos + 1] & 0x80) {
+    numScratch[0] = key[pos + 1] & 0x7f;
+    for (let i = 1; i < 8; i++) numScratch[i] = key[pos + 1 + i];
+  } else {
+    for (let i = 0; i < 8; i++) numScratch[i] = ~key[pos + 1 + i] & 0xff;
+  }
+  const d = numScratchView.getFloat64(0, false);
+  const delta = ((key[pos + 9] << 8) | key[pos + 10]) - 0x8000;
+  return delta === 0 ? d : BigInt(d) + BigInt(delta);
+}
+
 // ------------------------------------------------------------------ rowid keys
 
 /**

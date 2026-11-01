@@ -63,15 +63,19 @@ async function main(): Promise<void> {
       /* not implemented yet */
     }
   }
+  // Median of at least `reps` runs, and enough runs to cover ~300 ms (millisecond queries are noisy).
   const time = (f: () => unknown, reps: number): number => {
     f();
     const t: number[] = [];
-    for (let i = 0; i < reps; i++) {
+    let total = 0;
+    while (t.length < reps || (total < 300 && t.length < 2000)) {
       const t0 = performance.now();
       f();
-      t.push(performance.now() - t0);
+      const dt = performance.now() - t0;
+      t.push(dt);
+      total += dt;
     }
-    return t.sort((a, b) => a - b)[reps >> 1];
+    return t.sort((a, b) => a - b)[t.length >> 1];
   };
   const canon = (rows: unknown[][]): string => JSON.stringify(rows.map((r) => r.map((v) => (typeof v === 'number' && !Number.isInteger(v) ? Number(v.toPrecision(10)) : typeof v === 'bigint' ? Number(v) : v)).join('|')).sort());
   console.log('query'.padEnd(40), 'smaltdb      sqlite     ratio   result   plan');
@@ -88,7 +92,7 @@ async function main(): Promise<void> {
     const tLite = time(() => s.selectArrays(sql), reps);
     const ok = canon(a) === canon(b) ? 'ok' : 'MISMATCH';
     const plan = db.query('EXPLAIN QUERY PLAN ' + sql).rows.map((r) => r[3]).join(' | ');
-    console.log(`${name.padEnd(40)} ${tSmalt.toFixed(1).padStart(8)} ms ${tLite.toFixed(1).padStart(8)} ms ${(tLite / tSmalt).toFixed(2).padStart(7)}x  ${ok.padEnd(8)} ${plan}`);
+    console.log(`${name.padEnd(40)} ${tSmalt.toFixed(2).padStart(8)} ms ${tLite.toFixed(2).padStart(8)} ms ${(tLite / tSmalt).toFixed(2).padStart(7)}x  ${ok.padEnd(8)} ${plan}`);
   }
 }
-main();
+if (/joins\.(ts|mjs)$/.test(process.argv[1] ?? "")) void main();

@@ -33,7 +33,7 @@ import { BTree } from './storage/btree.js';
 import { KeyEncoder, decodeKey, readRowidKey } from './storage/key-codec.js';
 import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordReader } from './storage/record.js';
-import { analyzeIndex, analyzeTable } from './exec/stats.js';
+import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec/stats.js';
 import type { SqlValue } from './values.js';
 import type { Vfs, VfsFile } from './vfs/types.js';
 
@@ -312,7 +312,7 @@ export class Database implements FunctionContext {
     const stmt = ps.stmt;
     const regs = new Registers(ps.paramCount);
     const planner = new Planner(
-      { getTable: (n) => this.getTable(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state },
+      { getTable: (n) => this.getTable(n), openTree: (root) => this.tree(root), sampledStats: (t) => this.sampledStats(t), funcCtx: this, state: this.state },
       regs,
     );
     planner.sqlText = ps.text;
@@ -512,6 +512,24 @@ export class Database implements FunctionContext {
     }
     this.schemaChanged();
     return none;
+  }
+
+  /** Sampled statistics per table schema object (a schema reload drops them with the old objects). */
+  private readonly sampled = new WeakMap<TableSchema, { stats: TableStats; at: number }>();
+
+  /**
+   * Statistics for a table that has not been ANALYZEd, computed on first use by the planner and
+   * recomputed when the table's size (estimated from the tree shape) has changed 4x or more.
+   */
+  private sampledStats(t: TableSchema): TableStats | undefined {
+    if (t.name.toLowerCase().startsWith('smalt_')) return undefined;
+    const tree = this.tree(t.rootPage);
+    const live = tree.estimateCount();
+    const hit = this.sampled.get(t);
+    if (hit && Math.max(live, 64) < Math.max(hit.at, 64) * 4 && Math.max(hit.at, 64) < Math.max(live, 64) * 4) return hit.stats;
+    const stats = sampleTable(tree, t, live);
+    this.sampled.set(t, { stats, at: live });
+    return stats;
   }
 
   /** Attach persisted statistics (smalt_stat) to the in-memory schema. */
