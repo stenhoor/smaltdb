@@ -259,6 +259,24 @@ MemoryVfs, median of 5). Invariant tests are in `test/perf-invariants.test.ts`.
 | `usesMemoryObjects` walks the AST per request; `morselQuery` cache-clears at 64 entries; merge statements compiled per run | Memoized per statement and schema version. The morsel cache is an LRU. Partial column types and the merge statement are compiled once per query text and schema; `smalt_partials()` reads the current rows at run time | 20000 checks with a TEMP table present: 25.2 ms | 0.04 ms |
 | TEMP-table growth never triggers re-planning | Statements re-check row assumptions when the memory pager's commit counter moves too (`Database.changeStamp`) | Plan kept after a TEMP table grew 1→20000 rows | Re-planned |
 
+### Regression check after all fixes
+
+`main` after the fixes (f42b0bc) against the last commit before them (6ec52a7), run back to back on the same
+machine. A difference counts only when the min–max ranges of the two runs do not overlap.
+
+| Suite | Result |
+|---|---|
+| Storage micro-benchmarks (`npm run bench`) | Flat. Sequential B-tree insert: 60.2 ms on both (median of 3 runs). |
+| Joins vs SQLite in Node (`bench/micro/joins.ts`, J1–J7) | Flat. J4 about 67 ms on both (6 runs each). |
+| `bench/micro/m7-perf.ts` | Every case the same or faster (table above). |
+| Browser, OPFS (47 workloads) | Nothing slower. Loading the join tables got faster: 1732 → 1330 ms. Geometric mean of the medians 0.0%. |
+| Browser, CPU only (`smaltdb-mem`, 45 workloads) | Nothing slower. Geometric mean −0.2% over 9 repetitions, against −0.7% for SQLite on the same runs. |
+
+The first run of `analytic: group by` came out 3–19% slower in individual browser runs, never outside the ranges.
+Measured directly in Node (15 fresh databases each) it is equal: 16.0–16.5 ms against 16.1–16.7 ms.
+
+Saved baselines: `bench/results/2026-11-01-chromium-f42b0bc.json` and `bench/results/2026-11-01-chromium-f42b0bc-cpu.json`.
+
 ## Cleanup
 
 Status: done, except two items kept on purpose and two that are behavior changes (follow-up features). Behavior is
