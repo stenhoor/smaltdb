@@ -93,3 +93,16 @@ describe('UPDATE ... FROM', () => {
     ]);
   });
 });
+
+describe('WITH on INSERT / UPDATE / DELETE', () => {
+  it('CTEs are visible to the statement', () => {
+    compare([
+      "WITH m AS (SELECT sku, sum(delta) AS d FROM moves GROUP BY sku) INSERT INTO kv(k, v) SELECT sku, d FROM m WHERE d > 0 ORDER BY sku RETURNING *",
+      'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5) INSERT INTO moves SELECT \'gen\', i FROM n',
+      "WITH big AS (SELECT sku FROM moves WHERE delta > 50) UPDATE inv SET qty = -1 WHERE sku IN (SELECT sku FROM big) RETURNING id",
+      'WITH t AS (SELECT sku, max(delta) AS d FROM moves GROUP BY sku) UPDATE inv SET qty = t.d FROM t WHERE t.sku = inv.sku',
+      "WITH gone AS (SELECT 'gen' AS s) DELETE FROM moves WHERE sku IN (SELECT s FROM gone) RETURNING delta",
+    ]);
+  });
+});
+

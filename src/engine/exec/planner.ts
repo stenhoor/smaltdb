@@ -1803,6 +1803,13 @@ export class Planner {
     return new Scope(parent);
   }
 
+  /** A scope holding the CTEs of a `WITH` clause attached to INSERT / UPDATE / DELETE. */
+  cteScope(w: WithClause): Scope {
+    const s = new Scope(null);
+    this.registerCtes(w, s);
+    return s;
+  }
+
   private resolveColumn(e: ColumnExpr, scope: Scope): ColumnBinding {
     let depth = 0;
     for (let s: Scope | null = scope; s; s = s.parent, depth++) {

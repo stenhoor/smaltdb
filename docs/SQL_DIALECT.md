@@ -106,7 +106,8 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
   `DELETE` (with a truncate fast path).
 - (M4) `RETURNING` on INSERT/UPDATE/DELETE (`*`, expressions, aliases; aggregates rejected like SQLite);
   upsert `ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET … [WHERE …]` with `excluded.*`, several clauses tried in order;
-  `UPDATE … FROM` (joined sources; with several matching FROM rows the first one wins, as in SQLite).
+  `UPDATE … FROM` (joined sources; with several matching FROM rows the first one wins, as in SQLite); `WITH [RECURSIVE]`
+  on INSERT … SELECT, UPDATE and DELETE.
 - (M4) Foreign keys are enforced, with SQLite's semantics: immediate constraints are checked at the end of each
   statement (temporary violations inside a statement are fine), `DEFERRABLE INITIALLY DEFERRED` ones at COMMIT;
   `ON DELETE` / `ON UPDATE` `NO ACTION | RESTRICT | CASCADE | SET NULL | SET DEFAULT` (actions recurse; RESTRICT is

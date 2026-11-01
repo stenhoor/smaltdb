@@ -35,6 +35,7 @@ import type {
   SelectStmt,
   Stmt,
   UpdateStmt,
+  WithClause,
 } from './sql/ast.js';
 import { parse, parseOne } from './sql/parser.js';
 import { BTree } from './storage/btree.js';
@@ -1312,7 +1313,13 @@ export class Database implements FunctionContext {
   }
 
   private compileInsert(stmt: InsertStmt, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
-    if (stmt.with) throw new SmaltError('SMALT_UNSUPPORTED', 'WITH ... INSERT is not supported yet');
+    // WITH ... INSERT: the CTEs belong to the row source.
+    if (stmt.with) {
+      if (stmt.source.kind !== 'select') throw new SmaltError('SMALT_UNSUPPORTED', 'WITH ... INSERT ... VALUES is not supported yet');
+      const sel = stmt.source.select;
+      const merged = sel.with ? { ...sel.with, recursive: sel.with.recursive || stmt.with.recursive, ctes: [...stmt.with.ctes, ...sel.with.ctes] } : stmt.with;
+      stmt = { ...stmt, with: undefined, source: { kind: 'select', select: { ...sel, with: merged } } };
+    }
     const table = this.targetTable(stmt.table, stmt.schema);
     const ncols = table.columns.length;
     const targets: number[] = stmt.columns
@@ -1552,8 +1559,15 @@ export class Database implements FunctionContext {
   }
 
   /** Plan a scan of `table` filtered by `where`, decoding every column and the rowid. */
-  private planTarget(table: TableSchema, alias: string | undefined, where: Expr | undefined, planner: Planner, from?: FromItem): { root: Operator; colRegs: number[]; rowidReg: number; scope: CompileScope } {
-    const scope = planner.newScope();
+  private planTarget(
+    table: TableSchema,
+    alias: string | undefined,
+    where: Expr | undefined,
+    planner: Planner,
+    from?: FromItem,
+    w?: WithClause,
+  ): { root: Operator; colRegs: number[]; rowidReg: number; scope: CompileScope } {
+    const scope = planner.newScope(w ? planner.cteScope(w) : null);
     const target: FromItem = { kind: 'table', schema: 'main', name: table.name, alias, pos: 0, end: 0 };
     // UPDATE ... FROM: the target joined with the FROM sources (the WHERE holds the join conditions).
     const item: FromItem = from ? { kind: 'join', joinType: 'INNER', natural: false, left: target, right: from, pos: 0, end: 0 } : target;
@@ -1570,9 +1584,8 @@ export class Database implements FunctionContext {
 
   private compileUpdate(stmt: UpdateStmt, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
     if (stmt.orderBy.length || stmt.limit) throw new SmaltError('SMALT_UNSUPPORTED', 'UPDATE ... ORDER BY/LIMIT is not supported');
-    if (stmt.with) throw new SmaltError('SMALT_UNSUPPORTED', 'WITH ... UPDATE is not supported yet');
     const table = this.targetTable(stmt.table, stmt.schema);
-    const { root, colRegs, rowidReg, scope } = this.planTarget(table, stmt.alias, stmt.where, planner, stmt.from);
+    const { root, colRegs, rowidReg, scope } = this.planTarget(table, stmt.alias, stmt.where, planner, stmt.from, stmt.with);
     const sets: { col: number; c: Compiled }[] = [];
     for (const s of stmt.set) {
       if (s.columns.length !== 1) throw new SmaltError('SMALT_UNSUPPORTED', 'row-value assignments are not supported yet');
@@ -1661,9 +1674,8 @@ export class Database implements FunctionContext {
 
   private compileDelete(stmt: DeleteStmt, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
     if (stmt.orderBy.length || stmt.limit) throw new SmaltError('SMALT_UNSUPPORTED', 'DELETE ... ORDER BY/LIMIT is not supported');
-    if (stmt.with) throw new SmaltError('SMALT_UNSUPPORTED', 'WITH ... DELETE is not supported yet');
     const table = this.targetTable(stmt.table, stmt.schema);
-    const { root, colRegs, rowidReg } = this.planTarget(table, stmt.alias, stmt.where, planner);
+    const { root, colRegs, rowidReg } = this.planTarget(table, stmt.alias, stmt.where, planner, undefined, stmt.with);
     // DELETE without WHERE truncates, unless foreign keys need to see every row.
     const truncate = !stmt.where && !stmt.returning;
     const ncols = table.columns.length;
