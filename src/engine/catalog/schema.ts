@@ -102,6 +102,18 @@ export interface ColumnarTableInfo {
   delRoot: number;
   /** Reader with its decoded-chunk cache (dropped on rollback and rewrite). */
   store?: import('../storage/columnar.js').ColumnStore;
+  /**
+   * Exact rows in the delta store and entries in the deletion tree, kept current by the writer
+   * (dropped on rollback; recounted when missing). Saves counting both trees after every write.
+   */
+  counts?: { delta: number; deleted: number };
+  /** Bumped on every change to the deletion tree in this connection (cache key of `deleted`). */
+  delVersion?: number;
+  /**
+   * The deleted rowids as a set, valid for `key` (commit counter, `delVersion`, deletion root):
+   * scans reuse it instead of reading the deletion tree each time.
+   */
+  deleted?: { key: string; set: Set<number | bigint> | null };
 }
 
 /** A materialized view's definition and refresh state (its rows live in the table's tree). */

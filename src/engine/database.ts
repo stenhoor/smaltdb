@@ -332,6 +332,14 @@ export class Database implements FunctionContext {
     return walk(parsed.stmt);
   }
 
+  /**
+   * @internal Changes when committed data changes, in the file or in the memory store (TEMP
+   * tables): statements re-check their row-count assumptions when it moves.
+   */
+  changeStamp(): string {
+    return this.mem ? `${this.pager.changeCounter}/${this.mem.changeCounter}` : String(this.pager.changeCounter);
+  }
+
   /** Copy the WAL into the database file (also happens automatically and on close). */
   checkpoint(): void {
     if (!this.autocommit) throw new SmaltError('SMALT_BUSY', 'cannot checkpoint inside a transaction');
@@ -522,7 +530,14 @@ export class Database implements FunctionContext {
     this.touchTable(table);
     const c = table.columnar;
     const w = c
-      ? new ColumnarTableWriter(table, this.pager, (root) => this.tree(root), () => this.columnStoreOf(table, true), this.tree(c.delRoot), () => this.columnarTouched.add(table))
+      ? new ColumnarTableWriter(table, this.pager, (root) => this.tree(root), () => this.columnStoreOf(table, true), this.tree(c.delRoot), (dDelta, dDeleted) => {
+          this.columnarTouched.add(table);
+          if (dDeleted !== 0) c.delVersion = (c.delVersion ?? 0) + 1;
+          if (c.counts) {
+            c.counts.delta += dDelta;
+            c.counts.deleted += dDeleted;
+          }
+        })
       : new TableWriter(table, this.pager, (root) => this.tree(root));
     w.beforeDelete = (row) => {
       if (this.fk.involved(table)) this.fk.beforeDelete(table, row);
@@ -584,7 +599,8 @@ export class Database implements FunctionContext {
       const m = this.morsel;
       const columns = [...Array.from({ length: m.keys }, (_, i) => `k${i}`), ...Array.from({ length: m.width - m.keys }, (_, i) => `a${i}`)];
       // Typed like the partial query's columns: a REAL partial (max(x) = 2.0) stays REAL when merged.
-      return { columns: columns.map((c, i) => ({ name: c, type: m.types[i] ?? ('any' as StaticType) })), rows: () => m.rows };
+      // Rows are read when the plan runs (merge statements are cached and reused).
+      return { columns: columns.map((c, i) => ({ name: c, type: m.types[i] ?? ('any' as StaticType) })), rows: () => this.morsel?.rows ?? [] };
     }
     if (schema === 'information_schema') {
       const vt = informationSchema(name, this.catalogSnapshot());
@@ -841,7 +857,7 @@ export class Database implements FunctionContext {
       openTree: (root) => this.tree(root),
       sampledStats: (t) => this.sampledStats(t),
       columnStore: (t) => (t.columnar ? this.columnStoreOf(t, true) : (t.matview!.store ??= new ColumnStore(this.tree(t.rootPage)))),
-      deletedRows: (t) => loadDeleted(this.tree(t.columnar!.delRoot)),
+      deletedRows: (t) => this.deletedRowsOf(t),
       funcCtx: this,
       state: this.state,
       spill: this.spill,
@@ -1268,14 +1284,19 @@ export class Database implements FunctionContext {
 
   /** `PRAGMA parallel_aggregates`: whether large aggregates may run as morsels on parallel readers. */
   private parallelAggregates = true;
-  private morselCache = new Map<string, { version: number; parsed: ParsedStatement; q: MorselQuery } | null>();
+  private morselCache = new Map<string, MorselEntry | null>();
   /** Partial rows being merged: the `smalt_partials()` source of the merge query. */
   private morsel: { rows: SqlValue[][]; keys: number; width: number; types: StaticType[] } | null = null;
 
-  private morselQuery(sql: string): { parsed: ParsedStatement; q: MorselQuery } | null {
+  private morselQuery(sql: string): MorselEntry | null {
     const hit = this.morselCache.get(sql);
-    if (hit !== undefined && (hit === null || hit.version === this.schemaVersion)) return hit;
-    let entry: { version: number; parsed: ParsedStatement; q: MorselQuery } | null = null;
+    if (hit !== undefined && (hit === null || hit.version === this.schemaVersion)) {
+      // Least recently used goes first: move this one to the end.
+      this.morselCache.delete(sql);
+      this.morselCache.set(sql, hit);
+      return hit;
+    }
+    let entry: MorselEntry | null = null;
     try {
       const parsed = parseOne(sql);
       if (parsed.stmt.kind === 'select') {
@@ -1296,7 +1317,8 @@ export class Database implements FunctionContext {
     } catch {
       entry = null; // let the normal path report the error
     }
-    if (this.morselCache.size > 64) this.morselCache.clear();
+    this.morselCache.delete(sql);
+    if (this.morselCache.size >= 64) this.morselCache.delete(this.morselCache.keys().next().value!);
     this.morselCache.set(sql, entry);
     return entry;
   }
@@ -1381,10 +1403,11 @@ export class Database implements FunctionContext {
   mergePartials(sql: string, params: BindParams | undefined, partials: SqlValue[][]): QueryResult {
     const m = this.morselQuery(sql);
     if (!m) throw new SmaltError('SMALT_ERROR', 'statement cannot run as partial aggregates');
-    const types = new Statement(this, { ...m.parsed, stmt: m.q.partial(0, 1) }, sql).columnTypes;
+    // Partial column types and the merge statement are compiled once per query text and schema.
+    const types = (m.types ??= new Statement(this, { ...m.parsed, stmt: m.q.partial(0, 1) }, sql).columnTypes);
     this.morsel = { rows: partials, keys: m.q.keyCount, width: m.q.width, types };
     try {
-      const st = new Statement(this, { ...m.parsed, stmt: m.q.final }, sql);
+      const st = (m.final ??= new Statement(this, { ...m.parsed, stmt: m.q.final }, sql));
       return { columns: st.columns, rows: st.all(params) as SqlValue[][] };
     } finally {
       this.morsel = null;
@@ -1430,7 +1453,24 @@ export class Database implements FunctionContext {
    * written by committed statements never change in place, so the caches survive everything else.
    */
   private dropColumnarCaches(): void {
-    for (const t of this.tables.values()) if (t.columnar) t.columnar.store = undefined;
+    for (const t of [...this.tables.values(), ...this.shadowedMain.values()]) {
+      if (t.columnar) {
+        t.columnar.store = undefined;
+        t.columnar.counts = undefined;
+        t.columnar.deleted = undefined;
+      }
+    }
+  }
+
+  /**
+   * The deleted rowids of a columnar table, cached until deletions change in this connection or a
+   * new commit is visible (a reader's refresh, another connection's writes).
+   */
+  private deletedRowsOf(t: TableSchema): Set<number | bigint> | null {
+    const c = t.columnar!;
+    const key = `${this.pager.changeCounter}:${c.delVersion ?? 0}:${c.delRoot}`;
+    if (c.deleted?.key !== key) c.deleted = { key, set: loadDeleted(this.tree(c.delRoot)) };
+    return c.deleted.set;
   }
 
   /** Upsert (or with `info` null, delete) a table's row in smalt_columnar. */
@@ -1509,16 +1549,18 @@ export class Database implements FunctionContext {
    */
   private compactTouched(): void {
     for (const t of this.columnarTouched) {
-      if (!t.columnar || this.tables.get(t.name.toLowerCase()) !== t) continue; // dropped meanwhile
+      if (!t.columnar || this.getTable(t.name, 'main') !== t) continue; // dropped meanwhile
       const store = this.columnStoreOf(t, true);
-      const del = this.tree(t.columnar.delRoot);
-      const deltaCount = this.tree(t.rootPage).count();
-      const delCount = del.count();
+      // Running counts (kept by the writer); counted once when missing (after a rollback or reload).
+      const counts = (t.columnar.counts ??= { delta: this.tree(t.rootPage).count(), deleted: this.tree(t.columnar.delRoot).count() });
+      const deltaCount = counts.delta;
+      const delCount = counts.deleted;
       if (delCount > Math.max(COMPACT_ROWS, store.rows / 4)) {
         this.rewriteColumnar(t, true);
         continue;
       }
       if (deltaCount < COMPACT_ROWS) continue;
+      t.columnar.counts = undefined; // rows move out of the delta store: recount next time
       if (!this.appendDelta(t)) this.rewriteColumnar(t, true);
     }
     this.columnarTouched.clear();
@@ -1607,6 +1649,9 @@ export class Database implements FunctionContext {
     delta.clear();
     c.segRoot = segRoot;
     c.store = undefined;
+    c.counts = { delta: 0, deleted: 0 };
+    c.delVersion = (c.delVersion ?? 0) + 1;
+    c.deleted = undefined;
     this.writeColumnarMeta(t.name, c);
     this.dirtySchema = true;
     this.schemaChanged();
@@ -1717,12 +1762,19 @@ export class Database implements FunctionContext {
   }
 
   /** Mark fresh materialized views that read the object named `lower` stale. */
+  /** Materialized views (cached per schema version: touchName runs for every DML statement). */
+  private matviewTables(): TableSchema[] {
+    if (this.mvList?.version !== this.schemaVersion) this.mvList = { version: this.schemaVersion, list: [...this.tables.values()].filter((t) => t.matview) };
+    return this.mvList.list;
+  }
+  private mvList: { version: number; list: TableSchema[] } | null = null;
+
   private touchName(lower: string): void {
     if (this.rebuilding) return;
     let changed = false;
-    for (const t of this.tables.values()) {
-      const m = t.matview;
-      if (!m?.fresh || !(m.deps ??= this.selectDeps(m.select)).has(lower)) continue;
+    for (const t of this.matviewTables()) {
+      const m = t.matview!;
+      if (!m.fresh || !(m.deps ??= this.selectDeps(m.select)).has(lower)) continue;
       m.fresh = false;
       this.writeMatviewMeta(t.name, { populated: m.populated, refreshedAt: m.refreshedAt, fresh: false });
       changed = true;
@@ -3354,13 +3406,13 @@ export class Statement {
     readonly sql: string,
   ) {}
 
-  private checkedAt = -1;
+  private checkedAt = '';
 
   private prog(): Program {
     if (this.program === null || this.version !== this.db.schemaVersion || this.statsDrifted(this.program)) {
       this.program = this.db.compile(this.parsed);
       this.version = this.db.schemaVersion;
-      this.checkedAt = this.db.pager.changeCounter;
+      this.checkedAt = this.db.changeStamp();
     }
     return this.program;
   }
@@ -3370,7 +3422,7 @@ export class Statement {
    * grown or shrunk 4x or more: a plan made for an empty table should not survive it filling up.
    */
   private statsDrifted(p: Program): boolean {
-    const cc = this.db.pager.changeCounter;
+    const cc = this.db.changeStamp();
     if (cc === this.checkedAt || !p.rowAssumptions || p.rowAssumptions.size === 0) return false;
     this.checkedAt = cc;
     for (const [root, assumed] of p.rowAssumptions) {
@@ -3395,8 +3447,11 @@ export class Statement {
 
   /** Reads TEMP tables or memory-resident views (parallel readers cannot see them). */
   get usesMemoryObjects(): boolean {
-    return this.db.usesMemoryObjects(this.parsed);
+    // Memory objects come and go with DDL, which bumps the schema version.
+    if (this.memoryUse?.version !== this.db.schemaVersion) this.memoryUse = { version: this.db.schemaVersion, value: this.db.usesMemoryObjects(this.parsed) };
+    return this.memoryUse.value;
   }
+  private memoryUse: { version: number; value: boolean } | null = null;
 
   get paramCount(): number {
     return this.parsed.paramCount;
@@ -3650,3 +3705,12 @@ function tableStorage(stmt: CreateTableStmt): 'row' | 'columnar' {
 
 /** Snapshot of no memory objects (shared: restoring it creates fresh maps). */
 const EMPTY_MEM_SNAPSHOT: MemSnapshot = { temps: [], views: [] };
+
+/** A query analyzed for morsel execution, with its compiled merge statement (per schema version). */
+interface MorselEntry {
+  version: number;
+  parsed: ParsedStatement;
+  q: MorselQuery;
+  types?: StaticType[];
+  final?: Statement;
+}
