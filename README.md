@@ -1,4 +1,11 @@
-# smaltdb
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/lockup-on-dark.svg">
+    <img alt="smaltdb" src="docs/brand/lockup.svg" width="320">
+  </picture>
+</h1>
+
+**Small. Alternate. Fast.**
 
 **smaltdb** is an embedded SQL database engine for web browsers, written in JavaScript/TypeScript.
 It stores data in the [Origin Private File System (OPFS)](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system),
