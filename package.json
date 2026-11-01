@@ -17,7 +17,10 @@
     "bench": "node bench/run-node.mjs",
     "bench:browser": "node bench/browser/run.mjs",
     "check": "npm run typecheck && npm test",
-    "build": "node scripts/build.mjs"
+    "build": "node scripts/build.mjs",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs"
   },
   "devDependencies": {
     "@duckdb/duckdb-wasm": "^1.33.1-dev57.0",
@@ -27,6 +30,7 @@
     "esbuild": "^0.28.2",
     "fast-check": "^4.10.2",
     "typescript": "5.9",
+    "vitepress": "1.6.4",
     "vitest": "^5.0.5"
   },
   "exports": {

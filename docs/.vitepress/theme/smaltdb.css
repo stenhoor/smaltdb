@@ -1,0 +1,115 @@
+/* smaltdb — Kiln palette and Geist-forward type, from the smaltdb design system.
+   Contrast (WCAG 2): text >= 15:1, text-2 >= 8.7:1, text-3 >= 5.5:1, links >= 8.7:1, in both themes. */
+
+:root {
+  --vp-font-family-base: 'Geist', system-ui, sans-serif;
+  --vp-font-family-mono: 'Geist Mono', ui-monospace, monospace;
+  --smalt-brand-font: 'Martian Mono', ui-monospace, monospace;
+
+  --vp-c-bg: #FFFFFF;
+  --vp-c-bg-alt: #F5F6F8;
+  --vp-c-bg-elv: #FFFFFF;
+  --vp-c-bg-soft: #EEF1F6;
+  --vp-c-divider: #D6DBE4;
+  --vp-c-border: #D6DBE4;
+  --vp-c-gutter: #D6DBE4;
+
+  --vp-c-text-1: #151922;
+  --vp-c-text-2: #3F4656;
+  --vp-c-text-3: #5C6375;
+
+  --vp-c-brand-1: #003399;
+  --vp-c-brand-2: #001F66;
+  --vp-c-brand-3: #003399;
+  --vp-c-brand-soft: rgba(0, 51, 153, 0.10);
+
+  --vp-button-brand-bg: #003399;
+  --vp-button-brand-hover-bg: #001F66;
+  --vp-button-brand-active-bg: #001F66;
+  --vp-button-brand-text: #FFFFFF;
+  --vp-button-brand-hover-text: #FFFFFF;
+
+  --vp-code-block-bg: #EEF1F6;
+  --vp-code-bg: #EEF1F6;
+  --vp-code-color: #151922;
+  --vp-code-font-size: 0.9em;
+
+  --vp-c-tip-1: #1D6B3A;
+  --vp-c-warning-1: #8A5A12;
+  --vp-c-danger-1: #A3195B;
+  --vp-c-note-1: #003399;
+  --vp-c-important-1: #A33A12;
+
+  --vp-home-hero-name-color: #151922;
+}
+
+.dark {
+  --vp-c-bg: #14171F;
+  --vp-c-bg-alt: #1B1F29;
+  --vp-c-bg-elv: #1B1F29;
+  --vp-c-bg-soft: #11141B;
+  --vp-c-divider: #2C3240;
+  --vp-c-border: #2C3240;
+  --vp-c-gutter: #2C3240;
+
+  --vp-c-text-1: #E9EBF0;
+  --vp-c-text-2: #B9BEC9;
+  --vp-c-text-3: #9096A3;
+
+  --vp-c-brand-1: #9DB4F5;
+  --vp-c-brand-2: #D6E0F3;
+  --vp-c-brand-3: #9DB4F5;
+  --vp-c-brand-soft: rgba(157, 180, 245, 0.14);
+
+  --vp-button-brand-bg: #9DB4F5;
+  --vp-button-brand-hover-bg: #D6E0F3;
+  --vp-button-brand-active-bg: #D6E0F3;
+  --vp-button-brand-text: #14171F;
+  --vp-button-brand-hover-text: #14171F;
+
+  --vp-code-block-bg: #11141B;
+  --vp-code-bg: #11141B;
+  --vp-code-color: #E9EBF0;
+
+  --vp-c-tip-1: #6FD69A;
+  --vp-c-warning-1: #F2B356;
+  --vp-c-danger-1: #FF9EC4;
+  --vp-c-note-1: #9DB4F5;
+  --vp-c-important-1: #FF8A5C;
+
+  --vp-home-hero-name-color: #E9EBF0;
+}
+
+/* Headings: Geist 700, tight tracking. */
+.vp-doc h1, .vp-doc h2, .vp-doc h3, .VPHero .name, .VPHero .text {
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+/* Body: 17px / 1.6, readable measure. */
+.vp-doc p, .vp-doc li { font-size: 17px; line-height: 1.6; }
+.vp-doc p { max-width: 70ch; }
+
+/* Links are underlined in body copy. */
+.vp-doc a { text-decoration: underline; text-underline-offset: 2px; }
+
+/* Code: 15px / 1.6, comments italic from the Shiki theme. */
+.vp-doc div[class*='language-'] code { font-size: 15px; line-height: 1.6; }
+
+/* Martian Mono for short labels: sidebar group titles. */
+.VPSidebarItem.level-0 > .item > .text,
+.VPSidebarItem.level-0 > .item .text {
+  font-family: var(--smalt-brand-font);
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}
+
+/* Visible focus ring. */
+:focus-visible { outline: 2px solid var(--vp-c-brand-1); outline-offset: 2px; }
+.dark :focus-visible { outline-color: #FF8A5C; }
+
+/* Nav lockup a little larger than VitePress's 24px default. */
+.VPNavBarTitle .logo { height: 30px; }
+
+/* Keep the hero mark in proportion with the name. */
+.VPHero .image-src { max-width: 200px; max-height: 200px; }
