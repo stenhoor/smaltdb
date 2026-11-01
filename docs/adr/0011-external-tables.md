@@ -1,6 +1,6 @@
 # ADR 0011: External tables (M8)
 
-- **Status:** proposed (open questions at the end; implementation waits for their answers)
+- **Status:** accepted (2026-11-01; the open questions are decided at the end)
 - **Date:** 2026-11-01
 - **Research:** [M8 external tables](../research/m8-external-tables.md)
 
@@ -76,7 +76,7 @@ columns, and filters on them prune whole files.
 | CSV / TSV | built in (streaming, extends the M4 importer) | Required. `delimiter`, `quote`, `escape`, `header`, `null`, `skip`, `encoding`, `on_error`. Types are inferred once at creation and stored, unless declared. |
 | JSON / NDJSON | built in | NDJSON streams. |
 | Parquet | `@smaltdb/parquet` (hyparquet) | Footer first, then only the needed column chunks of row groups that survive row-group statistics (used as zone maps). Codecs beyond Snappy come via hyparquet-compressors. |
-| Excel (.xlsx, .xlsb, .ods) | `@smaltdb/excel` (SheetJS Community Edition, a pinned version vendored from the SheetJS CDN) | Whole file (it is a zip archive); cached formula values; dates converted by the declared type or `dates = 'iso'`. |
+| Excel (.xlsx, .xlsb, .ods), **deferred** (see the decisions below) | `@smaltdb/excel` (SheetJS Community Edition, a pinned version vendored from the SheetJS CDN) | Whole file (it is a zip archive); cached formula values; dates converted by the declared type or `dates = 'iso'`. |
 
 **Excel sheet and range references** use Excel's own syntax:
 - `sheet = 'Sales'` (by name) or `sheet = 2` (1-based position);
@@ -212,9 +212,9 @@ Bidirectional sync, conflict policies and resolvers belong to the plugin.
 | M8.1 | `CREATE CONNECTION` / `CREATE EXTERNAL TABLE`, catalog and information_schema, async fetch phase, `file:` and HTTP sources, CSV and JSON readers, `read_csv` / `read_json`, caching through materialized views with ETag freshness |
 | M8.2 | S3 (aws4fetch, credential providers, presigned URLs), globs and partitioned paths |
 | M8.3 | Parquet: footer, column chunks, row-group pruning, ranged fetches, `read_parquet` |
-| M8.4 | Excel: sheets, A1 ranges, tables and defined names, dates, `read_excel` |
+| M8.4 | Excel: sheets, A1 ranges, tables and defined names, dates, `read_excel`. **Deferred** (after M8.5; library to be chosen then) |
 | M8.5 | Connector interface, dialect printers, the Neon / PlanetScale / libSQL / D1 connectors, `smaltdb-gateway` on Kysely, filter / projection / limit pushdown |
-| M8.6 | Sync groundwork: change tracking, logical clock, id helpers, refresh policies |
+| ~~M8.6~~ | Sync groundwork (change tracking, logical clock, id helpers): **moved to its own milestone** before the sync plugin, with its own ADR. Refresh policies for cached views stay in M8.1 |
 
 ## Consequences
 
@@ -234,7 +234,19 @@ Bidirectional sync, conflict policies and resolvers belong to the plugin.
   remain. EXPLAIN, errors and capability flags make them visible instead of hiding them.
 - Browsers need CORS on every bucket and server they read from directly.
 
-## Open questions
+## Decisions on the open questions (2026-11-01)
+
+1. **Writes:** read-only in M8. Writes to remote databases come later.
+2. **Gateway:** `smaltdb-gateway` is a first-party package (the recommendation; no objection raised). It is needed
+   only from M8.5.
+3. **Excel:** deferred. M8 delivers CSV, JSON, Parquet and remote databases first; the Excel reader and its library
+   (SheetJS vendored or ExcelJS) are decided when M8.4 is picked up.
+4. **Async API:** `queryAsync` in-process. Local statements keep the synchronous API; statements that read external
+   tables need `queryAsync` (or the worker client, which is asynchronous anyway), and the synchronous API throws
+   `SMALT_ASYNC_REQUIRED` for them.
+5. **Sync groundwork:** a separate milestone before the sync plugin, not part of M8. Section 9 describes its scope.
+
+## Open questions as proposed
 
 1. **Writes:** stay read-only in M8 (recommended), or include INSERT, UPDATE and DELETE on remote database tables?
 2. **Gateway:** is `smaltdb-gateway` a first-party, maintained package (recommended: the only safe route from
