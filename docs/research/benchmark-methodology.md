@@ -124,3 +124,17 @@ of 5 further runs, e.g. a refreshed dashboard). SQLite's WebAssembly is compiled
 the generated per-query functions and of the engine. Statement preparation is about 0.3 ms once the engine is warm, but
 about 3 ms for the very first statement in a worker. Options: fuse scan, filter and aggregate into one generated function per pipeline
 (fewer cold functions), and reduce first-statement compile cost.
+
+## Update: fused scan + filter + aggregate (2026-11-01)
+
+Raw data: [bench/results/2026-11-01-chromium-aab7a9e.json](../../bench/results/2026-11-01-chromium-aab7a9e.json). Ungrouped aggregates over a
+full scan now compile into one generated function per pipeline. Versus the faster crash-safe SQLite mode:
+
+| Analytical query | first run | repeat (median of 5) |
+|---|---|---|
+| Filter + sum | 8.1 vs 10.4 ms: **1.29× faster** | 3.1 vs 9.0 ms: **2.92× faster** |
+| GROUP BY (100 groups) (not fused) | **3.33× faster** | **3.72× faster** |
+| Arithmetic filter + aggregate | 8.4 vs 8.7 ms: tie (ranges overlap) | 4.0 vs 8.1 ms: **2.01× faster** |
+
+All other workloads are unchanged (1.2–4.8× faster). smaltdb is now faster than or tied with crash-safe SQLite WASM on every workload in the
+suite. See also [vectorization-review.md](vectorization-review.md).
