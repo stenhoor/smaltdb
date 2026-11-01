@@ -1066,6 +1066,12 @@ function shortestSeparator(
  * Bidirectional cursor over a B+tree. Holds a pin on its current leaf; call {@link close}.
  * Cursors are invalidated by writes to the tree (re-seek after modifying).
  */
+/** Whether the last key of leaf `p` (with n > 0 cells) is >= `key`. */
+function lastKeyAtLeast(p: PageBuf, n: number, key: Uint8Array): boolean {
+  const off = slot(p, n - 1);
+  return compareKeyAt(key, p.bytes, off + LEAF_HDR, p.view.getUint16(off, true)) <= 0;
+}
+
 export class BTreeCursor {
   private frame: Frame | null = null;
   private idx = 0;
@@ -1087,6 +1093,34 @@ export class BTreeCursor {
 
   first(): boolean {
     return this.seek();
+  }
+
+  /**
+   * {@link seek} for ascending probes: `key` must be greater than the key of the previous seek on
+   * this cursor. When it lies on the current leaf or the next one, no root-to-leaf descent is made.
+   */
+  seekForward(key: Uint8Array): boolean {
+    const f = this.frame;
+    if (f === null) return this.seek(key);
+    const tree = this.tree;
+    let n = nCells(f);
+    if (n > 0 && lastKeyAtLeast(f, n, key)) {
+      this.idx = tree.leafLowerBound(f, key);
+      return this.settleForward();
+    }
+    const nx = rightPtr(f);
+    if (nx !== 0) {
+      const g = tree.pager.get(nx);
+      n = nCells(g);
+      if (n > 0 && lastKeyAtLeast(g, n, key)) {
+        tree.pager.release(f);
+        this.frame = g;
+        this.idx = tree.leafLowerBound(g, key);
+        return this.settleForward();
+      }
+      tree.pager.release(g);
+    }
+    return this.seek(key);
   }
 
   last(): boolean {

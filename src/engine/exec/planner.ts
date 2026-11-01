@@ -629,6 +629,8 @@ export class Planner {
     }
 
     if (agg) {
+      // One output row from order-insensitive aggregates: index scans below may fetch in rowid order.
+      if (agg.groupFns.length === 0 && agg.bare.size === 0 && agg.aggs.every((a) => ORDER_INSENSITIVE_AGGS.has(a.name))) markUnordered(root);
       const fused =
         agg.bare.size > 0
           ? null
@@ -1593,7 +1595,19 @@ export class Planner {
     if (src.indexedBy === null) return options.filter((o) => !o.label.startsWith('index '));
     if (typeof src.indexedBy === 'string') {
       const forced = options.filter((o) => o.label.toLowerCase() === `index ${src.indexedBy!.toLowerCase()}`);
-      if (forced.length === 0) throw new SmaltError('SMALT_ERROR', 'no query solution');
+      // Where the index is unusable on its own (e.g. this table placed first in a join), offer an
+      // infinitely expensive option: join ordering avoids it, and only a plan that needs it fails.
+      if (!forced.some((o) => !o.dependsOnOuter)) {
+        forced.push({
+          label: 'no query solution',
+          cost: Infinity,
+          rows: 1,
+          dependsOnOuter: false,
+          build: () => {
+            throw new SmaltError('SMALT_ERROR', 'no query solution');
+          },
+        });
+      }
       return forced;
     }
     return options;
@@ -2385,6 +2399,20 @@ function containsWindow(e: Expr | undefined): boolean {
 }
 
 /** Shape of an expression for matching against index definitions: no positions, no table qualifiers. */
+/** Aggregates whose result does not depend on input order (sum/avg of REAL up to rounding). */
+const ORDER_INSENSITIVE_AGGS = new Set(['count', 'sum', 'total', 'avg', 'min', 'max']);
+
+/**
+ * Let index scans under `op` fetch rows in rowid order: the caller guarantees the row order is not
+ * observable. Only descends through operators that pass the row multiset on unchanged.
+ */
+export function markUnordered(op: Operator): void {
+  if (op instanceof IndexScan) op.unordered = true;
+  else if (op instanceof Filter || op instanceof Project || op instanceof NestedLoopJoin || op instanceof HashJoin || op instanceof OuterJoin || op instanceof Materialize) {
+    for (const c of op.children) markUnordered(c);
+  }
+}
+
 function exprShapeKey(e: Expr): string {
   return JSON.stringify(e, (k, v) => {
     if (k === 'pos' || k === 'end' || k === 'table' || k === 'schema') return undefined;

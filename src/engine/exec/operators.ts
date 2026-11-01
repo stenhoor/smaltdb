@@ -367,6 +367,18 @@ export class IndexScan implements Operator {
   private readonly enc = new KeyEncoder();
   private readonly keyBuf = new Uint8Array(ROWID_KEY_SIZE);
 
+  /**
+   * Set by the planner when the consumer cannot observe row order (an order-insensitive aggregate,
+   * UPDATE target collection). Rows are then fetched in batches sorted by rowid, so consecutive
+   * fetches walk the table forward instead of descending from the root for each row.
+   */
+  unordered = false;
+  private batch: Float64Array | null = null;
+  private batchBig: (number | bigint)[] | null = null;
+  private bn = 0;
+  private bi = 0;
+  private idxDone = false;
+
   constructor(
     readonly access: TableAccess,
     readonly spec: IndexScanSpec,
@@ -408,6 +420,9 @@ export class IndexScan implements Operator {
     this.r = r;
     this.started = false;
     this.done = false;
+    this.bn = 0;
+    this.bi = 0;
+    this.idxDone = false;
     if (this.idx === null) this.idx = this.spec.tree.cursor();
     if (this.tab === null && !this.covering()) this.tab = this.access.tree.cursor();
   }
@@ -454,6 +469,7 @@ export class IndexScan implements Operator {
 
   next(): boolean {
     if (this.done) return false;
+    if (this.unordered && !this.covering()) return this.nextSorted();
     const c = this.idx!;
     let ok: boolean;
     if (!this.started) {
@@ -496,7 +512,62 @@ export class IndexScan implements Operator {
     this.idx = null;
     this.tab = null;
   }
+
+  /** Unordered mode: next row from the current rowid-sorted batch. */
+  private nextSorted(): boolean {
+    if (this.bi >= this.bn && (this.idxDone || !this.fillBatch())) return (this.done = true), false;
+    const rowid = this.batchBig !== null ? this.batchBig[this.bi] : this.batch![this.bi];
+    this.bi++;
+    writeRowidKey(this.keyBuf, 0, rowid);
+    const t = this.tab!;
+    // Rowids ascend within a batch: walk forward from the previous row's leaf.
+    const ok = this.bi === 1 ? t.seek(this.keyBuf) : t.seekForward(this.keyBuf);
+    if (!ok || t.compareKey(this.keyBuf) !== 0) {
+      throw new SmaltError('SMALT_CORRUPT', `index ${this.spec.indexName} references missing row ${rowid}`);
+    }
+    this.access.load(t, this.r);
+    return true;
+  }
+
+  /** Read up to SORT_BATCH matching rowids from the index and sort them; false when none remain. */
+  private fillBatch(): boolean {
+    const c = this.idx!;
+    if (this.batch === null) this.batch = new Float64Array(SORT_BATCH);
+    const batch = this.batch;
+    let big: (number | bigint)[] | null = null;
+    let n = 0;
+    while (n < SORT_BATCH) {
+      let ok: boolean;
+      if (!this.started) {
+        this.started = true;
+        if (!this.bounds()) {
+          this.idxDone = true;
+          break;
+        }
+        ok = c.seek(this.lower!);
+      } else ok = c.next();
+      if (!ok || c.compareKey(this.upper!) >= 0) {
+        this.idxDone = true;
+        break;
+      }
+      c.loadKey();
+      const rowid = readIndexRowid(c.keyBytes, c.keyOffset + c.keyLength);
+      if (big === null && typeof rowid === 'bigint') big = Array.from(batch.subarray(0, n));
+      if (big !== null) big.push(rowid);
+      else batch[n] = rowid as number;
+      n++;
+    }
+    if (big !== null) big.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    else batch.subarray(0, n).sort();
+    this.batchBig = big;
+    this.bn = n;
+    this.bi = 0;
+    return n > 0;
+  }
 }
+
+/** Rowids fetched per sorted batch in unordered index scans. */
+const SORT_BATCH = 4096;
 
 function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
   const out = new Uint8Array(a.length + b.length);

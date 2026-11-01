@@ -15,7 +15,7 @@ import { type StaticType, truthy } from './exec/convert.js';
 import { type CompileScope, type Compiled, type Fn, compileExpr } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
-import { Planner, type QueryPlan, Registers } from './exec/planner.js';
+import { Planner, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
 import { type ConflictMode, TableWriter } from './exec/write.js';
 import type {
   AlterTableStmt,
@@ -1712,6 +1712,8 @@ export class Database implements FunctionContext {
     if (stmt.orderBy.length || stmt.limit) throw new SmaltError('SMALT_UNSUPPORTED', 'UPDATE ... ORDER BY/LIMIT is not supported');
     const table = this.targetTable(stmt.table, stmt.schema);
     const { root, colRegs, rowidReg, scope } = this.planTarget(table, stmt.alias, stmt.where, planner, stmt.from, stmt.with);
+    // Target rowids are collected and sorted before any change: scan order is not observable.
+    if (!stmt.from) markUnordered(root);
     const sets: { col: number; c: Compiled }[] = [];
     for (const s of stmt.set) {
       if (s.columns.length !== 1) throw new SmaltError('SMALT_UNSUPPORTED', 'row-value assignments are not supported yet');
