@@ -199,6 +199,16 @@ class Scope {
   correlated = false;
   /** Select-list aliases usable as a fallback in WHERE/GROUP BY/HAVING/ORDER BY. */
   aliases: Map<string, Expr> | null = null;
+  /**
+   * Scope that alias expansions compile in. In an aggregate query this is the aggregate scope, so
+   * `HAVING s > 1` with `sum(a) AS s` refers to the aggregate (not a misuse of sum() per row).
+   */
+  aliasScope: CompileScope | null = null;
+  /**
+   * Called with the register of a column of this scope's sources that a nested subquery reads. In an
+   * aggregate query the aggregate must carry such columns to its output rows (like bare columns).
+   */
+  onOuterRef: ((reg: number) => void) | null = null;
   ctes = new Map<string, CteEntry>();
   constructor(readonly parent: Scope | null) {}
 
@@ -548,7 +558,8 @@ export class Planner {
         ...baseCompile,
         resolveColumn: (e) => {
           const b = baseCompile.resolveColumn(e);
-          bare.add(b.reg);
+          // reg -1: an expanded select-list alias (its own columns were recorded while compiling it).
+          if (b.reg >= 0) bare.add(b.reg);
           return b;
         },
         groupRef: (e) => {
@@ -590,6 +601,9 @@ export class Planner {
           return { reg: spec.outReg, type: def.resultType(argTypes), collation: spec.collation, affinity: 'NONE' };
         },
       };
+      scope.aliasScope = exprScope;
+      // Subqueries in the result, HAVING and ORDER BY run on aggregate output rows.
+      scope.onOuterRef = (reg) => bare.add(reg);
     } else {
       exprScope = this.compileScope(scope);
     }
@@ -2145,7 +2159,10 @@ export class Planner {
     for (let s: Scope | null = scope; s; s = s.parent, depth++) {
       const b = this.resolveIn(e, s);
       if (b) {
-        if (depth > 0) for (let t: Scope | null = scope; t && t !== s; t = t.parent) t.correlated = true;
+        if (depth > 0) {
+          for (let t: Scope | null = scope; t && t !== s; t = t.parent) t.correlated = true;
+          if (b.reg >= 0) s.onOuterRef?.(b.reg);
+        }
         return b;
       }
     }
@@ -2157,7 +2174,7 @@ export class Planner {
         if (aliased && !this.expandingAliases.has(key)) {
           this.expandingAliases.add(key);
           try {
-            const c = compileExpr(aliased, this.compileScope(s));
+            const c = compileExpr(aliased, s.aliasScope ?? this.compileScope(s));
             return { reg: -1, type: c.type, collation: c.collation, affinity: c.affinity, compiled: c };
           } finally {
             this.expandingAliases.delete(key);
@@ -2336,7 +2353,19 @@ export class Planner {
       return null;
     }
     if (plan.correlated) return null;
-    const outerScope = this.compileScope(scope);
+    // The outer expressions read the enclosing query's columns; in an aggregate query the aggregate
+    // must carry them to its output rows (as for a subquery that is not decorrelated).
+    const cs = this.compileScope(scope);
+    const outerScope: CompileScope = scope.onOuterRef
+      ? {
+          ...cs,
+          resolveColumn: (e) => {
+            const b = cs.resolveColumn(e);
+            if (b.reg >= 0) scope.onOuterRef!(b.reg);
+            return b;
+          },
+        }
+      : cs;
     const keyFns: { outer: Fn; convOuter: ((v: SqlValue) => SqlValue) | null; convInner: ((v: SqlValue) => SqlValue) | null; coll: Collation }[] = [];
     for (let i = 0; i < pairs.length; i++) {
       const col = plan.columns[i];
