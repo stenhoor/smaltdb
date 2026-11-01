@@ -11,6 +11,7 @@ import { Collation, type SqlValue, compareValues } from '../values.js';
 import { applyNumericAffinity, hashKey, hashKeyMulti, toNumeric, truthy } from './convert.js';
 import { type Fn, isTrue } from './expr.js';
 import { type AggregateFunction, type AggregateState, MinMaxState } from './functions.js';
+import { type Run, RunReader, RunWriter, type SpillArea, SpillRestart, partitionHash, rowBytes, valueBytes } from './spill.js';
 
 /**
  * Pull-based physical operators. All operators of a statement share one register file `r`
@@ -1006,6 +1007,18 @@ interface Group {
   bare: SqlValue[] | null;
 }
 
+/** Partitions per spill level of a hash aggregate. */
+const AGG_PARTITIONS = 16;
+/** Re-partitioning depth after which a partition is aggregated in memory regardless. */
+const AGG_MAX_LEVEL = 6;
+
+/**
+ * GROUP BY with a hash table. When the groups outgrow `work_mem` (and a spill area exists), it
+ * goes grace-hash: groups already in memory keep accumulating, and rows for keys not yet seen
+ * are written, with their aggregate arguments evaluated, to hash partitions in the spill file.
+ * After the in-memory groups are returned, each partition is aggregated on its own (partitioned
+ * again, with another hash, if it is still too big).
+ */
 export class HashAggregate implements Operator {
   readonly children: Operator[];
   private r!: SqlValue[];
@@ -1014,6 +1027,13 @@ export class HashAggregate implements Operator {
   private readonly argBufs: SqlValue[][];
   /** Exactly one min()/max(): bare columns come from the row that produced the extreme. */
   private readonly minMaxIndex: number;
+  /** Values per spilled row: keys, per aggregate (filter flag,) arguments, bare columns. */
+  private readonly width: number;
+  private bytes = 0;
+  private spilling = false;
+  private pending: { run: Run; level: number }[] = [];
+  /** Partitions written (statistics, tests). */
+  spilledPartitions = 0;
 
   constructor(
     readonly child: Operator,
@@ -1022,11 +1042,13 @@ export class HashAggregate implements Operator {
     readonly groupRegs: number[],
     readonly aggs: AggSpec[],
     readonly bareRegs: number[],
+    readonly spill: SpillArea | null = null,
   ) {
     this.children = [child];
     this.argBufs = aggs.map((a) => new Array(a.args.length).fill(null));
     const mm = aggs.flatMap((a, i) => (a.isMinMax ? [i] : []));
     this.minMaxIndex = mm.length === 1 ? mm[0] : -1;
+    this.width = groupFns.length + aggs.reduce((n, a) => n + (a.filter !== undefined ? 1 : 0) + a.args.length, 0) + bareRegs.length;
   }
 
   get detail(): string {
@@ -1034,6 +1056,7 @@ export class HashAggregate implements Operator {
   }
 
   private newGroup(keys: SqlValue[]): Group {
+    this.bytes += 96 + 64 * this.aggs.length + rowBytes(keys);
     return {
       keys,
       states: this.aggs.map((a) => a.def.create(a.star ? [] : a.argTypes, a.collation)),
@@ -1042,14 +1065,41 @@ export class HashAggregate implements Operator {
     };
   }
 
+  private get budget(): number {
+    return this.spill !== null && this.spill.enabled && this.groupFns.length > 0 ? this.spill.workMem : Infinity;
+  }
+
+  private partitions(): RunWriter[] {
+    if (!this.spilling) {
+      this.spill!.acquire();
+      this.spilling = true;
+    }
+    return Array.from({ length: AGG_PARTITIONS }, () => new RunWriter(this.spill!));
+  }
+
+  private finishPartitions(parts: RunWriter[], level: number): void {
+    for (const w of parts) {
+      const run = w.finish();
+      if (run.rows > 0) {
+        this.pending.push({ run, level });
+        this.spilledPartitions++;
+      }
+    }
+  }
+
   open(r: SqlValue[]): void {
     this.r = r;
     this.gi = 0;
+    this.releaseSpill();
+    this.bytes = 0;
+    const budget = this.budget;
     const map = new Map<unknown, Group>();
     const groups: Group[] = [];
     const nk = this.groupFns.length;
     const keyVals: SqlValue[] = new Array(nk).fill(null);
     let single: Group | null = null;
+    let parts: RunWriter[] | null = null;
+    const rec: SqlValue[] = new Array(this.width).fill(null);
     this.child.open(r);
     while (this.child.next()) {
       let g: Group;
@@ -1064,6 +1114,11 @@ export class HashAggregate implements Operator {
         const k = nk === 1 ? hashKey(keyVals[0], this.groupColls[0]) : hashKeyMulti(keyVals, this.groupColls);
         let found = map.get(k);
         if (found === undefined) {
+          if (parts !== null) {
+            this.record(keyVals, rec);
+            parts[partitionHash(k, 0) % AGG_PARTITIONS].add(rec, this.width);
+            continue;
+          }
           found = this.newGroup(keyVals.slice());
           map.set(k, found);
           groups.push(found);
@@ -1071,10 +1126,28 @@ export class HashAggregate implements Operator {
         g = found;
       }
       this.step(g);
+      if (this.bytes > budget && parts === null) parts = this.partitions();
     }
     this.child.close();
+    if (parts !== null) this.finishPartitions(parts, 0);
     if (nk === 0 && single === null) groups.push(this.newGroup([]));
     this.groups = groups;
+  }
+
+  /** Evaluate the current row into a spill record (keys, then per aggregate its inputs, then bare columns). */
+  private record(keyVals: SqlValue[], rec: SqlValue[]): void {
+    const r = this.r;
+    let o = 0;
+    for (let i = 0; i < keyVals.length; i++) rec[o++] = keyVals[i];
+    for (const a of this.aggs) {
+      let pass = true;
+      if (a.filter !== undefined) {
+        pass = isTrue(a.filter(r));
+        rec[o++] = pass ? 1 : 0;
+      }
+      for (let j = 0; j < a.args.length; j++) rec[o++] = pass ? a.args[j](r) : null;
+    }
+    for (let i = 0; i < this.bareRegs.length; i++) rec[o++] = r[this.bareRegs[i]];
   }
 
   private step(g: Group): void {
@@ -1091,6 +1164,7 @@ export class HashAggregate implements Operator {
         const k = hashKey(buf[0], a.collation);
         if (seen.has(k)) continue;
         seen.add(k);
+        this.bytes += 16 + valueBytes(buf[0]);
       }
       g.states[i].step(buf);
     }
@@ -1104,8 +1178,78 @@ export class HashAggregate implements Operator {
     }
   }
 
+  /** {@link step} from a spill record. */
+  private stepRecord(g: Group, rec: SqlValue[]): void {
+    const aggs = this.aggs;
+    let o = this.groupFns.length;
+    for (let i = 0; i < aggs.length; i++) {
+      const a = aggs[i];
+      let pass = true;
+      if (a.filter !== undefined) pass = rec[o++] === 1;
+      const buf = this.argBufs[i];
+      for (let j = 0; j < a.args.length; j++) buf[j] = rec[o++];
+      if (!pass) continue;
+      const seen = g.seen[i];
+      if (seen !== null) {
+        if (buf[0] === null) continue;
+        const k = hashKey(buf[0], a.collation);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        this.bytes += 16 + valueBytes(buf[0]);
+      }
+      g.states[i].step(buf);
+    }
+    const bare = this.bareRegs;
+    if (bare.length > 0) {
+      const take = this.minMaxIndex < 0 || g.bare === null || (g.states[this.minMaxIndex] as MinMaxState).changed;
+      if (take) {
+        if (g.bare === null) g.bare = new Array(bare.length);
+        for (let i = 0; i < bare.length; i++) g.bare[i] = rec[o + i];
+      }
+    }
+  }
+
+  /** Aggregate the next spilled partition into `groups`; false when none are left. */
+  private loadPartition(): boolean {
+    const nk = this.groupFns.length;
+    const w = this.width;
+    while (this.pending.length > 0) {
+      const { run, level } = this.pending.pop()!;
+      const reader = new RunReader(this.spill!, run);
+      const map = new Map<unknown, Group>();
+      const groups: Group[] = [];
+      const rec: SqlValue[] = new Array(w).fill(null);
+      const budget = level < AGG_MAX_LEVEL ? this.budget : Infinity;
+      let parts: RunWriter[] | null = null;
+      this.bytes = 0;
+      this.groups = [];
+      while (reader.next(rec, w)) {
+        const k = nk === 1 ? hashKey(rec[0], this.groupColls[0]) : hashKeyMulti(rec.slice(0, nk), this.groupColls);
+        let g = map.get(k);
+        if (g === undefined) {
+          if (parts !== null) {
+            parts[partitionHash(k, level + 1) % AGG_PARTITIONS].add(rec, w);
+            continue;
+          }
+          g = this.newGroup(rec.slice(0, nk));
+          map.set(k, g);
+          groups.push(g);
+        }
+        this.stepRecord(g, rec);
+        if (this.bytes > budget && parts === null) parts = this.partitions();
+      }
+      if (parts !== null) this.finishPartitions(parts, level + 1);
+      this.groups = groups;
+      this.gi = 0;
+      if (groups.length > 0) return true;
+    }
+    return false;
+  }
+
   next(): boolean {
-    if (this.gi >= this.groups.length) return false;
+    while (this.gi >= this.groups.length) {
+      if (this.pending.length === 0 || !this.loadPartition()) return false;
+    }
     const g = this.groups[this.gi++];
     const r = this.r;
     for (let i = 0; i < this.groupRegs.length; i++) r[this.groupRegs[i]] = g.keys[i];
@@ -1115,10 +1259,19 @@ export class HashAggregate implements Operator {
     return true;
   }
 
+  private releaseSpill(): void {
+    this.pending = [];
+    if (this.spilling) {
+      this.spilling = false;
+      this.spill!.release();
+    }
+  }
+
   close(): void {
     // Children consumed in open() are closed here too, so an error part-way releases their pages.
     this.child.close();
     this.groups = [];
+    this.releaseSpill();
   }
 }
 
@@ -1129,6 +1282,20 @@ export interface SortKey {
   collation: Collation;
 }
 
+/** Sorted runs merged at once; more are first merged into longer runs. */
+const SORT_FAN_IN = 64;
+
+/** One input of a k-way merge: a spilled run or the rows still in memory. */
+interface MergeSource {
+  cur: SqlValue[];
+  advance(): boolean;
+}
+
+/**
+ * ORDER BY. Sorts in memory; when the rows outgrow `work_mem` (and a spill area exists) it becomes
+ * an external merge sort: each memory-full of rows is sorted and written as a run to the spill
+ * file, and the runs (plus the last, in-memory one) are merged as rows are read.
+ */
 export class Sort implements Operator {
   readonly children: Operator[];
   readonly detail = 'USE TEMP B-TREE FOR ORDER BY';
@@ -1136,6 +1303,12 @@ export class Sort implements Operator {
   private rows: SqlValue[][] = [];
   private i = 0;
   private readonly keyIdx: number[];
+  private spilling = false;
+  private sources: MergeSource[] = [];
+  private heap: number[] = [];
+  private remaining = 0;
+  /** Runs written by the last open (statistics, tests). */
+  spilledRuns = 0;
 
   constructor(
     readonly child: Operator,
@@ -1144,6 +1317,7 @@ export class Sort implements Operator {
     readonly regs: number[],
     /** Keep only the first `limit()` rows (top-N), when known. */
     readonly limit?: (r: SqlValue[]) => number,
+    readonly spill: SpillArea | null = null,
   ) {
     this.children = [child];
     this.keyIdx = keys.map((k) => regs.indexOf(k.reg));
@@ -1169,10 +1343,16 @@ export class Sort implements Operator {
   open(r: SqlValue[]): void {
     this.r = r;
     this.i = 0;
-    const rows: SqlValue[][] = [];
+    this.releaseSpill();
+    this.spilledRuns = 0;
+    let rows: SqlValue[][] = [];
     const regs = this.regs;
     const n = regs.length;
     const cap = this.limit ? this.limit(r) : -1;
+    const area = this.spill;
+    const budget = area !== null && area.enabled ? area.workMem : Infinity;
+    let bytes = 0;
+    const runs: Run[] = [];
     this.child.open(r);
     while (this.child.next()) {
       const row = new Array(n);
@@ -1180,27 +1360,150 @@ export class Sort implements Operator {
       rows.push(row);
       if (cap >= 0 && rows.length >= Math.max(64, cap * 4)) {
         rows.sort(this.compare);
+        bytes = budget === Infinity ? 0 : Math.ceil((bytes * cap) / rows.length);
         rows.length = cap;
+      }
+      if (budget !== Infinity && (bytes += rowBytes(row, n)) > budget) {
+        // Memory is full: write it out as a sorted run.
+        if (!this.spilling) {
+          area!.acquire();
+          this.spilling = true;
+        }
+        rows.sort(this.compare);
+        if (cap >= 0 && rows.length > cap) rows.length = cap;
+        const w = new RunWriter(area!);
+        for (const x of rows) w.add(x, n);
+        runs.push(w.finish());
+        rows = [];
+        bytes = 0;
       }
     }
     this.child.close();
     rows.sort(this.compare);
     if (cap >= 0 && rows.length > cap) rows.length = cap;
-    this.rows = rows;
+    this.spilledRuns = runs.length;
+    if (runs.length === 0) {
+      this.rows = rows;
+      return;
+    }
+    // Merge passes until the runs fit one merge, then merge lazily as rows are read.
+    while (runs.length + 1 > SORT_FAN_IN) {
+      const group = runs.splice(0, SORT_FAN_IN);
+      const w = new RunWriter(area!);
+      this.startMerge(group, [], -1);
+      while (this.pop()) w.add(this.out, n);
+      runs.push(w.finish());
+    }
+    this.startMerge(runs, rows, cap);
+  }
+
+  /** The row most recently produced by {@link pop}. */
+  private out: SqlValue[] = [];
+
+  private startMerge(runs: Run[], memRows: SqlValue[][], cap: number): void {
+    const n = this.regs.length;
+    const sources: MergeSource[] = runs.map((run) => {
+      const reader = new RunReader(this.spill!, run);
+      const src: MergeSource = { cur: new Array(n), advance: () => reader.next(src.cur, n) };
+      return src;
+    });
+    if (memRows.length > 0) {
+      let k = 0;
+      const src: MergeSource = {
+        cur: memRows[0],
+        advance: () => {
+          if (++k >= memRows.length) return false;
+          src.cur = memRows[k];
+          return true;
+        },
+      };
+      sources.push(src);
+    }
+    this.sources = sources;
+    this.heap = [];
+    for (let i = 0; i < sources.length; i++) {
+      if (i < runs.length && !sources[i].advance()) continue;
+      this.heap.push(i);
+      this.siftUp(this.heap.length - 1);
+    }
+    this.remaining = cap >= 0 ? cap : Infinity;
+  }
+
+  /** Ties go to the earlier source (earlier input), keeping the sort stable. */
+  private less(a: number, b: number): boolean {
+    const c = this.compare(this.sources[a].cur, this.sources[b].cur);
+    return c < 0 || (c === 0 && a < b);
+  }
+
+  private siftUp(i: number): void {
+    const h = this.heap;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (!this.less(h[i], h[p])) break;
+      [h[i], h[p]] = [h[p], h[i]];
+      i = p;
+    }
+  }
+
+  private siftDown(i: number): void {
+    const h = this.heap;
+    for (;;) {
+      const l = 2 * i + 1;
+      if (l >= h.length) return;
+      const m = l + 1 < h.length && this.less(h[l + 1], h[l]) ? l + 1 : l;
+      if (!this.less(h[m], h[i])) return;
+      [h[i], h[m]] = [h[m], h[i]];
+      i = m;
+    }
+  }
+
+  /** Take the smallest row of the merge into `out` (copied); false when the merge is done. */
+  private pop(): boolean {
+    const h = this.heap;
+    if (h.length === 0 || this.remaining <= 0) return false;
+    this.remaining--;
+    const s = this.sources[h[0]];
+    const out = this.out;
+    const n = this.regs.length;
+    for (let j = 0; j < n; j++) out[j] = s.cur[j];
+    if (s.advance()) this.siftDown(0);
+    else {
+      const last = h.pop()!;
+      if (h.length > 0) {
+        h[0] = last;
+        this.siftDown(0);
+      }
+    }
+    return true;
   }
 
   next(): boolean {
+    const regs = this.regs;
+    if (this.spilling) {
+      if (!this.pop()) return false;
+      for (let j = 0; j < regs.length; j++) this.r[regs[j]] = this.out[j];
+      return true;
+    }
     if (this.i >= this.rows.length) return false;
     const row = this.rows[this.i++];
-    const regs = this.regs;
     for (let j = 0; j < regs.length; j++) this.r[regs[j]] = row[j];
     return true;
+  }
+
+  private releaseSpill(): void {
+    this.sources = [];
+    this.heap = [];
+    if (this.spilling) {
+      this.spilling = false;
+      this.spill!.release();
+    }
   }
 
   close(): void {
     // Children consumed in open() are closed here too, so an error part-way releases their pages.
     this.child.close();
     this.rows = [];
+    this.releaseSpill();
   }
 }
 
@@ -1947,12 +2250,18 @@ export class FusedGroupAggregate implements Operator {
   private gi = 0;
   private r!: SqlValue[];
 
+  /** The equivalent (spilling) hash aggregate, used once the groups outgrow work_mem. */
+  fallback: HashAggregate | null = null;
+  private delegated = false;
+
   constructor(
     readonly access: TableAccess,
     private readonly build: () => (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => void,
     readonly groupRegs: number[],
     readonly aggs: AggSpec[],
     private readonly label?: string,
+    /** Group memory used by the generated loop's newGroup (null: unlimited). */
+    private readonly budget: { used: number; limit: number; area: SpillArea } | null = null,
   ) {}
 
   get detail(): string {
@@ -1963,12 +2272,27 @@ export class FusedGroupAggregate implements Operator {
     this.run ??= this.build();
     this.r = r;
     this.gi = 0;
+    this.delegated = false;
     const order: { keys: SqlValue[]; st: AggregateState[] }[] = [];
-    this.run(r, new Map(), order);
+    if (this.budget) {
+      this.budget.used = 0;
+      this.budget.limit = this.fallback && this.budget.area.enabled ? this.budget.area.workMem : Infinity;
+    }
+    try {
+      this.run(r, new Map(), order);
+    } catch (e) {
+      if (e !== SpillRestart || !this.fallback) throw e;
+      // Too many groups to hold: run the query again with the hash aggregate, which spills.
+      this.order = [];
+      this.delegated = true;
+      this.fallback.open(r);
+      return;
+    }
     this.order = order;
   }
 
   next(): boolean {
+    if (this.delegated) return this.fallback!.next();
     if (this.gi >= this.order.length) return false;
     const g = this.order[this.gi++];
     const r = this.r;
@@ -1979,5 +2303,9 @@ export class FusedGroupAggregate implements Operator {
 
   close(): void {
     this.order = [];
+    if (this.delegated) {
+      this.delegated = false;
+      this.fallback!.close();
+    }
   }
 }

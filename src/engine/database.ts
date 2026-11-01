@@ -18,6 +18,7 @@ import { type CompileScope, type Compiled, type Fn, compileExpr } from './exec/e
 import { type FunctionContext, aggregateFunctions, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
 import { Planner, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
+import { DEFAULT_WORK_MEM, SpillArea } from './exec/spill.js';
 import { type ConflictMode, TableWriter } from './exec/write.js';
 import type {
   AlterTableStmt,
@@ -77,6 +78,17 @@ export interface DatabaseOptions extends PagerOptions {
    * too (parallel readers). Exclusive access must then be ensured otherwise (the multi-tab lock).
    */
   sharedHandles?: boolean;
+  /**
+   * Estimated heap bytes a sort or hash aggregate may hold before it spills to the scratch file
+   * (default 256 MiB; 0 never spills). `PRAGMA work_mem` changes it at runtime.
+   */
+  workMem?: number;
+  /**
+   * Scratch file for spilling sorts and hash aggregates: default `<path>-spill` for a writable
+   * file database; false for none (operators then stay in memory). Readers get none unless given
+   * a path. In-memory databases never spill.
+   */
+  spillPath?: string | false;
 }
 
 const CATALOG_SQL = 'CREATE TABLE smalt_schema(type TEXT, name TEXT, tbl_name TEXT, rootpage INTEGER, sql TEXT)';
@@ -188,8 +200,12 @@ export class Database implements FunctionContext {
     this.memViews = new Map(snap.views.map(([k, v]) => [k, { ...v, indexRoots: new Map(v.indexRoots) }]));
   }
 
-  private constructor(file: VfsFile | null, options: DatabaseOptions, walFile?: VfsFile, reader = false) {
+  /** Scratch area for sorts and hash aggregates that outgrow work_mem (M7.2). */
+  private readonly spill: SpillArea;
+
+  private constructor(file: VfsFile | null, options: DatabaseOptions, walFile?: VfsFile, reader = false, spillFile: VfsFile | null = null) {
     this.pager = file === null ? Pager.openMemory(options) : reader ? Pager.openReader(file, walFile!, options) : Pager.open(file, options, walFile);
+    this.spill = new SpillArea(spillFile, options.workMem ?? DEFAULT_WORK_MEM);
     this.mem = file === null ? null : Pager.openMemory({ pageSize: this.pager.pageSize });
     this.cacheSize = options.statementCacheSize ?? 64;
     if (this.pager.catalogRoot === 0) {
@@ -225,7 +241,7 @@ export class Database implements FunctionContext {
     const shared = options.sharedHandles === true;
     const file = await vfs.open(path, { shared });
     const wal = (options.journalMode ?? 'wal') === 'wal' ? await vfs.open(`${path}-wal`, { shared }) : undefined;
-    return new Database(file, options, wal);
+    return new Database(file, options, wal, false, await Database.openSpill(vfs, options.spillPath ?? `${path}-spill`));
   }
 
   /**
@@ -235,7 +251,17 @@ export class Database implements FunctionContext {
   static async openReader(vfs: Vfs, path: string, options: DatabaseOptions = {}): Promise<Database> {
     const file = await vfs.open(path, { shared: true, create: false });
     const wal = await vfs.open(`${path}-wal`, { shared: true, create: false });
-    return new Database(file, options, wal, true);
+    return new Database(file, options, wal, true, await Database.openSpill(vfs, options.spillPath ?? false));
+  }
+
+  /** The scratch file, or null (none wanted, or it cannot be opened: then nothing spills). */
+  private static async openSpill(vfs: Vfs, path: string | false): Promise<VfsFile | null> {
+    if (path === false) return null;
+    try {
+      return await vfs.open(path);
+    } catch {
+      return null;
+    }
   }
 
   /** Reader: move to the latest committed state (reloads the schema if it changed). */
@@ -264,9 +290,10 @@ export class Database implements FunctionContext {
   /**
    * Whether a statement reads memory-resident objects (TEMP tables, memory materialized views),
    * directly or through views: those exist only in this connection, so parallel readers cannot
-   * answer it.
+   * answer it. PRAGMAs count too: settings (work_mem, foreign_keys) belong to this connection.
    */
   usesMemoryObjects(parsed: ParsedStatement): boolean {
+    if (parsed.stmt.kind === 'pragma') return true;
     if (this.tempTables.size === 0 && this.memViews.size === 0) return false;
     const seen = new Set<string>();
     const walk = (x: unknown): boolean => {
@@ -385,6 +412,7 @@ export class Database implements FunctionContext {
   setInterruptCheck(check: (() => void) | null): void {
     this.pager.interrupt = check;
     if (this.mem) this.mem.interrupt = check;
+    this.spill.interrupt = check;
   }
 
   get inTransaction(): boolean {
@@ -421,6 +449,7 @@ export class Database implements FunctionContext {
     if (this.closed) return;
     for (const c of [...this.activeCursors]) c.close();
     this.pager.close();
+    this.spill.close();
     this.closed = true;
   }
 
@@ -767,6 +796,7 @@ export class Database implements FunctionContext {
       columnStore: (t) => (t.matview!.store ??= new ColumnStore(this.tree(t.rootPage))),
       funcCtx: this,
       state: this.state,
+      spill: this.spill,
     };
   }
 
@@ -2550,6 +2580,17 @@ export class Database implements FunctionContext {
         }
         return ro(['foreign_keys'], () => [[this.fk.enabled ? 1 : 0]]);
       }
+      case 'work_mem': {
+        if (stmt.value) {
+          const v = Number(arg());
+          if (!Number.isInteger(v) || v < 0) throw new SmaltError('SMALT_ERROR', 'work_mem must be a non-negative number of bytes');
+          return { readonly: true, columns: [], columnTypes: [], exec: () => ((this.spill.workMem = v), { changes: 0, lastInsertRowid: this.lastRowid }) };
+        }
+        return ro(['work_mem'], () => [[this.spill.workMem]]);
+      }
+      case 'spill_bytes':
+        // Bytes written to the scratch file since the database was opened.
+        return ro(['spill_bytes'], () => [[this.spill.bytesWritten]]);
       case 'page_size':
         return ro(['page_size'], () => [[this.pager.pageSize]]);
       case 'page_count':

@@ -36,7 +36,7 @@ function startReader(init: Extract<ReaderMessage, { type: 'init' }>): void {
         scope.postMessage({ type: 'idle', reader: init.reader } satisfies ReaderMessage);
       }
     },
-    { open: () => Database.openReader(new OpfsVfs(), `${init.name}.db`, { pageSize: init.pageSize, cacheSizeBytes: init.cacheSizeBytes }) },
+    { open: () => Database.openReader(new OpfsVfs(), `${init.name}.db`, { pageSize: init.pageSize, cacheSizeBytes: init.cacheSizeBytes, spillPath: `${init.name}.db-spill-r${init.reader}` }) },
   );
   // Open (with the shared interrupt flag); the 'ok' goes to id 0, which the client ignores.
   server.receive(EngineServer.LOCAL, { id: 0, op: 'open', name: init.name, storage: 'opfs', interrupt: init.interrupt });

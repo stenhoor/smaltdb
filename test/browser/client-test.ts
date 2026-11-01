@@ -25,6 +25,17 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   check('columnar numeric zero-copy', colr.length === 2000 && colr.data.id instanceof Float64Array && (colr.data.id as Float64Array)[1999] === 2000, colr.length);
   check('columnar nulls preserved', Array.isArray(colr.data.qty) && (colr.data.qty as unknown[])[6] === null);
 
+  // Spill to OPFS: a tiny work_mem makes the sort and the GROUP BY go through the scratch file.
+  const plain = await db.query('SELECT price % 37 AS k, count(*) AS n, sum(id) AS s FROM items GROUP BY k ORDER BY k, n', undefined, { rowMode: 'array' });
+  const sorted = await db.query('SELECT name FROM items ORDER BY name DESC, id', undefined, { rowMode: 'array' });
+  const spillBefore = (await db.query('PRAGMA spill_bytes', undefined, { rowMode: 'array' }))[0][0] as number;
+  await db.exec('PRAGMA work_mem = 2048');
+  const spilledAgg = await db.query('SELECT price % 37 AS k, count(*) AS n, sum(id) AS s FROM items GROUP BY k ORDER BY k, n', undefined, { rowMode: 'array' });
+  const spilledSort = await db.query('SELECT name FROM items ORDER BY name DESC, id', undefined, { rowMode: 'array' });
+  const spillAfter = (await db.query('PRAGMA spill_bytes', undefined, { rowMode: 'array' }))[0][0] as number;
+  await db.exec('PRAGMA work_mem = 268435456');
+  check('spill to OPFS (sort + GROUP BY)', spillAfter > spillBefore && JSON.stringify(plain) === JSON.stringify(spilledAgg) && JSON.stringify(sorted) === JSON.stringify(spilledSort) && sorted.length === 2000, [plain.length, spilledAgg.length, spillBefore, spillAfter]);
+
   const st = await db.prepare('SELECT name FROM items WHERE id = ?');
   t0 = performance.now();
   let found = 0;

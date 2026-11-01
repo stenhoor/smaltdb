@@ -22,7 +22,7 @@ Still open: running the browser tests and benchmarks on Firefox and WebKit, whic
 - Subquery decorrelation.
 - sqllogictest: 122,333 / 122,334 records of the tracked subset ([research/sqllogictest.md](research/sqllogictest.md)).
 
-**Next:** M7, analytics (spill-to-OPFS, morsel parallelism, columnar base tables, MV matching, mixed storage environments).
+**In progress:** M7, analytics. Done: mixed storage environments (TEMP tables, `location = 'memory'` MVs) and spill-to-OPFS for sorts and hash aggregates (ADR 0010). Next: columnar base tables, morsel parallelism, MV matching.
 
 Roadmap change (2026-11-01, agreed): the columnar segment format and zone maps move from M7 into M5, with materialized
 views as their first consumer; see [research/columnar-mv-assessment.md](research/columnar-mv-assessment.md).

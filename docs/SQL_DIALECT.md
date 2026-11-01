@@ -60,7 +60,7 @@ SQLite compatibility: `sqlite_schema` / `sqlite_master`, `pragma_table_info()`, 
 > **Implemented in M4** (`src/engine/catalog/information-schema.ts`): `schemata`, `tables`, `columns`, `views`, `table_constraints`,
 > `key_column_usage`, `referential_constraints`, `check_constraints`, `routines` (built-in functions) and `statistics`.
 > Constraints without a name get PostgreSQL-style names (`t_pkey`, `t_col_key`, `t_col_fkey`, `t_check1`). Internal tables
-> (`smalt_*`) are not listed. Not yet: `parameters` (no per-function signatures), TEMP objects. `materialized_views` (extension) arrived with M5.
+> (`smalt_*`) are not listed. Not yet: `parameters` (no per-function signatures), TEMP objects (TEMP tables are not listed). `materialized_views` (extension) arrived with M5.
 > Table-valued pragmas: `pragma_table_info`, `pragma_table_xinfo`, `pragma_index_list`, `pragma_index_info`,
 > `pragma_index_xinfo`, `pragma_foreign_key_list`; their arguments may reference earlier FROM sources
 > (`FROM sqlite_schema m JOIN pragma_table_info(m.name)`), which plans them as lateral joins.
@@ -154,6 +154,10 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
   `CHECK`, `COLLATE`), `CREATE [UNIQUE] INDEX` (multi-column, `ASC`/`DESC`, collations), and `DROP INDEX`.
 - `CREATE [TEMP] VIEW [IF NOT EXISTS] name [(columns)] AS select` and `DROP VIEW [IF EXISTS]` (M4). TEMP views exist for
   the connection only and shadow main views of the same name.
+- (M7) `CREATE TEMP|TEMPORARY TABLE`: lives in the connection's memory store (no pages written to the file, even in an
+  OPFS database), shadows a main table of the same name, takes indexes, and is gone when the database closes. Temp DDL
+  and writes roll back with the transaction. `CREATE MATERIALIZED VIEW … WITH (location = 'memory')` keeps an MV's rows
+  and indexes in memory and its definition in the file; it is recomputed when the database opens (ADR 0010).
 - `x [NOT] IN table` / `x IN f(args)`: SQLite's shorthand for `x IN (SELECT * FROM …)`. As in SQLite, a view's body is
   resolved when the view is used, not when it is created, and views cannot be modified or indexed. Simple views and FROM
   subqueries (no aggregates, DISTINCT, LIMIT, ORDER BY, compound, window functions or subquery expressions) are flattened
@@ -161,7 +165,9 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
 - `BEGIN` / `COMMIT` / `ROLLBACK`, `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` (M2), with statement-level atomicity inside transactions.
 - `EXPLAIN QUERY PLAN`, `EXPLAIN ANALYZE` (SELECT; estimated vs actual rows, loops and time per operator), and `ANALYZE [table]`
   (statistics in `smalt_stat`; M3); `PRAGMA table_info / index_list / index_info / page_size / page_count / freelist_count /
-  schema_version / integrity_check / journal_mode / wal_checkpoint`; `smalt_schema` (also `sqlite_schema` / `sqlite_master`).
+  schema_version / integrity_check / journal_mode / wal_checkpoint / work_mem / spill_bytes`. `PRAGMA work_mem = bytes`
+  (default 256 MiB) is how much a sort or hash aggregate may hold before spilling to the scratch file `<db>-spill`;
+  `spill_bytes` reports scratch bytes written since open (M7); `smalt_schema` (also `sqlite_schema` / `sqlite_master`).
 
 **Type mapping (STRICT by default):** declared types map to storage types by SQLite's affinity rules. *INT* → INTEGER;
 *CHAR*/*CLOB*/*TEXT* → TEXT; *BLOB* → BLOB; *REAL*/*FLOA*/*DOUB* → REAL; `ANY` or no type → ANY; anything else
@@ -170,7 +176,7 @@ losslessly as SQLite STRICT tables do (`'5'` into an INTEGER column becomes 5), 
 `cannot store TEXT value in INTEGER column t.c`.
 
 **Not yet supported** (each gives a clear `SMALT_UNSUPPORTED` error): `USING` / `NATURAL` with `RIGHT` / `FULL` joins,
-materialized views (M5), `ON CONFLICT` targets with WHERE, row-value assignments (`SET (a, b) = …`), `INCLUDE` columns, `WITHOUT ROWID`, `LOOSE` tables, generated columns, TEMP tables, JSON
+materialized views (M5), `ON CONFLICT` targets with WHERE, row-value assignments (`SET (a, b) = …`), `INCLUDE` columns, `WITHOUT ROWID`, `LOOSE` tables, generated columns, JSON
 functions, and `VACUUM`. Plain `EXPLAIN` returns the `EXPLAIN QUERY PLAN` output (there is no bytecode to list).
 
 **Known deviations:**

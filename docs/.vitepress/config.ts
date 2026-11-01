@@ -80,6 +80,7 @@ export default defineConfig({
           { text: '0007 Compact cells', link: '/adr/0007-compact-cells-and-free-blocks' },
           { text: '0008 Materialized views & columnar', link: '/adr/0008-materialized-views-and-columnar-segments' },
           { text: '0009 Concurrency', link: '/adr/0009-concurrency' },
+          { text: '0010 Analytics & mixed storage', link: '/adr/0010-analytics-and-mixed-storage' },
         ],
       },
       {

@@ -94,6 +94,7 @@ import {
   type ZonePredicate,
 } from './operators.js';
 import { type ColumnStore, ROW_GROUP_ROWS, zoneMayMatch } from '../storage/columnar.js';
+import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
 
 export interface PlannerEnv {
   getTable(name: string): TableSchema | undefined;
@@ -111,6 +112,8 @@ export interface PlannerEnv {
   columnStore?(table: TableSchema): ColumnStore;
   funcCtx: FunctionContext;
   state: ExecState;
+  /** Scratch file for sorts and hash aggregates that outgrow work_mem (M7.2). */
+  spill?: SpillArea | null;
 }
 
 export class Registers {
@@ -390,7 +393,7 @@ export class Planner {
         const idx = this.compoundOrderIndex(t, first.columns, stmt.core);
         return { reg: regs[idx], desc: t.desc, nullsFirst: t.nulls ? t.nulls === 'FIRST' : !t.desc, collation: first.columns[idx].collation };
       });
-      root = new Sort(root, keys, regs);
+      root = new Sort(root, keys, regs, undefined, this.env.spill ?? null);
     }
     root = this.applyLimit(root, stmt, base);
     return { root, outRegs: regs, columns: first.columns, correlated };
@@ -642,7 +645,10 @@ export class Planner {
           : agg.groupFns.length === 0
             ? this.tryFuseAggregate(root, agg.aggs, scope)
             : this.tryFuseGroupAggregate(root, groupAstsForFusion, agg.groupColls, agg.groupRegs, agg.aggs, scope);
-      root = fused ?? new HashAggregate(root, agg.groupFns, agg.groupColls, agg.groupRegs, agg.aggs, [...agg.bare]);
+      const hashAgg = new HashAggregate(root, agg.groupFns, agg.groupColls, agg.groupRegs, agg.aggs, [...agg.bare], this.env.spill ?? null);
+      // A fused GROUP BY that outgrows work_mem starts over as the (spilling) hash aggregate.
+      if (fused instanceof FusedGroupAggregate) fused.fallback = hashAgg;
+      root = fused ?? hashAgg;
       if (having) root = new Filter(root, having);
     }
 
@@ -672,7 +678,7 @@ export class Planner {
     if (core.distinct) root = new Distinct(root, regs, columns.map((c) => c.collation));
     if (sortNeeded) {
       const limitHint = stmt?.limit ? this.topNHint(stmt, parent) : undefined;
-      root = new Sort(root, sortKeys, [...regs, ...extraRegs], limitHint);
+      root = new Sort(root, sortKeys, [...regs, ...extraRegs], limitHint, this.env.spill ?? null);
     }
     return { root, outRegs: regs, columns, correlated: scope.correlated };
   }
@@ -875,15 +881,21 @@ export class Planner {
     const access = chain.scan.access;
     const cs = this.compileScope(scope);
     const node = chain.scan;
+    const spill = this.env.spill;
+    // Group memory of the current run (reset at open): past the limit the fused loop gives up.
+    const budget = spill ? { used: 0, limit: Infinity, area: spill } : null;
     const helpers = {
       ...(node instanceof ColumnScan ? this.columnarHelpers(node) : this.fusedHelpers(access)),
       hashKey,
       hashKeyMulti: (values: SqlValue[], colls: number[]) => hashKeyMulti(values, colls),
-      newGroup: (keys: SqlValue[]) => ({ keys, st: aggs.map((a) => a.def.create(a.star ? [] : a.argTypes, a.collation)) }),
+      newGroup: (keys: SqlValue[]) => {
+        if (budget !== null && (budget.used += 96 + 64 * aggs.length + rowBytes(keys)) > budget.limit) throw SpillRestart;
+        return { keys, st: aggs.map((a) => a.def.create(a.star ? [] : a.argTypes, a.collation)) };
+      },
     };
     const build = () =>
       generateGroupAggregate(chain.preds, groupAsts.map((expr, i) => ({ expr, collation: groupColls[i] })), specs, this.pipelineSource(node), helpers, (e) => compileNode(e, cs));
-    return new FusedGroupAggregate(access, build, groupRegs, aggs, node instanceof ColumnScan ? node.fusedLabel('group aggregate') : undefined);
+    return new FusedGroupAggregate(access, build, groupRegs, aggs, node instanceof ColumnScan ? node.fusedLabel('group aggregate') : undefined, budget);
   }
 
   private tryFuseAggregate(src: Operator, aggs: AggSpec[], scope: Scope): Operator | null {
@@ -1023,7 +1035,7 @@ export class Planner {
         const idx = this.compoundOrderIndex(t, columns, { kind: 'values', rows, pos: 0, end: 0 } as SelectCore);
         return { reg: regs[idx], desc: t.desc, nullsFirst: t.nulls ? t.nulls === 'FIRST' : !t.desc, collation: Collation.Binary };
       });
-      root = new Sort(root, keys, regs);
+      root = new Sort(root, keys, regs, undefined, this.env.spill ?? null);
     }
     return { root, outRegs: regs, columns, correlated: scope.correlated };
   }
