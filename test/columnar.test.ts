@@ -106,6 +106,6 @@ describe('columnar materialized views', () => {
     ]) {
       expect(db.query(q.replaceAll('$T', 'c')).rows).toEqual(db.query(q.replaceAll('$T', 't')).rows);
     }
-    expect(db.query('EXPLAIN QUERY PLAN SELECT sum(x) FROM c WHERE x > 10').rows.flat().join(' ')).toMatch(/columnar, fused/);
+    if (!process.env.SMALT_NO_CODEGEN) expect(db.query('EXPLAIN QUERY PLAN SELECT sum(x) FROM c WHERE x > 10').rows.flat().join(' ')).toMatch(/columnar, fused/);
   });
 });
