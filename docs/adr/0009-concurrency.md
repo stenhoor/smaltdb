@@ -58,17 +58,38 @@ exclusive. Nothing could be cancelled.
      epoch, so an id from an old owner cannot address a different statement.
    - *Copies:* BroadcastChannel copies messages (no transfers), so other tabs pay one copy per batch.
 
-## Not in this ADR
+7. **Parallel reader workers (Chromium).** These are used only where OPFS `readwrite-unsafe` handles exist, there is
+   more than one core, and the multi-tab leader lock guarantees one owner. Shared handles give up the file lock, and
+   the leader lock replaces it.
+   - *Readers:* the owner opens its files with shared handles and starts up to three reader workers. Each opens the
+     same files read-only (`Database.openReader`).
+   - *Snapshots:* before each query, a reader catches up with the WAL incrementally (`Wal.refresh`). It invalidates
+     only the pages that later commits changed. After a checkpoint, the database header's change counter tells it
+     whether the file changed. A query therefore sees exactly the commits that existed when it started, while the
+     owner keeps writing (snapshot isolation for those reads; readers never block writers).
+   - *Checkpoints:* the owner holds them back while any reader query runs; skipping one is always safe.
+   - *Routing:* a read-only query outside any transaction goes to an idle reader when other requests are waiting
+     behind it. A query that arrives alone runs on the owner, because the hand-off and snapshot refresh cost more
+     than they save: in testing, routing every query to readers took prepared lookups from 65 to 713 µs. The server
+     starts processing on a fresh task, so requests that arrived together are all queued before the first is routed.
+   - *Results:* readers answer the client directly over a `MessagePort`, or the BroadcastChannel for other tabs.
+     Credits and cancels are forwarded to them, and they share the interrupt flag.
+   - *Other browsers:* there are no parallel readers. A shared buffer pool is planned as M8.
 
-**Parallel reader workers** (the "parallel" mode of WORKER_MODEL §3) are not built. Two approaches are open:
-- **Per-reader file handles (`readwrite-unsafe`).** Each reader opens the database and WAL files itself and runs
-  read-only queries on a WAL snapshot, while the owner holds checkpoints back. This mostly reuses the engine, but
-  `readwrite-unsafe` is Chromium-only today.
-- **Shared buffer pool.** The pool lives in `SharedArrayBuffer`, with page reads proxied to the file owner. It works in
-  any cross-origin isolated browser, but needs a shared page cache with atomics, and stalls when the owner is busy.
+## Found on the way: text decoding contended across Chromium workers
+
+Four concurrent text-heavy queries in four Chromium workers took 5.6× as long as one, and each was 4× slower than in
+Node. The cause was `TextDecoder.decode`, called once per TEXT value: it is a costly host call in browsers and
+contended across workers. ASCII values up to 64 bytes are now built in JS, 8 characters per `String.fromCharCode`
+call (3× faster than `TextDecoder` in a Chromium worker). Four concurrent queries now take about as long as one.
+Node keeps its fast native decoder above 24 bytes. This speeds up text decoding in browsers generally, not only for
+readers.
 
 ## Consequences
 
 - Several tabs can use one database safely. Long results can be streamed and cancelled; running statements can be
   interrupted.
-- Concurrency between tabs is serialization, not parallelism: a long transaction in one tab blocks the others.
+- Transactions between tabs are serialized: a long transaction in one tab blocks the other tabs' statements.
+- On Chromium, concurrent read-only queries run in parallel on snapshots and do not block writers. In the browser
+  test, eight concurrent analytic queries took 65–88 ms against 116 ms serial (three readers plus the owner, after
+  warm-up). Elsewhere, reads run on the owner.

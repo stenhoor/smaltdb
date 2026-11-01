@@ -22,7 +22,7 @@ Still open: running the browser tests and benchmarks on Firefox and WebKit, whic
 - Subquery decorrelation.
 - sqllogictest: 122,333 / 122,334 records of the tracked subset ([research/sqllogictest.md](research/sqllogictest.md)).
 
-**Next:** M6, concurrency (multi-tab leader election, parallel reader workers).
+**Next:** M7, analytics (spill-to-OPFS, morsel parallelism, columnar base tables, MV matching, mixed storage environments).
 
 Roadmap change (2026-11-01, agreed): the columnar segment format and zone maps move from M7 into M5, with materialized
 views as their first consumer; see [research/columnar-mv-assessment.md](research/columnar-mv-assessment.md).
@@ -42,7 +42,7 @@ Carried over from M1, by decision (see [ADR 0003](adr/0003-m1-executor-and-trans
 | **M3: Optimizer** ✅ (2026-11-01, sqllogictest tracking → M4) | Statistics/ANALYZE, cost model, join ordering, access-path selection, EXPLAIN [ANALYZE], sqllogictest pass rate tracked |
 | **M4: Dialect breadth** ✅ (2026-11-01) | Window functions, CTEs (recursive), subquery decorrelation, ON CONFLICT, RETURNING, date/time, information_schema, sqlite_schema/pragmas, CSV/JSON import/export |
 | **M5: Materialized views + columnar segments** ✅ (2026-11-01) | Full refresh and `REFRESH … CONCURRENTLY` (copy-on-write swap); columnar segment format in pager pages, zone maps, columnar scans feeding the generated pipelines; MVs `WITH (storage = 'row' \| 'columnar')` ([research](research/columnar-mv-assessment.md)) |
-| **M6: Concurrency** | Multi-tab leader election, parallel reader workers (when crossOriginIsolated), cancellation, backpressure |
+| **M6: Concurrency** ✅ (2026-11-01; parallel readers on Chromium, others in M8) | Multi-tab leader election, parallel reader workers (when crossOriginIsolated), cancellation, backpressure |
 | **M7: Analytics** | Spill-to-OPFS, morsel parallelism, updatable columnar base tables (delta stores), MV matching (route queries to fresh columnar MVs), **mixed storage environments**: per-object placement in one database, e.g. memory-resident materialized views or tables inside an OPFS database (`WITH (location = 'memory')`, rebuilt on open or first use), via a second, in-memory page store (shared groundwork with `ATTACH`) |
 | **M8: Parallel readers everywhere** | Shared buffer pool in `SharedArrayBuffer` (page cache shared by the owner and reader workers, page reads proxied to the file owner with `Atomics.wait`/`notify`), so parallel reads work in every cross-origin isolated browser. M6 ships parallel readers only where OPFS `readwrite-unsafe` handles exist (Chromium) |
 | **1.0** | Format freeze, docs, performance targets met on Chromium, Firefox, and Safari |

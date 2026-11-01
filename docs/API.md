@@ -38,7 +38,12 @@ first change in a transaction are kept in memory for rollback.
   - *Failover:* when the owning tab closes, a waiting tab takes over and recovers committed data. Requests in flight
     then fail with `SMALT_RETRY` (safe to retry), and statements prepared under the old owner must be prepared again.
 
-*(planned)* parallel reader workers (`workers`), `insertColumns`, `explain`.
+- **Parallel readers (Chromium).** With multi-tab on and OPFS `readwrite-unsafe` handles available, concurrent
+  read-only queries outside transactions run on up to three reader workers, each reading a snapshot of the latest
+  commit. They run in parallel and do not block writers. Nothing changes in the API: `db.stats.readerQueries` counts
+  the queries readers served. In other browsers, reads run on the owning worker (a shared buffer pool is planned as M8).
+
+*(planned)* `insertColumns`, `explain`.
 The draft below shows the long-term shape.
 
 ```ts

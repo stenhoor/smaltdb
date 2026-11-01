@@ -2,8 +2,9 @@
 
 > Status: §2 (multi-tab), §5 (messaging, backpressure, cancellation) and the basic mode of §3 are **implemented in M6**
 > ([ADR 0009](adr/0009-concurrency.md)): `src/engine/server.ts`, `src/engine/worker.ts`, `src/client/index.ts`.
-> Not yet: the parallel reader pool (§3, "Parallel") and MVCC snapshots. Readers and writers of different tabs are
-> serialized instead (see ADR 0009).
+> Parallel readers (§3) are built differently from the plan below. On Chromium, reader workers open the files with
+> OPFS `readwrite-unsafe` handles and read WAL snapshots, with no shared buffer pool (ADR 0009). The shared-buffer-pool
+> design below is M8, for the other browsers. Transactions of different tabs are serialized.
 
 ## 1. Constraints that shape the design
 
