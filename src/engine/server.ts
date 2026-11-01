@@ -20,7 +20,7 @@
 import { type BindParams, Database, RowCursor, type Statement } from './database.js';
 import { SmaltError } from './errors.js';
 import { AsyncRequiredError } from './external/external.js';
-import { exportCSV, exportJSON, importCSV, importJSON } from './io/import-export.js';
+import { exportCSV, exportCSVAsync, exportJSON, exportJSONAsync, importCSV, importJSON } from './io/import-export.js';
 import type { Vfs } from './vfs/types.js';
 import { type ReaderSettings, type Request, type Response, encodeColumns } from '../shared/protocol.js';
 import type { SqlValue } from './values.js';
@@ -57,6 +57,8 @@ export interface ServerOptions {
   watchSession?(session: string): void;
   /** Parallel reader workers: may take a read-only query (returns false when none is idle). */
   readers?: ReaderPool;
+  /** Run materialized views' refresh policies on a one-second timer (default true; tests drive `refreshTick`). */
+  refreshTimer?: boolean;
 }
 
 /** Parallel readers as seen by the owner's server. */
@@ -116,15 +118,107 @@ export class EngineServer {
   morselQueries = 0;
 
   constructor(
-    private readonly send: Send,
+    private readonly sendOut: Send,
     private readonly options: ServerOptions,
   ) {}
 
   /** Session of the client that owns the engine worker. */
   static readonly LOCAL = 'local';
+  /** The server's own requests (scheduled refreshes): their responses go nowhere. */
+  static readonly INTERNAL = '\u0000internal';
+
+  private send(session: string, msg: Response, transfer?: Transferable[]): void {
+    if (session === EngineServer.INTERNAL) this.internalResult(msg);
+    else this.sendOut(session, msg, transfer);
+  }
+
+  // ---------------------------------------------------------------- credential callbacks (M8.1)
+
+  /** Credentials whose headers come from a session's callback: name -> session. */
+  private readonly credentialOwners = new Map<string, string>();
+  /** Questions to sessions' credentials callbacks, by question id. */
+  private readonly credentialAsks = new Map<number, { session: string; name: string; resolve: (h: Record<string, string>) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  private nextAsk = 1;
+
+  /** Ask `session` for the headers of a request to `url` (its callback for credentials `name`). */
+  private askCredentials(session: string, name: string, url: string): Promise<Record<string, string>> {
+    const request = this.nextAsk++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.credentialAsks.delete(request);
+        reject(new SmaltError('SMALT_EXTERNAL', `credentials '${name}': the provider did not answer within 30 s`));
+      }, 30_000);
+      (timer as { unref?: () => void }).unref?.();
+      this.credentialAsks.set(request, { session, name, resolve, reject, timer });
+      this.send(session, { id: 0, kind: 'credentials', request, name, url });
+    });
+  }
+
+  // ---------------------------------------------------------------- refresh policies (M8.1)
+
+  /** Scheduled refreshes queued or running: request id -> materialized view. */
+  private readonly refreshJobs = new Map<number, string>();
+  private nextInternalId = -1;
+  /** When each view's last scheduled refresh was started (ms). */
+  private readonly lastRefreshAttempt = new Map<string, number>();
+  private refreshTimer: ReturnType<typeof setInterval> | null = null;
+
+  private internalResult(msg: Response): void {
+    const name = this.refreshJobs.get(msg.id);
+    if (name === undefined || (msg.kind !== 'ok' && msg.kind !== 'error')) return;
+    this.refreshJobs.delete(msg.id);
+    // Shown in information_schema.materialized_views.last_refresh_error (offline, HTTP errors, …).
+    this.db?.noteRefreshResult(name, msg.kind === 'error' ? msg.message : null);
+  }
+
+  /**
+   * Queue `REFRESH … IF CHANGED` for views whose `refresh_every` has elapsed since their last
+   * refresh (or the last attempt). Runs every second while the database is open; tests pass a clock.
+   */
+  refreshTick(now = Date.now()): void {
+    const db = this.db;
+    if (!db) return;
+    for (const p of db.refreshPolicies()) {
+      if (p.every === null) continue;
+      const last = Math.max(this.lastRefreshAttempt.get(p.name.toLowerCase()) ?? 0, p.refreshedAt);
+      if (now - last >= p.every * 1000) this.queueRefresh(p.name, now);
+    }
+  }
+
+  /** The network is back (the worker's 'online' event): refresh views with `refresh_on_reconnect`. */
+  reconnected(now = Date.now()): void {
+    for (const p of this.db?.refreshPolicies() ?? []) if (p.onReconnect) this.queueRefresh(p.name, now);
+  }
+
+  /** A scheduled refresh: an ordinary queued request, so it waits for transactions and runs in turn. */
+  private queueRefresh(name: string, now: number): void {
+    const lower = name.toLowerCase();
+    if ([...this.refreshJobs.values()].some((n) => n.toLowerCase() === lower)) return; // already queued
+    this.lastRefreshAttempt.set(lower, now);
+    const id = this.nextInternalId--;
+    this.refreshJobs.set(id, name);
+    this.queue.push({ session: EngineServer.INTERNAL, req: { id, op: 'exec', sql: `REFRESH MATERIALIZED VIEW "${name.replace(/"/g, '""')}" IF CHANGED` }, blocked: false });
+    this.kick();
+  }
+
+  private stopRefreshTimer(): void {
+    if (this.refreshTimer !== null) clearInterval(this.refreshTimer);
+    this.refreshTimer = null;
+  }
 
   /** A request from `session`. Credits and cancellations act immediately; the rest queue. */
   receive(session: string, req: Request): void {
+    if (req.op === 'credentialsReply') {
+      // Answers a question asked while a request waits on its fetch: never queued behind it.
+      const ask = this.credentialAsks.get(req.target);
+      if (ask && ask.session === session) {
+        this.credentialAsks.delete(req.target);
+        clearTimeout(ask.timer);
+        if (req.headers) ask.resolve(req.headers);
+        else ask.reject(new SmaltError('SMALT_EXTERNAL', `credentials '${ask.name}': ${req.error ?? 'no headers'}`));
+      }
+      return;
+    }
     if ((req.op === 'credit' || req.op === 'cancel') && this.options.readers?.forward(session, req)) return;
     if (req.op === 'credit') {
       const s = this.streams.find((x) => x.session === session && x.id === req.target);
@@ -144,6 +238,18 @@ export class EngineServer {
   /** A session went away: drop its work, close its streams, roll back its transaction. */
   sessionGone(session: string): void {
     this.watched.delete(session);
+    for (const [id, ask] of this.credentialAsks) {
+      if (ask.session !== session) continue;
+      this.credentialAsks.delete(id);
+      clearTimeout(ask.timer);
+      ask.reject(new SmaltError('SMALT_EXTERNAL', `credentials '${ask.name}': the tab that provides them closed`));
+    }
+    // Its callbacks went with it.
+    for (const [name, owner] of this.credentialOwners) {
+      if (owner !== session) continue;
+      this.credentialOwners.delete(name);
+      this.db?.registerCredentials(name, null);
+    }
     for (let i = this.queue.length - 1; i >= 0; i--) if (this.queue[i].session === session) this.queue.splice(i, 1);
     for (const m of this.morselJobs) if (m.session === session) m.cancelled = true;
     for (let i = this.streams.length - 1; i >= 0; i--) {
@@ -294,6 +400,10 @@ export class EngineServer {
           return;
         }
         this.db = await this.options.open(req);
+        if (this.options.refreshTimer !== false && this.refreshTimer === null) {
+          this.refreshTimer = setInterval(() => this.refreshTick(), 1000);
+          (this.refreshTimer as { unref?: () => void }).unref?.(); // Node: do not keep the process alive
+        }
         const flag = this.interruptFlag;
         if (flag) {
           this.db.setInterruptCheck(() => {
@@ -330,10 +440,17 @@ export class EngineServer {
         this.requireDb().registerFile(req.name, req.file);
         this.send(session, { id, kind: 'ok' });
         return;
-      case 'registerCredentials':
-        this.requireDb().registerCredentials(req.name, req.provider);
+      case 'registerCredentials': {
+        const p = req.provider;
+        const name = req.name;
+        // A callback stays in the registering tab: the engine asks it for each request's headers.
+        this.requireDb().registerCredentials(name, p && (p.callback ? { endpoint: p.endpoint, headers: (url) => this.askCredentials(session, name, url) } : { endpoint: p.endpoint, headers: p.headers ?? {} }));
+        if (p?.callback) this.credentialOwners.set(name, session);
+        else this.credentialOwners.delete(name);
+        if (session !== EngineServer.LOCAL) this.watch(session);
         this.send(session, { id, kind: 'ok' });
         return;
+      }
       case 'query': {
         const st = this.requireDb().prepare(req.sql);
         if (this.readsExternal(st)) return this.queryExternal(session, req.sql, req);
@@ -382,7 +499,13 @@ export class EngineServer {
       case 'export': {
         const d = this.requireDb();
         const params = req.params as SqlValue[] | Record<string, SqlValue> | undefined;
-        const text = req.format === 'csv' ? exportCSV(d, req.sql, params, req.options) : exportJSON(d, req.sql, params, req.options);
+        // Queries over external data (M8) fetch their sources first; the rest run as before.
+        const external = this.readsExternal(d.prepare(req.sql));
+        const text = external
+          ? await this.withAbort(session, id, (signal) => (req.format === 'csv' ? exportCSVAsync(d, req.sql, params, req.options, signal) : exportJSONAsync(d, req.sql, params, req.options, signal)))
+          : req.format === 'csv'
+            ? exportCSV(d, req.sql, params, req.options)
+            : exportJSON(d, req.sql, params, req.options);
         this.send(session, { id, kind: 'ok', text });
         return;
       }
@@ -402,6 +525,7 @@ export class EngineServer {
           m.cancelled = true;
           this.fail(m.session, m.id, new SmaltError('SMALT_MISUSE', 'database is closed'));
         }
+        this.stopRefreshTimer();
         this.db?.close();
         this.db = null;
         this.send(session, { id, kind: 'ok' });

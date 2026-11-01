@@ -37,7 +37,8 @@ function startReader(init: Extract<ReaderMessage, { type: 'init' }>): void {
         scope.postMessage({ type: 'idle', reader: init.reader } satisfies ReaderMessage);
       }
     },
-    { open: () => Database.openReader(new OpfsVfs(), `${init.name}.db`, { pageSize: init.pageSize, cacheSizeBytes: init.cacheSizeBytes, spillPath: `${init.name}.db-spill-r${init.reader}` }) },
+    // Readers never refresh materialized views (the owner's scheduler does).
+    { open: () => Database.openReader(new OpfsVfs(), `${init.name}.db`, { pageSize: init.pageSize, cacheSizeBytes: init.cacheSizeBytes, spillPath: `${init.name}.db-spill-r${init.reader}` }), refreshTimer: false },
   );
   // Open (with the shared interrupt flag); the 'ok' goes to id 0, which the client ignores.
   server.receive(EngineServer.LOCAL, { id: 0, op: 'open', name: init.name, storage: 'opfs', interrupt: init.interrupt });
@@ -199,6 +200,8 @@ const server = new EngineServer(
 );
 
 function startOwner(): void {
+  // Materialized views with `refresh_on_reconnect` refresh when the network comes back.
+  scope.addEventListener('online', () => server.reconnected());
   scope.onmessage = (e: MessageEvent<Request>) => {
     const req = e.data;
     if (req.op === 'open' && req.bus && !bus) {

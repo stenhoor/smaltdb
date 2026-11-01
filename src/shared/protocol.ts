@@ -37,8 +37,14 @@ export type Request = { id: number } & (
   | { op: 'close' }
   /** M8: make a File / Blob / file handle / bytes / text readable as `file:<name>` (null removes it). */
   | { op: 'registerFile'; name: string; file: Blob | Uint8Array | ArrayBuffer | string | { getFile(): Promise<Blob> } | null }
-  /** M8: credentials a connection names: headers sent only to URLs that start with `endpoint` (null removes them). */
-  | { op: 'registerCredentials'; name: string; provider: { endpoint: string; headers: Record<string, string> } | null }
+  /**
+   * M8: credentials a connection names: headers sent only to URLs that start with `endpoint` (null
+   * removes them). `callback`: the engine asks this session for the headers of each request instead
+   * (a 'credentials' message, answered with 'credentialsReply').
+   */
+  | { op: 'registerCredentials'; name: string; provider: { endpoint: string; headers?: Record<string, string>; callback?: boolean } | null }
+  /** Answer to a 'credentials' message: the headers for that request, or why there are none. */
+  | { op: 'credentialsReply'; target: number; headers?: Record<string, string>; error?: string }
   /** Grant `n` more batches to the stream of request `target`. */
   | { op: 'credit'; target: number; n: number }
   /** Stop request `target`: dequeue it or close its stream (running statements: interrupt flag). */
@@ -85,6 +91,8 @@ export type WireColumn =
   | { t: 'any'; data: SqlValue[] };
 
 export type Response =
+  /** M8: the engine needs headers for `url` from this session's credentials callback `name`. */
+  | { id: 0; kind: 'credentials'; request: number; name: string; url: string }
   | { id: number; kind: 'ok'; changes?: number; lastInsertRowid?: number | bigint; stmt?: number; columns?: string[]; paramCount?: number; capabilities?: unknown; text?: string }
   /** `reader`: which parallel reader worker serves the result (absent: the owner). */
   | { id: number; kind: 'columns'; columns: string[]; reader?: number; /** Merged from this many morsels (parallel readers). */ morsels?: number }

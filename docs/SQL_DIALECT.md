@@ -53,7 +53,7 @@ These are read-only views over the internal catalog and follow the SQL-standard 
 | `information_schema.table_constraints`, `key_column_usage`, `referential_constraints`, `check_constraints` | |
 | `information_schema.routines`, `parameters` | built-in and user-defined functions |
 | `information_schema.statistics` (non-standard, like MySQL) | indexes and index columns |
-| `information_schema.materialized_views` (extension) | refresh mode, last refresh time, staleness |
+| `information_schema.materialized_views` (extension) | refresh mode (MANUAL or the automatic policy), last refresh time, staleness, last automatic refresh error |
 | `information_schema.external_tables`, `connections` (extensions, M8) | location, format, connection and reader options of external tables; connection endpoints and the names of their credentials (never secrets) |
 
 SQLite compatibility: `sqlite_schema` / `sqlite_master`, `pragma_table_info()`, `pragma_index_list()`, and the related table-valued pragma functions.
@@ -119,7 +119,10 @@ SELECT * FROM read_csv('https://example.com/rates.csv', delimiter => ';', null =
 SELECT * FROM read_json('file:upload', format => 'ndjson');
 
 -- A local cache (offline, fast repeat reads); REFRESH re-reads the source.
-CREATE MATERIALIZED VIEW prices_local WITH (storage = 'columnar') AS SELECT * FROM prices;
+CREATE MATERIALIZED VIEW prices_local
+  WITH (storage = 'columnar', refresh_every = 300, refresh_on_reconnect = true)
+AS SELECT * FROM prices;
+REFRESH MATERIALIZED VIEW prices_local IF CHANGED;   -- only when a source changed
 
 DROP EXTERNAL TABLE [IF EXISTS] prices;   -- catalog entry only: never touches the source
 DROP CONNECTION [IF EXISTS] api;          -- fails while an external table uses it
@@ -143,6 +146,16 @@ DROP CONNECTION [IF EXISTS] api;          -- fails while an external table uses 
   re-read by every statement; for repeat reads, cache them in a materialized view. A view over external data is never
   used to answer queries implicitly (`matview_rewrite`), since the source can change without the database knowing.
   `read_csv` / `read_json` arguments must be constants.
+- **Caches and freshness:** a materialized view over external data records each source's validator when it is
+  refreshed: the ETag or Last-Modified of a URL, a local file's modification time and size, a registered `File`'s
+  `lastModified` and size. `REFRESH MATERIALIZED VIEW name IF CHANGED` checks them (a HEAD request or a stat, not a
+  download) and refreshes only if one changed. A source without a validator (a registered Blob or bytes) always counts
+  as changed. For a view over local tables only, `IF CHANGED` refreshes when the view is stale. It needs the async API.
+- **Refresh policies:** `WITH (refresh_every = <seconds>)` and `WITH (refresh_on_reconnect = true)` on a materialized
+  view make the engine worker run `REFRESH … IF CHANGED` when the interval has passed since its last refresh, and when
+  the browser comes back online. These refreshes queue like any request. `information_schema.materialized_views` shows
+  the policy in `refresh_mode` (`EVERY 300 SECONDS`, `ON RECONNECT`) and the last automatic refresh's error in
+  `last_refresh_error`. In-process (Node), run `REFRESH … IF CHANGED` yourself.
 - **Errors:** `SMALT_EXTERNAL` names the source and the HTTP status, the CSV line or the JSON item; a network failure
   mentions CORS. A cancelled request aborts its fetches (`SMALT_INTERRUPT`).
 - **Catalog:** `sqlite_schema` lists them with types `external` and `connection`; `information_schema.tables` reports

@@ -3,7 +3,7 @@
  * never cross the message boundary one by one: imports go through one prepared INSERT in a single
  * transaction (all constraints, conversions and foreign keys apply), exports format query results.
  */
-import type { Database } from '../database.js';
+import type { Database, Statement } from '../database.js';
 import { SmaltError } from '../errors.js';
 import { formatReal } from '../exec/functions.js';
 import type { SqlValue } from '../values.js';
@@ -303,13 +303,39 @@ function textOf(v: SqlValue, real = false): string {
   return String(v);
 }
 
+/** A result with its columns' static types (REAL values print as reals, `2.0`). */
+interface TypedResult {
+  columns: string[];
+  rows: SqlValue[][];
+  real: boolean[];
+}
+
+function typedResult(st: Statement, params?: SqlValue[] | Record<string, SqlValue>): TypedResult {
+  const rows = st.all(params as never);
+  return { columns: st.columns, rows, real: st.columnTypes.map((t) => t === 'real') };
+}
+
 export function exportCSV(db: Database, sql: string, params?: SqlValue[] | Record<string, SqlValue>, opts: CsvExportOptions = {}): string {
+  return formatCSV(typedResult(db.prepare(sql), params), opts);
+}
+
+/** `exportCSV` for queries that may read external data (M8): their sources are fetched first. */
+export async function exportCSVAsync(db: Database, sql: string, params?: SqlValue[] | Record<string, SqlValue>, opts: CsvExportOptions = {}, signal?: AbortSignal): Promise<string> {
+  const st = db.prepare(sql);
+  return formatCSV(await db.withExternal(signal, st, () => typedResult(st, params)), opts);
+}
+
+/** `exportJSON` for queries that may read external data (M8). */
+export async function exportJSONAsync(db: Database, sql: string, params?: SqlValue[] | Record<string, SqlValue>, opts: JsonExportOptions = {}, signal?: AbortSignal): Promise<string> {
+  const st = db.prepare(sql);
+  return formatJSON(await db.withExternal(signal, st, () => typedResult(st, params)), opts);
+}
+
+function formatCSV(res: TypedResult, opts: CsvExportOptions): string {
   const delim = opts.delimiter ?? ',';
   const nl = opts.crlf ? '\r\n' : '\n';
   const nullString = opts.nullString ?? '';
-  const st = db.prepare(sql);
-  const res = { columns: st.columns, rows: st.all(params as never) };
-  const real = st.columnTypes.map((t) => t === 'real');
+  const real = res.real;
   const field = (s: string): string => (s.includes(delim) || s.includes('"') || s.includes('\n') || s.includes('\r') || /^\s|\s$/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s);
   const out: string[] = [];
   if (opts.header ?? true) out.push(res.columns.map(field).join(delim));
@@ -326,10 +352,12 @@ function jsonOf(v: SqlValue, real = false): string {
 }
 
 export function exportJSON(db: Database, sql: string, params?: SqlValue[] | Record<string, SqlValue>, opts: JsonExportOptions = {}): string {
-  const st = db.prepare(sql);
-  const rows = st.all(params as never);
-  const real = st.columnTypes.map((t) => t === 'real');
-  const keys = st.columns.map((c) => JSON.stringify(c));
+  return formatJSON(typedResult(db.prepare(sql), params), opts);
+}
+
+function formatJSON(res: TypedResult, opts: JsonExportOptions): string {
+  const { rows, real } = res;
+  const keys = res.columns.map((c) => JSON.stringify(c));
   const objects = rows.map((row) => '{' + row.map((v, i) => `${keys[i]}:${jsonOf(v, real[i])}`).join(',') + '}');
   if (opts.format === 'ndjson') return objects.length ? objects.join('\n') + '\n' : '';
   return '[' + objects.join(',') + ']';

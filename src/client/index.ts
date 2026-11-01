@@ -230,10 +230,12 @@ export class Database implements Queryable {
             this.epoch++;
             this.failAll(new SmaltdbError('SMALT_RETRY', 'the tab that owned the database closed; retry'), true);
           }
+          const changed = leader !== null;
           leader = m.leader;
           const q = queue;
           queue = [];
           for (const req of q) bus.postMessage({ type: 'req', session, leader, req } satisfies BusMessage);
+          if (changed) this.replayRegistrations();
         }
       };
       this.link = {
@@ -264,6 +266,7 @@ export class Database implements Queryable {
         becomeLeader();
         // A follower that was already open re-opens the database in its new worker.
         void this.request(openReq).catch(() => undefined);
+        this.replayRegistrations();
         return new Promise<void>((r) => (releaseLeader = r));
       });
     }
@@ -282,6 +285,10 @@ export class Database implements Queryable {
   }
 
   private onMessage(msg: Response): void {
+    if (msg.kind === 'credentials') {
+      void this.answerCredentials(msg);
+      return;
+    }
     const p = this.pending.get(msg.id);
     if (!p) return;
     if (msg.kind === 'columns') {
@@ -498,6 +505,8 @@ export class Database implements Queryable {
    * or `read_csv('file:<name>')`. Pass null to remove it. Files are not stored in the database.
    */
   async registerFile(name: string, file: Blob | Uint8Array | ArrayBuffer | string | { getFile(): Promise<Blob> } | null): Promise<void> {
+    if (file === null) this.registeredFiles.delete(name);
+    else this.registeredFiles.set(name, file);
     await this.request({ op: 'registerFile', name, file });
   }
 
@@ -506,8 +515,34 @@ export class Database implements Queryable {
    * `headers` are sent only with requests to URLs that start with `endpoint`. They live in the engine
    * worker's memory, never in SQL or the database file. Pass null to remove them.
    */
-  async registerCredentials(name: string, provider: { endpoint: string; headers: Record<string, string> } | null): Promise<void> {
-    await this.request({ op: 'registerCredentials', name, provider });
+  async registerCredentials(name: string, provider: CredentialsProvider | null): Promise<void> {
+    if (provider === null) this.registeredCredentials.delete(name);
+    else this.registeredCredentials.set(name, provider);
+    await this.request({ op: 'registerCredentials', name, provider: provider && wireProvider(provider) });
+  }
+
+  // Files and credentials live in the owning worker's memory: kept here to register them again with
+  // a new owner (another tab taking over).
+  private readonly registeredFiles = new Map<string, Blob | Uint8Array | ArrayBuffer | string | { getFile(): Promise<Blob> }>();
+  private readonly registeredCredentials = new Map<string, CredentialsProvider>();
+
+  /** @internal After a change of owner: register this tab's files and credentials with it. */
+  replayRegistrations(): void {
+    for (const [name, file] of this.registeredFiles) void this.request({ op: 'registerFile', name, file }).catch(() => undefined);
+    for (const [name, p] of this.registeredCredentials) void this.request({ op: 'registerCredentials', name, provider: wireProvider(p) }).catch(() => undefined);
+  }
+
+  /** The engine needs headers from one of this tab's credentials callbacks. */
+  private async answerCredentials(msg: Extract<Response, { kind: 'credentials' }>): Promise<void> {
+    const p = this.registeredCredentials.get(msg.name);
+    let reply: { headers?: Record<string, string>; error?: string };
+    try {
+      if (!p) throw new Error('not registered in this tab');
+      reply = { headers: typeof p.headers === 'function' ? await p.headers(msg.url) : p.headers };
+    } catch (e) {
+      reply = { error: e instanceof Error ? e.message : String(e) };
+    }
+    this.link?.send({ id: 0, op: 'credentialsReply', target: msg.request, ...reply } as Request);
   }
 
   /** Prepare a statement for repeated execution. */
@@ -658,5 +693,19 @@ function materialize(columns: string[], batches: { length: number; cols: WireCol
 
 /** Data accepted by importCSV / importJSON. */
 export type ImportSource = string | Uint8Array | ArrayBuffer | Blob;
+
+/**
+ * Credentials for connections (M8): `headers` for requests to URLs that start with `endpoint`,
+ * either fixed or computed per request (for example a token refreshed on demand). A function stays
+ * in this tab: the engine asks it for each request's headers.
+ */
+export interface CredentialsProvider {
+  endpoint: string;
+  headers: Record<string, string> | ((url: string) => Record<string, string> | Promise<Record<string, string>>);
+}
+
+function wireProvider(p: CredentialsProvider): { endpoint: string; headers?: Record<string, string>; callback?: boolean } {
+  return typeof p.headers === 'function' ? { endpoint: p.endpoint, callback: true } : { endpoint: p.endpoint, headers: p.headers };
+}
 export type { CsvExportOptions, CsvImportOptions, JsonExportOptions, JsonImportOptions } from '../engine/io/import-export.js';
 

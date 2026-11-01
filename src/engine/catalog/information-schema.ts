@@ -133,13 +133,16 @@ export function informationSchema(name: string, cat: CatalogSnapshot): VirtualTa
     case 'materialized_views':
       // smaltdb extension (PostgreSQL has pg_matviews).
       return {
-        columns: [t('table_catalog'), t('table_schema'), t('table_name'), t('view_definition'), t('storage'), t('location'), t('refresh_mode'), t('is_populated'), t('last_refresh'), t('is_fresh')],
+        columns: [t('table_catalog'), t('table_schema'), t('table_name'), t('view_definition'), t('storage'), t('location'), t('refresh_mode'), t('is_populated'), t('last_refresh'), t('is_fresh'), t('last_refresh_error')],
         rows: () =>
           userTables()
             .filter((x) => x.matview)
             .map((x) => {
               const m = x.matview!;
-              return [CATALOG, SCHEMA, x.name, m.sql.slice(m.select.pos, m.select.end), m.storage, x.rootPage >= 2 ** 30 ? 'memory' : 'file', 'MANUAL', yesNo(m.populated), m.refreshedAt, yesNo(m.populated && m.fresh === true)];
+              // MANUAL, or the automatic policy: `EVERY 300 SECONDS`, `ON RECONNECT`, or both.
+              const p = m.policy;
+              const mode = [p?.every ? `EVERY ${p.every} SECONDS` : '', p?.onReconnect ? 'ON RECONNECT' : ''].filter(Boolean).join(', ') || 'MANUAL';
+              return [CATALOG, SCHEMA, x.name, m.sql.slice(m.select.pos, m.select.end), m.storage, x.rootPage >= 2 ** 30 ? 'memory' : 'file', mode, yesNo(m.populated), m.refreshedAt, yesNo(m.populated && m.fresh === true), m.lastRefreshError ?? null];
             }),
       };
     case 'views':
