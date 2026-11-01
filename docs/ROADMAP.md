@@ -11,11 +11,25 @@ multiple connections.
 M1/M0 notes: M0 and M1 are complete. See [research/m0-baseline.md](research/m0-baseline.md) and
 [research/m1-baseline.md](research/m1-baseline.md). Performance versus SQLite WASM is mixed once measured like-for-like (see the correction in the M1 baseline): smaltdb is slower on small durable commits and on scan-heavy analytical queries.
 Still open: running the browser tests and benchmarks on Firefox and WebKit, which are not installed in the dev container.
-**Next:** M4 (dialect breadth). Optimizer follow-ups:
-- histograms and most-common values for range predicates;
-- transitive predicate inference;
-- covering index scans;
-- a sqllogictest pass rate.
+**In progress:** M4 (dialect breadth).
+- *Done:*
+  - views, with query flattening;
+  - `information_schema` and the table-valued pragmas;
+  - `RETURNING`, upsert and `UPDATE … FROM`;
+  - `WITH RECURSIVE`;
+  - window functions;
+  - date/time functions.
+- *Remaining:*
+  - `ALTER TABLE`;
+  - foreign-key enforcement;
+  - `RIGHT` / `FULL` joins;
+  - expression and partial indexes;
+  - CSV/JSON import and export;
+  - subquery decorrelation;
+  - `WITH` on DML;
+  - the sqllogictest pass rate.
+
+Optimizer follow-ups from M3: histograms and most-common values, transitive predicate inference, covering index scans.
 
 Carried over from M1, by decision (see [ADR 0003](adr/0003-m1-executor-and-transactions.md)):
 - the vectorized executor (M1 shipped a register-based iterator executor);
