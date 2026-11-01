@@ -85,23 +85,47 @@ export class TableWriter {
     }
   }
 
-  private indexKey(idx: IndexSchema, row: readonly SqlValue[], rowid: number | bigint | null): Uint8Array | null {
-    const e = this.keyEnc.reset();
-    for (const ic of idx.columns) {
-      const v = row[ic.column];
-      e.add(v, ic);
+  /** Index column values of a row (expressions evaluated), or null when a partial index excludes it. */
+  private indexValues(idx: IndexSchema, row: readonly SqlValue[], rowid: number | bigint): SqlValue[] | null {
+    const ev = idx.eval;
+    if (ev?.where && !ev.where(row, rowid)) return null;
+    const out: SqlValue[] = [];
+    for (let i = 0; i < idx.columns.length; i++) {
+      const f = ev?.cols[i];
+      out.push(f ? f(row, rowid) : row[idx.columns[i].column]);
     }
-    if (rowid === null) return e.finish();
-    e.add(rowid);
+    return out;
+  }
+
+  /** Index key of a row (with the rowid suffix unless `prefixOnly`); null when a partial index excludes the row. */
+  private indexKey(idx: IndexSchema, row: readonly SqlValue[], rowid: number | bigint, prefixOnly = false): Uint8Array | null {
+    const e = this.keyEnc.reset();
+    if (idx.eval) {
+      const vals = this.indexValues(idx, row, rowid);
+      if (vals === null) return null;
+      idx.columns.forEach((ic, i) => e.add(vals[i], ic));
+    } else {
+      for (const ic of idx.columns) e.add(row[ic.column], ic);
+    }
+    if (!prefixOnly) e.add(rowid);
     return e.finish();
   }
 
+  /** @internal Index entry for a row (CREATE INDEX on a populated table); null if excluded. */
+  indexEntry(idx: IndexSchema, row: readonly SqlValue[], rowid: number | bigint): Uint8Array | null {
+    const k = this.indexKey(idx, row, rowid);
+    return k && k.slice();
+  }
+
   /** Rowid of a row that conflicts with `row` on unique index `i`, or null. */
-  private uniqueConflict(i: number, row: readonly SqlValue[], except: number | bigint | null): number | bigint | null {
+  private uniqueConflict(i: number, row: readonly SqlValue[], except: number | bigint | null, rowid?: number | bigint): number | bigint | null {
     const idx = this.table.indexes[i];
     if (!idx.unique) return null;
-    for (const ic of idx.columns) if (row[ic.column] === null) return null; // NULLs never conflict
-    const prefix = this.indexKey(idx, row, null)!;
+    const rid = rowid ?? rowidHint(row, this.table);
+    const vals = idx.eval ? this.indexValues(idx, row, rid) : idx.columns.map((ic) => row[ic.column]);
+    if (vals === null) return null; // not in this partial index
+    for (const v of vals) if (v === null) return null; // NULLs never conflict
+    const prefix = this.indexKey(idx, row, rid, true)!;
     const c = this.indexTrees[i].cursor();
     try {
       for (let ok = c.seek(prefix); ok; ok = c.next()) {
@@ -126,6 +150,8 @@ export class TableWriter {
       const name = t.rowidAlias >= 0 ? t.columns[t.rowidAlias].name : 'rowid';
       return `UNIQUE constraint failed: ${t.name}.${name}`;
     }
+    // Like SQLite, expression indexes are named rather than listed by column.
+    if (idx.columns.some((c) => c.column < 0)) return `UNIQUE constraint failed: index '${idx.name}'`;
     return `UNIQUE constraint failed: ${idx.columns.map((c) => `${t.name}.${t.columns[c.column].name}`).join(', ')}`;
   }
 
@@ -146,7 +172,7 @@ export class TableWriter {
     }
     for (let i = 0; i < this.table.indexes.length; i++) {
       for (;;) {
-        const other = this.uniqueConflict(i, row, except);
+        const other = this.uniqueConflict(i, row, except, rowid);
         if (other === null) break;
         if (mode === 'IGNORE') return false;
         if (mode !== 'REPLACE') {
@@ -167,7 +193,7 @@ export class TableWriter {
       // eslint-disable-next-line eqeqeq
       return (except === null || rowid != except) && this.rowExists(rowid) ? rowid : null;
     }
-    return this.uniqueConflict(target, row, except);
+    return this.uniqueConflict(target, row, except, rowid);
   }
 
   /** First conflicting constraint (rowid, then unique indexes in order), or null. */
@@ -202,7 +228,10 @@ export class TableWriter {
     }
     this.tree.put(this.key(rowid), this.enc.encode(row));
     if (alias >= 0) row[alias] = saved;
-    for (let i = 0; i < t.indexes.length; i++) this.indexTrees[i].put(this.indexKey(t.indexes[i], row, rowid)!, EMPTY);
+    for (let i = 0; i < t.indexes.length; i++) {
+      const k = this.indexKey(t.indexes[i], row, rowid);
+      if (k) this.indexTrees[i].put(k, EMPTY);
+    }
     this.noteRowid(rowid);
   }
 
@@ -220,7 +249,10 @@ export class TableWriter {
     if (row === null) return false;
     if (!silent) this.beforeDelete?.(row);
     const t = this.table;
-    for (let i = 0; i < t.indexes.length; i++) this.indexTrees[i].delete(this.indexKey(t.indexes[i], row, rowid)!);
+    for (let i = 0; i < t.indexes.length; i++) {
+      const k = this.indexKey(t.indexes[i], row, rowid);
+      if (k) this.indexTrees[i].delete(k);
+    }
     this.tree.delete(this.key(rowid));
     if (!silent) this.onDelete?.(row, replace);
     return true;
@@ -235,3 +267,10 @@ export class TableWriter {
     return n;
   }
 }
+
+/** The rowid a row will have (its INTEGER PRIMARY KEY), for evaluating index expressions; 0 otherwise. */
+function rowidHint(row: readonly SqlValue[], t: TableSchema): number | bigint {
+  const v = t.rowidAlias >= 0 ? row[t.rowidAlias] : null;
+  return typeof v === 'number' || typeof v === 'bigint' ? v : 0;
+}
+

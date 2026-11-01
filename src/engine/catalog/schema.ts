@@ -28,10 +28,20 @@ export interface ColumnSchema {
 }
 
 export interface IndexColumnSchema {
-  /** Table column index, or -1 for an expression column (not supported in M1). */
+  /** Table column index, or -1 for an expression column. */
   column: number;
+  /** The indexed expression when `column` is -1. */
+  expr?: Expr;
   desc: boolean;
   collation: Collation;
+}
+
+/** Compiled evaluators of an index's expressions / WHERE clause over a row (set up by the database). */
+export interface IndexEval {
+  /** Per index column: the expression's value for (row, rowid), or null for plain columns. */
+  cols: (((row: readonly SqlValue[], rowid: number | bigint) => SqlValue) | null)[];
+  /** Partial index: whether the row belongs to the index. */
+  where?: (row: readonly SqlValue[], rowid: number | bigint) => boolean;
 }
 
 export interface IndexSchema {
@@ -45,6 +55,8 @@ export interface IndexSchema {
   /** Name given with `CONSTRAINT name` (constraint-backed indexes). */
   constraintName?: string;
   where?: Expr;
+  /** Evaluators for expression columns and the partial-index WHERE (absent for plain indexes). */
+  eval?: IndexEval;
   /** CREATE INDEX text (undefined for automatic indexes). */
   sql?: string;
   /** Statistics from ANALYZE. */
@@ -396,8 +408,15 @@ function fkSchema(name: string | undefined, columns: number[], c: ForeignKeyClau
 
 export function buildIndexSchema(stmt: CreateIndexStmt, sql: string, table: TableSchema, rootPage: number): IndexSchema {
   if (stmt.include?.length) throw new SmaltError('SMALT_UNSUPPORTED', 'INCLUDE columns are not supported yet');
-  const columns = stmt.columns.map((ic) => {
-    const name = indexedColumnName(ic);
+  const columns: IndexColumnSchema[] = stmt.columns.map((ic) => {
+    const plain = ic.expr.kind === 'column' || (ic.expr.kind === 'collate' && ic.expr.expr.kind === 'column');
+    if (!plain) {
+      // Expression column; validated and compiled by the database (Database.prepareIndex).
+      return { column: -1, expr: ic.expr.kind === 'collate' ? ic.expr.expr : ic.expr, desc: ic.desc, collation: toCollation(indexedColumnCollation(ic), Collation.Binary) };
+    }
+    const col = (ic.expr.kind === 'collate' ? ic.expr.expr : ic.expr) as { table?: string; name: string };
+    if (col.table && col.table.toLowerCase() !== table.name.toLowerCase()) throw new SmaltError('SMALT_ERROR', `no such column: ${col.table}.${col.name}`);
+    const name = col.name;
     const index = findColumn(table, name);
     if (index < 0) throw new SmaltError('SMALT_ERROR', `no such column: ${name}`);
     return { column: index, desc: ic.desc, collation: toCollation(indexedColumnCollation(ic), table.columns[index].collation) };

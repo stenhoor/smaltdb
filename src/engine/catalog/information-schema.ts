@@ -171,7 +171,7 @@ export function informationSchema(name: string, cat: CatalogSnapshot): VirtualTa
         columns: [t('table_catalog'), t('table_schema'), t('table_name'), i('non_unique'), t('index_name'), i('seq_in_index'), t('column_name'), t('collation'), t('index_type')],
         rows: () =>
           userTables().flatMap((x) =>
-            x.indexes.flatMap((idx) => idx.columns.map((c, n) => [CATALOG, SCHEMA, x.name, idx.unique ? 0 : 1, idx.name, n + 1, x.columns[c.column].name, c.desc ? 'D' : 'A', 'BTREE'])),
+            x.indexes.flatMap((idx) => idx.columns.map((c, n) => [CATALOG, SCHEMA, x.name, idx.unique ? 0 : 1, idx.name, n + 1, c.column < 0 ? null : x.columns[c.column].name, c.desc ? 'D' : 'A', 'BTREE'])),
           ),
       };
     default:

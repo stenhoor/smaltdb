@@ -1385,7 +1385,9 @@ export class Planner {
     const N = this.tableRows(src);
     const table = src.table!;
     const access = src.access!;
-    type Probe = { op: string; other: Expr; deps: Set<number>; col: number | 'rowid'; colExpr: Expr; conj: ConjunctInfo; list?: Expr[] };
+    type Probe = { op: string; other: Expr; deps: Set<number>; col: number | 'rowid'; colExpr: Expr; conj: ConjunctInfo; list?: Expr[]; exprKey?: string };
+    // Expression indexes: comparisons whose one side is an expression over this source alone.
+    const exprIndexes = table.indexes.some((i) => i.columns.some((c) => c.expr));
     const probes: Probe[] = [];
     for (const c of candidates) {
       const e = c.expr;
@@ -1409,11 +1411,17 @@ export class Planner {
         [e.right, e.left, true],
       ] as const) {
         const col = this.columnOf(colSide, src, scope);
-        if (col === null) continue;
+        let exprKey: string | undefined;
+        if (col === null) {
+          if (!exprIndexes) continue;
+          const sd = this.deps(colSide, scope);
+          if (sd === null || sd.size !== 1 || !sd.has(p)) continue;
+          exprKey = exprShapeKey(colSide);
+        }
         const d = this.deps(otherSide, scope);
         if (d === null || d.has(p)) continue;
         const op = e.op === 'IS' ? 'IS' : flip ? flipOp(e.op) : e.op;
-        probes.push({ op, other: otherSide, deps: d, col, colExpr: colSide, conj: c });
+        probes.push({ op, other: otherSide, deps: d, col: col ?? -1, colExpr: colSide, conj: c, exprKey });
         break;
       }
     }
@@ -1465,11 +1473,17 @@ export class Planner {
 
     // Secondary indexes.
     for (const idx of table.indexes) {
-      if (idx.where) continue; // partial indexes: not used by the M1 planner
+      if (idx.where) {
+        // A partial index holds only rows matching its WHERE: usable when the query implies it.
+        const have = new Set(candidates.map((c) => exprShapeKey(c.expr)));
+        if (!conjuncts(idx.where).every((w) => have.has(exprShapeKey(w)))) continue;
+      }
       const eqs: Probe[] = [];
       const converters: ((v: SqlValue) => SqlValue)[] = [];
-      const usable = (pr: Probe, ic: { column: number; collation: Collation }): ((v: SqlValue) => SqlValue) | null => {
-        if (pr.col !== ic.column) return null;
+      const usable = (pr: Probe, ic: { column: number; collation: Collation; expr?: Expr }): ((v: SqlValue) => SqlValue) | null => {
+        if (ic.column < 0) {
+          if (pr.exprKey === undefined || pr.exprKey !== exprShapeKey(ic.expr!)) return null;
+        } else if (pr.col !== ic.column) return null;
         const colC = compileExpr(pr.colExpr, cs);
         const otherC = compileExpr(pr.other, cs);
         if (comparisonCollation(colC, otherC) !== ic.collation) return null;
@@ -1518,9 +1532,12 @@ export class Planner {
       else if (k > 0 && idx.stats) matches = idx.stats.avg[k - 1];
       else {
         matches = N;
-        for (let j = 0; j < k; j++) matches /= this.ndv(src, idx.columns[j].column);
+        // Expression columns have no statistics: assume ~10 rows per value, like SQLite without ANALYZE.
+        for (let j = 0; j < k; j++) matches /= idx.columns[j].column < 0 ? Math.max(1, N / 10) : this.ndv(src, idx.columns[j].column);
       }
       if (lo || hi) matches *= lo && hi ? 0.25 : 0.33;
+      // A partial index only holds rows matching its WHERE.
+      if (idx.where) for (const w of conjuncts(idx.where)) matches *= this.selectivity(w, scope);
       matches = Math.max(1, matches);
       const deps = outerDep([...eqs, ...(lo ? [lo] : []), ...(hi ? [hi] : [])]);
       consider(`index ${idx.name}`, COST.probe + matches * COST.fetch, matches, deps, () => {
@@ -2084,5 +2101,16 @@ function containsWindow(e: Expr | undefined): boolean {
     }
   });
   return found;
+}
+
+/** Shape of an expression for matching against index definitions: no positions, no table qualifiers. */
+function exprShapeKey(e: Expr): string {
+  return JSON.stringify(e, (k, v) => {
+    if (k === 'pos' || k === 'end' || k === 'table' || k === 'schema') return undefined;
+    if (k === 'name' && typeof v === 'string') return v.toLowerCase();
+    if (typeof v === 'bigint') return `${v}n`;
+    if (v instanceof Uint8Array) return [...v];
+    return v;
+  });
 }
 

@@ -412,6 +412,7 @@ export class Database implements FunctionContext {
       const table = this.tables.get(r.tbl_name.toLowerCase());
       if (!table) throw new SmaltError('SMALT_CORRUPT', `index ${r.name} references missing table ${r.tbl_name}`);
       const idx = buildIndexSchema(stmt, r.sql, table, r.rootpage);
+      this.prepareIndex(table, idx);
       table.indexes.push(idx);
       this.indexes.set(idx.name.toLowerCase(), idx);
     }
@@ -813,15 +814,15 @@ export class Database implements FunctionContext {
     const table = this.tables.get(stmt.table.toLowerCase());
     if (!table) throw new SmaltError('SMALT_ERROR', this.views.has(stmt.table.toLowerCase()) ? 'views may not be indexed' : `no such table: ${stmt.table}`);
     this.checkNewName(stmt.name, 'index');
-    if (stmt.where) throw new SmaltError('SMALT_UNSUPPORTED', 'partial indexes are not supported yet');
     this.dirtySchema = true;
     const root = BTree.create(this.pager);
     const idx = buildIndexSchema(stmt, sql, table, root);
-    // Populate from existing rows.
+    this.prepareIndex(table, idx);
+    // Populate from existing rows (expression values computed, partial-index rows filtered).
     const tree = new BTree(this.pager, table.rootPage);
     const itree = new BTree(this.pager, root);
     const reader = new RecordReader(table.layout, table.recordDefaults);
-    const enc = new KeyEncoder();
+    const w = new TableWriter(table, this.pager, (r) => this.tree(r));
     const entries: Uint8Array[] = [];
     const c = tree.cursor();
     try {
@@ -830,10 +831,9 @@ export class Database implements FunctionContext {
         const rowid = readRowidKey(c.keyBytes, c.keyOffset);
         c.loadValue();
         reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
-        enc.reset();
-        for (const ic of idx.columns) enc.add(ic.column === table.rowidAlias ? rowid : reader.column(ic.column), ic);
-        enc.add(rowid);
-        entries.push(enc.finish());
+        const row = table.columns.map((_, i) => (i === table.rowidAlias ? rowid : reader.column(i)));
+        const k = w.indexEntry(idx, row, rowid);
+        if (k) entries.push(k);
       }
     } finally {
       c.close();
@@ -847,6 +847,56 @@ export class Database implements FunctionContext {
     return none;
   }
 
+  /**
+   * Validate and compile an index's expression columns and partial-index WHERE (like SQLite: no
+   * subqueries, parameters or non-deterministic functions) into evaluators over a row.
+   */
+  private prepareIndex(table: TableSchema, idx: IndexSchema): void {
+    idx.eval = undefined;
+    if (!idx.where && !idx.columns.some((c) => c.expr)) return;
+    const n = table.columns.length;
+    const planner = new Planner({ getTable: (x) => this.getTable(x), openTree: (root) => this.tree(root), funcCtx: this, state: this.state }, new Registers(n + 1));
+    const scope = this.rowScope(table, undefined, 0, n, planner);
+    const check = (e: Expr, what: string): void => {
+      const go = (x: unknown): void => {
+        if (Array.isArray(x)) return x.forEach(go);
+        if (typeof x !== 'object' || x === null || Object.getPrototypeOf(x) !== Object.prototype) return;
+        const o = x as Record<string, unknown>;
+        if ((o.kind === 'subquery' || o.kind === 'exists' || o.kind === 'inSelect') && 'select' in o) throw new SmaltError('SMALT_ERROR', `subqueries prohibited in ${what}`);
+        if (o.kind === 'param') throw new SmaltError('SMALT_ERROR', `parameters prohibited in ${what}`);
+        if (o.kind === 'call') {
+          const name = String(o.name);
+          const def = scalarFunctions.get(name);
+          if ((def && !def.deterministic) || name === 'current_time' || name === 'current_date' || name === 'current_timestamp') {
+            throw new SmaltError('SMALT_ERROR', `non-deterministic functions prohibited in ${what}`);
+          }
+        }
+        for (const k of Object.keys(o)) go(o[k]);
+      };
+      go(e);
+    };
+    const cols = idx.columns.map((c) => {
+      if (!c.expr) return null;
+      check(c.expr, 'index expressions');
+      return compileExpr(c.expr, scope).fn;
+    });
+    let where: Fn | undefined;
+    if (idx.where) {
+      check(idx.where, 'partial index WHERE clauses');
+      where = compileExpr(idx.where, scope).fn;
+    }
+    const regs: SqlValue[] = new Array(Math.max(planner.regs.count, n + 1)).fill(null);
+    const load = (row: readonly SqlValue[], rowid: number | bigint): SqlValue[] => {
+      for (let i = 0; i < n; i++) regs[i] = row[i];
+      regs[n] = rowid;
+      return regs;
+    };
+    idx.eval = {
+      cols: cols.map((f) => (f ? (row: readonly SqlValue[], rowid: number | bigint) => f(load(row, rowid)) : null)),
+      where: where ? (row, rowid) => truthy(where!(load(row, rowid))) === true : undefined,
+    };
+  }
+
   private checkUniqueIndex(table: TableSchema, idx: IndexSchema): void {
     const itree = new BTree(this.pager, idx.rootPage);
     const c = itree.cursor();
@@ -856,7 +906,7 @@ export class Database implements FunctionContext {
         const k = c.key();
         const prefix = k.subarray(0, k.length - 11);
         if (prev && prefix.length === prev.length && prefix.every((b, i) => b === prev![i]) && !prefixHasNull(prefix)) {
-          throw new ConstraintError('SMALT_CONSTRAINT_UNIQUE', `UNIQUE constraint failed: ${idx.columns.map((ic) => `${table.name}.${table.columns[ic.column].name}`).join(', ')}`);
+          throw new ConstraintError('SMALT_CONSTRAINT_UNIQUE', idx.columns.some((ic) => ic.column < 0) ? `UNIQUE constraint failed: index '${idx.name}'` : `UNIQUE constraint failed: ${idx.columns.map((ic) => `${table.name}.${table.columns[ic.column].name}`).join(', ')}`);
         }
         prev = prefix.slice();
       }
@@ -1007,7 +1057,7 @@ export class Database implements FunctionContext {
       try {
         const t = built.get(r.tbl_name.toLowerCase());
         if (!t) throw new SmaltError('SMALT_ERROR', `no such table: ${r.tbl_name}`);
-        buildIndexSchema(parseOne(r.sql).stmt as CreateIndexStmt, r.sql, t, r.rootpage);
+        this.prepareIndex(t, buildIndexSchema(parseOne(r.sql).stmt as CreateIndexStmt, r.sql, t, r.rootpage));
       } catch (e) {
         throw new SmaltError('SMALT_ERROR', `error in index ${r.name}${suffix}: ${(e as Error).message}`);
       }
@@ -1758,14 +1808,14 @@ export class Database implements FunctionContext {
           const idx = this.indexes.get(name.toLowerCase());
           if (!idx) return [];
           const t = this.tables.get(idx.table.toLowerCase())!;
-          return idx.columns.map((c, i) => [i, c.column, t.columns[c.column].name]);
+          return idx.columns.map((c, i) => (c.column < 0 ? [i, -2, null] : [i, c.column, t.columns[c.column].name]));
         });
       case 'index_xinfo':
         return ro(['seqno', 'cid', 'name', 'desc', 'coll', 'key'], () => {
           const idx = this.indexes.get((arg() ?? '').toLowerCase());
           if (!idx) return [];
           const t = this.tables.get(idx.table.toLowerCase())!;
-          const keys = idx.columns.map((c, i) => [i, c.column, t.columns[c.column].name, c.desc ? 1 : 0, ['BINARY', 'NOCASE', 'RTRIM'][c.collation], 1]);
+          const keys = idx.columns.map((c, i) => [i, c.column < 0 ? -2 : c.column, c.column < 0 ? null : t.columns[c.column].name, c.desc ? 1 : 0, ['BINARY', 'NOCASE', 'RTRIM'][c.collation], 1]);
           return [...keys, [idx.columns.length, -1, null, 0, 'BINARY', 0]];
         });
       case 'foreign_key_list':
@@ -1857,7 +1907,7 @@ export class Database implements FunctionContext {
             for (const i of t.indexes) {
               pages += check(i.rootPage, `index ${i.name}`);
               const m = new BTree(this.pager, i.rootPage).count();
-              if (m !== n) errors.push(`index ${i.name} has ${m} entries, table ${t.name} has ${n} rows`);
+              if (m !== n && !i.where) errors.push(`index ${i.name} has ${m} entries, table ${t.name} has ${n} rows`);
             }
           }
           if (pages + this.pager.freelistCount !== this.pager.pageCount) {
