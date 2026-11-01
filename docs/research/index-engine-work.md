@@ -74,3 +74,62 @@ The non-index workloads (OLTP, analytic, joins) are unchanged within run-to-run 
 - **Table size.** Rows are 2.3× SQLite's because integers take a fixed 8 bytes. This is deferred to
   the columnar milestone, as recommended.
 - **Index entry overhead.** Each entry still carries a 7-byte cell header and a 2-byte slot.
+
+## Round 2: sorted rowid fetch, format 3, faster CREATE INDEX
+
+Changes:
+1. **Sorted rowid fetch.** An index scan whose row order cannot be observed sorts its rowids in
+   batches of 4,096 and walks the table forward.
+2. **Format 3** (ADR 0007): varint leaf cell headers (2 bytes for an index entry instead of 7) and
+   per-page free-block lists.
+3. **CREATE INDEX.** A radix sort on key prefixes, and expression indexes decode only the columns
+   they read.
+
+Sizes (200k rows): table 1,427 → 1,307 pages; `a(b)` 397 → 275 (SQLite 263); `a(d, c)` 455 → 332
+(SQLite 463); `a(lower(e))` 478 → 355 (SQLite 286).
+
+Runs:
+- `bench/results/2026-11-01-chromium-4feec71-cpu.json` (CPU-only);
+- `bench/results/2026-11-01-chromium-4feec71.json` (OPFS).
+
+Each is compared with the round-1 runs above.
+
+### CPU-only (both engines in memory)
+
+| Workload | Round 1 | Round 2 | SQLite | Round 2 vs SQLite |
+|---|---|---|---|---|
+| CREATE INDEX, 1 column | 78 ms | 73 ms | 41 ms | 0.56× slower |
+| CREATE INDEX, 2 columns | 81 ms | 60 ms | 81 ms | 1.34× faster |
+| CREATE INDEX on `lower(e)` | 151 ms | 120 ms | 69 ms | 0.57× slower |
+| Equality lookups ×10k | 70 ms | 73 ms | 78 ms | no clear difference |
+| Range lookups ×1k | 688 ms | 495 ms | 534 ms | no clear difference (was 0.74×) |
+| Composite lookups ×1k | 29.0 ms | 28.7 ms | 29.6 ms | no clear difference |
+| Expression lookups ×1k | 121 ms | 114 ms | 182 ms | 1.60× faster |
+| UPDATE indexed column, 10k rows | 85 ms | 73 ms | 28 ms | 0.38× slower |
+| DELETE 10k rows | 46.5 ms | 46.8 ms | 26.3 ms | 0.56× slower |
+| Bulk insert 100k, 3 indexes | 479 ms | 460 ms | 664 ms | 1.44× faster |
+
+### OPFS (smaltdb vs the faster crash-safe SQLite mode)
+
+| Workload | Round 1 | Round 2 | Best SQLite | Round 2 vs SQLite |
+|---|---|---|---|---|
+| CREATE INDEX, 1 column | 92 ms | 78 ms | 163 ms | 2.10× faster |
+| CREATE INDEX, 2 columns | 130 ms | 102 ms | 302 ms | 2.96× faster |
+| CREATE INDEX on `lower(e)` | 179 ms | 139 ms | 196 ms | 1.41× faster |
+| Equality lookups ×10k | 70 ms | 74 ms | 78 ms | no clear difference |
+| Range lookups ×1k | 721 ms | 484 ms | 520 ms | no clear difference (was 0.71×) |
+| Composite lookups ×1k | 29.3 ms | 29.7 ms | 31.1 ms | no clear difference |
+| Expression lookups ×1k | 112 ms | 126 ms | 181 ms | 1.44× faster |
+| UPDATE indexed column, 10k rows | 229 ms | 213 ms | 1,331 ms | 6.2× faster |
+| DELETE 10k rows | 168 ms | 166 ms | 654 ms | 3.9× faster |
+| Bulk insert 100k, 3 indexes | 607 ms | 612 ms | 1,118 ms | 1.83× faster |
+
+On OPFS, smaltdb is now at least even with SQLite on every index workload. Non-index workloads are
+unchanged within noise.
+
+### Still behind, CPU-only
+
+- **UPDATE (0.38×) and DELETE (0.56×):** two passes, a root-to-leaf search per operation, and
+  undo copies of modified pages.
+- **1-column and expression CREATE INDEX (about 0.56×):** the cost is now spread across the scan
+  loop, the bulk build and the key encoding.
