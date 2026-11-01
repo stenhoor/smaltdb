@@ -18,6 +18,7 @@
  */
 import type { ColumnExpr, Expr, FromItem, SelectStmt } from '../sql/ast.js';
 import { type MorselTableInfo, analyzeMorsels, exprKey } from './morsel.js';
+import { isAggregateCall } from './planner.js';
 
 const NO_POS = { pos: 0, end: 0 };
 
@@ -73,8 +74,7 @@ function contains(x: unknown, pred: (o: Record<string, unknown>) => boolean): bo
   return pred(o) || Object.values(o).some((v) => contains(v, pred));
 }
 
-const AGGREGATES = new Set(['count', 'sum', 'total', 'min', 'max', 'avg', 'group_concat', 'string_agg', 'json_group_array', 'json_group_object']);
-const isAggregateCall = (o: Record<string, unknown>): boolean => o.kind === 'call' && AGGREGATES.has(o.name as string) && (o.name === 'count' || (o.args as unknown[]).length === 1);
+const isAggregate = (o: Record<string, unknown>): boolean => o.kind === 'call' && isAggregateCall(o as unknown as Expr);
 // A nested SELECT statement (it has a `core`; a SELECT core is also of kind 'select').
 const hasSubquery = (o: Record<string, unknown>): boolean => o.kind === 'subquery' || o.kind === 'exists' || o.kind === 'inSelect' || (o.kind === 'select' && 'core' in o);
 
@@ -116,7 +116,7 @@ export function matchMatview(query: SelectStmt, text: string, views: MatviewCand
   const nq = normalize(query);
   const nqc = nq.core as typeof qc;
   const qConj = conjuncts(nqc.where);
-  const qAggregate = nqc.groupBy.length > 0 || contains(nqc.columns, isAggregateCall) || contains(nqc.having, isAggregateCall);
+  const qAggregate = nqc.groupBy.length > 0 || contains(nqc.columns, isAggregate) || contains(nqc.having, isAggregate);
   for (const v of views) {
     const vc = simpleCore(v.select);
     if (!vc || (vc.from as { name: string }).name.toLowerCase() !== table || vc.having || v.select.orderBy.length || v.select.limit) continue;
@@ -128,7 +128,7 @@ export function matchMatview(query: SelectStmt, text: string, views: MatviewCand
     if (!vConj.every((c) => qKeys.has(exprKey(c)))) continue;
     const vKeys = new Set(vConj.map(exprKey));
     const extra = qConj.filter((c) => !vKeys.has(exprKey(c)));
-    const vAggregate = nv.groupBy.length > 0 || contains(nv.columns, isAggregateCall);
+    const vAggregate = nv.groupBy.length > 0 || contains(nv.columns, isAggregate);
     const r = qAggregate ? (vAggregate ? rollUp(query, text, nq, v, nv, extra, info) : null) : vAggregate ? null : project(nq, query, v, nv, extra);
     if (r) return { stmt: r, view: v.name };
   }
@@ -165,7 +165,7 @@ function rollUp(
   // Aggregate columns of the view; total(x) can be merged from a sum(x) column too.
   const aggs = new Map<string, string>();
   nv.columns.forEach((rc, i) => {
-    if (rc.kind !== 'expr' || !isAggregateCall(rc.expr as unknown as Record<string, unknown>)) return;
+    if (rc.kind !== 'expr' || !isAggregateCall(rc.expr)) return;
     aggs.set(exprKey(rc.expr), v.columns[i]);
     const c = rc.expr as Expr & { kind: 'call' };
     if (c.name === 'sum') aggs.set(exprKey({ ...c, name: 'total' }), v.columns[i]);

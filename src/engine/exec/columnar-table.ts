@@ -109,20 +109,34 @@ export function maxSegmentRowid(store: ColumnStore, rowidCol: number): Rowid {
  */
 export class ColumnarTableWriter extends TableWriter {
   private readonly rowidCol: number;
+  /** Largest segment rowid, and the segment reader: both change when compaction moves rows. */
   private segMax: Rowid | null = null;
+  private store: ColumnStore;
   private readonly delKey = new Uint8Array(ROWID_KEY_SIZE);
 
   constructor(
     table: TableSchema,
     pager: Pager,
     treeFor: (root: number) => BTree,
-    private readonly store: ColumnStore,
+    /** The table's current segment reader (re-read each statement: compaction and rollbacks replace it). */
+    private readonly storeFor: () => ColumnStore,
     private readonly del: BTree,
     /** Called once the table has been written (compaction is checked at statement end). */
     private readonly touched: () => void,
   ) {
     super(table, pager, treeFor);
     this.rowidCol = table.columns.length;
+    this.store = storeFor();
+  }
+
+  /**
+   * A statement program keeps its writer across executions (INSERT): between them, compaction may
+   * have moved delta rows into the segments, or a rollback may have dropped the segment reader.
+   */
+  override resetStatement(): void {
+    super.resetStatement();
+    this.segMax = null;
+    this.store = this.storeFor();
   }
 
   private delKeyOf(rowid: Rowid): Uint8Array {

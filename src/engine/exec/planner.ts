@@ -99,7 +99,8 @@ import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
 import { deletedBitmap, rowidsOf, zoneOf } from './columnar-table.js';
 
 export interface PlannerEnv {
-  getTable(name: string): TableSchema | undefined;
+  /** A table by name; `schema` 'main' / 'temp' picks that schema when a TEMP table shadows a main one. */
+  getTable(name: string, schema?: string): TableSchema | undefined;
   /**
    * Virtual tables: `information_schema.<name>` (schema 'information_schema') and table-valued
    * functions such as `pragma_table_info(t)` (schema undefined). Rows are computed at open.
@@ -294,7 +295,8 @@ function hasSubquery(e: Expr): boolean {
   return found;
 }
 
-function isAggregateCall(e: Expr): e is CallExpr {
+/** A call that is an aggregate (not a window function, not scalar min/max of several arguments). */
+export function isAggregateCall(e: Expr): e is CallExpr {
   return e.kind === 'call' && aggregateFunctions.has(e.name) && !((e.name === 'min' || e.name === 'max') && e.args.length > 1) && e.over === undefined;
 }
 
@@ -791,8 +793,8 @@ export class Planner {
     if (core.columns.length !== 1 || !core.from || core.from.kind !== 'table' || core.from.indexedBy !== undefined) return null;
     const rc = core.columns[0];
     if (rc.kind !== 'expr' || rc.expr.kind !== 'call' || rc.expr.name !== 'count' || !rc.expr.star || rc.expr.filter || rc.expr.over) return null;
-    const table = this.env.getTable(core.from.name);
-    if (!table || this.env.getTable(core.from.name) === undefined || table.matview?.storage === 'columnar' || table.columnar) return null;
+    const table = this.env.getTable(core.from.name, core.from.schema);
+    if (!table || table.matview?.storage === 'columnar' || table.columnar) return null;
     const reg = outRegs ? outRegs[0] : this.regs.alloc();
     const name = rc.alias ?? this.sqlText.slice(rc.expr.pos, rc.expr.end);
     return {
@@ -862,7 +864,7 @@ export class Planner {
     const access = scan.access;
     const cs = this.compileScope(scope);
     const helpers = this.fusedHelpers(access);
-    const table = this.env.getTable(access.tableName)!;
+    const table = access.table!;
     const build = (cap: number) => {
       const spec = access.loaderSpec();
       const outs: { reg: number; type: StaticType }[] = [];
@@ -1428,10 +1430,11 @@ export class Planner {
     }
     if (item.kind === 'join') throw new SmaltError('SMALT_ERROR', 'unexpected join');
     if (item.schema && !['main', 'temp'].includes(item.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${item.schema}`);
-    const table = this.env.getTable(item.name);
-    if (!table) throw new SmaltError('SMALT_ERROR', `no such table: ${item.name}`);
+    const table = this.env.getTable(item.name, item.schema);
+    if (!table) throw new SmaltError('SMALT_ERROR', `no such table: ${item.schema ? `${item.schema}.` : ''}${item.name}`);
     const base = this.regs.alloc(table.columns.length + 1);
     const access = new TableAccess(this.env.openTree(table.rootPage), new RecordReader(table.layout, table.recordDefaults), table.name, table.rowidAlias);
+    access.table = table;
     const cols: SourceColumn[] = table.columns.map((c, i) => ({
       name: c.name,
       reg: base + i,
@@ -2275,7 +2278,7 @@ export class Planner {
         return addFrom(f.left) && addFrom(f.right);
       }
       if (f.kind !== 'table' || (f.schema && f.schema.toLowerCase() !== 'main') || (!f.schema && scope.findCte(f.name))) return false;
-      const t = this.env.getTable(f.name);
+      const t = this.env.getTable(f.name, f.schema);
       if (!t) return false;
       inner.set((f.alias ?? f.name).toLowerCase(), new Set([...t.columns.map((c) => c.name.toLowerCase()), 'rowid', 'oid', '_rowid_']));
       return true;

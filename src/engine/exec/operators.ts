@@ -42,6 +42,8 @@ export class TableAccess {
   readonly decode: number[] = [];
   private readonly decoded = new Set<number>();
   rowidReg = -1;
+  /** The table scanned (a TEMP table and a main table may share `tableName`). */
+  table: import('../catalog/schema.js').TableSchema | null = null;
 
   constructor(
     readonly tree: BTree,

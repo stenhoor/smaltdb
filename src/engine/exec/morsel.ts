@@ -18,6 +18,7 @@
  * DISTINCT or compound selects; GROUP BY keys compared with BINARY collation.
  */
 import type { CallExpr, ColumnExpr, Expr, FromItem, LiteralExpr, OrderingTerm, ResultColumn, SelectStmt } from '../sql/ast.js';
+import { isAggregateCall } from './planner.js';
 
 const MERGEABLE = new Set(['count', 'sum', 'total', 'min', 'max', 'avg']);
 
@@ -170,7 +171,9 @@ export function analyzeMorsels(stmt: SelectStmt, text: string, info: (table: str
       // An output alias (HAVING / ORDER BY may name one); any other column is a bare column.
       return allowAlias && !e.table && aliases.has(e.name.toLowerCase()) ? e : null;
     }
-    if (e.kind === 'call' && MERGEABLE.has(e.name) && e.args.length <= 1 && e.name !== 'count') return null; // aggregate form we cannot merge
+    // Any other aggregate (group_concat, string_agg, json_group_*, …) cannot be merged from partials,
+    // whatever its arguments: over constants or keys it would run once per partial row, not per row.
+    if (e.kind === 'call' && isAggregateCall(e)) return null;
     // Rebuild the node with rewritten children (expressions only; no subqueries here).
     let failed = false;
     const out: Record<string, unknown> = {};

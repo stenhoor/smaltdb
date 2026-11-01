@@ -14,7 +14,7 @@ memory store and TEMP tables, spilling, columnar base tables, morsel parallelism
 
 There is no CLAUDE.md, so no conventions findings were possible.
 
-**Status: nothing fixed yet.** Each item below records how it was reproduced and the suggested direction. Severity:
+**Status:** S1 items 1–5 are fixed, each with a regression test in `test/s1-regressions.test.ts`; everything else is open. Each item below records how it was reproduced and the suggested direction. Severity:
 **S1** corrupts data or returns wrong results silently; **S2** wrong results or errors in specific shapes; **S3**
 lifecycle, robustness and edge cases; **P** performance; **C** cleanup.
 
@@ -22,7 +22,7 @@ lifecycle, robustness and edge cases; **P** performance; **C** cleanup.
 
 ### S1: data corruption and silent wrong results
 
-1. **A re-run INSERT on a columnar table reuses rowids after compaction.**
+1. **Fixed. A re-run INSERT on a columnar table reuses rowids after compaction.**
    - *Where:* `exec/columnar-table.ts:143` and `database.ts:2614`.
    - *Cause:* `ColumnarTableWriter` caches `segMax` (and its `ColumnStore`) forever. The INSERT program keeps one
      writer across executions (`writer ??= this.writerFor(table)`). Compaction (`appendDelta`) does not bump the
@@ -31,9 +31,9 @@ lifecycle, robustness and edge cases; **P** performance; **C** cleanup.
      `count(*) = 8200` but `count(DISTINCT rowid) = 8192`. An explicit INSERT of an id already in the segments is
      also accepted.
    - *After a rollback:* `dropColumnarCaches()` leaves the writer holding the old `ColumnStore` object.
-   - *Fix:* override `resetStatement()` to clear `segMax` and re-fetch the store, or stop caching writers across
-     executions for columnar tables.
-2. **A failed `CREATE UNIQUE INDEX` on a TEMP table corrupts it.**
+   - *Fix (done):* `ColumnarTableWriter.resetStatement()` clears `segMax` and re-reads the table's current segment
+     reader each execution.
+2. **Fixed. A failed `CREATE UNIQUE INDEX` on a TEMP table corrupts it.**
    - *Where:* `database.ts:1862`.
    - *Cause:* the index is registered (`table.indexes.push`, `this.indexes.set`) before `checkUniqueIndex`. For TEMP
      tables `dirtySchema` is false, and `memDirty` is set only after the check. When the check fails, the pages roll
@@ -41,17 +41,18 @@ lifecycle, robustness and edge cases; **P** performance; **C** cleanup.
    - *Repro:* `CREATE TEMP TABLE tt(x); INSERT INTO tt VALUES (1),(1); CREATE UNIQUE INDEX ui ON tt(x)` fails, as it
      should. Afterwards every `INSERT INTO tt` and `PRAGMA integrity_check` fails with "page 2 out of range", and
      `ui` is still listed. This also happens on `:memory:` databases, where `memBefore` is null.
-   - *Fix:* set `memDirty` before any temp DDL changes state, and restore the memory snapshot for `:memory:`
-     databases too, or register the index only after it is built.
-3. **Morsel and MV merges accept aggregates they cannot merge.**
+   - *Fix (done):* temp index creation sets `memDirty` before changing state, and every write statement now takes a
+     memory snapshot (a shared empty one when there are no memory objects), so `:memory:` databases restore too.
+3. **Fixed. Morsel and MV merges accept aggregates they cannot merge.**
    - *Where:* `exec/morsel.ts:173`, also reached through `mv-match.ts` `rollUp`.
    - *Cause:* only bare-column arguments of non-mergeable aggregates are rejected.
      `group_concat`/`string_agg`/`json_group_*`/user aggregates over constants or GROUP BY keys are copied into the
      merge query and aggregated over partial rows.
    - *Repro:* `SELECT g, length(group_concat('x','')) FROM t GROUP BY g` (1000 rows) gives `[[0,500],[1,500]]`
      normally and `[[0,4],[1,4]]` through `queryMorsels`.
-   - *Fix:* reject any aggregate call outside the mergeable set, wherever it appears.
-4. **Materialized views stay "fresh" when they are not.**
+   - *Fix (done):* any aggregate call outside the mergeable set rejects the query, using the planner's
+     `isAggregateCall`, which the view matcher now also uses instead of its own list.
+4. **Fixed. Materialized views stay "fresh" when they are not.**
    - *Where:* `database.ts:1645` (`touchTable`) and `:1619` (`selectDeps`).
    - *Cause:* freshness tracks base tables by name, with dependencies cached in `m.deps ??=`. With
      `matview_rewrite = 1` this gives stale or unrelated answers.
@@ -63,16 +64,24 @@ lifecycle, robustness and edge cases; **P** performance; **C** cleanup.
      - `WITH t AS (SELECT * FROM t WHERE …) SELECT … FROM t` gets empty dependencies (CTE names are hidden
        globally, including inside the CTE body), so inserts never make it stale.
      - A TEMP table shadowing `t` is answered from the main table's MV.
-   - *Fix:* make DROP, RENAME, CREATE or DROP VIEW and temp DDL mark dependents stale and clear cached
-     dependencies. Scope CTE names to their own SELECT. Key dependencies by object identity or catalog rowid rather
-     than name.
-5. **`main.`-qualified statements reach a shadowing TEMP table.**
+   - *Fix (done):*
+     - DROP TABLE, ALTER (including RENAME onto the name), CREATE and DROP VIEW and DROP MATERIALIZED VIEW mark
+       dependent views stale and clear cached dependencies.
+     - Dependencies now include view names, and CTE names are scoped (visible in their own body only when
+       RECURSIVE).
+     - View rewrite skips any view whose dependencies a TEMP table or view shadows.
+5. **Fixed. `main.`-qualified statements reach a shadowing TEMP table.**
    - *Where:* `database.ts:2398` (`targetTable`) and `:2086` (DROP TABLE).
    - *Repro:* main `t` with 2 rows, then `CREATE TEMP TABLE t`, then `DROP TABLE main.t`. This destroys the temp
      table's trees but the main table's catalog row. Main `t` is gone, and `integrity_check` reports
      `2 in use + 0 free != 3 total` permanently.
    - *Also:* `INSERT INTO main.t` writes into the temp table.
-   - *Fix:* resolve `main.`-qualified names against the persisted catalog only (keep main and temp maps separate).
+   - *Fix (done):*
+     - Shadowed main tables are kept in a `shadowedMain` map, and `getTable(name, schema)` resolves `main.` and
+       `temp.` against the right one.
+     - The planner (FROM items, the `count(*)` shortcut, decorrelation) and DML targets pass the schema through.
+     - DROP TABLE removes the right entry, and its foreign-key cascade names `main.`.
+     - Scans carry their table, so a fused scan never re-resolves it by name.
 
 ### S2: wrong results or errors in specific shapes
 
