@@ -428,11 +428,102 @@ export interface FusedHelpers extends LoaderHelpers, CodegenHelpers {
 }
 
 /**
+ * Shared machinery for generated scan pipelines: maps registers of decoded columns to per-row JS
+ * locals (numeric ones with separate NULL flags), emits WHERE conjuncts, and finally the decode
+ * block. Expressions must be emitted before `finish()`, because column references are resolved
+ * (and added to the scan's decode list) while emitting.
+ */
+class Pipeline {
+  readonly em: Emitter;
+  private readonly localRegs = new Map<number, boolean>(); // reg -> flagged
+  readonly rowLines: string[] = [];
+
+  constructor(fallback: (e: Expr) => FallbackNode) {
+    this.em = new Emitter(fallback, () => undefined);
+    this.em.regRef = (reg, type) => {
+      const flagged = type === 'int' || type === 'real';
+      if (!this.localRegs.has(reg)) this.localRegs.set(reg, flagged);
+      return this.localRegs.get(reg) ? { v: `c${reg}`, nul: `c${reg}n` } : { v: `c${reg}` };
+    };
+  }
+
+  take(): string[] {
+    const l = this.em.lines;
+    this.em.lines = [];
+    return l;
+  }
+
+  /** WHERE: every conjunct must be true (NULL counts as false). */
+  addPredicates(preds: Expr[]): void {
+    for (const p of preds) {
+      const g = this.em.gen(p);
+      this.rowLines.push(...this.take(), `if (!${this.em.isTrue(g)}) continue;`);
+    }
+  }
+
+  /** Read a decoded register as a nullable JS value expression. */
+  regValue(reg: number, type: StaticType): string {
+    return this.em.value({ ...this.em.regRef(reg, type), type });
+  }
+
+  /** Produce the per-function prologue and the per-row decode block for the final decode list. */
+  finish(spec: LoaderSpec): { prologue: string[]; rowStart: string[] } {
+    const localRegs = this.localRegs;
+    const decodedRegs = new Set<number>([...spec.rowidRegs]);
+    for (let i = 1; i < spec.decode.length; i += 2) decodedRegs.add(spec.decode[i]);
+    // Closure-compiled nodes read the register file, so then mirror decoded values into it.
+    const mirror = this.em.usesRegisterFile;
+    const assign: Assign = (reg, expr) => {
+      const m = mirror ? (expr === 'null' ? ` r[${reg}] = null;` : ` r[${reg}] = c${reg};`) : '';
+      if (!localRegs.has(reg)) return mirror ? `r[${reg}] = ${expr};` : '';
+      if (!localRegs.get(reg)) return `c${reg} = ${expr};${m}`;
+      return expr === 'null' ? `c${reg}n = true; c${reg} = 0;${m}` : `c${reg}n = false; c${reg} = ${expr};${m}`;
+    };
+    const dec: string[] = [];
+    emitDecode(spec, dec, assign);
+    // Registers referenced but not decoded here (e.g. outer-query columns) come from the register file.
+    const outer = [...localRegs.keys()].filter((reg) => !decodedRegs.has(reg));
+    const locals = [...localRegs.keys()].filter((reg) => decodedRegs.has(reg));
+    const load = (reg: number): string =>
+      localRegs.get(reg) ? `{ const t = r[${reg}]; c${reg}n = t === null; c${reg} = c${reg}n ? 0 : t; }` : `c${reg} = r[${reg}];`;
+    const declLocals = locals.map((reg) => (localRegs.get(reg) ? `c${reg} = 0, c${reg}n = true` : `c${reg} = null`)).join(', ');
+    return {
+      prologue: outer.map((reg) => (localRegs.get(reg) ? `const c${reg}n = r[${reg}] === null; const c${reg} = c${reg}n ? 0 : r[${reg}];` : `const c${reg} = r[${reg}];`)),
+      rowStart: [
+        'const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);',
+        locals.length ? `let ${declLocals};` : '',
+        `if (${cellIsFast(spec)}) { ${dec.join(' ')} } else { H.slow(f, off, r); ${locals.map(load).join(' ')} }`,
+      ],
+    };
+  }
+
+  /** Emit aggregate steps into rowLines; `state(i)` is the JS expression for the i-th state. */
+  addAggregates(aggs: FusedAggSpec[], state: (i: number) => string): void {
+    const em = this.em;
+    aggs.forEach((a, i) => {
+      const body: string[] = [];
+      if (a.kind === 'countStar') body.push(`${state(i)}.n++;`);
+      else {
+        const g = em.gen(a.arg!);
+        body.push(...this.take());
+        body.push(a.kind === 'count' ? `if (!${em.isNull(g)}) ${state(i)}.n++;` : `${state(i)}.step1(${em.value(g)});`);
+      }
+      if (a.filter) {
+        const f = em.gen(a.filter);
+        this.rowLines.push(`{ ${this.take().join(' ')} if (${em.isTrue(f)}) { ${body.join(' ')} } }`);
+      } else this.rowLines.push(`{ ${body.join(' ')} }`);
+    });
+  }
+}
+
+/** Compile generated source `return function ...` with the given parameter names and arguments. */
+function compileFn<T>(params: string[], src: string, args: unknown[]): T {
+  return new Function(...params, `"use strict"; ${src}`)(...args) as T;
+}
+
+/**
  * Generate one function that scans every leaf of a table, decodes the needed columns, evaluates
- * the WHERE conjuncts and steps the aggregates — no per-row operator calls. Expressions are
- * emitted with the same generator as single expressions (closure compiler for other nodes).
- * Column references are resolved (and added to the decode list) while emitting, so the decode
- * section is generated last.
+ * the WHERE conjuncts and steps the aggregates — no per-row operator calls.
  */
 export function generateFusedAggregate(
   preds: Expr[],
@@ -441,81 +532,122 @@ export function generateFusedAggregate(
   helpers: FusedHelpers,
   fallback: (e: Expr) => FallbackNode,
 ): (r: SqlValue[], states: unknown[]) => void {
-  const em = new Emitter(fallback, () => undefined);
-  // Decoded columns live in JS locals (no boxing into the shared register array). Registers are
-  // resolved lazily while emitting, so collect the ones referenced.
-  // Numeric columns get a separate NULL flag (c5 / c5n) so the value variable stays an unboxed number.
-  const localRegs = new Map<number, boolean>(); // reg -> flagged
-  em.regRef = (reg, type) => {
-    const flagged = type === 'int' || type === 'real';
-    if (!localRegs.has(reg)) localRegs.set(reg, flagged);
-    return localRegs.get(reg) ? { v: `c${reg}`, nul: `c${reg}n` } : { v: `c${reg}` };
-  };
-  const rowLines: string[] = [];
-  const take = (): string[] => {
-    const l = em.lines;
-    em.lines = [];
-    return l;
-  };
-  // WHERE: every conjunct must be true (NULL counts as false).
-  for (const p of preds) {
-    const g = em.gen(p);
-    rowLines.push(...take(), `if (!${em.isTrue(g)}) continue;`);
-  }
-  aggs.forEach((a, i) => {
-    const body: string[] = [];
-    if (a.kind === 'countStar') body.push(`S${i}.n++;`);
-    else {
-      const g = em.gen(a.arg!);
-      body.push(...take());
-      body.push(a.kind === 'count' ? `if (!${em.isNull(g)}) S${i}.n++;` : `S${i}.step1(${em.value(g)});`);
-    }
-    if (a.filter) {
-      const f = em.gen(a.filter);
-      rowLines.push(`{ ${take().join(' ')} if (${em.isTrue(f)}) { ${body.join(' ')} } }`);
-    } else rowLines.push(`{ ${body.join(' ')} }`);
-  });
-  const spec = loaderSpec(); // decode list is final now
-  const decodedRegs = new Set<number>([...spec.rowidRegs]);
-  for (let i = 1; i < spec.decode.length; i += 2) decodedRegs.add(spec.decode[i]);
-  // Closure-compiled nodes read the register file, so then mirror decoded values into it.
-  const mirror = em.usesRegisterFile;
-  const assign: Assign = (reg, expr) => {
-    const m = mirror ? (expr === 'null' ? ` r[${reg}] = null;` : ` r[${reg}] = c${reg};`) : '';
-    if (!localRegs.has(reg)) return mirror ? `r[${reg}] = ${expr};` : '';
-    if (!localRegs.get(reg)) return `c${reg} = ${expr};${m}`;
-    return expr === 'null' ? `c${reg}n = true; c${reg} = 0;${m}` : `c${reg}n = false; c${reg} = ${expr};${m}`;
-  };
-  const dec: string[] = [];
-  emitDecode(spec, dec, assign);
-  // Registers referenced by expressions but not decoded here (e.g. outer-query columns) are read from the register file.
-  const outer = [...localRegs.keys()].filter((reg) => !decodedRegs.has(reg));
-  const locals = [...localRegs.keys()].filter((reg) => decodedRegs.has(reg));
-  const load = (reg: number): string =>
-    localRegs.get(reg) ? `{ const t = r[${reg}]; c${reg}n = t === null; c${reg} = c${reg}n ? 0 : t; }` : `c${reg} = r[${reg}];`;
-  const reloadAfterSlow = locals.map(load).join(' ');
-  const declLocals = locals.map((reg) => (localRegs.get(reg) ? `c${reg} = 0, c${reg}n = true` : `c${reg} = null`)).join(', ');
+  const pl = new Pipeline(fallback);
+  pl.addPredicates(preds);
+  pl.addAggregates(aggs, (i) => `S${i}`);
+  const { prologue, rowStart } = pl.finish(loaderSpec());
   const src = [
     ...aggs.map((_, i) => `const S${i} = S[${i}];`),
-    ...outer.map((reg) => (localRegs.get(reg) ? `const c${reg}n = r[${reg}] === null; const c${reg} = c${reg}n ? 0 : r[${reg}];` : `const c${reg} = r[${reg}];`)),
+    ...prologue,
     'let f = H.first();',
     'try {',
     '  while (f !== null) {',
     '    const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);',
     '    for (let i = 0; i < n; i++) {',
-    '      const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);',
-    locals.length ? `      let ${declLocals};` : '',
-    `      if (${cellIsFast(spec)}) { ${dec.join(' ')} } else { H.slow(f, off, r); ${reloadAfterSlow} }`,
-    ...rowLines.map((l) => '      ' + l),
+    ...rowStart.map((l) => '      ' + l),
+    ...pl.rowLines.map((l) => '      ' + l),
     '    }',
     '    f = H.next(f);',
     '  }',
     '} finally { if (f !== null) H.release(f); }',
   ].join('\n');
-  const factory = new Function('H', 'K', 'T', `"use strict"; return function smaltFusedAggregate(r, S) {\n${src}\n};`) as (
-    H: FusedHelpers,
-    K: unknown[],
-    T: typeof truthy,
-  ) => (r: SqlValue[], states: unknown[]) => void;
-  return factory(helpers, em.consts, truthy);
+  return compileFn(['H', 'K', 'T'], `return function smaltFusedAggregate(r, S) {\n${src}\n};`, [helpers, pl.em.consts, truthy]);
+}
+
+/** Resumable scan state for generated scan + filter pipelines. */
+export interface ScanState {
+  f: { bytes: Uint8Array; view: DataView } | null;
+  i: number;
+}
+
+/**
+ * Generate `fill(st, r, out)`: continues the scan from `st`, and for each row passing the WHERE
+ * conjuncts writes the values of `outRegs` into `out` (row-major), up to `cap` rows. Returns the
+ * number of rows written (0 = scan finished). The current leaf stays pinned in `st.f` between calls.
+ */
+export function generateScanFilter(
+  preds: Expr[],
+  outRegs: { reg: number; type: StaticType }[],
+  cap: number,
+  loaderSpec: () => LoaderSpec,
+  helpers: FusedHelpers,
+  fallback: (e: Expr) => FallbackNode,
+): (st: ScanState, r: SqlValue[], out: SqlValue[]) => number {
+  const pl = new Pipeline(fallback);
+  pl.addPredicates(preds);
+  const w = outRegs.length;
+  const writes = outRegs.map((o, j) => `out[k * ${w} + ${j}] = ${pl.regValue(o.reg, o.type)};`);
+  const { prologue, rowStart } = pl.finish(loaderSpec());
+  const src = [
+    ...prologue,
+    'let f = st.f; let i = st.i; let k = 0;',
+    'while (f !== null) {',
+    '  const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);',
+    '  for (; i < n; i++) {',
+    ...rowStart.map((l) => '    ' + l),
+    ...pl.rowLines.map((l) => '    ' + l),
+    `    ${writes.join(' ')}`,
+    '    k++;',
+    `    if (k === ${cap}) { st.i = i + 1; return k; }`,
+    '  }',
+    '  st.f = null; f = H.next(f); st.f = f; i = 0; st.i = 0;',
+    '}',
+    'return k;',
+  ].join('\n');
+  return compileFn(['H', 'K', 'T'], `return function smaltScanFilter(st, r, out) {\n${src}\n};`, [helpers, pl.em.consts, truthy]);
+}
+
+/** Group lookup helpers for generated GROUP BY pipelines. */
+export interface GroupHelpers {
+  hashKey: (v: SqlValue, collation: number) => unknown;
+  hashKeyMulti: (values: SqlValue[], collations: number[]) => unknown;
+}
+
+/**
+ * Generate `run(r, groups, order)`: scans the table, filters rows, computes the GROUP BY key,
+ * finds or creates the group (`newGroup(keys)` returns `{ keys, st: AggregateState[] }`) and steps
+ * its aggregates.
+ */
+export function generateGroupAggregate(
+  preds: Expr[],
+  groupExprs: { expr: Expr; collation: number }[],
+  aggs: FusedAggSpec[],
+  loaderSpec: () => LoaderSpec,
+  helpers: FusedHelpers & GroupHelpers & { newGroup: (keys: SqlValue[]) => { keys: SqlValue[]; st: unknown[] } },
+  fallback: (e: Expr) => FallbackNode,
+): (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => void {
+  const pl = new Pipeline(fallback);
+  pl.addPredicates(preds);
+  const em = pl.em;
+  const keyLines: string[] = [];
+  const keyVals: string[] = [];
+  let keyExpr: string;
+  const gens = groupExprs.map((g) => em.gen(g.expr));
+  keyLines.push(...pl.take());
+  gens.forEach((g, j) => keyLines.push(`const kv${j} = ${em.value(g)};`) && keyVals.push(`kv${j}`));
+  if (gens.length === 1) {
+    const g = gens[0];
+    // Numbers hash to themselves (as hashKey does); other values go through hashKey (collations, blobs).
+    keyExpr = isNum(g.type) ? `kv0` : `H.hashKey(kv0, ${groupExprs[0].collation})`;
+  } else {
+    keyExpr = `H.hashKeyMulti([${keyVals.join(', ')}], [${groupExprs.map((g) => g.collation).join(', ')}])`;
+  }
+  pl.rowLines.push(...keyLines, `const key = ${keyExpr};`, 'let G = groups.get(key);', `if (G === undefined) { G = H.newGroup([${keyVals.join(', ')}]); groups.set(key, G); order.push(G); }`, 'const GS = G.st;');
+  pl.addAggregates(aggs, (i) => `GS[${i}]`);
+  const { prologue, rowStart } = pl.finish(loaderSpec());
+  const src = [
+    ...prologue,
+    'let f = H.first();',
+    'try {',
+    '  while (f !== null) {',
+    '    const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);',
+    '    for (let i = 0; i < n; i++) {',
+    ...rowStart.map((l) => '      ' + l),
+    ...pl.rowLines.map((l) => '      ' + l),
+    '    }',
+    '    f = H.next(f);',
+    '  }',
+    '} finally { if (f !== null) H.release(f); }',
+  ].join('\n');
+  return compileFn(['H', 'K', 'T'], `return function smaltGroupAggregate(r, groups, order) {\n${src}\n};`, [helpers, pl.em.consts, truthy]);
 }

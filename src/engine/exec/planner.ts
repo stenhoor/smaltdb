@@ -15,7 +15,7 @@ import type {
 import type { BTree } from '../storage/btree.js';
 import { RecordReader } from '../storage/record.js';
 import { Collation, type SqlValue } from '../values.js';
-import { type Affinity, type StaticType, affinityOfStorage, hashKey, staticTypeOfStorage, truthy } from './convert.js';
+import { type Affinity, type StaticType, affinityOfStorage, hashKey, hashKeyMulti, staticTypeOfStorage, truthy } from './convert.js';
 import {
   CollSrc,
   type ColumnBinding,
@@ -29,7 +29,7 @@ import {
   conjuncts,
 } from './expr.js';
 import { type AggregateState, type FunctionContext, aggregateFunctions } from './functions.js';
-import { type FusedAggSpec, type FusedHelpers, codegenEnabled, generateFusedAggregate } from './codegen.js';
+import { type FusedAggSpec, type FusedHelpers, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter } from './codegen.js';
 import { CODEGEN_HELPERS_FOR_FUSION } from './expr.js';
 import type { Frame } from '../storage/pager.js';
 import { PH_RIGHT } from '../storage/format.js';
@@ -42,7 +42,9 @@ import {
   Distinct,
   type ExecState,
   Filter,
+  FusedGroupAggregate,
   FusedScanAggregate,
+  FusedScanFilter,
   HashAggregate,
   HashJoin,
   IndexScan,
@@ -361,6 +363,7 @@ export class Planner {
 
     let exprScope: CompileScope;
     let agg: { groupFns: Fn[]; groupColls: Collation[]; groupRegs: number[]; aggs: AggSpec[]; bare: Set<number> } | null = null;
+    let groupAstsForFusion: Expr[] = [];
     if (isAgg) {
       const baseCompile = this.compileScope(scope);
       const groupCompiled = core.groupBy.map((g) => this.compileGroupTerm(g, scope, resultCols, baseCompile));
@@ -370,6 +373,7 @@ export class Planner {
       const bare = new Set<number>();
       agg = { groupFns: groupCompiled.map((g) => g.fn), groupColls: groupCompiled.map((g) => g.collation), groupRegs, aggs, bare };
       const groupAsts = core.groupBy.map((g) => this.resolveGroupAst(g, resultCols));
+      groupAstsForFusion = groupAsts;
       exprScope = {
         ...baseCompile,
         resolveColumn: (e) => {
@@ -464,7 +468,12 @@ export class Planner {
     }
 
     if (agg) {
-      const fused = agg.groupFns.length === 0 && agg.bare.size === 0 ? this.tryFuseAggregate(root, agg.aggs, scope) : null;
+      const fused =
+        agg.bare.size > 0
+          ? null
+          : agg.groupFns.length === 0
+            ? this.tryFuseAggregate(root, agg.aggs, scope)
+            : this.tryFuseGroupAggregate(root, groupAstsForFusion, agg.groupColls, agg.groupRegs, agg.aggs, scope);
       root = fused ?? new HashAggregate(root, agg.groupFns, agg.groupColls, agg.groupRegs, agg.aggs, [...agg.bare]);
       if (having) root = new Filter(root, having);
     }
@@ -483,6 +492,7 @@ export class Planner {
       }
     }
 
+    if (!agg) root = this.tryFuseScanFilter(root, scope);
     root = new Project(root, [...compiled.map((c) => c.fn), ...extraFns], [...regs, ...extraRegs]);
     if (core.distinct) root = new Distinct(root, regs, columns.map((c) => c.collation));
     if (sortNeeded) {
@@ -514,22 +524,96 @@ export class Planner {
    * Fuse `Filter* -> full TableScan` under an ungrouped aggregate into one generated function
    * (FusedScanAggregate). Returns null when the shape or the aggregates do not qualify.
    */
-  private tryFuseAggregate(src: Operator, aggs: AggSpec[], scope: Scope): Operator | null {
-    if (!codegenEnabled() || aggs.length === 0) return null;
+  /** Match `Filter* -> forward full TableScan`; returns the scan and the predicate ASTs (outermost last). */
+  private scanChain(src: Operator): { scan: TableScan; preds: Expr[] } | null {
+    if (!codegenEnabled()) return null;
     const preds: Expr[] = [];
     let node: Operator = src;
     while (node instanceof Filter) {
-      if (!node.ast) return null;
+      if (!node.ast || hasSubquery(node.ast)) return null;
       preds.push(node.ast);
       node = node.child;
     }
-    if (!(node instanceof TableScan) || node.lo || node.hi) return null;
+    if (!(node instanceof TableScan) || node.lo || node.hi || node.reverse) return null;
+    return { scan: node, preds: preds.reverse() };
+  }
+
+  private fusedAggSpecs(aggs: AggSpec[]): FusedAggSpec[] | null {
     const specs: FusedAggSpec[] = [];
     for (const a of aggs) {
       if (a.distinct || !FUSABLE_AGGS.has(a.name) || a.argAsts.length > 1) return null;
+      if ([a.filterAst, ...a.argAsts].some((x) => x !== undefined && hasSubquery(x))) return null;
       if (a.name === 'count') specs.push(a.star ? { kind: 'countStar', filter: a.filterAst } : { kind: 'count', arg: a.argAsts[0], filter: a.filterAst });
       else specs.push({ kind: 'step', arg: a.argAsts[0], filter: a.filterAst });
     }
+    return specs;
+  }
+
+  /** Page iteration helpers for generated pipelines over `access`. */
+  private fusedHelpers(access: TableAccess): FusedHelpers {
+    const tree = access.tree;
+    const pager = tree.pager;
+    return {
+      ...CODEGEN_HELPERS_FOR_FUSION,
+      first: () => tree.descendForCursor(null, false),
+      next: (page) => {
+        const f = page as Frame;
+        const nx = f.view.getUint32(PH_RIGHT, true);
+        pager.release(f);
+        return nx === 0 ? null : pager.get(nx);
+      },
+      release: (page) => pager.release(page as Frame),
+      slow: (page, off, r) => access.loadCell(page, off, r),
+    };
+  }
+
+  /** Replace `Filter* -> full TableScan` with a generated scan + filter (non-aggregate queries). */
+  private tryFuseScanFilter(src: Operator, scope: Scope): Operator {
+    const chain = this.scanChain(src);
+    if (!chain) return src;
+    const { scan, preds } = chain;
+    const access = scan.access;
+    const cs = this.compileScope(scope);
+    const helpers = this.fusedHelpers(access);
+    const table = this.env.getTable(access.tableName)!;
+    const build = (cap: number) => {
+      const spec = access.loaderSpec();
+      const outs: { reg: number; type: StaticType }[] = [];
+      for (let i = 0; i < spec.decode.length; i += 2) {
+        const t = table.columns[spec.decode[i]].type;
+        outs.push({ reg: spec.decode[i + 1], type: t === 'INTEGER' ? 'int' : t === 'REAL' ? 'real' : 'any' });
+      }
+      for (const reg of spec.rowidRegs) outs.push({ reg, type: 'int' });
+      const fill = generateScanFilter(preds, outs, cap, () => access.loaderSpec(), helpers, (e) => compileNode(e, cs));
+      return { fill, regs: outs.map((o) => o.reg) };
+    };
+    return new FusedScanFilter(access, build, helpers.first, helpers.release);
+  }
+
+  /** Scan + filter + GROUP BY + aggregates in one generated loop. */
+  private tryFuseGroupAggregate(src: Operator, groupAsts: Expr[], groupColls: Collation[], groupRegs: number[], aggs: AggSpec[], scope: Scope): Operator | null {
+    const chain = this.scanChain(src);
+    const specs = this.fusedAggSpecs(aggs);
+    if (!chain || !specs || groupAsts.some(hasSubquery)) return null;
+    const access = chain.scan.access;
+    const cs = this.compileScope(scope);
+    const helpers = {
+      ...this.fusedHelpers(access),
+      hashKey,
+      hashKeyMulti: (values: SqlValue[], colls: number[]) => hashKeyMulti(values, colls),
+      newGroup: (keys: SqlValue[]) => ({ keys, st: aggs.map((a) => a.def.create(a.star ? [] : a.argTypes, a.collation)) }),
+    };
+    const build = () =>
+      generateGroupAggregate(chain.preds, groupAsts.map((expr, i) => ({ expr, collation: groupColls[i] })), specs, () => access.loaderSpec(), helpers, (e) => compileNode(e, cs));
+    return new FusedGroupAggregate(access, build, groupRegs, aggs);
+  }
+
+  private tryFuseAggregate(src: Operator, aggs: AggSpec[], scope: Scope): Operator | null {
+    if (aggs.length === 0) return null;
+    const chain = this.scanChain(src);
+    const specs = this.fusedAggSpecs(aggs);
+    if (!chain || !specs) return null;
+    const { scan: node, preds } = chain;
     const access = node.access;
     const cs = this.compileScope(scope);
     const tree = access.tree;
@@ -549,7 +633,7 @@ export class Planner {
       release: (page) => pager.release(page as Frame),
       slow: (page, off, r) => access.loadCell(page, off, r),
     };
-    const run = generateFusedAggregate(preds.reverse(), specs, () => access.loaderSpec(), helpers, (e) => compileNode(e, cs));
+    const run = generateFusedAggregate(preds, specs, () => access.loaderSpec(), helpers, (e) => compileNode(e, cs));
     return new FusedScanAggregate(access, aggs, run as (r: SqlValue[], states: AggregateState[]) => void);
   }
 

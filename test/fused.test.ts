@@ -46,3 +46,58 @@ describe('fused scan + filter + aggregate', () => {
     expect(d.query('SELECT count(*), sum(b), avg(c), min(b) FROM t WHERE b > 0').rows).toEqual([[0, null, null, null]]);
   });
 });
+
+describe('fused scan + filter and fused GROUP BY', () => {
+  it('match SQLite across batches, pages, LIMIT, correlation, NULL/NOCASE/multi-column keys; no leaked pins', () => {
+    const d = Database.openFile(new MemoryVfs().openSync('g.db'), { pageSize: 1024 });
+    const ddl = 'CREATE TABLE g(id INTEGER PRIMARY KEY, k INT, t TEXT COLLATE NOCASE, x REAL, big TEXT)';
+    d.exec(ddl);
+    lite.exec(ddl + ' STRICT');
+    const words = ['apple', 'Apple', 'APPLE', 'pear', 'Pear', 'fig', null];
+    const rows: string[] = [];
+    for (let i = 1; i <= 5000; i++) {
+      const k = i % 17 === 0 ? 'NULL' : String(i % 23);
+      const t = words[i % words.length];
+      const x = i % 19 === 0 ? 'NULL' : String((i % 101) / 4);
+      const big = i % 211 === 0 ? `'${'y'.repeat(1500)}'` : 'NULL';
+      rows.push(`(${i}, ${k}, ${t === null ? 'NULL' : `'${t}'`}, ${x}, ${big})`);
+    }
+    for (let i = 0; i < rows.length; i += 500) {
+      const sql = `INSERT INTO g VALUES ${rows.slice(i, i + 500).join(',')}`;
+      d.exec(sql);
+      lite.exec(sql);
+    }
+    // Which spelling represents a NOCASE group is unspecified (first row in each engine's processing order).
+    const norm = (rs: unknown[][]) =>
+      rs.map((r) => r.map((v) => (typeof v === 'number' && !Number.isInteger(v) ? Number(v.toPrecision(10)) : typeof v === 'bigint' ? Number(v) : typeof v === 'string' ? v.toLowerCase() : v)));
+    const sorted = (rs: unknown[][]) => JSON.stringify(norm(rs).map((r) => JSON.stringify(r)).sort());
+    const cases: [string, RegExp, boolean][] = [
+      ['SELECT id, k * 2 + 1, x FROM g WHERE k % 3 = 1 AND x < 20', /fused scan \+ filter\)/, false],
+      ['SELECT id, length(big) FROM g WHERE big IS NOT NULL', /fused scan \+ filter\)/, false],
+      ['SELECT id FROM g WHERE x > 10 ORDER BY id LIMIT 7', /fused scan \+ filter\)/, true],
+      ['SELECT id FROM g WHERE k = 5 LIMIT 3 OFFSET 40', /fused scan \+ filter\)/, false],
+      ['SELECT DISTINCT t FROM g WHERE x >= 0', /fused scan \+ filter\)/, false],
+      ['SELECT k, count(*), sum(x), avg(id) FROM g GROUP BY k', /GROUP BY\)/, false],
+      ['SELECT t, count(*), max(id) FROM g WHERE x IS NOT NULL GROUP BY t', /GROUP BY\)/, false],
+      ['SELECT k % 4, t, count(*), total(x) FROM g GROUP BY k % 4, t', /GROUP BY\)/, false],
+      ['SELECT k, count(*) FILTER (WHERE x > 5), min(x) FROM g WHERE k > 10 GROUP BY k HAVING count(*) > 100', /GROUP BY\)/, false],
+      ['SELECT k, sum(length(big)) FROM g GROUP BY k', /GROUP BY\)/, false],
+      ['SELECT g1.id, (SELECT count(*) FROM g AS g2 WHERE g2.k = g1.k AND g2.id < g1.id) FROM g AS g1 WHERE g1.id % 500 = 0', /fused/, false],
+    ];
+    for (const [q, plan, ordered] of cases) {
+      const p = d.query('EXPLAIN QUERY PLAN ' + q).rows.map((r) => r[3]).join(' | ');
+      if (!process.env.SMALT_NO_CODEGEN) expect(p, q).toMatch(plan);
+      const a = d.query(q).rows;
+      const b = lite.selectArrays(q);
+      if (ordered) expect(JSON.stringify(norm(a)), q).toBe(JSON.stringify(norm(b)));
+      else expect(sorted(a), q).toBe(sorted(b));
+      expect(d.pager.pinnedCount(), `pins after ${q}`).toBe(0);
+    }
+    // A cursor abandoned mid-scan must release its pinned leaf.
+    const st = d.prepare('SELECT id FROM g WHERE k = 1');
+    const c = st.cursor();
+    expect(c.next()).not.toBeNull();
+    c.close();
+    expect(d.pager.pinnedCount()).toBe(0);
+  });
+});

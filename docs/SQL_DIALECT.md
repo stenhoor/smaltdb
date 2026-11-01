@@ -115,4 +115,6 @@ functions, `ANALYZE`, and `VACUUM`. Foreign keys are parsed and stored but not y
   the largest row).
 - PRIMARY KEY columns are always NOT NULL.
 - `OR FAIL` behaves like `OR ABORT`.
+- In `GROUP BY` / `DISTINCT` over NOCASE or RTRIM text, values that compare equal form one group, and which spelling is returned is unspecified.
+  smaltdb returns the first row in scan order; SQLite returns the first in its own sort order, which can differ.
 - Index keys must fit in about a quarter of a page (≈2 KB with 8 KiB pages); SQLite allows larger keys via overflow pages.

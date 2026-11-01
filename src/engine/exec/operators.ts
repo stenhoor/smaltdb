@@ -2,7 +2,7 @@ import { SmaltError } from '../errors.js';
 import type { BTree, BTreeCursor } from '../storage/btree.js';
 import { KeyEncoder, ROWID_KEY_SIZE, decodeKey, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
 import { type RecordReader, decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
-import { type LoaderHelpers, type LoaderSpec, codegenEnabled, generateLoader } from './codegen.js';
+import { type LoaderHelpers, type LoaderSpec, type ScanState, codegenEnabled, generateLoader } from './codegen.js';
 
 const LOADER_HELPERS: LoaderHelpers = { readInt64, utf8: decodeUtf8, tagged: decodeTagged, rowid: readRowidKey };
 import { Collation, type SqlValue, compareValues } from '../values.js';
@@ -1196,5 +1196,117 @@ export class FusedScanAggregate implements Operator {
 
   close(): void {
     this.states = [];
+  }
+}
+
+const SCAN_BATCH = 256;
+
+/**
+ * Full table scan + WHERE fused into generated code that decodes and filters rows straight off the
+ * leaf pages and hands passing rows to the consumer in batches. Generated on first open (when the
+ * decode list is final).
+ */
+export class FusedScanFilter implements Operator {
+  readonly children: Operator[] = [];
+  private fill: ((st: ScanState, r: SqlValue[], out: SqlValue[]) => number) | null = null;
+  private regs: number[] = [];
+  private readonly st: ScanState = { f: null, i: 0 };
+  private buf: SqlValue[] = [];
+  private count = 0;
+  private pos = 0;
+  private done = false;
+  private r!: SqlValue[];
+
+  constructor(
+    readonly access: TableAccess,
+    private readonly build: (cap: number) => { fill: (st: ScanState, r: SqlValue[], out: SqlValue[]) => number; regs: number[] },
+    private readonly first: () => { bytes: Uint8Array; view: DataView } | null,
+    private readonly release: (page: { bytes: Uint8Array; view: DataView }) => void,
+  ) {}
+
+  get detail(): string {
+    return `SCAN ${this.access.tableName} (fused scan + filter)`;
+  }
+
+  open(r: SqlValue[]): void {
+    if (this.fill === null) {
+      const b = this.build(SCAN_BATCH);
+      this.fill = b.fill;
+      this.regs = b.regs;
+      this.buf = new Array(SCAN_BATCH * Math.max(1, b.regs.length)).fill(null);
+    }
+    this.close();
+    this.r = r;
+    this.st.f = this.first();
+    this.st.i = 0;
+    this.count = 0;
+    this.pos = 0;
+    this.done = false;
+  }
+
+  next(): boolean {
+    if (this.pos >= this.count) {
+      if (this.done) return false;
+      this.count = this.fill!(this.st, this.r, this.buf);
+      this.pos = 0;
+      if (this.count < SCAN_BATCH) this.done = true;
+      if (this.count === 0) return false;
+    }
+    const regs = this.regs;
+    const w = regs.length;
+    const base = this.pos * w;
+    const r = this.r;
+    for (let j = 0; j < w; j++) r[regs[j]] = this.buf[base + j];
+    this.pos++;
+    return true;
+  }
+
+  close(): void {
+    if (this.st.f !== null) {
+      this.release(this.st.f);
+      this.st.f = null;
+    }
+  }
+}
+
+/** Scan + WHERE + GROUP BY + aggregates fused into one generated loop (hash aggregation inline). */
+export class FusedGroupAggregate implements Operator {
+  readonly children: Operator[] = [];
+  private run: ((r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => void) | null = null;
+  private order: { keys: SqlValue[]; st: AggregateState[] }[] = [];
+  private gi = 0;
+  private r!: SqlValue[];
+
+  constructor(
+    readonly access: TableAccess,
+    private readonly build: () => (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => void,
+    readonly groupRegs: number[],
+    readonly aggs: AggSpec[],
+  ) {}
+
+  get detail(): string {
+    return `SCAN ${this.access.tableName} (fused scan + filter + GROUP BY)`;
+  }
+
+  open(r: SqlValue[]): void {
+    this.run ??= this.build();
+    this.r = r;
+    this.gi = 0;
+    const order: { keys: SqlValue[]; st: AggregateState[] }[] = [];
+    this.run(r, new Map(), order);
+    this.order = order;
+  }
+
+  next(): boolean {
+    if (this.gi >= this.order.length) return false;
+    const g = this.order[this.gi++];
+    const r = this.r;
+    for (let i = 0; i < this.groupRegs.length; i++) r[this.groupRegs[i]] = g.keys[i];
+    for (let i = 0; i < this.aggs.length; i++) r[this.aggs[i].outReg] = g.st[i].final();
+    return true;
+  }
+
+  close(): void {
+    this.order = [];
   }
 }
