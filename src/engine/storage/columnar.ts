@@ -101,45 +101,66 @@ function chunkKey(rg: number, col: number): Uint8Array {
 
 /** Appends rows and writes complete row groups to an empty tree. */
 export class ColumnStoreWriter {
-  private cols: SqlValue[][];
+  /** Per column, a row group's values (preallocated, reused across row groups). */
+  private readonly cols: SqlValue[][];
+  private rows = 0;
   private rg = 0;
   private total = 0;
+  private readonly enc = new ChunkEncoder();
+  /** Chunks are written in key order, so the tree is built bottom-up. */
+  private readonly loader: ReturnType<BTree['bulkLoader']>;
 
   constructor(
-    private readonly tree: BTree,
+    tree: BTree,
     private readonly ncols: number,
   ) {
-    this.cols = Array.from({ length: ncols }, () => []);
+    this.cols = Array.from({ length: ncols }, () => new Array<SqlValue>(ROW_GROUP_ROWS).fill(null));
+    this.loader = tree.bulkLoader();
   }
 
   add(row: readonly SqlValue[]): void {
-    for (let c = 0; c < this.ncols; c++) this.cols[c].push(row[c]);
-    if (this.cols[0].length === ROW_GROUP_ROWS) this.flush();
+    const i = this.rows++;
+    for (let c = 0; c < this.ncols; c++) this.cols[c][i] = row[c];
+    if (this.rows === ROW_GROUP_ROWS) this.flush();
+  }
+
+  /** Add the row held in registers `r[regs[c]]`. */
+  addFrom(r: readonly SqlValue[], regs: readonly number[]): void {
+    const i = this.rows++;
+    for (let c = 0; c < this.ncols; c++) this.cols[c][i] = r[regs[c]];
+    if (this.rows === ROW_GROUP_ROWS) this.flush();
   }
 
   /** Write the last partial row group and the header; returns the row count. */
   finish(): number {
-    if (this.ncols > 0 && this.cols[0].length > 0) this.flush();
+    if (this.ncols > 0 && this.rows > 0) this.flush();
     const h = new Uint8Array(12);
     const v = new DataView(h.buffer);
     v.setUint32(0, this.rg, true);
     v.setFloat64(4, this.total, true);
-    this.tree.put(chunkKey(HEADER_RG, 0), h);
+    this.put(chunkKey(HEADER_RG, 0), h);
+    this.loader.finish();
     return this.total;
   }
 
+  private put(key: Uint8Array, value: Uint8Array): void {
+    this.loader.add(key, 0, key.length, value);
+  }
+
   private flush(): void {
-    const rows = this.cols[0].length;
+    const rows = this.rows;
     const zones: Zone[] = [];
     for (let c = 0; c < this.ncols; c++) {
-      const { bytes, zone } = encodeChunk(this.cols[c]);
-      this.tree.put(chunkKey(this.rg, c), bytes);
+      const col = this.cols[c];
+      if (rows < col.length) col.length = rows; // last, partial row group
+      const { bytes, zone } = this.enc.encode(col);
+      this.put(chunkKey(this.rg, c), bytes);
       zones.push(zone);
-      this.cols[c] = [];
     }
-    this.tree.put(chunkKey(this.rg, META_COL), encodeMeta(rows, zones));
+    this.put(chunkKey(this.rg, META_COL), encodeMeta(rows, zones));
     this.rg++;
     this.total += rows;
+    this.rows = 0;
   }
 }
 
@@ -189,8 +210,38 @@ class ByteWriter {
 }
 
 const MAX_ZONE_TEXT = 64;
+const SURROGATE = /[\uD800-\uDFFF]/;
 
-function encodeChunk(vals: SqlValue[]): { bytes: Uint8Array; zone: Zone } {
+/** Encodes column chunks, reusing its byte buffers between chunks. */
+class ChunkEncoder {
+  private readonly w = new ByteWriter();
+  private text = new Uint8Array(1 << 16);
+
+  encode(vals: SqlValue[]): { bytes: Uint8Array; zone: Zone } {
+    this.w.len = 0;
+    return encodeChunk(vals, this.w, this);
+  }
+
+  /** UTF-8 of every string in `vals` into one buffer; ends[i] = end offset of value i. */
+  utf8All(vals: SqlValue[], ends: Uint32Array): Uint8Array {
+    let pos = 0;
+    for (let i = 0; i < vals.length; i++) {
+      const v = vals[i];
+      if (typeof v === 'string') {
+        if (pos + v.length * 3 > this.text.length) {
+          const next = new Uint8Array(Math.max(this.text.length * 2, pos + v.length * 3));
+          next.set(this.text.subarray(0, pos));
+          this.text = next;
+        }
+        pos += textEncoder.encodeInto(v, this.text.subarray(pos)).written;
+      }
+      ends[i] = pos;
+    }
+    return this.text.subarray(0, pos);
+  }
+}
+
+function encodeChunk(vals: SqlValue[], w: ByteWriter, ce: ChunkEncoder): { bytes: Uint8Array; zone: Zone } {
   const n = vals.length;
   let nulls = 0;
   let allNum = true;
@@ -214,16 +265,23 @@ function encodeChunk(vals: SqlValue[]): { bytes: Uint8Array; zone: Zone } {
       if (!(v === (v | 0) && !Object.is(v, -0))) allInt32 = false;
     } else if (typeof v === 'string') {
       allNum = allInt32 = allBlob = false;
-      if (textEncoder.encode(v).length > MAX_ZONE_TEXT) textZone = false;
-      if (textMin === undefined || binaryLess(v, textMin)) textMin = v;
-      if (textMax === undefined || binaryLess(textMax, v)) textMax = v;
+      // At most 3 UTF-8 bytes per UTF-16 unit: short strings need no encoding to check.
+      if (textZone && v.length * 3 > MAX_ZONE_TEXT && textEncoder.encode(v).length > MAX_ZONE_TEXT) textZone = false;
+      // UTF-16 order equals code point (BINARY) order unless surrogates are involved.
+      if (textMin === undefined) textMin = textMax = v;
+      else if (SURROGATE.test(v) || SURROGATE.test(textMin) || SURROGATE.test(textMax!)) {
+        if (binaryLess(v, textMin)) textMin = v;
+        if (binaryLess(textMax!, v)) textMax = v;
+      } else {
+        if (v < textMin) textMin = v;
+        if (v > textMax!) textMax = v;
+      }
     } else {
       allNum = allInt32 = allStr = false;
       if (!(v instanceof Uint8Array)) allBlob = false;
     }
   }
   const zone: Zone = { nulls };
-  const w = new ByteWriter();
   const nonNull = n - nulls;
   let enc: number;
   if (nonNull === 0) enc = ENC_NULLS;
@@ -263,16 +321,27 @@ function encodeChunk(vals: SqlValue[]): { bytes: Uint8Array; zone: Zone } {
   }
   w.align(8);
   switch (enc) {
-    case ENC_F64:
-      for (const v of vals) w.f64(v === null ? 0 : (v as number));
-      break;
-    case ENC_I32:
-      w.ensure(4 * n);
-      for (const v of vals) {
-        w.view.setInt32(w.len, v === null ? 0 : (v as number), true);
-        w.len += 4;
+    case ENC_F64: {
+      // The payload starts 8-byte aligned in the writer's buffer: write through a typed view.
+      w.ensure(8 * n);
+      const f = new Float64Array(w.buf.buffer, w.len, n);
+      for (let i = 0; i < n; i++) {
+        const v = vals[i];
+        f[i] = v === null ? 0 : (v as number);
       }
+      w.len += 8 * n;
       break;
+    }
+    case ENC_I32: {
+      w.ensure(4 * n);
+      const a = new Int32Array(w.buf.buffer, w.len, n);
+      for (let i = 0; i < n; i++) {
+        const v = vals[i];
+        a[i] = v === null ? 0 : (v as number);
+      }
+      w.len += 4 * n;
+      break;
+    }
     case ENC_DICT: {
       const entries = [...dict!.keys()];
       const enc8 = entries.map((s) => textEncoder.encode(s));
@@ -294,16 +363,23 @@ function encodeChunk(vals: SqlValue[]): { bytes: Uint8Array; zone: Zone } {
       }
       break;
     }
-    case ENC_STR:
+    case ENC_STR: {
+      const ends = new Uint32Array(n);
+      const text = ce.utf8All(vals, ends);
+      w.ensure(4 * (n + 1));
+      w.u32(0);
+      for (let i = 0; i < n; i++) w.u32(ends[i]);
+      w.bytes(text);
+      break;
+    }
     case ENC_BLOB: {
-      const parts = vals.map((v) => (v === null ? new Uint8Array(0) : typeof v === 'string' ? textEncoder.encode(v) : (v as Uint8Array)));
       let off = 0;
-      for (const b of parts) {
+      for (const v of vals) {
         w.u32(off);
-        off += b.length;
+        off += v === null ? 0 : (v as Uint8Array).length;
       }
       w.u32(off);
-      for (const b of parts) w.bytes(b);
+      for (const v of vals) if (v !== null) w.bytes(v as Uint8Array);
       break;
     }
     case ENC_ANY:

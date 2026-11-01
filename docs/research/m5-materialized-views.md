@@ -65,3 +65,28 @@ generation and chunk decoding: filter + sum takes 5.4 ms on the first run, again
     1.45× faster for refresh.
   - The in-memory gap is real CPU work. Likely fixes: a generated scan that writes straight into column buffers, and
     typed-array accumulation instead of per-row JS arrays.
+
+## Refresh fix (after the runs above)
+
+Changes:
+- **Row storage:** a refresh streams records into a bottom-up B+tree build (`BTree.bulkLoader`), so there are no
+  descents or splits.
+- **Columnar storage:** values go from the query's registers straight into reused column buffers, and the chunk tree
+  is bulk-built too.
+- **Chunk encoding:** one UTF-8 buffer per chunk, typed-array writes for numbers, and no UTF-8 encoding just to check
+  the length for zone maps.
+- **Both:** no per-row arrays.
+
+Chromium, 3 repetitions, medians:
+
+| Workload | Before | After | SQLite |
+|---|---|---|---|
+| Build projection, CPU-only | 344 ms | 86 ms | 32 ms (`:memory:`) |
+| Refresh, CPU-only | 378 ms | 60 ms | 44 ms (`:memory:`) |
+| Build projection, OPFS | 403 ms | 134 ms | 370 ms (TRUNCATE, best) |
+| Refresh, OPFS | 412 ms | 106 ms | 651 ms (WAL, best) |
+
+On OPFS, building is now 2.8× faster than SQLite's best mode, and refreshing 6.1× faster. In memory, SQLite's direct
+record copy is still faster: 2.7× for the build and 1.4× for refresh. Node, in memory: columnar refresh went from
+150 to 45 ms, and row refresh from 172 to 80 ms.
+

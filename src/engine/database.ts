@@ -43,10 +43,10 @@ import type {
 import { parse, parseOne } from './sql/parser.js';
 import { BTree } from './storage/btree.js';
 import { ColumnStore, ColumnStoreWriter } from './storage/columnar.js';
-import { KeyEncoder, type KeyColumn, decodeKey, readRowidKey, rowidSuffixStart } from './storage/key-codec.js';
+import { KeyEncoder, type KeyColumn, ROWID_KEY_SIZE, decodeKey, readRowidKey, rowidSuffixStart, writeRowidKey } from './storage/key-codec.js';
 import { compareRanges } from './util/bytes.js';
 import { Pager, type PagerOptions } from './storage/pager.js';
-import { RecordReader } from './storage/record.js';
+import { RecordEncoder, RecordReader } from './storage/record.js';
 import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec/stats.js';
 import { type CatalogSnapshot, informationSchema } from './catalog/information-schema.js';
 import { type SchemaLookup, applyEdits, renameColumnEdits, renameTableEdits } from './catalog/alter.js';
@@ -772,23 +772,35 @@ export class Database implements FunctionContext {
     const info = mv.matview!;
     const root = BTree.create(this.pager);
     const target: TableSchema = { ...mv, rootPage: root, indexes: [] };
-    const columnar = info.storage === 'columnar' ? new ColumnStoreWriter(this.tree(root), mv.columns.length) : null;
-    const w = new TableWriter(target, this.pager, (r) => this.tree(r));
     const cols = mv.columns;
+    const ncols = cols.length;
+    const types = cols.map((c) => c.type);
+    // Rows go straight from the query's registers into column buffers (columnar) or a bottom-up
+    // B+tree build (row): no per-row arrays, descents or splits.
+    const columnar = info.storage === 'columnar' ? new ColumnStoreWriter(this.tree(root), ncols) : null;
+    const loader = columnar ? null : this.tree(root).bulkLoader();
+    const enc = columnar ? null : new RecordEncoder(mv.layout);
+    const vals: SqlValue[] = new Array(ncols).fill(null);
+    const key = new Uint8Array(ROWID_KEY_SIZE);
     let rowid = 0;
-    this.runSelect(info.select, info.sql, (vals) => {
-      if (vals.length !== cols.length) throw new SmaltError('SMALT_ERROR', `materialized view ${mv.name}: the query now returns ${vals.length} columns, the view has ${cols.length}`);
-      for (let i = 0; i < cols.length; i++) {
-        if (!fitsStorage(vals[i], cols[i].type)) {
-          throw new SmaltError('SMALT_MISMATCH', `materialized view ${mv.name}: column ${cols[i].name} is ${cols[i].type} but the query produced ${describeValue(vals[i])} (add a CAST to the view)`);
+    this.runSelect(info.select, info.sql, (r, outRegs) => {
+      if (outRegs.length !== ncols) throw new SmaltError('SMALT_ERROR', `materialized view ${mv.name}: the query now returns ${outRegs.length} columns, the view has ${ncols}`);
+      for (let i = 0; i < ncols; i++) {
+        const v = r[outRegs[i]];
+        if (v !== null && !fitsStorage(v, types[i])) {
+          throw new SmaltError('SMALT_MISMATCH', `materialized view ${mv.name}: column ${cols[i].name} is ${types[i]} but the query produced ${describeValue(v)} (add a CAST to the view)`);
         }
+        if (!columnar) vals[i] = v;
       }
-      if (columnar) {
-        columnar.add(vals);
-        ++rowid;
-      } else w.writeRow(vals, ++rowid);
+      rowid++;
+      if (columnar) columnar.addFrom(r, outRegs);
+      else {
+        writeRowidKey(key, 0, rowid);
+        loader!.add(key, 0, ROWID_KEY_SIZE, enc!.encode(vals));
+      }
     });
-    columnar?.finish();
+    if (columnar) columnar.finish();
+    else loader!.finish();
     const indexRoots = mv.indexes.map((idx) => {
       const r = BTree.create(this.pager);
       const copy: IndexSchema = { ...idx, rootPage: r };
@@ -846,8 +858,8 @@ export class Database implements FunctionContext {
     return `CREATE TABLE ${q(name)}(${defs.join(', ')})`;
   }
 
-  /** Run a query to completion, passing each result row (a fresh array) to `emit`. */
-  private runSelect(select: SelectStmt, sql: string, emit: (vals: SqlValue[]) => void): void {
+  /** Run a query to completion; `emit` reads each result row from the registers `r[outRegs[i]]`. */
+  private runSelect(select: SelectStmt, sql: string, emit: (r: SqlValue[], outRegs: number[]) => void): void {
     const regs = new Registers(0);
     const planner = new Planner(this.plannerDeps(), regs);
     planner.sqlText = sql;
@@ -856,7 +868,8 @@ export class Database implements FunctionContext {
     const root = plan.root;
     root.open(r);
     try {
-      while (root.next()) emit(plan.outRegs.map((g) => r[g]));
+      const out = plan.outRegs;
+      while (root.next()) emit(r, out);
     } finally {
       root.close();
     }

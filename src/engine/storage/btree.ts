@@ -394,59 +394,84 @@ export class BTree {
    * interior levels) without per-key descents or splits (CREATE INDEX).
    */
   bulkLoadKeys(keys: Uint8Array, offs: Int32Array, order: Int32Array): void {
+    const loader = this.bulkLoader();
+    for (let k = 0; k < order.length; k++) {
+      const e = order[k];
+      loader.add(keys, offs[e], offs[e + 1] - offs[e], EMPTY);
+    }
+    loader.finish();
+  }
+
+  /**
+   * Streaming bottom-up build of an empty tree: `add` entries in strictly ascending key order (the
+   * key is copied, so callers may reuse their buffer), then `finish`. Leaves are filled completely
+   * and linked; interior levels are built at the end. No descents, no splits (refresh, CREATE INDEX).
+   */
+  bulkLoader(): { add(key: Uint8Array, kOff: number, kLen: number, value: Uint8Array): void; finish(): void } {
     const pager = this.pager;
     const usable = this.usable;
     const root = pager.get(this.root);
     const empty = isLeaf(root) && nCells(root) === 0;
     pager.release(root);
-    if (!empty) throw new MisuseError('bulkLoadKeys needs an empty tree');
-    if (order.length === 0) return;
-
-    // Level 0: leaves. `seps[i]` separates page i from page i + 1.
-    let pages: number[] = [];
-    let seps: Uint8Array[] = [];
+    if (!empty) throw new MisuseError('bulk load needs an empty tree');
+    const pages: number[] = [];
+    const seps: Uint8Array[] = [];
     let page: Frame | null = null;
     let cs = 0;
     let n = 0;
-    let prevStart = 0;
-    let prevLen = 0;
-    const finishLeaf = (): void => {
+    const closeLeaf = (): void => {
       page!.view.setUint16(PH_CELL_COUNT, n, true);
       page!.view.setUint16(PH_CONTENT_START, cs, true);
     };
-    for (let k = 0; k < order.length; k++) {
-      const e = order[k];
-      const start = offs[e];
-      const kl = offs[e + 1] - start;
+    const add = (key: Uint8Array, kOff: number, kl: number, value: Uint8Array): void => {
       if (kl > this.maxKeySize) throw new MisuseError(`key too large (${kl} > ${this.maxKeySize} bytes)`);
-      const size = varintLen(kl) + 1 + kl;
+      const vl = value.length;
+      const inline = leafHdrLen(kl, vl) + kl + vl <= this.maxLocal;
+      const size = inline ? leafHdrLen(kl, vl) + kl + vl : leafHdrLen(kl, vl) + kl + 4;
+      if (page !== null && n > 0) {
+        const lk = leafKey(page.bytes, slot(page, n - 1));
+        if (compareRanges(page.bytes, lk >>> 16, lk & 0xffff, key, kOff, kl) >= 0) throw new MisuseError('bulk load: keys out of order');
+      }
       if (page === null || cs - size < H + 2 * (n + 1)) {
         const next = pager.allocate();
         initPage(next, PageType.BTreeLeaf, usable);
         if (page !== null) {
-          finishLeaf();
+          closeLeaf();
           setRightPtr(page, next.pgno);
           setPrevPtr(next, page.pgno);
-          seps.push(shortestSeparator(keys, prevStart, prevLen, keys, start, kl));
+          const lk = leafKey(page.bytes, slot(page, n - 1));
+          seps.push(shortestSeparator(page.bytes, lk >>> 16, lk & 0xffff, key, kOff, kl));
           pager.release(page);
         }
         page = next;
         pages.push(next.pgno);
         cs = usable;
         n = 0;
-      } else if (n > 0 && compareRanges(keys, prevStart, prevLen, keys, start, kl) >= 0) {
-        throw new MisuseError('bulkLoadKeys: keys out of order');
       }
       cs -= size;
       const b = page.bytes;
-      b.set(keys.subarray(start, start + kl), writeLeafHdr(b, cs, kl, 0, false));
+      const ko = writeLeafHdr(b, cs, kl, vl, !inline);
+      b.set(key.subarray(kOff, kOff + kl), ko);
+      if (inline) b.set(value, ko + kl);
+      else page.view.setUint32(ko + kl, this.writeOverflow(value), true);
       page.view.setUint16(H + 2 * n, cs, true);
       n++;
-      prevStart = start;
-      prevLen = kl;
-    }
-    finishLeaf();
-    pager.release(page!);
+    };
+    const finish = (): void => {
+      if (page === null) return;
+      closeLeaf();
+      pager.release(page);
+      this.bulkFinish(pages, seps);
+    };
+    return { add, finish };
+  }
+
+  /** Build the interior levels over leaf pages `pages` (seps[i] separates i and i+1) and move the top into the root. */
+  private bulkFinish(leafPages: number[], leafSeps: Uint8Array[]): void {
+    const pager = this.pager;
+    const usable = this.usable;
+    let pages = leafPages;
+    let seps = leafSeps;
     let leaf = true;
 
     // Interior levels until one page remains. A page over children a..b has cells (child i, sep i)
