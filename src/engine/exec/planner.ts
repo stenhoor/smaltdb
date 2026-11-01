@@ -155,6 +155,8 @@ interface Source {
   sub?: QueryPlan;
   /** Table-valued function whose arguments read earlier sources of the same FROM (re-run per row). */
   lateral?: boolean;
+  /** `INDEXED BY name` (string) / `NOT INDEXED` (null). */
+  indexedBy?: string | null;
   joinType: JoinType;
   on: Expr[];
   /** Lower-cased column names merged by USING/NATURAL (hidden from unqualified lookup and *). */
@@ -310,6 +312,8 @@ interface AccessChoice {
   dependsOnOuter: boolean;
   /** Supports ORDER BY rowid elimination. */
   scan?: TableScan;
+  /** Conjuncts the access path enforces exactly (an index probe's equalities and range bounds): not re-checked. */
+  consumed?: ConjunctInfo[];
 }
 
 /** One way to read a source, with estimated cost per open and rows produced per open (before local filters). */
@@ -1126,9 +1130,11 @@ export class Planner {
       const access = step.option.build();
       if (!multi && access.scan) this.lastScan = access.scan;
 
+      // Conditions the index enforces exactly need no filter (their columns then need not be decoded).
+      for (const c of access.consumed ?? []) c.placed = true;
       // Filters local to this source (depend only on it and outer scopes).
       let leaf = access.leaf;
-      const local = candidates.filter((c) => c.deps!.size === 1);
+      const local = candidates.filter((c) => c.deps!.size === 1 && !c.placed);
       for (const c of local) {
         leaf = new Filter(leaf, compileExpr(c.expr, cs).fn, c.expr);
         c.placed = true;
@@ -1344,7 +1350,11 @@ export class Planner {
       on: [],
       hidden: new Set(),
       position,
+      indexedBy: item.indexedBy,
     };
+    if (typeof item.indexedBy === 'string' && !table.indexes.some((i) => sameName(i.name, item.indexedBy!))) {
+      throw new SmaltError('SMALT_ERROR', `no such index: ${item.indexedBy}`);
+    }
     for (const s of scope.sources) {
       if (sameName(s.name, src.name)) throw new SmaltError('SMALT_ERROR', `ambiguous table name: ${src.name}`);
     }
@@ -1490,6 +1500,15 @@ export class Planner {
       const eqs: Probe[] = [];
       const converters: ((v: SqlValue) => SqlValue)[] = [];
       const usable = (pr: Probe, ic: { column: number; collation: Collation; expr?: Expr }): ((v: SqlValue) => SqlValue) | null => {
+        // Costing only: compiling the probe must not make the scan decode its columns.
+        this.dryCompile++;
+        try {
+          return usableInner(pr, ic);
+        } finally {
+          this.dryCompile--;
+        }
+      };
+      const usableInner = (pr: Probe, ic: { column: number; collation: Collation; expr?: Expr }): ((v: SqlValue) => SqlValue) | null => {
         if (ic.column < 0) {
           if (pr.exprKey === undefined || pr.exprKey !== exprShapeKey(ic.expr!)) return null;
         } else if (pr.col !== ic.column) return null;
@@ -1558,9 +1577,23 @@ export class Planner {
           lo: lo ? { fn: compileExpr(lo.other, cs).fn, inclusive: lo.op === '>=' } : undefined,
           hi: hi ? { fn: compileExpr(hi.other, cs).fn, inclusive: hi.op === '<=' } : undefined,
           convert: [...converters, ...(rangeConv ? [rangeConv] : [])],
+          // Key columns usable for index-only scans: plain columns whose key form is the value itself.
+          keyColumns: idx.columns.map((c) => {
+            if (c.column < 0) return -1;
+            const t = table.columns[c.column].type;
+            const textual = t === 'TEXT' || t === 'ANY' || t === 'NUMERIC';
+            return textual && c.collation !== Collation.Binary ? -1 : c.column;
+          }),
         };
-        return { leaf: new IndexScan(access, spec), dependsOnOuter: deps };
+        return { leaf: new IndexScan(access, spec), dependsOnOuter: deps, consumed: [...eqs, ...(lo ? [lo] : []), ...(hi ? [hi] : [])].map((x) => x.conj) };
       });
+    }
+    // INDEXED BY / NOT INDEXED, as in SQLite.
+    if (src.indexedBy === null) return options.filter((o) => !o.label.startsWith('index '));
+    if (typeof src.indexedBy === 'string') {
+      const forced = options.filter((o) => o.label.toLowerCase() === `index ${src.indexedBy!.toLowerCase()}`);
+      if (forced.length === 0) throw new SmaltError('SMALT_ERROR', 'no query solution');
+      return forced;
     }
     return options;
   }
@@ -1578,6 +1611,9 @@ export class Planner {
     }
     return src.estRows;
   }
+
+  /** >0 while compiling expressions only to inspect them (column use is not recorded). */
+  private dryCompile = 0;
 
   /** Views being expanded (detects circular definitions). */
   private readonly expandingViews = new Set<string>();
@@ -1916,11 +1952,11 @@ export class Planner {
 
   private resolveIn(e: ColumnExpr, scope: Scope): ColumnBinding | undefined {
     const bind = (src: Source, c: SourceColumn): ColumnBinding => {
-      if (src.access) src.access.use(c.index, c.reg);
+      if (src.access && !this.dryCompile) src.access.use(c.index, c.reg);
       return { reg: c.reg, type: c.type, collation: c.collation, affinity: c.affinity };
     };
     const rowidOf = (src: Source): ColumnBinding => {
-      src.access!.useRowid(src.rowidReg);
+      if (!this.dryCompile) src.access!.useRowid(src.rowidReg);
       return { reg: src.rowidReg, type: 'int', collation: Collation.Binary, affinity: 'INTEGER' };
     };
     if (e.table) {

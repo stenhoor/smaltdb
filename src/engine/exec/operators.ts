@@ -1,6 +1,6 @@
 import { SmaltError } from '../errors.js';
 import type { BTree, BTreeCursor } from '../storage/btree.js';
-import { KeyEncoder, ROWID_KEY_SIZE, readNumericKeyAt, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
+import { KeyEncoder, type KeyColumn, ROWID_KEY_SIZE, decodeKey, readNumericKeyAt, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
 import { type RecordReader, decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
 import { type LoaderHelpers, type LoaderSpec, type ScanState, codegenEnabled, generateLoader } from './codegen.js';
 
@@ -347,6 +347,11 @@ export interface IndexScanSpec {
   hi?: { fn: Fn; inclusive: boolean };
   /** Converts probe values with the indexed column's affinity. */
   convert: ((v: SqlValue) => SqlValue)[];
+  /**
+   * Per index column: the table column it stores, or -1 when it cannot supply the column's value
+   * (an expression, or text stored in a non-BINARY collated form). Enables index-only scans.
+   */
+  keyColumns?: number[];
 }
 
 /** Index range/equality scan followed by a table lookup per entry. */
@@ -372,7 +377,31 @@ export class IndexScan implements Operator {
     const parts: string[] = [];
     for (let i = 0; i < cols; i++) parts.push('=?');
     if (this.spec.lo || this.spec.hi) parts.push('range');
-    return `SEARCH ${this.access.tableName} USING INDEX ${this.spec.indexName} (${parts.length ? parts.join(',') : 'scan'})`;
+    return `SEARCH ${this.access.tableName} USING ${this.covering() ? 'COVERING ' : ''}INDEX ${this.spec.indexName} (${parts.length ? parts.join(',') : 'scan'})`;
+  }
+
+  /**
+   * Index-only scan plan (like SQLite's covering indexes): when every column the query reads from
+   * this table is stored in the index key, values come from the key and the row is never fetched.
+   * Decided once the decode list is final (first open). Null = not covering.
+   */
+  private cover: { keyPos: number[]; regs: number[]; keyCols: KeyColumn[] } | null | undefined;
+  private covering(): boolean {
+    if (this.cover === undefined) {
+      const kc = this.spec.keyColumns;
+      const d = this.access.decode;
+      let plan: { keyPos: number[]; regs: number[]; keyCols: KeyColumn[] } | null = kc ? { keyPos: [], regs: [], keyCols: this.spec.columns } : null;
+      for (let i = 0; plan && i < d.length; i += 2) {
+        const pos = kc!.indexOf(d[i]);
+        if (pos < 0) plan = null;
+        else {
+          plan.keyPos.push(pos);
+          plan.regs.push(d[i + 1]);
+        }
+      }
+      this.cover = plan;
+    }
+    return this.cover !== null;
   }
 
   open(r: SqlValue[]): void {
@@ -380,7 +409,7 @@ export class IndexScan implements Operator {
     this.started = false;
     this.done = false;
     if (this.idx === null) this.idx = this.spec.tree.cursor();
-    if (this.tab === null) this.tab = this.access.tree.cursor();
+    if (this.tab === null && !this.covering()) this.tab = this.access.tree.cursor();
   }
 
   /** Compute bound keys; returns false if the scan is empty. */
@@ -438,6 +467,20 @@ export class IndexScan implements Operator {
     const kb = c.keyBytes;
     const end = c.keyOffset + c.keyLength;
     const rowid = readNumericKeyAt(kb, end - 11);
+    const cover = this.cover;
+    if (cover) {
+      const r = this.r;
+      if (cover.regs.length) {
+        const vals = decodeKey(kb.subarray(c.keyOffset, end - 11), cover.keyCols);
+        for (let i = 0; i < cover.regs.length; i++) r[cover.regs[i]] = vals[cover.keyPos[i]];
+      }
+      const a = this.access;
+      if (a.rowidReg >= 0) {
+        r[a.rowidReg] = rowid;
+        for (const x of a.extraRowidRegs) r[x] = rowid;
+      }
+      return true;
+    }
     writeRowidKey(this.keyBuf, 0, rowid);
     const t = this.tab!;
     if (!t.seek(this.keyBuf) || t.compareKey(this.keyBuf) !== 0) {

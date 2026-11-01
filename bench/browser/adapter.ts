@@ -23,8 +23,13 @@ export interface Adapter {
   smallTxns(start: number, count: number): Promise<void>;
   /** Load the analytical table `a` with n rows (see analyticRow) in one transaction. */
   loadAnalytic(n: number): Promise<void>;
-  /** Create a table (`ddl`) and load rows row(1..n) into it in one transaction. */
-  loadRows(ddl: string, table: string, n: number, row: (i: number) => (number | string)[]): Promise<void>;
+  /** Create a table (`ddl`), then `indexes` (if any), and load rows row(1..n) into it in one transaction. */
+  loadRows(ddl: string, table: string, n: number, row: (i: number) => (number | string)[], indexes?: string[]): Promise<void>;
+  /**
+   * Run a one-parameter query (`?`, may appear as `?1` several times) once per key with a prepared
+   * statement; each run returns one row. Returns the sum of the first column (a checksum).
+   */
+  lookups(sql: string, keys: (number | string)[]): Promise<number>;
   /** Execute a statement without results (e.g. CREATE INDEX). */
   exec(sql: string): Promise<void>;
   /** Run a read-only query and return its rows as value arrays. */

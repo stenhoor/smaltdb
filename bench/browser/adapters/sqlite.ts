@@ -91,13 +91,29 @@ export class SqliteAdapter implements Adapter {
     st.finalize();
   }
 
-  async loadRows(ddl: string, table: string, n: number, row: (i: number) => (number | string)[]): Promise<void> {
+  async loadRows(ddl: string, table: string, n: number, row: (i: number) => (number | string)[], indexes: string[] = []): Promise<void> {
     this.db.exec(ddl);
+    for (const ix of indexes) this.db.exec(ix);
     const st = this.db.prepare(`INSERT INTO ${table} VALUES (${row(1).map(() => '?').join(', ')})`);
     this.db.exec('BEGIN');
     for (let i = 1; i <= n; i++) st.bind(row(i)).stepReset();
     this.db.exec('COMMIT');
     st.finalize();
+  }
+
+  async lookups(sql: string, keys: (number | string)[]): Promise<number> {
+    const st = this.db.prepare(sql);
+    let sum = 0;
+    for (const k of keys) {
+      st.bind([k]);
+      if (st.step()) {
+        const v = st.get(0);
+        if (v !== null) sum += Number(v);
+      }
+      st.reset();
+    }
+    st.finalize();
+    return sum;
   }
 
   async exec(sql: string): Promise<void> {

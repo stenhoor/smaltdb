@@ -59,11 +59,25 @@ export class PgliteAdapter implements Adapter {
     await this.db.exec('COMMIT');
   }
 
-  async loadRows(ddl: string, table: string, n: number, row: (i: number) => (number | string)[]): Promise<void> {
+  async loadRows(ddl: string, table: string, n: number, row: (i: number) => (number | string)[], indexes: string[] = []): Promise<void> {
     await this.db.exec(`DROP TABLE IF EXISTS ${table}; ${ddl.replace(/ REAL\b/g, ' DOUBLE PRECISION')}`);
+    for (const ix of indexes) await this.db.exec(ix);
     await this.db.exec('BEGIN');
     for (let from = 1; from <= n; from += 1000) await this.db.exec(`INSERT INTO ${table} VALUES ${valuesSql(from, Math.min(n, from + 999), row)}`);
     await this.db.exec('COMMIT');
+  }
+
+  async lookups(sql: string, keys: (number | string)[]): Promise<number> {
+    const pg = sql.replace(/\?1?/g, '$1');
+    let sum = 0;
+    await this.db.exec('BEGIN READ ONLY');
+    for (const k of keys) {
+      const r = await this.db.query(pg, [k], { rowMode: 'array' });
+      const v = r.rows[0]?.[0];
+      if (v !== null && v !== undefined) sum += Number(v);
+    }
+    await this.db.exec('COMMIT');
+    return sum;
   }
 
   async exec(sql: string): Promise<void> {
@@ -78,7 +92,7 @@ export class PgliteAdapter implements Adapter {
   }
 
   async close(): Promise<void> {
-    await this.db.exec(['DROP TABLE t; DROP TABLE IF EXISTS a', ...JOIN_TABLES.map((t) => `DROP TABLE IF EXISTS ${t}`)].join('; '));
+    await this.db.exec(['DROP TABLE t; DROP TABLE IF EXISTS a', ...JOIN_TABLES.map((t) => `DROP TABLE IF EXISTS ${t}`), 'DROP TABLE IF EXISTS ix'].join('; '));
     await this.db.close();
   }
 }

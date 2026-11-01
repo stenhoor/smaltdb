@@ -1,5 +1,5 @@
 /// <reference lib="webworker" />
-import { ANALYTIC_QUERIES, type Adapter } from './adapter.js';
+import { ANALYTIC_QUERIES, type Adapter, analyticRow } from './adapter.js';
 import { DuckdbAdapter } from './adapters/duckdb.js';
 import { PgliteAdapter } from './adapters/pglite.js';
 import { SmaltdbAdapter } from './adapters/smaltdb.js';
@@ -42,8 +42,8 @@ async function timed(out: WorkloadResult[], workload: string, ops: number, fn: (
   out.push({ workload, ops, ms, check: Array.isArray(r) ? canon(r as unknown[][]) : String(r) });
 }
 
-self.onmessage = async (e: MessageEvent<{ engine: string; rows: number; lookups: number; smallTxns: number; analyticRows: number; joins: boolean }>) => {
-  const { engine, rows: N, lookups, smallTxns, analyticRows, joins } = e.data;
+self.onmessage = async (e: MessageEvent<{ engine: string; rows: number; lookups: number; smallTxns: number; analyticRows: number; joins: boolean; indexes: boolean }>) => {
+  const { engine, rows: N, lookups, smallTxns, analyticRows, joins, indexes } = e.data;
   try {
     const a = factories[engine]();
     const results: WorkloadResult[] = [];
@@ -73,6 +73,38 @@ self.onmessage = async (e: MessageEvent<{ engine: string; rows: number; lookups:
       for (let i = 0; i < 5; i++) await timed(reps, 'x', analyticRows, () => a.query(sql));
       const sorted = reps.map((x) => x.ms).sort((x, y) => x - y);
       results.push({ workload: `analytic: ${name} (repeat, median of 5)`, ops: analyticRows, ms: sorted[2], check: reps[0].check });
+    }
+    if (indexes) {
+      // Secondary indexes on the analytic table `a` (b = i % 1000, d = i % 100, e = 'x' || i % 50).
+      let ks = 7;
+      const rnd = (m: number): number => ((ks = (Math.imul(ks, 1103515245) + 12345) >>> 0), ks % m);
+      const eqKeys = Array.from({ length: 10_000 }, () => rnd(1000));
+      const rangeKeys = Array.from({ length: 1_000 }, () => rnd(990));
+      const dKeys = Array.from({ length: 1_000 }, () => rnd(100));
+      const eKeys = Array.from({ length: 1_000 }, () => 'x' + rnd(50));
+      await timed(results, `index: create on 1 column (${analyticRows} rows)`, analyticRows, () => a.exec('CREATE INDEX a_b ON a(b)'));
+      await timed(results, `index: create on 2 columns (${analyticRows} rows)`, analyticRows, () => a.exec('CREATE INDEX a_dc ON a(d, c)'));
+      await timed(results, `index: create on expression lower(e) (${analyticRows} rows)`, analyticRows, () => a.exec('CREATE INDEX a_le ON a(lower(e))'));
+      await timed(results, 'index: equality lookups x10k (200 rows each)', 10_000, () => a.lookups('SELECT count(*) FROM a WHERE b = ?', eqKeys));
+      await timed(results, 'index: range lookups x1k (1% of rows each)', 1_000, () => a.lookups('SELECT sum(d) FROM a WHERE b >= ?1 AND b < ?1 + 10', rangeKeys));
+      await timed(results, 'index: composite lookups x1k (d = ? AND c > 500)', 1_000, () => a.lookups('SELECT count(*) FROM a WHERE d = ?1 AND c > 500', dKeys));
+      await timed(results, 'index: expression lookups x1k (lower(e) = ?)', 1_000, () => a.lookups('SELECT count(*) FROM a WHERE lower(e) = ?', eKeys));
+      await timed(results, 'index: update indexed column, 10k rows (3 indexes)', 10_000, async () => {
+        await a.exec('UPDATE a SET b = b + 1 WHERE id % 20 = 0');
+        return a.query('SELECT count(*), sum(b) FROM a');
+      });
+      await timed(results, 'index: delete 10k rows (3 indexes)', 10_000, async () => {
+        await a.exec('DELETE FROM a WHERE id % 20 = 1');
+        return a.query('SELECT count(*), sum(b) FROM a');
+      });
+      await timed(results, 'index: bulk insert 100k rows into a table with 3 indexes', 100_000, async () => {
+        await a.loadRows('CREATE TABLE ix(id INTEGER PRIMARY KEY, b INT, c REAL, d INT, e TEXT)', 'ix', 100_000, analyticRow, [
+          'CREATE INDEX ix_b ON ix(b)',
+          'CREATE INDEX ix_dc ON ix(d, c)',
+          'CREATE INDEX ix_e ON ix(e)',
+        ]);
+        return a.query('SELECT count(*), sum(b), sum(d) FROM ix');
+      });
     }
     if (joins) {
       const total = JOIN_TABLES.reduce((n, t) => n + JOIN_SIZES[t], 0);

@@ -98,7 +98,7 @@ describe('SQL smoke', () => {
     expect(res.rows.every((r) => typeof r[6] === 'number' && (r[6] as number) >= 0)).toBe(true);
     // Index nested loop: the inner side runs once per outer row.
     const point = d.query('EXPLAIN ANALYZE SELECT b.id FROM a JOIN b ON b.a_id = a.id WHERE a.id IN (3, 7)').rows;
-    const inner = point.find((r) => /SEARCH b USING INDEX b_a/.test(String(r[2])))!;
+    const inner = point.find((r) => /SEARCH b USING (COVERING )?INDEX b_a/.test(String(r[2])))!;
     expect(inner[4]).toBe(2);
     expect(inner[5]).toBe(8);
     // The instrumented operators were restored: the same SQL still runs normally.

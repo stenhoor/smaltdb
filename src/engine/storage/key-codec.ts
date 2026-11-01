@@ -161,6 +161,9 @@ export function encodeKey(values: readonly SqlValue[], cols?: readonly KeyColumn
  * NOCASE/RTRIM text decodes to its collated form (the original is not recoverable).
  * Integers beyond 2^53 decode as bigint; other numbers as number.
  */
+const decodeScratch = new Uint8Array(8);
+const decodeScratchView = new DataView(decodeScratch.buffer);
+
 export function decodeKey(key: Uint8Array, cols?: readonly KeyColumn[]): SqlValue[] {
   const out: SqlValue[] = [];
   let pos = 0;
@@ -174,11 +177,12 @@ export function decodeKey(key: Uint8Array, cols?: readonly KeyColumn[]): SqlValu
       pos += 1;
     } else if (tag === TAG_NUM) {
       if (pos + 11 > key.length) throw new CorruptionError('truncated numeric key');
-      const raw = new Uint8Array(8);
+      // Shared scratch buffer: no allocation per numeric component (index-only scans decode many).
+      const raw = decodeScratch;
       for (let i = 0; i < 8; i++) raw[i] = key[pos + 1 + i] ^ flip;
       if (raw[0] & 0x80) raw[0] &= 0x7f;
       else for (let i = 0; i < 8; i++) raw[i] = ~raw[i] & 0xff;
-      const d = new DataView(raw.buffer).getFloat64(0, false);
+      const d = decodeScratchView.getFloat64(0, false);
       const delta = (((key[pos + 9] ^ flip) << 8) | (key[pos + 10] ^ flip)) - 0x8000;
       out.push(delta === 0 ? d : BigInt(d) + BigInt(delta));
       pos += 11;

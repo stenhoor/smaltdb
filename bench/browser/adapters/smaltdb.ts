@@ -69,12 +69,27 @@ export class SmaltdbAdapter implements Adapter {
     this.db.exec('COMMIT');
   }
 
-  async loadRows(ddl: string, table: string, n: number, row: (i: number) => (number | string)[]): Promise<void> {
+  async loadRows(ddl: string, table: string, n: number, row: (i: number) => (number | string)[], indexes: string[] = []): Promise<void> {
     this.db.exec(ddl);
+    for (const ix of indexes) this.db.exec(ix);
     const st = this.db.prepare(`INSERT INTO ${table} VALUES (${row(1).map(() => '?').join(', ')})`);
     this.db.exec('BEGIN');
     for (let i = 1; i <= n; i++) st.run(row(i));
     this.db.exec('COMMIT');
+  }
+
+  async lookups(sql: string, keys: (number | string)[]): Promise<number> {
+    const st = this.db.prepare(sql);
+    const p: [number | string] = [0];
+    let sum = 0;
+    for (const k of keys) {
+      p[0] = k;
+      const c = st.cursor(p);
+      const row = c.next();
+      c.close();
+      if (row && row[0] !== null) sum += Number(row[0]);
+    }
+    return sum;
   }
 
   async exec(sql: string): Promise<void> {
