@@ -11,6 +11,7 @@ import {
   toNumeric,
   toText,
 } from './convert.js';
+import { dateFn, datetimeFn, juliandayFn, strftimeFn, timeFn, timediffFn, unixepochFn } from './datetime.js';
 
 /** A compiled expression: reads the register file and returns a value. */
 export type Fn = (r: SqlValue[]) => SqlValue;
@@ -26,6 +27,8 @@ export interface FunctionContext {
   lastInsertRowid(): number | bigint;
   changes(): number;
   totalChanges(): number;
+  /** Current time in Unix milliseconds; the same value for every call within one statement execution. */
+  now(): number;
 }
 
 export interface ScalarFunction {
@@ -590,6 +593,14 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
   ['changes', simple(0, 0, 'int', (_v, _a, ctx) => ctx.changes(), false)],
   ['total_changes', simple(0, 0, 'int', (_v, _a, ctx) => ctx.totalChanges(), false)],
   ['smaltdb_version', simple(0, 0, 'text', () => '0.1.0')],
+  // Date and time (datetime.ts). Not constant-folded: 'now' and 'localtime' depend on when they run.
+  ['date', simple(0, -1, 'text', (v, _a, ctx) => dateFn(v, ctx), false)],
+  ['time', simple(0, -1, 'text', (v, _a, ctx) => timeFn(v, ctx), false)],
+  ['datetime', simple(0, -1, 'text', (v, _a, ctx) => datetimeFn(v, ctx), false)],
+  ['julianday', simple(0, -1, 'real', (v, _a, ctx) => juliandayFn(v, ctx), false)],
+  ['unixepoch', simple(0, -1, 'num', (v, _a, ctx) => unixepochFn(v, ctx), false)],
+  ['strftime', simple(0, -1, 'text', (v, _a, ctx) => strftimeFn(v, ctx), false)],
+  ['timediff', simple(2, 2, 'text', (v, _a, ctx) => timediffFn(v, ctx), false)],
 ]);
 
 // ------------------------------------------------------------------ aggregates
