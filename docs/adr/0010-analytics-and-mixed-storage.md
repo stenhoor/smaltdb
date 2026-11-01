@@ -1,4 +1,4 @@
-# ADR 0010: Analytics (M7): mixed storage, spilling
+# ADR 0010: Analytics (M7): mixed storage, spilling, columnar tables
 
 - **Status:** accepted (M7 in progress; sections are added as parts land)
 - **Date:** 2026-11-01
@@ -81,6 +81,53 @@ tables, morsel parallelism and MV matching.
   - *Cost:* the restart repeats the scan once. This is acceptable because it only happens for results that would
     not fit anyway.
 
+### 3. Columnar base tables (M7.3)
+
+`CREATE TABLE t(…) WITH (storage = 'columnar')` keeps a table's rows in three B+trees.
+
+- **Delta store**: the table's ordinary root, in row format. Every INSERT lands here, so constraints, conflict
+  handling (`OR REPLACE`/`IGNORE`), RETURNING and triggers of the write path need no columnar variant.
+- **Segments**: a column store in the ADR 0008 format. It holds the table's columns plus a final rowid column
+  (rowids are not dense once rows move), in 8192-row groups with zone maps.
+- **Deletion tree**: rowids of segment rows that were deleted, or that an UPDATE moved back into the delta store
+  (keys only).
+
+The segment and deletion roots are kept in `smalt_columnar(name, seg_root, del_root)`. The CREATE text itself says
+the table is columnar.
+
+**Reading.**
+- *Scans:* a scan reads the delta store, then the segments minus deleted rowids (`ColumnarTableScan`). Results come
+  back in no particular rowid order.
+- *Zone maps:* comparisons with constants, including on the rowid or INTEGER PRIMARY KEY, become zone-map tests.
+- *Fused loops:* fused aggregate and GROUP BY loops are generated once per source, a leaf loop for the delta store
+  and a row-group loop for the segments. Both step the same aggregate states or groups. The row-group loop reads
+  stored rowids and skips rows flagged in a per-row-group deleted bitmap.
+- *Deletions:* deleted rowids are read when a scan opens. Compaction keeps that set small.
+
+**Writing** (`ColumnarTableWriter`).
+- *Lookups:* reads, existence checks and conflict checks look in the delta store, then the segments. A zone-map
+  search runs only for rowids at or below the segments' maximum, so INSERTs with new rowids never search.
+- *Segment rows:* a DELETE of a segment row records its rowid. An UPDATE records the rowid and writes the new version
+  to the delta store.
+- *Order safety:* UPDATE and DELETE collect target rowids before changing anything, so the order of the two sources
+  cannot revisit a row.
+
+**Compaction** runs at the end of a write statement, inside the statement's journal or autocommit transaction, so a
+failure rolls it back.
+- *Append:* once the delta store holds 8192 rows, whole row groups of delta rows, oldest rowids first, are appended
+  as new row groups with B+tree inserts at the tree's right edge. The rest stay in the delta store.
+- *Rows held back:* delta rows whose rowid is also in the deletion tree (updated segment rows, reused rowids) stay
+  behind, because the deletion entry would hide them.
+- *Rewrite:* when deletions exceed a quarter of the segment rows, when too few rows could move, on
+  `PRAGMA compact(t)`, or on `DELETE FROM t` without WHERE, the segments are rewritten into a new tree. The delta
+  store and deletion tree are emptied.
+- *Readers:* a new segment root bumps the schema cookie, so readers reload.
+- *Caches:* decoded-chunk caches survive commits, because segments never change in place. They are dropped on
+  rollback, since the keys of rolled-back row groups get reused.
+
+**Not supported yet:** secondary indexes, UNIQUE constraints other than INTEGER PRIMARY KEY, foreign keys to or
+from columnar tables, ALTER TABLE, TEMP columnar tables and ANALYZE statistics. Each fails with a clear error.
+
 ## Consequences
 
 - An OPFS database can hold memory-only state (scratch tables, fast dashboards' MVs) without writing pages. Readers
@@ -97,3 +144,24 @@ tables, morsel parallelism and MV matching.
   `json_group_array`.
 - **Not spilling yet:** window partitions, hash joins and DISTINCT. Hash-join build sides are usually the smaller
   input; these are follow-ups.
+- **Columnar tables against a row table** (Node, 1M rows of 5 columns, MemoryVfs):
+
+  | Operation | Row table | Columnar |
+  |---|---|---|
+  | `sum`/`avg`/`count` | 84.6 ms | 13.7 ms |
+  | `GROUP BY` (100 groups) | 90.7 ms | 13.9 ms |
+  | Filtered aggregate | 72.3 ms | 2.2 ms |
+  | Text `GROUP BY` | 123.6 ms | 17.2 ms |
+  | rowid range | 1.8 ms | 0.76 ms |
+  | Point lookup | 0.02 ms | 1.24 ms |
+  | 1M-row INSERT | 2.9 s | 4.2 s |
+  | UPDATE of 10k rows | 404 ms | 743 ms |
+  | `GROUP BY` after DML | 98 ms | 37 ms |
+
+  - *Point lookups:* slower, as expected, because they scan zone maps rather than descend a tree.
+  - *INSERT:* rows are written twice, to the delta store and then to the segments. A direct bulk-load path is a
+    follow-up.
+  - *GROUP BY after DML:* the deleted bitmaps are recomputed on every scan.
+  - *Row-table UPDATE:* the 404 ms figure includes a pager fix found while measuring. Before it, UPDATE took 3.2 s:
+    with nearly every frame dirty, each cache miss swept the whole clock.
+

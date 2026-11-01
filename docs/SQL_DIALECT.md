@@ -158,6 +158,10 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
   OPFS database), shadows a main table of the same name, takes indexes, and is gone when the database closes. Temp DDL
   and writes roll back with the transaction. `CREATE MATERIALIZED VIEW … WITH (location = 'memory')` keeps an MV's rows
   and indexes in memory and its definition in the file; it is recomputed when the database opens (ADR 0010).
+- (M7) `CREATE TABLE t(…) WITH (storage = 'columnar')`: a columnar table (column segments with zone maps, plus a
+  row delta store and deletions; full DML). Analytics scans are several times faster; point lookups are slower.
+  `PRAGMA compact(t)` rewrites its segments. No secondary indexes, UNIQUE constraints (other than INTEGER PRIMARY
+  KEY), foreign keys or ALTER TABLE yet. `storage = 'row'` is the default.
 - `x [NOT] IN table` / `x IN f(args)`: SQLite's shorthand for `x IN (SELECT * FROM …)`. As in SQLite, a view's body is
   resolved when the view is used, not when it is created, and views cannot be modified or indexed. Simple views and FROM
   subqueries (no aggregates, DISTINCT, LIMIT, ORDER BY, compound, window functions or subquery expressions) are flattened
@@ -165,7 +169,7 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
 - `BEGIN` / `COMMIT` / `ROLLBACK`, `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` (M2), with statement-level atomicity inside transactions.
 - `EXPLAIN QUERY PLAN`, `EXPLAIN ANALYZE` (SELECT; estimated vs actual rows, loops and time per operator), and `ANALYZE [table]`
   (statistics in `smalt_stat`; M3); `PRAGMA table_info / index_list / index_info / page_size / page_count / freelist_count /
-  schema_version / integrity_check / journal_mode / wal_checkpoint / work_mem / spill_bytes`. `PRAGMA work_mem = bytes`
+  schema_version / integrity_check / journal_mode / wal_checkpoint / work_mem / spill_bytes / compact`. `PRAGMA work_mem = bytes`
   (default 256 MiB) is how much a sort or hash aggregate may hold before spilling to the scratch file `<db>-spill`;
   `spill_bytes` reports scratch bytes written since open (M7); `smalt_schema` (also `sqlite_schema` / `sqlite_master`).
 
