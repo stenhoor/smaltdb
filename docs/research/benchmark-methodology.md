@@ -90,3 +90,37 @@ What changed and why:
 
 **Open question, unchanged:** the probe measured about 200 µs per OPFS read call, yet SQLite's cold numbers imply fewer or cheaper calls
 than its page count suggests. Re-measure on real hardware and on Firefox/Safari.
+
+## Update: generated row decoders, append-optimized splits, first-run vs repeat (2026-11-01)
+
+Raw data: [bench/results/2026-11-01-chromium-5e9a80f.json](../../bench/results/2026-11-01-chromium-5e9a80f.json). Both sides are crash-safe,
+there are 5 repetitions, and each workload is compared against the faster of SQLite's WAL and TRUNCATE modes. Analytical queries are now reported twice:
+the **first run** in a fresh worker (which includes JIT warm-up of smaltdb's generated code and engine code) and the **repeat** (median
+of 5 further runs, e.g. a refreshed dashboard). SQLite's WebAssembly is compiled ahead of time and barely changes between the two.
+
+| Workload | smaltdb | best crash-safe SQLite | verdict |
+|---|---|---|---|
+| Bulk insert 100k rows | 253 | 607 | **2.40× faster** |
+| Point lookup ×10k (warm) | 30.5 | 40.3 | **1.32× faster** |
+| Scan, read values (warm) | 55.6 | 114 | **2.05× faster** |
+| 200 single-row durable txns | 101 | 498 | **4.94× faster** |
+| Point lookup ×10k (cold) | 59.8 | 134 | **2.25× faster** |
+| Scan, read values (cold) | 103 | 238 | **2.31× faster** |
+| Load analytic table (200k rows) | 504 | 1,209 | **2.40× faster** |
+| Filter + sum: first run / repeat | 10.3 / 5.8 | 10.4 / 9.0 | tie / **1.55× faster** |
+| GROUP BY: first run / repeat | 20.0 / 15.7 | 67.6 / 55.0 | **3.37× / 3.49× faster** |
+| Arithmetic filter + aggregate: first run / repeat | 11.9 / 7.4 | 8.6 / 8.1 | **1.38× slower** / **1.09× faster** |
+
+**What changed:**
+- **The marginal cost of arithmetic is not the bottleneck.** In Node with both engines in memory, smaltdb's arithmetic costs about 0–2 ns
+  per operation versus 1–5 ns for SQLite (measured as query time with versus without the arithmetic). The remaining gap was per-row
+  pipeline cost.
+- **Generated row decoders** read columns straight from leaf page bytes, with offsets and types baked in. Integers that fit in int32
+  are produced as int32, so V8 keeps them as small integers; integer `%` on doubles had been calling `fmod`.
+- **Append-optimized leaf splits.** Sequential inserts left every page half full. A 200k-row table shrank from 22.3 to 11.1 MiB,
+  which halves the pages read by scans and cold reads.
+
+**Remaining gap:** the arithmetic query's first run in a fresh worker. That run is 4–5 ms slower than its repeats because of JIT warm-up of
+the generated per-query functions and of the engine. Statement preparation is about 0.3 ms once the engine is warm, but
+about 3 ms for the very first statement in a worker. Options: fuse scan, filter and aggregate into one generated function per pipeline
+(fewer cold functions), and reduce first-statement compile cost.

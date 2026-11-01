@@ -54,3 +54,6 @@ correctness work, and differential testing showed the value of getting semantics
 - Fixed: REAL `%` with an int64 operand beyond 2^53 converted the operand through a double first; it now casts the original value.
 - A new differential test checks int64 extremes, the 2^53 boundary, division and modulo by 0 and -1, negative zero, and mixed
   INTEGER/REAL/TEXT/ANY operands against SQLite, under both the generated-code and closure paths.
+- **Generated row decoders** (`generateLoader` in codegen.ts): per table access, column offsets and types are baked into a decoder that
+  reads leaf page bytes directly. Overflow cells and short (pre-ADD COLUMN) records fall back to the generic `RecordReader`.
+- **Append-optimized splits:** an insert past the end of the rightmost leaf starts a new page instead of splitting 50/50.
