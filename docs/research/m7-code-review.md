@@ -14,7 +14,7 @@ memory store and TEMP tables, spilling, columnar base tables, morsel parallelism
 
 There is no CLAUDE.md, so no conventions findings were possible.
 
-**Status:** S1 items 1–5 are fixed, each with a regression test in `test/s1-regressions.test.ts`; everything else is open. Each item below records how it was reproduced and the suggested direction. Severity:
+**Status:** S1 items 1–5 and S2 items 6–19 are fixed, each with regression tests (`test/s1-regressions.test.ts`, `test/s2-regressions.test.ts`); S3, performance and cleanup items are open. Each item below records how it was reproduced and the suggested direction. Severity:
 **S1** corrupts data or returns wrong results silently; **S2** wrong results or errors in specific shapes; **S3**
 lifecycle, robustness and edge cases; **P** performance; **C** cleanup.
 
@@ -85,7 +85,7 @@ lifecycle, robustness and edge cases; **P** performance; **C** cleanup.
 
 ### S2: wrong results or errors in specific shapes
 
-6. **The server's morsel path breaks request scheduling.**
+6. **Fixed. The server's morsel path breaks request scheduling.**
    - *Where:* `server.ts:398` (`toMorsels` `finish`).
    - *Deadlock:* a local query with a finite credit, while another session runs BEGIN and then INSERT. The query
      receives only `columns`, and the INSERT never answers: the stream waits for `allowed()`, and the INSERT waits
@@ -98,18 +98,21 @@ lifecycle, robustness and edge cases; **P** performance; **C** cleanup.
      - let the requesting session's own writes wait (or treat its morsel job like its own stream);
      - cancel pending morsel jobs on close, and check `this.db === db` in `finish`;
      - use a read-hold counter instead of a fake `RowCursor`.
-7. **min/max merges ignore column collation.**
+   - *Fix (done):* Merged morsel results are precomputed rows that hold no reads, so writers don't wait for their client. A write during pending morsel work waits in the queue, the requesting session's own included. A reader failure re-queues the query to run normally on the owner, under the usual scheduling. Close fails pending morsel queries, and `finish()` never answers from a closed database.
+7. **Fixed. min/max merges ignore column collation.**
    - *Where:* `exec/morsel.ts:163`.
    - *Repro:* `ci TEXT COLLATE NOCASE` holding `'b','a','B','C'`. `SELECT min(ci), max(ci)` gives `['a','C']`
      normally and `['B','b']` through morsels. The MV roll-up has the same bug.
    - *Fix:* reject non-BINARY `min`/`max` arguments, or carry the collation into the merge.
-8. **An MV roll-up `count` returns NULL instead of 0 when no view rows match.**
+   - *Fix (done):* a min/max argument compared with a non-BINARY collation declines the split.
+8. **Fixed. An MV roll-up `count` returns NULL instead of 0 when no view rows match.**
    - *Where:* `exec/mv-match.ts:151`.
    - *Cause:* an ungrouped query merges `count` as `sum` over the view's group rows, which are zero when nothing
      matches.
    - *Repro:* `SELECT count(*) FROM t WHERE g = 999` returns `[[null]]`. An empty base table gives the same.
    - *Fix:* merge `count` as `coalesce(sum(n), 0)`, or `total(n)` cast to integer.
-9. **The morsel range filter binds to a user column named `rowid`.**
+   - *Fix (done):* `count` merges as `coalesce(sum(n), 0)`.
+9. **Fixed. The morsel range filter binds to a user column named `rowid`.**
    - *Where:* `exec/morsel.ts:249`.
    - *Cause:* the filter uses a column reference named `rowid`, while `rowidBounds` splits by true B+tree rowids.
    - *Repro:* `CREATE TABLE t(rowid INT, v INT)` with user `rowid` values outside the true range.
@@ -117,58 +120,79 @@ lifecycle, robustness and edge cases; **P** performance; **C** cleanup.
      columnar tables and columnar views.
    - *Fix:* refuse morsels when a column is named `rowid`, `_rowid_` or `oid`, or filter on an internal rowid
      reference.
-10. **The morsel merge loses REAL typing.**
+   - *Fix (done):* the range filter uses the first of `rowid` / `_rowid_` / `oid` that no user column takes, and declines when all three are taken.
+10. **Fixed. The morsel merge loses REAL typing.**
     - *Where:* `database.ts:560`.
     - *Cause:* `smalt_partials` columns are typed `any`.
     - *Repro:* `x REAL` holding `2.0, 4.0, …`. `typeof(max(x))` and `min(x) || ''` give `real`/`2.0` normally and
       `integer`/`2` through morsels.
     - *Fix:* type the partial columns from the partial query's output types.
-11. **A HAVING alias that matches a table column breaks morsel queries.**
+   - *Fix (done):* `smalt_partials()` columns are typed from the partial query's output types.
+11. **Fixed. A HAVING alias that matches a table column breaks morsel queries.**
     - *Where:* `exec/morsel.ts:171`.
     - *Repro:* `SELECT g, sum(a) AS a FROM t GROUP BY g HAVING a > 5` works normally but fails through morsels with
       "misuse of aggregate function sum()".
     - *Fix:* resolve HAVING names the way the planner does (table column first), or decline when an alias shadows
       a column.
-12. **Rewriting a query to an MV breaks `t.*` and renames `SELECT *` columns.**
+   - *Fix (done):* in HAVING, a table column takes precedence over an output alias, as the planner resolves it; the query then declines.
+12. **Fixed. Rewriting a query to an MV breaks `t.*` and renames `SELECT *` columns.**
     - *Where:* `exec/mv-match.ts` `project`.
     - *Repros:*
       - `SELECT t.* FROM t` fails with "no such table: t": the star's qualifier is not normalized.
       - `SELECT * FROM t` against `CREATE MATERIALIZED VIEW mv(x, y) AS SELECT * FROM t` returns columns `x, y`
         instead of `a, b`.
-13. **ALTER TABLE on a TEMP table does nothing, or rewrites the main table.**
+   - *Fix (done):* `*` and `t.*` are spelled out from the view's columns under the base table's names (`MatviewCandidate.baseColumns`), which also fixes column mapping for renamed `SELECT *` views.
+13. **Fixed. ALTER TABLE on a TEMP table does nothing, or rewrites the main table.**
     - *Where:* `database.ts:2146`.
     - *Repros:*
       - `ALTER TABLE tmp ADD COLUMN y DEFAULT 3` succeeds without effect.
       - With main `t` and TEMP `t(a,b)`, `ALTER TABLE t ADD COLUMN c` writes `a,b,c` into main `t`'s catalog row
         over records shaped `(a)`.
     - *Fix:* support ALTER for temp tables in memory, or reject it.
-14. **Persistent views and MVs may read TEMP tables.**
+   - *Fix (done):* ALTER resolves `main.` / `temp.` and rejects TEMP tables (`SMALT_UNSUPPORTED`). `ALTER TABLE main.t` alters a shadowed main table.
+14. **Fixed. Persistent views and MVs may read TEMP tables.**
     - *Where:* `database.ts:986` (`createMatview`) and `createView`.
     - *Repro:* `CREATE MATERIALIZED VIEW m AS SELECT x FROM tt` (`tt` is TEMP) persists this connection's private
       rows to the file, visible to readers and other tabs. After reopen, `REFRESH` fails with "no such table: tt".
     - *Fix:* reject persistent objects with temp dependencies (SQLite makes such views TEMP, or rejects them when
       `main` is explicit).
-15. **TEMP views are not treated as connection-local.**
+   - *Fix (done):* a materialized view over a TEMP object is rejected. A plain view over one becomes a TEMP view, as in SQLite, or is rejected when written `main.`.
+15. **Fixed. TEMP views are not treated as connection-local.**
     - *Where:* `database.ts:298` (`usesMemoryObjects`).
     - *Repro:* `CREATE TEMP VIEW tv AS SELECT * FROM t`, then `SELECT * FROM tv`. It can be routed to a parallel
       reader, which fails with "no such table: tv".
-16. **ANALYZE includes TEMP tables.**
+   - *Fix (done):* TEMP views count as connection-local.
+16. **Fixed. ANALYZE includes TEMP tables.**
     - *Where:* `database.ts:1664`.
     - *Effect:* their statistics are written into `smalt_stat` in the file and survive reopen. A TEMP `t` shadowing
       main `t` overwrites main `t`'s statistics, with the wrong column count.
-17. **A TEMP table hides the main table from information_schema.**
+   - *Fix (done):* ANALYZE skips TEMP tables, includes shadowed main tables, and loads statistics onto main tables only.
+17. **Fixed. A TEMP table hides the main table from information_schema.**
     - *Where:* `catalog/information-schema.ts:56` and `database.ts:587`.
     - *Repro:* with main `t` and TEMP `t`, `information_schema.tables` and `.columns` lose main `t` entirely.
-18. **A columnar table wraps past the maximum rowid.**
+   - *Fix (done):* `information_schema` includes shadowed main tables.
+18. **Fixed. A columnar table wraps past the maximum rowid.**
     - *Where:* `exec/columnar-table.ts:146`.
     - *Cause:* there is no `I64_MAX` check, unlike `TableWriter.newRowid`.
     - *Repro:* with segments holding 9223372036854775807, an INSERT succeeds with rowid 2^63, which reads back as
       -9223372036854775808. A row table raises `SMALT_FULL`.
-19. **TEMP and main indexes can share a name.**
+   - *Fix (done):* `SMALT_FULL` past the maximum rowid, as for row tables.
+19. **Fixed. TEMP and main indexes can share a name.**
     - *Where:* `database.ts` `createIndex` and `loadSchema`.
     - *Cause:* `checkNewName` checks only the persisted catalog, so a main index may reuse a TEMP index's name.
     - *Effect:* depending on whether the schema was reloaded, `DROP INDEX i` drops one of the two, and the other can
       then never be dropped.
+   - *Fix (done):* main indexes share one namespace with TEMP indexes.
+
+**Found while fixing S2** (fixed in the same change):
+- *View flattening:* `flatten.ts` re-emitted a view's base tables as `main.<name>`. Since the S1 schema fix, that made
+  views and subqueries over TEMP tables fail with "no such table: main.x". It now uses the resolved table's own
+  schema.
+- *Integrity check:* `PRAGMA integrity_check` skipped main tables shadowed by a TEMP table, so their pages looked
+  leaked ("page accounting"). Shadowed main tables are now checked.
+- *HAVING alias of an aggregate (open):* `SELECT g, sum(a) AS s FROM t GROUP BY g HAVING s > 100` fails with "misuse
+  of aggregate function sum()", also on the normal path. This is an older planner gap, not an M7 bug; SQLite accepts
+  it.
 
 ### S3: lifecycle, robustness and edge cases
 

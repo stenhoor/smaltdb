@@ -32,6 +32,8 @@ interface Job {
   req: Request;
   /** Waiting for open read cursors to close (a write hit SMALT_BUSY). */
   blocked: boolean;
+  /** Run on the owner, not as morsels (a morsel run of it already failed). */
+  noMorsels?: boolean;
 }
 
 interface Stream {
@@ -41,6 +43,8 @@ interface Stream {
   batchSize: number;
   /** Batches the client still accepts (Infinity without backpressure). */
   credit: number;
+  /** Reads the database while it streams (writes must wait); false for precomputed rows (merged morsels). */
+  holdsReads: boolean;
 }
 
 export interface ServerOptions {
@@ -192,7 +196,7 @@ export class EngineServer {
   }
 
   private unblock(): void {
-    if (this.streams.length === 0 && this.morselJobs.length === 0) for (const j of this.queue) j.blocked = false;
+    if (this.morselJobs.length === 0 && !this.streams.some((s) => s.holdsReads)) for (const j of this.queue) j.blocked = false;
   }
 
   /** Whether `session` may run now (no other session's transaction is open). */
@@ -238,9 +242,11 @@ export class EngineServer {
       await this.handle(session, req);
     } catch (err) {
       if (err instanceof SmaltError && err.code === 'SMALT_BUSY' && /query cursor is open/.test(err.message)) {
-        // A write while results stream. Wait for the streams, unless they are this session's own.
-        const holders = [...this.streams.map((s) => s.session), ...this.morselJobs.map((m) => m.session)];
-        if (holders.length > 0 && holders.every((s) => s !== session)) {
+        // A write while reads are held. Morsel queries finish by themselves: wait for them (also when
+        // they are this session's own). Streams wait for their clients: wait unless they are this
+        // session's own (waiting for itself would deadlock).
+        const holders = this.streams.filter((s) => s.holdsReads).map((s) => s.session);
+        if (this.morselJobs.length > 0 || (holders.length > 0 && holders.every((s) => s !== session))) {
           job.blocked = true;
           this.queue.unshift(job);
           return;
@@ -357,6 +363,12 @@ export class EngineServer {
         for (const s of this.streams) s.cursor.close();
         this.streams.length = 0;
         this.statements.clear();
+        // Morsel queries still out on readers: they end here (their late results are dropped).
+        for (const m of this.morselJobs) {
+          if (m.cancelled) continue;
+          m.cancelled = true;
+          this.fail(m.session, m.id, new SmaltError('SMALT_MISUSE', 'database is closed'));
+        }
         this.db?.close();
         this.db = null;
         this.send(session, { id, kind: 'ok' });
@@ -385,7 +397,8 @@ export class EngineServer {
   private toMorsels(session: string, st: Statement, sql: string, req: { id: number; params?: unknown; batchSize?: number; credit?: number }): boolean {
     const pool = this.options.readers;
     const db = this.db;
-    if (!pool?.partial || !pool.idle || !db || this.txOwner !== null || db.inTransaction || !st.readonly || st.usesMemoryObjects) return false;
+    const job0 = this.current;
+    if (!pool?.partial || !pool.idle || !db || job0 === null || job0.noMorsels || this.txOwner !== null || db.inTransaction || !st.readonly || st.usesMemoryObjects) return false;
     const idle = pool.idle();
     if (idle < 2) return false;
     const ranges = db.parallelSplit(sql, idle);
@@ -399,14 +412,22 @@ export class EngineServer {
       release();
       this.morselJobs.splice(this.morselJobs.indexOf(job), 1);
       if (!job.cancelled) {
-        try {
-          // A reader failed: answer it here instead (same snapshot: writes were held).
-          const result = failed === null ? db.mergePartials(sql, req.params as BindParams | undefined, partials.flat()) : null;
-          const cursor = result ? new RowCursor(db, null, result.rows, [], result.columns) : st.cursor(req.params as BindParams | undefined);
-          if (result) this.morselQueries++;
-          this.startStream(session, req.id, cursor, req.batchSize ?? 4096, req.credit, result ? ranges.length : undefined);
-        } catch (err) {
-          this.fail(session, req.id, err);
+        if (this.db !== db) {
+          // The database was closed (or replaced) meanwhile: never answer from a closed handle.
+          this.fail(session, req.id, new SmaltError('SMALT_MISUSE', 'database is closed'));
+        } else if (failed !== null) {
+          // A reader failed: run the query again on the owner, as an ordinary queued request, so it
+          // waits its turn (transactions of other sessions, held reads) like any other.
+          this.queue.unshift({ session, req: job0.req, blocked: false, noMorsels: true });
+        } else {
+          try {
+            // Precomputed rows: the stream holds no reads, so writes need not wait for its client.
+            const result = db.mergePartials(sql, req.params as BindParams | undefined, partials.flat());
+            this.morselQueries++;
+            this.startStream(session, req.id, new RowCursor(db, null, result.rows, [], result.columns), req.batchSize ?? 4096, req.credit, ranges.length);
+          } catch (err) {
+            this.fail(session, req.id, err);
+          }
         }
       }
       this.unblock();
@@ -436,7 +457,7 @@ export class EngineServer {
 
   private startStream(session: string, id: number, cursor: RowCursor, batchSize: number, credit: number | undefined, morsels?: number): void {
     this.send(session, morsels ? { id, kind: 'columns', columns: cursor.columns, morsels } : { id, kind: 'columns', columns: cursor.columns });
-    const s: Stream = { session, id, cursor, batchSize, credit: credit ?? Infinity };
+    const s: Stream = { session, id, cursor, batchSize, credit: credit ?? Infinity, holdsReads: cursor.plan !== null };
     this.streams.push(s);
     this.watch(session);
     // Results without backpressure are sent right away (the common case: whole results).

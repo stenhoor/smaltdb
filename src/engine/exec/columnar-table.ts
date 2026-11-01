@@ -24,6 +24,7 @@ import { TableWriter } from './write.js';
 export type Rowid = number | bigint;
 
 const EMPTY = new Uint8Array(0);
+const I64_MAX = 2n ** 63n - 1n;
 
 /**
  * Zone map of column `col` in row group `rg`; column -1 is the implicit rowid of a columnar view
@@ -157,6 +158,8 @@ export class ColumnarTableWriter extends TableWriter {
     this.segMax ??= maxSegmentRowid(this.store, this.rowidCol);
     if (n > this.segMax) return n;
     const m = this.segMax;
+    // Like TableWriter.newRowid: past the largest rowid there is no next one.
+    if (typeof m === 'bigint' && m >= I64_MAX) throw new SmaltError('SMALT_FULL', 'database or disk is full (rowid space exhausted)');
     return typeof m === 'number' && Number.isSafeInteger(m + 1) ? m + 1 : BigInt(m) + 1n;
   }
 
