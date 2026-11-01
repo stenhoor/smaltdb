@@ -158,6 +158,27 @@ export class TableWriter {
     return true;
   }
 
+  /**
+   * Rowid of the row that `row` would collide with on one constraint: `target` -1 is the rowid /
+   * INTEGER PRIMARY KEY, otherwise an index position in `table.indexes`. Null when none.
+   */
+  conflictOn(target: number, row: readonly SqlValue[], rowid: number | bigint, except: number | bigint | null): number | bigint | null {
+    if (target < 0) {
+      // eslint-disable-next-line eqeqeq
+      return (except === null || rowid != except) && this.rowExists(rowid) ? rowid : null;
+    }
+    return this.uniqueConflict(target, row, except);
+  }
+
+  /** First conflicting constraint (rowid, then unique indexes in order), or null. */
+  firstConflict(row: readonly SqlValue[], rowid: number | bigint, except: number | bigint | null): { target: number; rowid: number | bigint } | null {
+    for (let t = -1; t < this.table.indexes.length; t++) {
+      const other = this.conflictOn(t, row, rowid, except);
+      if (other !== null) return { target: t, rowid: other };
+    }
+    return null;
+  }
+
   /** Write a row whose conflicts were already resolved. */
   writeRow(row: SqlValue[], rowid: number | bigint): void {
     const t = this.table;

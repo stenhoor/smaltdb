@@ -98,6 +98,9 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
   (string, numeric, `printf`/`format`, `typeof`, `quote`, `hex`, `coalesce`/`ifnull`/`iif`/`nullif`, `last_insert_rowid`, `changes`, …).
 - `INSERT` (VALUES, SELECT, DEFAULT VALUES, column lists, `OR IGNORE` / `OR REPLACE`), `UPDATE` (two-pass, SQLite order),
   `DELETE` (with a truncate fast path).
+- (M4) `RETURNING` on INSERT/UPDATE/DELETE (`*`, expressions, aliases; aggregates rejected like SQLite);
+  upsert `ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET … [WHERE …]` with `excluded.*`, several clauses tried in order;
+  `UPDATE … FROM` (joined sources; with several matching FROM rows the first one wins, as in SQLite).
 - `CREATE` / `DROP TABLE` (`IF [NOT] EXISTS`, `INTEGER PRIMARY KEY` rowid alias, `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`,
   `CHECK`, `COLLATE`), `CREATE [UNIQUE] INDEX` (multi-column, `ASC`/`DESC`, collations), and `DROP INDEX`.
 - `CREATE VIEW [IF NOT EXISTS] name [(columns)] AS select` and `DROP VIEW [IF EXISTS]` (M4). As in SQLite, a view's body is
@@ -116,7 +119,7 @@ losslessly as SQLite STRICT tables do (`'5'` into an INTEGER column becomes 5), 
 `cannot store TEXT value in INTEGER column t.c`.
 
 **Not yet supported** (each gives a clear `SMALT_UNSUPPORTED` error): `WITH RECURSIVE`, window functions, `RIGHT` / `FULL` joins,
-TEMP views, materialized views (M5), `RETURNING`, upsert (`ON CONFLICT ... DO`), `UPDATE ... FROM`, `ALTER TABLE`, expression and
+TEMP views, materialized views (M5), `ON CONFLICT` targets with WHERE, row-value assignments (`SET (a, b) = …`), `ALTER TABLE`, expression and
 partial indexes, `INCLUDE` columns, `WITHOUT ROWID`, `LOOSE` tables, generated columns, TEMP tables, date/time and JSON
 functions, and `VACUUM`. Plain `EXPLAIN` returns the `EXPLAIN QUERY PLAN` output (there is no bytecode to list). Foreign keys are parsed and stored but not yet enforced (M4).
 

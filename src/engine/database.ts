@@ -16,7 +16,9 @@ import { type ExecState, type Operator, explainAnalyze, explainRows } from './ex
 import { Planner, type QueryPlan, Registers } from './exec/planner.js';
 import { type ConflictMode, TableWriter } from './exec/write.js';
 import type {
+  ColumnExpr,
   CreateIndexStmt,
+  FromItem,
   CreateTableStmt,
   CreateViewStmt,
   DeleteStmt,
@@ -25,6 +27,7 @@ import type {
   InsertStmt,
   ParsedStatement,
   PragmaStmt,
+  ResultColumn,
   SelectStmt,
   Stmt,
   UpdateStmt,
@@ -68,6 +71,12 @@ export interface ViewSchema {
   sql: string;
   columns?: string[];
   select: SelectStmt;
+}
+
+/** A compiled ON CONFLICT clause (target -1 = rowid, n = index position, null = any constraint). */
+interface Upsert {
+  target: number | null;
+  update: { sets: { col: number; c: Compiled }[]; where: Fn | null; oldBase: number; oldRowid: number } | null;
 }
 
 interface CatalogEntry {
@@ -398,13 +407,14 @@ export class Database implements FunctionContext {
         return done({ plan, readonly: true, columns: plan.columns.map((c) => c.name), columnTypes: plan.columns.map((c) => c.type) });
       }
       case 'insert': {
-        const single = stmt.source.kind === 'values' && stmt.source.rows.length === 1 && (stmt.or ?? 'ABORT') !== 'REPLACE' && this.getTable(stmt.table)?.indexes.length === 0;
-        return done({ exec: this.compileInsert(stmt, planner), readonly: false, singleRowWrite: single, columns: [], columnTypes: [] });
+        const single = stmt.source.kind === 'values' && stmt.source.rows.length === 1 && (stmt.or ?? 'ABORT') !== 'REPLACE' && this.getTable(stmt.table)?.indexes.length === 0 && !stmt.upsert.length;
+        const c = this.compileInsert(stmt, planner);
+        return done(this.dmlProgram(c, single));
       }
       case 'update':
-        return done({ exec: this.compileUpdate(stmt, planner), readonly: false, columns: [], columnTypes: [] });
+        return done(this.dmlProgram(this.compileUpdate(stmt, planner)));
       case 'delete':
-        return done({ exec: this.compileDelete(stmt, planner), readonly: false, columns: [], columnTypes: [] });
+        return done(this.dmlProgram(this.compileDelete(stmt, planner)));
       case 'createTable':
         return done({ exec: () => this.createTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
       case 'createIndex':
@@ -448,6 +458,22 @@ export class Database implements FunctionContext {
       default:
         throw new SmaltError('SMALT_UNSUPPORTED', `${stmt.kind} statements are not supported yet`);
     }
+  }
+
+  /** Program for a write statement; with RETURNING it produces rows (and still counts changes). */
+  private dmlProgram(c: { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } }, singleRowWrite = false): Omit<Program, 'regCount'> {
+    if (!c.returning) return { exec: (r) => c.exec(r), readonly: false, singleRowWrite, columns: [], columnTypes: [] };
+    return {
+      readonly: false,
+      singleRowWrite,
+      rows: (r) => {
+        const out: SqlValue[][] = [];
+        c.exec(r, out);
+        return out;
+      },
+      columns: c.returning.columns,
+      columnTypes: c.returning.types,
+    };
   }
 
   /** Open SQL savepoints, oldest first, with their pager depth. */
@@ -823,32 +849,75 @@ export class Database implements FunctionContext {
 
   /** Compile scope where the table's columns read registers `regs[i]` and the rowid `rowidReg`. */
   private rowScope(table: TableSchema, alias: string | undefined, base: number, rowidReg: number, planner: Planner): CompileScope {
+    return this.rowsScope([{ table, names: [alias ?? table.name, table.name], base, rowidReg }], planner);
+  }
+
+  /**
+   * Scope over one or more single-row sources held in registers (the target row of a write,
+   * `excluded` in upserts). Unqualified names resolve to the first source that has the column.
+   */
+  private rowsScope(sources: { table: TableSchema; names: string[]; base: number; rowidReg: number }[], planner: Planner): CompileScope {
     const outer = planner.compileScope(planner.newScope());
-    const qualifier = (alias ?? table.name).toLowerCase();
+    const bind = (src: (typeof sources)[number], name: string): ReturnType<CompileScope['resolveColumn']> | null => {
+      const i = findColumn(src.table, name);
+      if (i >= 0) {
+        const c = src.table.columns[i];
+        const type: StaticType = c.rowidAlias ? 'int' : c.type === 'INTEGER' ? 'int' : c.type === 'REAL' ? 'real' : c.type === 'TEXT' ? 'text' : c.type === 'BLOB' ? 'blob' : 'any';
+        const aff = c.type === 'ANY' || c.type === 'BLOB' ? 'BLOB' : c.type;
+        return { reg: src.base + i, type, collation: c.collation, affinity: aff as 'INTEGER' };
+      }
+      if (['rowid', 'oid', '_rowid_'].includes(name.toLowerCase())) return { reg: src.rowidReg, type: 'int', collation: 0, affinity: 'INTEGER' };
+      return null;
+    };
     return {
       ...outer,
       resolveColumn: (e) => {
-        if (e.table && e.table.toLowerCase() !== qualifier && e.table.toLowerCase() !== table.name.toLowerCase()) {
-          throw new SmaltError('SMALT_ERROR', `no such column: ${e.table}.${e.name}`);
+        if (e.table) {
+          const q = e.table.toLowerCase();
+          const src = sources.find((x) => x.names.some((n) => n.toLowerCase() === q));
+          if (!src) throw new SmaltError('SMALT_ERROR', `no such column: ${e.table}.${e.name}`);
+          const b = bind(src, e.name);
+          if (!b) throw new SmaltError('SMALT_ERROR', `no such column: ${e.table}.${e.name}`);
+          return b;
         }
-        const i = findColumn(table, e.name);
-        if (i >= 0) {
-          const c = table.columns[i];
-          const type: StaticType = c.rowidAlias ? 'int' : c.type === 'INTEGER' ? 'int' : c.type === 'REAL' ? 'real' : c.type === 'TEXT' ? 'text' : c.type === 'BLOB' ? 'blob' : 'any';
-          const aff = c.type === 'ANY' || c.type === 'BLOB' ? 'BLOB' : c.type;
-          return { reg: base + i, type, collation: c.collation, affinity: aff as 'INTEGER' };
+        for (const src of sources) {
+          const b = bind(src, e.name);
+          if (b) return b;
         }
-        if (['rowid', 'oid', '_rowid_'].includes(e.name.toLowerCase())) return { reg: rowidReg, type: 'int', collation: 0, affinity: 'INTEGER' };
         throw new SmaltError('SMALT_ERROR', `no such column: ${e.name}`);
       },
     };
   }
 
-  /**
-   * Coerce, NOT NULL- and CHECK-validate a full row; `real[i]` marks semantically REAL values.
-   * Returns false when the row must be skipped (OR IGNORE). Under OR REPLACE a NOT NULL violation
-   * takes the column default, if there is one (SQLite semantics).
-   */
+  /** RETURNING list: result names/types and one function per output column. */
+  private compileReturning(list: ResultColumn[], table: TableSchema, alias: string | undefined, scope: CompileScope, sqlText: string): { columns: string[]; types: StaticType[]; fns: Fn[] } {
+    const columns: string[] = [];
+    const types: StaticType[] = [];
+    const fns: Fn[] = [];
+    const q = alias ?? table.name;
+    for (const rc of list) {
+      if (rc.kind === 'star' || rc.kind === 'tableStar') {
+        if (rc.kind === 'tableStar' && rc.table.toLowerCase() !== q.toLowerCase() && rc.table.toLowerCase() !== table.name.toLowerCase()) {
+          throw new SmaltError('SMALT_ERROR', `no such table: ${rc.table}`);
+        }
+        for (const c of table.columns) {
+          const b = scope.resolveColumn({ kind: 'column', table: q, name: c.name, pos: 0, end: 0 });
+          columns.push(c.name);
+          types.push(b.type);
+          fns.push((r) => r[b.reg]);
+        }
+        continue;
+      }
+      const agg = aggregateCallName(rc.expr);
+      if (agg) throw new SmaltError('SMALT_ERROR', `misuse of aggregate function ${agg}()`);
+      const c = compileExpr(rc.expr, scope);
+      columns.push(rc.alias ?? (rc.expr.kind === 'column' ? rc.expr.name : sqlText.slice(rc.expr.pos, rc.expr.end)));
+      types.push(c.type);
+      fns.push(c.fn);
+    }
+    return { columns, types, fns };
+  }
+
   private validateRow(
     table: TableSchema,
     row: SqlValue[],
@@ -884,7 +953,9 @@ export class Database implements FunctionContext {
   }
 
   private compileChecks(table: TableSchema, scope: CompileScope, sql: string): { fn: Fn; name: string }[] {
-    return table.checks.map((c) => ({ fn: compileExpr(c.expr, scope).fn, name: c.name ?? sql.slice(c.expr.pos, c.expr.end) }));
+    // Unnamed checks are reported by their text, which lives in the table's SQL (not the statement's).
+    void sql;
+    return table.checks.map((c) => ({ fn: compileExpr(c.expr, scope).fn, name: c.name ?? table.sql.slice(c.expr.pos, c.expr.end) }));
   }
 
   /** Normalize a rowid value (INTEGER PRIMARY KEY must hold an integer). */
@@ -898,9 +969,7 @@ export class Database implements FunctionContext {
     throw new SmaltError('SMALT_MISMATCH', 'datatype mismatch');
   }
 
-  private compileInsert(stmt: InsertStmt, planner: Planner): (r: SqlValue[]) => RunResult {
-    if (stmt.upsert.length) throw new SmaltError('SMALT_UNSUPPORTED', 'ON CONFLICT (upsert) clauses are not supported yet');
-    if (stmt.returning) throw new SmaltError('SMALT_UNSUPPORTED', 'RETURNING is not supported yet');
+  private compileInsert(stmt: InsertStmt, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
     if (stmt.with) throw new SmaltError('SMALT_UNSUPPORTED', 'WITH ... INSERT is not supported yet');
     const table = this.targetTable(stmt.table, stmt.schema);
     const ncols = table.columns.length;
@@ -920,7 +989,10 @@ export class Database implements FunctionContext {
     const defaultReal = table.columns.map((c) => (c.defaultExpr ? compileExpr(c.defaultExpr, emptyScope).type === 'real' : false));
     const base = planner.regs.alloc(ncols);
     const rowidReg = planner.regs.alloc();
-    const checks = this.compileChecks(table, this.rowScope(table, undefined, base, rowidReg, planner), planner.sqlText);
+    const rowScope = this.rowScope(table, stmt.alias, base, rowidReg, planner);
+    const checks = this.compileChecks(table, rowScope, planner.sqlText);
+    const ret = stmt.returning ? this.compileReturning(stmt.returning, table, stmt.alias, rowScope, planner.sqlText) : undefined;
+    const upserts = this.compileUpserts(stmt, table, base, rowidReg, planner);
 
     // Row source: each produces values for `targets`.
     let rowsFn: (r: SqlValue[], emit: (vals: SqlValue[], real: boolean[]) => void) => void;
@@ -962,7 +1034,13 @@ export class Database implements FunctionContext {
     }
 
     let writer: TableWriter | null = null;
-    return (r) => {
+    const emitReturning = (r: SqlValue[], out: SqlValue[][] | undefined, row: SqlValue[], rowid: number | bigint): void => {
+      if (!ret || !out) return;
+      for (let i = 0; i < ncols; i++) r[base + i] = row[i];
+      r[rowidReg] = rowid;
+      out.push(ret.fns.map((f) => f(r)));
+    };
+    const exec = (r: SqlValue[], out?: SqlValue[][]): RunResult => {
       writer ??= new TableWriter(table, this.pager, (root) => this.tree(root));
       writer.resetStatement();
       const w = writer;
@@ -996,22 +1074,146 @@ export class Database implements FunctionContext {
         if (table.rowidAlias >= 0) row[table.rowidAlias] = rowid;
         r[rowidReg] = rowid;
         if (!this.validateRow(table, row, real, checks, r, base, mode, defaults)) return;
+        if (upserts.length) {
+          const done = this.applyUpsert(upserts, w, table, row, rowid, r, base, rowidReg, checks, defaults);
+          if (done !== undefined) {
+            if (done) {
+              changes++;
+              emitReturning(r, out, done.row, done.rowid);
+            }
+            return;
+          }
+        }
         if (!w.resolveConflicts(row, rowid, null, mode)) return;
         w.writeRow(row, rowid);
         changes++;
         last = rowid;
+        emitReturning(r, out, row, rowid);
       });
       this.lastRowid = last;
       this.lastChanges = changes;
       this.total += changes;
       return { changes, lastInsertRowid: last };
     };
+    return { exec, returning: ret && { columns: ret.columns, types: ret.types } };
+  }
+
+  /** Compiled ON CONFLICT clauses: which constraint each targets and what it does. */
+  private compileUpserts(stmt: InsertStmt, table: TableSchema, base: number, rowidReg: number, planner: Planner): Upsert[] {
+    if (!stmt.upsert.length) return [];
+    const out: Upsert[] = [];
+    stmt.upsert.forEach((u, n) => {
+      let target: number | null = null;
+      if (u.target) {
+        if (u.target.where) throw new SmaltError('SMALT_UNSUPPORTED', 'ON CONFLICT targets with WHERE (partial indexes) are not supported yet');
+        const cols = u.target.columns.map((ic) => {
+          if (ic.expr.kind !== 'column' && !(ic.expr.kind === 'collate' && ic.expr.expr.kind === 'column')) throw new SmaltError('SMALT_ERROR', 'ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint');
+          const name = ic.expr.kind === 'column' ? ic.expr.name : (ic.expr.expr as ColumnExpr).name;
+          const i = findColumn(table, name);
+          if (i < 0) throw new SmaltError('SMALT_ERROR', `no such column: ${name}`);
+          return i;
+        });
+        const set = new Set(cols);
+        if (cols.length === 1 && cols[0] === table.rowidAlias) target = -1;
+        else {
+          const i = table.indexes.findIndex((idx) => idx.unique && idx.columns.length === set.size && idx.columns.every((c) => set.has(c.column)));
+          if (i < 0) throw new SmaltError('SMALT_ERROR', 'ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint');
+          target = i;
+        }
+      } else if (n !== stmt.upsert.length - 1) {
+        throw new SmaltError('SMALT_ERROR', 'a target-less ON CONFLICT clause must be the last one');
+      }
+      if (u.action.kind === 'nothing') {
+        out.push({ target, update: null });
+        return;
+      }
+      if (!u.target) throw new SmaltError('SMALT_ERROR', 'ON CONFLICT DO UPDATE requires a conflict target');
+      // DO UPDATE sees the existing row (table name/alias, unqualified) and `excluded.*` (the proposed row).
+      const ncols = table.columns.length;
+      const oldBase = planner.regs.alloc(ncols);
+      const oldRowid = planner.regs.alloc();
+      const scope = this.rowsScope(
+        [
+          { table, names: [stmt.alias ?? table.name, table.name], base: oldBase, rowidReg: oldRowid },
+          { table, names: ['excluded'], base, rowidReg },
+        ],
+        planner,
+      );
+      const sets: { col: number; c: Compiled }[] = [];
+      for (const sc of u.action.set) {
+        if (sc.columns.length !== 1) throw new SmaltError('SMALT_UNSUPPORTED', 'row-value assignments are not supported yet');
+        const col = findColumn(table, sc.columns[0]);
+        if (col < 0) throw new SmaltError('SMALT_ERROR', `no such column: ${sc.columns[0]}`);
+        sets.push({ col, c: compileExpr(sc.value, scope) });
+      }
+      const where = u.action.where ? compileExpr(u.action.where, scope).fn : null;
+      out.push({ target, update: { sets, where, oldBase, oldRowid } });
+    });
+    return out;
+  }
+
+  /**
+   * Apply the first ON CONFLICT clause whose constraint the proposed row violates. Returns
+   * undefined when no clause applies (insert normally), null when the row was skipped (DO NOTHING
+   * or a false DO UPDATE ... WHERE), or the updated row.
+   */
+  private applyUpsert(
+    upserts: Upsert[],
+    w: TableWriter,
+    table: TableSchema,
+    row: SqlValue[],
+    rowid: number | bigint,
+    r: SqlValue[],
+    base: number,
+    rowidReg: number,
+    checks: { fn: Fn; name: string }[],
+    defaults: (Fn | null)[],
+  ): { row: SqlValue[]; rowid: number | bigint } | null | undefined {
+    for (const u of upserts) {
+      let other: number | bigint | null;
+      if (u.target === null) other = w.firstConflict(row, rowid, null)?.rowid ?? null;
+      else other = w.conflictOn(u.target, row, rowid, null);
+      if (other === null) continue;
+      if (!u.update) return null;
+      const ncols = table.columns.length;
+      const old = w.readRow(other)!;
+      const { sets, where, oldBase, oldRowid } = u.update;
+      for (let i = 0; i < ncols; i++) {
+        r[oldBase + i] = old[i];
+        r[base + i] = row[i];
+      }
+      r[oldRowid] = other;
+      r[rowidReg] = rowid;
+      if (where && !truthy(where(r))) return null;
+      const next = old.slice();
+      const real: boolean[] = new Array(ncols).fill(false);
+      for (const sc of sets) {
+        next[sc.col] = sc.c.fn(r);
+        real[sc.col] = sc.c.type === 'real';
+      }
+      let newRowid: number | bigint = other;
+      if (table.rowidAlias >= 0) {
+        if (next[table.rowidAlias] === null) throw new ConstraintError('SMALT_CONSTRAINT_NOTNULL', `NOT NULL constraint failed: ${table.name}.${table.columns[table.rowidAlias].name}`);
+        newRowid = this.toRowid(next[table.rowidAlias], table);
+        next[table.rowidAlias] = newRowid;
+      }
+      r[rowidReg] = newRowid;
+      this.validateRow(table, next, real, checks, r, base, 'ABORT', defaults);
+      w.resolveConflicts(next, newRowid, other, 'ABORT');
+      w.deleteRow(other, old);
+      w.writeRow(next, newRowid);
+      return { row: next, rowid: newRowid };
+    }
+    return undefined;
   }
 
   /** Plan a scan of `table` filtered by `where`, decoding every column and the rowid. */
-  private planTarget(table: TableSchema, alias: string | undefined, where: Expr | undefined, planner: Planner): { root: Operator; colRegs: number[]; rowidReg: number; scope: CompileScope } {
+  private planTarget(table: TableSchema, alias: string | undefined, where: Expr | undefined, planner: Planner, from?: FromItem): { root: Operator; colRegs: number[]; rowidReg: number; scope: CompileScope } {
     const scope = planner.newScope();
-    const root = planner.planFrom({ kind: 'table', name: table.name, alias, pos: 0, end: 0 }, where, scope);
+    const target: FromItem = { kind: 'table', schema: 'main', name: table.name, alias, pos: 0, end: 0 };
+    // UPDATE ... FROM: the target joined with the FROM sources (the WHERE holds the join conditions).
+    const item: FromItem = from ? { kind: 'join', joinType: 'INNER', natural: false, left: target, right: from, pos: 0, end: 0 } : target;
+    const root = planner.planFrom(item, where, scope);
     const cs = planner.compileScope(scope);
     const q = alias ?? table.name;
     const colRegs = table.columns.map((c) => {
@@ -1022,13 +1224,11 @@ export class Database implements FunctionContext {
     return { root, colRegs, rowidReg, scope: cs };
   }
 
-  private compileUpdate(stmt: UpdateStmt, planner: Planner): (r: SqlValue[]) => RunResult {
-    if (stmt.from) throw new SmaltError('SMALT_UNSUPPORTED', 'UPDATE ... FROM is not supported yet');
-    if (stmt.returning) throw new SmaltError('SMALT_UNSUPPORTED', 'RETURNING is not supported yet');
+  private compileUpdate(stmt: UpdateStmt, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
     if (stmt.orderBy.length || stmt.limit) throw new SmaltError('SMALT_UNSUPPORTED', 'UPDATE ... ORDER BY/LIMIT is not supported');
     if (stmt.with) throw new SmaltError('SMALT_UNSUPPORTED', 'WITH ... UPDATE is not supported yet');
     const table = this.targetTable(stmt.table, stmt.schema);
-    const { root, colRegs, rowidReg, scope } = this.planTarget(table, stmt.alias, stmt.where, planner);
+    const { root, colRegs, rowidReg, scope } = this.planTarget(table, stmt.alias, stmt.where, planner, stmt.from);
     const sets: { col: number; c: Compiled }[] = [];
     for (const s of stmt.set) {
       if (s.columns.length !== 1) throw new SmaltError('SMALT_UNSUPPORTED', 'row-value assignments are not supported yet');
@@ -1046,15 +1246,27 @@ export class Database implements FunctionContext {
     const defaults: (Fn | null)[] = table.columns.map((c) => (c.defaultExpr ? compileExpr(c.defaultExpr, emptyScope).fn : null));
     const base = planner.regs.alloc(ncols);
     const checkRowid = planner.regs.alloc();
-    const checks = this.compileChecks(table, this.rowScope(table, stmt.alias, base, checkRowid, planner), planner.sqlText);
+    const newRowScope = this.rowScope(table, stmt.alias, base, checkRowid, planner);
+    const checks = this.compileChecks(table, newRowScope, planner.sqlText);
+    const ret = stmt.returning ? this.compileReturning(stmt.returning, table, stmt.alias, newRowScope, planner.sqlText) : undefined;
+    const withFrom = stmt.from !== undefined;
 
-    return (r) => {
+    const exec = (r: SqlValue[], out?: SqlValue[][]): RunResult => {
       // Two passes, like SQLite: collect target rowids first (Halloween-safe), then update them in
-      // ascending rowid order, computing new values from each row's *current* contents.
+      // ascending rowid order, computing new values from each row's *current* contents. With FROM,
+      // values are computed during the join (from the first matching FROM row, as SQLite does).
       const rowids: (number | bigint)[] = [];
+      const fromValues = new Map<number | bigint, SqlValue[]>();
       root.open(r);
       try {
-        while (root.next()) rowids.push(r[rowidReg] as number | bigint);
+        while (root.next()) {
+          const id = r[rowidReg] as number | bigint;
+          if (withFrom) {
+            if (fromValues.has(id)) continue;
+            fromValues.set(id, sets.map((s) => s.c.fn(r)));
+          }
+          rowids.push(id);
+        }
       } finally {
         root.close();
       }
@@ -1069,15 +1281,16 @@ export class Database implements FunctionContext {
         const next = old.slice();
         const real: boolean[] = new Array(ncols).fill(false);
         let newRowidV: SqlValue = rowid;
-        for (const s of sets) {
-          const v = s.c.fn(r);
+        const pre = withFrom ? fromValues.get(rowid)! : null;
+        sets.forEach((s, k) => {
+          const v = pre ? pre[k] : s.c.fn(r);
           if (s.col === -2) newRowidV = v;
           else {
             next[s.col] = v;
             real[s.col] = s.c.type === 'real';
             if (s.col === table.rowidAlias) newRowidV = v;
           }
-        }
+        });
         if (newRowidV === null) {
           if (table.rowidAlias >= 0) throw new ConstraintError('SMALT_CONSTRAINT_NOTNULL', `NOT NULL constraint failed: ${table.name}.${table.columns[table.rowidAlias].name}`);
           throw new SmaltError('SMALT_MISMATCH', 'datatype mismatch');
@@ -1090,28 +1303,39 @@ export class Database implements FunctionContext {
         writer.deleteRow(rowid, old);
         writer.writeRow(next, newRowid);
         changes++;
+        if (ret && out) {
+          for (let i = 0; i < ncols; i++) r[base + i] = next[i];
+          r[checkRowid] = newRowid;
+          out.push(ret.fns.map((f) => f(r)));
+        }
       }
       this.lastChanges = changes;
       this.total += changes;
       return { changes, lastInsertRowid: this.lastRowid };
     };
+    return { exec, returning: ret && { columns: ret.columns, types: ret.types } };
   }
 
-  private compileDelete(stmt: DeleteStmt, planner: Planner): (r: SqlValue[]) => RunResult {
-    if (stmt.returning) throw new SmaltError('SMALT_UNSUPPORTED', 'RETURNING is not supported yet');
+  private compileDelete(stmt: DeleteStmt, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
     if (stmt.orderBy.length || stmt.limit) throw new SmaltError('SMALT_UNSUPPORTED', 'DELETE ... ORDER BY/LIMIT is not supported');
     if (stmt.with) throw new SmaltError('SMALT_UNSUPPORTED', 'WITH ... DELETE is not supported yet');
     const table = this.targetTable(stmt.table, stmt.schema);
-    if (!stmt.where) {
-      return () => {
-        const n = new TableWriter(table, this.pager, (root) => this.tree(root)).truncate();
-        this.lastChanges = n;
-        this.total += n;
-        return { changes: n, lastInsertRowid: this.lastRowid };
+    if (!stmt.where && !stmt.returning) {
+      return {
+        exec: () => {
+          const n = new TableWriter(table, this.pager, (root) => this.tree(root)).truncate();
+          this.lastChanges = n;
+          this.total += n;
+          return { changes: n, lastInsertRowid: this.lastRowid };
+        },
       };
     }
     const { root, colRegs, rowidReg } = this.planTarget(table, stmt.alias, stmt.where, planner);
-    return (r) => {
+    const ncols = table.columns.length;
+    const oldBase = planner.regs.alloc(ncols);
+    const oldRowid = planner.regs.alloc();
+    const ret = stmt.returning ? this.compileReturning(stmt.returning, table, stmt.alias, this.rowScope(table, stmt.alias, oldBase, oldRowid, planner), planner.sqlText) : undefined;
+    const exec = (r: SqlValue[], out?: SqlValue[][]): RunResult => {
       const pending: { rowid: number | bigint; row: SqlValue[] }[] = [];
       root.open(r);
       try {
@@ -1121,11 +1345,20 @@ export class Database implements FunctionContext {
       }
       const writer = new TableWriter(table, this.pager, (root) => this.tree(root));
       let changes = 0;
-      for (const p of pending) if (writer.deleteRow(p.rowid, p.row)) changes++;
+      for (const p of pending) {
+        if (!writer.deleteRow(p.rowid, p.row)) continue;
+        changes++;
+        if (ret && out) {
+          for (let i = 0; i < ncols; i++) r[oldBase + i] = p.row[i];
+          r[oldRowid] = p.rowid;
+          out.push(ret.fns.map((f) => f(r)));
+        }
+      }
       this.lastChanges = changes;
       this.total += changes;
       return { changes, lastInsertRowid: this.lastRowid };
     };
+    return { exec, returning: ret && { columns: ret.columns, types: ret.types } };
   }
 
   // ---------------------------------------------------------------- PRAGMA
@@ -1511,5 +1744,24 @@ export class RowCursor {
       this.db.activeCursors.delete(this);
     }
   }
+}
+
+/** Name of an aggregate function called by `e` (outside nested SELECTs), if any. */
+function aggregateCallName(e: Expr): string | undefined {
+  let hit: string | undefined;
+  const go = (x: unknown): void => {
+    if (hit || x === null || typeof x !== 'object') return;
+    if (Array.isArray(x)) return x.forEach(go);
+    if (Object.getPrototypeOf(x) !== Object.prototype) return;
+    const o = x as Record<string, unknown>;
+    if (o.kind === 'select' && 'core' in o) return;
+    if (o.kind === 'call' && aggregateFunctions.has(String(o.name)) && o.over === undefined && !((o.name === 'min' || o.name === 'max') && (o.args as unknown[]).length > 1)) {
+      hit = String(o.name);
+      return;
+    }
+    for (const k of Object.keys(o)) go(o[k]);
+  };
+  go(e);
+  return hit;
 }
 
