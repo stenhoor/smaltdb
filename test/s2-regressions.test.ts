@@ -226,6 +226,18 @@ async function server() {
   return { db, srv, readers, send, settle, of, kinds, rows };
 }
 
+/**
+ * Wait until `done()` holds (polling): server responses arrive after reader callbacks and
+ * scheduling ticks, whose timing varies with machine load (fixed sleeps flaked on CI).
+ */
+async function until(what: string, done: () => boolean, ms = 8000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!done()) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
 const AGG = 'SELECT g, count(*), sum(x) FROM t GROUP BY g ORDER BY g';
 
 describe('S2-6: server morsel scheduling', () => {
@@ -233,7 +245,7 @@ describe('S2-6: server morsel scheduling', () => {
     const s = await server();
     const q = s.send('local', { op: 'query', sql: AGG });
     const w = s.send('local', { op: 'exec', sql: 'INSERT INTO t VALUES (999999, 1, 1.0)' });
-    await s.settle();
+    await until('the query and the write', () => s.kinds('local', q).includes('done') && s.kinds('local', w).length > 0);
     expect(s.srv.morselQueries).toBe(1);
     expect(s.rows('local', q).length).toBe(10);
     expect(s.kinds('local', w)).toEqual(['ok']);
@@ -247,14 +259,18 @@ describe('S2-6: server morsel scheduling', () => {
       const q = s.send('local', { op: 'query', sql: AGG, credit: 1, batchSize: 2 });
       const b = s.send('tab-b', { op: 'exec', sql: 'BEGIN' });
       const ins = s.send('tab-b', { op: 'exec', sql: 'INSERT INTO t VALUES (999999, 1, 1.0)' });
-      await s.settle();
+      await until("tab-b's INSERT (a deadlock never answers it)", () => s.kinds('tab-b', ins).length > 0);
       expect(s.kinds('tab-b', b)).toEqual(['ok']);
       expect(s.kinds('tab-b', ins)).toEqual(['ok']); // not stuck behind the morsel query
       const c = s.send('tab-b', { op: 'exec', sql: 'COMMIT' });
-      await s.settle();
+      await until('COMMIT', () => s.kinds('tab-b', c).length > 0);
       expect(s.kinds('tab-b', c)).toEqual(['ok']);
-      s.srv.receive('local', { id: 0, op: 'credit', target: q, n: 100 } as Request);
-      await s.settle();
+      // The query may still be on its first batch or not started (fallback): grant credit until done.
+      await until('the query to finish', () => {
+        s.srv.receive('local', { id: 0, op: 'credit', target: q, n: 100 } as Request);
+        const k = s.kinds('local', q).at(-1);
+        return k === 'done' || k === 'error';
+      });
       expect(s.kinds('local', q).at(-1)).toBe('done');
       expect(s.rows('local', q).length).toBe(10);
     });
@@ -264,7 +280,7 @@ describe('S2-6: server morsel scheduling', () => {
     const s = await server();
     const q = s.send('local', { op: 'query', sql: AGG });
     const c = s.send('local', { op: 'close' });
-    await s.settle();
+    await until('close and the query', () => s.kinds('local', c).length > 0 && s.kinds('local', q).length > 0);
     expect(s.kinds('local', c)).toEqual(['ok']);
     expect(s.kinds('local', q)).toEqual(['error']);
   });

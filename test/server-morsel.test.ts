@@ -73,20 +73,34 @@ async function setup() {
   return { db, server, readers, send, settle, of, rows };
 }
 
+/**
+ * Wait until `done()` holds (polling): server responses arrive after reader callbacks and
+ * scheduling ticks, whose timing varies with machine load (fixed sleeps flaked on CI).
+ */
+async function until(what: string, done: () => boolean, ms = 8000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!done()) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
 const SQL = 'SELECT g, count(*), sum(x), avg(x) FROM t GROUP BY g ORDER BY g';
+
+const ended = (t: { of: (s: string, id: number) => { kind: string }[] }, session: string, id: number) => t.of(session, id).some((m) => m.kind === 'done' || m.kind === 'error' || m.kind === 'ok');
 
 describe('morsel parallelism in the server', () => {
   it('splits a large aggregate across idle readers and merges it', async () => {
     const t = await setup();
     const want = t.db.query(SQL).rows;
     const q = t.send('local', { op: 'query', sql: SQL });
-    await t.settle();
+    await until('the morsel query', () => ended(t, 'local', q));
     expect(t.rows('local', q)).toEqual(want);
     expect(t.server.morselQueries).toBe(1);
     expect(t.readers.ran).toBe(3);
     // Small or unsuitable queries run on the owner.
     const s = t.send('local', { op: 'query', sql: 'SELECT count(DISTINCT g) FROM t' });
-    await t.settle();
+    await until('the owner query', () => ended(t, 'local', s));
     expect(t.rows('local', s)).toEqual([[10]]);
     expect(t.server.morselQueries).toBe(1);
   });
@@ -95,7 +109,7 @@ describe('morsel parallelism in the server', () => {
     const t = await setup();
     const q = t.send('local', { op: 'query', sql: 'SELECT count(*), sum(g) FROM t' });
     const w = t.send('tab-b', { op: 'exec', sql: 'UPDATE t SET g = g + 1' });
-    await t.settle();
+    await until('the query and the write', () => ended(t, 'local', q) && ended(t, 'tab-b', w));
     expect(t.rows('local', q)).toEqual([[250000, 1125000]]);
     expect(t.of('tab-b', w).some((m) => m.kind === 'ok')).toBe(true);
     expect(t.db.query('SELECT sum(g) FROM t').rows).toEqual([[1375000]]);
@@ -105,12 +119,13 @@ describe('morsel parallelism in the server', () => {
     const t = await setup();
     t.readers.failNext = true;
     const q = t.send('local', { op: 'query', sql: SQL });
-    await t.settle();
+    await until('the fallback query', () => ended(t, 'local', q));
     expect(t.rows('local', q)).toEqual(t.db.query(SQL).rows);
     expect(t.server.morselQueries).toBe(0);
     const c = t.send('local', { op: 'query', sql: SQL });
     t.server.receive('local', { id: 0, op: 'cancel', target: c });
-    await t.settle();
+    await until('the cancelled query', () => ended(t, 'local', c));
+    await new Promise((r) => setTimeout(r, 50)); // its late partials must not answer it again
     expect(t.of('local', c).map((m) => m.kind)).toEqual(['error']);
   });
 });
