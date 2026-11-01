@@ -568,7 +568,11 @@ export class BTree {
     const n = nCells(leaf);
     for (let k = 0; k < n; k++) cells.push(this.copyCell(leaf, k, true));
     cells.splice(i, 0, cell);
-    const m = splitPoint(cells);
+    // Append to the rightmost leaf (sequential inserts, e.g. auto-increment rowids): keep the full
+    // page full and start a new page with just the new cell. A 50/50 split would leave every page
+    // half empty, doubling table size and scan cost.
+    const appending = i === n && rightPtr(leaf) === 0 && n > 0;
+    const m = appending ? n : splitPoint(cells);
     const lastLeft = cells[m - 1];
     const firstRight = cells[m];
     const sep = shortestSeparator(

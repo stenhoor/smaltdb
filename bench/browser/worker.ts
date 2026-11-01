@@ -64,8 +64,14 @@ self.onmessage = async (e: MessageEvent<{ engine: string; rows: number; lookups:
     await a.reopen();
     await timed(results, 'scan read values (cold)', N, () => a.scanValues());
     await timed(results, `load analytic table (${analyticRows} rows)`, analyticRows, () => a.loadAnalytic(analyticRows));
+    // Report both the first execution (includes JIT warm-up of generated code) and the steady state
+    // (median of 5 repeats, e.g. a refreshed dashboard). WebAssembly engines warm up differently.
     for (const [name, sql] of Object.entries(ANALYTIC_QUERIES)) {
-      await timed(results, `analytic: ${name}`, analyticRows, () => a.query(sql));
+      await timed(results, `analytic: ${name} (first run)`, analyticRows, () => a.query(sql));
+      const reps: WorkloadResult[] = [];
+      for (let i = 0; i < 5; i++) await timed(reps, 'x', analyticRows, () => a.query(sql));
+      const sorted = reps.map((x) => x.ms).sort((x, y) => x - y);
+      results.push({ workload: `analytic: ${name} (repeat, median of 5)`, ops: analyticRows, ms: sorted[2], check: reps[0].check });
     }
     await a.close();
     postMessage({ ok: true, engine: a.name, config: a.config, atomicCommits: a.atomicCommits, openMs, results, version: (a as { libVersion?: string }).libVersion });
