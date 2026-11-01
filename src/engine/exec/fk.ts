@@ -53,6 +53,7 @@ export class ForeignKeys {
   sync(schemaVersion: number): void {
     if (schemaVersion === this.version) return;
     this.version = schemaVersion;
+    this.involvedCache = new WeakMap();
     this.childLinks = new Map();
     this.parentLinks = new Map();
     for (const child of this.host.allTables()) {
@@ -70,12 +71,18 @@ export class ForeignKeys {
     for (const list of this.parentLinks.values()) list.reverse();
   }
 
-  /** Whether writes to `t` need foreign-key processing. */
+  /** Whether writes to `t` need foreign-key processing (cached per table; called for every written row). */
   involved(t: TableSchema): boolean {
     if (!this.enabled) return false;
-    const k = t.name.toLowerCase();
-    return this.childLinks.has(k) || this.parentLinks.has(k);
+    let v = this.involvedCache.get(t);
+    if (v === undefined) {
+      const k = t.name.toLowerCase();
+      v = this.childLinks.has(k) || this.parentLinks.has(k);
+      this.involvedCache.set(t, v);
+    }
+    return v;
   }
+  private involvedCache = new WeakMap<TableSchema, boolean>();
 
   /** Resolve a link's parent table and key columns (errors like SQLite when they do not match a key). */
   private resolve(l: Link): Link {

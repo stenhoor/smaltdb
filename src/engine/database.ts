@@ -834,6 +834,7 @@ export class Database implements FunctionContext {
     const itree = new BTree(this.pager, root);
     const reader = new RecordReader(table.layout, table.recordDefaults);
     const w = new TableWriter(table, this.pager, (r) => this.tree(r));
+    const enc = new KeyEncoder();
     const entries: Uint8Array[] = [];
     const c = tree.cursor();
     try {
@@ -842,9 +843,18 @@ export class Database implements FunctionContext {
         const rowid = readRowidKey(c.keyBytes, c.keyOffset);
         c.loadValue();
         reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
-        const row = table.columns.map((_, i) => (i === table.rowidAlias ? rowid : reader.column(i)));
-        const k = w.indexEntry(idx, row, rowid);
-        if (k) entries.push(k);
+        if (idx.eval) {
+          // Expression / partial index: evaluate over the whole row.
+          const row = table.columns.map((_, i) => (i === table.rowidAlias ? rowid : reader.column(i)));
+          const k = w.indexEntry(idx, row, rowid);
+          if (k) entries.push(k);
+          continue;
+        }
+        // Plain columns: decode only the indexed ones.
+        enc.reset();
+        for (const ic of idx.columns) enc.add(ic.column === table.rowidAlias ? rowid : reader.column(ic.column), ic);
+        enc.add(rowid);
+        entries.push(enc.finish());
       }
     } finally {
       c.close();
