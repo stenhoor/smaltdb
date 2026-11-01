@@ -7,7 +7,6 @@ import { type BindParams, Database, type RowCursor, type Statement } from './dat
 import { exportCSV, exportJSON, importCSV, importJSON } from './io/import-export.js';
 import { SmaltError } from './errors.js';
 import { detectCapabilities } from './vfs/capabilities.js';
-import { MemoryVfs } from './vfs/memory.js';
 import { OpfsVfs } from './vfs/opfs.js';
 import { type Request, type Response, encodeColumns } from '../shared/protocol.js';
 import type { SqlValue } from './values.js';
@@ -43,8 +42,8 @@ async function handle(req: Request): Promise<void> {
   switch (req.op) {
     case 'open': {
       if (db) throw new SmaltError('SMALT_MISUSE', 'database already open in this worker');
-      const vfs = req.storage === 'memory' ? new MemoryVfs() : new OpfsVfs();
-      db = await Database.open(vfs, `${req.name}.db`, { pageSize: req.pageSize, cacheSizeBytes: req.cacheSizeBytes, syncOnCommit: req.syncOnCommit });
+      const options = { pageSize: req.pageSize, cacheSizeBytes: req.cacheSizeBytes, syncOnCommit: req.syncOnCommit };
+      db = req.storage === 'memory' || req.name === ':memory:' ? Database.openMemory(options) : await Database.open(new OpfsVfs(), `${req.name}.db`, options);
       post({ id, kind: 'ok', capabilities: detectCapabilities() });
       return;
     }

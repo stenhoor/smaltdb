@@ -100,6 +100,10 @@ interface Savepoint {
  * (default), {@link commit} appends the changed pages to the log and flushes it, which makes the
  * commit atomic and durable; checkpoints copy pages back into the database file. Without a WAL
  * (`journalMode: 'off'`), pages are written in place: durable but not crash-atomic.
+ *
+ * In-memory databases ({@link Pager.openMemory}) have no backing file: frames are the database and
+ * are never evicted, pages carry no checksums, and commit only forgets the transaction's undo
+ * images. Rollback restores the images captured on each page's first modification.
  */
 
 export class Pager {
@@ -125,9 +129,15 @@ export class Pager {
   private readonly autoCheckpoint: number;
   private readonly extentPages: number;
   private extentBuf: Uint8Array | null = null;
+  /** In-memory database: no file, no eviction, no checksums. */
+  private readonly memory: boolean = false;
+  /** In memory: undo images for the open transaction (committed contents of modified pages). */
+  private txn: Savepoint | null = null;
+  /** In memory: frames returned by discard(), reused before new ones are created. */
+  private readonly spare: Frame[] = [];
 
   private constructor(
-    private readonly file: VfsFile,
+    private readonly file: VfsFile | null,
     private readonly wal: Wal | null,
     pageSize: number,
     reservedBytes: number,
@@ -145,6 +155,13 @@ export class Pager {
     this.extentPages = Math.max(1, Math.floor((options.readAheadBytes ?? 64 * 1024) / pageSize));
     const budget = options.cacheSizeBytes ?? 16 * 1024 * 1024;
     this.targetFrames = Math.max(16, Math.floor(budget / pageSize));
+    if (file === null) {
+      // In memory: frames are created as pages are, and never evicted.
+      this.memory = true;
+      this.targetFrames = Infinity;
+      this.txn = this.newLevel();
+      return;
+    }
     const arena = new Uint8Array(this.targetFrames * pageSize);
     for (let i = 0; i < this.targetFrames; i++) {
       this.frames.push(new Frame(i, arena.subarray(i * pageSize, (i + 1) * pageSize)));
@@ -193,6 +210,39 @@ export class Pager {
     pager.headerDirty = true;
     pager.commit();
     return pager;
+  }
+
+  /** A new, empty in-memory database. Its contents disappear when it is closed. */
+  static openMemory(options: PagerOptions = {}): Pager {
+    const pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
+    validatePageSize(pageSize);
+    const header = new Uint8Array(pageSize);
+    header.set(MAGIC, DH_MAGIC);
+    const v = new DataView(header.buffer);
+    v.setUint16(DH_FORMAT_MAJOR, FORMAT_MAJOR, true);
+    v.setUint16(DH_FORMAT_MINOR, FORMAT_MINOR, true);
+    v.setUint32(DH_PAGE_SIZE, pageSize, true);
+    v.setUint8(DH_RESERVED_BYTES, DEFAULT_RESERVED_BYTES);
+    v.setUint32(DH_PAGE_COUNT, 1, true);
+    const pager = new Pager(null, null, pageSize, DEFAULT_RESERVED_BYTES, header, options);
+    pager.headerDirty = true;
+    pager.commit();
+    return pager;
+  }
+
+  /** True for in-memory databases. */
+  get inMemory(): boolean {
+    return this.memory;
+  }
+
+  private newLevel(): Savepoint {
+    return { images: new Map(), fresh: new Set(), pageCount: this.pageCount, header: this.header.slice(0, DB_HEADER_SIZE) };
+  }
+
+  /** In memory: keep the committed contents of a page before its first change in the transaction. */
+  private captureTxn(f: Frame): void {
+    const t = this.txn!;
+    if (f.pgno < t.pageCount && !t.images.has(f.pgno)) t.images.set(f.pgno, f.bytes.slice());
   }
 
   get walStats(): WalStats | null {
@@ -279,10 +329,15 @@ export class Pager {
     if (pgno <= 0 || pgno >= this.pageCount) throw new CorruptionError(`page ${pgno} out of range (pageCount=${this.pageCount})`);
     this.stats.misses++;
     const f = this.takeFrame(pgno);
+    if (this.file === null) {
+      // In memory, an uncached page was never written (e.g. a free page).
+      f.bytes.fill(0);
+      return f;
+    }
     let n: number;
     if (this.wal !== null && this.wal.read(pgno, f.bytes)) n = this.pageSize;
     else if (this.extentPages > 1) n = this.readExtent(pgno, f);
-    else n = this.file.read(f.bytes, pgno * this.pageSize);
+    else n = this.file!.read(f.bytes, pgno * this.pageSize);
     this.stats.reads++;
     if (n < this.pageSize) {
       f.bytes.fill(0, n);
@@ -304,7 +359,7 @@ export class Pager {
     const count = Math.min(e, this.pageCount - start);
     if (this.extentBuf === null) this.extentBuf = new Uint8Array(e * ps);
     const buf = this.extentBuf;
-    const got = this.file.read(buf.subarray(0, count * ps), start * ps);
+    const got = this.file!.read(buf.subarray(0, count * ps), start * ps);
     const off = (pgno - start) * ps;
     const n = Math.max(0, Math.min(ps, got - off));
     if (n > 0) f.bytes.set(buf.subarray(off, off + n));
@@ -331,6 +386,7 @@ export class Pager {
    * changed: inside a statement, the first call snapshots the page for {@link rollbackStatement}.
    */
   markDirty(f: Frame): void {
+    if (this.txn !== null && !f.dirty) this.captureTxn(f);
     const sp = this.top;
     if (sp !== undefined && f.pgno < sp.pageCount && !sp.images.has(f.pgno) && !sp.fresh.has(f.pgno)) {
       sp.images.set(f.pgno, f.bytes.slice());
@@ -500,7 +556,8 @@ export class Pager {
         // Contents of a freed page are irrelevant; drop any cached copy so it is never written.
         // Inside a statement, keep its image first so a statement rollback can resurrect it.
         if (cached !== undefined) {
-          if (cached.dirty) this.captureForStatement(cached);
+          // In memory the frame is the only copy, so keep it even when clean.
+          if (cached.dirty || this.memory) this.captureForStatement(cached);
           this.discard(cached);
         }
         return;
@@ -538,6 +595,15 @@ export class Pager {
     this.checkOpen();
     if (this.savepoints.length > 0) throw new MisuseError('commit with open savepoints');
     if (!this.inTransaction) return;
+    if (this.memory) {
+      for (const f of this.dirtyList) f.dirty = false;
+      this.dirtyList.length = 0;
+      this.hv.setUint32(DH_CHANGE_COUNTER, (this.changeCounter + 1) >>> 0, true);
+      this.committedHeader.set(this.header);
+      this.headerDirty = false;
+      this.txn = this.newLevel();
+      return;
+    }
     if (this.wal !== null) {
       this.commitToWal(this.wal);
       return;
@@ -572,7 +638,7 @@ export class Pager {
           this.sealPage(dirty[k].bytes);
           batch.set(dirty[k].bytes, (k - i) * ps);
         }
-        this.file.write(batch.subarray(0, (j - i) * ps), first.pgno * ps);
+        this.file!.write(batch.subarray(0, (j - i) * ps), first.pgno * ps);
         this.stats.writes += j - i;
       }
       for (let k = i; k < j; k++) dirty[k].dirty = false;
@@ -583,7 +649,7 @@ export class Pager {
     this.writePage(this.header, 0);
     this.committedHeader.set(this.header);
     this.headerDirty = false;
-    if (this.syncOnCommit) this.file.flush();
+    if (this.syncOnCommit) this.file!.flush();
     this.trimOverflowFrames();
   }
 
@@ -615,7 +681,7 @@ export class Pager {
     const wal = this.wal;
     if (wal === null || wal.isEmpty) return;
     if (this.inTransaction) throw new MisuseError('checkpoint inside a transaction');
-    wal.checkpoint(this.file, (pgno) => {
+    wal.checkpoint(this.file!, (pgno) => {
       if (pgno === 0) return this.header;
       const f = this.map.get(pgno);
       return f !== undefined && !f.dirty ? f.bytes : null;
@@ -628,6 +694,16 @@ export class Pager {
     this.savepoints.length = 0;
     for (const f of this.dirtyList) {
       if (f.dirty && f.pins > 0) throw new MisuseError(`rollback with pinned page ${f.pgno}`);
+    }
+    if (this.memory) {
+      // Restore committed images; pages created by the transaction disappear.
+      this.restoreLevel(this.txn!);
+      for (const f of this.dirtyList) f.dirty = false;
+      this.dirtyList.length = 0;
+      this.header.set(this.committedHeader);
+      this.headerDirty = false;
+      this.txn = this.newLevel();
+      return;
     }
     for (const f of this.dirtyList) if (f.dirty) this.discard(f);
     this.dirtyList.length = 0;
@@ -643,7 +719,7 @@ export class Pager {
       this.checkpoint();
       this.wal.close();
     }
-    this.file.close();
+    this.file?.close();
     this.closed = true;
   }
 
@@ -661,7 +737,7 @@ export class Pager {
 
   private writePage(bytes: Uint8Array, pgno: number): void {
     this.sealPage(bytes);
-    this.file.write(bytes, pgno * this.pageSize);
+    this.file!.write(bytes, pgno * this.pageSize);
     this.stats.writes++;
   }
 
@@ -676,6 +752,7 @@ export class Pager {
   }
 
   private captureForStatement(f: Frame): void {
+    if (this.txn !== null) this.captureTxn(f);
     const sp = this.top;
     if (sp !== undefined && f.pgno < sp.pageCount && !sp.images.has(f.pgno) && !sp.fresh.has(f.pgno)) {
       sp.images.set(f.pgno, f.bytes.slice());
@@ -684,6 +761,7 @@ export class Pager {
 
   /** Drop a frame's contents and return it to the free pool. Any dirty-list entry goes stale (see commit). */
   private discard(f: Frame): void {
+    if (this.memory && f.pgno !== -1) this.spare.push(f);
     this.map.delete(f.pgno);
     f.dirty = false;
     f.pgno = -1;
@@ -693,6 +771,7 @@ export class Pager {
 
   /** Release frames allocated beyond the budget once they are no longer pinned or dirty. */
   private trimOverflowFrames(): void {
+    if (this.memory) return;
     const frames = this.frames;
     while (frames.length > this.targetFrames) {
       const f = frames[frames.length - 1];
@@ -705,6 +784,19 @@ export class Pager {
 
   /** Get an unused frame bound to `pgno` (pinned once, not read). CLOCK replacement, no-steal. */
   private takeFrame(pgno: number): Frame {
+    if (this.memory) {
+      let f = this.spare.pop();
+      if (f === undefined) {
+        f = new Frame(this.frames.length, new Uint8Array(this.pageSize));
+        this.frames.push(f);
+      }
+      f.pgno = pgno;
+      f.pins = 1;
+      f.ref = true;
+      f.unverified = false;
+      this.map.set(pgno, f);
+      return f;
+    }
     const frames = this.frames;
     const n = frames.length;
     let victim: Frame | undefined;

@@ -138,8 +138,8 @@ export class Database implements FunctionContext {
   readonly activeCursors = new Set<RowCursor>();
   private closed = false;
 
-  private constructor(file: VfsFile, options: DatabaseOptions, walFile?: VfsFile) {
-    this.pager = Pager.open(file, options, walFile);
+  private constructor(file: VfsFile | null, options: DatabaseOptions, walFile?: VfsFile) {
+    this.pager = file === null ? Pager.openMemory(options) : Pager.open(file, options, walFile);
     this.cacheSize = options.statementCacheSize ?? 64;
     if (this.pager.catalogRoot === 0) {
       this.pager.catalogRoot = BTree.create(this.pager);
@@ -148,10 +148,20 @@ export class Database implements FunctionContext {
     this.loadSchema();
   }
 
+  /** `path` ':memory:' opens a new in-memory database (see {@link openMemory}). */
   static async open(vfs: Vfs, path: string, options: DatabaseOptions = {}): Promise<Database> {
+    if (path === ':memory:') return Database.openMemory(options);
     const file = await vfs.open(path);
     const wal = (options.journalMode ?? 'wal') === 'wal' ? await vfs.open(`${path}-wal`) : undefined;
     return new Database(file, options, wal);
+  }
+
+  /**
+   * A new in-memory database: no file, no write-ahead log, no page checksums. Transactions and
+   * statements still roll back; the data is gone when the database is closed.
+   */
+  static openMemory(options: DatabaseOptions = {}): Database {
+    return new Database(null, options);
   }
 
   /** Open from already-open files (pass `walFile` for WAL mode). */

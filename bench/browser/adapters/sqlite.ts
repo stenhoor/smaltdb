@@ -1,6 +1,6 @@
 import { ANALYTIC_DDL, type Adapter, analyticRow, importUrl, valueFor } from '../adapter.js';
 
-export type SqliteJournal = 'TRUNCATE' | 'WAL' | 'OFF';
+export type SqliteJournal = 'TRUNCATE' | 'WAL' | 'OFF' | 'MEMORY-DB';
 
 /**
  * Official SQLite WASM build with the opfs-sahpool VFS (its fastest OPFS option; no COOP/COEP needed),
@@ -12,12 +12,18 @@ export class SqliteAdapter implements Adapter {
   readonly atomicCommits: boolean;
   private db: any;
   private pool: any;
+  private sqlite3: any;
   private version = '';
 
+  readonly persistent: boolean;
+
   constructor(private readonly journal: SqliteJournal) {
-    this.name = `SQLite WASM (journal ${journal})`;
+    this.persistent = journal !== 'MEMORY-DB';
+    this.name = this.persistent ? `SQLite WASM (journal ${journal})` : 'SQLite WASM (:memory:)';
     this.atomicCommits = journal !== 'OFF';
-    this.config = `opfs-sahpool VFS, locking_mode=EXCLUSIVE, journal_mode=${journal}, synchronous=FULL, 64 MiB cache, prepared statements`;
+    this.config = this.persistent
+      ? `opfs-sahpool VFS, locking_mode=EXCLUSIVE, journal_mode=${journal}, synchronous=FULL, 64 MiB cache, prepared statements`
+      : ':memory: database (in-memory rollback journal), 64 MiB cache, prepared statements';
   }
 
   get libVersion(): string {
@@ -25,6 +31,11 @@ export class SqliteAdapter implements Adapter {
   }
 
   private openDb(): void {
+    if (!this.persistent) {
+      this.db = new this.sqlite3.oo1.DB(':memory:');
+      this.db.exec('PRAGMA cache_size=-65536;');
+      return;
+    }
     this.db = new this.pool.OpfsSAHPoolDb('/bench.db');
     this.db.exec(`PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=${this.journal}; PRAGMA synchronous=FULL; PRAGMA cache_size=-65536;`);
     const mode = String(this.db.selectValue('PRAGMA journal_mode')).toUpperCase();
@@ -35,7 +46,8 @@ export class SqliteAdapter implements Adapter {
     const mod = await importUrl('/nm/@sqlite.org/sqlite-wasm/dist/index.mjs');
     const sqlite3 = await mod.default({ print: () => {}, printErr: () => {} });
     this.version = sqlite3.version.libVersion;
-    this.pool = await sqlite3.installOpfsSAHPoolVfs({ name: 'bench-sahpool', directory: '/sqlite-bench', clearOnInit: true });
+    this.sqlite3 = sqlite3;
+    if (this.persistent) this.pool = await sqlite3.installOpfsSAHPoolVfs({ name: 'bench-sahpool', directory: '/sqlite-bench', clearOnInit: true });
     this.openDb();
     this.db.exec('CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)');
   }
@@ -126,6 +138,6 @@ export class SqliteAdapter implements Adapter {
 
   async close(): Promise<void> {
     this.db.close();
-    await this.pool.wipeFiles();
+    if (this.persistent) await this.pool.wipeFiles();
   }
 }

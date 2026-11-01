@@ -15,6 +15,12 @@
 The synchronous engine is also available directly (`smaltdb/engine`: `Database.open(vfs, path)`, `db.query/run/exec/prepare`),
 for use inside your own worker or in Node.
 
+**In-memory databases.** `open(name, { storage: 'memory' })` or `open(':memory:')` (engine:
+`Database.openMemory()` or `Database.open(vfs, ':memory:')`) creates a database that lives only in
+memory and is discarded when it is closed. It has no file, no write-ahead log and no page checksums.
+Transactions, savepoints and statement rollback work as usual: each page's contents before its
+first change in a transaction are kept in memory for rollback.
+
 *(planned)* `workers`, `multiTab`, streaming iteration (`stmt.stream`), `insertColumns`, `explain`, and import/export helpers.
 The draft below shows the long-term shape.
 

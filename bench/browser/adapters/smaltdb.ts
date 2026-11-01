@@ -4,18 +4,33 @@ import { ANALYTIC_DDL, type Adapter, analyticRow, valueFor } from '../adapter.js
 
 /** smaltdb through its SQL layer, hosted in the benchmark worker and called synchronously (like SQLite). */
 export class SmaltdbAdapter implements Adapter {
-  readonly name = 'smaltdb';
-  readonly config = 'OPFS sync handles, WAL (auto-checkpoint 4 MiB), 8 KiB pages, 64 MiB cache, flush per commit, prepared statements';
+  readonly name: string;
+  readonly config: string;
   readonly atomicCommits = true;
+
+  /** `memory`: an in-memory database (no OPFS, no WAL, no checksums) for CPU-only comparisons. */
+  constructor(readonly memory = false) {
+    this.name = memory ? 'smaltdb (:memory:)' : 'smaltdb';
+    this.config = memory
+      ? 'in-memory database (in-memory undo images, no WAL, no checksums), 8 KiB pages, prepared statements'
+      : 'OPFS sync handles, WAL (auto-checkpoint 4 MiB), 8 KiB pages, 64 MiB cache, flush per commit, prepared statements';
+  }
+
+  get persistent(): boolean {
+    return !this.memory;
+  }
   private vfs = new OpfsVfs({ rootDir: 'smaltdb-bench' });
   private db!: Database;
   private insert!: Statement;
   private readonly opts = { pageSize: 8192, cacheSizeBytes: 64 * 1024 * 1024 };
 
   async open(): Promise<void> {
-    await this.vfs.delete('bench.db');
-    await this.vfs.delete('bench.db-wal');
-    this.db = await Database.open(this.vfs, 'bench.db', this.opts);
+    if (this.memory) this.db = Database.openMemory(this.opts);
+    else {
+      await this.vfs.delete('bench.db');
+      await this.vfs.delete('bench.db-wal');
+      this.db = await Database.open(this.vfs, 'bench.db', this.opts);
+    }
     this.db.exec('CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)');
     this.insert = this.db.prepare('INSERT INTO t(k, v) VALUES (?, ?)');
   }
@@ -102,6 +117,7 @@ export class SmaltdbAdapter implements Adapter {
 
   async close(): Promise<void> {
     this.db.close();
+    if (this.memory) return;
     await this.vfs.delete('bench.db');
     await this.vfs.delete('bench.db-wal');
   }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { BTree } from '../src/engine/storage/btree.js';
+import { Pager } from '../src/engine/storage/pager.js';
 import { encodeKey } from '../src/engine/storage/key-codec.js';
 import { compareBytes } from '../src/engine/util/bytes.js';
 import { hex, openMemoryPager, rng } from './helpers.js';
@@ -18,12 +19,13 @@ function modelSnapshot(m: Model): string[] {
   return [...m.values()].sort((a, b) => compareBytes(a[0], b[0])).map(([k, v]) => hex(k) + '=' + hex(v));
 }
 
-describe('Pager statement savepoints', () => {
+describe.each(['file', 'in-memory'] as const)('Pager statement savepoints (%s)', (mode) => {
   const seeds = Number(process.env.STMT_SEEDS ?? 6);
   for (const seed of Array.from({ length: seeds }, (_, i) => 101 + i)) {
     it(`statement rollback restores the exact pre-statement tree (seed ${seed})`, () => {
       const pageSize = 512;
-      const { pager, reopen } = openMemoryPager({ pageSize, cacheSizeBytes: 32 * pageSize });
+      const opts = { pageSize, cacheSizeBytes: 32 * pageSize };
+      const { pager, reopen } = mode === 'file' ? openMemoryPager(opts) : { pager: Pager.openMemory(opts), reopen: null };
       const root = BTree.create(pager);
       const tree = new BTree(pager, root);
       pager.commit();
@@ -67,6 +69,11 @@ describe('Pager statement savepoints', () => {
         }
       }
       pager.commit();
+      if (reopen === null) {
+        expect(snapshot(tree)).toEqual(modelSnapshot(txnModel));
+        tree.checkIntegrity();
+        return;
+      }
       pager.close();
       const p2 = reopen();
       const t2 = new BTree(p2, root);
@@ -76,11 +83,11 @@ describe('Pager statement savepoints', () => {
   }
 });
 
-describe('single-row INSERT without a statement journal', () => {
+describe.each(['file', 'in-memory'] as const)('single-row INSERT without a statement journal (%s)', (mode) => {
   const open = async () => {
     const { Database } = await import('../src/engine/database.js');
     const { MemoryVfs } = await import('../src/engine/vfs/memory.js');
-    return Database.openFile(new MemoryVfs().openSync('x.db'));
+    return mode === 'file' ? Database.openFile(new MemoryVfs().openSync('x.db')) : Database.openMemory();
   };
 
   it('an index expression error leaves no partial row inside a transaction', async () => {

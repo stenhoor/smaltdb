@@ -3,6 +3,9 @@
 //   npm run bench:browser -- [--engines smaltdb,sqlite-off,sqlite-journal] [--reps 5] [--rows 100000]
 //                            [--analytic-rows 200000] [--no-joins] [--no-indexes] [--save] [--baseline sqlite-off]
 //
+// CPU-only view (no storage I/O or durability work on either side):
+//   npm run bench:browser -- --engines smaltdb-mem,sqlite-mem --baseline sqlite-mem
+//
 // Each repetition runs every engine once in a fresh worker (engine order rotates per repetition).
 // Reports the median and spread per workload, and ratios versus the baseline engine with a verdict
 // that only claims a difference when the min/max ranges do not overlap.
@@ -17,7 +20,7 @@ const arg = (name, def) => {
   const i = process.argv.indexOf(`--${name}`);
   return i > 0 ? process.argv[i + 1] : def;
 };
-const ALL = ['smaltdb', 'sqlite-off', 'sqlite-wal', 'sqlite-journal', 'pglite', 'duckdb'];
+const ALL = ['smaltdb', 'sqlite-off', 'sqlite-wal', 'sqlite-journal', 'pglite', 'duckdb', 'smaltdb-mem', 'sqlite-mem'];
 const enginesArg = arg('engines', 'smaltdb,sqlite-off,sqlite-wal,sqlite-journal');
 const engines = enginesArg === 'all' ? ALL : enginesArg.split(',');
 const reps = Number(arg('reps', 5));
@@ -147,7 +150,8 @@ if (mismatches.length) console.log('\nRESULT MISMATCHES:\n  ' + [...new Set(mism
 else console.log('\nAll engines returned identical results for every read workload.');
 
 if (save) {
-  const file = `bench/results/${env.date.slice(0, 10)}-${browserName}-${commit}.json`;
+  const suffix = engines.every((e) => e.endsWith("-mem")) ? "-cpu" : "";
+  const file = `bench/results/${env.date.slice(0, 10)}-${browserName}-${commit}${suffix}.json`;
   writeFileSync(file, JSON.stringify({ env, summary, failures, mismatches, raw: runs }, null, 2));
   console.log(`\nsaved ${file}`);
 }

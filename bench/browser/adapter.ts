@@ -2,7 +2,8 @@
  * Common workload interface for engine comparisons. All engines store the same tables:
  *   t(k INTEGER PRIMARY KEY, v TEXT)                         OLTP-style, v is a 32-character string
  *   a(id INTEGER PRIMARY KEY, b INT, c REAL, d INT, e TEXT)   analytical
- * Every engine runs in its own dedicated worker and persists to OPFS.
+ * Every engine runs in its own dedicated worker and persists to OPFS, except the in-memory variants
+ * (CPU-only comparison: no storage I/O, no durability work).
  */
 export interface Adapter {
   readonly name: string;
@@ -10,6 +11,8 @@ export interface Adapter {
   readonly config: string;
   /** Whether a commit survives a crash atomically (fairness: compare like with like). */
   readonly atomicCommits: boolean;
+  /** False for in-memory engines: there is nothing to reopen, so cold-cache workloads are skipped. */
+  readonly persistent?: boolean;
   open(): Promise<void>;
   /** Close and reopen the same database files, so later reads start with a cold engine cache. */
   reopen(): Promise<void>;

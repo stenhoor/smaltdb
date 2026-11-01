@@ -8,6 +8,8 @@ import { JOIN_DDL, JOIN_INDEXES, JOIN_QUERIES, JOIN_SIZES, JOIN_TABLES, joinRows
 
 export const factories: Record<string, () => Adapter> = {
   smaltdb: () => new SmaltdbAdapter(),
+  'smaltdb-mem': () => new SmaltdbAdapter(true),
+  'sqlite-mem': () => new SqliteAdapter('MEMORY-DB'),
   'sqlite-off': () => new SqliteAdapter('OFF'),
   'sqlite-wal': () => new SqliteAdapter('WAL'),
   'sqlite-journal': () => new SqliteAdapter('TRUNCATE'),
@@ -60,10 +62,12 @@ self.onmessage = async (e: MessageEvent<{ engine: string; rows: number; lookups:
     await timed(results, `point lookup x${lookups} (warm)`, lookups, () => a.pointLookups(keys));
     await timed(results, 'scan read values (warm)', N, () => a.scanValues());
     await timed(results, `${smallTxns} single-row durable txns`, smallTxns, () => a.smallTxns(N, smallTxns));
-    await a.reopen();
-    await timed(results, `point lookup x${lookups} (cold)`, lookups, () => a.pointLookups(keys));
-    await a.reopen();
-    await timed(results, 'scan read values (cold)', N, () => a.scanValues());
+    if (a.persistent !== false) {
+      await a.reopen();
+      await timed(results, `point lookup x${lookups} (cold)`, lookups, () => a.pointLookups(keys));
+      await a.reopen();
+      await timed(results, 'scan read values (cold)', N, () => a.scanValues());
+    }
     await timed(results, `load analytic table (${analyticRows} rows)`, analyticRows, () => a.loadAnalytic(analyticRows));
     // Report both the first execution (includes JIT warm-up of generated code) and the steady state
     // (median of 5 repeats, e.g. a refreshed dashboard). WebAssembly engines warm up differently.
