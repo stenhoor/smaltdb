@@ -1,4 +1,4 @@
-# ADR 0010: Analytics (M7): mixed storage, spilling, columnar tables
+# ADR 0010: Analytics (M7): mixed storage, spilling, columnar tables, morsels
 
 - **Status:** accepted (M7 in progress; sections are added as parts land)
 - **Date:** 2026-11-01
@@ -128,6 +128,39 @@ failure rolls it back.
 **Not supported yet:** secondary indexes, UNIQUE constraints other than INTEGER PRIMARY KEY, foreign keys to or
 from columnar tables, ALTER TABLE, TEMP columnar tables and ANALYZE statistics. Each fails with a clear error.
 
+### 4. Morsel parallelism on reader workers (M7.4)
+
+Partial aggregates are computed over rowid ranges on parallel reader workers and merged on the owner. This works
+in Chromium, where shared OPFS handles allow parallel readers (ADR 0009).
+
+**Eligible queries** (`exec/morsel.ts`): a single SELECT over one file table (row table, columnar table or columnar
+view).
+- *Aggregates:* only those that merge exactly: `count`, `sum`, `total`, `min`/`max` with one argument, and `avg`.
+  They may use `FILTER`, but not `DISTINCT` or `ORDER BY` inside the call.
+- *Shape:* no joins, subqueries, window functions, `DISTINCT` or compound selects.
+- *Columns:* GROUP BY keys must be plain BINARY-collated expressions, so partial groups meet by value. Output
+  columns may refer only to keys, aggregates and output aliases.
+- *Size:* at least 200k rows.
+
+The analysis rewrites the AST twice.
+- *Partial query:* the keys plus each aggregate's inputs, over `WHERE (original) AND rowid >= lo AND rowid < hi`.
+  `avg` becomes `total` and `count`.
+- *Merge query:* runs over a table-valued `smalt_partials()` source. `count` merges with `sum`, `avg` with
+  `total(s) / sum(n)`, and the others with themselves. HAVING, ORDER BY, LIMIT and OFFSET apply there.
+- *Column names:* output names are carried over as aliases, so results look exactly as without parallelism.
+
+**Pruning.** Rowid ranges prune B+tree scans by key range, columnar tables by their rowid zone maps, and columnar
+views by an implicit rowid zone (row-group base + count).
+
+**The server** (`EngineServer.toMorsels`) splits a query across all idle readers, when there are at least two.
+- *Consistent snapshot:* until every partial is back, the owner holds a placeholder read cursor. Writes wait, as for
+  an open stream, so every morsel sees the same commit.
+- *Merge:* the owner merges the partials and streams the result. The `columns` message carries `morsels: n`, and the
+  client counts these in `stats.morselQueries`.
+- *Failures and cancellation:* a failed reader makes the owner answer the query itself. A cancel drops the partial
+  rows.
+- *Switch:* `PRAGMA parallel_aggregates = 0` turns morsels off.
+
 ## Consequences
 
 - An OPFS database can hold memory-only state (scratch tables, fast dashboards' MVs) without writing pages. Readers
@@ -164,4 +197,8 @@ from columnar tables, ALTER TABLE, TEMP columnar tables and ANALYZE statistics. 
   - *GROUP BY after DML:* the deleted bitmaps are recomputed on every scan.
   - *Row-table UPDATE:* the 404 ms figure includes a pager fix found while measuring. Before it, UPDATE took 3.2 s:
     with nearly every frame dirty, each cache miss swept the whole clock.
+- **Morsels in Chromium**: a 600k-row `GROUP BY` takes 37 ms as morsels on 3 readers and 184 ms on the owner alone.
+  The query is the same; parallel aggregates are turned off with the pragma for the owner run. The speedup is more
+  than 3× because each reader caches only its third of the table, while the whole table exceeds the owner's 16 MiB
+  page cache. With a warm cache that fits the table, expect roughly the reader count.
 

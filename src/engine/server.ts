@@ -17,7 +17,7 @@
  * - **Sessions that disappear** (a closed tab) lose their queued work and streams; an open
  *   transaction is rolled back.
  */
-import { type BindParams, Database, type RowCursor, type Statement } from './database.js';
+import { type BindParams, Database, RowCursor, type Statement } from './database.js';
 import { SmaltError } from './errors.js';
 import { exportCSV, exportJSON, importCSV, importJSON } from './io/import-export.js';
 import type { Vfs } from './vfs/types.js';
@@ -60,6 +60,28 @@ export interface ReaderPool {
   dispatch(session: string, req: Extract<Request, { op: 'query' }>): boolean;
   /** Route a credit or cancel for a query a reader is serving; false if none is. */
   forward(session: string, req: Request): boolean;
+  /** Readers idle right now (morsel parallelism needs at least two). */
+  idle?(): number;
+  /**
+   * Run the partial aggregates of `task.sql` over rowids [lo, hi) on an idle reader (M7.4);
+   * `done` receives its rows, or an error message. False when no reader is idle.
+   */
+  partial?(task: PartialTask, done: (err: string | null, rows: SqlValue[][] | null) => void): boolean;
+}
+
+/** One morsel of a parallel aggregate. */
+export interface PartialTask {
+  sql: string;
+  params?: unknown;
+  lo: number;
+  hi: number;
+}
+
+/** A query whose morsels are out on readers. */
+interface MorselJob {
+  session: string;
+  id: number;
+  cancelled: boolean;
 }
 
 /** Work done between yields to the event loop, in milliseconds. */
@@ -76,6 +98,10 @@ export class EngineServer {
   private current: Job | null = null;
   private interruptFlag: Int32Array | null = null;
   private readonly watched = new Set<string>();
+  /** Queries split into morsels, waiting for their partials (writes wait for them). */
+  private readonly morselJobs: MorselJob[] = [];
+  /** Queries answered by merging morsels (statistics, tests). */
+  morselQueries = 0;
 
   constructor(
     private readonly send: Send,
@@ -107,6 +133,7 @@ export class EngineServer {
   sessionGone(session: string): void {
     this.watched.delete(session);
     for (let i = this.queue.length - 1; i >= 0; i--) if (this.queue[i].session === session) this.queue.splice(i, 1);
+    for (const m of this.morselJobs) if (m.session === session) m.cancelled = true;
     for (let i = this.streams.length - 1; i >= 0; i--) {
       if (this.streams[i].session === session) {
         this.streams[i].cursor.close();
@@ -129,6 +156,12 @@ export class EngineServer {
     const qi = this.queue.findIndex((j) => j.session === session && j.req.id === target);
     if (qi >= 0) {
       this.queue.splice(qi, 1);
+      this.fail(session, target, new SmaltError('SMALT_INTERRUPT', 'interrupted'));
+      return;
+    }
+    const mj = this.morselJobs.find((m) => m.session === session && m.id === target && !m.cancelled);
+    if (mj) {
+      mj.cancelled = true; // the partials finish on the readers; their rows are dropped
       this.fail(session, target, new SmaltError('SMALT_INTERRUPT', 'interrupted'));
       return;
     }
@@ -159,7 +192,7 @@ export class EngineServer {
   }
 
   private unblock(): void {
-    if (this.streams.length === 0) for (const j of this.queue) j.blocked = false;
+    if (this.streams.length === 0 && this.morselJobs.length === 0) for (const j of this.queue) j.blocked = false;
   }
 
   /** Whether `session` may run now (no other session's transaction is open). */
@@ -206,7 +239,8 @@ export class EngineServer {
     } catch (err) {
       if (err instanceof SmaltError && err.code === 'SMALT_BUSY' && /query cursor is open/.test(err.message)) {
         // A write while results stream. Wait for the streams, unless they are this session's own.
-        if (this.streams.length > 0 && this.streams.every((s) => s.session !== session)) {
+        const holders = [...this.streams.map((s) => s.session), ...this.morselJobs.map((m) => m.session)];
+        if (holders.length > 0 && holders.every((s) => s !== session)) {
           job.blocked = true;
           this.queue.unshift(job);
           return;
@@ -270,6 +304,7 @@ export class EngineServer {
       }
       case 'query': {
         const st = this.requireDb().prepare(req.sql);
+        if (this.toMorsels(session, st, req.sql, req)) return;
         if (this.toReader(session, st, req.sql, req)) return;
         this.startStream(session, id, st.cursor(req.params as BindParams | undefined), req.batchSize ?? 4096, req.credit);
         return;
@@ -289,6 +324,7 @@ export class EngineServer {
       }
       case 'stmtQuery': {
         const st = this.statement(req.stmt);
+        if (this.toMorsels(session, st, st.sql, req)) return;
         if (this.toReader(session, st, st.sql, req)) return;
         this.startStream(session, id, st.cursor(req.params as BindParams | undefined), req.batchSize ?? 4096, req.credit);
         return;
@@ -341,14 +377,65 @@ export class EngineServer {
     return pool.dispatch(session, { op: 'query', id: req.id, sql, params: req.params as never, batchSize: req.batchSize, credit: req.credit });
   }
 
+  /**
+   * Morsel parallelism (M7.4): an aggregate over a large table, with at least two idle readers,
+   * runs as partial aggregates over rowid ranges on the readers and is merged here. Writes wait
+   * until every partial is back, so all morsels see the same commit.
+   */
+  private toMorsels(session: string, st: Statement, sql: string, req: { id: number; params?: unknown; batchSize?: number; credit?: number }): boolean {
+    const pool = this.options.readers;
+    const db = this.db;
+    if (!pool?.partial || !pool.idle || !db || this.txOwner !== null || db.inTransaction || !st.readonly || st.usesMemoryObjects) return false;
+    const idle = pool.idle();
+    if (idle < 2) return false;
+    const ranges = db.parallelSplit(sql, idle);
+    if (!ranges) return false;
+    const job: MorselJob = { session, id: req.id, cancelled: false };
+    const release = db.holdReads();
+    const partials: SqlValue[][][] = new Array(ranges.length);
+    let pending = ranges.length;
+    let failed: string | null = null;
+    const finish = (): void => {
+      release();
+      this.morselJobs.splice(this.morselJobs.indexOf(job), 1);
+      if (!job.cancelled) {
+        try {
+          // A reader failed: answer it here instead (same snapshot: writes were held).
+          const result = failed === null ? db.mergePartials(sql, req.params as BindParams | undefined, partials.flat()) : null;
+          const cursor = result ? new RowCursor(db, null, result.rows, [], result.columns) : st.cursor(req.params as BindParams | undefined);
+          if (result) this.morselQueries++;
+          this.startStream(session, req.id, cursor, req.batchSize ?? 4096, req.credit, result ? ranges.length : undefined);
+        } catch (err) {
+          this.fail(session, req.id, err);
+        }
+      }
+      this.unblock();
+      this.kick();
+    };
+    this.morselJobs.push(job);
+    this.watch(session);
+    ranges.forEach((r, i) => {
+      const ok = pool.partial!({ sql, params: req.params, lo: r.lo, hi: r.hi }, (err, rows) => {
+        if (err !== null) failed ??= err;
+        else partials[i] = rows!;
+        if (--pending === 0) finish();
+      });
+      if (!ok) {
+        failed ??= 'no idle reader';
+        if (--pending === 0) finish();
+      }
+    });
+    return true;
+  }
+
   private statement(id: number): Statement {
     const st = this.statements.get(id);
     if (!st) throw new SmaltError('SMALT_MISUSE', 'statement is finalized');
     return st;
   }
 
-  private startStream(session: string, id: number, cursor: RowCursor, batchSize: number, credit: number | undefined): void {
-    this.send(session, { id, kind: 'columns', columns: cursor.columns });
+  private startStream(session: string, id: number, cursor: RowCursor, batchSize: number, credit: number | undefined, morsels?: number): void {
+    this.send(session, morsels ? { id, kind: 'columns', columns: cursor.columns, morsels } : { id, kind: 'columns', columns: cursor.columns });
     const s: Stream = { session, id, cursor, batchSize, credit: credit ?? Infinity };
     this.streams.push(s);
     this.watch(session);

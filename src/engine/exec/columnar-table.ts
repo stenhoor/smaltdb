@@ -15,7 +15,7 @@
 import { SmaltError } from '../errors.js';
 import type { TableSchema } from '../catalog/schema.js';
 import type { BTree } from '../storage/btree.js';
-import { type ColumnStore, ROW_GROUP_ROWS, chunkValue, zoneMayMatch } from '../storage/columnar.js';
+import { type ColumnStore, ROW_GROUP_ROWS, type RowGroupMeta, type Zone, chunkValue, zoneMayMatch } from '../storage/columnar.js';
 import { ROWID_KEY_SIZE, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
 import type { Pager } from '../storage/pager.js';
 import type { SqlValue } from '../values.js';
@@ -24,6 +24,15 @@ import { TableWriter } from './write.js';
 export type Rowid = number | bigint;
 
 const EMPTY = new Uint8Array(0);
+
+/**
+ * Zone map of column `col` in row group `rg`; column -1 is the implicit rowid of a columnar view
+ * (rows of group g are numbered g * 8192 + 1 onwards).
+ */
+export function zoneOf(m: RowGroupMeta, rg: number, col: number): Zone {
+  if (col >= 0) return m.zones[col];
+  return { nulls: 0, numMin: rg * ROW_GROUP_ROWS + 1, numMax: rg * ROW_GROUP_ROWS + m.rows };
+}
 
 /** Deleted segment rowids (null when there are none). Read per scan: deletions change with every write. */
 export function loadDeleted(del: BTree): Set<Rowid> | null {

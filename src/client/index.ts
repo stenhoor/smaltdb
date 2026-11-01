@@ -168,7 +168,7 @@ export class Database implements Queryable {
   /** Multi-tab: this tab owns the engine worker. */
   isLeader = true;
   /** Queries answered by parallel reader workers / by the owner (diagnostics). */
-  readonly stats = { readerQueries: 0, ownerQueries: 0 };
+  readonly stats = { readerQueries: 0, ownerQueries: 0, morselQueries: 0 };
   /** Set while this client's transaction runs: other calls on this Database wait for it. */
   private txRunning: Promise<void> | null = null;
   private onClose: (() => void)[] = [];
@@ -286,6 +286,7 @@ export class Database implements Queryable {
     if (!p) return;
     if (msg.kind === 'columns') {
       if (msg.reader) this.stats.readerQueries++;
+      else if (msg.morsels) this.stats.morselQueries++;
       else this.stats.ownerQueries++;
     }
     if (p.onMessage) {

@@ -96,7 +96,7 @@ import {
 } from './operators.js';
 import { type ColumnStore, ROW_GROUP_ROWS, zoneMayMatch } from '../storage/columnar.js';
 import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
-import { deletedBitmap, rowidsOf } from './columnar-table.js';
+import { deletedBitmap, rowidsOf, zoneOf } from './columnar-table.js';
 
 export interface PlannerEnv {
   getTable(name: string): TableSchema | undefined;
@@ -988,7 +988,7 @@ export class Planner {
         const m = s.meta(g);
         for (let k = 0; k < zones.length; k++) {
           const z = zones[k];
-          if (!zoneMayMatch(m.zones[z.col], m.rows, z.op, vals[k], z.binaryText)) return false;
+          if (!zoneMayMatch(zoneOf(m, g, z.col), m.rows, z.op, vals[k], z.binaryText)) return false;
         }
         return true;
       },
@@ -1747,12 +1747,13 @@ export class Planner {
   ): AccessOption[] {
     if (typeof src.indexedBy === 'string') throw new SmaltError('SMALT_ERROR', `no such index: ${src.indexedBy}`);
     const zones: ZonePredicate[] = [];
-    // A columnar table stores rowids in a final column, with zone maps like any other.
+    // A columnar table stores rowids in a final column, with zone maps like any other; a columnar
+    // view's rowids are implicit (row group base + position): zone column -1 (see zoneOf).
     const rowidCol = table.columnar ? table.columns.length : -1;
     for (const pr of probes) {
       if (pr.deps.size > 0 || !['=', '<', '<=', '>', '>='].includes(pr.op)) continue;
       const col = pr.col === 'rowid' || pr.col === table.rowidAlias ? rowidCol : pr.col;
-      if (typeof col !== 'number' || col < 0) continue;
+      if (typeof col !== 'number' || (col < 0 && !(col === -1 && pr.col === 'rowid'))) continue;
       this.dryCompile++;
       try {
         const colC = compileExpr(pr.colExpr, cs);
@@ -1762,7 +1763,7 @@ export class Planner {
           op: pr.op,
           value: otherC.fn,
           binaryText: comparisonCollation(colC, otherC) === Collation.Binary,
-          label: `${col === rowidCol ? 'rowid' : table.columns[col].name} ${pr.op} ?`,
+          label: `${col === rowidCol || col < 0 ? 'rowid' : table.columns[col].name} ${pr.op} ?`,
         });
       } finally {
         this.dryCompile--;

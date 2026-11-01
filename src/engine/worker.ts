@@ -12,7 +12,8 @@
  */
 import { Database } from './database.js';
 import { SmaltError } from './errors.js';
-import { EngineServer, type ReaderPool, defaultOpen } from './server.js';
+import { EngineServer, type PartialTask, type ReaderPool, defaultOpen } from './server.js';
+import type { SqlValue } from './values.js';
 import { detectCapabilities } from './vfs/capabilities.js';
 import { OpfsVfs } from './vfs/opfs.js';
 import type { BusMessage, ReaderMessage, Request, Response } from '../shared/protocol.js';
@@ -47,6 +48,18 @@ function startReader(init: Extract<ReaderMessage, { type: 'init' }>): void {
   waitOpen();
   scope.onmessage = (e: MessageEvent<ReaderMessage>) => {
     const m = e.data;
+    if (m.type === 'partial') {
+      // A morsel: partial aggregates over a rowid range, back to the owner (which merges them).
+      let msg: ReaderMessage;
+      try {
+        server.db!.refreshSnapshot();
+        msg = { type: 'partialDone', reader: init.reader, task: m.task, rows: server.db!.runPartial(m.sql, m.params as never, m.lo, m.hi) };
+      } catch (err) {
+        msg = { type: 'partialDone', reader: init.reader, task: m.task, error: err instanceof Error ? err.message : String(err) };
+      }
+      scope.postMessage(msg);
+      return;
+    }
     if (m.type !== 'job') return;
     if (m.req.op === 'query') {
       // A new query: move to the latest commit first.
@@ -69,6 +82,22 @@ const leaderId = crypto.randomUUID();
 /** Parallel readers of this owner (empty when shared handles are unavailable). */
 class Readers implements ReaderPool {
   private readonly workers: { w: Worker; ready: boolean; job: { session: string; id: number } | null }[] = [];
+  private readonly partials = new Map<number, (err: string | null, rows: SqlValue[][] | null) => void>();
+  private nextTask = 1;
+
+  idle(): number {
+    return this.workers.filter((r) => r.ready && r.job === null).length;
+  }
+
+  partial(task: PartialTask, done: (err: string | null, rows: SqlValue[][] | null) => void): boolean {
+    const r = this.workers.find((x) => x.ready && x.job === null);
+    if (!r) return false;
+    const id = this.nextTask++;
+    r.job = { session: '', id: -id }; // busy (and holds checkpoints back) until the partial is done
+    this.partials.set(id, done);
+    r.w.postMessage({ type: 'partial', task: id, sql: task.sql, params: task.params, lo: task.lo, hi: task.hi } satisfies ReaderMessage);
+    return true;
+  }
 
   /** Queries running on readers: checkpoints wait for zero. */
   get active(): number {
@@ -86,9 +115,22 @@ class Readers implements ReaderPool {
         if (m.type === 'ready') entry.ready = true;
         else if (m.type === 'idle') entry.job = null;
         else if (m.type === 'failed') entry.ready = false;
+        else if (m.type === 'partialDone') {
+          entry.job = null;
+          const done = this.partials.get(m.task);
+          this.partials.delete(m.task);
+          done?.(m.error ?? null, m.rows ?? null);
+        }
       };
       w.onerror = () => {
         entry.ready = false;
+        // Partials it was running will not come back: fail them (the owner answers the query itself).
+        if (entry.job !== null && entry.job.id < 0) {
+          const done = this.partials.get(-entry.job.id);
+          this.partials.delete(-entry.job.id);
+          entry.job = null;
+          done?.('reader failed', null);
+        }
       };
       // The client's end of the direct result channel.
       scope.postMessage({ id: 0, kind: 'port', port: ch.port1 } satisfies Response, [ch.port1]);

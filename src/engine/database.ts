@@ -20,6 +20,7 @@ import { type ExecState, type Operator, explainAnalyze, explainRows } from './ex
 import { Planner, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
+import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
 import { type ConflictMode, TableWriter } from './exec/write.js';
 import type {
   AlterTableStmt,
@@ -550,6 +551,12 @@ export class Database implements FunctionContext {
 
   /** @internal Virtual tables for the planner: information_schema views and pragma_*() functions. */
   virtualTable(schema: string | undefined, name: string): { columns: { name: string; type: StaticType }[]; rows: (args: SqlValue[]) => SqlValue[][] } | undefined {
+    if (schema === undefined && name.toLowerCase() === 'smalt_partials' && this.morsel !== null) {
+      // The partial aggregates being merged (morsel parallelism).
+      const m = this.morsel;
+      const columns = [...Array.from({ length: m.keys }, (_, i) => `k${i}`), ...Array.from({ length: m.width - m.keys }, (_, i) => `a${i}`)];
+      return { columns: columns.map((c) => ({ name: c, type: 'any' as StaticType })), rows: () => m.rows };
+    }
     if (schema === 'information_schema') {
       const vt = informationSchema(name, this.catalogSnapshot());
       return vt && { columns: vt.columns, rows: () => vt.rows() };
@@ -1183,6 +1190,149 @@ export class Database implements FunctionContext {
     c.close();
     if (found) w.deleteRow(found.rowid);
     if (meta) w.writeRow([name, meta.layout ?? found?.layout ?? null, meta.populated ? 1 : 0, meta.refreshedAt], found?.rowid ?? w.newRowid());
+  }
+
+  // ---------------------------------------------------------------- morsel parallelism (M7.4)
+
+  /** `PRAGMA parallel_aggregates`: whether large aggregates may run as morsels on parallel readers. */
+  private parallelAggregates = true;
+  private morselCache = new Map<string, { version: number; parsed: ParsedStatement; q: MorselQuery } | null>();
+  /** Partial rows being merged: the `smalt_partials()` source of the merge query. */
+  private morsel: { rows: SqlValue[][]; keys: number; width: number } | null = null;
+
+  private morselQuery(sql: string): { parsed: ParsedStatement; q: MorselQuery } | null {
+    const hit = this.morselCache.get(sql);
+    if (hit !== undefined && (hit === null || hit.version === this.schemaVersion)) return hit;
+    let entry: { version: number; parsed: ParsedStatement; q: MorselQuery } | null = null;
+    try {
+      const parsed = parseOne(sql);
+      if (parsed.stmt.kind === 'select') {
+        const q = analyzeMorsels(parsed.stmt, parsed.text, (name) => {
+          const t = this.getTable(name);
+          // Readers open the file: memory-resident objects and system tables stay on the owner.
+          if (!t || t.temp || t.system || t.rootPage >= MEM_BASE || (t.matview && !t.matview.populated)) return undefined;
+          return {
+            hasColumn: (c) => findColumn(t, c) >= 0,
+            binaryColumn: (c) => {
+              const i = findColumn(t, c);
+              return i >= 0 && (t.columns[i].collation ?? Collation.Binary) === Collation.Binary;
+            },
+          };
+        });
+        if (q) entry = { version: this.schemaVersion, parsed, q };
+      }
+    } catch {
+      entry = null; // let the normal path report the error
+    }
+    if (this.morselCache.size > 64) this.morselCache.clear();
+    this.morselCache.set(sql, entry);
+    return entry;
+  }
+
+  /** Smallest and largest rowid of a table (numbers only), or null. */
+  private rowidBounds(t: TableSchema): { min: number; max: number } | null {
+    if (t.matview?.storage === 'columnar') {
+      const n = this.matviewStore(t).rows;
+      return n > 0 ? { min: 1, max: n } : null;
+    }
+    let min = Infinity;
+    let max = -Infinity;
+    const c = this.tree(t.rootPage).cursor();
+    try {
+      if (c.first()) {
+        c.loadKey();
+        min = Number(readRowidKey(c.keyBytes, c.keyOffset));
+        c.last();
+        c.loadKey();
+        max = Number(readRowidKey(c.keyBytes, c.keyOffset));
+      }
+    } finally {
+      c.close();
+    }
+    if (t.columnar) {
+      const store = this.columnStoreOf(t, true);
+      const rc = t.columns.length;
+      for (let rg = 0; rg < store.rowGroups; rg++) {
+        const z = store.meta(rg).zones[rc];
+        if (z.numMin === undefined || z.numMax === undefined) return null;
+        min = Math.min(min, z.numMin);
+        max = Math.max(max, z.numMax);
+      }
+    }
+    if (!Number.isSafeInteger(min) || !Number.isSafeInteger(max)) return null;
+    return { min, max };
+  }
+
+  private matviewStore(t: TableSchema): ColumnStore {
+    return (t.matview!.store ??= new ColumnStore(this.tree(t.rootPage)));
+  }
+
+  /**
+   * Morsel parallelism: when `sql` is an aggregate over one table of at least `minRows` rows whose
+   * aggregates merge exactly, rowid ranges for `parts` partial queries ({@link runPartial});
+   * otherwise null (run it normally).
+   */
+  parallelSplit(sql: string, parts: number, minRows = 200_000): { lo: number; hi: number }[] | null {
+    if (parts < 2 || !this.parallelAggregates) return null;
+    const m = this.morselQuery(sql);
+    if (!m) return null;
+    const t = this.getTable(m.q.table)!;
+    const rows =
+      t.matview?.storage === 'columnar'
+        ? this.matviewStore(t).rows
+        : t.columnar
+          ? this.columnStoreOf(t, true).rows + this.tree(t.rootPage).estimateCount()
+          : this.tree(t.rootPage).estimateCount();
+    if (rows < minRows) return null;
+    const b = this.rowidBounds(t);
+    if (!b) return null;
+    const span = b.max - b.min + 1;
+    const out: { lo: number; hi: number }[] = [];
+    for (let i = 0; i < parts; i++) {
+      const lo = b.min + Math.floor((span * i) / parts);
+      const hi = i === parts - 1 ? b.max + 1 : b.min + Math.floor((span * (i + 1)) / parts);
+      if (hi > lo) out.push({ lo, hi });
+    }
+    return out.length > 1 ? out : null;
+  }
+
+  /** The partial aggregates of `sql` over rowids in [lo, hi) (one row per group). */
+  runPartial(sql: string, params: BindParams | undefined, lo: number, hi: number): SqlValue[][] {
+    const m = this.morselQuery(sql);
+    if (!m) throw new SmaltError('SMALT_ERROR', 'statement cannot run as partial aggregates');
+    return new Statement(this, { ...m.parsed, stmt: m.q.partial(lo, hi) }, sql).all(params) as SqlValue[][];
+  }
+
+  /** Merge partial rows (from {@link runPartial} over every range) into the result of `sql`. */
+  mergePartials(sql: string, params: BindParams | undefined, partials: SqlValue[][]): QueryResult {
+    const m = this.morselQuery(sql);
+    if (!m) throw new SmaltError('SMALT_ERROR', 'statement cannot run as partial aggregates');
+    this.morsel = { rows: partials, keys: m.q.final.core.kind === 'select' ? m.q.final.core.groupBy.length : 0, width: m.q.width };
+    try {
+      const st = new Statement(this, { ...m.parsed, stmt: m.q.final }, sql);
+      return { columns: st.columns, rows: st.all(params) as SqlValue[][] };
+    } finally {
+      this.morsel = null;
+    }
+  }
+
+  /**
+   * Keep writes out (they fail with SMALT_BUSY, like during an open query cursor) until the
+   * returned release function is called: morsels running on readers must all see one commit.
+   */
+  holdReads(): () => void {
+    const token = { close: () => void this.activeCursors.delete(token as unknown as RowCursor) };
+    this.activeCursors.add(token as unknown as RowCursor);
+    return token.close;
+  }
+
+  /** {@link parallelSplit} + {@link runPartial} + {@link mergePartials} in this thread (tests, fallback). */
+  queryMorsels(sql: string, params?: BindParams, parts = 4, minRows = 0): QueryResult | null {
+    const ranges = this.parallelSplit(sql, parts, minRows);
+    if (!ranges) return null;
+    const partials: SqlValue[][] = [];
+    for (const r of ranges) partials.push(...this.runPartial(sql, params, r.lo, r.hi));
+    return this.mergePartials(sql, params, partials);
   }
 
   // ---------------------------------------------------------------- columnar tables (M7.3)
@@ -2827,6 +2977,14 @@ export class Database implements FunctionContext {
           return { readonly: true, columns: [], columnTypes: [], exec: () => ((this.spill.workMem = v), { changes: 0, lastInsertRowid: this.lastRowid }) };
         }
         return ro(['work_mem'], () => [[this.spill.workMem]]);
+      }
+      case 'parallel_aggregates': {
+        if (stmt.value) {
+          const v = arg()?.toLowerCase();
+          const on = v === '1' || v === 'on' || v === 'true' || v === 'yes';
+          return { readonly: true, columns: [], columnTypes: [], exec: () => ((this.parallelAggregates = on), { changes: 0, lastInsertRowid: this.lastRowid }) };
+        }
+        return ro(['parallel_aggregates'], () => [[this.parallelAggregates ? 1 : 0]]);
       }
       case 'spill_bytes':
         // Bytes written to the scratch file since the database was opened.

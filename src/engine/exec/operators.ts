@@ -11,7 +11,7 @@ import { Collation, type SqlValue, compareValues } from '../values.js';
 import { applyNumericAffinity, hashKey, hashKeyMulti, toNumeric, truthy } from './convert.js';
 import { type Fn, isTrue } from './expr.js';
 import { type AggregateFunction, type AggregateState, MinMaxState } from './functions.js';
-import { deletedBitmap, rowidsOf } from './columnar-table.js';
+import { deletedBitmap, rowidsOf, zoneOf } from './columnar-table.js';
 import { type Run, RunReader, RunWriter, type SpillArea, SpillRestart, partitionHash, rowBytes, valueBytes } from './spill.js';
 
 /**
@@ -666,7 +666,7 @@ export class ColumnScan implements Operator {
         let ok = true;
         for (let k = 0; k < this.zones.length && ok; k++) {
           const z = this.zones[k];
-          ok = zoneMayMatch(m.zones[z.col], m.rows, z.op, this.zoneVals[k], z.binaryText);
+          ok = zoneMayMatch(zoneOf(m, this.rg, z.col), m.rows, z.op, this.zoneVals[k], z.binaryText);
         }
         if (!ok) {
           this.skipped++;

@@ -45,6 +45,9 @@ export type Request = { id: number } & (
 export type ReaderMessage =
   | { type: 'init'; name: string; pageSize?: number; cacheSizeBytes?: number; reader: number; port: MessagePort; bus?: string; interrupt?: SharedArrayBuffer }
   | { type: 'job'; session: string; req: Request }
+  /** Morsel parallelism: partial aggregates of `sql` over rowids [lo, hi), answered with 'partialDone'. */
+  | { type: 'partial'; task: number; sql: string; params?: unknown; lo: number; hi: number }
+  | { type: 'partialDone'; reader: number; task: number; rows?: SqlValue[][]; error?: string }
   | { type: 'ready'; reader: number }
   | { type: 'idle'; reader: number }
   | { type: 'failed'; reader: number; message: string };
@@ -68,7 +71,7 @@ export type WireColumn =
 export type Response =
   | { id: number; kind: 'ok'; changes?: number; lastInsertRowid?: number | bigint; stmt?: number; columns?: string[]; paramCount?: number; capabilities?: unknown; text?: string }
   /** `reader`: which parallel reader worker serves the result (absent: the owner). */
-  | { id: number; kind: 'columns'; columns: string[]; reader?: number }
+  | { id: number; kind: 'columns'; columns: string[]; reader?: number; /** Merged from this many morsels (parallel readers). */ morsels?: number }
   | { id: number; kind: 'batch'; length: number; cols: WireColumn[] }
   | { id: number; kind: 'done' }
   | { id: number; kind: 'error'; code: string; message: string }
