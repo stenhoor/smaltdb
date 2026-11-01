@@ -87,6 +87,21 @@ export interface TableSchema {
   matview?: MatViewInfo;
   /** TEMP table: memory store, not in the persisted catalog, visible to this connection only. */
   temp?: boolean;
+  /**
+   * Columnar base table (`WITH (storage = 'columnar')`, M7.3): `rootPage` is the row-format delta
+   * store; older rows live in column segments, minus the rowids in the deletion tree.
+   */
+  columnar?: ColumnarTableInfo;
+}
+
+/** Storage of a columnar base table besides its delta store (roots in smalt_columnar). */
+export interface ColumnarTableInfo {
+  /** Column store: the table's columns plus a final rowid column. */
+  segRoot: number;
+  /** Rowids of segment rows that were deleted or moved to the delta by an UPDATE (keys only). */
+  delRoot: number;
+  /** Reader with its decoded-chunk cache (dropped on rollback and rewrite). */
+  store?: import('../storage/columnar.js').ColumnStore;
 }
 
 /** A materialized view's definition and refresh state (its rows live in the table's tree). */

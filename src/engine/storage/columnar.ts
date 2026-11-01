@@ -1,5 +1,6 @@
 /**
- * Columnar segments (ADR 0008): the storage of `storage = 'columnar'` materialized views.
+ * Columnar segments (ADR 0008): the storage of `storage = 'columnar'` materialized views and, with a
+ * row delta store and deletion tree, of columnar base tables (ADR 0010).
  *
  * Rows are grouped into row groups of {@link ROW_GROUP_ROWS}. Each column of a row group is one
  * encoded chunk, stored as a value in an ordinary B+tree keyed by (u32 rowGroup, u16 column), both
@@ -167,6 +168,53 @@ export class ColumnStoreWriter {
     this.rg++;
     this.total += rows;
     this.rows = 0;
+  }
+}
+
+/**
+ * Appends row groups to an existing store with ordinary B+tree inserts (columnar base tables:
+ * compaction moves delta rows into new row groups). Keys of new row groups sort after existing
+ * ones, so inserts land at the right edge of the tree.
+ */
+export class ColumnStoreAppender {
+  private readonly enc = new ChunkEncoder();
+  private rg: number;
+  private total: number;
+
+  constructor(private readonly tree: BTree) {
+    const h = tree.get(chunkKey(HEADER_RG, 0));
+    if (h === undefined) {
+      this.rg = 0;
+      this.total = 0;
+    } else {
+      const v = new DataView(h.buffer, h.byteOffset, h.byteLength);
+      this.rg = v.getUint32(0, true);
+      this.total = v.getFloat64(4, true);
+    }
+  }
+
+  /** Write one row group from per-column value arrays (all of length `rows`). */
+  addRowGroup(cols: SqlValue[][], rows: number): void {
+    const zones: Zone[] = [];
+    for (let c = 0; c < cols.length; c++) {
+      const col = cols[c];
+      if (col.length !== rows) col.length = rows;
+      const { bytes, zone } = this.enc.encode(col);
+      this.tree.put(chunkKey(this.rg, c), bytes);
+      zones.push(zone);
+    }
+    this.tree.put(chunkKey(this.rg, META_COL), encodeMeta(rows, zones));
+    this.rg++;
+    this.total += rows;
+  }
+
+  /** Update the store header. */
+  finish(): void {
+    const h = new Uint8Array(12);
+    const v = new DataView(h.buffer);
+    v.setUint32(0, this.rg, true);
+    v.setFloat64(4, this.total, true);
+    this.tree.put(chunkKey(HEADER_RG, 0), h);
   }
 }
 
@@ -587,6 +635,11 @@ export class ColumnStore {
       }
     }
     return this.header;
+  }
+
+  /** Re-read the header at the next access (row groups may have been appended since). */
+  refreshHeader(): void {
+    this.header = null;
   }
 
   get rowGroups(): number {

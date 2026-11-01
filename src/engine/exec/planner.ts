@@ -70,6 +70,7 @@ import {
   type ExecState,
   Filter,
   FusedGroupAggregate,
+  ColumnarTableScan,
   FusedScanAggregate,
   FusedScanFilter,
   HashAggregate,
@@ -95,6 +96,7 @@ import {
 } from './operators.js';
 import { type ColumnStore, ROW_GROUP_ROWS, zoneMayMatch } from '../storage/columnar.js';
 import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
+import { deletedBitmap, rowidsOf } from './columnar-table.js';
 
 export interface PlannerEnv {
   getTable(name: string): TableSchema | undefined;
@@ -108,8 +110,10 @@ export interface PlannerEnv {
   openTree(rootPage: number): BTree;
   /** On-demand statistics for a table without ANALYZE results (sampled; cached by the database). */
   sampledStats?(table: TableSchema): TableStats | undefined;
-  /** Reader for a columnar materialized view's segments. */
+  /** Reader for the segments of a columnar materialized view or table. */
   columnStore?(table: TableSchema): ColumnStore;
+  /** Columnar table: rowids hidden in its segments (read per scan), null when none. */
+  deletedRows?(table: TableSchema): Set<number | bigint> | null;
   funcCtx: FunctionContext;
   state: ExecState;
   /** Scratch file for sorts and hash aggregates that outgrow work_mem (M7.2). */
@@ -788,7 +792,7 @@ export class Planner {
     const rc = core.columns[0];
     if (rc.kind !== 'expr' || rc.expr.kind !== 'call' || rc.expr.name !== 'count' || !rc.expr.star || rc.expr.filter || rc.expr.over) return null;
     const table = this.env.getTable(core.from.name);
-    if (!table || this.env.getTable(core.from.name) === undefined || table.matview?.storage === 'columnar') return null;
+    if (!table || this.env.getTable(core.from.name) === undefined || table.matview?.storage === 'columnar' || table.columnar) return null;
     const reg = outRegs ? outRegs[0] : this.regs.alloc();
     const name = rc.alias ?? this.sqlText.slice(rc.expr.pos, rc.expr.end);
     return {
@@ -804,7 +808,7 @@ export class Planner {
    * (FusedScanAggregate). Returns null when the shape or the aggregates do not qualify.
    */
   /** Match `Filter* -> forward full TableScan`; returns the scan and the predicate ASTs (outermost last). */
-  private scanChain(src: Operator): { scan: TableScan | ColumnScan; preds: Expr[] } | null {
+  private scanChain(src: Operator): { scan: TableScan | ColumnScan | ColumnarTableScan; preds: Expr[] } | null {
     if (!codegenEnabled()) return null;
     const preds: Expr[] = [];
     let node: Operator = src;
@@ -813,7 +817,7 @@ export class Planner {
       preds.push(node.ast);
       node = node.child;
     }
-    if (node instanceof ColumnScan) return { scan: node, preds: preds.reverse() };
+    if (node instanceof ColumnScan || node instanceof ColumnarTableScan) return { scan: node, preds: preds.reverse() };
     if (!(node instanceof TableScan) || node.lo || node.hi || node.reverse) return null;
     return { scan: node, preds: preds.reverse() };
   }
@@ -853,7 +857,7 @@ export class Planner {
   /** Replace `Filter* -> full TableScan` with a generated scan + filter (non-aggregate queries). */
   private tryFuseScanFilter(src: Operator, scope: Scope): Operator {
     const chain = this.scanChain(src);
-    if (!chain || chain.scan instanceof ColumnScan) return src;
+    if (!chain || !(chain.scan instanceof TableScan)) return src;
     const { scan, preds } = chain;
     const access = scan.access;
     const cs = this.compileScope(scope);
@@ -885,7 +889,6 @@ export class Planner {
     // Group memory of the current run (reset at open): past the limit the fused loop gives up.
     const budget = spill ? { used: 0, limit: Infinity, area: spill } : null;
     const helpers = {
-      ...(node instanceof ColumnScan ? this.columnarHelpers(node) : this.fusedHelpers(access)),
       hashKey,
       hashKeyMulti: (values: SqlValue[], colls: number[]) => hashKeyMulti(values, colls),
       newGroup: (keys: SqlValue[]) => {
@@ -893,9 +896,22 @@ export class Planner {
         return { keys, st: aggs.map((a) => a.def.create(a.star ? [] : a.argTypes, a.collation)) };
       },
     };
-    const build = () =>
-      generateGroupAggregate(chain.preds, groupAsts.map((expr, i) => ({ expr, collation: groupColls[i] })), specs, this.pipelineSource(node), helpers, (e) => compileNode(e, cs));
-    return new FusedGroupAggregate(access, build, groupRegs, aggs, node instanceof ColumnScan ? node.fusedLabel('group aggregate') : undefined, budget);
+    const groupSpecs = groupAsts.map((expr, i) => ({ expr, collation: groupColls[i] }));
+    const gen = (scan: TableScan | ColumnScan) =>
+      generateGroupAggregate(chain.preds, groupSpecs, specs, this.pipelineSource(scan), { ...helpers, ...(scan instanceof ColumnScan ? this.columnarHelpers(scan) : this.fusedHelpers(access)) }, (e) => compileNode(e, cs));
+    // A columnar table: one loop over the delta store's leaves, one over the segments, same groups.
+    const build =
+      node instanceof ColumnarTableScan
+        ? () => {
+            const a = gen(node.delta);
+            const b = gen(node.segments);
+            return (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => {
+              a(r, groups, order);
+              b(r, groups, order);
+            };
+          }
+        : () => gen(node);
+    return new FusedGroupAggregate(access, build, groupRegs, aggs, node instanceof TableScan ? undefined : node.fusedLabel('group aggregate'), budget);
   }
 
   private tryFuseAggregate(src: Operator, aggs: AggSpec[], scope: Scope): Operator | null {
@@ -909,6 +925,16 @@ export class Planner {
     if (node instanceof ColumnScan) {
       const run = generateFusedAggregate(preds, specs, this.pipelineSource(node), this.columnarHelpers(node), (e) => compileNode(e, cs));
       return new FusedScanAggregate(access, aggs, run as (r: SqlValue[], states: AggregateState[]) => void, node.fusedLabel('aggregate'));
+    }
+    if (node instanceof ColumnarTableScan) {
+      // The delta store's leaves, then the segments, stepping the same aggregate states.
+      const a = generateFusedAggregate(preds, specs, this.pipelineSource(node.delta), this.fusedHelpers(access), (e) => compileNode(e, cs));
+      const b = generateFusedAggregate(preds, specs, this.pipelineSource(node.segments), this.columnarHelpers(node.segments), (e) => compileNode(e, cs));
+      const run = (r: SqlValue[], states: AggregateState[]): void => {
+        a(r, states);
+        b(r, states);
+      };
+      return new FusedScanAggregate(access, aggs, run, node.fusedLabel('aggregate'));
     }
     const tree = access.tree;
     const pager = tree.pager;
@@ -938,20 +964,23 @@ export class Planner {
   private pipelineSource(node: TableScan | ColumnScan): PipelineSource {
     const access = node.access;
     if (node instanceof TableScan) return { rows: () => access.loaderSpec() };
-    return { columns: () => ({ decode: access.decode, rowidRegs: access.rowidReg >= 0 ? [access.rowidReg, ...access.extraRowidRegs] : [] }) };
+    return { columns: () => ({ decode: access.decode, rowidRegs: access.rowidReg >= 0 ? [access.rowidReg, ...access.extraRowidRegs] : [], segments: node.segments !== null }) };
   }
 
   /** Column-store access for generated loops over a columnar scan (zone maps evaluated per execution). */
   private columnarHelpers(node: ColumnScan): ColumnarHelpers {
     let s: ColumnStore;
     let vals: SqlValue[] = [];
+    let del: Set<number | bigint> | null = null;
     const zones = node.zones;
+    const seg = node.segments;
     return {
       ...CODEGEN_HELPERS_FOR_FUSION,
       RG: ROW_GROUP_ROWS,
       open: (r) => {
         s = node.store();
         vals = zones.map((z) => z.value(r));
+        del = seg !== null ? seg.deleted() : null;
       },
       groups: () => s.rowGroups,
       keep: (g) => {
@@ -965,6 +994,12 @@ export class Planner {
       },
       rows: (g) => s.meta(g).rows,
       chunk: (g, c) => s.chunk(g, c),
+      ...(seg !== null
+        ? {
+            rowids: (g: number) => rowidsOf(s, g, seg.rowidCol),
+            deleted: (g: number) => deletedBitmap(s, g, seg.rowidCol, del),
+          }
+        : {}),
     };
   }
 
@@ -1512,7 +1547,7 @@ export class Planner {
     }
 
     const outerDep = (list: Probe[]): boolean => list.some((x) => x.deps.size > 0);
-    if (table.matview?.storage === 'columnar') return this.columnarOptions(src, table, access, probes, cs, N);
+    if (table.matview?.storage === 'columnar' || table.columnar) return this.columnarOptions(src, table, access, probes, cs, N);
     const options: AccessOption[] = [
       {
         label: 'scan',
@@ -1684,11 +1719,16 @@ export class Planner {
     if (src.sub) return SUBQUERY_ROWS;
     if (src.estRows === undefined) {
       const t = src.table!;
-      const live = t.matview?.storage === 'columnar' ? this.env.columnStore!(t).rows : src.access!.tree.estimateCount();
+      const live =
+        t.matview?.storage === 'columnar'
+          ? this.env.columnStore!(t).rows
+          : t.columnar
+            ? this.env.columnStore!(t).rows + src.access!.tree.estimateCount()
+            : src.access!.tree.estimateCount();
       src.estRows = Math.max(1, src.table!.stats?.rows ?? live);
       // Remember what the plan assumed, so the statement can re-plan if the table grows or shrinks a lot.
       // (Columnar views change only on refresh, which re-plans anyway.)
-      if (t.matview?.storage !== 'columnar') this.rowAssumptions.set(t.rootPage, live);
+      if (t.matview?.storage !== 'columnar' && !t.columnar) this.rowAssumptions.set(t.rootPage, live);
     }
     return src.estRows;
   }
@@ -1707,24 +1747,40 @@ export class Planner {
   ): AccessOption[] {
     if (typeof src.indexedBy === 'string') throw new SmaltError('SMALT_ERROR', `no such index: ${src.indexedBy}`);
     const zones: ZonePredicate[] = [];
+    // A columnar table stores rowids in a final column, with zone maps like any other.
+    const rowidCol = table.columnar ? table.columns.length : -1;
     for (const pr of probes) {
-      if (typeof pr.col !== 'number' || pr.col < 0 || pr.deps.size > 0 || !['=', '<', '<=', '>', '>='].includes(pr.op)) continue;
+      if (pr.deps.size > 0 || !['=', '<', '<=', '>', '>='].includes(pr.op)) continue;
+      const col = pr.col === 'rowid' || pr.col === table.rowidAlias ? rowidCol : pr.col;
+      if (typeof col !== 'number' || col < 0) continue;
       this.dryCompile++;
       try {
         const colC = compileExpr(pr.colExpr, cs);
         const otherC = compileExpr(pr.other, cs);
         zones.push({
-          col: pr.col,
+          col,
           op: pr.op,
           value: otherC.fn,
           binaryText: comparisonCollation(colC, otherC) === Collation.Binary,
-          label: `${table.columns[pr.col].name} ${pr.op} ?`,
+          label: `${col === rowidCol ? 'rowid' : table.columns[col].name} ${pr.op} ?`,
         });
       } finally {
         this.dryCompile--;
       }
     }
     const store = (): ColumnStore => this.env.columnStore!(table);
+    if (table.columnar) {
+      const segments = { rowidCol, deleted: () => this.env.deletedRows!(table) };
+      return [
+        {
+          label: 'columnar table scan',
+          cost: N * COST.scanRow * 0.5,
+          rows: N,
+          dependsOnOuter: false,
+          build: () => ({ leaf: new ColumnarTableScan(new TableScan(access), new ColumnScan(access, store, zones, segments)), dependsOnOuter: false }),
+        },
+      ];
+    }
     // Decoding typed column chunks is cheaper per row than record decoding.
     return [{ label: 'columnar scan', cost: N * COST.scanRow * 0.5, rows: N, dependsOnOuter: false, build: () => ({ leaf: new ColumnScan(access, store, zones), dependsOnOuter: false }) }];
   }

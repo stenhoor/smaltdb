@@ -19,7 +19,7 @@ export class TableWriter {
   readonly tree: BTree;
   private readonly indexTrees: BTree[];
   private readonly enc: RecordEncoder;
-  private readonly reader: RecordReader;
+  protected readonly reader: RecordReader;
   private readonly keyEnc = new KeyEncoder();
   /** Second encoder: UPDATE holds the old and new key at once. */
   private readonly keyEnc2 = new KeyEncoder();
@@ -38,7 +38,7 @@ export class TableWriter {
     this.reader = new RecordReader(table.layout, table.recordDefaults);
   }
 
-  private key(rowid: number | bigint): Uint8Array {
+  protected key(rowid: number | bigint): Uint8Array {
     writeRowidKey(this.rowidKey, 0, rowid);
     return this.rowidKey;
   }

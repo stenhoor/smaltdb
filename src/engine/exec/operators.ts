@@ -11,6 +11,7 @@ import { Collation, type SqlValue, compareValues } from '../values.js';
 import { applyNumericAffinity, hashKey, hashKeyMulti, toNumeric, truthy } from './convert.js';
 import { type Fn, isTrue } from './expr.js';
 import { type AggregateFunction, type AggregateState, MinMaxState } from './functions.js';
+import { deletedBitmap, rowidsOf } from './columnar-table.js';
 import { type Run, RunReader, RunWriter, type SpillArea, SpillRestart, partitionHash, rowBytes, valueBytes } from './spill.js';
 
 /**
@@ -613,6 +614,10 @@ export class ColumnScan implements Operator {
   private base = 0;
   private chunks: Chunk[] = [];
   private zoneVals: SqlValue[] = [];
+  /** Columnar table: deleted rowids of this scan, the current row group's deleted flags and rowids. */
+  private deleted: Set<number | bigint> | null = null;
+  private gone: Uint8Array | null = null;
+  private rowids: ArrayLike<SqlValue> | null = null;
   /** Row groups skipped by zone maps in the last scan (EXPLAIN ANALYZE, tests). */
   skipped = 0;
 
@@ -620,6 +625,8 @@ export class ColumnScan implements Operator {
     readonly access: TableAccess,
     readonly store: () => ColumnStore,
     readonly zones: ZonePredicate[],
+    /** Segments of a columnar table (explicit rowid column, deletions); absent for materialized views. */
+    readonly segments: ColumnarSegments | null = null,
   ) {}
 
   get detail(): string {
@@ -643,43 +650,111 @@ export class ColumnScan implements Operator {
     this.i = this.n = 0;
     this.skipped = 0;
     this.zoneVals = this.zones.map((z) => z.value(r));
+    this.deleted = this.segments ? this.segments.deleted() : null;
+    this.gone = null;
+    this.rowids = null;
   }
 
   next(): boolean {
     const d = this.access.decode;
-    while (this.i >= this.n) {
-      if (++this.rg >= this.rgCount) return false;
-      const m = this.s.meta(this.rg);
-      let ok = true;
-      for (let k = 0; k < this.zones.length && ok; k++) {
-        const z = this.zones[k];
-        ok = zoneMayMatch(m.zones[z.col], m.rows, z.op, this.zoneVals[k], z.binaryText);
-      }
-      if (!ok) {
-        this.skipped++;
-        continue;
-      }
-      const chunks = this.chunks;
-      chunks.length = 0;
-      for (let k = 0; k < d.length; k += 2) chunks.push(this.s.chunk(this.rg, d[k]));
-      this.n = m.rows;
-      this.i = 0;
-      this.base = this.rg * ROW_GROUP_ROWS;
-    }
-    const i = this.i++;
-    const r = this.r;
-    const chunks = this.chunks;
-    for (let k = 0; k < d.length; k += 2) r[d[k + 1]] = chunkValue(chunks[k >>> 1], i);
     const a = this.access;
-    if (a.rowidReg >= 0) {
-      const id = this.base + i + 1;
-      r[a.rowidReg] = id;
-      for (const x of a.extraRowidRegs) r[x] = id;
+    const seg = this.segments;
+    for (;;) {
+      while (this.i >= this.n) {
+        if (++this.rg >= this.rgCount) return false;
+        const m = this.s.meta(this.rg);
+        let ok = true;
+        for (let k = 0; k < this.zones.length && ok; k++) {
+          const z = this.zones[k];
+          ok = zoneMayMatch(m.zones[z.col], m.rows, z.op, this.zoneVals[k], z.binaryText);
+        }
+        if (!ok) {
+          this.skipped++;
+          continue;
+        }
+        const chunks = this.chunks;
+        chunks.length = 0;
+        for (let k = 0; k < d.length; k += 2) chunks.push(this.s.chunk(this.rg, d[k]));
+        this.n = m.rows;
+        this.i = 0;
+        this.base = this.rg * ROW_GROUP_ROWS;
+        if (seg !== null) {
+          this.gone = deletedBitmap(this.s, this.rg, seg.rowidCol, this.deleted);
+          this.rowids = a.rowidReg >= 0 ? rowidsOf(this.s, this.rg, seg.rowidCol) : null;
+        }
+      }
+      const i = this.i++;
+      if (this.gone !== null && this.gone[i] === 1) continue;
+      const r = this.r;
+      const chunks = this.chunks;
+      for (let k = 0; k < d.length; k += 2) r[d[k + 1]] = chunkValue(chunks[k >>> 1], i);
+      if (a.rowidReg >= 0) {
+        const id = this.rowids !== null ? this.rowids[i] : this.base + i + 1;
+        r[a.rowidReg] = id;
+        for (const x of a.extraRowidRegs) r[x] = id;
+      }
+      return true;
     }
-    return true;
   }
 
   close(): void {}
+}
+
+/** A columnar table's segment layout, for scans of it. */
+export interface ColumnarSegments {
+  /** Column index of the stored rowids (= number of table columns). */
+  rowidCol: number;
+  /** Rowids hidden in the segments (read when a scan opens). */
+  deleted: () => Set<number | bigint> | null;
+}
+
+/**
+ * Full scan of a columnar table: the delta store's rows, then the segments' live rows (ADR 0010).
+ * Not in rowid order.
+ */
+export class ColumnarTableScan implements Operator {
+  readonly children: Operator[] = [];
+  private r!: SqlValue[];
+  private inSegments = false;
+
+  constructor(
+    readonly delta: TableScan,
+    readonly segments: ColumnScan,
+  ) {}
+
+  get access(): TableAccess {
+    return this.delta.access;
+  }
+
+  get detail(): string {
+    return this.segments.detail.replace('(columnar', '(columnar table: delta + segments');
+  }
+
+  /** EXPLAIN text when fused into generated code with filters and `what`. */
+  fusedLabel(what: string): string {
+    return this.segments.fusedLabel(what).replace('(columnar', '(columnar table: delta + segments');
+  }
+
+  open(r: SqlValue[]): void {
+    this.r = r;
+    this.inSegments = false;
+    this.delta.open(r);
+  }
+
+  next(): boolean {
+    if (!this.inSegments) {
+      if (this.delta.next()) return true;
+      this.delta.close();
+      this.inSegments = true;
+      this.segments.open(this.r);
+    }
+    return this.segments.next();
+  }
+
+  close(): void {
+    this.delta.close();
+    this.segments.close();
+  }
 }
 
 // ------------------------------------------------------------------ relational operators

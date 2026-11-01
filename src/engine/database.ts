@@ -19,6 +19,7 @@ import { type FunctionContext, aggregateFunctions, scalarFunctions } from './exe
 import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
 import { Planner, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea } from './exec/spill.js';
+import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type ConflictMode, TableWriter } from './exec/write.js';
 import type {
   AlterTableStmt,
@@ -43,7 +44,7 @@ import type {
 } from './sql/ast.js';
 import { parse, parseOne } from './sql/parser.js';
 import { BTree } from './storage/btree.js';
-import { ColumnStore, ColumnStoreWriter } from './storage/columnar.js';
+import { ColumnStore, ColumnStoreAppender, ColumnStoreWriter, ROW_GROUP_ROWS, chunkValue } from './storage/columnar.js';
 import { KeyEncoder, type KeyColumn, ROWID_KEY_SIZE, decodeKey, readRowidKey, rowidSuffixStart, writeRowidKey } from './storage/key-codec.js';
 import { compareRanges } from './util/bytes.js';
 import { Pager, type PagerOptions } from './storage/pager.js';
@@ -358,6 +359,7 @@ export class Database implements FunctionContext {
     rollbackStatement: (): void => {
       this.pager.rollbackStatement();
       this.mem?.rollbackStatement();
+      this.dropColumnarCaches();
     },
     commit: (): void => {
       this.pager.commit();
@@ -366,6 +368,7 @@ export class Database implements FunctionContext {
     rollback: (): void => {
       this.pager.rollback();
       this.mem?.rollback();
+      this.dropColumnarCaches();
     },
     releaseAllPins: (): void => {
       this.pager.releaseAllPins();
@@ -383,6 +386,7 @@ export class Database implements FunctionContext {
     rollbackToSavepoint: (d: number, keep: boolean): void => {
       this.pager.rollbackToSavepoint(d, keep);
       this.mem?.rollbackToSavepoint(d, keep);
+      this.dropColumnarCaches();
     },
   };
 
@@ -487,7 +491,10 @@ export class Database implements FunctionContext {
 
   /** Writer for user DML: deletions it makes (DELETE, REPLACE conflicts) run foreign-key processing. */
   private writerFor(table: TableSchema): TableWriter {
-    const w = new TableWriter(table, this.pager, (root) => this.tree(root));
+    const c = table.columnar;
+    const w = c
+      ? new ColumnarTableWriter(table, this.pager, (root) => this.tree(root), this.columnStoreOf(table), this.tree(c.delRoot), () => this.columnarTouched.add(table))
+      : new TableWriter(table, this.pager, (root) => this.tree(root));
     w.beforeDelete = (row) => {
       if (this.fk.involved(table)) this.fk.beforeDelete(table, row);
     };
@@ -634,6 +641,7 @@ export class Database implements FunctionContext {
       this.tables.set(table.name.toLowerCase(), table);
     }
     this.loadMatviews(rows.filter((r) => r.type === 'matview'));
+    this.loadColumnar();
     for (const r of rows) {
       if (r.type !== 'index' || r.sql === null) continue;
       const stmt = parseOne(r.sql).stmt as CreateIndexStmt;
@@ -793,7 +801,8 @@ export class Database implements FunctionContext {
       virtualTable: (schema, n) => this.virtualTable(schema, n),
       openTree: (root) => this.tree(root),
       sampledStats: (t) => this.sampledStats(t),
-      columnStore: (t) => (t.matview!.store ??= new ColumnStore(this.tree(t.rootPage))),
+      columnStore: (t) => (t.columnar ? this.columnStoreOf(t, true) : (t.matview!.store ??= new ColumnStore(this.tree(t.rootPage)))),
+      deletedRows: (t) => loadDeleted(this.tree(t.columnar!.delRoot)),
       funcCtx: this,
       state: this.state,
       spill: this.spill,
@@ -916,8 +925,12 @@ export class Database implements FunctionContext {
     this.fk.sync(this.schemaVersion);
     this.fk.stmt = 0;
     const deferredBefore = this.fk.deferred;
+    this.columnarTouched.clear();
     try {
       result = body();
+      // Columnar tables written by this statement: move full row groups out of the delta store.
+      // Needs a way to undo a failure part-way: a statement journal or the autocommit transaction.
+      if (this.columnarTouched.size > 0 && (journal || this.autocommit)) this.compactTouched();
       this.fk.checkStatement();
       if (this.autocommit) this.fk.checkCommit();
     } catch (e) {
@@ -1172,6 +1185,209 @@ export class Database implements FunctionContext {
     if (meta) w.writeRow([name, meta.layout ?? found?.layout ?? null, meta.populated ? 1 : 0, meta.refreshedAt], found?.rowid ?? w.newRowid());
   }
 
+  // ---------------------------------------------------------------- columnar tables (M7.3)
+
+  private static readonly COLUMNAR_SQL = 'CREATE TABLE smalt_columnar(name TEXT, seg_root INTEGER, del_root INTEGER)';
+
+  /** Columnar tables written by the running statement (compacted at its end). */
+  private readonly columnarTouched = new Set<TableSchema>();
+
+  /** The segment reader of a columnar table (`fresh`: re-read the header, row groups may have been added). */
+  private columnStoreOf(t: TableSchema, fresh = false): ColumnStore {
+    const c = t.columnar!;
+    if (c.store === undefined) c.store = new ColumnStore(this.tree(c.segRoot));
+    else if (fresh) c.store.refreshHeader();
+    return c.store;
+  }
+
+  /**
+   * Decoded chunks may describe rolled-back row groups (their keys get reused): drop them. Segments
+   * written by committed statements never change in place, so the caches survive everything else.
+   */
+  private dropColumnarCaches(): void {
+    for (const t of this.tables.values()) if (t.columnar) t.columnar.store = undefined;
+  }
+
+  /** Upsert (or with `info` null, delete) a table's row in smalt_columnar. */
+  private writeColumnarMeta(name: string, info: { segRoot: number; delRoot: number } | null): void {
+    const t = this.tables.get('smalt_columnar')!;
+    const w = new TableWriter(t, this.pager, (root) => this.tree(root));
+    const c = this.tree(t.rootPage).cursor();
+    let found: number | bigint | null = null;
+    const reader = new RecordReader(t.layout, t.recordDefaults);
+    try {
+      for (let ok = c.first(); ok; ok = c.next()) {
+        c.loadValue();
+        reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+        if (String(reader.column(0)).toLowerCase() === name.toLowerCase()) {
+          c.loadKey();
+          found = readRowidKey(c.keyBytes, c.keyOffset);
+          break;
+        }
+      }
+    } finally {
+      c.close();
+    }
+    if (found !== null) w.deleteRow(found);
+    if (info) w.writeRow([name, info.segRoot, info.delRoot], found ?? w.newRowid());
+  }
+
+  /** Attach segment and deletion roots to columnar tables (from smalt_columnar). */
+  private loadColumnar(): void {
+    const meta = this.tables.get('smalt_columnar');
+    const roots = new Map<string, { segRoot: number; delRoot: number }>();
+    if (meta) {
+      const reader = new RecordReader(meta.layout, meta.recordDefaults);
+      const c = this.tree(meta.rootPage).cursor();
+      try {
+        for (let ok = c.first(); ok; ok = c.next()) {
+          c.loadValue();
+          reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+          roots.set(String(reader.column(0)).toLowerCase(), { segRoot: Number(reader.column(1)), delRoot: Number(reader.column(2)) });
+        }
+      } finally {
+        c.close();
+      }
+    }
+    for (const t of this.tables.values()) {
+      if (t.matview || t.system || !/storage/i.test(t.sql) || tableStorage(parseOne(t.sql).stmt as CreateTableStmt) !== 'columnar') continue;
+      const r = roots.get(t.name.toLowerCase());
+      if (!r) throw new SmaltError('SMALT_CORRUPT', `columnar table ${t.name} has no segments`);
+      t.columnar = { ...r };
+    }
+  }
+
+  /** Values of every delta-store row of `t`, in rowid order, with the rowid appended. */
+  private *deltaRows(t: TableSchema): Generator<{ rowid: number | bigint; row: SqlValue[] }> {
+    const reader = new RecordReader(t.layout, t.recordDefaults);
+    const ncols = t.columns.length;
+    const c = this.tree(t.rootPage).cursor();
+    try {
+      for (let ok = c.first(); ok; ok = c.next()) {
+        c.loadKey();
+        const rowid = readRowidKey(c.keyBytes, c.keyOffset);
+        c.loadValue();
+        reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+        const row: SqlValue[] = new Array(ncols + 1);
+        for (let i = 0; i < ncols; i++) row[i] = i === t.rowidAlias ? null : reader.column(i);
+        row[ncols] = rowid;
+        yield { rowid, row };
+      }
+    } finally {
+      c.close();
+    }
+  }
+
+  /**
+   * End of a statement that wrote columnar tables: once the delta store holds a row group's worth
+   * of rows, move whole row groups into the segments; rewrite the segments when deletions pile up.
+   */
+  private compactTouched(): void {
+    for (const t of this.columnarTouched) {
+      if (!t.columnar || this.tables.get(t.name.toLowerCase()) !== t) continue; // dropped meanwhile
+      const store = this.columnStoreOf(t, true);
+      const del = this.tree(t.columnar.delRoot);
+      const deltaCount = this.tree(t.rootPage).count();
+      const delCount = del.count();
+      if (delCount > Math.max(COMPACT_ROWS, store.rows / 4)) {
+        this.rewriteColumnar(t, true);
+        continue;
+      }
+      if (deltaCount < COMPACT_ROWS) continue;
+      if (!this.appendDelta(t)) this.rewriteColumnar(t, true);
+    }
+    this.columnarTouched.clear();
+  }
+
+  /**
+   * Move delta rows into new row groups, in whole row groups, oldest rowids first. Rows whose
+   * rowid is also hidden in the segments (updated segment rows) stay: the deletion tree would hide
+   * them too. Returns false when fewer than a row group's worth could move (rewrite instead).
+   */
+  private appendDelta(t: TableSchema): boolean {
+    const c = t.columnar!;
+    const ncols = t.columns.length + 1;
+    const deleted = loadDeleted(this.tree(c.delRoot));
+    const cols: SqlValue[][] = Array.from({ length: ncols }, () => new Array<SqlValue>(ROW_GROUP_ROWS));
+    const moved: (number | bigint)[] = [];
+    let batch: (number | bigint)[] = [];
+    let n = 0;
+    let appender: ColumnStoreAppender | null = null;
+    for (const { rowid, row } of this.deltaRows(t)) {
+      if (deleted?.has(rowid)) continue;
+      for (let k = 0; k < ncols; k++) cols[k][n] = row[k];
+      batch.push(rowid);
+      if (++n === ROW_GROUP_ROWS) {
+        (appender ??= new ColumnStoreAppender(this.tree(c.segRoot))).addRowGroup(cols, n);
+        moved.push(...batch);
+        batch = [];
+        n = 0;
+      }
+    }
+    if (appender === null) return false;
+    appender.finish();
+    const delta = this.tree(t.rootPage);
+    if (n === 0 && deleted === null) delta.clear();
+    else {
+      const key = new Uint8Array(ROWID_KEY_SIZE);
+      for (const id of moved) {
+        writeRowidKey(key, 0, id);
+        delta.delete(key);
+      }
+    }
+    this.columnStoreOf(t, true);
+    return true;
+  }
+
+  /**
+   * Rewrite a columnar table's segments: live segment rows and all delta rows go into a new column
+   * store (`keep` false: an empty one, for DELETE without WHERE); the delta store and deletions are
+   * emptied. A new segment root changes the schema (readers reload it). Returns the rows dropped
+   * (`keep` false) or 0.
+   */
+  private rewriteColumnar(t: TableSchema, keep: boolean): number {
+    const c = t.columnar!;
+    const ncols = t.columns.length;
+    const store = this.columnStoreOf(t, true);
+    const delTree = this.tree(c.delRoot);
+    const delta = this.tree(t.rootPage);
+    const deleted = loadDeleted(delTree);
+    const segRoot = BTree.create(this.pager);
+    let dropped = 0;
+    if (keep) {
+      const w = new ColumnStoreWriter(this.tree(segRoot), ncols + 1);
+      const row: SqlValue[] = new Array(ncols + 1);
+      try {
+        for (let rg = 0; rg < store.rowGroups; rg++) {
+          const rows = store.meta(rg).rows;
+          const gone = deletedBitmap(store, rg, ncols, deleted);
+          const chunks = Array.from({ length: ncols + 1 }, (_, k) => store.chunk(rg, k));
+          for (let i = 0; i < rows; i++) {
+            if (gone !== null && gone[i] === 1) continue;
+            for (let k = 0; k <= ncols; k++) row[k] = chunkValue(chunks[k], i);
+            w.add(row);
+          }
+        }
+        for (const { row: r } of this.deltaRows(t)) w.add(r);
+        w.finish();
+      } catch (e) {
+        w.abort();
+        throw e;
+      }
+    } else {
+      dropped = delta.count() + store.rows - delTree.count();
+    }
+    this.freshTree(c.segRoot).destroy();
+    delTree.clear();
+    delta.clear();
+    c.segRoot = segRoot;
+    c.store = undefined;
+    this.writeColumnarMeta(t.name, c);
+    this.dirtySchema = true;
+    this.schemaChanged();
+    return dropped;
+  }
+
   /** Build materialized views' table schemas from catalog rows and smalt_matview. */
   private loadMatviews(rows: { name: string; rootpage: number; sql: string | null }[]): void {
     if (rows.length === 0) return;
@@ -1216,11 +1432,11 @@ export class Database implements FunctionContext {
   /** ANALYZE [table]: gather optimizer statistics and store them in smalt_stat. */
   private analyze(target: string | undefined): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
-    let tables = [...this.tables.values()].filter((t) => !t.system && t.name.toLowerCase() !== 'smalt_stat' && t.matview?.storage !== 'columnar');
+    let tables = [...this.tables.values()].filter((t) => !t.system && t.name.toLowerCase() !== 'smalt_stat' && t.matview?.storage !== 'columnar' && !t.columnar);
     if (target) {
       const t = this.tables.get(target.toLowerCase());
       const idx = this.indexes.get(target.toLowerCase());
-      if (t) tables = t.matview?.storage === 'columnar' ? [] : [t];
+      if (t) tables = t.matview?.storage === 'columnar' || t.columnar ? [] : [t];
       else if (idx) tables = [this.tables.get(idx.table.toLowerCase())!];
       else throw new SmaltError('SMALT_ERROR', `no such table or index: ${target}`);
     }
@@ -1266,7 +1482,7 @@ export class Database implements FunctionContext {
    * recomputed when the table's size (estimated from the tree shape) has changed 4x or more.
    */
   private sampledStats(t: TableSchema): TableStats | undefined {
-    if (t.name.toLowerCase().startsWith('smalt_') || t.matview?.storage === 'columnar') return undefined;
+    if (t.name.toLowerCase().startsWith('smalt_') || t.matview?.storage === 'columnar' || t.columnar) return undefined;
     const tree = this.tree(t.rootPage);
     const live = tree.estimateCount();
     const hit = this.sampled.get(t);
@@ -1339,12 +1555,29 @@ export class Database implements FunctionContext {
 
   private createTable(stmt: CreateTableStmt, sql: string, internal = false): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
-    if (stmt.temp) return this.createTempTable(stmt, sql);
+    const columnar = tableStorage(stmt) === 'columnar';
+    if (stmt.temp) {
+      if (columnar) throw new SmaltError('SMALT_UNSUPPORTED', 'TEMP tables cannot be columnar');
+      return this.createTempTable(stmt, sql);
+    }
     if (stmt.ifNotExists && this.catalog.has(stmt.name.toLowerCase())) return none;
     if (!internal) this.checkNewName(stmt.name, 'table');
     this.dirtySchema = true;
     const root = BTree.create(this.pager);
     const { table, implicitIndexes } = buildTableSchema(stmt, sql, root);
+    if (columnar) {
+      // Columnar tables are scanned, not probed: no secondary structures to keep in step.
+      if (implicitIndexes.length > 0) throw new SmaltError('SMALT_UNSUPPORTED', 'columnar tables support no UNIQUE or PRIMARY KEY constraints other than INTEGER PRIMARY KEY');
+      if (table.foreignKeys.length > 0) throw new SmaltError('SMALT_UNSUPPORTED', 'columnar tables cannot have foreign keys');
+      if (!this.tables.has('smalt_columnar')) {
+        this.createTable(parseOne(Database.COLUMNAR_SQL).stmt as CreateTableStmt, Database.COLUMNAR_SQL, true);
+      }
+      table.columnar = { segRoot: BTree.create(this.pager), delRoot: BTree.create(this.pager) };
+      this.writeColumnarMeta(table.name, table.columnar);
+    }
+    for (const fk of table.foreignKeys) {
+      if (this.tables.get(fk.table.toLowerCase())?.columnar) throw new SmaltError('SMALT_UNSUPPORTED', `foreign keys cannot reference columnar table ${fk.table}`);
+    }
     this.addCatalogRow('table', table.name, table.name, root, sql);
     implicitIndexes.forEach((spec, i) => {
       const name = autoIndexName(table.name, i + 1);
@@ -1391,6 +1624,7 @@ export class Database implements FunctionContext {
     const table = this.tables.get(stmt.table.toLowerCase());
     if (!table) throw new SmaltError('SMALT_ERROR', this.views.has(stmt.table.toLowerCase()) ? 'views may not be indexed' : `no such table: ${stmt.table}`);
     if (table.matview?.storage === 'columnar') throw new SmaltError('SMALT_ERROR', `columnar materialized view ${table.name} cannot be indexed (zone maps prune its scans)`);
+    if (table.columnar) throw new SmaltError('SMALT_UNSUPPORTED', `columnar table ${table.name} cannot be indexed (zone maps prune its scans)`);
     if (table.temp) {
       if (this.indexes.has(stmt.name.toLowerCase())) throw new SmaltError('SMALT_ERROR', `index ${stmt.name} already exists`);
     } else this.checkNewName(stmt.name, 'index');
@@ -1636,6 +1870,11 @@ export class Database implements FunctionContext {
         this.indexes.delete(idx.name.toLowerCase());
       }
       this.freshTree(table.rootPage).destroy();
+      if (table.columnar) {
+        this.freshTree(table.columnar.segRoot).destroy();
+        this.freshTree(table.columnar.delRoot).destroy();
+        this.writeColumnarMeta(table.name, null);
+      }
       this.removeCatalogRow(table.name);
       this.tables.delete(lower);
       this.schemaChanged();
@@ -1686,6 +1925,7 @@ export class Database implements FunctionContext {
     const table = this.tables.get(lower);
     if (!table) throw new SmaltError('SMALT_ERROR', `no such table: ${stmt.table}`);
     if (table.matview) throw new SmaltError('SMALT_ERROR', `materialized view ${table.name} may not be altered`);
+    if (table.columnar) throw new SmaltError('SMALT_UNSUPPORTED', `ALTER TABLE is not supported for columnar table ${table.name} yet`);
     this.dirtySchema = true;
     const a = stmt.action;
     switch (a.kind) {
@@ -1926,7 +2166,7 @@ export class Database implements FunctionContext {
   private targetTable(name: string, schema?: string): TableSchema {
     if (schema && schema.toLowerCase() !== 'main') throw new SmaltError('SMALT_ERROR', `unknown database ${schema}`);
     const lower = name.toLowerCase();
-    if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat' || lower === 'smalt_matview') throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
+    if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat' || lower === 'smalt_matview' || lower === 'smalt_columnar') throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
     const t = this.tables.get(lower);
     if (!t) {
       if (this.views.has(lower)) throw new SmaltError('SMALT_ERROR', `cannot modify ${name} because it is a view`);
@@ -2432,7 +2672,7 @@ export class Database implements FunctionContext {
     const ret = stmt.returning ? this.compileReturning(stmt.returning, table, stmt.alias, this.rowScope(table, stmt.alias, oldBase, oldRowid, planner), planner.sqlText) : undefined;
     const exec = (r: SqlValue[], out?: SqlValue[][]): RunResult => {
       if (truncate && !this.fk.involved(table)) {
-        const n = new TableWriter(table, this.pager, (root) => this.tree(root)).truncate();
+        const n = table.columnar ? this.rewriteColumnar(table, false) : new TableWriter(table, this.pager, (root) => this.tree(root)).truncate();
         this.lastChanges = n;
         this.total += n;
         return { changes: n, lastInsertRowid: this.lastRowid };
@@ -2615,6 +2855,10 @@ export class Database implements FunctionContext {
           let pages = 1 + check(this.pager.catalogRoot, 'smalt_schema');
           for (const t of this.tables.values()) {
             pages += check(t.rootPage, `table ${t.name}`);
+            if (t.columnar) {
+              pages += check(t.columnar.segRoot, `segments of ${t.name}`);
+              pages += check(t.columnar.delRoot, `deletions of ${t.name}`);
+            }
             const n = this.freshTree(t.rootPage).count();
             for (const i of t.indexes) {
               pages += check(i.rootPage, `index ${i.name}`);
@@ -2627,6 +2871,13 @@ export class Database implements FunctionContext {
           }
           return errors.length ? errors.map((e) => [e]) : [['ok']];
         });
+      case 'compact': {
+        // Columnar table: rewrite its segments with every live row (delta included), dropping deletions.
+        const name = arg();
+        const t = name ? this.tables.get(name.toLowerCase()) : undefined;
+        if (!t?.columnar) throw new SmaltError('SMALT_ERROR', `PRAGMA compact needs a columnar table${name ? `, not ${name}` : ''}`);
+        return { readonly: false, columns: [], columnTypes: [], exec: () => (this.rewriteColumnar(t, true), { changes: 0, lastInsertRowid: this.lastRowid }) };
+      }
       case 'journal_mode':
         return ro(['journal_mode'], () => [[this.pager.walStats ? 'wal' : 'off']]);
       case 'wal_checkpoint':
@@ -3016,4 +3267,13 @@ interface MemView {
 interface MemSnapshot {
   temps: [string, TableSchema, IndexSchema[]][];
   views: [string, MemView][];
+}
+
+/** `CREATE TABLE … WITH (storage = 'row' | 'columnar')` (validates the options). */
+function tableStorage(stmt: CreateTableStmt): 'row' | 'columnar' {
+  const opts = stmt.with ?? {};
+  for (const k of Object.keys(opts)) if (k !== 'storage') throw new SmaltError('SMALT_ERROR', `unknown table option: ${k}`);
+  const storage = String(opts.storage ?? 'row').toLowerCase();
+  if (storage !== 'row' && storage !== 'columnar') throw new SmaltError('SMALT_ERROR', `storage must be 'row' or 'columnar'`);
+  return storage;
 }

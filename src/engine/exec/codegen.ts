@@ -618,8 +618,14 @@ class Pipeline {
         denseDec.push(`let c${reg} = null; ${generic}`);
       }
     }
+    const rowidExpr = src.segments ? 'rid[i]' : 'base + i + 1';
+    const skip = src.segments ? ['if (dm !== null && dm[i] === 1) continue;'] : [];
+    if (src.segments) {
+      groupStart.push('const dm = H.deleted(g);');
+      if (src.rowidRegs.length) groupStart.push('const rid = H.rowids(g);');
+    }
     if (src.rowidRegs.length) {
-      dec.push('{ const id = base + i + 1;');
+      dec.push(`{ const id = ${rowidExpr};`);
       for (const reg of src.rowidRegs) dec.push(assign(reg, 'id'));
       dec.push('}');
     }
@@ -632,15 +638,16 @@ class Pipeline {
         ? {
             test: denseTests.join(' && '),
             rowStart: [
+              ...skip,
               ...denseDec,
-              ...rowidDecl.map((reg) => (localRegs.get(reg) ? `const c${reg}n = false; const c${reg} = base + i + 1;` : `const c${reg} = base + i + 1;`)),
+              ...rowidDecl.map((reg) => (localRegs.get(reg) ? `const c${reg}n = false; const c${reg} = ${rowidExpr};` : `const c${reg} = ${rowidExpr};`)),
             ],
           }
         : null;
     return {
       prologue: outer.map((reg) => (localRegs.get(reg) ? `const c${reg}n = r[${reg}] === null; const c${reg} = c${reg}n ? 0 : r[${reg}];` : `const c${reg} = r[${reg}];`)),
       groupStart,
-      rowStart: [locals.length ? `let ${declLocals};` : '', ...dec],
+      rowStart: [...skip, locals.length ? `let ${declLocals};` : '', ...dec],
       dense,
     };
   }
@@ -705,6 +712,8 @@ export function generateFusedAggregate(
 export interface ColumnSource {
   decode: number[];
   rowidRegs: number[];
+  /** Columnar table segments: rowids come from a stored column and deleted rows are skipped. */
+  segments?: boolean;
 }
 
 /** Helpers for generated loops over a column store (one execution: `open` evaluates zone-map values). */
@@ -717,6 +726,10 @@ export interface ColumnarHelpers extends CodegenHelpers {
   keep(g: number): boolean;
   rows(g: number): number;
   chunk(g: number, col: number): unknown;
+  /** Columnar table segments: stored rowids of a row group. */
+  rowids?(g: number): ArrayLike<SqlValue>;
+  /** Columnar table segments: per-row deleted flags of a row group (null: none deleted). */
+  deleted?(g: number): Uint8Array | null;
 }
 
 /** Where a generated pipeline reads rows from: leaf pages of a row table, or a column store. */
