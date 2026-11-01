@@ -105,7 +105,13 @@ Source: `src/engine/exec/` — `planner.ts`, `operators.ts`, `expr.ts`, `functio
 - **Sorting:** in-memory stable sort with a top-N cap when `LIMIT` is known. `ORDER BY rowid` on a single-table scan uses the
   table order, scanning in reverse for DESC.
 - **`count(*)` fast path:** summing leaf cell counts, as SQLite's `OP_Count` does.
-- **Subqueries:** uncorrelated ones are evaluated once per execution. Correlated ones re-run per outer row (decorrelation is M4).
+- **Subqueries:** uncorrelated ones are evaluated once per execution. Since M4, correlated `[NOT] EXISTS` and
+  scalar-aggregate subqueries whose correlation is a set of equalities (`inner = outer`) are **decorrelated**.
+  The inner side runs once per execution, as a hash semi-join (EXISTS) or one GROUP BY on the correlation keys
+  (scalar aggregates, with the empty-set value such as `count` = 0 for missing keys). Hashing uses the comparison's
+  collation and affinity, so it is exactly `=`. Conjuncts over the outer row alone act as per-row guards. Anything
+  else (non-equality correlation, correlated IN, LIMIT/ORDER BY in a scalar subquery, views or derived tables
+  inside) re-runs per outer row as before. `SMALT_NO_DECORRELATE=1` disables it for tests.
 - **Fused pipelines** (generated per query when code generation is allowed). Single-table full scans with WHERE compile into one function
   that walks leaf pages, decodes the needed columns into per-row locals (numeric values with separate NULL flags, so they stay unboxed) and
   evaluates the conjuncts. Three consumers are fused: ungrouped aggregates (`FusedScanAggregate`), GROUP BY with an inline hash aggregate
