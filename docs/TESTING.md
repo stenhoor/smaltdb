@@ -53,3 +53,16 @@ What M1 adds:
 - **Statement savepoints:** model-based tests that interleave statement and transaction commits and rollbacks.
 - **Record format:** property tests for round trips and for rowid key ordering.
 - **SQL smoke tests:** constraints, transactions, persistence, `EXPLAIN QUERY PLAN`.
+
+## Timing in tests
+
+Tests must not depend on scheduling luck. CI runners are slower and busier than a development machine, and several
+"flaky" failures came from tests that slept a fixed time and then asserted.
+- **Waiting for something to happen:** poll for the exact response being checked, with `until(what, done)` from
+  `test/helpers/wait.ts`. It polls every 5 ms and fails after a deadline, naming what never arrived, so a real
+  deadlock still fails clearly.
+- **Checking that something has *not* happened** (a request still waiting): `pause()` is fine. Extra load can only
+  keep such a check passing, never make it flake.
+- **Routing to parallel readers or morsels** depends on message timing between page and worker. A browser test that
+  needs a query to run on a reader detects where it actually ran (`db.stats.readerQueries` / `morselQueries`, with a
+  concurrent request that always stays on the owner, such as a PRAGMA) and retries, instead of assuming it.
