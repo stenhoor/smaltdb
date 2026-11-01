@@ -28,7 +28,13 @@ efficient fixed-width columnar storage and vectorization.
 ## 3. Functions
 
 - Core scalar functions: SQLite's full core set (`abs`, `coalesce`, `ifnull`, `instr`, `length`, `lower`, `printf`/`format`, `replace`, `round`, `substr`, `trim`, `typeof`, …)
-- Date/time: `date`, `time`, `datetime`, `julianday`, `unixepoch`, `strftime`
+- Date/time: `date`, `time`, `datetime`, `julianday`, `unixepoch`, `strftime`, `timediff`, and `CURRENT_DATE` / `CURRENT_TIME` /
+  `CURRENT_TIMESTAMP`, with SQLite 3.54 semantics (a port of SQLite's `date.c`, checked against the SQLite WASM build in
+  `test/datetime.test.ts`). All time-value formats are supported (`YYYY-MM-DD[ |T]HH:MM[:SS[.SSS]]`, `HH:MM…` alone, `24:00`, time-zone
+  suffixes `[+-]HH:MM` / `Z`, `'now'`, `'subsec'`, julian day or Unix numbers), as are all modifiers (`±NNN days|hours|minutes|seconds|months|years`,
+  `±HH:MM[:SS[.SSS]]`, `±YYYY-MM-DD[ HH:MM[:SS[.SSS]]]`, `start of day|month|year`, `weekday [-]N`, `unixepoch`, `julianday`, `auto`,
+  `localtime`, `utc`, `subsec`/`subsecond`, `ceiling`, `floor`) and all `strftime` codes (`%d %e %f %F %G %g %H %I %j %J %k %l %m %M %p %P
+  %R %s %S %T %u %U %V %w %W %Y %%`). Invalid input gives NULL where SQLite does. `'localtime'` and `'utc'` use the host (browser) time zone.
 - Math: SQLite math functions
 - Aggregates: `count`, `sum`, `total`, `avg`, `min`, `max`, `group_concat`/`string_agg`
 - Window functions: `row_number`, `rank`, `dense_rank`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, and aggregates over frames
@@ -123,7 +129,7 @@ losslessly as SQLite STRICT tables do (`'5'` into an INTEGER column becomes 5), 
 
 **Not yet supported** (each gives a clear `SMALT_UNSUPPORTED` error): window functions, `RIGHT` / `FULL` joins,
 TEMP views, materialized views (M5), `ON CONFLICT` targets with WHERE, row-value assignments (`SET (a, b) = …`), `ALTER TABLE`, expression and
-partial indexes, `INCLUDE` columns, `WITHOUT ROWID`, `LOOSE` tables, generated columns, TEMP tables, date/time and JSON
+partial indexes, `INCLUDE` columns, `WITHOUT ROWID`, `LOOSE` tables, generated columns, TEMP tables, JSON
 functions, and `VACUUM`. Plain `EXPLAIN` returns the `EXPLAIN QUERY PLAN` output (there is no bytecode to list). Foreign keys are parsed and stored but not yet enforced (M4).
 
 **Known deviations:**
@@ -136,4 +142,10 @@ functions, and `VACUUM`. Plain `EXPLAIN` returns the `EXPLAIN QUERY PLAN` output
 - `OR FAIL` behaves like `OR ABORT`.
 - In `GROUP BY` / `DISTINCT` over NOCASE or RTRIM text, values that compare equal form one group, and which spelling is returned is unspecified.
   smaltdb returns the first row in scan order; SQLite returns the first in its own sort order, which can differ.
+- Date/time: `'now'` (and `CURRENT_*`) is read once per statement execution, so every row of a query sees the same instant (SQLite
+  guarantees this only within one `sqlite3_step()`). `unixepoch(…, 'subsec')` returns a REAL that reads back as INTEGER when it has no
+  fractional part (the integral-REAL deviation above). Julian-day arithmetic is done in doubles, exact up to ±2^53 ms, so modifier chains whose
+  intermediate values exceed that (e.g. `'+400000000000000 seconds', '-400000000000000 seconds'`) can be off by a few milliseconds where
+  SQLite's int64 arithmetic is exact. Date functions are not rejected in CHECK constraints (SQLite rejects `'now'`
+  and `'localtime'` there).
 - Index keys must fit in about a quarter of a page (≈2 KB with 8 KiB pages); SQLite allows larger keys via overflow pages.

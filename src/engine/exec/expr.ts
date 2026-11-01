@@ -20,6 +20,7 @@ import {
   toText,
   truthy,
 } from './convert.js';
+import { currentTimeText } from './datetime.js';
 import { type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type CodegenHelpers, codegenEnabled, generate, isCodegenRoot } from './codegen.js';
 import { decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
@@ -951,10 +952,8 @@ function compileCall(e: CallExpr, scope: CompileScope): Compiled {
   }
   if (e.distinct || e.star || e.filter) throw new SmaltError('SMALT_ERROR', `DISTINCT/FILTER/* is only valid with aggregate functions`);
   if (name === 'current_time' || name === 'current_date' || name === 'current_timestamp') {
-    const now = new Date();
-    const iso = now.toISOString();
-    const v = name === 'current_date' ? iso.slice(0, 10) : name === 'current_time' ? iso.slice(11, 19) : iso.slice(0, 10) + ' ' + iso.slice(11, 19);
-    return { fn: () => v, type: 'text', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
+    const ctx = scope.funcCtx;
+    return { fn: () => currentTimeText(name, ctx.now()), type: 'text', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
   }
   const def = scalarFunctions.get(name);
   if (!def) throw new SmaltError('SMALT_ERROR', `no such function: ${name}`);

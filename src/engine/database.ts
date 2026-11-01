@@ -176,6 +176,11 @@ export class Database implements FunctionContext {
   totalChanges(): number {
     return this.total;
   }
+  /** 'now' for date/time functions: read once per statement execution (reset in execute()). */
+  now(): number {
+    return (this.stmtNow ??= Date.now());
+  }
+  private stmtNow: number | undefined;
 
   get inTransaction(): boolean {
     return !this.autocommit;
@@ -548,6 +553,7 @@ export class Database implements FunctionContext {
       throw new SmaltError('SMALT_BUSY', 'cannot modify the database while a query cursor is open; finish or close it first');
     }
     this.state.epoch++;
+    this.stmtNow = undefined;
     if (program.readonly) return body();
     const pager = this.pager;
     // A statement journal is only needed inside an explicit transaction (autocommit failures roll
