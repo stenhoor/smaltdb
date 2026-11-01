@@ -261,32 +261,44 @@ MemoryVfs, median of 5). Invariant tests are in `test/perf-invariants.test.ts`.
 
 ## Cleanup
 
+Status: done, except two items kept on purpose and two that are behavior changes (follow-up features). Behavior is
+unchanged: all suites pass, and `bench/micro/m7-perf.ts` plus an interpreted GROUP BY benchmark show no regression.
+
 - **Reuse:**
-  - `mv-match.ts` re-implements helpers that already exist:
-    - `conjuncts` (exported from `expr.ts`);
-    - `andAll` (`flatten.ts` `and`);
-    - the aggregate and subquery predicates (`planner.ts`).
-  - There are three notions of structural expression equality: `exprKey`, `exprShapeKey` and `exprEquals`. Use one.
-  - Three deep AST walkers exist (`walk`, `contains`, `flatten.ts` `anyNode`).
-  - `writeColumnarMeta` duplicates `writeMatviewMeta`: one "upsert a row by name" helper would serve both, and the
-    matview version does not close its cursor on errors.
-  - Pragma boolean parsing and setter literals are written out three or four times.
-  - There is a third varint codec in `spill.ts`.
+  - *AST helpers:* a new `sql/ast-util.ts` holds `exprKey`, `anyNode`, `and` and `andAll`.
+    - `mv-match.ts` uses `conjuncts` from `expr.ts`, the shared `andAll` and `anyNode`, and the planner's
+      `isAggregateCall`; its own copies are gone.
+    - `flatten.ts` uses the shared `and` and `anyNode`, keeping its behavior of not entering nested SELECTs.
+  - *Expression keys:* `exprKey` (morsels, MV matching) and the planner's `exprShapeKey` are now one canonical function
+    with options (`foldNames`, `ignoreQualifiers`). **Kept:** `exprEquals` stays a separate, allocation-free
+    comparator, because it is used on planner hot paths where building a key string would cost more.
+  - *Walkers:* the deep walkers (`walk` in morsel, `contains` in mv-match, `anyNode` in flatten) are replaced by the
+    shared `anyNode`.
+  - *Metadata rows:* `writeMatviewMeta` and `writeColumnarMeta` share `upsertMetaRow`, which also closes its cursor on
+    errors.
+  - *Pragmas:* boolean parsing and setters use `pragmaBool()` and `setter()`.
+  - *Varints:* the spill writer uses the B+tree module's `writeVarint` (same encoding).
 - **Simplification:**
-  - `HashAggregate.step` and `stepRecord` are near-duplicates.
-  - `MemView` duplicates the `MatViewInfo` state fields.
-  - There are three ways to get a table's `ColumnStore`.
-  - Unused statistics fields remain (`spilledRuns`, `spilledPartitions`, `ColumnScan.skipped`).
-  - The interpreted `ColumnScan` and the codegen helpers duplicate zone, deletion and rowid handling.
-  - The worker encodes morsel tasks as fake jobs with negative ids.
+  - *Column stores:* a single `storeOf(t)` replaces the three ways of getting a table's `ColumnStore`, and one
+    `liveRows(t)` is shared by the planner (through `PlannerEnv`) and `parallelSplit`.
+  - *Unused fields removed:* `spilledRuns`, `spilledPartitions` and `ColumnScan.skipped`.
+  - *Columnar scans:* the interpreted `ColumnScan` and the generated loops share `ColumnScanRun` (zone-map test,
+    deleted flags, stored rowids per row group).
+  - *Worker jobs:* reader jobs are a tagged union (`{ kind: 'query' } | { kind: 'partial' }`) instead of fake jobs with
+    negative ids.
+  - **Kept:** `HashAggregate.step` and `stepRecord` stay separate. Routing in-memory rows through the spill record
+    format cost about 20% on an interpreted GROUP BY (34 → 41 ms over 300k rows), so `step` reads registers directly
+    and a comment ties the two together. `record()` now shares `inputs()` with the spill path.
+  - **Kept:** `MemView` still mirrors the refresh state of `MatViewInfo`. It has to outlive `TableSchema` objects,
+    which are rebuilt on every schema reload. Folding the two together would touch every refresh path for little gain.
 - **Altitude:**
-  - About ten hand-written `t.matview?.storage === 'columnar' || t.columnar` checks: use one `isColumnar(t)`
-    predicate and one `liveRows(t)`.
-  - Columnar views use an implicit rowid zone column (-1). As a result, INTEGER PRIMARY KEY range filters on
-    columnar views are never pruned.
-  - MV rewrite applies only to top-level SELECT and EXPLAIN, not to subqueries, CTEs, views or INSERT … SELECT.
-    Hooking it into `planSelect` would cover all of them.
-  - PRAGMA settings (`work_mem`, `matview_rewrite`) are not passed to parallel readers.
+  - *Columnar checks:* the hand-written `t.matview?.storage === 'columnar' || t.columnar` checks are now
+    `isColumnar(t)`.
+  - *Implicit rowid zone (-1):* kept, and the stated consequence does not occur. A materialized view's storage layout
+    never declares an INTEGER PRIMARY KEY, so views have no rowid alias that could go unpruned.
+  - **Follow-up features, not cleanup** (they change behavior):
+    - MV rewrite inside subqueries, CTEs, views and INSERT … SELECT, by hooking it into `planSelect`;
+    - passing PRAGMA settings (`work_mem`, `matview_rewrite`) to parallel readers.
 
 ## Suggested order of work
 

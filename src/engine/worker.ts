@@ -79,9 +79,12 @@ function startReader(init: Extract<ReaderMessage, { type: 'init' }>): void {
 let bus: BroadcastChannel | null = null;
 const leaderId = crypto.randomUUID();
 
+/** What a reader worker is busy with: a client's query (streamed to it directly) or a morsel. */
+type ReaderJob = { kind: 'query'; session: string; id: number } | { kind: 'partial'; task: number };
+
 /** Parallel readers of this owner (empty when shared handles are unavailable). */
 class Readers implements ReaderPool {
-  private readonly workers: { w: Worker; ready: boolean; job: { session: string; id: number } | null }[] = [];
+  private readonly workers: { w: Worker; ready: boolean; job: ReaderJob | null }[] = [];
   private readonly partials = new Map<number, (err: string | null, rows: SqlValue[][] | null) => void>();
   private nextTask = 1;
 
@@ -93,7 +96,7 @@ class Readers implements ReaderPool {
     const r = this.workers.find((x) => x.ready && x.job === null);
     if (!r) return false;
     const id = this.nextTask++;
-    r.job = { session: '', id: -id }; // busy (and holds checkpoints back) until the partial is done
+    r.job = { kind: 'partial', task: id }; // busy (and holds checkpoints back) until the partial is done
     this.partials.set(id, done);
     r.w.postMessage({ type: 'partial', task: id, sql: task.sql, params: task.params, lo: task.lo, hi: task.hi } satisfies ReaderMessage);
     return true;
@@ -107,7 +110,7 @@ class Readers implements ReaderPool {
   start(count: number, open: Extract<Request, { op: 'open' }>): void {
     for (let i = 0; i < count; i++) {
       const w = new Worker(scope.location.href, { type: 'module', name: `smaltdb-reader-${i + 1}` });
-      const entry = { w, ready: false, job: null as { session: string; id: number } | null };
+      const entry = { w, ready: false, job: null as ReaderJob | null };
       this.workers.push(entry);
       const ch = new MessageChannel();
       w.onmessage = (e: MessageEvent<ReaderMessage>) => {
@@ -125,9 +128,9 @@ class Readers implements ReaderPool {
       w.onerror = () => {
         entry.ready = false;
         // Partials it was running will not come back: fail them (the owner answers the query itself).
-        if (entry.job !== null && entry.job.id < 0) {
-          const done = this.partials.get(-entry.job.id);
-          this.partials.delete(-entry.job.id);
+        if (entry.job?.kind === 'partial') {
+          const done = this.partials.get(entry.job.task);
+          this.partials.delete(entry.job.task);
           entry.job = null;
           done?.('reader failed', null);
         }
@@ -144,14 +147,14 @@ class Readers implements ReaderPool {
   dispatch(session: string, req: Extract<Request, { op: 'query' }>): boolean {
     const r = this.workers.find((x) => x.ready && x.job === null);
     if (!r) return false;
-    r.job = { session, id: req.id };
+    r.job = { kind: 'query', session, id: req.id };
     r.w.postMessage({ type: 'job', session, req } satisfies ReaderMessage);
     return true;
   }
 
   forward(session: string, req: Request): boolean {
     const target = (req as { target?: number }).target;
-    const r = this.workers.find((x) => x.job !== null && x.job.session === session && x.job.id === target);
+    const r = this.workers.find((x) => x.job?.kind === 'query' && x.job.session === session && x.job.id === target);
     if (!r) return false;
     r.w.postMessage({ type: 'job', session, req } satisfies ReaderMessage);
     return true;

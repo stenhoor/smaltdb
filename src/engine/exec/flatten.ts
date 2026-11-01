@@ -16,6 +16,10 @@ import type { TableSchema } from '../catalog/schema.js';
 import { findColumn } from '../catalog/schema.js';
 import type { ColumnExpr, Expr, FromItem, JoinType, OrderingTerm, ResultColumn, SelectCoreSelect, SelectStmt, TableRef } from '../sql/ast.js';
 import { aggregateFunctions } from './functions.js';
+import { and, anyNode as anyNodeIn } from '../sql/ast-util.js';
+
+/** Whether any node of `e` satisfies `pred`, not looking inside nested SELECT statements. */
+const anyNode = (e: unknown, pred: (x: Record<string, unknown>) => boolean): boolean => anyNodeIn(e, pred, false);
 
 export interface FlattenContext {
   getTable(name: string): TableSchema | undefined;
@@ -69,12 +73,6 @@ function rebuild(links: Link[]): FromItem {
   return acc;
 }
 
-function and(a: Expr | undefined, b: Expr | undefined): Expr | undefined {
-  if (!a) return b;
-  if (!b) return a;
-  return { kind: 'binary', op: 'AND', left: a, right: b, pos: a.pos, end: a.end };
-}
-
 const isPlainObject = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && Object.getPrototypeOf(x) === Object.prototype;
 
 /**
@@ -98,24 +96,6 @@ function mapColumns(e: Expr, f: (c: ColumnExpr) => Expr, onSelect: (s: SelectStm
 }
 
 /** Visit every expression node (not entering nested SELECTs). */
-function anyNode(e: Expr | undefined, pred: (x: Record<string, unknown>) => boolean): boolean {
-  if (!e) return false;
-  let hit = false;
-  const go = (x: unknown): void => {
-    if (hit) return;
-    if (Array.isArray(x)) return x.forEach(go);
-    if (!isPlainObject(x)) return;
-    if (pred(x)) {
-      hit = true;
-      return;
-    }
-    if (x.kind === 'select' && 'core' in x) return;
-    for (const k of Object.keys(x)) go(x[k]);
-  };
-  go(e);
-  return hit;
-}
-
 /** All identifiers (column names and qualifiers, FROM names) mentioned anywhere inside `s`, lower-cased. */
 function identifiersIn(s: SelectStmt): Set<string> {
   const out = new Set<string>();

@@ -112,7 +112,8 @@ function varintLen(v: number): number {
   return n;
 }
 
-function writeVarint(b: Uint8Array, p: number, v: number): number {
+/** Unsigned LEB128-style varint (7 bits per byte, low first) at `p`; returns the end. */
+export function writeVarint(b: Uint8Array, p: number, v: number): number {
   while (v >= 128) {
     b[p++] = (v % 128) | 0x80;
     v = Math.floor(v / 128);

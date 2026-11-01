@@ -22,7 +22,7 @@ function decorrelationDisabled(): boolean {
   return decorrelateOff;
 }
 import { SmaltError } from '../errors.js';
-import { type TableSchema, findColumn } from '../catalog/schema.js';
+import { type TableSchema, findColumn, isColumnar } from '../catalog/schema.js';
 import type {
   CallExpr,
   ColumnExpr,
@@ -71,6 +71,7 @@ import {
   Filter,
   FusedGroupAggregate,
   ColumnarTableScan,
+  ColumnScanRun,
   FusedScanAggregate,
   FusedScanFilter,
   HashAggregate,
@@ -97,6 +98,7 @@ import {
 import { type ColumnStore, ROW_GROUP_ROWS, zoneMayMatch } from '../storage/columnar.js';
 import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
 import { deletedBitmap, rowidsOf, zoneOf } from './columnar-table.js';
+import { exprKey } from '../sql/ast-util.js';
 
 export interface PlannerEnv {
   /** A table by name; `schema` 'main' / 'temp' picks that schema when a TEMP table shadows a main one. */
@@ -113,6 +115,8 @@ export interface PlannerEnv {
   sampledStats?(table: TableSchema): TableStats | undefined;
   /** Reader for the segments of a columnar materialized view or table. */
   columnStore?(table: TableSchema): ColumnStore;
+  /** Estimated rows of a table (columnar storage counts its segments); default: the tree's shape. */
+  liveRows?(table: TableSchema): number;
   /** Columnar table: rowids hidden in its segments (read per scan), null when none. */
   deletedRows?(table: TableSchema): Set<number | bigint> | null;
   funcCtx: FunctionContext;
@@ -794,7 +798,7 @@ export class Planner {
     const rc = core.columns[0];
     if (rc.kind !== 'expr' || rc.expr.kind !== 'call' || rc.expr.name !== 'count' || !rc.expr.star || rc.expr.filter || rc.expr.over) return null;
     const table = this.env.getTable(core.from.name, core.from.schema);
-    if (!table || table.matview?.storage === 'columnar' || table.columnar) return null;
+    if (!table || isColumnar(table)) return null;
     const reg = outRegs ? outRegs[0] : this.regs.alloc();
     const name = rc.alias ?? this.sqlText.slice(rc.expr.pos, rc.expr.end);
     return {
@@ -971,35 +975,21 @@ export class Planner {
 
   /** Column-store access for generated loops over a columnar scan (zone maps evaluated per execution). */
   private columnarHelpers(node: ColumnScan): ColumnarHelpers {
-    let s: ColumnStore;
-    let vals: SqlValue[] = [];
-    let del: Set<number | bigint> | null = null;
-    const zones = node.zones;
-    const seg = node.segments;
+    let run: ColumnScanRun;
     return {
       ...CODEGEN_HELPERS_FOR_FUSION,
       RG: ROW_GROUP_ROWS,
       open: (r) => {
-        s = node.store();
-        vals = zones.map((z) => z.value(r));
-        del = seg !== null ? seg.deleted() : null;
+        run = new ColumnScanRun(node, r);
       },
-      groups: () => s.rowGroups,
-      keep: (g) => {
-        if (zones.length === 0) return true;
-        const m = s.meta(g);
-        for (let k = 0; k < zones.length; k++) {
-          const z = zones[k];
-          if (!zoneMayMatch(zoneOf(m, g, z.col), m.rows, z.op, vals[k], z.binaryText)) return false;
-        }
-        return true;
-      },
-      rows: (g) => s.meta(g).rows,
-      chunk: (g, c) => s.chunk(g, c),
-      ...(seg !== null
+      groups: () => run.store.rowGroups,
+      keep: (g) => run.keep(g),
+      rows: (g) => run.store.meta(g).rows,
+      chunk: (g, c) => run.store.chunk(g, c),
+      ...(node.segments !== null
         ? {
-            rowids: (g: number) => rowidsOf(s, g, seg.rowidCol),
-            deleted: (g: number) => deletedBitmap(s, g, seg.rowidCol, del),
+            rowids: (g: number) => run.rowids(g)!,
+            deleted: (g: number) => run.deletedFlags(g),
           }
         : {}),
     };
@@ -1550,7 +1540,7 @@ export class Planner {
     }
 
     const outerDep = (list: Probe[]): boolean => list.some((x) => x.deps.size > 0);
-    if (table.matview?.storage === 'columnar' || table.columnar) return this.columnarOptions(src, table, access, probes, cs, N);
+    if (isColumnar(table)) return this.columnarOptions(src, table, access, probes, cs, N);
     const options: AccessOption[] = [
       {
         label: 'scan',
@@ -1722,16 +1712,11 @@ export class Planner {
     if (src.sub) return SUBQUERY_ROWS;
     if (src.estRows === undefined) {
       const t = src.table!;
-      const live =
-        t.matview?.storage === 'columnar'
-          ? this.env.columnStore!(t).rows
-          : t.columnar
-            ? this.env.columnStore!(t).rows + src.access!.tree.estimateCount()
-            : src.access!.tree.estimateCount();
+      const live = this.env.liveRows ? this.env.liveRows(t) : src.access!.tree.estimateCount();
       src.estRows = Math.max(1, src.table!.stats?.rows ?? live);
       // Remember what the plan assumed, so the statement can re-plan if the table grows or shrinks a lot.
       // (Columnar views change only on refresh, which re-plans anyway.)
-      if (t.matview?.storage !== 'columnar' && !t.columnar) this.rowAssumptions.set(t.rootPage, live);
+      if (!isColumnar(t)) this.rowAssumptions.set(t.rootPage, live);
     }
     return src.estRows;
   }
@@ -2587,12 +2572,6 @@ export function markUnordered(op: Operator): void {
 }
 
 function exprShapeKey(e: Expr): string {
-  return JSON.stringify(e, (k, v) => {
-    if (k === 'pos' || k === 'end' || k === 'table' || k === 'schema') return undefined;
-    if (k === 'name' && typeof v === 'string') return v.toLowerCase();
-    if (typeof v === 'bigint') return `${v}n`;
-    if (v instanceof Uint8Array) return [...v];
-    return v;
-  });
+  return exprKey(e, { foldNames: true, ignoreQualifiers: true });
 }
 

@@ -19,6 +19,7 @@
  */
 import type { CallExpr, ColumnExpr, Expr, FromItem, LiteralExpr, OrderingTerm, ResultColumn, SelectStmt } from '../sql/ast.js';
 import { isAggregateCall } from './planner.js';
+import { anyNode, exprKey } from '../sql/ast-util.js';
 
 const MERGEABLE = new Set(['count', 'sum', 'total', 'min', 'max', 'avg']);
 
@@ -48,33 +49,7 @@ export interface MorselQuery {
 
 const NO_POS = { pos: 0, end: 0 };
 
-/** Structural key of an expression (positions ignored). */
-export function exprKey(e: unknown): string {
-  const canon = (v: unknown): unknown => {
-    if (typeof v === 'bigint') return `${v}n`;
-    if (v instanceof Uint8Array) return { bytes: [...v] };
-    if (Array.isArray(v)) return v.map(canon);
-    if (v && typeof v === 'object') {
-      const out: Record<string, unknown> = {};
-      for (const k of Object.keys(v).sort()) {
-        const x = (v as Record<string, unknown>)[k];
-        if (k === 'pos' || k === 'end' || x === undefined) continue;
-        out[k] = canon(x);
-      }
-      return out;
-    }
-    return v;
-  };
-  return JSON.stringify(canon(e));
-}
-
-function walk(x: unknown, visit: (node: Record<string, unknown>) => boolean | void): boolean {
-  if (Array.isArray(x)) return x.some((y) => walk(y, visit));
-  if (typeof x !== 'object' || x === null || x instanceof Uint8Array) return false;
-  const o = x as Record<string, unknown>;
-  if (visit(o) === true) return true;
-  return Object.keys(o).some((k) => walk(o[k], visit));
-}
+export { exprKey };
 
 const col = (name: string): ColumnExpr => ({ kind: 'column', name, ...NO_POS });
 const lit = (value: number | bigint): LiteralExpr => ({ kind: 'literal', value, ...NO_POS });
@@ -102,7 +77,7 @@ export function analyzeMorsels(stmt: SelectStmt, text: string, info: (table: str
   // Subqueries, window functions, DISTINCT / ORDER BY aggregates, unknown aggregate shapes: no.
   let bad = false;
   const scan = (x: unknown): void => {
-    walk(x, (o) => {
+    anyNode(x, (o) => {
       if (o.kind === 'subquery' || o.kind === 'exists' || o.kind === 'inSelect' || o.kind === 'select') bad = true;
       if (o.kind === 'call') {
         const c = o as unknown as CallExpr;
@@ -119,7 +94,7 @@ export function analyzeMorsels(stmt: SelectStmt, text: string, info: (table: str
   const keys = core.groupBy;
   for (const k of keys) {
     let ok = true;
-    walk(k, (o) => {
+    anyNode(k, (o) => {
       if (o.kind === 'collate') ok = false;
       if (o.kind === 'column') {
         const c = o as unknown as ColumnExpr;
