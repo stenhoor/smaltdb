@@ -77,3 +77,44 @@ Plain inserts and CREATE INDEX were also slower in Node. Two M4 changes caused i
 Most rows are within run-to-run noise. Cold point lookups show the widest spread of any row in both runs
 (58–100 ms here), so the 60 → 81 ms median difference is not a clear regression. They are still 1.7× faster
 than SQLite.
+
+## Index workloads (added after M4)
+
+Run: `bench/results/2026-11-01-chromium-9f1f951.json` (Chromium 153, 5 reps, OPFS for every engine).
+Table `a` has 200k rows. The indexes are `a(b)` (1,000 distinct values), `a(d, c)` and `a(lower(e))`.
+"Best SQLite" is the faster of WAL and TRUNCATE (both crash-safe) for each row. A verdict is given only
+when the min–max ranges do not overlap. All engines returned identical results.
+
+| Workload | smaltdb | Best SQLite | Ratio | Verdict |
+|---|---|---|---|---|
+| CREATE INDEX, 1 column | 196 ms | 169 ms (TRUNCATE) | 0.86× | overlap |
+| CREATE INDEX, 2 columns | 279 ms | 304 ms (TRUNCATE) | 1.09× | overlap |
+| CREATE INDEX on `lower(e)` | 338 ms | 202 ms (TRUNCATE) | 0.60× | slower |
+| Equality lookups ×10k (200 rows each) | 88.8 ms | 89.5 ms | 1.01× | overlap |
+| Range lookups ×1k (1% of rows each) | 696 ms | 522 ms | 0.75× | slower |
+| Composite lookups ×1k (`d = ? AND c > 500`) | 38.8 ms | 32.8 ms | 0.85× | slower |
+| Expression lookups ×1k (`lower(e) = ?`) | 118 ms | 189 ms | 1.60× | faster |
+| UPDATE indexed column, 10k rows | 236 ms | 1,310 ms | 5.6× | faster |
+| DELETE 10k rows (3 indexes) | 197 ms | 611 ms | 3.1× | faster |
+| Bulk insert 100k rows, 3 indexes | 756 ms | 1,126 ms | 1.49× | faster |
+
+Changes made to get here:
+- covering (index-only) scans;
+- index-enforced conditions are no longer re-filtered;
+- range estimates from the index's min/max;
+- 8-byte rowid-key compares;
+- in-place UPDATE that skips unchanged index keys;
+- sorted bulk append for CREATE INDEX;
+- no statement journal for single-row INSERTs into indexed tables (index keys are validated
+  before any write).
+
+The same workloads are in Node, in memory, in `bench/micro/indexes.ts`. Without OPFS costs, SQLite
+leads on CREATE INDEX (about 3–4×), UPDATE/DELETE (3–5×) and range lookups (about 1.6×).
+
+Open gaps:
+- **Range lookups:** about 0.35 µs per row fetched by rowid, vs about 0.25 µs for SQLite. Candidates
+  are faster page access in the B-tree descent, or sorting rowids before fetching for unordered
+  aggregates.
+- **Expression CREATE INDEX:** the whole row is decoded and the expression is evaluated through the
+  generic evaluator for every row.
+- **Composite lookups:** each index entry decodes a REAL key component.
