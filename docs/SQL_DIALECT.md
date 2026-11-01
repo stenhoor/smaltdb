@@ -107,6 +107,13 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
 - (M4) `RETURNING` on INSERT/UPDATE/DELETE (`*`, expressions, aliases; aggregates rejected like SQLite);
   upsert `ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET … [WHERE …]` with `excluded.*`, several clauses tried in order;
   `UPDATE … FROM` (joined sources; with several matching FROM rows the first one wins, as in SQLite).
+- (M4) Foreign keys are enforced, with SQLite's semantics: immediate constraints are checked at the end of each
+  statement (temporary violations inside a statement are fine), `DEFERRABLE INITIALLY DEFERRED` ones at COMMIT;
+  `ON DELETE` / `ON UPDATE` `NO ACTION | RESTRICT | CASCADE | SET NULL | SET DEFAULT` (actions recurse; RESTRICT is
+  checked when its turn comes, newest constraint first, like SQLite); composite and self-referencing keys; REPLACE
+  conflicts and `DROP TABLE` of a parent apply them; "foreign key mismatch" errors for parent keys that are not
+  PRIMARY KEY/UNIQUE. **Deviation:** enforcement is **on by default** (SQLite's default is off);
+  `PRAGMA foreign_keys = OFF` turns it off (not inside a transaction, as in SQLite).
 - (M4) `ALTER TABLE … RENAME TO | RENAME COLUMN | ADD COLUMN | DROP COLUMN`, like SQLite: renames rewrite the
   stored SQL of the table, its indexes, other tables' `REFERENCES` clauses and views (only references that resolve
   to the altered table/column change; quoting style is kept); every object is re-validated and the ALTER fails with
@@ -140,9 +147,10 @@ losslessly as SQLite STRICT tables do (`'5'` into an INTEGER column becomes 5), 
 **Not yet supported** (each gives a clear `SMALT_UNSUPPORTED` error): `RIGHT` / `FULL` joins,
 TEMP views, materialized views (M5), `ON CONFLICT` targets with WHERE, row-value assignments (`SET (a, b) = …`), expression and
 partial indexes, `INCLUDE` columns, `WITHOUT ROWID`, `LOOSE` tables, generated columns, TEMP tables, JSON
-functions, and `VACUUM`. Plain `EXPLAIN` returns the `EXPLAIN QUERY PLAN` output (there is no bytecode to list). Foreign keys are parsed and stored but not yet enforced (M4).
+functions, and `VACUUM`. Plain `EXPLAIN` returns the `EXPLAIN QUERY PLAN` output (there is no bytecode to list).
 
 **Known deviations:**
+- Foreign keys are enforced by default (`PRAGMA foreign_keys` is 1); SQLite starts with 0.
 - An integral REAL with magnitude below 2^53 stored in an `ANY`/`NUMERIC` column, or flowing through an untyped expression, reads back as
   INTEGER. This affects `typeof()`, text conversion and integer division (ADR 0003, decision 2). REALs outside ±2^53, such as int64-overflow
   results, are always treated as REAL, because smaltdb represents such integers as `bigint`.

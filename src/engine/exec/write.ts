@@ -141,7 +141,7 @@ export class TableWriter {
     // eslint-disable-next-line eqeqeq
     if ((except === null || rowid != except) && this.rowExists(rowid)) {
       if (mode === 'IGNORE') return false;
-      if (mode === 'REPLACE') this.deleteRow(rowid);
+      if (mode === 'REPLACE') this.deleteRow(rowid, undefined, false, true);
       else throw new ConstraintError(this.conflictCode(null), this.conflictMessage(null));
     }
     for (let i = 0; i < this.table.indexes.length; i++) {
@@ -152,7 +152,7 @@ export class TableWriter {
         if (mode !== 'REPLACE') {
           throw new ConstraintError(this.conflictCode(this.table.indexes[i]), this.conflictMessage(this.table.indexes[i]));
         }
-        this.deleteRow(other);
+        this.deleteRow(other, undefined, false, true);
       }
     }
     return true;
@@ -206,13 +206,23 @@ export class TableWriter {
     this.noteRowid(rowid);
   }
 
-  /** Delete a row by rowid (reads it first to remove its index entries). Returns false if absent. */
-  deleteRow(rowid: number | bigint, knownRow?: readonly SqlValue[]): boolean {
+  /** Foreign-key hooks around a deletion (not called for the delete half of an UPDATE). */
+  beforeDelete?: (row: readonly SqlValue[]) => void;
+  /** `replace`: the row was removed by a REPLACE conflict (foreign-key actions do not fire then). */
+  onDelete?: (row: readonly SqlValue[], replace: boolean) => void;
+
+  /**
+   * Delete a row by rowid (reads it first to remove its index entries). Returns false if absent.
+   * `silent` skips {@link onDelete} (the row is being replaced by an UPDATE).
+   */
+  deleteRow(rowid: number | bigint, knownRow?: readonly SqlValue[], silent = false, replace = false): boolean {
     const row = knownRow ?? this.readRow(rowid);
     if (row === null) return false;
+    if (!silent) this.beforeDelete?.(row);
     const t = this.table;
     for (let i = 0; i < t.indexes.length; i++) this.indexTrees[i].delete(this.indexKey(t.indexes[i], row, rowid)!);
     this.tree.delete(this.key(rowid));
+    if (!silent) this.onDelete?.(row, replace);
     return true;
   }
 

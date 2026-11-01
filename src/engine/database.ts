@@ -44,6 +44,7 @@ import { RecordReader } from './storage/record.js';
 import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec/stats.js';
 import { type CatalogSnapshot, informationSchema } from './catalog/information-schema.js';
 import { type SchemaLookup, applyEdits, renameColumnEdits, renameTableEdits } from './catalog/alter.js';
+import { ForeignKeys } from './exec/fk.js';
 import type { SqlValue } from './values.js';
 import type { Vfs, VfsFile } from './vfs/types.js';
 
@@ -249,6 +250,69 @@ export class Database implements FunctionContext {
     return this.tables.get(lower);
   }
 
+  private fkInvolvedNow(name: string): boolean {
+    const t = this.tables.get(name.toLowerCase());
+    if (!t) return false;
+    this.fk.sync(this.schemaVersion);
+    return this.fk.involved(t);
+  }
+
+  /** Writer for user DML: deletions it makes (DELETE, REPLACE conflicts) run foreign-key processing. */
+  private writerFor(table: TableSchema): TableWriter {
+    const w = new TableWriter(table, this.pager, (root) => this.tree(root));
+    w.beforeDelete = (row) => {
+      if (this.fk.involved(table)) this.fk.beforeDelete(table, row);
+    };
+    w.onDelete = (row) => {
+      if (this.fk.involved(table)) this.fk.afterDelete(table, row);
+    };
+    return w;
+  }
+
+  /** Foreign-key enforcement (on by default; PRAGMA foreign_keys = OFF disables it). */
+  private readonly fk = new ForeignKeys({
+    getTable: (n) => this.tables.get(n.toLowerCase()),
+    allTables: () => [...this.tables.values()].filter((t) => !t.system),
+    query: (sql, params) => this.internal(sql, params) ?? [],
+    run: (sql, params) => void this.internal(sql, params),
+  });
+
+  private internalPrograms = new Map<string, { version: number; prog: Program }>();
+
+  /**
+   * Run an internal statement (foreign-key checks and actions) with positional parameters, inside
+   * the current statement: no transaction handling, and changes() is not affected.
+   */
+  private internal(sql: string, params: SqlValue[]): SqlValue[][] | null {
+    let c = this.internalPrograms.get(sql);
+    if (!c || c.version !== this.schemaVersion) {
+      const ps = parseOne(sql);
+      c = { version: this.schemaVersion, prog: this.compile(ps) };
+      this.internalPrograms.set(sql, c);
+    }
+    const p = c.prog;
+    const regs: SqlValue[] = new Array(p.regCount).fill(null);
+    params.forEach((v, i) => (regs[i] = v));
+    const saved = [this.lastChanges, this.total, this.lastRowid] as const;
+    try {
+      if (p.exec) {
+        p.exec(regs);
+        return null;
+      }
+      const root = p.plan!.root;
+      const out: SqlValue[][] = [];
+      root.open(regs);
+      try {
+        while (root.next()) out.push(p.plan!.outRegs.map((g) => regs[g]));
+      } finally {
+        root.close();
+      }
+      return out;
+    } finally {
+      [this.lastChanges, this.total, this.lastRowid] = saved;
+    }
+  }
+
   /** @internal Virtual tables for the planner: information_schema views and pragma_*() functions. */
   virtualTable(schema: string | undefined, name: string): { columns: { name: string; type: StaticType }[]; rows: (args: SqlValue[]) => SqlValue[][] } | undefined {
     if (schema === 'information_schema') {
@@ -417,7 +481,7 @@ export class Database implements FunctionContext {
         return done({ plan, readonly: true, columns: plan.columns.map((c) => c.name), columnTypes: plan.columns.map((c) => c.type) });
       }
       case 'insert': {
-        const single = stmt.source.kind === 'values' && stmt.source.rows.length === 1 && (stmt.or ?? 'ABORT') !== 'REPLACE' && this.getTable(stmt.table)?.indexes.length === 0 && !stmt.upsert.length;
+        const single = stmt.source.kind === 'values' && stmt.source.rows.length === 1 && (stmt.or ?? 'ABORT') !== 'REPLACE' && this.getTable(stmt.table)?.indexes.length === 0 && !stmt.upsert.length && !this.fkInvolvedNow(stmt.table);
         const c = this.compileInsert(stmt, planner);
         return done(this.dmlProgram(c, single));
       }
@@ -538,6 +602,8 @@ export class Database implements FunctionContext {
   }
 
   private commitTransaction(): void {
+    // Deferred foreign-key violations keep the transaction open, as in SQLite.
+    this.fk.checkCommit();
     if (this.sqlSavepoints.length) this.pager.releaseSavepoint(1);
     this.sqlSavepoints.length = 0;
     this.pager.commit();
@@ -546,6 +612,7 @@ export class Database implements FunctionContext {
   }
 
   private rollbackTransaction(): void {
+    this.fk.deferred = 0;
     this.sqlSavepoints.length = 0;
     this.txnFromSavepoint = false;
     this.pager.rollback();
@@ -568,9 +635,16 @@ export class Database implements FunctionContext {
     const journal = !this.autocommit && !program.singleRowWrite;
     if (journal) pager.beginStatement();
     let result: T;
+    this.fk.sync(this.schemaVersion);
+    this.fk.stmt = 0;
+    const deferredBefore = this.fk.deferred;
     try {
       result = body();
+      this.fk.checkStatement();
+      if (this.autocommit) this.fk.checkCommit();
     } catch (e) {
+      this.fk.stmt = 0;
+      this.fk.deferred = this.autocommit ? 0 : deferredBefore;
       if (journal) pager.rollbackStatement();
       if (this.autocommit) pager.rollback();
       this.loadSchemaIfChanged();
@@ -814,6 +888,11 @@ export class Database implements FunctionContext {
       if (!table) {
         if (stmt.ifExists) return none;
         throw new SmaltError('SMALT_ERROR', `no such table: ${stmt.name}`);
+      }
+      // Like SQLite, dropping a parent table first deletes its rows (applying foreign-key actions).
+      if (this.fk.enabled && this.tables.size > 1 && [...this.tables.values()].some((t) => t !== table && t.foreignKeys.some((f) => f.table.toLowerCase() === lower))) {
+        this.fk.sync(this.schemaVersion);
+        this.internal(`DELETE FROM "${table.name.replace(/"/g, '""')}"`, []);
       }
       this.dirtySchema = true;
       for (const idx of table.indexes) {
@@ -1304,7 +1383,7 @@ export class Database implements FunctionContext {
       out.push(ret.fns.map((f) => f(r)));
     };
     const exec = (r: SqlValue[], out?: SqlValue[][]): RunResult => {
-      writer ??= new TableWriter(table, this.pager, (root) => this.tree(root));
+      writer ??= this.writerFor(table);
       writer.resetStatement();
       const w = writer;
       let changes = 0;
@@ -1349,6 +1428,7 @@ export class Database implements FunctionContext {
         }
         if (!w.resolveConflicts(row, rowid, null, mode)) return;
         w.writeRow(row, rowid);
+        if (this.fk.involved(table)) this.fk.afterInsert(table, row);
         changes++;
         last = rowid;
         emitReturning(r, out, row, rowid);
@@ -1456,15 +1536,16 @@ export class Database implements FunctionContext {
       }
       let newRowid: number | bigint = other;
       if (table.rowidAlias >= 0) {
-        if (next[table.rowidAlias] === null) throw new ConstraintError('SMALT_CONSTRAINT_NOTNULL', `NOT NULL constraint failed: ${table.name}.${table.columns[table.rowidAlias].name}`);
+        if (next[table.rowidAlias] === null) throw new SmaltError('SMALT_MISMATCH', 'datatype mismatch');
         newRowid = this.toRowid(next[table.rowidAlias], table);
         next[table.rowidAlias] = newRowid;
       }
       r[rowidReg] = newRowid;
       this.validateRow(table, next, real, checks, r, base, 'ABORT', defaults);
       w.resolveConflicts(next, newRowid, other, 'ABORT');
-      w.deleteRow(other, old);
+      w.deleteRow(other, old, true);
       w.writeRow(next, newRowid);
+      if (this.fk.involved(table)) this.fk.afterUpdate(table, old, next);
       return { row: next, rowid: newRowid };
     }
     return undefined;
@@ -1534,7 +1615,7 @@ export class Database implements FunctionContext {
         root.close();
       }
       rowids.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-      const writer = new TableWriter(table, this.pager, (root) => this.tree(root));
+      const writer = this.writerFor(table);
       let changes = 0;
       for (const rowid of rowids) {
         const old = writer.readRow(rowid);
@@ -1554,17 +1635,16 @@ export class Database implements FunctionContext {
             if (s.col === table.rowidAlias) newRowidV = v;
           }
         });
-        if (newRowidV === null) {
-          if (table.rowidAlias >= 0) throw new ConstraintError('SMALT_CONSTRAINT_NOTNULL', `NOT NULL constraint failed: ${table.name}.${table.columns[table.rowidAlias].name}`);
-          throw new SmaltError('SMALT_MISMATCH', 'datatype mismatch');
-        }
+        // Like SQLite: an UPDATE cannot set the rowid (or INTEGER PRIMARY KEY) to NULL.
+        if (newRowidV === null) throw new SmaltError('SMALT_MISMATCH', 'datatype mismatch');
         const newRowid = this.toRowid(newRowidV, table);
         if (table.rowidAlias >= 0) next[table.rowidAlias] = newRowid;
         r[checkRowid] = newRowid;
         if (!this.validateRow(table, next, real, checks, r, base, mode, defaults)) continue;
         if (!writer.resolveConflicts(next, newRowid, rowid, mode)) continue;
-        writer.deleteRow(rowid, old);
+        writer.deleteRow(rowid, old, true);
         writer.writeRow(next, newRowid);
+        if (this.fk.involved(table)) this.fk.afterUpdate(table, old, next);
         changes++;
         if (ret && out) {
           for (let i = 0; i < ncols; i++) r[base + i] = next[i];
@@ -1583,22 +1663,20 @@ export class Database implements FunctionContext {
     if (stmt.orderBy.length || stmt.limit) throw new SmaltError('SMALT_UNSUPPORTED', 'DELETE ... ORDER BY/LIMIT is not supported');
     if (stmt.with) throw new SmaltError('SMALT_UNSUPPORTED', 'WITH ... DELETE is not supported yet');
     const table = this.targetTable(stmt.table, stmt.schema);
-    if (!stmt.where && !stmt.returning) {
-      return {
-        exec: () => {
-          const n = new TableWriter(table, this.pager, (root) => this.tree(root)).truncate();
-          this.lastChanges = n;
-          this.total += n;
-          return { changes: n, lastInsertRowid: this.lastRowid };
-        },
-      };
-    }
     const { root, colRegs, rowidReg } = this.planTarget(table, stmt.alias, stmt.where, planner);
+    // DELETE without WHERE truncates, unless foreign keys need to see every row.
+    const truncate = !stmt.where && !stmt.returning;
     const ncols = table.columns.length;
     const oldBase = planner.regs.alloc(ncols);
     const oldRowid = planner.regs.alloc();
     const ret = stmt.returning ? this.compileReturning(stmt.returning, table, stmt.alias, this.rowScope(table, stmt.alias, oldBase, oldRowid, planner), planner.sqlText) : undefined;
     const exec = (r: SqlValue[], out?: SqlValue[][]): RunResult => {
+      if (truncate && !this.fk.involved(table)) {
+        const n = new TableWriter(table, this.pager, (root) => this.tree(root)).truncate();
+        this.lastChanges = n;
+        this.total += n;
+        return { changes: n, lastInsertRowid: this.lastRowid };
+      }
       const pending: { rowid: number | bigint; row: SqlValue[] }[] = [];
       root.open(r);
       try {
@@ -1606,7 +1684,7 @@ export class Database implements FunctionContext {
       } finally {
         root.close();
       }
-      const writer = new TableWriter(table, this.pager, (root) => this.tree(root));
+      const writer = this.writerFor(table);
       let changes = 0;
       for (const p of pending) {
         if (!writer.deleteRow(p.rowid, p.row)) continue;
@@ -1720,6 +1798,26 @@ export class Database implements FunctionContext {
         const name = stmt.name;
         const p = this.pragmaTable(name, () => arg());
         return ro(p!.columns, p!.rows);
+      }
+      case 'foreign_keys': {
+        if (stmt.value) {
+          const v = arg()?.toLowerCase();
+          const on = v === '1' || v === 'on' || v === 'true' || v === 'yes';
+          return {
+            readonly: true,
+            columns: [],
+            columnTypes: [],
+            exec: () => {
+              // Like SQLite, the setting cannot change inside a transaction.
+              if (this.autocommit && on !== this.fk.enabled) {
+                this.fk.enabled = on;
+                this.schemaVersion++; // re-plan statements compiled under the other setting
+              }
+              return { changes: 0, lastInsertRowid: this.lastRowid };
+            },
+          };
+        }
+        return ro(['foreign_keys'], () => [[this.fk.enabled ? 1 : 0]]);
       }
       case 'page_size':
         return ro(['page_size'], () => [[this.pager.pageSize]]);
