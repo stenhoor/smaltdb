@@ -7,7 +7,7 @@
  * Multi-byte page fields are little-endian; index keys are big-endian (memcmp-comparable).
  */
 
-export const FORMAT_MAJOR = 1;
+export const FORMAT_MAJOR = 2;
 export const FORMAT_MINOR = 0;
 export const MAGIC = new Uint8Array([0x73, 0x6d, 0x61, 0x6c, 0x74, 0x64, 0x62, 0x00]); // "smaltdb\0"
 

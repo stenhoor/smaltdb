@@ -2,7 +2,6 @@
 //   npx tsx bench/micro/indexes.ts
 import sqliteInit from '@sqlite.org/sqlite-wasm';
 import { Database } from '../../src/engine/database.js';
-import { MemoryVfs } from '../../src/engine/vfs/memory.js';
 import { analyticRow } from '../browser/adapter.js';
 
 async function main(): Promise<void> {
@@ -10,7 +9,7 @@ async function main(): Promise<void> {
   const lite: any = await (sqliteInit as any)({ print() {}, printErr() {} });
   const s = new lite.oo1.DB(':memory:');
   s.exec('PRAGMA cache_size=-524288');
-  const d = Database.openFile(new MemoryVfs().openSync('i.db'), { cacheSizeBytes: 512 << 20 });
+  const d = Database.openMemory();
   const ddl = 'CREATE TABLE a(id INTEGER PRIMARY KEY, b INT, c REAL, d INT, e TEXT)';
   d.exec(ddl);
   s.exec(ddl);

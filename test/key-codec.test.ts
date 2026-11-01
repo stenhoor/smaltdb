@@ -1,6 +1,6 @@
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
-import { Collation, decodeKey, encodeKey, type KeyColumn, type SqlValue } from '../src/engine/storage/key-codec.js';
+import { Collation, KeyEncoder, decodeKey, encodeKey, type KeyColumn, readIndexRowid, rowidSuffixStart, type SqlValue } from '../src/engine/storage/key-codec.js';
 import { compareBytes } from '../src/engine/util/bytes.js';
 
 const enc = new TextEncoder();
@@ -62,7 +62,11 @@ const valueArb: fc.Arbitrary<SqlValue> = fc.oneof(
   // values clustered around the 2^53 precision boundary
   fc.bigInt({ min: 2n ** 53n - 5000n, max: 2n ** 53n + 5000n }),
   fc.bigInt({ min: 2n ** 62n - 5000n, max: 2n ** 62n + 5000n }).map((x) => (Math.random() < 0.5 ? -x : x)),
-  fc.constantFrom(2 ** 53, 2 ** 53 + 2, 2 ** 62, -(2 ** 63), 2 ** 63, 0.5, -0, Infinity, -Infinity),
+  fc.constantFrom(2 ** 53, 2 ** 53 + 2, 2 ** 62, -(2 ** 63), 2 ** 63, 0.5, -0, Infinity, -Infinity, Number.MIN_VALUE, -Number.MIN_VALUE, 2.2250738585072014e-308, Number.MAX_VALUE, 1 / 3, 2 ** 31, 2 ** 31 - 1, -(2 ** 31)),
+  // small integers and fractions (the compact forms) and subnormals
+  fc.integer({ min: -300, max: 300 }),
+  fc.integer({ min: -300, max: 300 }).map((x) => x / 8),
+  fc.double({ min: -1e-300, max: 1e-300 }),
   fc.string({ unit: 'binary', maxLength: 12 }),
   fc.constantFrom('', '\0', 'a\0', 'a', 'A', 'a ', 'a  ', 'ab', 'é'),
   fc.uint8Array({ maxLength: 10 }),
@@ -128,5 +132,54 @@ describe('key codec', () => {
     const keys = vals.map((v) => encodeKey([v]));
     for (let i = 1; i < keys.length; i++) expect(compareBytes(keys[i - 1], keys[i])).toBeLessThan(0);
     expect(decodeKey(keys[keys.length - 1])[0]).toBe(I64_MAX);
+  });
+
+  it('uses compact forms for small numbers', () => {
+    const size = (v: SqlValue): number => encodeKey([v]).length;
+    expect(size(0)).toBe(1);
+    expect(size(1)).toBe(2);
+    expect(size(127)).toBe(2);
+    expect(size(-127)).toBe(2);
+    expect(size(16383)).toBe(3);
+    expect(size(2 ** 21 - 1)).toBe(4);
+    expect(size(0.5)).toBe(4);
+    expect(size(1 / 3)).toBeLessThanOrEqual(11);
+    expect(size(1234.5678)).toBeLessThanOrEqual(9);
+    expect(size(I64_MAX)).toBeLessThanOrEqual(10);
+  });
+
+  it('round-trips int64 exactly and keeps components prefix-free', () => {
+    fc.assert(
+      fc.property(valueArb, valueArb, (a, b) => {
+        if (typeof a === 'bigint') {
+          const d = decodeKey(encodeKey([a]))[0];
+          expect(BigInt(d as number | bigint)).toBe(a);
+        }
+        const ka = encodeKey([a]);
+        const kb = encodeKey([b]);
+        if (cmpValue(a, b) !== 0 && ka.length < kb.length) {
+          // A shorter key that is not equal must not be a prefix of the other.
+          expect(ka.every((x, i) => x === kb[i])).toBe(false);
+        }
+      }),
+      { numRuns: 20000 },
+    );
+  });
+
+  it('stores the rowid as a suffix readable from the end', () => {
+    fc.assert(
+      fc.property(fc.array(fc.tuple(valueArb, colArb), { maxLength: 3 }), fc.oneof(fc.integer({ min: -1000, max: 2 ** 31 }), fc.bigInt({ min: I64_MIN, max: I64_MAX })), (cols, rowid) => {
+        const e = new KeyEncoder();
+        for (const [v, c] of cols) e.add(v, c);
+        const prefixLen = e.length;
+        e.addRowid(rowid);
+        const k = e.finish();
+        expect(rowidSuffixStart(k, k.length)).toBe(prefixLen);
+        const r = readIndexRowid(k, k.length);
+        expect(BigInt(r)).toBe(BigInt(rowid));
+        expect(decodeKey(k.subarray(0, prefixLen), cols.map((c) => c[1])).length).toBe(cols.length);
+      }),
+      { numRuns: 5000 },
+    );
   });
 });

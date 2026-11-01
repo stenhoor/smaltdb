@@ -38,7 +38,7 @@ import type {
   WithClause,
 } from '../sql/ast.js';
 import { type BTree, BTreeCursor } from '../storage/btree.js';
-import { decodeKey } from '../storage/key-codec.js';
+import { KEY_AFTER_NULL, decodeKey, rowidSuffixStart } from '../storage/key-codec.js';
 import { RecordReader } from '../storage/record.js';
 import { Collation, type SqlValue } from '../values.js';
 import { type Affinity, type StaticType, affinityOfStorage, hashKey, hashKeyMulti, staticTypeOfStorage, truthy } from './convert.js';
@@ -1681,11 +1681,12 @@ export class Planner {
     const cur = new BTreeCursor(tree);
     const cols = idx.columns.map((c) => ({ desc: c.desc, collation: c.collation }));
     try {
-      // 0x06 sorts after every NULL key: the first non-NULL value.
-      if (!cur.seek(new Uint8Array([0x06]))) return undefined;
-      const min = decodeKey(cur.key(), cols)[0];
+      // The first non-NULL value, and the last value.
+      const first = (k: Uint8Array): SqlValue => decodeKey(k.subarray(0, rowidSuffixStart(k, k.length)), cols)[0];
+      if (!cur.seek(KEY_AFTER_NULL)) return undefined;
+      const min = first(cur.key());
       if (!cur.last()) return undefined;
-      const max = decodeKey(cur.key(), cols)[0];
+      const max = first(cur.key());
       if (typeof min !== 'number' || typeof max !== 'number') return undefined;
       return { min, max };
     } finally {

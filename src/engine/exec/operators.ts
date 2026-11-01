@@ -1,6 +1,6 @@
 import { SmaltError } from '../errors.js';
 import type { BTree, BTreeCursor } from '../storage/btree.js';
-import { KeyEncoder, type KeyColumn, ROWID_KEY_SIZE, decodeKey, readNumericKeyAt, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
+import { KeyEncoder, type KeyColumn, KEY_AFTER_NULL, ROWID_KEY_SIZE, decodeKey, readIndexRowid, readRowidKey, rowidSuffixStart, writeRowidKey } from '../storage/key-codec.js';
 import { type RecordReader, decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
 import { type LoaderHelpers, type LoaderSpec, type ScanState, codegenEnabled, generateLoader } from './codegen.js';
 
@@ -440,7 +440,7 @@ export class IndexScan implements Operator {
         const withV = concat(prefix, this.enc.reset().add(v, col).finish());
         this.lower = s.lo.inclusive ? withV : ff(withV);
       } else {
-        this.lower = concat(prefix, new Uint8Array([0x06]));
+        this.lower = concat(prefix, KEY_AFTER_NULL);
       }
       if (s.hi) {
         const v = s.convert[i](s.hi.fn(this.r));
@@ -462,16 +462,16 @@ export class IndexScan implements Operator {
       ok = c.seek(this.lower!);
     } else ok = c.next();
     if (!ok || c.compareKey(this.upper!) >= 0) return (this.done = true), false;
-    // The rowid is the last key component (11-byte numeric encoding).
+    // The rowid is the key's suffix (see key-codec).
     c.loadKey();
     const kb = c.keyBytes;
     const end = c.keyOffset + c.keyLength;
-    const rowid = readNumericKeyAt(kb, end - 11);
+    const rowid = readIndexRowid(kb, end);
     const cover = this.cover;
     if (cover) {
       const r = this.r;
       if (cover.regs.length) {
-        const vals = decodeKey(kb.subarray(c.keyOffset, end - 11), cover.keyCols);
+        const vals = decodeKey(kb.subarray(c.keyOffset, rowidSuffixStart(kb, end)), cover.keyCols);
         for (let i = 0; i < cover.regs.length; i++) r[cover.regs[i]] = vals[cover.keyPos[i]];
       }
       const a = this.access;

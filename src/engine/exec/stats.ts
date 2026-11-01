@@ -1,6 +1,6 @@
 import type { IndexSchema, TableSchema } from '../catalog/schema.js';
 import { BTree } from '../storage/btree.js';
-import { decodeKey, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
+import { decodeKey, readRowidKey, rowidSuffixStart, writeRowidKey } from '../storage/key-codec.js';
 import { RecordReader, type RecordLayout } from '../storage/record.js';
 import type { SqlValue } from '../values.js';
 import { hashKey } from './convert.js';
@@ -122,7 +122,7 @@ export function analyzeIndex(tree: BTree, index: IndexSchema): IndexStats {
     for (let ok = c.first(); ok; ok = c.next()) {
       rows++;
       const key = c.key();
-      const vals = decodeKey(key.subarray(0, key.length - 11), index.columns).slice(0, k);
+      const vals = decodeKey(key.subarray(0, rowidSuffixStart(key, key.length)), index.columns).slice(0, k);
       let firstDiff = prev === null ? 0 : k;
       if (prev !== null) {
         for (let i = 0; i < k; i++) {

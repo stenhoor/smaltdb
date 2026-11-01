@@ -100,6 +100,15 @@ interior cell:  u32 child | u16 keyLen | key
 
 - Secondary indexes are B+trees on `(key columns…, rowid)`. Keys use a **memcmp-comparable encoding**
   (order-preserving byte strings), so a key comparison is a single `Uint8Array` compare loop.
+- Format 2 key encoding (`src/engine/storage/key-codec.ts`, ADR 0006):
+  - NULL `0x01`; TEXT `0x90` + escaped collated UTF-8 + `00 00`; BLOB `0xA0` + escaped bytes + `00 00`.
+  - Numbers: a tag for sign and binary exponent (`0x46 + E` for positive E in 0..63, mirrored
+    below `0x44` = zero for negatives; values below 1 or at least 2^64 add a 2-byte exponent),
+    then the mantissa in 7-bit groups with a continuation bit (negative payloads inverted).
+    1–127 take 2 bytes; a double at most 9; an int64 at most 10.
+  - DESC columns invert their component's bytes.
+  - Each entry ends with the rowid suffix: the rowid as a number component, then one byte with
+    that component's length.
 - Supported: composite, unique, partial (`WHERE`), and expression indexes. Covering indexes are supported through `INCLUDE` columns, which is a non-SQLite extension.
 
 ## 5. Columnar segments (milestone M7)
@@ -166,6 +175,8 @@ Original plan:
 - `VACUUM` rewrites the file compactly. An optional `auto_vacuum=incremental` mode exists.
 
 ## 9. Format versioning
+
+- Current format: **2** (format 1 used 11-byte numeric key components; ADR 0006).
 
 - A format version in the header. Engines refuse to write newer major versions, and minor versions must be backward compatible.
 - Logical import/export in v1: **CSV and JSON/NDJSON**. Later: SQL dump, SQLite file import, Arrow/Parquet.

@@ -39,7 +39,7 @@ import type {
 } from './sql/ast.js';
 import { parse, parseOne } from './sql/parser.js';
 import { BTree } from './storage/btree.js';
-import { KeyEncoder, decodeKey, readRowidKey } from './storage/key-codec.js';
+import { KeyEncoder, type KeyColumn, decodeKey, readRowidKey, rowidSuffixStart } from './storage/key-codec.js';
 import { compareBytes } from './util/bytes.js';
 import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordReader } from './storage/record.js';
@@ -864,7 +864,7 @@ export class Database implements FunctionContext {
         // Plain columns: decode only the indexed ones.
         enc.reset();
         for (const ic of idx.columns) enc.add(ic.column === table.rowidAlias ? rowid : reader.column(ic.column), ic);
-        enc.add(rowid);
+        enc.addRowid(rowid);
         entries.push(enc.finish());
       }
     } finally {
@@ -939,8 +939,8 @@ export class Database implements FunctionContext {
     try {
       for (let ok = c.first(); ok; ok = c.next()) {
         const k = c.key();
-        const prefix = k.subarray(0, k.length - 11);
-        if (prev && prefix.length === prev.length && prefix.every((b, i) => b === prev![i]) && !prefixHasNull(prefix)) {
+        const prefix = k.subarray(0, rowidSuffixStart(k, k.length));
+        if (prev && prefix.length === prev.length && prefix.every((b, i) => b === prev![i]) && !prefixHasNull(prefix, idx.columns)) {
           throw new ConstraintError('SMALT_CONSTRAINT_UNIQUE', idx.columns.some((ic) => ic.column < 0) ? `UNIQUE constraint failed: index '${idx.name}'` : `UNIQUE constraint failed: ${idx.columns.map((ic) => `${table.name}.${table.columns[ic.column].name}`).join(', ')}`);
         }
         prev = prefix.slice();
@@ -1973,9 +1973,9 @@ export class Database implements FunctionContext {
   }
 }
 
-function prefixHasNull(prefix: Uint8Array): boolean {
+function prefixHasNull(prefix: Uint8Array, cols: readonly KeyColumn[]): boolean {
   try {
-    return decodeKey(prefix).some((v) => v === null);
+    return decodeKey(prefix, cols).some((v) => v === null);
   } catch {
     return false;
   }
