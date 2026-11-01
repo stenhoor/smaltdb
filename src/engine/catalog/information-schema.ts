@@ -53,7 +53,7 @@ function constraints(table: TableSchema): { name: string; type: string; columns:
 }
 
 export function informationSchema(name: string, cat: CatalogSnapshot): VirtualTable | undefined {
-  const userTables = (): TableSchema[] => cat.tables.filter((x) => !x.system && !x.name.toLowerCase().startsWith('smalt_'));
+  const userTables = (): TableSchema[] => cat.tables.filter((x) => !x.system && !x.temp && !x.name.toLowerCase().startsWith('smalt_'));
   switch (name.toLowerCase()) {
     case 'schemata':
       return {
@@ -115,13 +115,13 @@ export function informationSchema(name: string, cat: CatalogSnapshot): VirtualTa
     case 'materialized_views':
       // smaltdb extension (PostgreSQL has pg_matviews).
       return {
-        columns: [t('table_catalog'), t('table_schema'), t('table_name'), t('view_definition'), t('storage'), t('refresh_mode'), t('is_populated'), t('last_refresh')],
+        columns: [t('table_catalog'), t('table_schema'), t('table_name'), t('view_definition'), t('storage'), t('location'), t('refresh_mode'), t('is_populated'), t('last_refresh')],
         rows: () =>
           userTables()
             .filter((x) => x.matview)
             .map((x) => {
               const m = x.matview!;
-              return [CATALOG, SCHEMA, x.name, m.sql.slice(m.select.pos, m.select.end), m.storage, 'MANUAL', yesNo(m.populated), m.refreshedAt];
+              return [CATALOG, SCHEMA, x.name, m.sql.slice(m.select.pos, m.select.end), m.storage, x.rootPage >= 2 ** 30 ? 'memory' : 'file', 'MANUAL', yesNo(m.populated), m.refreshedAt];
             }),
       };
     case 'views':

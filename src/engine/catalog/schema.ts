@@ -85,6 +85,8 @@ export interface TableSchema {
   stats?: import('../exec/stats.js').TableStats;
   /** Set for materialized views: the table holds the view's stored rows. */
   matview?: MatViewInfo;
+  /** TEMP table: memory store, not in the persisted catalog, visible to this connection only. */
+  temp?: boolean;
 }
 
 /** A materialized view's definition and refresh state (its rows live in the table's tree). */

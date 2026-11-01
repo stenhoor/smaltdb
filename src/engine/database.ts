@@ -124,6 +124,9 @@ interface Program {
  * The engine's synchronous core: one database file, one connection. Runs inside the engine worker
  * (or directly in Node for tests). See docs/ARCHITECTURE.md.
  */
+/** Root page numbers at or above this live in the memory store (see Database.mem). */
+const MEM_BASE = 2 ** 30;
+
 export class Database implements FunctionContext {
   readonly pager: Pager;
   private readonly tables = new Map<string, TableSchema>();
@@ -147,8 +150,47 @@ export class Database implements FunctionContext {
   readonly activeCursors = new Set<RowCursor>();
   private closed = false;
 
+  /**
+   * Memory store (M7, ADR 0010): pages of memory-resident objects (TEMP tables, `location =
+   * 'memory'` materialized views) of a file-backed database. Their root page numbers are offset by
+   * {@link MEM_BASE}; {@link tree} routes them here. Null for in-memory databases (everything is
+   * in memory already).
+   */
+  private readonly mem: Pager | null;
+  /** TEMP tables (by lower-case name); they shadow main tables of the same name. */
+  private tempTables = new Map<string, TableSchema>();
+  /**
+   * Memory-resident materialized views: runtime roots and refresh state (the catalog records only
+   * the definition, with root {@link MEM_BASE} as a marker).
+   */
+  private memViews = new Map<string, MemView>();
+  /** Temp DDL / memory refreshes happened in the current statement (restore on failure). */
+  private memDirty = false;
+  /** Memory-object state at BEGIN, and at each SQL savepoint (parallel to sqlSavepoints). */
+  private txnMem: MemSnapshot | null = null;
+  private memSnapshots: MemSnapshot[] = [];
+
+  private snapshotMem(): MemSnapshot {
+    return {
+      temps: [...this.tempTables].map(([k, t]) => [k, t, [...t.indexes]]),
+      views: [...this.memViews].map(([k, v]) => [k, { ...v, indexRoots: new Map(v.indexRoots) }]),
+    };
+  }
+
+  /** Put back temp tables and memory-view roots (their pages were rolled back with the store). */
+  private restoreMem(snap: MemSnapshot): void {
+    this.tempTables = new Map(
+      snap.temps.map(([k, t, ix]) => {
+        t.indexes = ix;
+        return [k, t];
+      }),
+    );
+    this.memViews = new Map(snap.views.map(([k, v]) => [k, { ...v, indexRoots: new Map(v.indexRoots) }]));
+  }
+
   private constructor(file: VfsFile | null, options: DatabaseOptions, walFile?: VfsFile, reader = false) {
     this.pager = file === null ? Pager.openMemory(options) : reader ? Pager.openReader(file, walFile!, options) : Pager.open(file, options, walFile);
+    this.mem = file === null ? null : Pager.openMemory({ pageSize: this.pager.pageSize });
     this.cacheSize = options.statementCacheSize ?? 64;
     if (this.pager.catalogRoot === 0) {
       if (reader) throw new SmaltError('SMALT_CANTOPEN', 'reader: the database has no catalog yet');
@@ -156,6 +198,25 @@ export class Database implements FunctionContext {
       this.pager.commit();
     }
     this.loadSchema();
+    if (!reader) this.rebuildMemoryViews();
+  }
+
+  /**
+   * Memory-resident materialized views lose their rows when the database closes: recompute them at
+   * open (in the memory store only; nothing is written to the file). A view whose query fails stays
+   * unpopulated.
+   */
+  private rebuildMemoryViews(): void {
+    if (!this.mem) return;
+    for (const t of this.tables.values()) {
+      if (!t.matview || t.rootPage < MEM_BASE || t.matview.populated) continue;
+      try {
+        this.fillMatview(t);
+      } catch {
+        // leave it unpopulated: reading it reports why it needs a refresh
+      }
+    }
+    this.mem.commit();
   }
 
   /** `path` ':memory:' opens a new in-memory database (see {@link openMemory}). */
@@ -200,6 +261,33 @@ export class Database implements FunctionContext {
     return new Database(file, options, walFile);
   }
 
+  /**
+   * Whether a statement reads memory-resident objects (TEMP tables, memory materialized views),
+   * directly or through views: those exist only in this connection, so parallel readers cannot
+   * answer it.
+   */
+  usesMemoryObjects(parsed: ParsedStatement): boolean {
+    if (this.tempTables.size === 0 && this.memViews.size === 0) return false;
+    const seen = new Set<string>();
+    const walk = (x: unknown): boolean => {
+      if (Array.isArray(x)) return x.some(walk);
+      if (typeof x !== 'object' || x === null || Object.getPrototypeOf(x) !== Object.prototype) return false;
+      const o = x as Record<string, unknown>;
+      if (o.kind === 'table' && typeof o.name === 'string') {
+        const lower = o.name.toLowerCase();
+        const t = this.tables.get(lower);
+        if (t && t.rootPage >= MEM_BASE) return true;
+        const v = this.getView(lower);
+        if (v && !seen.has(lower)) {
+          seen.add(lower);
+          if (walk(v.select)) return true;
+        }
+      }
+      return Object.keys(o).some((k) => walk(o[k]));
+    };
+    return walk(parsed.stmt);
+  }
+
   /** Copy the WAL into the database file (also happens automatically and on close). */
   checkpoint(): void {
     if (!this.autocommit) throw new SmaltError('SMALT_BUSY', 'cannot checkpoint inside a transaction');
@@ -210,11 +298,66 @@ export class Database implements FunctionContext {
   tree(root: number): BTree {
     let t = this.trees.get(root);
     if (t === undefined) {
-      t = new BTree(this.pager, root);
+      t = this.freshTree(root);
       this.trees.set(root, t);
     }
     return t;
   }
+
+  /** A new B+tree handle for `root`, in the store the root number belongs to. */
+  freshTree(root: number): BTree {
+    if (root >= MEM_BASE) {
+      if (!this.mem) throw new SmaltError('SMALT_CORRUPT', `memory root ${root} in an in-memory database`);
+      return new BTree(this.mem, root - MEM_BASE);
+    }
+    return new BTree(this.pager, root);
+  }
+
+  /** Create an empty B+tree in the main or the memory store; returns its (routable) root number. */
+  private createTree(memory: boolean): number {
+    return memory && this.mem ? BTree.create(this.mem) + MEM_BASE : BTree.create(this.pager);
+  }
+
+  /** Transaction boundaries apply to both stores (the memory store commits after the main one). */
+  private readonly tx = {
+    beginStatement: (): void => {
+      this.pager.beginStatement();
+      this.mem?.beginStatement();
+    },
+    commitStatement: (): void => {
+      this.pager.commitStatement();
+      this.mem?.commitStatement();
+    },
+    rollbackStatement: (): void => {
+      this.pager.rollbackStatement();
+      this.mem?.rollbackStatement();
+    },
+    commit: (): void => {
+      this.pager.commit();
+      this.mem?.commit();
+    },
+    rollback: (): void => {
+      this.pager.rollback();
+      this.mem?.rollback();
+    },
+    releaseAllPins: (): void => {
+      this.pager.releaseAllPins();
+      this.mem?.releaseAllPins();
+    },
+    beginSavepoint: (): number => {
+      const d = this.pager.beginSavepoint();
+      this.mem?.beginSavepoint();
+      return d;
+    },
+    releaseSavepoint: (d: number): void => {
+      this.pager.releaseSavepoint(d);
+      this.mem?.releaseSavepoint(d);
+    },
+    rollbackToSavepoint: (d: number, keep: boolean): void => {
+      this.pager.rollbackToSavepoint(d, keep);
+      this.mem?.rollbackToSavepoint(d, keep);
+    },
+  };
 
   // ---------------------------------------------------------------- FunctionContext
 
@@ -241,6 +384,7 @@ export class Database implements FunctionContext {
    */
   setInterruptCheck(check: (() => void) | null): void {
     this.pager.interrupt = check;
+    if (this.mem) this.mem.interrupt = check;
   }
 
   get inTransaction(): boolean {
@@ -466,10 +610,22 @@ export class Database implements FunctionContext {
       const stmt = parseOne(r.sql).stmt as CreateIndexStmt;
       const table = this.tables.get(r.tbl_name.toLowerCase());
       if (!table) throw new SmaltError('SMALT_CORRUPT', `index ${r.name} references missing table ${r.tbl_name}`);
-      const idx = buildIndexSchema(stmt, r.sql, table, r.rootpage);
+      let root = r.rootpage;
+      if (root === MEM_BASE) {
+        // Index of a memory-resident view: its runtime root (an empty tree after reopening).
+        const mv = this.memViews.get(table.name.toLowerCase());
+        root = mv?.indexRoots.get(r.name.toLowerCase()) ?? this.createTree(true);
+        mv?.indexRoots.set(r.name.toLowerCase(), root);
+      }
+      const idx = buildIndexSchema(stmt, r.sql, table, root);
       this.prepareIndex(table, idx);
       table.indexes.push(idx);
       this.indexes.set(idx.name.toLowerCase(), idx);
+    }
+    // TEMP tables live outside the catalog: re-add them (they shadow main tables of the same name).
+    for (const [lower, t] of this.tempTables) {
+      this.tables.set(lower, t);
+      for (const idx of t.indexes) this.indexes.set(idx.name.toLowerCase(), idx);
     }
     this.loadStats();
     this.schemaVersion++;
@@ -640,6 +796,7 @@ export class Database implements FunctionContext {
     switch (stmt.kind) {
       case 'begin':
         if (!this.autocommit) throw new SmaltError('SMALT_ERROR', 'cannot start a transaction within a transaction');
+        this.txnMem = this.snapshotMem();
         this.autocommit = false;
         this.txnFromSavepoint = false;
         break;
@@ -651,22 +808,27 @@ export class Database implements FunctionContext {
         if (this.autocommit) throw new SmaltError('SMALT_ERROR', 'cannot rollback - no transaction is active');
         if (stmt.savepoint) {
           const i = this.findSavepoint(stmt.savepoint);
-          this.pager.rollbackToSavepoint(this.sqlSavepoints[i].depth, true);
+          this.tx.rollbackToSavepoint(this.sqlSavepoints[i].depth, true);
           this.sqlSavepoints.length = i + 1;
+          this.restoreMem(this.memSnapshots[i]);
+          this.memSnapshots.length = i + 1;
           this.loadSchema();
         } else this.rollbackTransaction();
         break;
       case 'savepoint':
         if (this.autocommit) {
+          this.txnMem = this.snapshotMem();
           this.autocommit = false;
           this.txnFromSavepoint = true;
         }
-        this.sqlSavepoints.push({ name: stmt.name, depth: this.pager.beginSavepoint() });
+        this.memSnapshots.push(this.snapshotMem());
+        this.sqlSavepoints.push({ name: stmt.name, depth: this.tx.beginSavepoint() });
         break;
       case 'release': {
         const i = this.findSavepoint(stmt.name);
-        this.pager.releaseSavepoint(this.sqlSavepoints[i].depth);
+        this.tx.releaseSavepoint(this.sqlSavepoints[i].depth);
         this.sqlSavepoints.length = i;
+        this.memSnapshots.length = i;
         if (i === 0 && this.txnFromSavepoint) this.commitTransaction();
         break;
       }
@@ -682,9 +844,11 @@ export class Database implements FunctionContext {
   private commitTransaction(): void {
     // Deferred foreign-key violations keep the transaction open, as in SQLite.
     this.fk.checkCommit();
-    if (this.sqlSavepoints.length) this.pager.releaseSavepoint(1);
+    if (this.sqlSavepoints.length) this.tx.releaseSavepoint(1);
     this.sqlSavepoints.length = 0;
-    this.pager.commit();
+    this.memSnapshots.length = 0;
+    this.txnMem = null;
+    this.tx.commit();
     this.autocommit = true;
     this.txnFromSavepoint = false;
   }
@@ -693,7 +857,10 @@ export class Database implements FunctionContext {
     this.fk.deferred = 0;
     this.sqlSavepoints.length = 0;
     this.txnFromSavepoint = false;
-    this.pager.rollback();
+    this.tx.rollback();
+    if (this.txnMem) this.restoreMem(this.txnMem);
+    this.txnMem = null;
+    this.memSnapshots.length = 0;
     this.autocommit = true;
     // Reload the in-memory schema if DDL was rolled back.
     this.loadSchema();
@@ -707,12 +874,15 @@ export class Database implements FunctionContext {
     this.state.epoch++;
     this.stmtNow = undefined;
     if (program.readonly) return body();
-    const pager = this.pager;
+    const pager = this.tx;
     // A statement journal is only needed inside an explicit transaction (autocommit failures roll
     // back the whole transaction) and only for statements that can fail after writing.
     const journal = !this.autocommit && !program.singleRowWrite;
     if (journal) pager.beginStatement();
     let result: T;
+    // Temp DDL and memory-view refreshes are not in the pages alone: restore them on failure.
+    const memBefore = this.mem ? this.snapshotMem() : null;
+    this.memDirty = false;
     this.fk.sync(this.schemaVersion);
     this.fk.stmt = 0;
     const deferredBefore = this.fk.deferred;
@@ -728,7 +898,11 @@ export class Database implements FunctionContext {
       pager.releaseAllPins();
       if (journal) pager.rollbackStatement();
       if (this.autocommit) pager.rollback();
-      this.loadSchemaIfChanged();
+      if (this.memDirty && memBefore) {
+        this.restoreMem(memBefore);
+        this.memDirty = false;
+        this.loadSchema();
+      } else this.loadSchemaIfChanged();
       throw e;
     }
     if (journal) pager.commitStatement();
@@ -762,7 +936,10 @@ export class Database implements FunctionContext {
     if (stmt.temp || stmt.schema?.toLowerCase() === 'temp') throw new SmaltError('SMALT_ERROR', 'materialized views cannot be temporary');
     if (stmt.ifNotExists && this.catalog.get(stmt.name.toLowerCase())?.type === 'matview') return none;
     const opts = stmt.with ?? {};
-    for (const k of Object.keys(opts)) if (k !== 'storage' && k !== 'refresh') throw new SmaltError('SMALT_ERROR', `unknown materialized view option: ${k}`);
+    for (const k of Object.keys(opts)) if (k !== 'storage' && k !== 'refresh' && k !== 'location') throw new SmaltError('SMALT_ERROR', `unknown materialized view option: ${k}`);
+    const location = String(opts.location ?? 'file').toLowerCase();
+    if (location !== 'file' && location !== 'memory') throw new SmaltError('SMALT_ERROR', `location must be 'file' or 'memory'`);
+    const inMemory = location === 'memory' && this.mem !== null;
     const storage = String(opts.storage ?? 'row').toLowerCase();
     if (storage !== 'row' && storage !== 'columnar') throw new SmaltError('SMALT_ERROR', `storage must be 'row' or 'columnar'`);
     const refresh = String(opts.refresh ?? 'manual').toLowerCase();
@@ -773,10 +950,15 @@ export class Database implements FunctionContext {
     if (!this.tables.has('smalt_matview')) {
       this.createTable(parseOne(Database.MATVIEW_SQL).stmt as CreateTableStmt, Database.MATVIEW_SQL, true);
     }
-    const root = BTree.create(this.pager);
+    const root = this.createTree(inMemory);
     const { table } = buildTableSchema(parseOne(layout).stmt as CreateTableStmt, layout, root);
     table.matview = { sql, select: stmt.select, storage, populated: false, refreshedAt: null };
-    this.addCatalogRow('matview', table.name, table.name, root, sql);
+    // A memory-resident view's root is assigned at runtime: the catalog records a marker.
+    this.addCatalogRow('matview', table.name, table.name, inMemory ? MEM_BASE : root, sql);
+    if (inMemory) {
+      this.memViews.set(table.name.toLowerCase(), { root, indexRoots: new Map(), populated: false, refreshedAt: null });
+      this.memDirty = true;
+    }
     this.tables.set(table.name.toLowerCase(), table);
     this.writeMatviewMeta(table.name, { layout, populated: false, refreshedAt: null });
     let changes = 0;
@@ -791,15 +973,18 @@ export class Database implements FunctionContext {
     const mv = this.tables.get(stmt.name.toLowerCase());
     if (!mv?.matview) throw new SmaltError('SMALT_ERROR', `no such materialized view: ${stmt.name}`);
     if (stmt.concurrently && !stmt.withData) throw new SmaltError('SMALT_ERROR', 'REFRESH ... CONCURRENTLY cannot be used with WITH NO DATA');
-    this.dirtySchema = true;
+    const memory = mv.rootPage >= MEM_BASE;
+    // A memory-resident view changes no stored schema: the file (and its cookie) stay untouched.
+    if (!memory) this.dirtySchema = true;
     let changes = 0;
     if (stmt.withData) changes = this.fillMatview(mv);
     else {
-      this.swapMatviewTrees(mv, BTree.create(this.pager), mv.indexes.map(() => BTree.create(this.pager)));
+      this.swapMatviewTrees(mv, this.createTree(memory), mv.indexes.map(() => this.createTree(memory)));
       mv.matview.populated = false;
       this.writeMatviewMeta(mv.name, { populated: false, refreshedAt: mv.matview.refreshedAt });
     }
-    this.schemaChanged();
+    if (memory) this.schemaVersion++;
+    else this.schemaChanged();
     return { changes, lastInsertRowid: this.lastRowid };
   }
 
@@ -810,7 +995,8 @@ export class Database implements FunctionContext {
    */
   private fillMatview(mv: TableSchema): number {
     const info = mv.matview!;
-    const root = BTree.create(this.pager);
+    const memory = mv.rootPage >= MEM_BASE;
+    const root = this.createTree(memory);
     const target: TableSchema = { ...mv, rootPage: root, indexes: [] };
     const cols = mv.columns;
     const ncols = cols.length;
@@ -849,7 +1035,7 @@ export class Database implements FunctionContext {
       throw e;
     }
     const indexRoots = mv.indexes.map((idx) => {
-      const r = BTree.create(this.pager);
+      const r = this.createTree(memory);
       const copy: IndexSchema = { ...idx, rootPage: r };
       this.populateIndex(target, copy, r);
       if (idx.unique) this.checkUniqueIndex(target, copy);
@@ -865,13 +1051,18 @@ export class Database implements FunctionContext {
   /** Point a materialized view (and its indexes) at new trees and free the old ones. */
   private swapMatviewTrees(mv: TableSchema, root: number, indexRoots: number[]): void {
     mv.matview!.store = undefined; // cached chunks belong to the old segments
-    new BTree(this.pager, mv.rootPage).destroy();
+    const memView = root >= MEM_BASE ? this.memViews.get(mv.name.toLowerCase()) : undefined;
+    this.freshTree(mv.rootPage).destroy();
     mv.rootPage = root;
-    this.setCatalogRoot(mv.name, root);
+    if (memView) {
+      memView.root = root;
+      this.memDirty = true;
+    } else this.setCatalogRoot(mv.name, root);
     mv.indexes.forEach((idx, i) => {
-      new BTree(this.pager, idx.rootPage).destroy();
+      this.freshTree(idx.rootPage).destroy();
       idx.rootPage = indexRoots[i];
-      this.setCatalogRoot(idx.name, indexRoots[i]);
+      if (memView) memView.indexRoots.set(idx.name.toLowerCase(), indexRoots[i]);
+      else this.setCatalogRoot(idx.name, indexRoots[i]);
     });
   }
 
@@ -926,6 +1117,13 @@ export class Database implements FunctionContext {
   private writeMatviewMeta(name: string, meta: { layout?: string; populated: boolean; refreshedAt: string | null } | null): void {
     const t = this.tables.get('smalt_matview');
     if (!t) return;
+    const mv = this.memViews.get(name.toLowerCase());
+    if (mv && meta && meta.layout === undefined) {
+      // Memory-resident: refresh state is runtime-only (the file is not written).
+      mv.populated = meta.populated;
+      mv.refreshedAt = meta.refreshedAt;
+      return;
+    }
     const w = new TableWriter(t, this.pager, (root) => this.tree(root));
     const reader = new RecordReader(t.layout, t.recordDefaults);
     let found: { rowid: number | bigint; layout: string } | null = null;
@@ -962,9 +1160,23 @@ export class Database implements FunctionContext {
       const m = meta.get(r.name.toLowerCase());
       if (!m) throw new SmaltError('SMALT_CORRUPT', `missing metadata for materialized view ${r.name}`);
       const def = parseOne(r.sql!).stmt as CreateViewStmt;
-      const { table } = buildTableSchema(parseOne(m.layout).stmt as CreateTableStmt, m.layout, r.rootpage);
+      let root = r.rootpage;
+      let populated = m.populated;
+      let refreshedAt = m.refreshedAt;
+      if (root === MEM_BASE) {
+        // Memory-resident: the runtime root, or a new empty tree after reopening (rebuilt at open).
+        let mv = this.memViews.get(r.name.toLowerCase());
+        if (!mv) {
+          mv = { root: this.createTree(true), indexRoots: new Map(), populated: false, refreshedAt: null };
+          this.memViews.set(r.name.toLowerCase(), mv);
+        }
+        root = mv.root;
+        populated = mv.populated;
+        refreshedAt = mv.refreshedAt;
+      }
+      const { table } = buildTableSchema(parseOne(m.layout).stmt as CreateTableStmt, m.layout, root);
       const storage = String(def.with?.storage ?? 'row').toLowerCase() as MatViewInfo['storage'];
-      table.matview = { sql: r.sql!, select: def.select, storage, populated: m.populated, refreshedAt: m.refreshedAt };
+      table.matview = { sql: r.sql!, select: def.select, storage, populated, refreshedAt };
       this.tables.set(table.name.toLowerCase(), table);
     }
   }
@@ -1097,7 +1309,7 @@ export class Database implements FunctionContext {
 
   private createTable(stmt: CreateTableStmt, sql: string, internal = false): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
-    if (stmt.temp) throw new SmaltError('SMALT_UNSUPPORTED', 'TEMP tables are not supported yet');
+    if (stmt.temp) return this.createTempTable(stmt, sql);
     if (stmt.ifNotExists && this.catalog.has(stmt.name.toLowerCase())) return none;
     if (!internal) this.checkNewName(stmt.name, 'table');
     this.dirtySchema = true;
@@ -1117,22 +1329,61 @@ export class Database implements FunctionContext {
     return none;
   }
 
+  /**
+   * CREATE TEMP TABLE: lives in the memory store, outside the persisted catalog, for this
+   * connection only (like SQLite's temp schema); it shadows a main table of the same name.
+   */
+  private createTempTable(stmt: CreateTableStmt, sql: string): RunResult {
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    const lower = stmt.name.toLowerCase();
+    if (this.tempTables.has(lower)) {
+      if (stmt.ifNotExists) return none;
+      throw new SmaltError('SMALT_ERROR', `table ${stmt.name} already exists`);
+    }
+    if (lower.startsWith('smalt_') || lower.startsWith('sqlite_')) throw new SmaltError('SMALT_ERROR', `object name reserved for internal use: ${stmt.name}`);
+    const { table, implicitIndexes } = buildTableSchema(stmt, sql, this.createTree(true));
+    table.temp = true;
+    implicitIndexes.forEach((spec, i) => {
+      const name = autoIndexName(table.name, i + 1);
+      table.indexes.push({ name, table: table.name, rootPage: this.createTree(true), columns: spec.columns, unique: true, origin: spec.origin, constraintName: spec.constraintName });
+    });
+    this.tempTables.set(lower, table);
+    this.memDirty = true;
+    this.tables.set(lower, table);
+    for (const idx of table.indexes) this.indexes.set(idx.name.toLowerCase(), idx);
+    this.schemaVersion++;
+    return none;
+  }
+
   private createIndex(stmt: CreateIndexStmt, sql: string): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     if (stmt.ifNotExists && this.catalog.has(stmt.name.toLowerCase())) return none;
     const table = this.tables.get(stmt.table.toLowerCase());
     if (!table) throw new SmaltError('SMALT_ERROR', this.views.has(stmt.table.toLowerCase()) ? 'views may not be indexed' : `no such table: ${stmt.table}`);
     if (table.matview?.storage === 'columnar') throw new SmaltError('SMALT_ERROR', `columnar materialized view ${table.name} cannot be indexed (zone maps prune its scans)`);
-    this.checkNewName(stmt.name, 'index');
-    this.dirtySchema = true;
-    const root = BTree.create(this.pager);
+    if (table.temp) {
+      if (this.indexes.has(stmt.name.toLowerCase())) throw new SmaltError('SMALT_ERROR', `index ${stmt.name} already exists`);
+    } else this.checkNewName(stmt.name, 'index');
+    this.dirtySchema = !table.temp;
+    const memory = table.rootPage >= MEM_BASE;
+    const root = this.createTree(memory);
     const idx = buildIndexSchema(stmt, sql, table, root);
     this.prepareIndex(table, idx);
     this.populateIndex(table, idx, root);
     table.indexes.push(idx);
     this.indexes.set(idx.name.toLowerCase(), idx);
     if (idx.unique) this.checkUniqueIndex(table, idx); // existing rows may already collide
-    this.addCatalogRow('index', idx.name, table.name, root, sql);
+    if (table.temp) {
+      this.memDirty = true;
+      this.schemaVersion++;
+      return none;
+    }
+    const mv = memory ? this.memViews.get(table.name.toLowerCase()) : undefined;
+    if (mv) {
+      mv.indexRoots.set(idx.name.toLowerCase(), root);
+      this.memDirty = true;
+    }
+    this.addCatalogRow('index', idx.name, table.name, memory ? MEM_BASE : root, sql);
     this.schemaChanged();
     return none;
   }
@@ -1142,8 +1393,8 @@ export class Database implements FunctionContext {
    * partial-index rows filtered): entries are packed, sorted and bulk-loaded.
    */
   private populateIndex(table: TableSchema, idx: IndexSchema, root: number): void {
-    const tree = new BTree(this.pager, table.rootPage);
-    const itree = new BTree(this.pager, root);
+    const tree = this.freshTree(table.rootPage);
+    const itree = this.freshTree(root);
     const reader = new RecordReader(table.layout, table.recordDefaults);
     const w = new TableWriter(table, this.pager, (r) => this.tree(r));
     const enc = new KeyEncoder();
@@ -1266,7 +1517,7 @@ export class Database implements FunctionContext {
   }
 
   private checkUniqueIndex(table: TableSchema, idx: IndexSchema): void {
-    const itree = new BTree(this.pager, idx.rootPage);
+    const itree = this.freshTree(idx.rootPage);
     const c = itree.cursor();
     let prev: Uint8Array | null = null;
     try {
@@ -1299,13 +1550,14 @@ export class Database implements FunctionContext {
       }
       this.dirtySchema = true;
       for (const idx of mv.indexes) {
-        new BTree(this.pager, idx.rootPage).destroy();
+        this.freshTree(idx.rootPage).destroy();
         this.removeCatalogRow(idx.name);
         this.indexes.delete(idx.name.toLowerCase());
       }
-      new BTree(this.pager, mv.rootPage).destroy();
+      this.freshTree(mv.rootPage).destroy();
       this.removeCatalogRow(mv.name);
       this.writeMatviewMeta(mv.name, null);
+      if (this.memViews.delete(lower)) this.memDirty = true;
       this.tables.delete(lower);
       this.schemaChanged();
       return none;
@@ -1327,6 +1579,15 @@ export class Database implements FunctionContext {
       this.schemaChanged();
       return none;
     }
+    if (stmt.objectType === 'table' && this.tempTables.has(lower) && stmt.schema?.toLowerCase() !== 'main') {
+      const table = this.tempTables.get(lower)!;
+      for (const idx of table.indexes) this.freshTree(idx.rootPage).destroy();
+      this.freshTree(table.rootPage).destroy();
+      this.tempTables.delete(lower);
+      this.memDirty = true;
+      this.loadSchema(); // un-shadow a main table of the same name
+      return none;
+    }
     if (stmt.objectType === 'table') {
       const table = this.tables.get(lower);
       if (!table) {
@@ -1340,11 +1601,11 @@ export class Database implements FunctionContext {
       }
       this.dirtySchema = true;
       for (const idx of table.indexes) {
-        new BTree(this.pager, idx.rootPage).destroy();
+        this.freshTree(idx.rootPage).destroy();
         this.removeCatalogRow(idx.name);
         this.indexes.delete(idx.name.toLowerCase());
       }
-      new BTree(this.pager, table.rootPage).destroy();
+      this.freshTree(table.rootPage).destroy();
       this.removeCatalogRow(table.name);
       this.tables.delete(lower);
       this.schemaChanged();
@@ -1357,8 +1618,18 @@ export class Database implements FunctionContext {
         throw new SmaltError('SMALT_ERROR', `no such index: ${stmt.name}`);
       }
       if (idx.origin !== 'c') throw new SmaltError('SMALT_ERROR', 'index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped');
+      const owner = this.tables.get(idx.table.toLowerCase())!;
+      if (owner.temp) {
+        this.freshTree(idx.rootPage).destroy();
+        owner.indexes = owner.indexes.filter((i) => i !== idx);
+        this.indexes.delete(lower);
+        this.memDirty = true;
+        this.schemaVersion++;
+        return none;
+      }
+      this.memViews.get(owner.name.toLowerCase())?.indexRoots.delete(lower);
       this.dirtySchema = true;
-      new BTree(this.pager, idx.rootPage).destroy();
+      this.freshTree(idx.rootPage).destroy();
       this.removeCatalogRow(idx.name);
       this.indexes.delete(lower);
       const table = this.tables.get(idx.table.toLowerCase())!;
@@ -2292,7 +2563,9 @@ export class Database implements FunctionContext {
           const errors: string[] = [];
           const check = (root: number, what: string): number => {
             try {
-              return new BTree(this.pager, root).checkIntegrity().pages;
+              const pages = this.freshTree(root).checkIntegrity().pages;
+              // Memory-store trees are checked, but their pages are not the file's.
+              return root >= MEM_BASE ? 0 : pages;
             } catch (e) {
               errors.push(`${what}: ${(e as Error).message}`);
               return 0;
@@ -2301,10 +2574,10 @@ export class Database implements FunctionContext {
           let pages = 1 + check(this.pager.catalogRoot, 'smalt_schema');
           for (const t of this.tables.values()) {
             pages += check(t.rootPage, `table ${t.name}`);
-            const n = new BTree(this.pager, t.rootPage).count();
+            const n = this.freshTree(t.rootPage).count();
             for (const i of t.indexes) {
               pages += check(i.rootPage, `index ${i.name}`);
-              const m = new BTree(this.pager, i.rootPage).count();
+              const m = this.freshTree(i.rootPage).count();
               if (m !== n && !i.where) errors.push(`index ${i.name} has ${m} entries, table ${t.name} has ${n} rows`);
             }
           }
@@ -2457,6 +2730,11 @@ export class Statement {
 
   get readonly(): boolean {
     return this.prog().readonly;
+  }
+
+  /** Reads TEMP tables or memory-resident views (parallel readers cannot see them). */
+  get usesMemoryObjects(): boolean {
+    return this.db.usesMemoryObjects(this.parsed);
   }
 
   get paramCount(): number {
@@ -2682,4 +2960,19 @@ function describeValue(v: SqlValue): string {
   if (typeof v === 'string') return 'TEXT';
   if (v instanceof Uint8Array) return 'BLOB';
   return typeof v === 'number' && !Number.isInteger(v) ? 'REAL' : 'INTEGER';
+}
+
+/** Runtime state of a memory-resident materialized view. */
+interface MemView {
+  root: number;
+  /** Index name (lower case) -> root. */
+  indexRoots: Map<string, number>;
+  populated: boolean;
+  refreshedAt: string | null;
+}
+
+/** Memory-object state at a transaction / savepoint / statement boundary. */
+interface MemSnapshot {
+  temps: [string, TableSchema, IndexSchema[]][];
+  views: [string, MemView][];
 }

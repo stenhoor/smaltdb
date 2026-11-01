@@ -334,7 +334,7 @@ export class EngineServer {
    */
   private toReader(session: string, st: Statement, sql: string, req: { id: number; params?: unknown; batchSize?: number; credit?: number }): boolean {
     const pool = this.options.readers;
-    if (!pool || this.txOwner !== null || this.db?.inTransaction || !st.readonly) return false;
+    if (!pool || this.txOwner !== null || this.db?.inTransaction || !st.readonly || st.usesMemoryObjects) return false;
     // A reader pays for a snapshot refresh and a hand-off: worth it only when other requests are
     // waiting behind this one (concurrent demand). Alone, the owner answers fastest.
     if (this.queue.length === 0) return false;
