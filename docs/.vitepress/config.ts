@@ -9,7 +9,7 @@ const REPO = 'https://github.com/stenhoor/smaltdb'
 export default defineConfig({
   title: 'smaltdb',
   description: 'A fast alternative database for the browser, written in TypeScript.',
-  base: '/smaltdb/',
+  base: '/',
   cleanUrls: true,
   srcExclude: ['brand/**'],
   // adr/README.md is the folder's landing page on GitHub; publish it at /adr/ too.
@@ -18,7 +18,7 @@ export default defineConfig({
   // docs/brand holds the logo files; serve them from the site root.
   vite: { publicDir: path.resolve(here, '../brand') },
   head: [
-    ['link', { rel: 'icon', type: 'image/svg+xml', href: '/smaltdb/favicon-32.svg' }],
+    ['link', { rel: 'icon', type: 'image/svg+xml', href: '/favicon-32.svg' }],
     ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],
     ['link', { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: '' }],
     ['link', { rel: 'stylesheet', href: 'https://fonts.googleapis.com/css2?family=Geist:wght@400;500;700&family=Geist+Mono:wght@400;500&family=Martian+Mono:wght@400;600&display=swap' }],
