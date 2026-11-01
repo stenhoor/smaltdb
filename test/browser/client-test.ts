@@ -178,6 +178,24 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
     for await (const rows of s2) for (const r of rows) total += r.n;
     const now = await db.query('SELECT sum(a) AS s FROM big');
     check('a reader stream keeps its snapshot while the owner writes', total === 20000100000 && now[0].s === -20000100000, [total, now]);
+    // PRAGMA settings reach the readers (separate connections): with matview_rewrite turned on at
+    // the owner, a query served by a reader is answered from the view. As above, the query goes to a
+    // reader only if the concurrent PRAGMA is still queued, so it is repeated until one served it.
+    await db.exec('CREATE MATERIALIZED VIEW big_mv AS SELECT a % 7 AS k, count(*) AS n FROM big GROUP BY a % 7');
+    await db.exec('PRAGMA matview_rewrite = 1');
+    let readerPlan: unknown[][] | null = null;
+    for (let attempt = 0; attempt < 20 && readerPlan === null; attempt++) {
+      const r1 = db.stats.readerQueries;
+      const plan = db.query('EXPLAIN QUERY PLAN SELECT a % 7, count(*) FROM big GROUP BY a % 7', undefined, { rowMode: 'array' });
+      const other = db.query('PRAGMA page_size');
+      const rows = await plan;
+      await other;
+      if (db.stats.readerQueries > r1) readerPlan = rows;
+      else await new Promise((r) => setTimeout(r, 20)); // let the readers report idle
+    }
+    check('PRAGMA matview_rewrite set on the owner applies on readers', readerPlan !== null && JSON.stringify(readerPlan).includes('big_mv'), readerPlan);
+    await db.exec('PRAGMA matview_rewrite = 0');
+    await db.exec('DROP MATERIALIZED VIEW big_mv');
     // Morsel parallelism: a large aggregate runs as partial aggregates on the readers, merged by the owner.
     await db.exec('CREATE TABLE huge(id INTEGER PRIMARY KEY, g INT, x REAL)');
     await db.exec('WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 600000) INSERT INTO huge SELECT i, i % 50, i / 3.0 FROM n');

@@ -41,12 +41,24 @@ export type Request = { id: number } & (
   | { op: 'cancel'; target: number }
 );
 
+/**
+ * Connection settings that change how a parallel reader answers a query (set on the owner with
+ * PRAGMA). Sent with every query and morsel handed to a reader, which applies them first.
+ */
+export interface ReaderSettings {
+  /** `PRAGMA work_mem`: bytes sorts and hash aggregates use before spilling. */
+  workMem: number;
+  /** `PRAGMA matview_rewrite`: answer queries from fresh materialized views. */
+  matviewRewrite: boolean;
+}
+
 /** Owner worker <-> parallel reader worker. */
 export type ReaderMessage =
   | { type: 'init'; name: string; pageSize?: number; cacheSizeBytes?: number; reader: number; port: MessagePort; bus?: string; interrupt?: SharedArrayBuffer }
-  | { type: 'job'; session: string; req: Request }
+  /** `settings`: the owner's, for a query (credits and cancels for a running query carry none). */
+  | { type: 'job'; session: string; req: Request; settings?: ReaderSettings }
   /** Morsel parallelism: partial aggregates of `sql` over rowids [lo, hi), answered with 'partialDone'. */
-  | { type: 'partial'; task: number; sql: string; params?: unknown; lo: number; hi: number }
+  | { type: 'partial'; task: number; sql: string; params?: unknown; lo: number; hi: number; settings?: ReaderSettings }
   | { type: 'partialDone'; reader: number; task: number; rows?: SqlValue[][]; error?: string }
   | { type: 'ready'; reader: number }
   | { type: 'idle'; reader: number }

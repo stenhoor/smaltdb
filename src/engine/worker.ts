@@ -16,7 +16,7 @@ import { EngineServer, type PartialTask, type ReaderPool, defaultOpen } from './
 import type { SqlValue } from './values.js';
 import { detectCapabilities } from './vfs/capabilities.js';
 import { OpfsVfs } from './vfs/opfs.js';
-import type { BusMessage, ReaderMessage, Request, Response } from '../shared/protocol.js';
+import type { BusMessage, ReaderMessage, ReaderSettings, Request, Response } from '../shared/protocol.js';
 
 const scope = self as unknown as DedicatedWorkerGlobalScope;
 
@@ -53,6 +53,7 @@ function startReader(init: Extract<ReaderMessage, { type: 'init' }>): void {
       let msg: ReaderMessage;
       try {
         server.db!.refreshSnapshot();
+        if (m.settings) server.db!.applyReaderSettings(m.settings);
         msg = { type: 'partialDone', reader: init.reader, task: m.task, rows: server.db!.runPartial(m.sql, m.params as never, m.lo, m.hi) };
       } catch (err) {
         msg = { type: 'partialDone', reader: init.reader, task: m.task, error: err instanceof Error ? err.message : String(err) };
@@ -62,9 +63,10 @@ function startReader(init: Extract<ReaderMessage, { type: 'init' }>): void {
     }
     if (m.type !== 'job') return;
     if (m.req.op === 'query') {
-      // A new query: move to the latest commit first.
+      // A new query: move to the latest commit and take the owner's settings first.
       try {
         server.db!.refreshSnapshot();
+        if (m.settings) server.db!.applyReaderSettings(m.settings);
       } catch (err) {
         scope.postMessage({ type: 'failed', reader: init.reader, message: String(err) } satisfies ReaderMessage);
       }
@@ -98,7 +100,7 @@ class Readers implements ReaderPool {
     const id = this.nextTask++;
     r.job = { kind: 'partial', task: id }; // busy (and holds checkpoints back) until the partial is done
     this.partials.set(id, done);
-    r.w.postMessage({ type: 'partial', task: id, sql: task.sql, params: task.params, lo: task.lo, hi: task.hi } satisfies ReaderMessage);
+    r.w.postMessage({ type: 'partial', task: id, sql: task.sql, params: task.params, lo: task.lo, hi: task.hi, settings: task.settings } satisfies ReaderMessage);
     return true;
   }
 
@@ -144,11 +146,11 @@ class Readers implements ReaderPool {
     }
   }
 
-  dispatch(session: string, req: Extract<Request, { op: 'query' }>): boolean {
+  dispatch(session: string, req: Extract<Request, { op: 'query' }>, settings: ReaderSettings): boolean {
     const r = this.workers.find((x) => x.ready && x.job === null);
     if (!r) return false;
     r.job = { kind: 'query', session, id: req.id };
-    r.w.postMessage({ type: 'job', session, req } satisfies ReaderMessage);
+    r.w.postMessage({ type: 'job', session, req, settings } satisfies ReaderMessage);
     return true;
   }
 

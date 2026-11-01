@@ -324,7 +324,10 @@ unchanged: all suites pass, and `bench/micro/m7-perf.ts` plus an interpreted GRO
     never declares an INTEGER PRIMARY KEY, so views have no rowid alias that could go unpruned.
   - **Follow-up features, not cleanup** (they change behavior):
     - MV rewrite inside subqueries, CTEs, views and INSERT … SELECT, by hooking it into `planSelect`;
-    - passing PRAGMA settings (`work_mem`, `matview_rewrite`) to parallel readers.
+    - passing PRAGMA settings (`work_mem`, `matview_rewrite`) to parallel readers. **Done:** the owner sends its
+      settings (`Database.readerSettings`) with each query and morsel handed to a reader, which applies them first
+      (`applyReaderSettings`). Tests: `test/reader-settings.test.ts`, plus a browser check that a reader answers from
+      a materialized view once the owner turns `matview_rewrite` on.
 
 ## Suggested order of work
 
