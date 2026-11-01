@@ -50,6 +50,13 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   } catch (e) {
     check('constraint error surfaces', (e as { code: string }).code === 'SMALT_CONSTRAINT_NOTNULL', String(e));
   }
+  // CSV / JSON import and export through the worker (bytes transferred, Blob source).
+  const imported = await db.importCSV('people', new Blob(['id,name,age\n1,"Lee, A",31\n2,Kim,\n']), { create: true });
+  const asJson = await db.exportJSON('SELECT id, name, age FROM people ORDER BY id');
+  check('import CSV / export JSON', imported.rows === 2 && asJson === '[{"id":1,"name":"Lee, A","age":31},{"id":2,"name":"Kim","age":null}]', [imported, asJson]);
+  await db.importJSON('people', '{"id":3,"name":"Ng"}\n');
+  const asCsv = await db.exportCSV('SELECT id, name FROM people WHERE id > ?', [1]);
+  check('import NDJSON / export CSV', asCsv === 'id,name\n2,Kim\n3,Ng\n', asCsv);
   await db.close();
 
   // Reopen: data persisted in OPFS.

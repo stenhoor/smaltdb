@@ -1988,6 +1988,11 @@ export class Statement {
     return this.prog().columns;
   }
 
+  /** Static result types ('int', 'real', 'text', ... or 'any' when unknown). */
+  get columnTypes(): StaticType[] {
+    return this.prog().columnTypes;
+  }
+
   get readonly(): boolean {
     return this.prog().readonly;
   }

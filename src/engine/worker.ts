@@ -4,6 +4,7 @@
  * in dedicated workers) and executes requests sequentially.
  */
 import { type BindParams, Database, type RowCursor, type Statement } from './database.js';
+import { exportCSV, exportJSON, importCSV, importJSON } from './io/import-export.js';
 import { SmaltError } from './errors.js';
 import { detectCapabilities } from './vfs/capabilities.js';
 import { MemoryVfs } from './vfs/memory.js';
@@ -87,6 +88,20 @@ async function handle(req: Request): Promise<void> {
       statements.delete(req.stmt);
       post({ id, kind: 'ok' });
       return;
+    case 'import': {
+      const d = requireDb();
+      const text = new TextDecoder().decode(req.data);
+      const r = req.format === 'csv' ? importCSV(d, req.table, text, req.options) : importJSON(d, req.table, text, req.options);
+      post({ id, kind: 'ok', changes: r.rows });
+      return;
+    }
+    case 'export': {
+      const d = requireDb();
+      const params = req.params as SqlValue[] | Record<string, SqlValue> | undefined;
+      const text = req.format === 'csv' ? exportCSV(d, req.sql, params, req.options) : exportJSON(d, req.sql, params, req.options);
+      post({ id, kind: 'ok', text });
+      return;
+    }
     case 'close':
       statements.clear();
       db?.close();

@@ -10,3 +10,4 @@ export { KeyEncoder, encodeKey, decodeKey, Collation, type KeyColumn, type SqlVa
 export { crc32c } from './storage/crc32c.js';
 export { Database, Statement, RowCursor, type RunResult, type QueryResult, type BindParams, type DatabaseOptions } from './database.js';
 export { parse, parseOne, SqlSyntaxError } from './sql/parser.js';
+export { importCSV, importJSON, exportCSV, exportJSON, type CsvImportOptions, type JsonImportOptions, type CsvExportOptions, type JsonExportOptions } from './io/import-export.js';

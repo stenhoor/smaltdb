@@ -24,6 +24,8 @@ export type Request = { id: number } & (
   | { op: 'stmtRun'; stmt: number; params?: Params }
   | { op: 'stmtQuery'; stmt: number; params?: Params; batchSize?: number }
   | { op: 'finalize'; stmt: number }
+  | { op: 'import'; format: 'csv' | 'json'; table: string; data: Uint8Array; options?: Record<string, unknown> }
+  | { op: 'export'; format: 'csv' | 'json'; sql: string; params?: Params; options?: Record<string, unknown> }
   | { op: 'close' }
 );
 
@@ -37,7 +39,7 @@ export type WireColumn =
   | { t: 'any'; data: SqlValue[] };
 
 export type Response =
-  | { id: number; kind: 'ok'; changes?: number; lastInsertRowid?: number | bigint; stmt?: number; columns?: string[]; paramCount?: number; capabilities?: unknown }
+  | { id: number; kind: 'ok'; changes?: number; lastInsertRowid?: number | bigint; stmt?: number; columns?: string[]; paramCount?: number; capabilities?: unknown; text?: string }
   | { id: number; kind: 'columns'; columns: string[] }
   | { id: number; kind: 'batch'; length: number; cols: WireColumn[] }
   | { id: number; kind: 'done' }

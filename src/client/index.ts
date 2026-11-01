@@ -2,6 +2,7 @@
  * smaltdb client API. Runs on the main thread (or any worker) and talks to the engine worker.
  * See docs/API.md.
  */
+import type { CsvExportOptions, CsvImportOptions, JsonExportOptions, JsonImportOptions } from '../engine/io/import-export.js';
 import type { SqlValue } from '../engine/values.js';
 import { type Params, type Request, type RequestBody, type Response, type WireColumn, columnValue } from '../shared/protocol.js';
 
@@ -217,6 +218,39 @@ export class Database implements Queryable {
     return this.withLock(() => this.rawExec(sql, params));
   }
 
+  /**
+   * Import CSV into `table` in one transaction (constraints and conversions apply). `source` may be
+   * text, bytes or a Blob/File. With `{ create: true }` a missing table is created with column types
+   * inferred from the data. Returns the number of rows inserted.
+   */
+  importCSV(table: string, source: ImportSource, options: CsvImportOptions = {}): Promise<{ rows: number }> {
+    return this.importData('csv', table, source, options as Record<string, unknown>);
+  }
+
+  /** Import a JSON array (of objects or arrays) or NDJSON into `table`; see {@link importCSV}. */
+  importJSON(table: string, source: ImportSource, options: JsonImportOptions = {}): Promise<{ rows: number }> {
+    return this.importData('json', table, source, options as Record<string, unknown>);
+  }
+
+  /** Run a query and return its result as CSV text (header row first by default). */
+  exportCSV(sql: string, params?: Params, options: CsvExportOptions = {}): Promise<string> {
+    return this.withLock(async () => ((await this.request({ op: 'export', format: 'csv', sql, params, options: options as Record<string, unknown> })) as { text: string }).text);
+  }
+
+  /** Run a query and return its result as a JSON array of objects (or NDJSON with `{ format: 'ndjson' }`). */
+  exportJSON(sql: string, params?: Params, options: JsonExportOptions = {}): Promise<string> {
+    return this.withLock(async () => ((await this.request({ op: 'export', format: 'json', sql, params, options: options as Record<string, unknown> })) as { text: string }).text);
+  }
+
+  private async importData(format: 'csv' | 'json', table: string, source: ImportSource, options: Record<string, unknown>): Promise<{ rows: number }> {
+    let data: Uint8Array;
+    if (typeof source === 'string') data = new TextEncoder().encode(source);
+    else if (source instanceof Uint8Array) data = source;
+    else if (source instanceof ArrayBuffer) data = new Uint8Array(source);
+    else data = new Uint8Array(await source.arrayBuffer());
+    return this.withLock(async () => ({ rows: ((await this.request({ op: 'import', format, table, data, options })) as { changes: number }).changes }));
+  }
+
   /** Prepare a statement for repeated execution. */
   async prepare(sql: string): Promise<PreparedStatement> {
     const r = (await this.withLock(() => this.request({ op: 'prepare', sql }))) as { stmt: number; columns: string[]; paramCount: number };
@@ -329,3 +363,8 @@ function materialize(columns: string[], batches: { length: number; cols: WireCol
   if (mode === 'array') (rows as unknown as ArrayResult).columns = columns;
   return rows;
 }
+
+/** Data accepted by importCSV / importJSON. */
+export type ImportSource = string | Uint8Array | ArrayBuffer | Blob;
+export type { CsvExportOptions, CsvImportOptions, JsonExportOptions, JsonImportOptions } from '../engine/io/import-export.js';
+
