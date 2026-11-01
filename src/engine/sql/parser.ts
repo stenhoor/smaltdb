@@ -288,6 +288,9 @@ class Parser {
     const stmt = this.statement();
     const start = this.starts[first];
     const end = this.ends[this.p - 1];
+    // Positions become relative to the statement's own text (what is stored for DDL and used to
+    // name result columns), not to the multi-statement source it came from.
+    if (start !== 0) rebase(stmt, start);
     return {
       stmt,
       text: this.src.slice(start, end),
@@ -1119,7 +1122,7 @@ class Parser {
         this.expectKw('KEY');
         const columns = this.nameList();
         this.expectKw('REFERENCES');
-        return { pos, name, kind: 'foreignKey', ...this.foreignKeyClause(), columns, end: this.ends[this.p - 1] };
+        return { pos, name, kind: 'foreignKey', columns, references: this.foreignKeyClause(), end: this.ends[this.p - 1] };
       }
       default:
         this.fail();
@@ -1690,3 +1693,19 @@ class Parser {
     return { kind: 'case', pos, base, whens, else: elseExpr, end: this.ends[this.p - 1] };
   }
 }
+
+/** Subtract `delta` from every `pos`/`end` in an AST (nodes are plain objects and arrays). */
+function rebase(node: unknown, delta: number): void {
+  if (Array.isArray(node)) {
+    for (const x of node) rebase(x, delta);
+    return;
+  }
+  if (typeof node !== 'object' || node === null || Object.getPrototypeOf(node) !== Object.prototype) return;
+  const o = node as Record<string, unknown>;
+  for (const k of Object.keys(o)) {
+    const v = o[k];
+    if ((k === 'pos' || k === 'end') && typeof v === 'number') o[k] = v - delta;
+    else if (typeof v === 'object' && v !== null) rebase(v, delta);
+  }
+}
+

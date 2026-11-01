@@ -11,7 +11,7 @@ import {
 import { MisuseError, SmaltError } from './errors.js';
 import { type StaticType, truthy } from './exec/convert.js';
 import { type CompileScope, type Compiled, type Fn, compileExpr } from './exec/expr.js';
-import type { FunctionContext } from './exec/functions.js';
+import { type FunctionContext, aggregateFunctions, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
 import { Planner, type QueryPlan, Registers } from './exec/planner.js';
 import { type ConflictMode, TableWriter } from './exec/write.js';
@@ -35,6 +35,7 @@ import { KeyEncoder, decodeKey, readRowidKey } from './storage/key-codec.js';
 import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordReader } from './storage/record.js';
 import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec/stats.js';
+import { type CatalogSnapshot, informationSchema } from './catalog/information-schema.js';
 import type { SqlValue } from './values.js';
 import type { Vfs, VfsFile } from './vfs/types.js';
 
@@ -229,6 +230,59 @@ export class Database implements FunctionContext {
     return this.tables.get(lower);
   }
 
+  /** @internal Virtual tables for the planner: information_schema views and pragma_*() functions. */
+  virtualTable(schema: string | undefined, name: string): { columns: { name: string; type: StaticType }[]; rows: (args: SqlValue[]) => SqlValue[][] } | undefined {
+    if (schema === 'information_schema') {
+      const vt = informationSchema(name, this.catalogSnapshot());
+      return vt && { columns: vt.columns, rows: () => vt.rows() };
+    }
+    const lower = name.toLowerCase();
+    if (!lower.startsWith('pragma_')) return undefined;
+    const pragma = lower.slice('pragma_'.length);
+    let current: SqlValue[] = [];
+    const p = this.pragmaTable(pragma, () => (current[0] === null || current[0] === undefined ? undefined : String(current[0])));
+    if (!p) return undefined;
+    return {
+      columns: p.columns.map((c) => ({ name: c, type: 'any' as StaticType })),
+      rows: (args) => {
+        current = args;
+        // Unlike PRAGMA, the table-valued form yields no rows for an unknown table.
+        try {
+          return p.rows();
+        } catch (e) {
+          if (e instanceof SmaltError && /^no such table/.test(e.message)) return [];
+          throw e;
+        }
+      },
+    };
+  }
+
+  private catalogSnapshot(): CatalogSnapshot {
+    return {
+      tables: [...this.tables.values()],
+      views: [...this.views.values()].map((v) => ({ name: v.name, sql: v.sql, selectPos: v.select.pos })),
+      viewColumns: (name) => {
+        const v = this.views.get(name.toLowerCase());
+        if (!v) return null;
+        try {
+          const planner = new Planner(
+            { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state },
+            new Registers(0),
+          );
+          planner.sqlText = v.sql;
+          const plan = planner.planSelect(v.select, null);
+          return plan.columns.map((c, i) => ({ name: v.columns?.[i] ?? c.name, declType: c.declType ?? '' }));
+        } catch {
+          return null;
+        }
+      },
+      functions: [
+        ...[...scalarFunctions].map(([name, f]) => ({ name, kind: 'FUNCTION' as const, deterministic: f.deterministic })),
+        ...[...aggregateFunctions.keys()].map((name) => ({ name, kind: 'AGGREGATE' as const, deterministic: true })),
+      ].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
+    };
+  }
+
   /** @internal View by name (for the planner). */
   getView(name: string): ViewSchema | undefined {
     return this.views.get(name.toLowerCase());
@@ -262,7 +316,7 @@ export class Database implements FunctionContext {
         const name = autoIndexName(table.name, i + 1);
         const root = autoRoots.get(name.toLowerCase());
         if (root === undefined) throw new SmaltError('SMALT_CORRUPT', `missing automatic index ${name}`);
-        const idx: IndexSchema = { name, table: table.name, rootPage: root, columns: spec.columns, unique: true, origin: spec.origin };
+        const idx: IndexSchema = { name, table: table.name, rootPage: root, columns: spec.columns, unique: true, origin: spec.origin, constraintName: spec.constraintName };
         table.indexes.push(idx);
         this.indexes.set(name.toLowerCase(), idx);
       });
@@ -333,7 +387,7 @@ export class Database implements FunctionContext {
     const stmt = ps.stmt;
     const regs = new Registers(ps.paramCount);
     const planner = new Planner(
-      { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), sampledStats: (t) => this.sampledStats(t), funcCtx: this, state: this.state },
+      { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), virtualTable: (schema, n) => this.virtualTable(schema, n), openTree: (root) => this.tree(root), sampledStats: (t) => this.sampledStats(t), funcCtx: this, state: this.state },
       regs,
     );
     planner.sqlText = ps.text;
@@ -629,7 +683,7 @@ export class Database implements FunctionContext {
     implicitIndexes.forEach((spec, i) => {
       const name = autoIndexName(table.name, i + 1);
       const iroot = BTree.create(this.pager);
-      const idx: IndexSchema = { name, table: table.name, rootPage: iroot, columns: spec.columns, unique: true, origin: spec.origin };
+      const idx: IndexSchema = { name, table: table.name, rootPage: iroot, columns: spec.columns, unique: true, origin: spec.origin, constraintName: spec.constraintName };
       table.indexes.push(idx);
       this.indexes.set(name.toLowerCase(), idx);
       this.addCatalogRow('index', name, table.name, iroot, null);
@@ -1076,6 +1130,72 @@ export class Database implements FunctionContext {
 
   // ---------------------------------------------------------------- PRAGMA
 
+  /**
+   * Schema pragmas usable both as `PRAGMA name(arg)` and as table-valued functions
+   * (`pragma_name(arg)`): column names and a row producer.
+   */
+  pragmaTable(name: string, arg: () => string | undefined): { columns: string[]; rows: () => SqlValue[][] } | undefined {
+    const tableArg = (): TableSchema => {
+      const n = arg();
+      const t = n ? this.getTable(n) : undefined;
+      if (!t) throw new SmaltError('SMALT_ERROR', `no such table: ${n}`);
+      return t;
+    };
+    const ro = (columns: string[], rows: () => SqlValue[][]): { columns: string[]; rows: () => SqlValue[][] } => ({ columns, rows });
+    switch (name) {
+      case 'table_info':
+      case 'table_xinfo':
+        return ro(['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'], () => {
+          const t = tableArg();
+          let pkn = 0;
+          const pkOrder = new Map<number, number>();
+          const pkIdx = t.indexes.find((i) => i.origin === 'pk');
+          if (t.rowidAlias >= 0) pkOrder.set(t.rowidAlias, 1);
+          else pkIdx?.columns.forEach((c) => pkOrder.set(c.column, ++pkn));
+          return t.columns.map((c, i) => [
+            i,
+            c.name,
+            c.declaredType,
+            c.declaredNotNull ? 1 : 0,
+            c.defaultExpr ? t.sql.slice(c.defaultExpr.pos, c.defaultExpr.end) : null,
+            pkOrder.get(i) ?? 0,
+          ]);
+        });
+      case 'index_list':
+        return ro(['seq', 'name', 'unique', 'origin', 'partial'], () => {
+          const t = tableArg();
+          return t.indexes.map((idx, i) => [i, idx.name, idx.unique ? 1 : 0, idx.origin, idx.where ? 1 : 0]);
+        });
+      case 'index_info':
+        return ro(['seqno', 'cid', 'name'], () => {
+          const name = arg() ?? '';
+          const idx = this.indexes.get(name.toLowerCase());
+          if (!idx) return [];
+          const t = this.tables.get(idx.table.toLowerCase())!;
+          return idx.columns.map((c, i) => [i, c.column, t.columns[c.column].name]);
+        });
+      case 'index_xinfo':
+        return ro(['seqno', 'cid', 'name', 'desc', 'coll', 'key'], () => {
+          const idx = this.indexes.get((arg() ?? '').toLowerCase());
+          if (!idx) return [];
+          const t = this.tables.get(idx.table.toLowerCase())!;
+          const keys = idx.columns.map((c, i) => [i, c.column, t.columns[c.column].name, c.desc ? 1 : 0, ['BINARY', 'NOCASE', 'RTRIM'][c.collation], 1]);
+          return [...keys, [idx.columns.length, -1, null, 0, 'BINARY', 0]];
+        });
+      case 'foreign_key_list':
+        return ro(['id', 'seq', 'table', 'from', 'to', 'on_update', 'on_delete', 'match'], () => {
+          const t = tableArg();
+          // SQLite lists the last-declared foreign key first.
+          return t.foreignKeys
+            .map((fk, id) => ({ fk, id: t.foreignKeys.length - 1 - id }))
+            .reverse()
+            .flatMap(({ fk, id }) => fk.columns.map((c, seq) => [id, seq, fk.table, t.columns[c].name, fk.refColumns?.[seq] ?? null, fk.onUpdate, fk.onDelete, 'NONE']));
+        });
+      default:
+        return undefined;
+    }
+  }
+
   private compilePragma(stmt: PragmaStmt, planner: Planner): Omit<Program, 'regCount'> {
     const arg = (): string | undefined => {
       if (!stmt.value) return undefined;
@@ -1097,35 +1217,14 @@ export class Database implements FunctionContext {
     switch (stmt.name) {
       case 'table_info':
       case 'table_xinfo':
-        return ro(['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'], () => {
-          const t = tableArg();
-          let pkn = 0;
-          const pkOrder = new Map<number, number>();
-          const pkIdx = t.indexes.find((i) => i.origin === 'pk');
-          if (t.rowidAlias >= 0) pkOrder.set(t.rowidAlias, 1);
-          else pkIdx?.columns.forEach((c) => pkOrder.set(c.column, ++pkn));
-          return t.columns.map((c, i) => [
-            i,
-            c.name,
-            c.declaredType,
-            c.notNull ? 1 : 0,
-            c.defaultExpr ? t.sql.slice(c.defaultExpr.pos, c.defaultExpr.end) : null,
-            pkOrder.get(i) ?? 0,
-          ]);
-        });
       case 'index_list':
-        return ro(['seq', 'name', 'unique', 'origin', 'partial'], () => {
-          const t = tableArg();
-          return t.indexes.map((idx, i) => [i, idx.name, idx.unique ? 1 : 0, idx.origin, idx.where ? 1 : 0]);
-        });
       case 'index_info':
-        return ro(['seqno', 'cid', 'name'], () => {
-          const name = arg() ?? '';
-          const idx = this.indexes.get(name.toLowerCase());
-          if (!idx) return [];
-          const t = this.tables.get(idx.table.toLowerCase())!;
-          return idx.columns.map((c, i) => [i, c.column, t.columns[c.column].name]);
-        });
+      case 'index_xinfo':
+      case 'foreign_key_list': {
+        const name = stmt.name;
+        const p = this.pragmaTable(name, () => arg());
+        return ro(p!.columns, p!.rows);
+      }
       case 'page_size':
         return ro(['page_size'], () => [[this.pager.pageSize]]);
       case 'page_count':

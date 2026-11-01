@@ -51,6 +51,14 @@ These are read-only views over the internal catalog and follow the SQL-standard 
 
 SQLite compatibility: `sqlite_schema` / `sqlite_master`, `pragma_table_info()`, `pragma_index_list()`, and the related table-valued pragma functions.
 
+> **Implemented in M4** (`src/engine/catalog/information-schema.ts`): `schemata`, `tables`, `columns`, `views`, `table_constraints`,
+> `key_column_usage`, `referential_constraints`, `check_constraints`, `routines` (built-in functions) and `statistics`.
+> Constraints without a name get PostgreSQL-style names (`t_pkey`, `t_col_key`, `t_col_fkey`, `t_check1`). Internal tables
+> (`smalt_*`) are not listed. Not yet: `parameters` (no per-function signatures), `materialized_views` (M5), TEMP objects.
+> Table-valued pragmas: `pragma_table_info`, `pragma_table_xinfo`, `pragma_index_list`, `pragma_index_info`,
+> `pragma_index_xinfo`, `pragma_foreign_key_list`; their arguments may reference earlier FROM sources
+> (`FROM sqlite_schema m JOIN pragma_table_info(m.name)`), which plans them as lateral joins.
+
 ## 5. Materialized views
 
 ```sql

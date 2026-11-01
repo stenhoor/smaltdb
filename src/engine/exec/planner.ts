@@ -73,10 +73,16 @@ import {
   TableAccess,
   TableScan,
   Values,
+  VirtualScan,
 } from './operators.js';
 
 export interface PlannerEnv {
   getTable(name: string): TableSchema | undefined;
+  /**
+   * Virtual tables: `information_schema.<name>` (schema 'information_schema') and table-valued
+   * functions such as `pragma_table_info(t)` (schema undefined). Rows are computed at open.
+   */
+  virtualTable?(schema: string | undefined, name: string): { columns: { name: string; type: StaticType }[]; rows: (args: SqlValue[]) => SqlValue[][] } | undefined;
   /** A view's definition, expanded where the view is referenced. */
   getView?(name: string): { name: string; sql: string; columns?: string[]; select: SelectStmt } | undefined;
   openTree(rootPage: number): BTree;
@@ -132,6 +138,8 @@ interface Source {
   cols: SourceColumn[];
   rowidReg: number;
   sub?: QueryPlan;
+  /** Table-valued function whose arguments read earlier sources of the same FROM (re-run per row). */
+  lateral?: boolean;
   joinType: JoinType;
   on: Expr[];
   /** Lower-cased column names merged by USING/NATURAL (hidden from unqualified lookup and *). */
@@ -984,7 +992,38 @@ export class Planner {
 
   private addSource(item: FromItem, joinType: JoinType, scope: Scope): void {
     const position = scope.sources.length;
-    if (item.kind === 'function') throw new SmaltError('SMALT_UNSUPPORTED', `table-valued function ${item.name}() is not supported yet`);
+    const isInfoSchema = item.kind === 'table' && item.schema?.toLowerCase() === 'information_schema';
+    if (item.kind === 'function' || isInfoSchema) {
+      const vt = this.env.virtualTable?.(isInfoSchema ? 'information_schema' : undefined, item.name);
+      if (!vt) {
+        if (isInfoSchema) throw new SmaltError('SMALT_ERROR', `no such table: information_schema.${item.name}`);
+        throw new SmaltError('SMALT_ERROR', `no such table-valued function: ${item.name}`);
+      }
+      const args = item.kind === 'function' ? item.args : [];
+      const cs = this.compileScope(scope);
+      const argFns = args.map((a) => compileExpr(a, cs).fn);
+      // Arguments that read earlier sources of this FROM make the source lateral.
+      let lateral = false;
+      let correlated = false;
+      for (const a of args) {
+        const d = this.deps(a, scope);
+        if (d === null) correlated = true;
+        else if (d.size > 0) lateral = true;
+        // A column that does not resolve in this FROM belongs to an enclosing query.
+        walk(a, (x) => {
+          if (x.kind === 'column' && this.findSourcePosition(x, scope) < 0) correlated = true;
+        });
+      }
+      const regs = vt.columns.map(() => this.regs.alloc());
+      const alias = item.alias ?? item.name;
+      const root = new VirtualScan(isInfoSchema ? `information_schema.${item.name}` : `${item.name}()`, (r) => vt.rows(argFns.map((f) => f(r))), regs);
+      const columns: ResultColumnInfo[] = vt.columns.map((c) => ({ name: c.name, type: c.type, collation: Collation.Binary, affinity: 'NONE' }));
+      const sub: QueryPlan = { root, outRegs: regs, columns, correlated: correlated || lateral };
+      if (correlated) scope.correlated = true;
+      const cols: SourceColumn[] = columns.map((c, i) => ({ name: c.name, reg: regs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: '', index: i }));
+      scope.sources.push({ name: alias, cols, rowidReg: -1, sub, lateral, joinType, on: [], hidden: new Set(), position });
+      return;
+    }
     const view =
       item.kind === 'table' && (!item.schema || item.schema.toLowerCase() === 'main') && !(!item.schema && scope.findCte(item.name)) && !this.env.getTable(item.name)
         ? this.env.getView?.(item.name)
@@ -1444,10 +1483,12 @@ export class Planner {
       segment = [];
     };
     for (let p = 0; p < n; p++) {
-      if (scope.sources[p].joinType === 'LEFT') {
+      const src = scope.sources[p];
+      if (src.joinType === 'LEFT' || src.lateral) {
+        // Fixed position: everything before it is joined first (outer-join semantics, lateral arguments).
         flush();
-        const step = this.joinStep(scope.sources[p], placed, rows, this.leftOnInfos(scope.sources[p], scope), scope, cs);
-        rows = Math.max(rows, step.rows); // a left join never drops outer rows
+        const step = this.joinStep(src, placed, rows, src.joinType === 'LEFT' ? this.leftOnInfos(src, scope) : pool, scope, cs);
+        rows = src.joinType === 'LEFT' ? Math.max(rows, step.rows) : step.rows; // a left join never drops outer rows
         order.push(p);
         placed.add(p);
       } else segment.push(p);

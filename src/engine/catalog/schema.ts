@@ -1,5 +1,5 @@
 import { SmaltError } from '../errors.js';
-import type { ColumnConstraint, CreateIndexStmt, CreateTableStmt, Expr, IndexedColumn } from '../sql/ast.js';
+import type { ColumnConstraint, CreateIndexStmt, CreateTableStmt, Expr, FkAction, ForeignKeyClause, IndexedColumn } from '../sql/ast.js';
 import { RecordLayout, type StorageType } from '../storage/record.js';
 import { Collation, type SqlValue, collationByName, normalizeInt } from '../values.js';
 
@@ -17,6 +17,8 @@ export interface ColumnSchema {
   declaredType: string;
   type: StorageType;
   notNull: boolean;
+  /** NOT NULL was written (PRAGMA table_info reports this; PRIMARY KEY columns are also enforced NOT NULL). */
+  declaredNotNull?: boolean;
   defaultExpr?: Expr;
   collation: Collation;
   /** Part of the PRIMARY KEY. */
@@ -40,6 +42,8 @@ export interface IndexSchema {
   unique: boolean;
   /** 'c' = CREATE INDEX, 'u' = UNIQUE constraint, 'pk' = PRIMARY KEY constraint. */
   origin: 'c' | 'u' | 'pk';
+  /** Name given with `CONSTRAINT name` (constraint-backed indexes). */
+  constraintName?: string;
   where?: Expr;
   /** CREATE INDEX text (undefined for automatic indexes). */
   sql?: string;
@@ -56,6 +60,7 @@ export interface TableSchema {
   strict: boolean;
   indexes: IndexSchema[];
   checks: { name?: string; expr: Expr }[];
+  foreignKeys: ForeignKeySchema[];
   sql: string;
   layout: RecordLayout;
   /** Default values for record columns, used by RecordReader for old (shorter) records. */
@@ -249,6 +254,21 @@ function toCollation(name: string | undefined, fallback: Collation): Collation {
 export interface ImplicitIndexSpec {
   origin: 'u' | 'pk';
   columns: IndexColumnSchema[];
+  constraintName?: string;
+}
+
+/** A FOREIGN KEY constraint (child columns -> parent table columns). */
+export interface ForeignKeySchema {
+  name?: string;
+  /** Child column indexes. */
+  columns: number[];
+  /** Parent table name as written. */
+  table: string;
+  /** Parent column names; absent = the parent's primary key. */
+  refColumns?: string[];
+  onDelete: FkAction;
+  onUpdate: FkAction;
+  deferrable: boolean;
 }
 
 /**
@@ -280,6 +300,7 @@ export function buildTableSchema(
       declaredType: def.type ?? '',
       type: storageTypeFor(def.type),
       notNull: constraintsOf(cs, 'notNull').length > 0,
+      declaredNotNull: constraintsOf(cs, 'notNull').length > 0,
       defaultExpr: dflt?.expr,
       collation: toCollation(coll?.collation, Collation.Binary),
       primaryKey: false,
@@ -292,9 +313,12 @@ export function buildTableSchema(
   let pkSeen = false;
   let rowidAlias = -1;
 
-  const addPk = (cols: { index: number; desc: boolean; collation?: string }[]): void => {
+  const fks: ForeignKeySchema[] = [];
+  let pkName: string | undefined;
+  const addPk = (cols: { index: number; desc: boolean; collation?: string }[], name?: string): void => {
     if (pkSeen) throw new SmaltError('SMALT_ERROR', `table "${stmt.name}" has more than one primary key`);
     pkSeen = true;
+    pkName = name;
     for (const c of cols) {
       columns[c.index].primaryKey = true;
       columns[c.index].notNull = true;
@@ -308,15 +332,17 @@ export function buildTableSchema(
     implicit.push({
       origin: 'pk',
       columns: cols.map((c) => ({ column: c.index, desc: c.desc, collation: toCollation(c.collation, columns[c.index].collation) })),
+      constraintName: name,
     });
   };
 
   // Column constraints first, then table constraints (SQLite numbers autoindexes in this order).
   stmt.columns.forEach((def, i) => {
     for (const c of def.constraints) {
-      if (c.kind === 'primaryKey') addPk([{ index: i, desc: c.desc }]);
-      else if (c.kind === 'unique') implicit.push({ origin: 'u', columns: [{ column: i, desc: false, collation: columns[i].collation }] });
+      if (c.kind === 'primaryKey') addPk([{ index: i, desc: c.desc }], c.name);
+      else if (c.kind === 'unique') implicit.push({ origin: 'u', columns: [{ column: i, desc: false, collation: columns[i].collation }], constraintName: c.name });
       else if (c.kind === 'check') checks.push({ name: c.name, expr: c.expr });
+      else if (c.kind === 'references') fks.push(fkSchema(c.name, [i], c));
     }
   });
   for (const tc of stmt.constraints) {
@@ -327,12 +353,18 @@ export function buildTableSchema(
         if (index < 0) throw new SmaltError('SMALT_ERROR', `no such column: ${name}`);
         return { index, desc: ic.desc, collation: indexedColumnCollation(ic) };
       });
-      if (tc.kind === 'primaryKey') addPk(cols);
-      else implicit.push({ origin: 'u', columns: cols.map((c) => ({ column: c.index, desc: c.desc, collation: toCollation(c.collation, columns[c.index].collation) })) });
+      if (tc.kind === 'primaryKey') addPk(cols, tc.name);
+      else implicit.push({ origin: 'u', columns: cols.map((c) => ({ column: c.index, desc: c.desc, collation: toCollation(c.collation, columns[c.index].collation) })), constraintName: tc.name });
     } else if (tc.kind === 'check') {
       checks.push({ name: tc.name, expr: tc.expr });
+    } else if (tc.kind === 'foreignKey') {
+      const idx = tc.columns.map((name) => {
+        const index = columns.findIndex((c) => c.name.toLowerCase() === name.toLowerCase());
+        if (index < 0) throw new SmaltError('SMALT_ERROR', `unknown column "${name}" in foreign key definition`);
+        return index;
+      });
+      fks.push(fkSchema(tc.name, idx, tc.references));
     }
-    // Foreign keys are parsed and kept in the SQL text; enforcement arrives with M4.
   }
   // Drop UNIQUE constraints that duplicate the rowid alias (always unique anyway).
   const filtered = implicit.filter((s) => !(s.columns.length === 1 && s.columns[0].column === rowidAlias));
@@ -346,11 +378,19 @@ export function buildTableSchema(
     strict: true,
     indexes: [],
     checks,
+    foreignKeys: fks,
     sql,
     layout: new RecordLayout(types),
     recordDefaults: columns.map(() => null),
   };
   return { table, implicitIndexes: filtered };
+}
+
+function fkSchema(name: string | undefined, columns: number[], c: ForeignKeyClause): ForeignKeySchema {
+  if (c.columns && c.columns.length !== columns.length) {
+    throw new SmaltError('SMALT_ERROR', `number of columns in foreign key does not match the number of columns in the referenced table`);
+  }
+  return { name, columns, table: c.table, refColumns: c.columns, onDelete: c.onDelete ?? 'NO ACTION', onUpdate: c.onUpdate ?? 'NO ACTION', deferrable: !!c.deferrable };
 }
 
 export function buildIndexSchema(stmt: CreateIndexStmt, sql: string, table: TableSchema, rootPage: number): IndexSchema {

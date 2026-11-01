@@ -1159,6 +1159,42 @@ export function explainRows(root: Operator): { id: number; parent: number; detai
   return out;
 }
 
+/** Rows of a virtual table (information_schema, table-valued pragma functions), computed at open. */
+export class VirtualScan implements Operator {
+  readonly children: Operator[] = [];
+  private rows: SqlValue[][] = [];
+  private i = 0;
+  private r!: SqlValue[];
+
+  constructor(
+    readonly label: string,
+    private readonly produce: (r: SqlValue[]) => SqlValue[][],
+    private readonly regs: number[],
+  ) {}
+
+  get detail(): string {
+    return `SCAN ${this.label} VIRTUAL TABLE`;
+  }
+
+  open(r: SqlValue[]): void {
+    this.r = r;
+    this.rows = this.produce(r);
+    this.i = 0;
+  }
+
+  next(): boolean {
+    if (this.i >= this.rows.length) return false;
+    const row = this.rows[this.i++];
+    const regs = this.regs;
+    for (let j = 0; j < regs.length; j++) this.r[regs[j]] = row[j] ?? null;
+    return true;
+  }
+
+  close(): void {
+    this.rows = [];
+  }
+}
+
 export interface AnalyzeRow {
   id: number;
   parent: number;

@@ -593,8 +593,8 @@ describe('CREATE TABLE', () => {
       ['a', true, undefined],
       ['b', false, 'NOCASE'],
     ]);
-    expect(s.constraints[3]).toMatchObject({ kind: 'foreignKey', columns: ['c'], table: 'p', onDelete: 'CASCADE' });
-    expect((s.constraints[3] as A.ForeignKeyClause).columns).toEqual(['c']);
+    expect(s.constraints[3]).toMatchObject({ kind: 'foreignKey', columns: ['c'], references: { table: 'p', onDelete: 'CASCADE' } });
+    expect((s.constraints[3] as { references: A.ForeignKeyClause }).references.columns).toEqual(['x']); // parent columns are kept separately
   });
 
   it('table options and WITH storage options', () => {
@@ -717,7 +717,7 @@ describe('scripts, spans and errors', () => {
     expect(list.map((s) => s.stmt.kind)).toEqual(['select', 'insert', 'delete']);
     expect(list.map((s) => s.text)).toEqual(['SELECT 1', 'INSERT INTO t VALUES (1)', 'DELETE FROM t']);
     for (const s of list) expect(sql.slice(s.start, s.end)).toBe(s.text);
-    expect(list[1].stmt.pos).toBe(list[1].start);
+    expect(list[1].stmt.pos).toBe(0); // positions are relative to the statement text
     expect(parse('')).toEqual([]);
     expect(parse(' ; ;')).toEqual([]);
   });

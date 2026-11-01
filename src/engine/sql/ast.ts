@@ -397,7 +397,7 @@ export type TableConstraint = Node & { name?: string } & (
     | { kind: 'primaryKey'; columns: IndexedColumn[]; onConflict?: ConflictAction }
     | { kind: 'unique'; columns: IndexedColumn[]; onConflict?: ConflictAction }
     | { kind: 'check'; expr: Expr }
-    | ({ kind: 'foreignKey'; columns: string[] } & ForeignKeyClause)
+    | { kind: 'foreignKey'; /** Child columns. */ columns: string[]; references: ForeignKeyClause }
   );
 
 export interface ColumnDef extends Node {
