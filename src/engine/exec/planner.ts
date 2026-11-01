@@ -55,7 +55,7 @@ import {
   conjuncts,
 } from './expr.js';
 import { type AggregateState, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
-import { type FusedAggSpec, type FusedHelpers, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter } from './codegen.js';
+import { type ColumnarHelpers, type FusedAggSpec, type FusedHelpers, type PipelineSource, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter } from './codegen.js';
 import { CODEGEN_HELPERS_FOR_FUSION } from './expr.js';
 import type { Frame } from '../storage/pager.js';
 import { PH_RIGHT } from '../storage/format.js';
@@ -93,7 +93,7 @@ import {
   WorkingScan,
   type ZonePredicate,
 } from './operators.js';
-import type { ColumnStore } from '../storage/columnar.js';
+import { type ColumnStore, ROW_GROUP_ROWS, zoneMayMatch } from '../storage/columnar.js';
 
 export interface PlannerEnv {
   getTable(name: string): TableSchema | undefined;
@@ -798,7 +798,7 @@ export class Planner {
    * (FusedScanAggregate). Returns null when the shape or the aggregates do not qualify.
    */
   /** Match `Filter* -> forward full TableScan`; returns the scan and the predicate ASTs (outermost last). */
-  private scanChain(src: Operator): { scan: TableScan; preds: Expr[] } | null {
+  private scanChain(src: Operator): { scan: TableScan | ColumnScan; preds: Expr[] } | null {
     if (!codegenEnabled()) return null;
     const preds: Expr[] = [];
     let node: Operator = src;
@@ -807,6 +807,7 @@ export class Planner {
       preds.push(node.ast);
       node = node.child;
     }
+    if (node instanceof ColumnScan) return { scan: node, preds: preds.reverse() };
     if (!(node instanceof TableScan) || node.lo || node.hi || node.reverse) return null;
     return { scan: node, preds: preds.reverse() };
   }
@@ -843,7 +844,7 @@ export class Planner {
   /** Replace `Filter* -> full TableScan` with a generated scan + filter (non-aggregate queries). */
   private tryFuseScanFilter(src: Operator, scope: Scope): Operator {
     const chain = this.scanChain(src);
-    if (!chain) return src;
+    if (!chain || chain.scan instanceof ColumnScan) return src;
     const { scan, preds } = chain;
     const access = scan.access;
     const cs = this.compileScope(scope);
@@ -870,15 +871,16 @@ export class Planner {
     if (!chain || !specs || groupAsts.some(hasSubquery)) return null;
     const access = chain.scan.access;
     const cs = this.compileScope(scope);
+    const node = chain.scan;
     const helpers = {
-      ...this.fusedHelpers(access),
+      ...(node instanceof ColumnScan ? this.columnarHelpers(node) : this.fusedHelpers(access)),
       hashKey,
       hashKeyMulti: (values: SqlValue[], colls: number[]) => hashKeyMulti(values, colls),
       newGroup: (keys: SqlValue[]) => ({ keys, st: aggs.map((a) => a.def.create(a.star ? [] : a.argTypes, a.collation)) }),
     };
     const build = () =>
-      generateGroupAggregate(chain.preds, groupAsts.map((expr, i) => ({ expr, collation: groupColls[i] })), specs, () => access.loaderSpec(), helpers, (e) => compileNode(e, cs));
-    return new FusedGroupAggregate(access, build, groupRegs, aggs);
+      generateGroupAggregate(chain.preds, groupAsts.map((expr, i) => ({ expr, collation: groupColls[i] })), specs, this.pipelineSource(node), helpers, (e) => compileNode(e, cs));
+    return new FusedGroupAggregate(access, build, groupRegs, aggs, node instanceof ColumnScan ? node.fusedLabel('group aggregate') : undefined);
   }
 
   private tryFuseAggregate(src: Operator, aggs: AggSpec[], scope: Scope): Operator | null {
@@ -889,6 +891,10 @@ export class Planner {
     const { scan: node, preds } = chain;
     const access = node.access;
     const cs = this.compileScope(scope);
+    if (node instanceof ColumnScan) {
+      const run = generateFusedAggregate(preds, specs, this.pipelineSource(node), this.columnarHelpers(node), (e) => compileNode(e, cs));
+      return new FusedScanAggregate(access, aggs, run as (r: SqlValue[], states: AggregateState[]) => void, node.fusedLabel('aggregate'));
+    }
     const tree = access.tree;
     const pager = tree.pager;
     const helpers: FusedHelpers = {
@@ -906,8 +912,42 @@ export class Planner {
       release: (page) => pager.release(page as Frame),
       slow: (page, off, r) => access.loadCell(page, off, r),
     };
-    const run = generateFusedAggregate(preds, specs, () => access.loaderSpec(), helpers, (e) => compileNode(e, cs));
+    const run = generateFusedAggregate(preds, specs, { rows: () => access.loaderSpec() }, helpers, (e) => compileNode(e, cs));
     return new FusedScanAggregate(access, aggs, run as (r: SqlValue[], states: AggregateState[]) => void);
+  }
+
+  /** Rows source for generated pipelines: leaf pages, or the column store of a columnar scan. */
+  private pipelineSource(node: TableScan | ColumnScan): PipelineSource {
+    const access = node.access;
+    if (node instanceof TableScan) return { rows: () => access.loaderSpec() };
+    return { columns: () => ({ decode: access.decode, rowidRegs: access.rowidReg >= 0 ? [access.rowidReg, ...access.extraRowidRegs] : [] }) };
+  }
+
+  /** Column-store access for generated loops over a columnar scan (zone maps evaluated per execution). */
+  private columnarHelpers(node: ColumnScan): ColumnarHelpers {
+    let s: ColumnStore;
+    let vals: SqlValue[] = [];
+    const zones = node.zones;
+    return {
+      ...CODEGEN_HELPERS_FOR_FUSION,
+      RG: ROW_GROUP_ROWS,
+      open: (r) => {
+        s = node.store();
+        vals = zones.map((z) => z.value(r));
+      },
+      groups: () => s.rowGroups,
+      keep: (g) => {
+        if (zones.length === 0) return true;
+        const m = s.meta(g);
+        for (let k = 0; k < zones.length; k++) {
+          const z = zones[k];
+          if (!zoneMayMatch(m.zones[z.col], m.rows, z.op, vals[k], z.binaryText)) return false;
+        }
+        return true;
+      },
+      rows: (g) => s.meta(g).rows,
+      chunk: (g, c) => s.chunk(g, c),
+    };
   }
 
   /** Register of the rowid if `e` names the rowid of the single source, else -1. */

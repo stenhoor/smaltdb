@@ -617,12 +617,21 @@ export class ColumnScan implements Operator {
 
   constructor(
     readonly access: TableAccess,
-    private readonly store: () => ColumnStore,
+    readonly store: () => ColumnStore,
     readonly zones: ZonePredicate[],
   ) {}
 
   get detail(): string {
-    return `SCAN ${this.access.tableName} (columnar${this.zones.length ? `, zone maps: ${this.zones.map((z) => z.label).join(' AND ')}` : ''})`;
+    return `SCAN ${this.access.tableName} (columnar${this.zoneText()})`;
+  }
+
+  private zoneText(): string {
+    return this.zones.length ? `, zone maps: ${this.zones.map((z) => z.label).join(' AND ')}` : '';
+  }
+
+  /** EXPLAIN text when this scan is fused into generated code with filters and `what`. */
+  fusedLabel(what: string): string {
+    return `SCAN ${this.access.tableName} (columnar, fused scan + filter + ${what}${this.zoneText()})`;
   }
 
   open(r: SqlValue[]): void {
@@ -1820,10 +1829,11 @@ export class FusedScanAggregate implements Operator {
     readonly aggs: AggSpec[],
     /** Generated: run(r, states) consumes the whole table. */
     readonly run: (r: SqlValue[], states: AggregateState[]) => void,
+    private readonly label?: string,
   ) {}
 
   get detail(): string {
-    return `SCAN ${this.access.tableName} (fused scan + filter + aggregate)`;
+    return this.label ?? `SCAN ${this.access.tableName} (fused scan + filter + aggregate)`;
   }
 
   open(r: SqlValue[]): void {
@@ -1928,10 +1938,11 @@ export class FusedGroupAggregate implements Operator {
     private readonly build: () => (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => void,
     readonly groupRegs: number[],
     readonly aggs: AggSpec[],
+    private readonly label?: string,
   ) {}
 
   get detail(): string {
-    return `SCAN ${this.access.tableName} (fused scan + filter + GROUP BY)`;
+    return this.label ?? `SCAN ${this.access.tableName} (fused scan + filter + GROUP BY)`;
   }
 
   open(r: SqlValue[]): void {

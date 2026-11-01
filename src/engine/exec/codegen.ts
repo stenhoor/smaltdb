@@ -580,6 +580,71 @@ class Pipeline {
     };
   }
 
+  /**
+   * Columnar counterpart of {@link finish}: per row group, bind each decoded column's chunk arrays;
+   * per row, read values straight from them (see storage/columnar.ts for the chunk shapes).
+   */
+  finishColumnar(src: ColumnSource): { prologue: string[]; groupStart: string[]; rowStart: string[]; dense: { test: string; rowStart: string[] } | null } {
+    const localRegs = this.localRegs;
+    const decodedRegs = new Set<number>([...src.rowidRegs]);
+    for (let i = 1; i < src.decode.length; i += 2) decodedRegs.add(src.decode[i]);
+    const mirror = this.em.usesRegisterFile;
+    const assign: Assign = (reg, expr) => {
+      const m = mirror ? (expr === 'null' ? ` r[${reg}] = null;` : ` r[${reg}] = c${reg};`) : '';
+      if (!localRegs.has(reg)) return mirror ? `r[${reg}] = ${expr};` : '';
+      if (!localRegs.get(reg)) return `c${reg} = ${expr};${m}`;
+      return expr === 'null' ? `c${reg}n = true; c${reg} = 0;${m}` : `c${reg}n = false; c${reg} = ${expr};${m}`;
+    };
+    const groupStart: string[] = [];
+    const dec: string[] = [];
+    // Dense variant: numeric columns without NULLs read straight from their arrays, with constant
+    // NULL flags the JIT can fold away. Used per row group when every such chunk qualifies.
+    const denseTests: string[] = [];
+    const denseDec: string[] = [];
+    let denseOk = !mirror;
+    for (let k = 0; k < src.decode.length; k += 2) {
+      const col = src.decode[k];
+      const reg = src.decode[k + 1];
+      if (!localRegs.has(reg) && !mirror) continue;
+      const j = k >>> 1;
+      groupStart.push(`const ch${j} = H.chunk(g, ${col}); const nb${j} = ch${j}.nulls; const nv${j} = ch${j}.num; const dc${j} = ch${j}.dict; const cd${j} = ch${j}.codes; const vs${j} = ch${j}.vals;`);
+      const val = `nv${j} !== null ? nv${j}[i] : dc${j} !== null ? dc${j}[cd${j}[i]] : vs${j} !== null ? vs${j}[i] : null`;
+      const generic = `if (nb${j} !== null && (nb${j}[i >>> 3] & (1 << (i & 7))) !== 0) { ${assign(reg, 'null')} } else { const x = ${val}; if (x === null) { ${assign(reg, 'null')} } else { ${assign(reg, 'x')} } }`;
+      dec.push(generic);
+      if (localRegs.get(reg)) {
+        denseTests.push(`nb${j} === null && nv${j} !== null`);
+        denseDec.push(`const c${reg}n = false; const c${reg} = nv${j}[i];`);
+      } else if (localRegs.has(reg)) {
+        denseDec.push(`let c${reg} = null; ${generic}`);
+      }
+    }
+    if (src.rowidRegs.length) {
+      dec.push('{ const id = base + i + 1;');
+      for (const reg of src.rowidRegs) dec.push(assign(reg, 'id'));
+      dec.push('}');
+    }
+    const outer = [...localRegs.keys()].filter((reg) => !decodedRegs.has(reg));
+    const locals = [...localRegs.keys()].filter((reg) => decodedRegs.has(reg));
+    const declLocals = locals.map((reg) => (localRegs.get(reg) ? `c${reg} = 0, c${reg}n = true` : `c${reg} = null`)).join(', ');
+    const rowidDecl = src.rowidRegs.filter((reg) => localRegs.has(reg));
+    const dense =
+      denseOk && denseTests.length > 0
+        ? {
+            test: denseTests.join(' && '),
+            rowStart: [
+              ...denseDec,
+              ...rowidDecl.map((reg) => (localRegs.get(reg) ? `const c${reg}n = false; const c${reg} = base + i + 1;` : `const c${reg} = base + i + 1;`)),
+            ],
+          }
+        : null;
+    return {
+      prologue: outer.map((reg) => (localRegs.get(reg) ? `const c${reg}n = r[${reg}] === null; const c${reg} = c${reg}n ? 0 : r[${reg}];` : `const c${reg} = r[${reg}];`)),
+      groupStart,
+      rowStart: [locals.length ? `let ${declLocals};` : '', ...dec],
+      dense,
+    };
+  }
+
   /** Emit aggregate steps into rowLines; `state(i)` is the JS expression for the i-th state. */
   addAggregates(aggs: FusedAggSpec[], state: (i: number) => string): void {
     const em = this.em;
@@ -625,30 +690,70 @@ function compileFn<T>(params: string[], src: string, args: unknown[]): T {
 export function generateFusedAggregate(
   preds: Expr[],
   aggs: FusedAggSpec[],
-  loaderSpec: () => LoaderSpec,
-  helpers: FusedHelpers,
+  source: PipelineSource,
+  helpers: FusedHelpers | ColumnarHelpers,
   fallback: (e: Expr) => FallbackNode,
 ): (r: SqlValue[], states: unknown[]) => void {
   const pl = new Pipeline(fallback);
   pl.addPredicates(preds);
   pl.addAggregates(aggs, (i) => `S${i}`);
-  const { prologue, rowStart } = pl.finish(loaderSpec());
-  const src = [
-    ...aggs.map((_, i) => `const S${i} = S[${i}];`),
-    ...prologue,
-    'let f = H.first();',
-    'try {',
-    '  while (f !== null) {',
-    '    const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);',
-    '    for (let i = 0; i < n; i++) {',
-    ...rowStart.map((l) => '      ' + l),
-    ...pl.rowLines.map((l) => '      ' + l),
-    '    }',
-    '    f = H.next(f);',
-    '  }',
-    '} finally { if (f !== null) H.release(f); }',
-  ].join('\n');
+  const src = [...aggs.map((_, i) => `const S${i} = S[${i}];`), ...scanLoop(pl, source)].join('\n');
   return compileFn(['H', 'K', 'T'], `return function smaltFusedAggregate(r, S) {\n${src}\n};`, [helpers, pl.em.consts, truthy]);
+}
+
+/** A columnar scan's decode list (column, register pairs) and rowid registers. */
+export interface ColumnSource {
+  decode: number[];
+  rowidRegs: number[];
+}
+
+/** Helpers for generated loops over a column store (one execution: `open` evaluates zone-map values). */
+export interface ColumnarHelpers extends CodegenHelpers {
+  open(r: SqlValue[]): void;
+  /** Rows per full row group (rowid = rg * RG + i + 1). */
+  readonly RG: number;
+  groups(): number;
+  /** False when the row group's zone maps rule it out. */
+  keep(g: number): boolean;
+  rows(g: number): number;
+  chunk(g: number, col: number): unknown;
+}
+
+/** Where a generated pipeline reads rows from: leaf pages of a row table, or a column store. */
+export type PipelineSource = { rows: () => LoaderSpec } | { columns: () => ColumnSource };
+
+/** The full scan loop around `pl.rowLines` for either source. */
+function scanLoop(pl: Pipeline, source: PipelineSource): string[] {
+  if ('rows' in source) {
+    const { prologue, rowStart } = pl.finish(source.rows());
+    return [
+      ...prologue,
+      'let f = H.first();',
+      'try {',
+      '  while (f !== null) {',
+      '    const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);',
+      '    for (let i = 0; i < n; i++) {',
+      ...rowStart.map((l) => '      ' + l),
+      ...pl.rowLines.map((l) => '      ' + l),
+      '    }',
+      '    f = H.next(f);',
+      '  }',
+      '} finally { if (f !== null) H.release(f); }',
+    ];
+  }
+  const { prologue, groupStart, rowStart, dense } = pl.finishColumnar(source.columns());
+  const loop = (start: string[]): string[] => ['for (let i = 0; i < n; i++) {', ...start.map((l) => '  ' + l), ...pl.rowLines.map((l) => '  ' + l), '}'];
+  return [
+    ...prologue,
+    'H.open(r);',
+    'const ng = H.groups();',
+    'for (let g = 0; g < ng; g++) {',
+    '  if (!H.keep(g)) continue;',
+    '  const n = H.rows(g); const base = g * H.RG;',
+    ...groupStart.map((l) => '  ' + l),
+    ...(dense ? [`  if (${dense.test}) {`, ...loop(dense.rowStart).map((l) => '    ' + l), '  } else {', ...loop(rowStart).map((l) => '    ' + l), '  }'] : loop(rowStart).map((l) => '  ' + l)),
+    '}',
+  ];
 }
 
 /** Resumable scan state for generated scan + filter pipelines. */
@@ -709,8 +814,8 @@ export function generateGroupAggregate(
   preds: Expr[],
   groupExprs: { expr: Expr; collation: number }[],
   aggs: FusedAggSpec[],
-  loaderSpec: () => LoaderSpec,
-  helpers: FusedHelpers & GroupHelpers & { newGroup: (keys: SqlValue[]) => { keys: SqlValue[]; st: unknown[] } },
+  source: PipelineSource,
+  helpers: (FusedHelpers | ColumnarHelpers) & GroupHelpers & { newGroup: (keys: SqlValue[]) => { keys: SqlValue[]; st: unknown[] } },
   fallback: (e: Expr) => FallbackNode,
 ): (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => void {
   const pl = new Pipeline(fallback);
@@ -731,20 +836,6 @@ export function generateGroupAggregate(
   }
   pl.rowLines.push(...keyLines, `const key = ${keyExpr};`, 'let G = groups.get(key);', `if (G === undefined) { G = H.newGroup([${keyVals.join(', ')}]); groups.set(key, G); order.push(G); }`, 'const GS = G.st;');
   pl.addAggregates(aggs, (i) => `GS[${i}]`);
-  const { prologue, rowStart } = pl.finish(loaderSpec());
-  const src = [
-    ...prologue,
-    'let f = H.first();',
-    'try {',
-    '  while (f !== null) {',
-    '    const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);',
-    '    for (let i = 0; i < n; i++) {',
-    ...rowStart.map((l) => '      ' + l),
-    ...pl.rowLines.map((l) => '      ' + l),
-    '    }',
-    '    f = H.next(f);',
-    '  }',
-    '} finally { if (f !== null) H.release(f); }',
-  ].join('\n');
+  const src = scanLoop(pl, source).join('\n');
   return compileFn(['H', 'K', 'T'], `return function smaltGroupAggregate(r, groups, order) {\n${src}\n};`, [helpers, pl.em.consts, truthy]);
 }

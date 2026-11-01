@@ -41,8 +41,8 @@ describe('columnar materialized views', () => {
     same(db, 'SELECT count(*) FROM $T WHERE sparse >= 19000');
     same(db, 'SELECT count(*) FROM $T WHERE big < 0');
     const plan = db.query('EXPLAIN QUERY PLAN SELECT count(*) FROM col WHERE id BETWEEN ? AND ?', [100, 500]).rows.flat().join(' ');
-    expect(plan).toMatch(/columnar, zone maps: id >= \? AND id <= \?/);
-    const rows = db.query('EXPLAIN ANALYZE SELECT count(*) FROM col WHERE id BETWEEN 100 AND 500').rows;
+    expect(plan).toMatch(/columnar.*zone maps: id >= \? AND id <= \?/);
+    const rows = db.query('EXPLAIN ANALYZE SELECT id FROM col WHERE id BETWEEN 100 AND 500').rows;
     const scan = rows.find((r) => String(r[2]).startsWith('SCAN col'))!;
     expect(scan[5]).toBe(8192); // one row group read out of three
   });
@@ -87,5 +87,25 @@ describe('columnar materialized views', () => {
     db.exec("CREATE MATERIALIZED VIEW n WITH (storage = 'columnar') AS SELECT * FROM t");
     expect(db.query('SELECT count(*), count(a), max(b) FROM n').rows).toEqual([[2, 0, null]]);
     expect(db.query('SELECT count(*) FROM n WHERE a = 1').rows).toEqual([[0]]);
+  });
+
+  it('fused aggregates switch between dense and NULL-aware loops per row group', () => {
+    const db = Database.openMemory();
+    db.exec('CREATE TABLE t(id INTEGER PRIMARY KEY, x INT, y REAL, k TEXT)');
+    const ins = db.prepare('INSERT INTO t VALUES (?, ?, ?, ?)');
+    db.exec('BEGIN');
+    // Row groups 0 and 1 dense; row group 2 has NULLs in x and a non-int32 value in y's group.
+    for (let i = 1; i <= 20000; i++) ins.run([i, i > 16384 && i % 3 === 0 ? null : i % 50, i > 16384 ? 1e300 / i : i / 4, 'g' + (i % 4)]);
+    db.exec('COMMIT');
+    db.exec("CREATE MATERIALIZED VIEW c WITH (storage = 'columnar') AS SELECT * FROM t");
+    for (const q of [
+      'SELECT sum(x), count(x), count(*), min(y), max(y) FROM $T WHERE x > 10',
+      'SELECT k, sum(x), avg(y), count(*) FROM $T WHERE y < 1e295 GROUP BY k ORDER BY k',
+      'SELECT count(*) FILTER (WHERE x IS NULL), sum(id) FROM $T',
+      'SELECT sum(x * 2 + id) FROM $T WHERE (x + id) % 3 = 0',
+    ]) {
+      expect(db.query(q.replaceAll('$T', 'c')).rows).toEqual(db.query(q.replaceAll('$T', 't')).rows);
+    }
+    expect(db.query('EXPLAIN QUERY PLAN SELECT sum(x) FROM c WHERE x > 10').rows.flat().join(' ')).toMatch(/columnar, fused/);
   });
 });
