@@ -492,6 +492,24 @@ export class Database implements Queryable {
     return this.withLock(async () => ({ rows: ((await this.request({ op: 'import', format, table, data, options })) as { changes: number }).changes }));
   }
 
+  /**
+   * Make a file readable by SQL as `file:<name>` (M8 external data), e.g. a `File` from an
+   * `<input type="file">` or a File System Access handle: `CREATE EXTERNAL TABLE t WITH (location = 'file:<name>', …)`
+   * or `read_csv('file:<name>')`. Pass null to remove it. Files are not stored in the database.
+   */
+  async registerFile(name: string, file: Blob | Uint8Array | ArrayBuffer | string | { getFile(): Promise<Blob> } | null): Promise<void> {
+    await this.request({ op: 'registerFile', name, file });
+  }
+
+  /**
+   * Credentials that connections name (`CREATE CONNECTION c WITH (url = …, credentials = '<name>')`):
+   * `headers` are sent only with requests to URLs that start with `endpoint`. They live in the engine
+   * worker's memory, never in SQL or the database file. Pass null to remove them.
+   */
+  async registerCredentials(name: string, provider: { endpoint: string; headers: Record<string, string> } | null): Promise<void> {
+    await this.request({ op: 'registerCredentials', name, provider });
+  }
+
   /** Prepare a statement for repeated execution. */
   async prepare(sql: string): Promise<PreparedStatement> {
     const epoch = this.epoch;

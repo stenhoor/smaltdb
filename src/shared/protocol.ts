@@ -35,6 +35,10 @@ export type Request = { id: number } & (
   | { op: 'import'; format: 'csv' | 'json'; table: string; data: Uint8Array; options?: Record<string, unknown> }
   | { op: 'export'; format: 'csv' | 'json'; sql: string; params?: Params; options?: Record<string, unknown> }
   | { op: 'close' }
+  /** M8: make a File / Blob / file handle / bytes / text readable as `file:<name>` (null removes it). */
+  | { op: 'registerFile'; name: string; file: Blob | Uint8Array | ArrayBuffer | string | { getFile(): Promise<Blob> } | null }
+  /** M8: credentials a connection names: headers sent only to URLs that start with `endpoint` (null removes them). */
+  | { op: 'registerCredentials'; name: string; provider: { endpoint: string; headers: Record<string, string> } | null }
   /** Grant `n` more batches to the stream of request `target`. */
   | { op: 'credit'; target: number; n: number }
   /** Stop request `target`: dequeue it or close its stream (running statements: interrupt flag). */

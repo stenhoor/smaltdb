@@ -47,12 +47,12 @@ const q = (name: string): string => '"' + name.replace(/"/g, '""') + '"';
 // ------------------------------------------------------------------ CSV parsing (RFC 4180)
 
 /** A parsed field: its text, and whether it was quoted (distinguishes "" from an empty field). */
-interface Field {
+export interface Field {
   text: string;
   quoted: boolean;
 }
 
-function* csvRecords(text: string, delim: string, quote: string): Generator<{ fields: Field[]; line: number }> {
+export function* csvRecords(text: string, delim: string, quote: string): Generator<{ fields: Field[]; line: number }> {
   let i = 0;
   const n = text.length;
   if (text.charCodeAt(0) === 0xfeff) i = 1; // BOM
@@ -110,7 +110,7 @@ const INT_RE = /^[+-]?\d+$/;
 const NUM_RE = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
 
 /** Infer a column type from sample values (INTEGER, REAL, TEXT). */
-function inferType(values: SqlValue[]): string {
+export function inferType(values: SqlValue[]): string {
   let type = 'INTEGER';
   let any = false;
   for (const v of values) {
@@ -133,7 +133,7 @@ function inferType(values: SqlValue[]): string {
 }
 
 /** Text that looks numeric becomes a number (for ANY / NUMERIC target columns). */
-function numericOrText(s: string): SqlValue {
+export function numericOrText(s: string): SqlValue {
   const t = s.trim();
   if (INT_RE.test(t)) {
     const b = BigInt(t);
@@ -233,7 +233,7 @@ export function importCSV(db: Database, table: string, text: string, opts: CsvIm
 }
 
 /** JSON value -> SQL value: booleans 1/0, nested arrays/objects as JSON text. */
-function jsonValue(v: unknown): SqlValue {
+export function jsonValue(v: unknown): SqlValue {
   if (v === null || v === undefined) return null;
   if (typeof v === 'boolean') return v ? 1 : 0;
   if (typeof v === 'number' || typeof v === 'string') return v;

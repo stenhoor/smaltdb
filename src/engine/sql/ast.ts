@@ -273,11 +273,13 @@ export interface SubqueryRef extends Node {
   alias?: string;
 }
 
-/** Table-valued function in FROM, e.g. `pragma_table_info('t')`. */
+/** Table-valued function in FROM, e.g. `pragma_table_info('t')` or `read_csv('x.csv', header => false)`. */
 export interface FunctionRef extends Node {
   kind: 'function';
   name: string;
   args: Expr[];
+  /** Named arguments (`name => value`, lower-cased names), after the positional ones. */
+  named?: Record<string, Expr>;
   alias?: string;
 }
 
@@ -450,9 +452,27 @@ export interface CreateViewStmt extends Node {
   select: SelectStmt;
 }
 
+/** M8: `CREATE CONNECTION name WITH (type = …, url = …, credentials = …)`: an endpoint for external tables. */
+export interface CreateConnectionStmt extends Node {
+  kind: 'createConnection';
+  ifNotExists: boolean;
+  name: string;
+  with: Record<string, SqlValue>;
+}
+
+/** M8: `CREATE EXTERNAL TABLE name [(columns)] WITH (location = …, format = …, …)`: rows that live elsewhere. */
+export interface CreateExternalTableStmt extends Node {
+  kind: 'createExternalTable';
+  ifNotExists: boolean;
+  name: string;
+  /** Declared columns (empty: inferred from the source when the table is created). */
+  columns: ColumnDef[];
+  with: Record<string, SqlValue>;
+}
+
 export interface DropStmt extends Node {
   kind: 'drop';
-  objectType: 'table' | 'index' | 'view' | 'materialized view' | 'trigger';
+  objectType: 'table' | 'index' | 'view' | 'materialized view' | 'trigger' | 'external table' | 'connection';
   ifExists: boolean;
   schema?: string;
   name: string;
@@ -540,6 +560,8 @@ export type Stmt =
   | CreateTableStmt
   | CreateIndexStmt
   | CreateViewStmt
+  | CreateConnectionStmt
+  | CreateExternalTableStmt
   | DropStmt
   | AlterTableStmt
   | RefreshStmt

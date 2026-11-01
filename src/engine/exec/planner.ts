@@ -22,7 +22,7 @@ function decorrelationDisabled(): boolean {
   return decorrelateOff;
 }
 import { SmaltError } from '../errors.js';
-import { type TableSchema, findColumn, isColumnar } from '../catalog/schema.js';
+import { type TableSchema, findColumn, isColumnar, storageTypeFor } from '../catalog/schema.js';
 import type {
   CallExpr,
   ColumnExpr,
@@ -99,6 +99,7 @@ import { type ColumnStore, ROW_GROUP_ROWS, zoneMayMatch } from '../storage/colum
 import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
 import { deletedBitmap, rowidsOf, zoneOf } from './columnar-table.js';
 import { anyNode, exprKey } from '../sql/ast-util.js';
+import type { ExternalSource } from '../external/external.js';
 
 export interface PlannerEnv {
   /** A table by name; `schema` 'main' / 'temp' picks that schema when a TEMP table shadows a main one. */
@@ -128,6 +129,23 @@ export interface PlannerEnv {
    * materialized view, or null. Absent when the statement may not use views.
    */
   rewriteSelect?(select: SelectStmt, text: string): SelectStmt | null;
+  /** M8: an external table by name (its columns from the catalog; its rows once loaded). */
+  externalTable?(name: string): ExternalScan | undefined;
+  /** M8: a reading table function (`read_csv`, `read_json`) called with constant arguments. */
+  externalFunction?(name: string, args: SqlValue[], named: Record<string, SqlValue>): ExternalScan | undefined;
+}
+
+/** Table functions that read external data (their arguments must be constants). */
+export const EXTERNAL_FUNCTIONS: ReadonlySet<string> = new Set(['read_csv', 'read_json']);
+
+/** An external source as the planner scans it. */
+export interface ExternalScan {
+  /** For EXPLAIN. */
+  label: string;
+  source: ExternalSource;
+  columns: { name: string; type: StaticType; declType: string }[];
+  /** The loaded rows (throws SMALT_ASYNC_REQUIRED when they were not loaded). */
+  rows(): SqlValue[][];
 }
 
 export class Registers {
@@ -1383,6 +1401,18 @@ export class Planner {
 
   private addSource(item: FromItem, joinType: JoinType, scope: Scope): void {
     const position = scope.sources.length;
+    const ext = this.externalScan(item, scope);
+    if (ext) {
+      // External data (M8): rows loaded before the statement runs, scanned like a virtual table.
+      this.externals.push(ext.source);
+      const regs = ext.columns.map(() => this.regs.alloc());
+      const root = new VirtualScan(`EXTERNAL ${ext.label}`, () => ext.rows(), regs);
+      const columns: ResultColumnInfo[] = ext.columns.map((c) => ({ name: c.name, type: c.type, declType: c.declType, collation: Collation.Binary, affinity: affinityOfStorage(storageTypeFor(c.declType)) }));
+      const sub: QueryPlan = { root, outRegs: regs, columns, correlated: false };
+      const cols: SourceColumn[] = columns.map((c, i) => ({ name: c.name, reg: regs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '', index: i }));
+      scope.sources.push({ name: (item as { alias?: string }).alias ?? (item as { name: string }).name, cols, rowidReg: -1, sub, lateral: false, joinType, on: [], hidden: new Set(), position });
+      return;
+    }
     const isInfoSchema = item.kind === 'table' && item.schema?.toLowerCase() === 'information_schema';
     if (item.kind === 'function' || isInfoSchema) {
       const vt = this.env.virtualTable?.(isInfoSchema ? 'information_schema' : undefined, item.name);
@@ -1857,6 +1887,29 @@ export class Planner {
 
   /** Root page -> row estimate (from the tree shape) each costed table had when this plan was made. */
   readonly rowAssumptions = new Map<number, number>();
+  /** External sources the statement reads (M8): loaded before it runs. */
+  readonly externals: ExternalSource[] = [];
+
+  /** `item` as an external table or a `read_csv` / `read_json` call, if it is one. */
+  private externalScan(item: FromItem, scope: Scope): ExternalScan | undefined {
+    if (item.kind === 'function') {
+      if (!EXTERNAL_FUNCTIONS.has(item.name) || !this.env.externalFunction) return undefined;
+      const cs = this.compileScope(scope);
+      const value = (e: Expr): SqlValue => {
+        const c = compileExpr(e, cs);
+        if (!c.constant) throw new SmaltError('SMALT_ERROR', `${item.name}() arguments must be constants`);
+        return c.fn([]);
+      };
+      const named: Record<string, SqlValue> = {};
+      for (const [k, e] of Object.entries(item.named ?? {})) named[k] = value(e);
+      return this.env.externalFunction(item.name, item.args.map(value), named);
+    }
+    if (item.kind !== 'table' || !this.env.externalTable) return undefined;
+    if (item.schema && item.schema.toLowerCase() !== 'main') return undefined;
+    if (!item.schema && scope.findCte(item.name)) return undefined;
+    if (this.env.getTable(item.name)) return undefined; // a TEMP table of the same name shadows it
+    return this.env.externalTable(item.name);
+  }
 
   /** Statistics for a source's table: ANALYZE results, else sampled on demand. */
   private statsOf(src: Source): TableStats | undefined {

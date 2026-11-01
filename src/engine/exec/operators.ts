@@ -2158,7 +2158,8 @@ export class VirtualScan implements Operator {
   ) {}
 
   get detail(): string {
-    return `SCAN ${this.label} VIRTUAL TABLE`;
+    // External data (M8) is labelled `EXTERNAL name (location)`; other virtual tables are computed.
+    return this.label.startsWith('EXTERNAL ') ? `SCAN ${this.label}` : `SCAN ${this.label} VIRTUAL TABLE`;
   }
 
   open(r: SqlValue[]): void {

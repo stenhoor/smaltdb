@@ -99,6 +99,19 @@ Post-v1: UDF registration, live queries / change notifications, and framework bi
 | `db.exportCSV(sql, params?, opts?)` → string | Header row by default. Values are quoted when needed; REALs print like SQLite (`2.0`); blobs print as hex. Options: `header`, `delimiter`, `nullString`, `crlf`. |
 | `db.exportJSON(sql, params?, opts?)` → string | An array of objects, or `{ format: 'ndjson' }`. Integers beyond 2^53 are written as exact digits. |
 
+**External data (M8.1).** SQL can read files and URLs directly ([SQL_DIALECT.md §5a](SQL_DIALECT.md), ADR 0011).
+
+| Call | Notes |
+|---|---|
+| `db.registerFile(name, file)` | Makes `file` readable as `file:<name>`: a `File` / `Blob`, a File System Access handle, bytes or text. `null` removes it. Registered files live in the engine worker's memory; nothing is copied into the database. |
+| `db.registerCredentials(name, { endpoint, headers })` | Headers for connections that name these credentials (`CREATE CONNECTION … WITH (credentials = 'name')`), sent only with requests to URLs that start with `endpoint`. They are never stored in SQL or the database file, so they must be registered again after reopening. `null` removes them. |
+
+In-process (`smaltdb/engine`, Node and tests), statements over external data run with
+`await db.queryAsync(sql, params?, { signal })`, `db.runAsync(…)` and `db.execAsync(…)`; the synchronous `query` /
+`run` / `exec` fail with `SMALT_ASYNC_REQUIRED` for them. The engine `Database` also has `registerFile`,
+`registerCredentials` (whose `headers` may be a function of the URL, sync or async) and `setFetch(fetchFn)` to replace
+the transport.
+
 Imports run as one prepared INSERT, in one transaction (or inside the caller's). Every constraint, type
 conversion and foreign key applies. On error the import is rolled back, and the message names the CSV line or
 JSON item (`CSV line 3: NOT NULL constraint failed: t.v`). The same functions are exported from `smaltdb/engine`

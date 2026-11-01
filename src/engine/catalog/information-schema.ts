@@ -12,6 +12,10 @@ export interface CatalogSnapshot {
   /** Result columns of a view (null when the view cannot be resolved, e.g. a dropped table). */
   viewColumns(name: string): { name: string; declType: string }[] | null;
   functions: { name: string; kind: 'FUNCTION' | 'AGGREGATE'; deterministic: boolean }[];
+  /** External tables (M8): columns as declared or inferred at creation. */
+  externals: { name: string; columns: { name: string; declType: string }[]; location: string; format: string | null; connection: string | null; options: string }[];
+  /** Connections (M8): no secrets, only the name of a credential provider. */
+  connections: { name: string; type: string; url: string | null; credentials: string | null }[];
 }
 
 export interface VirtualTable {
@@ -69,7 +73,20 @@ export function informationSchema(name: string, cat: CatalogSnapshot): VirtualTa
         rows: () => [
           ...userTables().map((x) => [CATALOG, SCHEMA, x.name, x.matview ? 'MATERIALIZED VIEW' : 'BASE TABLE', x.matview ? 'NO' : 'YES']),
           ...cat.views.map((v) => [CATALOG, SCHEMA, v.name, 'VIEW', 'NO']),
+          ...cat.externals.map((x) => [CATALOG, SCHEMA, x.name, 'EXTERNAL', 'NO']),
         ],
+      };
+    case 'external_tables':
+      // smaltdb extension (M8, ADR 0011).
+      return {
+        columns: [t('table_catalog'), t('table_schema'), t('table_name'), t('location'), t('format'), t('connection_name'), t('options')],
+        rows: () => cat.externals.map((x) => [CATALOG, SCHEMA, x.name, x.location, x.format, x.connection, x.options]),
+      };
+    case 'connections':
+      // smaltdb extension (M8, ADR 0011): endpoints, never secrets.
+      return {
+        columns: [t('connection_name'), t('connection_type'), t('url'), t('credentials')],
+        rows: () => cat.connections.map((c) => [c.name, c.type, c.url, c.credentials]),
       };
     case 'columns':
       return {
@@ -109,6 +126,7 @@ export function informationSchema(name: string, cat: CatalogSnapshot): VirtualTa
             const cols = cat.viewColumns(v.name);
             cols?.forEach((c, n) => out.push([CATALOG, SCHEMA, v.name, c.name, n + 1, null, 'YES', c.declType || 'ANY', null, 'NO', 'NEVER']));
           }
+          for (const x of cat.externals) x.columns.forEach((c, n) => out.push([CATALOG, SCHEMA, x.name, c.name, n + 1, null, 'YES', c.declType || 'ANY', null, 'NO', 'NEVER']));
           return out;
         },
       };

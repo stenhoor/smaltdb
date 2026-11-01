@@ -25,6 +25,22 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   check('columnar numeric zero-copy', colr.length === 2000 && colr.data.id instanceof Float64Array && (colr.data.id as Float64Array)[1999] === 2000, colr.length);
   check('columnar nulls preserved', Array.isArray(colr.data.qty) && (colr.data.qty as unknown[])[6] === null);
 
+  // External data (M8): a CSV over HTTP from this page's server and a registered Blob, joined with
+  // a local table, plus a materialized view caching the HTTP one.
+  await db.exec('DROP MATERIALIZED VIEW IF EXISTS prices_cache; DROP EXTERNAL TABLE IF EXISTS prices; DROP CONNECTION IF EXISTS site');
+  await db.registerFile('stock', new Blob(['id,qty\n1,10\n2,0\n3,7\n']));
+  await db.exec(`CREATE CONNECTION site WITH (url = '${location.origin}')`);
+  await db.exec("CREATE EXTERNAL TABLE prices WITH (connection = 'site', location = 'prices.csv')");
+  const ext = await db.query("SELECT p.name, p.price, s.qty, i.name AS item FROM prices p JOIN read_csv('file:stock') s ON s.id = p.id JOIN items i ON i.id = p.id ORDER BY p.id", undefined, { rowMode: 'array' });
+  check('external: HTTP CSV joined with a registered file and a local table', JSON.stringify(ext) === JSON.stringify([['apple', 1.5, 10, 'item-1'], ['pear, green', 2, 0, 'item-2'], ['plum', null, 7, 'item-3']]), ext);
+  const extCols = await db.query("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'prices' ORDER BY ordinal_position", undefined, { rowMode: 'array' });
+  check('external: columns inferred at creation', JSON.stringify(extCols) === JSON.stringify([['id', 'INTEGER'], ['name', 'TEXT'], ['price', 'REAL']]), extCols);
+  await db.exec('CREATE MATERIALIZED VIEW prices_cache AS SELECT * FROM prices');
+  const cached = await db.query('SELECT count(*), sum(price) FROM prices_cache', undefined, { rowMode: 'array' });
+  check('external: cached in a materialized view', JSON.stringify(cached) === JSON.stringify([[3, 3.5]]), cached);
+  await db.exec('DROP MATERIALIZED VIEW prices_cache; DROP EXTERNAL TABLE prices; DROP CONNECTION site');
+  await db.registerFile('stock', null);
+
   // Spill to OPFS: a tiny work_mem makes the sort and the GROUP BY go through the scratch file.
   const plain = await db.query('SELECT price % 37 AS k, count(*) AS n, sum(id) AS s FROM items GROUP BY k ORDER BY k, n', undefined, { rowMode: 'array' });
   const sorted = await db.query('SELECT name FROM items ORDER BY name DESC, id', undefined, { rowMode: 'array' });
