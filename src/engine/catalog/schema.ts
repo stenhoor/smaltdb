@@ -42,6 +42,8 @@ export interface IndexEval {
   cols: (((row: readonly SqlValue[], rowid: number | bigint) => SqlValue) | null)[];
   /** Partial index: whether the row belongs to the index. */
   where?: (row: readonly SqlValue[], rowid: number | bigint) => boolean;
+  /** Table columns the expressions and WHERE read (an UPDATE that changes none of them keeps the entry). */
+  deps: number[];
 }
 
 export interface IndexSchema {

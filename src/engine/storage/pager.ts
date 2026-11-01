@@ -133,6 +133,10 @@ export class Pager {
   private readonly memory: boolean = false;
   /** In memory: undo images for the open transaction (committed contents of modified pages). */
   private txn: Savepoint | null = null;
+  /** In memory: slabs holding the transaction's undo images, reused after commit/rollback. */
+  private readonly slabs: Uint8Array[] = [];
+  private slabIdx = 0;
+  private slabOff = 0;
   /** In memory: frames returned by discard(), reused before new ones are created. */
   private readonly spare: Frame[] = [];
 
@@ -242,7 +246,35 @@ export class Pager {
   /** In memory: keep the committed contents of a page before its first change in the transaction. */
   private captureTxn(f: Frame): void {
     const t = this.txn!;
-    if (f.pgno < t.pageCount && !t.images.has(f.pgno)) t.images.set(f.pgno, f.bytes.slice());
+    if (f.pgno < t.pageCount && !t.images.has(f.pgno)) {
+      const img = this.imageBuffer();
+      img.set(f.bytes);
+      t.images.set(f.pgno, img);
+    }
+  }
+
+  /** A page-sized buffer from the undo slabs (64 pages each), valid until the transaction ends. */
+  private imageBuffer(): Uint8Array {
+    const ps = this.pageSize;
+    const SLAB = 64;
+    if (this.slabIdx >= this.slabs.length || this.slabOff === SLAB) {
+      if (this.slabOff === SLAB) {
+        this.slabIdx++;
+        this.slabOff = 0;
+      }
+      if (this.slabIdx >= this.slabs.length) this.slabs.push(new Uint8Array(SLAB * ps));
+    }
+    const slab = this.slabs[this.slabIdx];
+    const off = this.slabOff++ * ps;
+    return slab.subarray(off, off + ps);
+  }
+
+  /** The transaction ended: undo images are dead, so their slabs can be reused. Keeps at most 16 MiB. */
+  private resetImages(): void {
+    this.slabIdx = 0;
+    this.slabOff = 0;
+    const keep = Math.max(1, Math.floor((16 << 20) / (64 * this.pageSize)));
+    if (this.slabs.length > keep) this.slabs.length = keep;
   }
 
   get walStats(): WalStats | null {
@@ -602,6 +634,7 @@ export class Pager {
       this.committedHeader.set(this.header);
       this.headerDirty = false;
       this.txn = this.newLevel();
+      this.resetImages();
       return;
     }
     if (this.wal !== null) {
@@ -703,6 +736,7 @@ export class Pager {
       this.header.set(this.committedHeader);
       this.headerDirty = false;
       this.txn = this.newLevel();
+      this.resetImages();
       return;
     }
     for (const f of this.dirtyList) if (f.dirty) this.discard(f);

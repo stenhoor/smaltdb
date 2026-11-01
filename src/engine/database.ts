@@ -946,9 +946,27 @@ export class Database implements FunctionContext {
       regs[n] = rowid;
       return regs;
     };
+    // Columns read by the index (plain columns, expression and WHERE references).
+    const deps = new Set<number>();
+    const walk = (x: unknown): void => {
+      if (Array.isArray(x)) return x.forEach(walk);
+      if (typeof x !== 'object' || x === null || Object.getPrototypeOf(x) !== Object.prototype) return;
+      const o = x as Record<string, unknown>;
+      if (o.kind === 'column' && typeof o.name === 'string') {
+        const ci = findColumn(table, o.name);
+        if (ci >= 0) deps.add(ci);
+      }
+      for (const k of Object.keys(o)) walk(o[k]);
+    };
+    for (const c of idx.columns) {
+      if (c.expr) walk(c.expr);
+      else deps.add(c.column);
+    }
+    if (idx.where) walk(idx.where);
     idx.eval = {
       cols: cols.map((f) => (f ? (row: readonly SqlValue[], rowid: number | bigint) => f(load(row, rowid)) : null)),
       where: where ? (row, rowid) => truthy(where!(load(row, rowid))) === true : undefined,
+      deps: [...deps],
     };
   }
 

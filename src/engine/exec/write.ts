@@ -21,6 +21,8 @@ export class TableWriter {
   private readonly enc: RecordEncoder;
   private readonly reader: RecordReader;
   private readonly keyEnc = new KeyEncoder();
+  /** Second encoder: UPDATE holds the old and new key at once. */
+  private readonly keyEnc2 = new KeyEncoder();
   private readonly rowidKey = new Uint8Array(ROWID_KEY_SIZE);
   /** Largest rowid known in this statement (avoids a descent per insert). */
   private maxRowid: number | bigint | null = null;
@@ -101,8 +103,8 @@ export class TableWriter {
    * Index key of a row (with the rowid suffix unless `prefixOnly`); null when a partial index
    * excludes the row. The result is a view of the shared encoder: copy it before the next call.
    */
-  private indexKey(idx: IndexSchema, row: readonly SqlValue[], rowid: number | bigint, prefixOnly = false): Uint8Array | null {
-    const e = this.keyEnc.reset();
+  private indexKey(idx: IndexSchema, row: readonly SqlValue[], rowid: number | bigint, prefixOnly = false, enc = this.keyEnc): Uint8Array | null {
+    const e = enc.reset();
     if (idx.eval) {
       const vals = this.indexValues(idx, row, rowid);
       if (vals === null) return null;
@@ -263,13 +265,29 @@ export class TableWriter {
     }
     const t = this.table;
     for (let i = 0; i < t.indexes.length; i++) {
-      const ok = this.indexKey(t.indexes[i], old, oldRowid);
-      const oldKey = ok && ok.slice();
-      const nk = this.indexKey(t.indexes[i], next, newRowid);
-      if (oldKey && nk && oldKey.length === nk.length && oldKey.every((b, j) => b === nk[j])) continue;
-      const newKey = nk && nk.slice();
+      const idx = t.indexes[i];
+      // Skip indexes whose columns all kept their values (same stored type and value).
+      let changed = false;
+      if (idx.eval) {
+        for (const c of idx.eval.deps) if (!sameStored(old[c], next[c])) changed = true;
+      } else {
+        for (const ic of idx.columns) if (!sameStored(old[ic.column], next[ic.column])) changed = true;
+      }
+      if (!changed) continue;
+      const oldKey = this.indexKey(idx, old, oldRowid, false, this.keyEnc);
+      const nk = this.indexKey(idx, next, newRowid, false, this.keyEnc2);
+      if (oldKey && nk && oldKey.length === nk.length) {
+        let same = true;
+        for (let j = 0; j < nk.length; j++) {
+          if (oldKey[j] !== nk[j]) {
+            same = false;
+            break;
+          }
+        }
+        if (same) continue;
+      }
       if (oldKey) this.indexTrees[i].delete(oldKey);
-      if (newKey) this.indexTrees[i].put(newKey, EMPTY);
+      if (nk) this.indexTrees[i].put(nk, EMPTY);
     }
     const alias = t.rowidAlias;
     let saved: SqlValue = null;
@@ -320,3 +338,10 @@ function rowidHint(row: readonly SqlValue[], t: TableSchema): number | bigint {
   return typeof v === 'number' || typeof v === 'bigint' ? v : 0;
 }
 
+/** Same stored value: identical type and value (REAL 1.0 and INTEGER 1 count as equal: same key). */
+function sameStored(a: SqlValue, b: SqlValue): boolean {
+  if (a === b) return true;
+  if (a instanceof Uint8Array && b instanceof Uint8Array) return a.length === b.length && a.every((x, i) => x === b[i]);
+  // eslint-disable-next-line eqeqeq
+  return typeof a === 'bigint' || typeof b === 'bigint' ? a == b : false;
+}
