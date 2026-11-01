@@ -205,6 +205,8 @@ interface Source {
   position: number;
   /** Cached row-count estimate. */
   estRows?: number;
+  /** An external table (M8): partition filters are attached to its source. */
+  external?: ExternalSource;
 }
 
 /** A CTE visible in a scope. `working` marks the self-reference inside a recursive step. */
@@ -1258,6 +1260,7 @@ export class Planner {
       }
     }
     for (const src of scope.sources) if (src.joinType === 'INNER' || src.joinType === 'CROSS') for (const c of src.on) addPool(c);
+    if (!hasOuter) this.prunePartitions(scope, pool);
 
     const cs = this.compileScope(scope);
     const order = hasOuter ? scope.sources.map((_, i) => i) : this.joinOrder(scope, pool, cs);
@@ -1410,7 +1413,9 @@ export class Planner {
       const columns: ResultColumnInfo[] = ext.columns.map((c) => ({ name: c.name, type: c.type, declType: c.declType, collation: Collation.Binary, affinity: affinityOfStorage(storageTypeFor(c.declType)) }));
       const sub: QueryPlan = { root, outRegs: regs, columns, correlated: false };
       const cols: SourceColumn[] = columns.map((c, i) => ({ name: c.name, reg: regs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '', index: i }));
-      scope.sources.push({ name: (item as { alias?: string }).alias ?? (item as { name: string }).name, cols, rowidReg: -1, sub, lateral: false, joinType, on: [], hidden: new Set(), position });
+      // Partition pruning applies to external tables (their columns are fixed by the catalog).
+      const external = item.kind === 'table' ? ext.source : undefined;
+      scope.sources.push({ name: (item as { alias?: string }).alias ?? (item as { name: string }).name, cols, rowidReg: -1, sub, lateral: false, joinType, on: [], hidden: new Set(), position, external });
       return;
     }
     const isInfoSchema = item.kind === 'table' && item.schema?.toLowerCase() === 'information_schema';
@@ -1889,6 +1894,68 @@ export class Planner {
   readonly rowAssumptions = new Map<number, number>();
   /** External sources the statement reads (M8): loaded before it runs. */
   readonly externals: ExternalSource[] = [];
+
+  /**
+   * Partition pruning (M8.2): a condition that reads only one external table's columns, constants
+   * and deterministic functions can be evaluated per file on its `key=value` directories; files for
+   * which it is false or NULL are not fetched (their rows could not pass it). Not for LEFT-joined
+   * tables, whose missing rows would turn into NULL-extended ones, nor with RIGHT / FULL joins.
+   */
+  private prunePartitions(scope: Scope, pool: ConjunctInfo[]): void {
+    for (const src of scope.sources) {
+      const ext = src.external;
+      if (!ext || src.joinType === 'LEFT') continue;
+      const keys: string[] = [];
+      for (const c of pool) {
+        if (c.deps === null || c.deps.size !== 1 || !c.deps.has(src.position)) continue;
+        const names = new Set<string>();
+        let ok = true;
+        walk(c.expr, (x) => {
+          if (!ok) return false;
+          switch (x.kind) {
+            case 'literal':
+            case 'unary':
+            case 'binary':
+            case 'between':
+            case 'inList':
+            case 'like':
+            case 'isNull':
+            case 'case':
+            case 'cast':
+            case 'collate':
+              return;
+            case 'column':
+              if (x.table && !sameName(x.table, src.name)) ok = false;
+              else names.add(x.name.toLowerCase());
+              return;
+            case 'call': {
+              const f = scalarFunctions.get(x.name);
+              if (!f || !f.deterministic || x.star || x.over || x.filter) ok = false;
+              return;
+            }
+            default:
+              ok = false; // parameters, subqueries, aggregates
+              return false;
+          }
+        });
+        const cols = src.cols.filter((col) => names.has(col.name.toLowerCase()));
+        if (!ok || cols.length !== names.size) continue;
+        const fn = compileExpr(c.expr, this.compileScope(scope)).fn;
+        (ext.prune ??= []).push((values) => {
+          const r: SqlValue[] = [];
+          for (const col of cols) {
+            const v = values.get(col.name.toLowerCase());
+            if (v === undefined) return undefined; // not a partition column of this file
+            r[col.reg] = v;
+          }
+          return truthy(fn(r)) === true; // false or NULL: no row of the file can pass
+        });
+        keys.push(exprKey(c.expr, { foldNames: true }));
+      }
+      // A pruned read differs from a full one: it gets its own fetch.
+      if (keys.length) ext.key += `|prune:${keys.join('&')}`;
+    }
+  }
 
   /** `item` as an external table or a `read_csv` / `read_json` call, if it is one. */
   private externalScan(item: FromItem, scope: Scope): ExternalScan | undefined {

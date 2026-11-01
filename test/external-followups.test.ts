@@ -203,7 +203,7 @@ describe('credential callbacks across the worker boundary', () => {
         if (m.session !== session || m.msg.kind !== 'credentials' || (m as { answered?: boolean }).answered) continue;
         (m as { answered?: boolean }).answered = true;
         const q = m.msg;
-        server.receive(session, { id: 0, op: 'credentialsReply', target: q.request, ...(refuse ? { error: 'signed out' } : { headers: { authorization: `Bearer t${token++}`, 'x-url': q.url } }) } as Request);
+        server.receive(session, { id: 0, op: 'credentialsReply', target: q.request, ...(refuse ? { error: 'signed out' } : { material: { headers: { authorization: `Bearer t${token++}`, 'x-url': q.url } } }) } as Request);
       }
     };
     await result(send({ op: 'open', name: 'db', storage: 'memory' }, EngineServer.LOCAL));
@@ -211,7 +211,7 @@ describe('credential callbacks across the worker boundary', () => {
     await result(send({ op: 'exec', sql: "CREATE CONNECTION c WITH (url = 'https://h', credentials = 'tok'); CREATE EXTERNAL TABLE e (a INT) WITH (connection = 'c', location = 'a.csv')" }, EngineServer.LOCAL));
     const q1 = send({ op: 'query', sql: 'SELECT sum(a) FROM e' }, EngineServer.LOCAL);
     await until('the question', () => log.some((m) => m.msg.kind === 'credentials'));
-    expect(log.find((m) => m.msg.kind === 'credentials')).toMatchObject({ session: 'tab-2', msg: { name: 'tok', url: 'https://h/a.csv' } });
+    expect(log.find((m) => m.msg.kind === 'credentials')).toMatchObject({ session: 'tab-2', msg: { name: 'tok', url: 'https://h/a.csv', method: 'GET' } });
     answer('tab-2');
     expect(await result(q1)).toBeUndefined();
     expect(src.s.headers.at(-1)).toEqual({ authorization: 'Bearer t1', 'x-url': 'https://h/a.csv' });

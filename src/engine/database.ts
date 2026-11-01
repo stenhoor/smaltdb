@@ -150,7 +150,12 @@ interface ExternalCacheEntry {
 const connectionKey = (name: string): string => `\u0000connection:${name.toLowerCase()}`;
 const quoteIdent = (name: string): string => '"' + name.replace(/"/g, '""') + '"';
 const sqlLiteral = (v: SqlValue): string => (v === null ? 'NULL' : typeof v === 'string' ? `'${v.replace(/'/g, "''")}'` : String(v));
-const CONNECTION_OPTIONS = new Set(['type', 'url', 'credentials']);
+/** Options of each connection type (M8.1 http, M8.2 s3 and azure). Never secrets: those come from credentials providers. */
+const CONNECTION_OPTIONS: Record<string, ReadonlySet<string>> = {
+  http: new Set(['type', 'url', 'credentials']),
+  s3: new Set(['type', 'region', 'bucket', 'endpoint', 'url_style', 'credentials']),
+  azure: new Set(['type', 'account', 'container', 'endpoint', 'credentials']),
+};
 
 interface CatalogEntry {
   type: 'table' | 'index' | 'view' | 'matview' | 'external' | 'connection';
@@ -819,6 +824,7 @@ export class Database implements FunctionContext {
         type: String(c.options.type ?? 'http'),
         url: c.options.url === undefined || c.options.url === null ? null : String(c.options.url),
         credentials: c.options.credentials === undefined || c.options.credentials === null ? null : String(c.options.credentials),
+        options: JSON.stringify(Object.fromEntries(Object.entries(c.options).filter(([k]) => !['type', 'url', 'credentials'].includes(k)))),
       })),
     };
   }
@@ -2244,11 +2250,18 @@ export class Database implements FunctionContext {
       if (stmt.ifNotExists) return none;
       throw new SmaltError('SMALT_ERROR', `connection ${stmt.name} already exists`);
     }
-    for (const k of Object.keys(stmt.with)) if (!CONNECTION_OPTIONS.has(k)) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: unknown option '${k}' (type, url, credentials)`);
-    const type = String(stmt.with.type ?? 'http').toLowerCase();
-    if (type !== 'http' && type !== 'https') throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: type '${type}' is not supported yet (http)`);
-    const url = stmt.with.url;
-    if (url !== undefined && url !== null && !/^https?:\/\//i.test(String(url))) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: url must be an http(s) URL`);
+    let type = String(stmt.with.type ?? 'http').toLowerCase();
+    if (type === 'https') type = 'http';
+    const allowed = CONNECTION_OPTIONS[type];
+    if (!allowed) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: type '${type}' is not supported (http, s3, azure)`);
+    for (const k of Object.keys(stmt.with)) if (!allowed.has(k)) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: unknown option '${k}' for type ${type} (${[...allowed].join(', ')})`);
+    for (const k of ['url', 'endpoint']) {
+      const v = stmt.with[k];
+      if (v !== undefined && v !== null && !/^https?:\/\//i.test(String(v))) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: ${k} must be an http(s) URL`);
+    }
+    if (type === 'azure' && !stmt.with.account) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: an azure connection needs account (the storage account name)`);
+    const style = stmt.with.url_style;
+    if (style !== undefined && style !== null && !['path', 'virtual'].includes(String(style).toLowerCase())) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: url_style must be 'path' or 'virtual'`);
     this.dirtySchema = true;
     this.addCatalogRow('connection', stmt.name, stmt.name, 0, sql, connectionKey(stmt.name));
     this.connections.set(lower, { name: stmt.name, options: stmt.with, sql });

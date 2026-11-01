@@ -4,7 +4,7 @@
  */
 import type { CsvExportOptions, CsvImportOptions, JsonExportOptions, JsonImportOptions } from '../engine/io/import-export.js';
 import type { SqlValue } from '../engine/values.js';
-import { type BusMessage, type Params, type Request, type RequestBody, type Response, type WireColumn, columnValue } from '../shared/protocol.js';
+import { type BusMessage, type Params, type Request, type RequestBody, type Response, type WireColumn, type WireCredentials, type WireMaterial, columnValue } from '../shared/protocol.js';
 
 export type { SqlValue, Params };
 
@@ -532,13 +532,20 @@ export class Database implements Queryable {
     for (const [name, p] of this.registeredCredentials) void this.request({ op: 'registerCredentials', name, provider: wireProvider(p) }).catch(() => undefined);
   }
 
-  /** The engine needs headers from one of this tab's credentials callbacks. */
+  /** The engine needs credentials from one of this tab's providers (some part is a function). */
   private async answerCredentials(msg: Extract<Response, { kind: 'credentials' }>): Promise<void> {
     const p = this.registeredCredentials.get(msg.name);
-    let reply: { headers?: Record<string, string>; error?: string };
+    let reply: { material?: WireMaterial; error?: string };
     try {
       if (!p) throw new Error('not registered in this tab');
-      reply = { headers: typeof p.headers === 'function' ? await p.headers(msg.url) : p.headers };
+      reply = {
+        material: {
+          headers: typeof p.headers === 'function' ? await p.headers(msg.url) : p.headers,
+          aws: typeof p.aws === 'function' ? await p.aws() : p.aws,
+          azure: typeof p.azure === 'function' ? await p.azure() : p.azure,
+          url: p.presign ? await p.presign(msg.url, msg.method) : undefined,
+        },
+      };
     } catch (e) {
       reply = { error: e instanceof Error ? e.message : String(e) };
     }
@@ -694,18 +701,30 @@ function materialize(columns: string[], batches: { length: number; cols: WireCol
 /** Data accepted by importCSV / importJSON. */
 export type ImportSource = string | Uint8Array | ArrayBuffer | Blob;
 
+type AwsKeys = { accessKeyId: string; secretAccessKey: string; sessionToken?: string };
+type AzureAuth = { sasToken: string } | { accountKey: string } | { bearerToken: string };
+
 /**
- * Credentials for connections (M8): `headers` for requests to URLs that start with `endpoint`,
- * either fixed or computed per request (for example a token refreshed on demand). A function stays
- * in this tab: the engine asks it for each request's headers.
+ * Credentials for connections (M8), used only for requests to URLs that start with `endpoint`.
+ * Any part may be a value or a function computed per request (a token refreshed on demand, keys from
+ * STS or Cognito); functions stay in this tab and the engine asks them for each request.
  */
 export interface CredentialsProvider {
   endpoint: string;
-  headers: Record<string, string> | ((url: string) => Record<string, string> | Promise<Record<string, string>>);
+  /** Extra headers (`authorization: Bearer …`). */
+  headers?: Record<string, string> | ((url: string) => Record<string, string> | Promise<Record<string, string>>);
+  /** AWS keys: requests on s3 connections are signed (Signature Version 4). */
+  aws?: AwsKeys | (() => AwsKeys | Promise<AwsKeys>);
+  /** Azure: a SAS token, the account key (Shared Key signing) or an Entra ID bearer token. */
+  azure?: AzureAuth | (() => AzureAuth | Promise<AzureAuth>);
+  /** Issues a presigned URL for each request (used instead of the request URL). */
+  presign?: (url: string, method: 'GET' | 'HEAD') => string | Promise<string>;
 }
 
-function wireProvider(p: CredentialsProvider): { endpoint: string; headers?: Record<string, string>; callback?: boolean } {
-  return typeof p.headers === 'function' ? { endpoint: p.endpoint, callback: true } : { endpoint: p.endpoint, headers: p.headers };
+function wireProvider(p: CredentialsProvider): WireCredentials {
+  const fn = typeof p.headers === 'function' || typeof p.aws === 'function' || typeof p.azure === 'function' || p.presign !== undefined;
+  if (fn) return { endpoint: p.endpoint, callback: true };
+  return { endpoint: p.endpoint, headers: p.headers as Record<string, string> | undefined, aws: p.aws as AwsKeys | undefined, azure: p.azure as AzureAuth | undefined };
 }
 export type { CsvExportOptions, CsvImportOptions, JsonExportOptions, JsonImportOptions } from '../engine/io/import-export.js';
 

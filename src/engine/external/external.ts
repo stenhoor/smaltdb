@@ -8,6 +8,10 @@ import { SmaltError } from '../errors.js';
 import type { StaticType } from '../exec/convert.js';
 import { type Field, csvRecords, inferType, jsonValue, numericOrText } from '../io/import-export.js';
 import type { SqlValue } from '../values.js';
+import { globPrefix, globRegExp, hivePartitions, isGlob, partitionValue } from './glob.js';
+import { AZURE_VERSION, type AwsKeys, signAzureSharedKey, signV4 } from './sign.js';
+
+export type { AwsKeys } from './sign.js';
 
 /** A named endpoint (`CREATE CONNECTION`). */
 export interface ConnectionInfo {
@@ -34,6 +38,12 @@ export interface ExternalSource {
   connection?: ConnectionInfo;
   /** Declared columns; undefined: inferred from the data. */
   columns?: ExternalColumn[];
+  /**
+   * Partition pruning (M8.2), set by the planner from constant WHERE conditions on partition
+   * columns: a file is skipped when one of these returns false for its `key=value` values
+   * (lower-cased keys). They return undefined when they cannot decide.
+   */
+  prune?: ((partition: Map<string, SqlValue>) => boolean | undefined)[];
 }
 
 /** Rows read from a source. */
@@ -60,14 +70,47 @@ export function externalError(source: { label: string }, message: string): Smalt
 /** A file the application registers under a name (`file:<name>` locations). */
 export type FileSource = Blob | Uint8Array | ArrayBuffer | string | { getFile(): Promise<Blob> };
 
+/** How a request to Azure Blob Storage authenticates. */
+export type AzureAuth = { sasToken: string } | { accountKey: string } | { bearerToken: string };
+
+/** What authenticates one request: headers, keys to sign it with, or a presigned URL to use instead. */
+export interface CredentialMaterial {
+  headers?: Record<string, string>;
+  aws?: AwsKeys;
+  azure?: AzureAuth;
+  /** A presigned URL (S3, Azure SAS, GCS): fetched instead of the request URL, with no other auth. */
+  url?: string;
+}
+
 /**
  * Credentials for a connection, registered at runtime (never stored in SQL or the database file).
- * They are only sent to URLs that start with `endpoint`, so a database file from elsewhere cannot
- * point a connection at another host and collect them.
+ * They are only used for URLs that start with `endpoint`, so a database file from elsewhere cannot
+ * point a connection at another host and collect them. Each part may be a value or a function
+ * (called per request: tokens that expire, keys from STS / Cognito).
  */
 export interface CredentialProvider {
   endpoint: string;
-  headers: Record<string, string> | ((url: string) => Record<string, string> | Promise<Record<string, string>>);
+  /** Extra headers (`authorization: Bearer …`). */
+  headers?: Record<string, string> | ((url: string) => Record<string, string> | Promise<Record<string, string>>);
+  /** AWS keys: requests to S3 connections are signed with Signature Version 4. */
+  aws?: AwsKeys | (() => AwsKeys | Promise<AwsKeys>);
+  /** Azure: a SAS token, the account key (Shared Key signing) or an Entra ID bearer token. */
+  azure?: AzureAuth | (() => AzureAuth | Promise<AzureAuth>);
+  /** Issues a presigned URL for a request (the URL to use instead). */
+  presign?: (url: string, method: 'GET' | 'HEAD') => string | Promise<string>;
+  /** @internal All of the above for one request at once (credentials callbacks across the worker). */
+  resolve?: (url: string, method: 'GET' | 'HEAD') => Promise<CredentialMaterial>;
+}
+
+/** The credential material of `p` for one request. */
+export async function materialOf(p: CredentialProvider, url: string, method: 'GET' | 'HEAD'): Promise<CredentialMaterial> {
+  if (p.resolve) return p.resolve(url, method);
+  return {
+    headers: typeof p.headers === 'function' ? await p.headers(url) : p.headers,
+    aws: typeof p.aws === 'function' ? await p.aws() : p.aws,
+    azure: typeof p.azure === 'function' ? await p.azure() : p.azure,
+    url: p.presign ? await p.presign(url, method) : undefined,
+  };
 }
 
 /** The subset of `fetch` the sources use (injectable for tests and custom transports). */
@@ -103,7 +146,7 @@ export function formatOf(location: string, options: Record<string, SqlValue>, la
   return f;
 }
 
-const READER_OPTIONS = new Set(['header', 'delimiter', 'quote', 'null', 'skip', 'encoding', 'format']);
+const READER_OPTIONS = new Set(['header', 'delimiter', 'quote', 'null', 'skip', 'encoding', 'format', 'hive_partitioning']);
 
 /** Reject unknown reader options (typos would otherwise be silently ignored). */
 export function checkReaderOptions(options: Record<string, SqlValue>, extra: ReadonlySet<string>, label: string): void {
@@ -181,11 +224,19 @@ export function readCsv(text: string, source: Pick<ExternalSource, 'label' | 'op
   }
   let names: string[] | undefined;
   if (header && records.length > 0) names = records.shift()!.fields.map((f) => f.text.trim());
-  const width = source.columns?.length ?? names?.length ?? records[0]?.fields.length ?? 0;
-  if (names && source.columns && names.length !== width) throw externalError(source, `the header has ${names.length} fields but ${width} columns are declared`);
+  // Declared columns match a header by name when every one is in it (files may order columns
+  // differently); otherwise by position.
+  let pick: number[] | null = null;
+  if (names && source.columns) {
+    const at = new Map(names.map((n, i) => [n.toLowerCase(), i]));
+    if (source.columns.every((c) => at.has(c.name.toLowerCase()))) pick = source.columns.map((c) => at.get(c.name.toLowerCase())!);
+    else if (names.length !== source.columns.length) throw externalError(source, `the header has ${names.length} fields but ${source.columns.length} columns are declared`);
+  }
+  const width = names?.length ?? source.columns?.length ?? records[0]?.fields.length ?? 0;
   const raw: (string | null)[][] = records.map((r) => {
     if (r.fields.length !== width) throw externalError(source, `CSV line ${r.line}: expected ${width} fields but found ${r.fields.length}`);
-    return r.fields.map((f) => (f.quoted ? f.text : f.text === '' || f.text === nullText ? null : f.text));
+    const vals = r.fields.map((f) => (f.quoted ? f.text : f.text === '' || f.text === nullText ? null : f.text));
+    return pick ? pick.map((i) => vals[i]) : vals;
   });
   let columns: ExternalColumn[];
   if (source.columns) columns = source.columns;
@@ -204,7 +255,7 @@ export function readCsv(text: string, source: Pick<ExternalSource, 'label' | 'op
 }
 
 /** Type of JSON values: INTEGER, REAL, TEXT, or ANY when they mix. */
-function jsonType(values: SqlValue[]): string {
+export function jsonType(values: SqlValue[]): string {
   let t: string | null = null;
   for (const v of values) {
     if (v === null) continue;
@@ -272,11 +323,70 @@ const SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 
 const isNode = (): boolean => typeof process !== 'undefined' && !!(process as { versions?: { node?: string } }).versions?.node;
 
+/** Percent-encode a key's path segments (S3 keys and blob names), keeping `/`. */
+const encodeKey = (key: string): string =>
+  key
+    .split('/')
+    .map((s) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase()))
+    .join('/');
+
+/** Where a location lives: the backend and what it needs to reach it. */
+type Place =
+  | { kind: 'http'; url: string }
+  | { kind: 'file'; name: string }
+  | { kind: 'node'; path: string }
+  | { kind: 's3'; bucket: string; key: string; region: string; endpoint: string | null; pathStyle: boolean }
+  | { kind: 'azure'; account: string; container: string; key: string; base: string };
+
+/** One file of a source (a pattern expands to many). */
+interface FileRef {
+  place: Place;
+  /** For messages, and the partition columns. */
+  path: string;
+  /** Validator from the listing, when the listing gives one. */
+  validator?: string | null;
+}
+
+const opt = (o: Record<string, SqlValue> | undefined, k: string): string | null => {
+  const v = o?.[k];
+  return v === undefined || v === null ? null : String(v);
+};
+
+/** XML text with entities decoded (S3 and Azure listings). */
+const xmlText = (s: string): string =>
+  s.replace(/&(lt|gt|amp|quot|apos|#\d+|#x[0-9a-f]+);/gi, (_m, e: string) =>
+    e === 'lt' ? '<' : e === 'gt' ? '>' : e === 'amp' ? '&' : e === 'quot' ? '"' : e === 'apos' ? "'" : String.fromCodePoint(e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10)),
+  );
+const xmlTag = (xml: string, tag: string): string | null => {
+  const m = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(xml);
+  return m ? xmlText(m[1]) : null;
+};
+const xmlAll = (xml: string, tag: string): string[] => [...xml.matchAll(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'g'))].map((m) => m[1]);
+
+/** Run `fn` over `items` with at most `limit` running at once. */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (x: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(d), (x) => x.toString(16).padStart(2, '0')).join('');
+}
+
 /** Fetches and reads external sources; holds what the application registered (files, credentials). */
 export class ExternalRegistry {
   readonly files = new Map<string, FileSource>();
   readonly credentials = new Map<string, CredentialProvider>();
-  /** Transport for http(s) locations (default: the global `fetch`). */
+  /** Transport for http(s), S3 and Azure requests (default: the global `fetch`). */
   fetchFn: FetchFn | null = null;
   /**
    * Data loaded for statements being run, by source key. Reference-counted: concurrent async calls
@@ -322,10 +432,55 @@ export class ExternalRegistry {
     }
   }
 
-  /** Fetch and parse one source. */
+  // ---------------------------------------------------------------- reading
+
+  /**
+   * Fetch and parse one source. A pattern reads every matching file (8 at a time) and merges them by
+   * column name; `key=value` directories add partition columns, and files the planner's partition
+   * filters exclude are not read at all.
+   */
   async read(source: ExternalSource, signal?: AbortSignal): Promise<ExternalData> {
     const fmt = formatOf(source.location, source.options, source.label);
-    const { bytes, validator } = await this.fetchBytes(source, signal);
+    const place0 = this.placeOf(source);
+    // In a URL, `?` starts the query: only wildcards in the path count (and HTTP cannot be listed).
+    if (place0.kind === 'http' && /[*[{]/.test(new URL(place0.url).pathname)) {
+      throw externalError(source, 'wildcards need a source that can be listed (S3, Azure, local paths or registered files), not an HTTP URL');
+    }
+    const glob = place0.kind !== 'http' && isGlob(source.location);
+    const hive = truthyOption(source.options.hive_partitioning, glob);
+    if (!glob) {
+      const place = this.placeOf(source);
+      const { bytes, validator } = await this.fetchFile(source, place, signal, false);
+      const parts = hive ? hivePartitions(source.location) : [];
+      const fileCols = source.columns?.filter((c) => !parts.some(([k]) => k.toLowerCase() === c.name.toLowerCase()));
+      const parsed = this.parse(source, bytes, fmt, fileCols);
+      return { ...this.merge(source, [{ parsed, partitions: parts }]), validator };
+    }
+    const files = await this.list(source, signal);
+    if (files.length === 0) throw externalError(source, `no files match ${source.location}`);
+    const validator = await this.combinedValidator(source, files, signal);
+    // Partition values as the rows will hold them (declared columns convert by their type).
+    const declared = new Map((source.columns ?? []).map((c) => [c.name.toLowerCase(), c.declType]));
+    const kept = files.filter((f) => {
+      if (!hive || !source.prune?.length) return true;
+      const values = new Map(
+        hivePartitions(f.path).map(([k, v]) => {
+          const t = declared.get(k.toLowerCase());
+          return [k.toLowerCase(), t !== undefined ? (v === null ? null : convertText(v, t)) : partitionValue(v)] as [string, SqlValue];
+        }),
+      );
+      return source.prune!.every((p) => p(values) !== false);
+    });
+    const partitionNames = new Set(hive ? files.flatMap((f) => hivePartitions(f.path).map(([k]) => k.toLowerCase())) : []);
+    const fileCols = source.columns?.filter((c) => !partitionNames.has(c.name.toLowerCase()));
+    const parsed = await mapLimit(kept, 8, async (f) => {
+      const { bytes } = await this.fetchFile(source, f.place, signal, false);
+      return { parsed: this.parse({ ...source, label: `${source.label} (${f.path})` }, bytes, fmt, fileCols), partitions: hive ? hivePartitions(f.path) : [] };
+    });
+    return { ...this.merge(source, parsed, [...partitionNames]), validator };
+  }
+
+  private parse(source: ExternalSource, bytes: Uint8Array, fmt: { format: 'csv' | 'json'; delimiter?: string }, columns: ExternalColumn[] | undefined): Omit<ExternalData, 'validator'> {
     const encoding = source.options.encoding === undefined || source.options.encoding === null ? 'utf-8' : String(source.options.encoding);
     let text: string;
     try {
@@ -333,87 +488,283 @@ export class ExternalRegistry {
     } catch {
       throw externalError(source, `unsupported encoding '${encoding}'`);
     }
-    const parsed = fmt.format === 'csv' ? readCsv(text, source, fmt.delimiter) : readJson(text, source);
-    return { ...parsed, validator };
-  }
-
-  /** The URL an http(s) location resolves to (relative locations against the connection's url). */
-  private url(source: ExternalSource): string | null {
-    const loc = source.location;
-    const base = source.connection?.options.url;
-    if (/^https?:/i.test(loc)) return loc;
-    if (base !== undefined && base !== null && !SCHEME.test(loc)) {
-      const b = String(base);
-      return new URL(loc, b.endsWith('/') ? b : `${b}/`).href;
-    }
-    return null;
+    const s = { ...source, columns };
+    return fmt.format === 'csv' ? readCsv(text, s, fmt.delimiter) : readJson(text, s);
   }
 
   /**
-   * The source's current validator (ETag or Last-Modified, a file's mtime and size, a registered
-   * File's lastModified and size) without reading it: a HEAD request or a stat. null when the source
-   * has none (a registered Blob or bytes): it then counts as changed.
+   * Files' rows as one table: declared columns (partition columns filled from the path), or the
+   * union of the files' columns by name (first seen first) followed by the partition columns.
    */
-  async currentValidator(source: ExternalSource, signal?: AbortSignal): Promise<string | null> {
-    return (await this.fetchBytes(source, signal, true)).validator;
+  private merge(source: ExternalSource, parts: { parsed: Omit<ExternalData, 'validator'>; partitions: [string, string | null][] }[], partitionNames: string[] = []): Omit<ExternalData, 'validator'> {
+    const lower = (s: string): string => s.toLowerCase();
+    let columns: ExternalColumn[];
+    if (source.columns) columns = source.columns;
+    else {
+      const byName = new Map<string, ExternalColumn>();
+      for (const p of parts) {
+        for (const c of p.parsed.columns) {
+          const old = byName.get(lower(c.name));
+          if (!old) byName.set(lower(c.name), { name: c.name, declType: c.declType });
+          else if (old.declType !== c.declType) old.declType = [old.declType, c.declType].every((t) => t === 'INTEGER' || t === 'REAL') ? 'REAL' : 'ANY';
+        }
+      }
+      const names = new Set([...partitionNames, ...parts.flatMap((p) => p.partitions.map(([k]) => lower(k)))]);
+      for (const p of parts) for (const [k] of p.partitions) if (names.has(lower(k)) && !byName.has(lower(k))) byName.set(lower(k), { name: k, declType: '' });
+      columns = [...byName.values()];
+    }
+    const rows: SqlValue[][] = [];
+    for (const p of parts) {
+      const pos = new Map(p.parsed.columns.map((c, i) => [lower(c.name), i]));
+      const pv = new Map(p.partitions.map(([k, v]) => [lower(k), v]));
+      const map = columns.map((c) => {
+        const i = pos.get(lower(c.name));
+        if (i !== undefined) return (r: SqlValue[]) => r[i];
+        if (pv.has(lower(c.name))) {
+          const v = pv.get(lower(c.name))!;
+          const value = source.columns ? (v === null ? null : convertText(v, c.declType)) : partitionValue(v);
+          return () => value;
+        }
+        return () => null;
+      });
+      for (const r of p.parsed.rows) rows.push(map.map((f) => f(r)));
+    }
+    // Inferred partition columns are typed from their values.
+    columns = columns.map((c, i) => (c.declType === '' ? { ...c, declType: jsonType(rows.map((r) => r[i])) } : c));
+    return { columns: typed(columns, rows), rows };
   }
 
-  /** `head`: only the validator (no body). */
-  private async fetchBytes(source: ExternalSource, signal?: AbortSignal, head = false): Promise<{ bytes: Uint8Array; validator: string | null }> {
+  // ---------------------------------------------------------------- validators
+
+  /**
+   * The source's current validator without reading it (a HEAD request, a stat, a listing): ETag or
+   * Last-Modified, a file's mtime and size, a registered File's lastModified and size, or for a
+   * pattern a digest of every matching file's. null when it has none (it then counts as changed).
+   */
+  async currentValidator(source: ExternalSource, signal?: AbortSignal): Promise<string | null> {
+    const place = this.placeOf(source);
+    if (place.kind === 'http' || !isGlob(source.location)) return (await this.fetchFile(source, place, signal, true)).validator;
+    return this.combinedValidator(source, await this.list(source, signal), signal);
+  }
+
+  private async combinedValidator(source: ExternalSource, files: FileRef[], signal?: AbortSignal): Promise<string | null> {
+    const parts: string[] = [];
+    for (const f of files) {
+      const v = f.validator !== undefined ? f.validator : (await this.fetchFile(source, f.place, signal, true)).validator;
+      if (v === null) return null;
+      parts.push(`${f.path}\u0000${v}`);
+    }
+    return 'files:' + (await sha256Hex(parts.sort().join('\n')));
+  }
+
+  // ---------------------------------------------------------------- locations
+
+  /** Where `source.location` lives (relative locations resolve against the connection). */
+  private placeOf(source: ExternalSource, location = source.location): Place {
     const conn = source.connection;
     const type = conn ? String(conn.options.type ?? 'http').toLowerCase() : null;
-    if (type !== null && type !== 'http' && type !== 'https') {
-      throw externalError(source, `connection ${conn!.name}: type '${type}' is not supported yet (M8.1 supports http)`);
+    const o = conn?.options;
+    if (/^file:/i.test(location)) return { kind: 'file', name: location.slice(5) };
+    if (/^https?:/i.test(location)) return { kind: 'http', url: location };
+    const s3 = /^s3:\/\/([^/]+)\/?(.*)$/i.exec(location);
+    if (s3) return this.s3Place(source, s3[1], s3[2]);
+    const az = /^(?:az|azure):\/\/([^/]+)\/?(.*)$/i.exec(location);
+    if (az) return this.azurePlace(source, az[1], az[2]);
+    if (SCHEME.test(location) && !/^[a-z]:[\\/]/i.test(location)) {
+      throw externalError(source, `unsupported location '${location}' (http(s), s3://, az://, file:<name>, or a path in Node)`);
     }
-    const loc = source.location;
-    if (/^file:/i.test(loc)) {
-      const name = loc.slice(5);
-      const f = this.files.get(name);
-      if (f === undefined) throw externalError(source, `no file is registered as '${name}' (registerFile)`);
-      return fileBytes(f, head);
+    if (type === 's3') {
+      const bucket = opt(o, 'bucket');
+      if (!bucket) throw externalError(source, `connection ${conn!.name} has no bucket: use s3://bucket/key`);
+      return this.s3Place(source, bucket, location);
     }
-    const url = this.url(source);
-    if (url !== null) return this.fetchUrl(source, url, signal, head);
-    if (SCHEME.test(loc) && !/^[a-z]:[\\/]/i.test(loc)) throw externalError(source, `unsupported location '${loc}' (http(s) URLs, file:<name>, or a path in Node)`);
-    if (!isNode()) throw externalError(source, `'${loc}' is a local path: in a browser, register the file (registerFile) and use file:<name>`);
-    const fsName = 'node:fs/promises';
-    const fs = (await import(/* @vite-ignore */ fsName)) as { readFile(p: string): Promise<Uint8Array>; stat(p: string): Promise<{ mtimeMs: number; size: number }> };
+    if (type === 'azure') {
+      const container = opt(o, 'container');
+      if (!container) throw externalError(source, `connection ${conn!.name} has no container: use az://container/path`);
+      return this.azurePlace(source, container, location);
+    }
+    const base = opt(o, 'url');
+    if (base !== null) return { kind: 'http', url: new URL(location, base.endsWith('/') ? base : `${base}/`).href };
+    if (!isNode()) throw externalError(source, `'${location}' is a local path: in a browser, register the file (registerFile) and use file:<name>`);
+    return { kind: 'node', path: location };
+  }
+
+  private s3Place(source: ExternalSource, bucket: string, key: string): Place {
+    const o = source.connection?.options;
+    const type = source.connection ? String(o?.type ?? 'http').toLowerCase() : 's3';
+    if (type !== 's3') throw externalError(source, `s3:// locations need an s3 connection (connection ${source.connection!.name} is ${type})`);
+    const endpoint = opt(o, 'endpoint');
+    const style = opt(o, 'url_style');
+    return { kind: 's3', bucket, key, region: opt(o, 'region') ?? 'us-east-1', endpoint: endpoint && endpoint.replace(/\/+$/, ''), pathStyle: style ? style.toLowerCase() === 'path' : endpoint !== null };
+  }
+
+  private azurePlace(source: ExternalSource, container: string, key: string): Place {
+    const o = source.connection?.options;
+    const type = source.connection ? String(o?.type ?? 'http').toLowerCase() : null;
+    if (type !== 'azure') throw externalError(source, 'az:// locations need an azure connection (it names the storage account)');
+    const account = opt(o, 'account');
+    const endpoint = opt(o, 'endpoint');
+    if (!account) throw externalError(source, `connection ${source.connection!.name} has no account`);
+    return { kind: 'azure', account, container, key, base: (endpoint ?? `https://${account}.blob.core.windows.net`).replace(/\/+$/, '') };
+  }
+
+  /** The URL of an object (key) in an S3 bucket or Azure container. */
+  private objectUrl(place: Extract<Place, { kind: 's3' | 'azure' }>, key: string): string {
+    if (place.kind === 'azure') return `${place.base}/${place.container}/${encodeKey(key)}`;
+    if (place.pathStyle) return `${place.endpoint ?? `https://s3.${place.region}.amazonaws.com`}/${place.bucket}/${encodeKey(key)}`;
+    if (place.endpoint) {
+      const u = new URL(place.endpoint);
+      return `${u.protocol}//${place.bucket}.${u.host}/${encodeKey(key)}`;
+    }
+    return `https://${place.bucket}.s3.${place.region}.amazonaws.com/${encodeKey(key)}`;
+  }
+
+  /** The files a pattern matches. */
+  private async list(source: ExternalSource, signal?: AbortSignal): Promise<FileRef[]> {
+    const place = this.placeOf(source);
+    if (place.kind === 'http') throw externalError(source, 'wildcards need a source that can be listed (S3, Azure, local paths or registered files), not an HTTP URL');
+    if (place.kind === 'file') {
+      const re = globRegExp(place.name);
+      return [...this.files.keys()]
+        .filter((n) => re.test(n))
+        .sort()
+        .map((n) => ({ place: { kind: 'file', name: n } as Place, path: n }));
+    }
+    if (place.kind === 'node') return this.listNode(source, place.path);
+    const re = globRegExp(place.key);
+    const prefix = globPrefix(place.key);
+    const out: FileRef[] = [];
+    let token: string | null = null;
+    do {
+      const listUrl =
+        place.kind === 's3'
+          ? `${this.objectUrl(place, '').replace(/\/$/, '')}${place.pathStyle ? '' : '/'}?list-type=2&prefix=${encodeURIComponent(prefix)}${token ? `&continuation-token=${encodeURIComponent(token)}` : ''}`
+          : `${place.base}/${place.container}?restype=container&comp=list&prefix=${encodeURIComponent(prefix)}${token ? `&marker=${encodeURIComponent(token)}` : ''}`;
+      const res = await this.request(source, place, listUrl, 'GET', signal);
+      const xml = new TextDecoder().decode(await res.arrayBuffer());
+      if (place.kind === 's3') {
+        for (const c of xmlAll(xml, 'Contents')) {
+          const key = xmlTag(c, 'Key')!;
+          if (re.test(key)) out.push({ place: { ...place, key }, path: key, validator: xmlTag(c, 'ETag') ?? xmlTag(c, 'LastModified') });
+        }
+        token = xmlTag(xml, 'IsTruncated') === 'true' ? xmlTag(xml, 'NextContinuationToken') : null;
+      } else {
+        for (const b of xmlAll(xml, 'Blob')) {
+          const key = xmlTag(b, 'Name')!;
+          if (re.test(key)) out.push({ place: { ...place, key }, path: key, validator: xmlTag(b, 'Etag') ?? xmlTag(b, 'Last-Modified') });
+        }
+        token = xmlTag(xml, 'NextMarker') || null;
+      }
+    } while (token);
+    return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  }
+
+  private async listNode(source: ExternalSource, pattern: string): Promise<FileRef[]> {
+    const fs = await nodeFs();
+    const prefix = globPrefix(pattern);
+    const dir = prefix.includes('/') ? prefix.slice(0, prefix.lastIndexOf('/') + 1) : './';
+    const re = globRegExp(pattern);
+    let names: string[];
     try {
-      const [bytes, st] = await Promise.all([head ? new Uint8Array(0) : fs.readFile(loc), fs.stat(loc)]);
-      return { bytes, validator: `${st.mtimeMs}:${st.size}` };
+      names = (await fs.readdir(dir, { recursive: true })) as string[];
     } catch (e) {
       throw externalError(source, (e as Error).message);
     }
+    const out: FileRef[] = [];
+    for (const n of names.sort()) {
+      const path = (dir === './' && !pattern.startsWith('./') ? '' : dir) + n.replace(/\\/g, '/');
+      if (!re.test(path)) continue;
+      const st = await fs.stat(path);
+      if (st.isFile()) out.push({ place: { kind: 'node', path }, path, validator: `${st.mtimeMs}:${st.size}` });
+    }
+    return out;
   }
 
-  private async fetchUrl(source: ExternalSource, url: string, signal?: AbortSignal, head = false): Promise<{ bytes: Uint8Array; validator: string | null }> {
-    const headers: Record<string, string> = {};
+  // ---------------------------------------------------------------- fetching
+
+  /** One file's bytes (or, with `head`, only its validator). */
+  private async fetchFile(source: ExternalSource, place: Place, signal: AbortSignal | undefined, head: boolean): Promise<{ bytes: Uint8Array; validator: string | null }> {
+    if (place.kind === 'file') {
+      const f = this.files.get(place.name);
+      if (f === undefined) throw externalError(source, `no file is registered as '${place.name}' (registerFile)`);
+      return fileBytes(f, head);
+    }
+    if (place.kind === 'node') {
+      const fs = await nodeFs();
+      try {
+        const [bytes, st] = await Promise.all([head ? new Uint8Array(0) : fs.readFile(place.path), fs.stat(place.path)]);
+        return { bytes, validator: `${st.mtimeMs}:${st.size}` };
+      } catch (e) {
+        throw externalError(source, (e as Error).message);
+      }
+    }
+    const url = place.kind === 'http' ? place.url : this.objectUrl(place, place.key);
+    const res = await this.request(source, place, url, head ? 'HEAD' : 'GET', signal);
+    const bytes = head ? new Uint8Array(0) : new Uint8Array(await res.arrayBuffer());
+    return { bytes, validator: res.headers.get('etag') ?? res.headers.get('last-modified') };
+  }
+
+  /**
+   * One HTTP request: with the connection's credentials (only for URLs under the provider's
+   * endpoint), signed for S3 (SigV4) or Azure (SAS, Shared Key, bearer), or to a presigned URL.
+   */
+  private async request(source: ExternalSource, place: Place, url: string, method: 'GET' | 'HEAD', signal?: AbortSignal): Promise<Awaited<ReturnType<FetchFn>>> {
+    let headers: Record<string, string> = {};
+    let target = url;
     const credName = source.connection?.options.credentials;
     if (credName !== undefined && credName !== null) {
       const p = this.credentials.get(String(credName));
       if (!p) throw externalError(source, `connection ${source.connection!.name}: no credentials are registered as '${credName}' (registerCredentials)`);
-      if (!url.startsWith(p.endpoint)) {
-        throw externalError(source, `credentials '${credName}' are bound to ${p.endpoint}; refusing to send them to ${url}`);
-      }
+      if (!url.startsWith(p.endpoint)) throw externalError(source, `credentials '${credName}' are bound to ${p.endpoint}; refusing to send them to ${url}`);
+      let m: CredentialMaterial;
       try {
-        Object.assign(headers, typeof p.headers === 'function' ? await p.headers(url) : p.headers);
+        m = await materialOf(p, url, method);
       } catch (e) {
         throw externalError(source, (e as Error).message); // a provider that failed or refused
       }
-    }
+      headers = { ...m.headers };
+      if (m.url) target = m.url;
+      else if (m.aws && place.kind === 's3') headers = await signV4({ method, url, headers }, m.aws, place.region, 's3');
+      else if (m.azure && place.kind === 'azure') {
+        const a = m.azure;
+        if ('sasToken' in a) target = `${url}${url.includes('?') ? '&' : '?'}${a.sasToken.replace(/^\?/, '')}`;
+        else if ('accountKey' in a) headers = await signAzureSharedKey({ method, url, headers }, place.account, a.accountKey);
+        else headers = { ...headers, authorization: `Bearer ${a.bearerToken}`, 'x-ms-version': AZURE_VERSION };
+      } else if (m.aws || m.azure) throw externalError(source, `credentials '${credName}' hold ${m.aws ? 'AWS' : 'Azure'} keys, but ${url} is not on a ${m.aws ? 's3' : 'azure'} connection`);
+    } else if (place.kind === 'azure') headers['x-ms-version'] = AZURE_VERSION;
     const fetchFn = this.fetchFn ?? (globalThis.fetch as unknown as FetchFn | undefined);
     if (!fetchFn) throw externalError(source, 'no fetch available in this environment');
     let res: Awaited<ReturnType<FetchFn>>;
     try {
-      res = await fetchFn(url, head ? { method: 'HEAD', headers, signal } : { headers, signal });
+      res = await fetchFn(target, method === 'HEAD' ? { method, headers, signal } : { headers, signal });
     } catch (e) {
       if ((e as Error).name === 'AbortError') throw new SmaltError('SMALT_INTERRUPT', 'interrupted');
       throw externalError(source, `fetching ${url} failed: ${(e as Error).message} (a network error, or a CORS error: the server must allow this origin)`);
     }
-    if (!res.ok) throw externalError(source, `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ''} for ${url}`);
-    const bytes = head ? new Uint8Array(0) : new Uint8Array(await res.arrayBuffer());
-    return { bytes, validator: res.headers.get('etag') ?? res.headers.get('last-modified') };
+    if (!res.ok) {
+      let detail = '';
+      if (method !== 'HEAD') {
+        // S3 and Azure explain errors in an XML body (<Code>AccessDenied</Code>, <Message>…</Message>).
+        const body = new TextDecoder().decode(await res.arrayBuffer().catch(() => new ArrayBuffer(0)));
+        const code = xmlTag(body, 'Code');
+        if (code) detail = ` (${code}${xmlTag(body, 'Message') ? `: ${xmlTag(body, 'Message')}` : ''})`;
+      }
+      throw externalError(source, `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ''} for ${url}${detail}`);
+    }
+    return res;
   }
+}
+
+type NodeFs = {
+  readFile(p: string): Promise<Uint8Array>;
+  stat(p: string): Promise<{ mtimeMs: number; size: number; isFile(): boolean }>;
+  readdir(p: string, o: { recursive: boolean }): Promise<string[]>;
+};
+
+/** Node's fs (loaded on first use; never bundled for browsers). */
+async function nodeFs(): Promise<NodeFs> {
+  const name = 'node:fs/promises';
+  return (await import(/* @vite-ignore */ name)) as NodeFs;
 }
 
 /** A registered file's bytes and validator (a File's lastModified and size; none for Blobs and bytes). */

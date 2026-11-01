@@ -1,5 +1,6 @@
 // Runs on the page main thread: exercises the public client API against the real engine worker + OPFS.
 import { open } from '../../src/client/index.js';
+import { signV4 } from '../../src/engine/external/sign.js';
 
 type Check = { name: string; ok: boolean; detail?: string };
 
@@ -50,6 +51,10 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   await db.registerCredentials('site-token', null);
   await db.exec('DROP MATERIALIZED VIEW prices_cache; DROP EXTERNAL TABLE prices; DROP CONNECTION site');
   await db.registerFile('stock', null);
+
+  // Object-store signing (M8.2) runs on this browser's WebCrypto: AWS's published SigV4 test vector.
+  const v4 = await signV4({ method: 'GET', url: 'https://examplebucket.s3.amazonaws.com/test.txt', headers: { Range: 'bytes=0-9' } }, { accessKeyId: 'AKIAIOSFODNN7EXAMPLE', secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' }, 'us-east-1', 's3', new Date('2013-05-24T00:00:00Z'));
+  check('S3 request signing (SigV4 test vector) with WebCrypto', v4.authorization.endsWith('Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41'), v4.authorization);
 
   // Spill to OPFS: a tiny work_mem makes the sort and the GROUP BY go through the scratch file.
   const plain = await db.query('SELECT price % 37 AS k, count(*) AS n, sum(id) AS s FROM items GROUP BY k ORDER BY k, n', undefined, { rowMode: 'array' });

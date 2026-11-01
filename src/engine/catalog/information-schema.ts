@@ -15,7 +15,7 @@ export interface CatalogSnapshot {
   /** External tables (M8): columns as declared or inferred at creation. */
   externals: { name: string; columns: { name: string; declType: string }[]; location: string; format: string | null; connection: string | null; options: string }[];
   /** Connections (M8): no secrets, only the name of a credential provider. */
-  connections: { name: string; type: string; url: string | null; credentials: string | null }[];
+  connections: { name: string; type: string; url: string | null; credentials: string | null; options: string }[];
 }
 
 export interface VirtualTable {
@@ -85,8 +85,8 @@ export function informationSchema(name: string, cat: CatalogSnapshot): VirtualTa
     case 'connections':
       // smaltdb extension (M8, ADR 0011): endpoints, never secrets.
       return {
-        columns: [t('connection_name'), t('connection_type'), t('url'), t('credentials')],
-        rows: () => cat.connections.map((c) => [c.name, c.type, c.url, c.credentials]),
+        columns: [t('connection_name'), t('connection_type'), t('url'), t('credentials'), t('options')],
+        rows: () => cat.connections.map((c) => [c.name, c.type, c.url, c.credentials, c.options]),
       };
     case 'columns':
       return {

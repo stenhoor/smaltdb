@@ -42,9 +42,9 @@ export type Request = { id: number } & (
    * removes them). `callback`: the engine asks this session for the headers of each request instead
    * (a 'credentials' message, answered with 'credentialsReply').
    */
-  | { op: 'registerCredentials'; name: string; provider: { endpoint: string; headers?: Record<string, string>; callback?: boolean } | null }
-  /** Answer to a 'credentials' message: the headers for that request, or why there are none. */
-  | { op: 'credentialsReply'; target: number; headers?: Record<string, string>; error?: string }
+  | { op: 'registerCredentials'; name: string; provider: WireCredentials | null }
+  /** Answer to a 'credentials' message: the credential material for that request, or why there is none. */
+  | { op: 'credentialsReply'; target: number; material?: WireMaterial; error?: string }
   /** Grant `n` more batches to the stream of request `target`. */
   | { op: 'credit'; target: number; n: number }
   /** Stop request `target`: dequeue it or close its stream (running statements: interrupt flag). */
@@ -90,9 +90,26 @@ export type WireColumn =
   | { t: 'str'; data: (string | null)[] }
   | { t: 'any'; data: SqlValue[] };
 
+/** Static credentials for a connection (M8), or `callback`: ask the registering session per request. */
+export interface WireCredentials {
+  endpoint: string;
+  headers?: Record<string, string>;
+  aws?: { accessKeyId: string; secretAccessKey: string; sessionToken?: string };
+  azure?: { sasToken: string } | { accountKey: string } | { bearerToken: string };
+  callback?: boolean;
+}
+
+/** What authenticates one request (headers, keys to sign with, or a presigned URL). */
+export interface WireMaterial {
+  headers?: Record<string, string>;
+  aws?: { accessKeyId: string; secretAccessKey: string; sessionToken?: string };
+  azure?: { sasToken: string } | { accountKey: string } | { bearerToken: string };
+  url?: string;
+}
+
 export type Response =
-  /** M8: the engine needs headers for `url` from this session's credentials callback `name`. */
-  | { id: 0; kind: 'credentials'; request: number; name: string; url: string }
+  /** M8: the engine needs credentials for a `method` request to `url` from this session's callback `name`. */
+  | { id: 0; kind: 'credentials'; request: number; name: string; url: string; method: 'GET' | 'HEAD' }
   | { id: number; kind: 'ok'; changes?: number; lastInsertRowid?: number | bigint; stmt?: number; columns?: string[]; paramCount?: number; capabilities?: unknown; text?: string }
   /** `reader`: which parallel reader worker serves the result (absent: the owner). */
   | { id: number; kind: 'columns'; columns: string[]; reader?: number; /** Merged from this many morsels (parallel readers). */ morsels?: number }

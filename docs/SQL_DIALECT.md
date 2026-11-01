@@ -128,9 +128,27 @@ DROP EXTERNAL TABLE [IF EXISTS] prices;   -- catalog entry only: never touches t
 DROP CONNECTION [IF EXISTS] api;          -- fails while an external table uses it
 ```
 
-- **Locations:** `http://` / `https://` URLs (relative to the connection's `url` when one is given); `file:<name>` for a
-  file the application registered (`registerFile`: a browser `File`, `Blob` or file handle, or bytes/text); a local path
-  in Node. S3, globs and partitioned paths come in M8.2, Parquet in M8.3, remote databases in M8.5.
+- **Locations:** `http://` / `https://` URLs (relative to the connection's `url` when one is given); `s3://bucket/key`
+  and `az://container/path` (M8.2), or a key relative to an s3 / azure connection's bucket or container; `file:<name>`
+  for a file the application registered (`registerFile`: a browser `File`, `Blob` or file handle, or bytes/text); a local
+  path in Node. Parquet comes in M8.3, remote databases in M8.5.
+- **Connections** (M8.2): `type = 'http'` (`url`), `type = 's3'` (`region`, `bucket`, `endpoint` for S3-compatible stores
+  such as MinIO or Cloudflare R2, `url_style = 'path' | 'virtual'`; path-style by default with an `endpoint`) and
+  `type = 'azure'` (`account`, `container`, `endpoint` for emulators or sovereign clouds). Each may name `credentials`.
+  `information_schema.connections` shows them (never secrets).
+- **Credentials** are registered by the application, bound to an endpoint prefix: headers, AWS keys (requests are signed
+  with Signature Version 4, including STS session tokens), Azure SAS tokens, account keys (Shared Key signing) or bearer
+  tokens, or a presigned-URL issuer. Signing runs on WebCrypto in the engine; nothing is stored in SQL or the file.
+- **Patterns** (M8.2): `*` (within a directory), `**` (any depth), `?`, `[a-z]`, `{a,b}` in S3 and Azure keys (listed
+  with ListObjectsV2 / List Blobs), local paths in Node and registered file names, not in HTTP URLs. Matching files are
+  read concurrently and merged by column name (a CSV header with the declared columns matches them by name, so files may
+  order columns differently).
+- **Partitions** (M8.2): with a pattern, `key=value` directories (Hive style: `sales/year=2024/month=02/x.csv`) become
+  columns, typed from their values (`__HIVE_DEFAULT_PARTITION__` is NULL); `hive_partitioning => false` turns this off,
+  `true` turns it on for a single file. For external tables, WHERE conditions on partition columns with constants (`year =
+  2024`, `month IN (1, 2)`, `year + month > 2030`, …) skip the files they exclude before anything is fetched. Not for
+  a LEFT-joined table, with RIGHT / FULL joins, or for `read_csv` / `read_json` calls. `REFRESH … IF CHANGED` over a
+  pattern compares the listing (each file's ETag or modification time).
 - **Formats:** `csv`, `tsv`, `json` (an array of objects, or of arrays with declared columns), `ndjson`; taken from
   `format` or the file extension.
 - **Reader options:** `header` (default true), `delimiter`, `quote`, `null` (text read as NULL; unquoted empty fields are

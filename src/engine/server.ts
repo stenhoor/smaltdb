@@ -22,7 +22,7 @@ import { SmaltError } from './errors.js';
 import { AsyncRequiredError } from './external/external.js';
 import { exportCSV, exportCSVAsync, exportJSON, exportJSONAsync, importCSV, importJSON } from './io/import-export.js';
 import type { Vfs } from './vfs/types.js';
-import { type ReaderSettings, type Request, type Response, encodeColumns } from '../shared/protocol.js';
+import { type ReaderSettings, type Request, type Response, type WireMaterial, encodeColumns } from '../shared/protocol.js';
 import type { SqlValue } from './values.js';
 
 /** Sends a response to a session. */
@@ -137,11 +137,11 @@ export class EngineServer {
   /** Credentials whose headers come from a session's callback: name -> session. */
   private readonly credentialOwners = new Map<string, string>();
   /** Questions to sessions' credentials callbacks, by question id. */
-  private readonly credentialAsks = new Map<number, { session: string; name: string; resolve: (h: Record<string, string>) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  private readonly credentialAsks = new Map<number, { session: string; name: string; resolve: (m: WireMaterial) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private nextAsk = 1;
 
-  /** Ask `session` for the headers of a request to `url` (its callback for credentials `name`). */
-  private askCredentials(session: string, name: string, url: string): Promise<Record<string, string>> {
+  /** Ask `session` for the credentials of a `method` request to `url` (its callback for credentials `name`). */
+  private askCredentials(session: string, name: string, url: string, method: 'GET' | 'HEAD'): Promise<WireMaterial> {
     const request = this.nextAsk++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -150,7 +150,7 @@ export class EngineServer {
       }, 30_000);
       (timer as { unref?: () => void }).unref?.();
       this.credentialAsks.set(request, { session, name, resolve, reject, timer });
-      this.send(session, { id: 0, kind: 'credentials', request, name, url });
+      this.send(session, { id: 0, kind: 'credentials', request, name, url, method });
     });
   }
 
@@ -214,8 +214,8 @@ export class EngineServer {
       if (ask && ask.session === session) {
         this.credentialAsks.delete(req.target);
         clearTimeout(ask.timer);
-        if (req.headers) ask.resolve(req.headers);
-        else ask.reject(new SmaltError('SMALT_EXTERNAL', `credentials '${ask.name}': ${req.error ?? 'no headers'}`));
+        if (req.material) ask.resolve(req.material);
+        else ask.reject(new SmaltError('SMALT_EXTERNAL', `credentials '${ask.name}': ${req.error ?? 'no credentials'}`));
       }
       return;
     }
@@ -444,7 +444,10 @@ export class EngineServer {
         const p = req.provider;
         const name = req.name;
         // A callback stays in the registering tab: the engine asks it for each request's headers.
-        this.requireDb().registerCredentials(name, p && (p.callback ? { endpoint: p.endpoint, headers: (url) => this.askCredentials(session, name, url) } : { endpoint: p.endpoint, headers: p.headers ?? {} }));
+        this.requireDb().registerCredentials(
+          name,
+          p && (p.callback ? { endpoint: p.endpoint, resolve: (url, method) => this.askCredentials(session, name, url, method) } : { endpoint: p.endpoint, headers: p.headers, aws: p.aws, azure: p.azure }),
+        );
         if (p?.callback) this.credentialOwners.set(name, session);
         else this.credentialOwners.delete(name);
         if (session !== EngineServer.LOCAL) this.watch(session);
