@@ -36,15 +36,35 @@ export interface MorselQuery {
   partial(lo: number | bigint, hi: number | bigint): SelectStmt;
   /** The merge query over `smalt_partials()`. */
   final: SelectStmt;
+  /** The merge query over another source with columns k0.., a0.. (MV matching). */
+  finalFrom(source: FromItem): SelectStmt;
   /** Values per partial row. */
   width: number;
+  /** The partial row's expressions: GROUP BY keys first ({@link keyCount}), then aggregate inputs. */
+  partialExprs: Expr[];
+  keyCount: number;
 }
 
 const NO_POS = { pos: 0, end: 0 };
 
 /** Structural key of an expression (positions ignored). */
-function exprKey(e: unknown): string {
-  return JSON.stringify(e, (k, v) => (k === 'pos' || k === 'end' ? undefined : typeof v === 'bigint' ? `${v}n` : v instanceof Uint8Array ? [...v] : v));
+export function exprKey(e: unknown): string {
+  const canon = (v: unknown): unknown => {
+    if (typeof v === 'bigint') return `${v}n`;
+    if (v instanceof Uint8Array) return { bytes: [...v] };
+    if (Array.isArray(v)) return v.map(canon);
+    if (v && typeof v === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const k of Object.keys(v).sort()) {
+        const x = (v as Record<string, unknown>)[k];
+        if (k === 'pos' || k === 'end' || x === undefined) continue;
+        out[k] = canon(x);
+      }
+      return out;
+    }
+    return v;
+  };
+  return JSON.stringify(canon(e));
 }
 
 function walk(x: unknown, visit: (node: Record<string, unknown>) => boolean | void): boolean {
@@ -212,8 +232,7 @@ export function analyzeMorsels(stmt: SelectStmt, text: string, info: (table: str
 
   const width = partialCols.length;
   const partialColumns: ResultColumn[] = partialCols.map((e) => ({ kind: 'expr', expr: e, ...NO_POS }));
-  const source: FromItem = { kind: 'function', name: 'smalt_partials', args: [], ...NO_POS };
-  const final: SelectStmt = {
+  const finalFrom = (source: FromItem): SelectStmt => ({
     kind: 'select',
     core: { ...core, columns: finalColumns, from: source, where: undefined, groupBy: keys.map((_, i) => col(`k${i}`)), having },
     compound: [],
@@ -221,7 +240,8 @@ export function analyzeMorsels(stmt: SelectStmt, text: string, info: (table: str
     limit: stmt.limit,
     offset: stmt.offset,
     ...NO_POS,
-  };
+  });
+  const final = finalFrom({ kind: 'function', name: 'smalt_partials', args: [], ...NO_POS });
   const partial = (lo: number | bigint, hi: number | bigint): SelectStmt => {
     const range: Expr = {
       kind: 'binary',
@@ -233,7 +253,7 @@ export function analyzeMorsels(stmt: SelectStmt, text: string, info: (table: str
     const where: Expr = core.where ? ({ kind: 'binary', op: 'AND', left: core.where, right: range, ...NO_POS } as Expr) : range;
     return { kind: 'select', core: { ...core, columns: partialColumns, where, having: undefined }, compound: [], orderBy: [], ...NO_POS };
   };
-  return { table: from.name, partial, final, width };
+  return { table: from.name, partial, final, finalFrom, width, partialExprs: partialCols, keyCount: keys.length };
 }
 
 function isExpr(x: unknown): x is Expr {

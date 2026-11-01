@@ -116,6 +116,10 @@ export interface MatViewInfo {
   refreshedAt: string | null;
   /** Columnar storage: reader (with its decoded-chunk cache) for the current segments; reset on refresh. */
   store?: import('../storage/columnar.js').ColumnStore;
+  /** No base table changed since the last refresh (M7.5: queries may be answered from the view). */
+  fresh?: boolean;
+  /** Base tables the view reads (lower case, through views). */
+  deps?: Set<string>;
 }
 
 /** Automatic index name for the n-th (1-based) UNIQUE/PRIMARY KEY constraint of a table. */

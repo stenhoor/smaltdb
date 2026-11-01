@@ -1,6 +1,6 @@
-# ADR 0010: Analytics (M7): mixed storage, spilling, columnar tables, morsels
+# ADR 0010: Analytics (M7): mixed storage, spilling, columnar tables, morsels, MV matching
 
-- **Status:** accepted (M7 in progress; sections are added as parts land)
+- **Status:** accepted
 - **Date:** 2026-11-01
 
 ## Context
@@ -161,6 +161,31 @@ views by an implicit rowid zone (row-group base + count).
   rows.
 - *Switch:* `PRAGMA parallel_aggregates = 0` turns morsels off.
 
+### 5. Materialized-view matching (M7.5)
+
+**Freshness.**
+- *Stored state:* `smalt_matview.populated` gains a third value: `2` means populated and fresh, that is, no base
+  table has changed since the last refresh. A refresh sets it.
+- *Going stale:* the first write to a base table marks dependent views stale. Writes here are any DML,
+  `DELETE`-truncation and `ALTER TABLE`, through views of views, and including a refresh of a view that another
+  view reads.
+- *Atomicity and readers:* the change happens in the writing transaction, so a rollback makes the view fresh again.
+  It bumps the schema cookie, so readers and cached plans notice.
+- *Visibility:* `information_schema.materialized_views.is_fresh` shows the state. Memory-resident views keep it at
+  runtime.
+
+**Matching** (`exec/mv-match.ts`) is opt-in per connection with `PRAGMA matview_rewrite = 1`. It applies to fresh
+views over a single table and rewrites the query at compile time, so EXPLAIN shows the view.
+- *Aggregate roll-up:* the view's WHERE must be part of the query's, the query may add conjuncts only on view group
+  keys, and its keys must be a subset of the view's. Its partial inputs (section 4) must each be a view column,
+  where `total(x)` may come from a `sum(x)` column. The query then merges the view's rows exactly as morsels are
+  merged. A view's rows are the query's partial aggregates at a finer grain.
+- *Selection and projection:* a non-aggregate query reads the view when the view's WHERE is part of the query's and
+  every column it uses is a view column (or the view is `SELECT *`).
+- *Comparison:* expressions are compared structurally after normalization: qualifiers dropped, names lower-cased,
+  keys canonical. Output names stay as the query wrote them.
+- *Interaction with morsels:* a query a fresh view answers is not split into morsels.
+
 ## Consequences
 
 - An OPFS database can hold memory-only state (scratch tables, fast dashboards' MVs) without writing pages. Readers
@@ -201,4 +226,8 @@ views by an implicit rowid zone (row-group base + count).
   The query is the same; parallel aggregates are turned off with the pragma for the owner run. The speedup is more
   than 3× because each reader caches only its third of the table, while the whole table exceeds the owner's 16 MiB
   page cache. With a warm cache that fits the table, expect roughly the reader count.
+- **MV matching** (Node, 1M-row table, view grouped by region and product):
+  - *Roll-up:* a region roll-up filtered on product takes 0.34 ms through the view, against 145 ms on the base table.
+  - *Write cost:* the first write after a refresh pays about 0.8 ms to mark the view stale.
+  - *Limits:* `avg(x)` needs a `count(x)` column in the view. `count(*)` is not equivalent when x can be NULL.
 

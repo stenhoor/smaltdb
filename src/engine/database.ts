@@ -21,6 +21,7 @@ import { Planner, type QueryPlan, Registers, markUnordered } from './exec/planne
 import { DEFAULT_WORK_MEM, SpillArea } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
+import { type MatviewCandidate, matchMatview } from './exec/mv-match.js';
 import { type ConflictMode, TableWriter } from './exec/write.js';
 import type {
   AlterTableStmt,
@@ -492,6 +493,7 @@ export class Database implements FunctionContext {
 
   /** Writer for user DML: deletions it makes (DELETE, REPLACE conflicts) run foreign-key processing. */
   private writerFor(table: TableSchema): TableWriter {
+    this.touchTable(table);
     const c = table.columnar;
     const w = c
       ? new ColumnarTableWriter(table, this.pager, (root) => this.tree(root), this.columnStoreOf(table), this.tree(c.delRoot), () => this.columnarTouched.add(table))
@@ -734,7 +736,7 @@ export class Database implements FunctionContext {
     const done = (p: Omit<Program, 'regCount'>): Program => ({ ...p, regCount: regs.count, rowAssumptions: planner.rowAssumptions });
     switch (stmt.kind) {
       case 'select': {
-        const plan = planner.planSelect(stmt, null);
+        const plan = planner.planSelect(this.matviewRewrite(stmt, ps.text) ?? stmt, null);
         return done({ plan, readonly: true, columns: plan.columns.map((c) => c.name), columnTypes: plan.columns.map((c) => c.type) });
       }
       case 'insert': {
@@ -766,7 +768,7 @@ export class Database implements FunctionContext {
         return done({ exec: () => this.transactionControl(stmt), readonly: true, columns: [], columnTypes: [] });
       case 'explain': {
         if (stmt.stmt.kind !== 'select') throw new SmaltError('SMALT_UNSUPPORTED', 'EXPLAIN is only supported for SELECT statements');
-        const plan = planner.planSelect(stmt.stmt as SelectStmt, null);
+        const plan = planner.planSelect(this.matviewRewrite(stmt.stmt as SelectStmt, ps.text) ?? (stmt.stmt as SelectStmt), null);
         if (stmt.analyze) {
           const round = (x: number): number => Math.round(x * 1000) / 1000;
           return done({
@@ -1006,7 +1008,7 @@ export class Database implements FunctionContext {
     // A memory-resident view's root is assigned at runtime: the catalog records a marker.
     this.addCatalogRow('matview', table.name, table.name, inMemory ? MEM_BASE : root, sql);
     if (inMemory) {
-      this.memViews.set(table.name.toLowerCase(), { root, indexRoots: new Map(), populated: false, refreshedAt: null });
+      this.memViews.set(table.name.toLowerCase(), { root, indexRoots: new Map(), populated: false, refreshedAt: null, fresh: false });
       this.memDirty = true;
     }
     this.tables.set(table.name.toLowerCase(), table);
@@ -1031,6 +1033,7 @@ export class Database implements FunctionContext {
     else {
       this.swapMatviewTrees(mv, this.createTree(memory), mv.indexes.map(() => this.createTree(memory)));
       mv.matview.populated = false;
+      mv.matview.fresh = false;
       this.writeMatviewMeta(mv.name, { populated: false, refreshedAt: mv.matview.refreshedAt });
     }
     if (memory) this.schemaVersion++;
@@ -1045,6 +1048,7 @@ export class Database implements FunctionContext {
    */
   private fillMatview(mv: TableSchema): number {
     const info = mv.matview!;
+    this.touchTable(mv); // views over this view
     const memory = mv.rootPage >= MEM_BASE;
     const root = this.createTree(memory);
     const target: TableSchema = { ...mv, rootPage: root, indexes: [] };
@@ -1093,8 +1097,9 @@ export class Database implements FunctionContext {
     });
     this.swapMatviewTrees(mv, root, indexRoots);
     info.populated = true;
+    info.fresh = true;
     info.refreshedAt = new Date().toISOString();
-    this.writeMatviewMeta(mv.name, { populated: true, refreshedAt: info.refreshedAt });
+    this.writeMatviewMeta(mv.name, { populated: true, refreshedAt: info.refreshedAt, fresh: true });
     return rowid;
   }
 
@@ -1164,7 +1169,7 @@ export class Database implements FunctionContext {
   }
 
   /** Upsert (or with `meta` null, delete) a view's row in smalt_matview. */
-  private writeMatviewMeta(name: string, meta: { layout?: string; populated: boolean; refreshedAt: string | null } | null): void {
+  private writeMatviewMeta(name: string, meta: { layout?: string; populated: boolean; refreshedAt: string | null; fresh?: boolean } | null): void {
     const t = this.tables.get('smalt_matview');
     if (!t) return;
     const mv = this.memViews.get(name.toLowerCase());
@@ -1172,6 +1177,8 @@ export class Database implements FunctionContext {
       // Memory-resident: refresh state is runtime-only (the file is not written).
       mv.populated = meta.populated;
       mv.refreshedAt = meta.refreshedAt;
+      mv.fresh = meta.fresh === true;
+      this.memDirty = true;
       return;
     }
     const w = new TableWriter(t, this.pager, (root) => this.tree(root));
@@ -1189,10 +1196,36 @@ export class Database implements FunctionContext {
     }
     c.close();
     if (found) w.deleteRow(found.rowid);
-    if (meta) w.writeRow([name, meta.layout ?? found?.layout ?? null, meta.populated ? 1 : 0, meta.refreshedAt], found?.rowid ?? w.newRowid());
+    // populated: 0 = no, 1 = yes, 2 = yes and fresh (no base table changed since the refresh).
+    if (meta) w.writeRow([name, meta.layout ?? found?.layout ?? null, meta.populated ? (meta.fresh ? 2 : 1) : 0, meta.refreshedAt], found?.rowid ?? w.newRowid());
   }
 
   // ---------------------------------------------------------------- morsel parallelism (M7.4)
+
+  /** `PRAGMA matview_rewrite`: answer queries from fresh materialized views (M7.5; off by default). */
+  private matviewRewriteOn = false;
+
+  /** The query rewritten to read a fresh materialized view, when one provably answers it. */
+  private matviewRewrite(stmt: SelectStmt, text: string): SelectStmt | null {
+    if (!this.matviewRewriteOn) return null;
+    const views: MatviewCandidate[] = [];
+    for (const t of this.tables.values()) {
+      if (t.matview?.populated && t.matview.fresh) views.push({ name: t.name, select: t.matview.select, columns: t.columns.map((c) => c.name) });
+    }
+    if (views.length === 0) return null;
+    const m = matchMatview(stmt, text, views, (name) => {
+      const t = this.getTable(name);
+      if (!t || t.system) return undefined;
+      return {
+        hasColumn: (c) => findColumn(t, c) >= 0,
+        binaryColumn: (c) => {
+          const i = findColumn(t, c);
+          return i >= 0 && (t.columns[i].collation ?? Collation.Binary) === Collation.Binary;
+        },
+      };
+    });
+    return m ? m.stmt : null;
+  }
 
   /** `PRAGMA parallel_aggregates`: whether large aggregates may run as morsels on parallel readers. */
   private parallelAggregates = true;
@@ -1276,6 +1309,8 @@ export class Database implements FunctionContext {
     if (parts < 2 || !this.parallelAggregates) return null;
     const m = this.morselQuery(sql);
     if (!m) return null;
+    // A fresh materialized view answers it more cheaply than any split of the base table.
+    if (m.parsed.stmt.kind === 'select' && this.matviewRewrite(m.parsed.stmt, m.parsed.text)) return null;
     const t = this.getTable(m.q.table)!;
     const rows =
       t.matview?.storage === 'columnar'
@@ -1543,13 +1578,14 @@ export class Database implements FunctionContext {
     if (rows.length === 0) return;
     const t = this.tables.get('smalt_matview');
     if (!t) throw new SmaltError('SMALT_CORRUPT', 'materialized views without smalt_matview');
-    const meta = new Map<string, { layout: string; populated: boolean; refreshedAt: string | null }>();
+    const meta = new Map<string, { layout: string; populated: boolean; fresh: boolean; refreshedAt: string | null }>();
     const reader = new RecordReader(t.layout, t.recordDefaults);
     const c = this.tree(t.rootPage).cursor();
     for (let ok = c.first(); ok; ok = c.next()) {
       c.loadValue();
       reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
-      meta.set(String(reader.column(0)).toLowerCase(), { layout: String(reader.column(1)), populated: reader.column(2) === 1, refreshedAt: reader.column(3) as string | null });
+      const p = reader.column(2);
+      meta.set(String(reader.column(0)).toLowerCase(), { layout: String(reader.column(1)), populated: p === 1 || p === 2, fresh: p === 2, refreshedAt: reader.column(3) as string | null });
     }
     c.close();
     for (const r of rows) {
@@ -1558,22 +1594,67 @@ export class Database implements FunctionContext {
       const def = parseOne(r.sql!).stmt as CreateViewStmt;
       let root = r.rootpage;
       let populated = m.populated;
+      let fresh = m.fresh;
       let refreshedAt = m.refreshedAt;
       if (root === MEM_BASE) {
         // Memory-resident: the runtime root, or a new empty tree after reopening (rebuilt at open).
         let mv = this.memViews.get(r.name.toLowerCase());
         if (!mv) {
-          mv = { root: this.createTree(true), indexRoots: new Map(), populated: false, refreshedAt: null };
+          mv = { root: this.createTree(true), indexRoots: new Map(), populated: false, refreshedAt: null, fresh: false };
           this.memViews.set(r.name.toLowerCase(), mv);
         }
         root = mv.root;
         populated = mv.populated;
+        fresh = mv.fresh;
         refreshedAt = mv.refreshedAt;
       }
       const { table } = buildTableSchema(parseOne(m.layout).stmt as CreateTableStmt, m.layout, root);
       const storage = String(def.with?.storage ?? 'row').toLowerCase() as MatViewInfo['storage'];
-      table.matview = { sql: r.sql!, select: def.select, storage, populated, refreshedAt };
+      table.matview = { sql: r.sql!, select: def.select, storage, populated, refreshedAt, fresh };
       this.tables.set(table.name.toLowerCase(), table);
+    }
+  }
+
+  /** Base tables a SELECT reads, through views (lower-case names; CTE names excluded). */
+  private selectDeps(select: SelectStmt, seen = new Set<string>()): Set<string> {
+    const out = new Set<string>();
+    const ctes = new Set<string>();
+    const visit = (x: unknown): void => {
+      if (Array.isArray(x)) return x.forEach(visit);
+      if (typeof x !== 'object' || x === null || x instanceof Uint8Array) return;
+      const o = x as Record<string, unknown>;
+      if (o.kind === 'select' && o.with && typeof o.with === 'object') for (const c of (o.with as { ctes: { name: string }[] }).ctes) ctes.add(c.name.toLowerCase());
+      if (o.kind === 'table' && typeof o.name === 'string') {
+        const n = o.name.toLowerCase();
+        const view = this.getView(n);
+        if (view && !seen.has(n)) {
+          seen.add(n);
+          for (const d of this.selectDeps(view.select, seen)) out.add(d);
+        } else if (!ctes.has(n)) out.add(n);
+      }
+      for (const v of Object.values(o)) visit(v);
+    };
+    visit(select);
+    return out;
+  }
+
+  /**
+   * A write to `table` is about to happen: materialized views over it stop being fresh (in this
+   * transaction, so a rollback makes them fresh again). Readers reload the schema to notice.
+   */
+  private touchTable(table: TableSchema): void {
+    const lower = table.name.toLowerCase();
+    let changed = false;
+    for (const t of this.tables.values()) {
+      const m = t.matview;
+      if (!m?.fresh || !(m.deps ??= this.selectDeps(m.select)).has(lower)) continue;
+      m.fresh = false;
+      this.writeMatviewMeta(t.name, { populated: m.populated, refreshedAt: m.refreshedAt, fresh: false });
+      changed = true;
+    }
+    if (changed) {
+      this.dirtySchema = true;
+      this.schemaChanged();
     }
   }
 
@@ -2076,6 +2157,7 @@ export class Database implements FunctionContext {
     if (!table) throw new SmaltError('SMALT_ERROR', `no such table: ${stmt.table}`);
     if (table.matview) throw new SmaltError('SMALT_ERROR', `materialized view ${table.name} may not be altered`);
     if (table.columnar) throw new SmaltError('SMALT_UNSUPPORTED', `ALTER TABLE is not supported for columnar table ${table.name} yet`);
+    this.touchTable(table);
     this.dirtySchema = true;
     const a = stmt.action;
     switch (a.kind) {
@@ -2822,6 +2904,7 @@ export class Database implements FunctionContext {
     const ret = stmt.returning ? this.compileReturning(stmt.returning, table, stmt.alias, this.rowScope(table, stmt.alias, oldBase, oldRowid, planner), planner.sqlText) : undefined;
     const exec = (r: SqlValue[], out?: SqlValue[][]): RunResult => {
       if (truncate && !this.fk.involved(table)) {
+        this.touchTable(table);
         const n = table.columnar ? this.rewriteColumnar(table, false) : new TableWriter(table, this.pager, (root) => this.tree(root)).truncate();
         this.lastChanges = n;
         this.total += n;
@@ -2977,6 +3060,25 @@ export class Database implements FunctionContext {
           return { readonly: true, columns: [], columnTypes: [], exec: () => ((this.spill.workMem = v), { changes: 0, lastInsertRowid: this.lastRowid }) };
         }
         return ro(['work_mem'], () => [[this.spill.workMem]]);
+      }
+      case 'matview_rewrite': {
+        if (stmt.value) {
+          const v = arg()?.toLowerCase();
+          const on = v === '1' || v === 'on' || v === 'true' || v === 'yes';
+          return {
+            readonly: true,
+            columns: [],
+            columnTypes: [],
+            exec: () => {
+              if (on !== this.matviewRewriteOn) {
+                this.matviewRewriteOn = on;
+                this.schemaVersion++; // re-plan statements compiled under the other setting
+              }
+              return { changes: 0, lastInsertRowid: this.lastRowid };
+            },
+          };
+        }
+        return ro(['matview_rewrite'], () => [[this.matviewRewriteOn ? 1 : 0]]);
       }
       case 'parallel_aggregates': {
         if (stmt.value) {
@@ -3419,6 +3521,7 @@ interface MemView {
   indexRoots: Map<string, number>;
   populated: boolean;
   refreshedAt: string | null;
+  fresh: boolean;
 }
 
 /** Memory-object state at a transaction / savepoint / statement boundary. */

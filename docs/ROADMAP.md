@@ -22,7 +22,7 @@ Still open: running the browser tests and benchmarks on Firefox and WebKit, whic
 - Subquery decorrelation.
 - sqllogictest: 122,333 / 122,334 records of the tracked subset ([research/sqllogictest.md](research/sqllogictest.md)).
 
-**In progress:** M7, analytics. Done: mixed storage environments (TEMP tables, `location = 'memory'` MVs), spill-to-OPFS for sorts and hash aggregates, columnar base tables, and morsel parallelism for large aggregates (ADR 0010). Next: MV matching.
+**Done:** M7, analytics (ADR 0010): mixed storage environments (TEMP tables, `location = 'memory'` MVs), spill-to-OPFS for sorts and hash aggregates, columnar base tables, morsel parallelism for large aggregates on parallel readers, and MV matching with freshness tracking. **Next:** M8 (shared buffer pool for browsers without shared OPFS handles).
 
 Roadmap change (2026-11-01, agreed): the columnar segment format and zone maps move from M7 into M5, with materialized
 views as their first consumer; see [research/columnar-mv-assessment.md](research/columnar-mv-assessment.md).
@@ -43,7 +43,7 @@ Carried over from M1, by decision (see [ADR 0003](adr/0003-m1-executor-and-trans
 | **M4: Dialect breadth** ✅ (2026-11-01) | Window functions, CTEs (recursive), subquery decorrelation, ON CONFLICT, RETURNING, date/time, information_schema, sqlite_schema/pragmas, CSV/JSON import/export |
 | **M5: Materialized views + columnar segments** ✅ (2026-11-01) | Full refresh and `REFRESH … CONCURRENTLY` (copy-on-write swap); columnar segment format in pager pages, zone maps, columnar scans feeding the generated pipelines; MVs `WITH (storage = 'row' \| 'columnar')` ([research](research/columnar-mv-assessment.md)) |
 | **M6: Concurrency** ✅ (2026-11-01; parallel readers on Chromium, others in M8) | Multi-tab leader election, parallel reader workers (when crossOriginIsolated), cancellation, backpressure |
-| **M7: Analytics** | Spill-to-OPFS, morsel parallelism, updatable columnar base tables (delta stores), MV matching (route queries to fresh columnar MVs), **mixed storage environments**: per-object placement in one database, e.g. memory-resident materialized views or tables inside an OPFS database (`WITH (location = 'memory')`, rebuilt on open or first use), via a second, in-memory page store (shared groundwork with `ATTACH`) |
+| **M7: Analytics** ✅ | Spill-to-OPFS, morsel parallelism, updatable columnar base tables (delta stores), MV matching (route queries to fresh columnar MVs), **mixed storage environments**: per-object placement in one database, e.g. memory-resident materialized views or tables inside an OPFS database (`WITH (location = 'memory')`, rebuilt on open or first use), via a second, in-memory page store (shared groundwork with `ATTACH`) |
 | **M8: Parallel readers everywhere** | Shared buffer pool in `SharedArrayBuffer` (page cache shared by the owner and reader workers, page reads proxied to the file owner with `Atomics.wait`/`notify`), so parallel reads work in every cross-origin isolated browser. M6 ships parallel readers only where OPFS `readwrite-unsafe` handles exist (Chromium) |
 | **1.0** | Format freeze, docs, performance targets met on Chromium, Firefox, and Safari |
 | **Post-1.0** | Incremental/on-commit MVs, triggers, JSON functions, JS UDFs, live queries, encryption at rest, SQLite import, ATTACH, locale collations, newer-browser fast paths (`readwrite-unsafe`, etc.) |

@@ -169,7 +169,7 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
 - `BEGIN` / `COMMIT` / `ROLLBACK`, `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` (M2), with statement-level atomicity inside transactions.
 - `EXPLAIN QUERY PLAN`, `EXPLAIN ANALYZE` (SELECT; estimated vs actual rows, loops and time per operator), and `ANALYZE [table]`
   (statistics in `smalt_stat`; M3); `PRAGMA table_info / index_list / index_info / page_size / page_count / freelist_count /
-  schema_version / integrity_check / journal_mode / wal_checkpoint / work_mem / spill_bytes / compact / parallel_aggregates`. `PRAGMA work_mem = bytes`
+  schema_version / integrity_check / journal_mode / wal_checkpoint / work_mem / spill_bytes / compact / parallel_aggregates / matview_rewrite`. `PRAGMA matview_rewrite = 1` (per connection, off by default) answers queries from fresh materialized views when they provably can (ADR 0010, section 5); `PRAGMA work_mem = bytes`
   (default 256 MiB) is how much a sort or hash aggregate may hold before spilling to the scratch file `<db>-spill`;
   `spill_bytes` reports scratch bytes written since open (M7); `smalt_schema` (also `sqlite_schema` / `sqlite_master`).
 
