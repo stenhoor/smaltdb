@@ -172,3 +172,57 @@ describe('BTree', () => {
     expect(tree.get(new Uint8Array(tree.maxKeySize).fill(7))!.length).toBe(5000);
   });
 });
+
+describe('BTree.bulkLoadKeys', () => {
+  for (const [seed, count, pageSize] of [[1, 0, 512], [2, 1, 512], [3, 30, 512], [4, 3000, 512], [5, 20000, 1024], [6, 5000, 4096]] as const) {
+    it(`builds a valid tree from ${count} sorted keys (seed ${seed}, ${pageSize}-byte pages)`, () => {
+      const { pager } = openMemoryPager({ pageSize, cacheSizeBytes: 64 * pageSize });
+      const tree = new BTree(pager, BTree.create(pager));
+      const r = rng(seed);
+      const set = new Map<string, Uint8Array>();
+      while (set.size < count) {
+        // Mostly short keys, some up to the maximum key size (long separators, few cells per page).
+        const len = r() < 0.9 ? 1 + Math.floor(r() * 12) : Math.floor(r() * tree.maxKeySize) + 1;
+        const k = new Uint8Array(len);
+        for (let i = 0; i < len; i++) k[i] = Math.floor(r() * 4);
+        set.set(hex(k), k);
+      }
+      const sorted = [...set.values()].sort(compareBytes);
+      // Pack in a shuffled physical order; `order` gives the sorted sequence.
+      const phys = [...sorted].sort(() => r() - 0.5);
+      const offs = new Int32Array(phys.length + 1);
+      const total = phys.reduce((n, k) => n + k.length, 0);
+      const keys = new Uint8Array(total);
+      let o = 0;
+      phys.forEach((k, i) => {
+        offs[i] = o;
+        keys.set(k, o);
+        o += k.length;
+      });
+      offs[phys.length] = o;
+      const pos = new Map(phys.map((k, i) => [hex(k), i]));
+      const order = Int32Array.from(sorted.map((k) => pos.get(hex(k))!));
+      tree.bulkLoadKeys(keys, offs, order);
+      checkAccounting(pager, tree);
+      const got: string[] = [];
+      const c = tree.cursor();
+      for (let ok = c.first(); ok; ok = c.next()) got.push(hex(c.key()));
+      c.close();
+      expect(got).toEqual(sorted.map(hex));
+      // Backward iteration follows the prev links.
+      const back: string[] = [];
+      const c2 = tree.cursor();
+      for (let ok = c2.last(); ok; ok = c2.prev()) back.push(hex(c2.key()));
+      c2.close();
+      expect(back).toEqual(sorted.map(hex).reverse());
+      // The tree stays usable for ordinary writes.
+      for (let i = 0; i < Math.min(2000, count); i++) {
+        const k = sorted[Math.floor(r() * sorted.length)];
+        if (r() < 0.5) tree.delete(k);
+        else tree.put(new Uint8Array([...k, 9]), new Uint8Array(0));
+      }
+      checkAccounting(pager, tree);
+      expect(pager.pinnedCount()).toBe(0);
+    });
+  }
+});

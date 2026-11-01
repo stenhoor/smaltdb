@@ -97,7 +97,10 @@ export class TableWriter {
     return out;
   }
 
-  /** Index key of a row (with the rowid suffix unless `prefixOnly`); null when a partial index excludes the row. */
+  /**
+   * Index key of a row (with the rowid suffix unless `prefixOnly`); null when a partial index
+   * excludes the row. The result is a view of the shared encoder: copy it before the next call.
+   */
   private indexKey(idx: IndexSchema, row: readonly SqlValue[], rowid: number | bigint, prefixOnly = false): Uint8Array | null {
     const e = this.keyEnc.reset();
     if (idx.eval) {
@@ -108,13 +111,15 @@ export class TableWriter {
       for (const ic of idx.columns) e.add(row[ic.column], ic);
     }
     if (!prefixOnly) e.addRowid(rowid);
-    return e.finish();
+    return e.view();
   }
 
-  /** @internal Index entry for a row (CREATE INDEX on a populated table); null if excluded. */
+  /**
+   * @internal Index entry for a row (CREATE INDEX on a populated table); null if excluded. A view,
+   * valid until the next call.
+   */
   indexEntry(idx: IndexSchema, row: readonly SqlValue[], rowid: number | bigint): Uint8Array | null {
-    const k = this.indexKey(idx, row, rowid);
-    return k && k.slice();
+    return this.indexKey(idx, row, rowid);
   }
 
   /** Rowid of a row that conflicts with `row` on unique index `i`, or null. */

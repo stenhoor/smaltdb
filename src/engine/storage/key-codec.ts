@@ -85,6 +85,11 @@ export class KeyEncoder {
     return this.buf.slice(0, this.len);
   }
 
+  /** The encoded key without copying; valid until the next reset or add. */
+  view(): Uint8Array {
+    return this.buf.subarray(0, this.len);
+  }
+
   add(value: SqlValue, col?: KeyColumn): this {
     const start = this.len;
     if (value === null) this.putByte(TAG_NULL);

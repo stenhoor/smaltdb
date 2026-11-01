@@ -260,6 +260,132 @@ export class BTree {
     }
   }
 
+  /**
+   * Fill an empty tree with `order.length` key-only entries, given in ascending key order: entry k
+   * is `keys[offs[order[k]] .. offs[order[k] + 1])`. Builds the tree bottom-up (full leaves, then
+   * interior levels) without per-key descents or splits (CREATE INDEX).
+   */
+  bulkLoadKeys(keys: Uint8Array, offs: Int32Array, order: Int32Array): void {
+    const pager = this.pager;
+    const usable = this.usable;
+    const root = pager.get(this.root);
+    const empty = isLeaf(root) && nCells(root) === 0;
+    pager.release(root);
+    if (!empty) throw new MisuseError('bulkLoadKeys needs an empty tree');
+    if (order.length === 0) return;
+
+    // Level 0: leaves. `seps[i]` separates page i from page i + 1.
+    let pages: number[] = [];
+    let seps: Uint8Array[] = [];
+    let page: Frame | null = null;
+    let cs = 0;
+    let n = 0;
+    let prevStart = 0;
+    let prevLen = 0;
+    const finishLeaf = (): void => {
+      page!.view.setUint16(PH_CELL_COUNT, n, true);
+      page!.view.setUint16(PH_CONTENT_START, cs, true);
+    };
+    for (let k = 0; k < order.length; k++) {
+      const e = order[k];
+      const start = offs[e];
+      const kl = offs[e + 1] - start;
+      if (kl > this.maxKeySize) throw new MisuseError(`key too large (${kl} > ${this.maxKeySize} bytes)`);
+      const size = LEAF_HDR + kl;
+      if (page === null || cs - size < H + 2 * (n + 1)) {
+        const next = pager.allocate();
+        initPage(next, PageType.BTreeLeaf, usable);
+        if (page !== null) {
+          finishLeaf();
+          setRightPtr(page, next.pgno);
+          setPrevPtr(next, page.pgno);
+          seps.push(shortestSeparator(keys, prevStart, prevLen, keys, start, kl));
+          pager.release(page);
+        }
+        page = next;
+        pages.push(next.pgno);
+        cs = usable;
+        n = 0;
+      } else if (n > 0 && compareRanges(keys, prevStart, prevLen, keys, start, kl) >= 0) {
+        throw new MisuseError('bulkLoadKeys: keys out of order');
+      }
+      cs -= size;
+      const b = page.bytes;
+      const v = page.view;
+      v.setUint16(cs, kl, true);
+      b[cs + 2] = 0;
+      v.setUint32(cs + 3, 0, true);
+      b.set(keys.subarray(start, start + kl), cs + LEAF_HDR);
+      v.setUint16(H + 2 * n, cs, true);
+      n++;
+      prevStart = start;
+      prevLen = kl;
+    }
+    finishLeaf();
+    pager.release(page!);
+    let leaf = true;
+
+    // Interior levels until one page remains. A page over children a..b has cells (child i, sep i)
+    // for i in a..b-1 and right pointer b; sep b separates it from the next page.
+    while (pages.length > 1) {
+      const last = pages.length - 1;
+      const groups: [number, number][] = [];
+      let a = 0;
+      while (a <= last) {
+        let room = usable - H;
+        let j = a;
+        // Add cells while they fit; child j ends the page as its right pointer.
+        while (j < last && room >= INT_HDR + seps[j].length + 2) {
+          room -= INT_HDR + seps[j].length + 2;
+          j++;
+        }
+        // Never leave a lone last child (a page needs at least one cell).
+        if (j === last - 1 && j > a + 1) j--;
+        groups.push([a, j]);
+        a = j + 1;
+      }
+      const up: number[] = [];
+      const upSeps: Uint8Array[] = [];
+      for (const [ga, gb] of groups) {
+        const p = pager.allocate();
+        initPage(p, PageType.BTreeInterior, usable);
+        let c = usable;
+        let m = 0;
+        for (let i = ga; i < gb; i++) {
+          const sep = seps[i];
+          c -= INT_HDR + sep.length;
+          p.view.setUint32(c, pages[i], true);
+          p.view.setUint16(c + 4, sep.length, true);
+          p.bytes.set(sep, c + INT_HDR);
+          p.view.setUint16(H + 2 * m, c, true);
+          m++;
+        }
+        setRightPtr(p, pages[gb]);
+        p.view.setUint16(PH_CELL_COUNT, m, true);
+        p.view.setUint16(PH_CONTENT_START, c, true);
+        up.push(p.pgno);
+        if (gb < last) upSeps.push(seps[gb]);
+        pager.release(p);
+      }
+      pages = up;
+      seps = upSeps;
+      leaf = false;
+    }
+
+    // The root page number never changes: move the single top page into it.
+    const top = pager.get(pages[0]);
+    const r = pager.get(this.root);
+    pager.markDirty(r);
+    r.bytes.set(top.bytes.subarray(0, usable));
+    if (leaf) {
+      setRightPtr(r, 0);
+      setPrevPtr(r, 0);
+    }
+    pager.release(r);
+    pager.release(top);
+    pager.free(pages[0]);
+  }
+
   /** Delete a key. Returns true if it existed. */
   delete(key: Uint8Array): boolean {
     const pager = this.pager;

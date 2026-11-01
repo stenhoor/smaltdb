@@ -40,7 +40,7 @@ import type {
 import { parse, parseOne } from './sql/parser.js';
 import { BTree } from './storage/btree.js';
 import { KeyEncoder, type KeyColumn, decodeKey, readRowidKey, rowidSuffixStart } from './storage/key-codec.js';
-import { compareBytes } from './util/bytes.js';
+import { compareRanges } from './util/bytes.js';
 import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordReader } from './storage/record.js';
 import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec/stats.js';
@@ -846,8 +846,30 @@ export class Database implements FunctionContext {
     const reader = new RecordReader(table.layout, table.recordDefaults);
     const w = new TableWriter(table, this.pager, (r) => this.tree(r));
     const enc = new KeyEncoder();
-    const entries: Uint8Array[] = [];
+    // Entries packed into one buffer (entry i = keys[offs[i] .. offs[i + 1])): no object per entry.
+    let keys = new Uint8Array(1 << 16);
+    let offs = new Int32Array(1024);
+    let count = 0;
+    let used = 0;
+    const push = (k: Uint8Array): void => {
+      if (used + k.length > keys.length) {
+        const next = new Uint8Array(Math.max(keys.length * 2, used + k.length));
+        next.set(keys.subarray(0, used));
+        keys = next;
+      }
+      if (count + 2 > offs.length) {
+        const next = new Int32Array(offs.length * 2);
+        next.set(offs);
+        offs = next;
+      }
+      keys.set(k, used);
+      offs[count] = used;
+      used += k.length;
+      count++;
+      offs[count] = used;
+    };
     const c = tree.cursor();
+    const row: SqlValue[] = new Array(table.columns.length).fill(null);
     try {
       for (let ok = c.first(); ok; ok = c.next()) {
         c.loadKey();
@@ -856,24 +878,22 @@ export class Database implements FunctionContext {
         reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
         if (idx.eval) {
           // Expression / partial index: evaluate over the whole row.
-          const row = table.columns.map((_, i) => (i === table.rowidAlias ? rowid : reader.column(i)));
+          for (let i = 0; i < row.length; i++) row[i] = i === table.rowidAlias ? rowid : reader.column(i);
           const k = w.indexEntry(idx, row, rowid);
-          if (k) entries.push(k);
+          if (k) push(k);
           continue;
         }
         // Plain columns: decode only the indexed ones.
         enc.reset();
         for (const ic of idx.columns) enc.add(ic.column === table.rowidAlias ? rowid : reader.column(ic.column), ic);
         enc.addRowid(rowid);
-        entries.push(enc.finish());
+        push(enc.view());
       }
     } finally {
       c.close();
     }
-    // Insert in key order: appends to the rightmost leaf keep pages full and avoid splits mid-tree.
-    entries.sort(compareBytes);
-    const empty = new Uint8Array(0);
-    for (const k of entries) itree.append(k, empty);
+    // Sort, then build the tree bottom-up from the sorted entries.
+    itree.bulkLoadKeys(keys, offs, sortPackedKeys(keys, offs, count));
     table.indexes.push(idx);
     this.indexes.set(idx.name.toLowerCase(), idx);
     if (idx.unique) this.checkUniqueIndex(table, idx); // existing rows may already collide
@@ -1971,6 +1991,44 @@ export class Database implements FunctionContext {
         throw new SmaltError('SMALT_UNSUPPORTED', `PRAGMA ${stmt.name} is not supported yet`);
     }
   }
+}
+
+/**
+ * Order of packed keys (key i = keys[offs[i] .. offs[i + 1])). Sorts numbers made of each key's
+ * first 4 bytes and its position with the native numeric sort, then fixes runs that share the
+ * 4-byte prefix with a byte comparison (entries arrive in rowid order, so runs are often sorted).
+ */
+function sortPackedKeys(keys: Uint8Array, offs: Int32Array, count: number): Int32Array {
+  const order = new Int32Array(count);
+  const cmp = (x: number, y: number): number => compareRanges(keys, offs[x], offs[x + 1] - offs[x], keys, offs[y], offs[y + 1] - offs[y]);
+  if (count >= 1 << 21) {
+    for (let i = 0; i < count; i++) order[i] = i;
+    return order.sort(cmp);
+  }
+  const packed = new Float64Array(count);
+  const prefix = new Uint32Array(count);
+  for (let i = 0; i < count; i++) {
+    const o = offs[i];
+    const n = offs[i + 1] - o;
+    const p = ((n > 0 ? keys[o] << 24 : 0) | (n > 1 ? keys[o + 1] << 16 : 0) | (n > 2 ? keys[o + 2] << 8 : 0) | (n > 3 ? keys[o + 3] : 0)) >>> 0;
+    prefix[i] = p;
+    packed[i] = p * 2097152 + i;
+  }
+  packed.sort();
+  for (let i = 0; i < count; i++) order[i] = packed[i] % 2097152;
+  // Runs with an equal prefix: check, and sort them by full key when needed.
+  let a = 0;
+  while (a < count) {
+    let b = a + 1;
+    while (b < count && prefix[order[b]] === prefix[order[a]]) b++;
+    if (b - a > 1) {
+      let sorted = true;
+      for (let i = a + 1; i < b && sorted; i++) if (cmp(order[i - 1], order[i]) > 0) sorted = false;
+      if (!sorted) order.subarray(a, b).sort(cmp);
+    }
+    a = b;
+  }
+  return order;
 }
 
 function prefixHasNull(prefix: Uint8Array, cols: readonly KeyColumn[]): boolean {
