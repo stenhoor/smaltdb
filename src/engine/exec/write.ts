@@ -105,10 +105,14 @@ export class TableWriter {
    */
   private indexKey(idx: IndexSchema, row: readonly SqlValue[], rowid: number | bigint, prefixOnly = false, enc = this.keyEnc): Uint8Array | null {
     const e = enc.reset();
-    if (idx.eval) {
-      const vals = this.indexValues(idx, row, rowid);
-      if (vals === null) return null;
-      idx.columns.forEach((ic, i) => e.add(vals[i], ic));
+    const ev = idx.eval;
+    if (ev) {
+      if (ev.where && !ev.where(row, rowid)) return null;
+      const cols = idx.columns;
+      for (let i = 0; i < cols.length; i++) {
+        const f = ev.cols[i];
+        e.add(f ? f(row, rowid) : row[cols[i].column], cols[i]);
+      }
     } else {
       for (const ic of idx.columns) e.add(row[ic.column], ic);
     }

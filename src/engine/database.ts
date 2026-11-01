@@ -877,8 +877,8 @@ export class Database implements FunctionContext {
         c.loadValue();
         reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
         if (idx.eval) {
-          // Expression / partial index: evaluate over the whole row.
-          for (let i = 0; i < row.length; i++) row[i] = i === table.rowidAlias ? rowid : reader.column(i);
+          // Expression / partial index: decode only the columns it reads.
+          for (const i of idx.eval.deps) row[i] = i === table.rowidAlias ? rowid : reader.column(i);
           const k = w.indexEntry(idx, row, rowid);
           if (k) push(k);
           continue;
@@ -2014,36 +2014,64 @@ export class Database implements FunctionContext {
 }
 
 /**
- * Order of packed keys (key i = keys[offs[i] .. offs[i + 1])). Sorts numbers made of each key's
- * first 4 bytes and its position with the native numeric sort, then fixes runs that share the
- * 4-byte prefix with a byte comparison (entries arrive in rowid order, so runs are often sorted).
+ * Order of packed keys (key i = keys[offs[i] .. offs[i + 1])). Radix-sorts by each key's first 4
+ * bytes, then fixes runs that share the 4-byte prefix with a byte comparison (entries arrive in
+ * rowid order, so runs are often sorted already).
  */
 function sortPackedKeys(keys: Uint8Array, offs: Int32Array, count: number): Int32Array {
   const order = new Int32Array(count);
   const cmp = (x: number, y: number): number => compareRanges(keys, offs[x], offs[x + 1] - offs[x], keys, offs[y], offs[y + 1] - offs[y]);
-  if (count >= 1 << 21) {
-    for (let i = 0; i < count; i++) order[i] = i;
-    return order.sort(cmp);
-  }
-  const packed = new Float64Array(count);
   const prefix = new Uint32Array(count);
   for (let i = 0; i < count; i++) {
     const o = offs[i];
     const n = offs[i + 1] - o;
-    const p = ((n > 0 ? keys[o] << 24 : 0) | (n > 1 ? keys[o + 1] << 16 : 0) | (n > 2 ? keys[o + 2] << 8 : 0) | (n > 3 ? keys[o + 3] : 0)) >>> 0;
-    prefix[i] = p;
-    packed[i] = p * 2097152 + i;
+    prefix[i] = ((n > 0 ? keys[o] << 24 : 0) | (n > 1 ? keys[o + 1] << 16 : 0) | (n > 2 ? keys[o + 2] << 8 : 0) | (n > 3 ? keys[o + 3] : 0)) >>> 0;
   }
-  packed.sort();
-  for (let i = 0; i < count; i++) order[i] = packed[i] % 2097152;
+  // Stable LSD radix sort on the prefix, one byte per pass (ties keep insertion order).
+  let src = order;
+  for (let i = 0; i < count; i++) src[i] = i;
+  let dst = new Int32Array(count);
+  const counts = new Int32Array(256);
+  for (let shift = 0; shift < 32; shift += 8) {
+    counts.fill(0);
+    for (let i = 0; i < count; i++) counts[(prefix[i] >>> shift) & 255]++;
+    if (counts[(prefix[0] >>> shift) & 255] === count) continue; // all in one bucket
+    let sum = 0;
+    for (let k = 0; k < 256; k++) {
+      const c = counts[k];
+      counts[k] = sum;
+      sum += c;
+    }
+    for (let i = 0; i < count; i++) {
+      const e = src[i];
+      dst[counts[(prefix[e] >>> shift) & 255]++] = e;
+    }
+    const t = src;
+    src = dst;
+    dst = t;
+  }
+  if (src !== order) order.set(src);
   // Runs with an equal prefix: check, and sort them by full key when needed.
   let a = 0;
   while (a < count) {
     let b = a + 1;
     while (b < count && prefix[order[b]] === prefix[order[a]]) b++;
     if (b - a > 1) {
+      // Inline byte comparison of neighbours (entries usually arrive sorted within a run).
       let sorted = true;
-      for (let i = a + 1; i < b && sorted; i++) if (cmp(order[i - 1], order[i]) > 0) sorted = false;
+      for (let i = a + 1; i < b && sorted; i++) {
+        const x = order[i - 1];
+        const y = order[i];
+        let px = offs[x] + 4;
+        let py = offs[y] + 4;
+        const ex = offs[x + 1];
+        const ey = offs[y + 1];
+        while (px < ex && py < ey && keys[px] === keys[py]) {
+          px++;
+          py++;
+        }
+        if (px < ex && (py === ey || keys[px] > keys[py])) sorted = false;
+      }
       if (!sorted) order.subarray(a, b).sort(cmp);
     }
     a = b;
