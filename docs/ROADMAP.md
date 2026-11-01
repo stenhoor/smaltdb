@@ -11,23 +11,18 @@ multiple connections.
 M1/M0 notes: M0 and M1 are complete. See [research/m0-baseline.md](research/m0-baseline.md) and
 [research/m1-baseline.md](research/m1-baseline.md). Performance versus SQLite WASM is mixed once measured like-for-like (see the correction in the M1 baseline): smaltdb is slower on small durable commits and on scan-heavy analytical queries.
 Still open: running the browser tests and benchmarks on Firefox and WebKit, which are not installed in the dev container.
-**In progress:** M4 (dialect breadth).
-- *Done:*
-  - views, with query flattening;
-  - `information_schema` and the table-valued pragmas;
-  - `RETURNING`, upsert and `UPDATE … FROM`;
-  - `WITH RECURSIVE`;
-  - window functions;
-  - date/time functions.
-- *Remaining:*
-  - `ALTER TABLE`;
-  - foreign-key enforcement;
-  - `RIGHT` / `FULL` joins;
-  - expression and partial indexes;
-  - CSV/JSON import and export;
-  - subquery decorrelation;
-  - `WITH` on DML;
-  - the sqllogictest pass rate.
+**Current:** M4 (dialect breadth) is complete.
+- Views (with query flattening) and TEMP views.
+- `information_schema` and the table-valued pragmas.
+- `RETURNING`, upsert, `UPDATE … FROM`, `WITH` on DML.
+- `WITH RECURSIVE`, window functions, date/time functions.
+- `ALTER TABLE`, foreign-key enforcement.
+- `RIGHT` / `FULL` joins, expression and partial indexes.
+- CSV/JSON import and export.
+- Subquery decorrelation.
+- sqllogictest: 122,333 / 122,334 records of the tracked subset ([research/sqllogictest.md](research/sqllogictest.md)).
+
+**Next:** M5, materialized views together with the columnar segment format.
 
 Roadmap change (2026-11-01, agreed): the columnar segment format and zone maps move from M7 into M5, with materialized
 views as their first consumer; see [research/columnar-mv-assessment.md](research/columnar-mv-assessment.md).
@@ -45,7 +40,7 @@ Carried over from M1, by decision (see [ADR 0003](adr/0003-m1-executor-and-trans
 | **M1: Minimal SQL** ✅ (2026-10-31) | Lexer/parser, catalog, CREATE TABLE/INDEX, INSERT/SELECT/UPDATE/DELETE, simple planner, row-at-a-time → vectorized executor, worker + client API |
 | **M2: Durability** ✅ (2026-10-31, group commit → M6) | WAL, group commit, recovery, checkpointing, transactions/savepoints, crash tests |
 | **M3: Optimizer** ✅ (2026-11-01, sqllogictest tracking → M4) | Statistics/ANALYZE, cost model, join ordering, access-path selection, EXPLAIN [ANALYZE], sqllogictest pass rate tracked |
-| **M4: Dialect breadth** | Window functions, CTEs (recursive), subquery decorrelation, ON CONFLICT, RETURNING, date/time, information_schema, sqlite_schema/pragmas, CSV/JSON import/export |
+| **M4: Dialect breadth** ✅ (2026-11-01) | Window functions, CTEs (recursive), subquery decorrelation, ON CONFLICT, RETURNING, date/time, information_schema, sqlite_schema/pragmas, CSV/JSON import/export |
 | **M5: Materialized views + columnar segments** | Full refresh and `REFRESH … CONCURRENTLY` (copy-on-write swap); columnar segment format in pager pages, zone maps, columnar scans feeding the generated pipelines; MVs `WITH (storage = 'row' \| 'columnar')` ([research](research/columnar-mv-assessment.md)) |
 | **M6: Concurrency** | Multi-tab leader election, parallel reader workers (when crossOriginIsolated), cancellation, backpressure |
 | **M7: Analytics** | Spill-to-OPFS, morsel parallelism, updatable columnar base tables (delta stores), MV matching (route queries to fresh columnar MVs) |

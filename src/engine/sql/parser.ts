@@ -1420,7 +1420,32 @@ class Parser {
       return { kind: 'between', pos, not, expr: left, low, high, end: this.ends[this.p - 1] };
     }
     if (kw === 'IN') {
-      if (!this.isOp('(')) this.fail();
+      if (!this.isOp('(')) {
+        // SQLite shorthand: `x IN table` / `x IN schema.table` / `x IN f(args)` means `x IN (SELECT * FROM …)`.
+        const tpos = this.pos();
+        const q = this.qualifiedName();
+        let from: A.FromItem;
+        if (this.isOp('(')) {
+          this.p++;
+          const args: A.Expr[] = [];
+          if (!this.isOp(')')) {
+            do args.push(this.expr());
+            while (this.acceptOp(','));
+          }
+          this.expectOp(')');
+          from = { kind: 'function', pos: tpos, name: q.name, args, end: this.ends[this.p - 1] };
+        } else from = { kind: 'table', pos: tpos, schema: q.schema, name: q.name, end: this.ends[this.p - 1] };
+        const end = this.ends[this.p - 1];
+        const select: A.SelectStmt = {
+          kind: 'select',
+          pos: tpos,
+          core: { kind: 'select', pos: tpos, distinct: false, columns: [{ kind: 'star', pos: tpos, end }], from, groupBy: [], windows: [], end },
+          compound: [],
+          orderBy: [],
+          end,
+        };
+        return { kind: 'inSelect', pos, not, expr: left, select, end };
+      }
       if (isSelectStartKw(this.kws[this.p + 1])) {
         this.p++;
         const select = this.selectStmt(undefined);

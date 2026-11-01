@@ -261,9 +261,12 @@ describe('expression precedence', () => {
     expect(ct.slice(c.columns[1].constraints[0].pos, c.columns[1].constraints[0].end)).toBe('DEFAULT (1)');
   });
 
-  it('rejects row values and IN table', () => {
+  it('rejects row values; accepts the IN table shorthand', () => {
     expect(syntaxError('SELECT (1, 2)').reason).toBe('row values are not supported');
-    expect(syntaxError('SELECT 1 IN t').reason).toBe('near "t": syntax error');
+    const e = parseExpr('1 NOT IN main.t') as A.InSelectExpr;
+    expect(e.kind).toBe('inSelect');
+    expect(e.not).toBe(true);
+    expect(e.select.core).toMatchObject({ kind: 'select', columns: [{ kind: 'star' }], from: { kind: 'table', schema: 'main', name: 't' } });
   });
 
   it('function call extras: FILTER, OVER, ORDER BY in aggregates', () => {

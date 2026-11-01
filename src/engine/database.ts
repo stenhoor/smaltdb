@@ -120,6 +120,8 @@ export class Database implements FunctionContext {
   private readonly indexes = new Map<string, IndexSchema>();
   private readonly catalog = new Map<string, CatalogEntry>();
   private readonly views = new Map<string, ViewSchema>();
+  /** TEMP views: this connection only, never stored (they shadow main-schema views, like SQLite's temp schema). */
+  private readonly tempViews = new Map<string, ViewSchema>();
   private catalogTable!: TableSchema;
   /** Incremented on every schema change (prepared statements recompile). */
   schemaVersion = 0;
@@ -369,7 +371,7 @@ export class Database implements FunctionContext {
 
   /** @internal View by name (for the planner). */
   getView(name: string): ViewSchema | undefined {
-    return this.views.get(name.toLowerCase());
+    return this.tempViews.get(name.toLowerCase()) ?? this.views.get(name.toLowerCase());
   }
 
   tableNames(): string[] {
@@ -499,8 +501,7 @@ export class Database implements FunctionContext {
         return done({ exec: () => this.alterTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
       case 'createView':
         if (stmt.materialized) throw new SmaltError('SMALT_UNSUPPORTED', 'materialized views are not supported yet (M5)');
-        if (stmt.temp) throw new SmaltError('SMALT_UNSUPPORTED', 'TEMP views are not supported yet');
-        if (stmt.schema && stmt.schema.toLowerCase() !== 'main') throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
+        if (stmt.schema && !['main', 'temp'].includes(stmt.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
         return done({ exec: () => this.createView(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
       case 'drop':
         return done({ exec: () => this.drop(stmt), readonly: false, columns: [], columnTypes: [] });
@@ -776,6 +777,16 @@ export class Database implements FunctionContext {
 
   private createView(stmt: CreateViewStmt, sql: string): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    if (stmt.temp || stmt.schema?.toLowerCase() === 'temp') {
+      const lower = stmt.name.toLowerCase();
+      if (this.tempViews.has(lower)) {
+        if (stmt.ifNotExists) return none;
+        throw new SmaltError('SMALT_ERROR', `view ${stmt.name} already exists`);
+      }
+      this.tempViews.set(lower, { name: stmt.name, sql, columns: stmt.columns, select: stmt.select });
+      this.schemaVersion++; // re-plan statements; nothing is stored
+      return none;
+    }
     if (stmt.ifNotExists && this.catalog.get(stmt.name.toLowerCase())?.type === 'view') return none;
     this.checkNewName(stmt.name, 'view');
     this.dirtySchema = true;
@@ -921,6 +932,11 @@ export class Database implements FunctionContext {
     const existing = this.catalog.get(lower);
     if (existing && (stmt.objectType === 'table' || stmt.objectType === 'view') && existing.type !== stmt.objectType && existing.type !== 'index') {
       throw new SmaltError('SMALT_ERROR', `use DROP ${existing.type.toUpperCase()} to delete ${existing.type} ${existing.name}`);
+    }
+    if (stmt.objectType === 'view' && this.tempViews.has(lower) && (!stmt.schema || stmt.schema.toLowerCase() === 'temp')) {
+      this.tempViews.delete(lower);
+      this.schemaVersion++;
+      return none;
     }
     if (stmt.objectType === 'view') {
       const view = this.views.get(lower);
@@ -1929,8 +1945,6 @@ export class Database implements FunctionContext {
             return [[0, frames, frames]];
           },
         };
-      case 'foreign_keys':
-        return ro(['foreign_keys'], () => [[0]]);
       default:
         throw new SmaltError('SMALT_UNSUPPORTED', `PRAGMA ${stmt.name} is not supported yet`);
     }

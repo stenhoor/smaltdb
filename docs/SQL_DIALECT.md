@@ -136,7 +136,9 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
   several recursive SELECTs.
 - `CREATE` / `DROP TABLE` (`IF [NOT] EXISTS`, `INTEGER PRIMARY KEY` rowid alias, `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`,
   `CHECK`, `COLLATE`), `CREATE [UNIQUE] INDEX` (multi-column, `ASC`/`DESC`, collations), and `DROP INDEX`.
-- `CREATE VIEW [IF NOT EXISTS] name [(columns)] AS select` and `DROP VIEW [IF EXISTS]` (M4). As in SQLite, a view's body is
+- `CREATE [TEMP] VIEW [IF NOT EXISTS] name [(columns)] AS select` and `DROP VIEW [IF EXISTS]` (M4). TEMP views exist for
+  the connection only and shadow main views of the same name.
+- `x [NOT] IN table` / `x IN f(args)`: SQLite's shorthand for `x IN (SELECT * FROM …)`. As in SQLite, a view's body is
   resolved when the view is used, not when it is created, and views cannot be modified or indexed. Simple views and FROM
   subqueries (no aggregates, DISTINCT, LIMIT, ORDER BY, compound, window functions or subquery expressions) are flattened
   into the referencing query, so their tables join and use indexes like tables written out directly.
@@ -152,7 +154,7 @@ losslessly as SQLite STRICT tables do (`'5'` into an INTEGER column becomes 5), 
 `cannot store TEXT value in INTEGER column t.c`.
 
 **Not yet supported** (each gives a clear `SMALT_UNSUPPORTED` error): `USING` / `NATURAL` with `RIGHT` / `FULL` joins,
-TEMP views, materialized views (M5), `ON CONFLICT` targets with WHERE, row-value assignments (`SET (a, b) = …`), `INCLUDE` columns, `WITHOUT ROWID`, `LOOSE` tables, generated columns, TEMP tables, JSON
+materialized views (M5), `ON CONFLICT` targets with WHERE, row-value assignments (`SET (a, b) = …`), `INCLUDE` columns, `WITHOUT ROWID`, `LOOSE` tables, generated columns, TEMP tables, JSON
 functions, and `VACUUM`. Plain `EXPLAIN` returns the `EXPLAIN QUERY PLAN` output (there is no bytecode to list).
 
 **Known deviations:**

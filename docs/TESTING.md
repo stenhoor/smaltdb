@@ -18,6 +18,7 @@
 | `BTREE_SEEDS=200 npm test -- btree` | Longer B+tree stress run: 200 seeds × 6,000 random operations, with reopen-from-storage checks |
 | `DIFF_QUERIES=20000 DIFF_DML=3000 npm test -- differential` | Differential testing against SQLite WASM (in Node): random queries and random writes; results and table contents must match |
 | `npm run typecheck` | `tsc --noEmit` over `src`, `test`, and `bench` |
+| `npm run slt` | sqllogictest subset (122k records) against the engine; see [research/sqllogictest.md](research/sqllogictest.md) |
 | `npm run test:browser` | Builds, then runs the OPFS storage test and the client API test (main thread → engine worker → OPFS) in a real browser (Playwright). `BROWSERS=chromium,firefox,webkit` picks the browsers. WebKit runs with a persistent profile, because Playwright's default (ephemeral) WebKit contexts have no OPFS; `PERSISTENT_CONTEXT=1` uses one for every browser |
 | `npm run bench` | Storage micro-benchmarks in Node |
 | `npm run bench:browser [-- --reps 5 --engines smaltdb,sqlite-off,… or all --baseline sqlite-off --save]` | Repeated, like-for-like engine comparison in a browser, with cross-engine result checks (see [research/benchmark-methodology.md](research/benchmark-methodology.md)). `--save` writes `bench/results/<date>-<browser>-<commit>.json` |

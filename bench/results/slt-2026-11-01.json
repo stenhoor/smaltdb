@@ -1,0 +1,263 @@
+{
+  "total": {
+    "records": 122334,
+    "passed": 122333,
+    "failed": 1,
+    "strict": 0,
+    "unsup": 0
+  },
+  "files": [
+    {
+      "file": "select1.test",
+      "records": 1031,
+      "passed": 1031,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 616,
+      "sampleFailures": []
+    },
+    {
+      "file": "select2.test",
+      "records": 1031,
+      "passed": 1031,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 495,
+      "sampleFailures": []
+    },
+    {
+      "file": "select3.test",
+      "records": 3351,
+      "passed": 3351,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 1118,
+      "sampleFailures": []
+    },
+    {
+      "file": "select4.test",
+      "records": 3857,
+      "passed": 3857,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 5896,
+      "sampleFailures": []
+    },
+    {
+      "file": "select5.test",
+      "records": 1436,
+      "passed": 1436,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 3050,
+      "sampleFailures": []
+    },
+    {
+      "file": "evidence/in1.test",
+      "records": 214,
+      "passed": 214,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 11,
+      "sampleFailures": []
+    },
+    {
+      "file": "evidence/in2.test",
+      "records": 53,
+      "passed": 53,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 4,
+      "sampleFailures": []
+    },
+    {
+      "file": "evidence/slt_lang_aggfunc.test",
+      "records": 80,
+      "passed": 79,
+      "failed": 1,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 22,
+      "sampleFailures": [
+        "line 480: query error: SMALT_ERROR integer overflow\n    SELECT sum(x) FROM t1"
+      ]
+    },
+    {
+      "file": "evidence/slt_lang_createview.test",
+      "records": 23,
+      "passed": 23,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 3,
+      "sampleFailures": []
+    },
+    {
+      "file": "evidence/slt_lang_dropindex.test",
+      "records": 8,
+      "passed": 8,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 1,
+      "sampleFailures": []
+    },
+    {
+      "file": "evidence/slt_lang_droptable.test",
+      "records": 12,
+      "passed": 12,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 1,
+      "sampleFailures": []
+    },
+    {
+      "file": "evidence/slt_lang_dropview.test",
+      "records": 13,
+      "passed": 13,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 4,
+      "sampleFailures": []
+    },
+    {
+      "file": "evidence/slt_lang_replace.test",
+      "records": 14,
+      "passed": 14,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 12,
+      "sampleFailures": []
+    },
+    {
+      "file": "evidence/slt_lang_update.test",
+      "records": 27,
+      "passed": 27,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 6,
+      "sampleFailures": []
+    },
+    {
+      "file": "random/aggregates/slt_good_0.test",
+      "records": 10012,
+      "passed": 10012,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 1468,
+      "sampleFailures": []
+    },
+    {
+      "file": "random/expr/slt_good_0.test",
+      "records": 10012,
+      "passed": 10012,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 643,
+      "sampleFailures": []
+    },
+    {
+      "file": "random/groupby/slt_good_0.test",
+      "records": 10012,
+      "passed": 10012,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 782,
+      "sampleFailures": []
+    },
+    {
+      "file": "random/select/slt_good_0.test",
+      "records": 10012,
+      "passed": 10012,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 847,
+      "sampleFailures": []
+    },
+    {
+      "file": "index/between/1/slt_good_0.test",
+      "records": 10022,
+      "passed": 10022,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 2780,
+      "sampleFailures": []
+    },
+    {
+      "file": "index/commute/10/slt_good_0.test",
+      "records": 10034,
+      "passed": 10034,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 1474,
+      "sampleFailures": []
+    },
+    {
+      "file": "index/delete/1/slt_good_0.test",
+      "records": 10907,
+      "passed": 10907,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 1130,
+      "sampleFailures": []
+    },
+    {
+      "file": "index/in/10/slt_good_0.test",
+      "records": 10035,
+      "passed": 10035,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 2506,
+      "sampleFailures": []
+    },
+    {
+      "file": "index/orderby/10/slt_good_0.test",
+      "records": 10053,
+      "passed": 10053,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 759,
+      "sampleFailures": []
+    },
+    {
+      "file": "index/orderby_nosort/10/slt_good_0.test",
+      "records": 10053,
+      "passed": 10053,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 731,
+      "sampleFailures": []
+    },
+    {
+      "file": "index/random/10/slt_good_0.test",
+      "records": 10032,
+      "passed": 10032,
+      "failed": 0,
+      "strictTyping": 0,
+      "unsupported": 0,
+      "ms": 900,
+      "sampleFailures": []
+    }
+  ]
+}

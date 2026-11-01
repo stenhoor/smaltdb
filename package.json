@@ -13,6 +13,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:browser": "node scripts/build.mjs && node test/browser/run.mjs",
+    "slt": "esbuild test/slt/run.ts --bundle --platform=node --format=esm --outfile=.cache/slt-run.mjs --log-level=warning && node .cache/slt-run.mjs",
     "bench": "node bench/run-node.mjs",
     "bench:browser": "node bench/browser/run.mjs",
     "check": "npm run typecheck && npm test",
