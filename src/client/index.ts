@@ -4,7 +4,7 @@
  */
 import type { CsvExportOptions, CsvImportOptions, JsonExportOptions, JsonImportOptions } from '../engine/io/import-export.js';
 import type { SqlValue } from '../engine/values.js';
-import { type Params, type Request, type RequestBody, type Response, type WireColumn, columnValue } from '../shared/protocol.js';
+import { type BusMessage, type Params, type Request, type RequestBody, type Response, type WireColumn, columnValue } from '../shared/protocol.js';
 
 export type { SqlValue, Params };
 
@@ -19,6 +19,13 @@ export interface OpenOptions {
   durable?: boolean;
   /** Override the engine worker: a URL/string to load, or an existing Worker. */
   worker?: URL | string | Worker;
+  /**
+   * Share the database with other tabs of this origin (default: on for OPFS when Web Locks and
+   * BroadcastChannel exist). One tab's engine worker owns the file; other tabs send it their
+   * requests. When that tab closes, another takes over (in-flight requests then fail with
+   * SMALT_RETRY and can be retried).
+   */
+  multiTab?: boolean;
 }
 
 export type RowMode = 'object' | 'array' | 'columnar';
@@ -27,6 +34,13 @@ export interface QueryOptions {
   rowMode?: RowMode;
   /** Rows per batch sent from the worker (default 4096). */
   batchSize?: number;
+  /** Cancel the request: queued requests and streams stop at once; running statements are interrupted when possible. */
+  signal?: AbortSignal;
+}
+
+export interface StreamOptions extends QueryOptions {
+  /** Batches the engine may send ahead of the consumer (default 4). */
+  highWaterMark?: number;
 }
 
 export interface RunResult {
@@ -62,6 +76,8 @@ interface Pending {
   reject: (e: unknown) => void;
   columns?: string[];
   batches?: { length: number; cols: WireColumn[] }[];
+  /** Streams: called per message instead of collecting batches. */
+  onMessage?: (msg: Response) => void;
 }
 
 /** Build (and cache) an object factory for a column list: monomorphic objects, no per-row key work. */
@@ -98,21 +114,29 @@ function defaultWorker(): Worker {
   return new Worker(new URL('./smaltdb-worker.js', import.meta.url), { type: 'module', name: 'smaltdb' });
 }
 
+function makeWorker(options: OpenOptions): Worker {
+  if (options.worker instanceof Worker) return options.worker;
+  if (options.worker !== undefined) return new Worker(options.worker, { type: 'module', name: 'smaltdb' });
+  return defaultWorker();
+}
+
 /** Open (or create) a database. */
 export async function open(name: string, options: OpenOptions = {}): Promise<Database> {
-  let worker: Worker;
-  if (options.worker instanceof Worker) worker = options.worker;
-  else if (options.worker !== undefined) worker = new Worker(options.worker, { type: 'module', name: 'smaltdb' });
-  else worker = defaultWorker();
-  const db = new Database(worker);
-  await db.request({
-    op: 'open',
+  const storage = options.storage ?? 'opfs';
+  const canShare = typeof navigator !== 'undefined' && !!navigator.locks && typeof BroadcastChannel !== 'undefined';
+  const multiTab = (options.multiTab ?? storage === 'opfs') && canShare && storage === 'opfs' && name !== ':memory:';
+  const db = new Database();
+  const openReq = {
+    op: 'open' as const,
     name,
-    storage: options.storage ?? 'opfs',
+    storage,
     pageSize: options.pageSize,
     cacheSizeBytes: options.cacheMB !== undefined ? options.cacheMB * 1024 * 1024 : undefined,
     syncOnCommit: options.durable,
-  });
+  };
+  if (multiTab) await db.attachShared(name, options, openReq);
+  else db.attachWorker(makeWorker(options), openReq, undefined);
+  await db.request(openReq);
   return db;
 }
 
@@ -121,7 +145,13 @@ type QueryResultFor<M extends RowMode | undefined, T> = M extends 'array' ? Arra
 /** Operations shared by Database and transaction handles. */
 export interface Queryable {
   query<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(sql: string, params?: Params, options?: QueryOptions & { rowMode?: M }): Promise<QueryResultFor<M, T>>;
-  exec(sql: string, params?: Params): Promise<RunResult>;
+  exec(sql: string, params?: Params, options?: { signal?: AbortSignal }): Promise<RunResult>;
+}
+
+/** Where requests go: this tab's engine worker, or another tab's over a BroadcastChannel. */
+interface Link {
+  send(req: Request): void;
+  close(): void;
 }
 
 export class Database implements Queryable {
@@ -130,20 +160,126 @@ export class Database implements Queryable {
   private closed = false;
   /** Serializes transactions against other callers (one connection per worker). */
   private lock: Promise<void> = Promise.resolve();
+  private link: Link | null = null;
+  /** Interrupt flag shared with this tab's engine worker (cross-origin isolated pages). */
+  private interrupt: Int32Array | null = null;
+  /** Incremented when the owning tab changes; prepared statements of an older owner are stale. */
+  epoch = 0;
+  /** Multi-tab: this tab owns the engine worker. */
+  isLeader = true;
+  private onClose: (() => void)[] = [];
 
   /** @internal */
-  constructor(private readonly worker: Worker) {
+  attachWorker(worker: Worker, openReq: Extract<RequestBody, { op: 'open' }>, bus: string | undefined): void {
     worker.onmessage = (e: MessageEvent<Response>) => this.onMessage(e.data);
-    worker.onerror = (e) => {
-      const err = new SmaltdbError('SMALT_WORKER', e.message || 'engine worker failed');
-      for (const p of this.pending.values()) p.reject(err);
-      this.pending.clear();
+    worker.onerror = (e) => this.failAll(new SmaltdbError('SMALT_WORKER', e.message || 'engine worker failed'));
+    if (typeof SharedArrayBuffer !== 'undefined' && (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated) {
+      const sab = new SharedArrayBuffer(4);
+      this.interrupt = new Int32Array(sab);
+      (openReq as { interrupt?: SharedArrayBuffer }).interrupt = sab;
+    }
+    if (bus) (openReq as { bus?: string }).bus = bus;
+    this.link = { send: (req) => worker.postMessage(req), close: () => worker.terminate() };
+    this.isLeader = true;
+  }
+
+  /**
+   * @internal Multi-tab: become the owner (leader) if no tab owns the database, else send requests
+   * to the owner and queue to take over when it goes away.
+   */
+  async attachShared(name: string, options: OpenOptions, openReq: Extract<RequestBody, { op: 'open' }>): Promise<void> {
+    const busName = `smaltdb:${name}`;
+    const session = crypto.randomUUID();
+    const locks = navigator.locks;
+    let releaseClient!: () => void;
+    let releaseLeader: (() => void) | null = null;
+    // Held for this tab's lifetime: the owner learns we are gone when it can take this lock.
+    await new Promise<void>((held) => {
+      void locks.request(`${busName}:client:${session}`, () => {
+        held();
+        return new Promise<void>((r) => (releaseClient = r));
+      });
+    });
+    const bus = new BroadcastChannel(busName);
+    let leader: string | null = null;
+    let queue: Request[] = [];
+    const becomeLeader = (): void => {
+      // Requests sent to a previous owner are lost with it.
+      if (leader !== null || queue.length > 0 || this.pending.size > 0) this.failAll(new SmaltdbError('SMALT_RETRY', 'the tab that owned the database closed; retry'), true);
+      queue = [];
+      this.epoch++;
+      bus.onmessage = null;
+      this.attachWorker(makeWorker(options), openReq, busName);
     };
+    const follow = (): void => {
+      this.isLeader = false;
+      bus.onmessage = (e: MessageEvent<BusMessage>) => {
+        const m = e.data;
+        if (m.type === 'res' && m.session === session) this.onMessage(m.res);
+        else if (m.type === 'leader' && m.leader !== leader) {
+          if (leader !== null) {
+            this.epoch++;
+            this.failAll(new SmaltdbError('SMALT_RETRY', 'the tab that owned the database closed; retry'), true);
+          }
+          leader = m.leader;
+          const q = queue;
+          queue = [];
+          for (const req of q) bus.postMessage({ type: 'req', session, leader, req } satisfies BusMessage);
+        }
+      };
+      this.link = {
+        send: (req) => {
+          if (leader === null) queue.push(req);
+          else bus.postMessage({ type: 'req', session, leader, req } satisfies BusMessage);
+        },
+        close: () => undefined,
+      };
+      bus.postMessage({ type: 'hello', session } satisfies BusMessage);
+    };
+    const isLeader = await new Promise<boolean>((resolve) => {
+      void locks.request(`${busName}:leader`, { ifAvailable: true }, (lock) => {
+        if (!lock) {
+          resolve(false);
+          return undefined;
+        }
+        resolve(true);
+        return new Promise<void>((r) => (releaseLeader = r));
+      });
+    });
+    if (isLeader) this.attachWorker(makeWorker(options), openReq, busName);
+    else {
+      follow();
+      // Take over when the owner goes away.
+      void locks.request(`${busName}:leader`, () => {
+        if (this.closed) return undefined;
+        becomeLeader();
+        // A follower that was already open re-opens the database in its new worker.
+        void this.request(openReq).catch(() => undefined);
+        return new Promise<void>((r) => (releaseLeader = r));
+      });
+    }
+    this.onClose.push(() => {
+      bus.close();
+      releaseLeader?.();
+      releaseClient();
+    });
+  }
+
+  /** @internal Reject every in-flight request (worker failure, change of owner). */
+  private failAll(err: SmaltdbError, all = true): void {
+    if (!all) return;
+    for (const p of this.pending.values()) p.reject(err);
+    this.pending.clear();
   }
 
   private onMessage(msg: Response): void {
     const p = this.pending.get(msg.id);
     if (!p) return;
+    if (p.onMessage) {
+      if (msg.kind === 'error' || msg.kind === 'done' || msg.kind === 'ok') this.pending.delete(msg.id);
+      p.onMessage(msg);
+      return;
+    }
     switch (msg.kind) {
       case 'ok':
         this.pending.delete(msg.id);
@@ -167,14 +303,31 @@ export class Database implements Queryable {
     }
   }
 
-  /** @internal */
-  request(req: RequestBody): Promise<unknown> {
-    if (this.closed) return Promise.reject(new SmaltdbError('SMALT_MISUSE', 'database is closed'));
+  /** @internal Send a request; `signal` cancels it. `onMessage` receives a stream's messages. */
+  request(req: RequestBody, signal?: AbortSignal, onMessage?: (msg: Response) => void): Promise<unknown> & { id: number } {
+    if (this.closed) return Object.assign(Promise.reject(new SmaltdbError('SMALT_MISUSE', 'database is closed')), { id: -1 });
+    if (signal?.aborted) return Object.assign(Promise.reject(new SmaltdbError('SMALT_INTERRUPT', 'interrupted')), { id: -1 });
     const id = this.nextId++;
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.worker.postMessage({ ...req, id } as Request);
+    const promise = new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject, onMessage });
+      this.link!.send({ ...req, id } as Request);
     });
+    if (signal) {
+      const abort = (): void => this.cancel(id);
+      signal.addEventListener('abort', abort, { once: true });
+      void promise.then(
+        () => signal.removeEventListener('abort', abort),
+        () => signal.removeEventListener('abort', abort),
+      );
+    }
+    return Object.assign(promise, { id });
+  }
+
+  /** @internal Stop request `id`: dequeue it, close its stream, or interrupt it while it runs. */
+  cancel(id: number): void {
+    if (!this.pending.has(id)) return;
+    if (this.interrupt && this.isLeader) Atomics.store(this.interrupt, 0, id);
+    this.link!.send({ id: 0, op: 'cancel', target: id });
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -191,13 +344,13 @@ export class Database implements Queryable {
 
   /** @internal Unlocked query (used inside transactions). */
   async rawQuery(sql: string, params: Params | undefined, options: QueryOptions): Promise<unknown> {
-    const res = (await this.request({ op: 'query', sql, params, batchSize: options.batchSize })) as { columns: string[]; batches: { length: number; cols: WireColumn[] }[] };
+    const res = (await this.request({ op: 'query', sql, params, batchSize: options.batchSize }, options.signal)) as { columns: string[]; batches: { length: number; cols: WireColumn[] }[] };
     return materialize(res.columns, res.batches, options.rowMode ?? 'object');
   }
 
   /** @internal */
-  async rawExec(sql: string, params: Params | undefined): Promise<RunResult> {
-    const r = (await this.request({ op: 'exec', sql, params })) as { changes: number; lastInsertRowid: number | bigint };
+  async rawExec(sql: string, params: Params | undefined, signal?: AbortSignal): Promise<RunResult> {
+    const r = (await this.request({ op: 'exec', sql, params }, signal)) as { changes: number; lastInsertRowid: number | bigint };
     return { changes: r.changes, lastInsertRowid: r.lastInsertRowid };
   }
 
@@ -214,8 +367,76 @@ export class Database implements Queryable {
   }
 
   /** Execute one statement (with params) or a script of statements (without). */
-  exec(sql: string, params?: Params): Promise<RunResult> {
-    return this.withLock(() => this.rawExec(sql, params));
+  exec(sql: string, params?: Params, options: { signal?: AbortSignal } = {}): Promise<RunResult> {
+    return this.withLock(() => this.rawExec(sql, params, options.signal));
+  }
+
+  /**
+   * Stream a query's result in batches: `for await (const rows of db.stream(sql)) …`. The engine
+   * sends at most `highWaterMark` batches ahead and pauses until they are consumed; leaving the
+   * loop early closes the result. While a stream is open, this tab's writes fail with SMALT_BUSY
+   * (other tabs' writes wait); reads continue.
+   */
+  stream<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(
+    sql: string,
+    params?: Params,
+    options: StreamOptions & { rowMode?: M } = {},
+  ): AsyncIterableIterator<QueryResultFor<M, T>> {
+    return this.openStream({ op: 'query', sql, params, batchSize: options.batchSize }, options) as AsyncIterableIterator<QueryResultFor<M, T>>;
+  }
+
+  /** @internal */
+  openStream(body: RequestBody, options: StreamOptions): AsyncIterableIterator<unknown> {
+    const hwm = Math.max(1, options.highWaterMark ?? 4);
+    const mode = options.rowMode ?? 'object';
+    const ready: unknown[] = [];
+    let columns: string[] = [];
+    let finished = false;
+    let failure: unknown = null;
+    let wake: (() => void) | null = null;
+    const notify = (): void => {
+      wake?.();
+      wake = null;
+    };
+    const req = this.request({ ...body, credit: hwm } as RequestBody, options.signal, (msg) => {
+      if (msg.kind === 'columns') columns = msg.columns;
+      else if (msg.kind === 'batch') ready.push(materialize(columns, [{ length: msg.length, cols: msg.cols }], mode));
+      else if (msg.kind === 'done') finished = true;
+      else if (msg.kind === 'error') {
+        finished = true;
+        failure = new SmaltdbError(msg.code, msg.message);
+      }
+      notify();
+    });
+    req.catch((e) => {
+      finished = true;
+      failure = e;
+      notify();
+    });
+    const id = req.id;
+    const it: AsyncIterableIterator<unknown> = {
+      [Symbol.asyncIterator]: () => it,
+      next: async () => {
+        for (;;) {
+          if (ready.length > 0) {
+            const value = ready.shift();
+            if (!finished) this.link?.send({ id: 0, op: 'credit', target: id, n: 1 });
+            return { value, done: false };
+          }
+          if (failure !== null) throw failure;
+          if (finished) return { value: undefined, done: true };
+          await new Promise<void>((r) => (wake = r));
+        }
+      },
+      return: async () => {
+        if (!finished) {
+          finished = true;
+          this.cancel(id);
+        }
+        return { value: undefined, done: true };
+      },
+    };
+    return it;
   }
 
   /**
@@ -253,8 +474,9 @@ export class Database implements Queryable {
 
   /** Prepare a statement for repeated execution. */
   async prepare(sql: string): Promise<PreparedStatement> {
+    const epoch = this.epoch;
     const r = (await this.withLock(() => this.request({ op: 'prepare', sql }))) as { stmt: number; columns: string[]; paramCount: number };
-    return new PreparedStatement(this, r.stmt, r.columns, r.paramCount);
+    return new PreparedStatement(this, r.stmt, r.columns, r.paramCount, epoch);
   }
 
   /**
@@ -279,12 +501,16 @@ export class Database implements Queryable {
     });
   }
 
-  /** Close the database and terminate the engine worker. */
+  /**
+   * Close the database. The tab that owns the engine worker closes the file and terminates the
+   * worker (another tab then takes over); other tabs just detach.
+   */
   async close(): Promise<void> {
     if (this.closed) return;
-    await this.withLock(() => this.request({ op: 'close' }));
+    await this.withLock(() => this.request({ op: 'close' })).catch(() => undefined);
     this.closed = true;
-    this.worker.terminate();
+    if (this.isLeader) this.link?.close();
+    for (const f of this.onClose) f();
   }
 }
 
@@ -295,19 +521,34 @@ export class PreparedStatement {
     private readonly id: number,
     readonly columns: string[],
     readonly paramCount: number,
+    private readonly epoch: number,
   ) {}
 
+  /** Statement ids belong to the tab that owned the engine when they were prepared. */
+  private check(): void {
+    if (this.epoch !== this.db.epoch) throw new SmaltdbError('SMALT_RETRY', 'the tab that owned the database changed; prepare the statement again');
+  }
+
   async query<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params, options: QueryOptions & { rowMode?: M } = {}): Promise<QueryResultFor<M, T>> {
-    const res = (await this.db.request({ op: 'stmtQuery', stmt: this.id, params, batchSize: options.batchSize })) as { columns: string[]; batches: { length: number; cols: WireColumn[] }[] };
+    this.check();
+    const res = (await this.db.request({ op: 'stmtQuery', stmt: this.id, params, batchSize: options.batchSize }, options.signal)) as { columns: string[]; batches: { length: number; cols: WireColumn[] }[] };
     return materialize(res.columns, res.batches, options.rowMode ?? 'object') as QueryResultFor<M, T>;
   }
 
-  async run(params?: Params): Promise<RunResult> {
-    const r = (await this.db.request({ op: 'stmtRun', stmt: this.id, params })) as { changes: number; lastInsertRowid: number | bigint };
+  /** Stream the statement's result in batches (see Database.stream). */
+  stream<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params, options: StreamOptions & { rowMode?: M } = {}): AsyncIterableIterator<QueryResultFor<M, T>> {
+    this.check();
+    return this.db.openStream({ op: 'stmtQuery', stmt: this.id, params, batchSize: options.batchSize }, options) as AsyncIterableIterator<QueryResultFor<M, T>>;
+  }
+
+  async run(params?: Params, options: { signal?: AbortSignal } = {}): Promise<RunResult> {
+    this.check();
+    const r = (await this.db.request({ op: 'stmtRun', stmt: this.id, params }, options.signal)) as { changes: number; lastInsertRowid: number | bigint };
     return { changes: r.changes, lastInsertRowid: r.lastInsertRowid };
   }
 
   async finalize(): Promise<void> {
+    if (this.epoch !== this.db.epoch) return;
     await this.db.request({ op: 'finalize', stmt: this.id });
   }
 }

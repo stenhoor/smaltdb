@@ -13,7 +13,9 @@ const out = '.cache/browser-test';
 mkdirSync(out, { recursive: true });
 await build({ entryPoints: ['test/browser/opfs-worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/opfs-worker.js`, logLevel: 'warning' });
 await build({ entryPoints: ['test/browser/client-test.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/client-test.js`, logLevel: 'warning' });
+await build({ entryPoints: ['test/browser/tab-test.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/tab-test.js`, logLevel: 'warning' });
 await build({ entryPoints: ['src/engine/worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/smaltdb-worker.js`, logLevel: 'warning' });
+writeFileSync(`${out}/tab.html`, '<!doctype html><meta charset="utf-8"><title>smaltdb tab</title><script type="module" src="./tab-test.js"></script>');
 writeFileSync(`${out}/client.html`, '<!doctype html><meta charset="utf-8"><title>smaltdb client test</title><script type="module" src="./client-test.js"></script>');
 writeFileSync(
   `${out}/index.html`,
@@ -67,6 +69,12 @@ for (const name of names) {
   } else if (result.ok) {
     result.checks.push({ name: 'client test ran', ok: false, detail: client.error });
   }
+  // Multi-tab: several pages of one context share a database through the leader's engine worker.
+  try {
+    for (const c of await multiTab(context, server.url)) result.checks?.push({ ...c, name: 'tabs: ' + c.name });
+  } catch (e) {
+    result.checks?.push({ name: 'tabs: test ran', ok: false, detail: String(e?.stack ?? e) });
+  }
   const version = browser ? browser.version() : `${playwright[name].name()} (persistent profile)`;
   await context.close();
   await browser?.close();
@@ -88,3 +96,61 @@ for (const name of names) {
 }
 server.close();
 process.exit(failed ? 1 : 0);
+
+async function multiTab(context, url) {
+  const checks = [];
+  const check = (name, ok, detail) => checks.push({ name, ok: !!ok, detail: detail === undefined ? undefined : JSON.stringify(detail) });
+  const tab = async () => {
+    const p = await context.newPage();
+    await p.goto(url + '/tab.html');
+    await p.waitForFunction(() => window.tabReady === true);
+    return p;
+  };
+  const call = (p, fn, ...args) => p.evaluate(([f, a]) => window.tab[f](...a), [fn, args]);
+  const db = 'tabs-' + Date.now();
+  const A = await tab();
+  const B = await tab();
+  check('first tab owns the database', (await call(A, 'open', db)) === true);
+  check('second tab joins as a client', (await call(B, 'open', db)) === false);
+  await call(B, 'exec', 'CREATE TABLE t(a INT)');
+  await call(B, 'exec', 'INSERT INTO t VALUES (?)', [1]);
+  check("one tab's writes are visible to the other", JSON.stringify(await call(A, 'query', 'SELECT sum(a) FROM t')) === '[[1]]');
+  // A transaction belongs to its tab: the other tab waits until it ends.
+  await call(A, 'exec', 'BEGIN; INSERT INTO t VALUES (10)');
+  await call(B, 'startQuery', 'SELECT sum(a) FROM t');
+  await new Promise((r) => setTimeout(r, 300));
+  const waiting = await B.evaluate(() => window.__pending.done);
+  await call(A, 'exec', 'COMMIT');
+  await B.waitForFunction(() => window.__pending.done === true);
+  const seen = await B.evaluate(() => window.__pending.rows);
+  check("other tabs wait for a tab's transaction, then see its commit", waiting === false && JSON.stringify(seen) === '[[11]]', [waiting, seen]);
+  // A tab that disappears mid-transaction: its transaction is rolled back.
+  await call(B, 'exec', 'BEGIN; INSERT INTO t VALUES (100)');
+  await B.close();
+  let afterB = null;
+  for (let i = 0; i < 50 && JSON.stringify(afterB) !== '[[11]]'; i++) {
+    afterB = await call(A, 'query', 'SELECT sum(a) FROM t').catch((e) => String(e));
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  check("a closed tab's open transaction is rolled back", JSON.stringify(afterB) === '[[11]]', afterB);
+  // Failover: the owner closes; a waiting tab takes over and recovers the committed data.
+  const C = await tab();
+  check('third tab joins as a client', (await call(C, 'open', db)) === false);
+  await A.close();
+  let leader = false;
+  for (let i = 0; i < 50 && !leader; i++) {
+    leader = await call(C, 'isLeader');
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  let rows = null;
+  for (let i = 0; i < 20; i++) {
+    rows = await call(C, 'query', 'SELECT sum(a) FROM t').catch((e) => String(e));
+    if (Array.isArray(rows)) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  check('another tab takes over when the owner closes, with all committed data', leader && JSON.stringify(rows) === '[[11]]', [leader, rows]);
+  await call(C, 'exec', 'DROP TABLE t');
+  await call(C, 'close');
+  await C.close();
+  return checks;
+}

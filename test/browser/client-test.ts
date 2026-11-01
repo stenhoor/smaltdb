@@ -57,6 +57,60 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   await db.importJSON('people', '{"id":3,"name":"Ng"}\n');
   const asCsv = await db.exportCSV('SELECT id, name FROM people WHERE id > ?', [1]);
   check('import NDJSON / export CSV', asCsv === 'id,name\n2,Kim\n3,Ng\n', asCsv);
+
+  // Streaming with backpressure: batches arrive as they are consumed; leaving early closes the stream.
+  let streamed = 0;
+  let batches = 0;
+  for await (const rows of db.stream<{ id: number }>('SELECT id FROM items ORDER BY id', undefined, { batchSize: 100, highWaterMark: 2 })) {
+    streamed += rows.length;
+    batches++;
+  }
+  check('stream delivers every row in batches', streamed === 2000 && batches === 20, [streamed, batches]);
+  let early = 0;
+  for await (const rows of db.stream('SELECT id FROM items', undefined, { batchSize: 50 })) {
+    early += rows.length;
+    if (early >= 100) break;
+  }
+  const afterBreak = await db.exec("UPDATE items SET qty = qty WHERE id = 1");
+  check('breaking out of a stream releases it (writes allowed again)', early === 100 && afterBreak.changes === 1, early);
+  // While a stream is open, this tab's own writes fail fast instead of deadlocking.
+  const it = db.stream('SELECT id FROM items', undefined, { batchSize: 10, highWaterMark: 1 });
+  await it.next();
+  let busy = '';
+  try {
+    await db.exec("UPDATE items SET qty = 0 WHERE id = 1");
+  } catch (e) {
+    busy = (e as { code: string }).code;
+  }
+  await it.return!();
+  check('own write during an open stream is SMALT_BUSY', busy === 'SMALT_BUSY', busy);
+
+  // Cancellation: a running statement is interrupted (shared-memory flag) and rolled back.
+  await db.exec('CREATE TABLE big(a INT, b TEXT)');
+  await db.exec("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200000) INSERT INTO big SELECT i, hex(randomblob(16)) FROM n");
+  const ac = new AbortController();
+  t0 = performance.now();
+  const slow = db.exec("UPDATE big SET b = b || b || b", undefined, { signal: ac.signal });
+  setTimeout(() => ac.abort(), 5);
+  let code = '';
+  try {
+    await slow;
+  } catch (e) {
+    code = (e as { code: string }).code;
+  }
+  timings.cancelLatencyMs = performance.now() - t0;
+  const unchanged = await db.query('SELECT max(length(b)) AS m FROM big');
+  check('abort interrupts a running statement and rolls it back', code === 'SMALT_INTERRUPT' && unchanged[0].m === 32, [code, unchanged]);
+  const pre = new AbortController();
+  pre.abort();
+  let preCode = '';
+  try {
+    await db.query('SELECT 1', undefined, { signal: pre.signal });
+  } catch (e) {
+    preCode = (e as { code: string }).code;
+  }
+  check('already-aborted signal rejects at once', preCode === 'SMALT_INTERRUPT', preCode);
+  await db.exec('DROP TABLE big');
   await db.close();
 
   // Reopen: data persisted in OPFS.
