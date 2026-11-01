@@ -95,7 +95,7 @@ import {
   WorkingScan,
   type ZonePredicate,
 } from './operators.js';
-import { type ColumnStore, ROW_GROUP_ROWS, zoneMayMatch } from '../storage/columnar.js';
+import { type ColumnStore, ROW_GROUP_ROWS, type Zone, zoneMayMatch } from '../storage/columnar.js';
 import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
 import { deletedBitmap, rowidsOf, zoneOf } from './columnar-table.js';
 import { anyNode, exprKey } from '../sql/ast-util.js';
@@ -136,7 +136,7 @@ export interface PlannerEnv {
 }
 
 /** Table functions that read external data (their arguments must be constants). */
-export const EXTERNAL_FUNCTIONS: ReadonlySet<string> = new Set(['read_csv', 'read_json']);
+export const EXTERNAL_FUNCTIONS: ReadonlySet<string> = new Set(['read_csv', 'read_json', 'read_parquet']);
 
 /** An external source as the planner scans it. */
 export interface ExternalScan {
@@ -205,8 +205,10 @@ interface Source {
   position: number;
   /** Cached row-count estimate. */
   estRows?: number;
-  /** An external table (M8): partition filters are attached to its source. */
+  /** External data (M8): projection and pruning are attached to its source. */
   external?: ExternalSource;
+  /** An external table (not a table function): partition pruning applies. */
+  externalTable?: boolean;
 }
 
 /** A CTE visible in a scope. `working` marks the self-reference inside a recursive step. */
@@ -1413,9 +1415,9 @@ export class Planner {
       const columns: ResultColumnInfo[] = ext.columns.map((c) => ({ name: c.name, type: c.type, declType: c.declType, collation: Collation.Binary, affinity: affinityOfStorage(storageTypeFor(c.declType)) }));
       const sub: QueryPlan = { root, outRegs: regs, columns, correlated: false };
       const cols: SourceColumn[] = columns.map((c, i) => ({ name: c.name, reg: regs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '', index: i }));
-      // Partition pruning applies to external tables (their columns are fixed by the catalog).
-      const external = item.kind === 'table' ? ext.source : undefined;
-      scope.sources.push({ name: (item as { alias?: string }).alias ?? (item as { name: string }).name, cols, rowidReg: -1, sub, lateral: false, joinType, on: [], hidden: new Set(), position, external });
+      // Parquet reads only the columns the statement uses (recorded as they resolve).
+      if (ext.source.format === 'parquet') ext.source.projection ??= new Set();
+      scope.sources.push({ name: (item as { alias?: string }).alias ?? (item as { name: string }).name, cols, rowidReg: -1, sub, lateral: false, joinType, on: [], hidden: new Set(), position, external: ext.source, externalTable: item.kind === 'table' });
       return;
     }
     const isInfoSchema = item.kind === 'table' && item.schema?.toLowerCase() === 'information_schema';
@@ -1908,6 +1910,14 @@ export class Planner {
       const keys: string[] = [];
       for (const c of pool) {
         if (c.deps === null || c.deps.size !== 1 || !c.deps.has(src.position)) continue;
+        if (ext.format === 'parquet') {
+          const zone = this.rowGroupCheck(c.expr, src);
+          if (zone) {
+            (ext.rowGroupPrune ??= []).push(zone);
+            keys.push('rg:' + exprKey(c.expr, { foldNames: true }));
+          }
+        }
+        if (!src.externalTable) continue;
         const names = new Set<string>();
         let ok = true;
         walk(c.expr, (x) => {
@@ -1955,6 +1965,68 @@ export class Planner {
       // A pruned read differs from a full one: it gets its own fetch.
       if (keys.length) ext.key += `|prune:${keys.join('&')}`;
     }
+  }
+
+  /**
+   * Row-group pruning (M8.3): `column op constant` (=, <, <=, >, >=, either side), `column BETWEEN
+   * a AND b` and `column IN (constants)` on a Parquet source, tested against each row group's
+   * statistics (zone maps): false when no row of the group can satisfy it.
+   */
+  private rowGroupCheck(e: Expr, src: Source): ((zones: Map<string, Zone>, rows: number) => boolean | undefined) | null {
+    const colName = (x: Expr): string | null => {
+      if (x.kind !== 'column' || (x.table && !sameName(x.table, src.name))) return null;
+      const c = src.cols.find((col) => sameName(col.name, x.name));
+      return c ? c.name.toLowerCase() : null;
+    };
+    const constant = (x: Expr): SqlValue | undefined => {
+      if (x.kind !== 'literal') return undefined;
+      const v = x.value;
+      if (typeof v === 'bigint') return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : undefined;
+      return typeof v === 'number' || typeof v === 'string' ? v : undefined;
+    };
+    const flip: Record<string, string> = { '=': '=', '<': '>', '<=': '>=', '>': '<', '>=': '<=' };
+    const tests: { col: string; op: string; value: SqlValue }[][] = []; // AND of ORs
+    if (e.kind === 'binary' && e.op in flip) {
+      const l = colName(e.left);
+      const r = colName(e.right);
+      if (l && constant(e.right) !== undefined) tests.push([{ col: l, op: e.op, value: constant(e.right)! }]);
+      else if (r && constant(e.left) !== undefined) tests.push([{ col: r, op: flip[e.op], value: constant(e.left)! }]);
+    } else if (e.kind === 'between' && !e.not) {
+      const col = colName(e.expr);
+      const lo = constant(e.low);
+      const hi = constant(e.high);
+      if (col && lo !== undefined && hi !== undefined) tests.push([{ col, op: '>=', value: lo }], [{ col, op: '<=', value: hi }]);
+    } else if (e.kind === 'inList' && !e.not) {
+      const col = colName(e.expr);
+      const values = e.list.map(constant);
+      if (col && values.length > 0 && values.every((v) => v !== undefined)) tests.push(values.map((v) => ({ col, op: '=', value: v! })));
+    }
+    if (tests.length === 0) return null;
+    return (zones, rows) => {
+      for (const any of tests) {
+        let possible = false;
+        for (const t of any) {
+          const z = zones.get(t.col);
+          if (!z || zoneMayMatch(z, rows, t.op, t.value, true)) {
+            possible = true;
+            break;
+          }
+        }
+        if (!possible) return false;
+      }
+      return undefined;
+    };
+  }
+
+  /**
+   * External sources of the statement, with keys final (M8.3): a Parquet read of some columns
+   * differs from one of others, so the projection is part of the fetch key.
+   */
+  finishExternals(): ExternalSource[] {
+    for (const s of this.externals) {
+      if (s.projection && !s.key.includes('|cols:')) s.key += `|cols:${[...s.projection].sort().join(',')}`;
+    }
+    return this.externals;
   }
 
   /** `item` as an external table or a `read_csv` / `read_json` call, if it is one. */
@@ -2361,6 +2433,7 @@ export class Planner {
   private resolveIn(e: ColumnExpr, scope: Scope): ColumnBinding | undefined {
     const bind = (src: Source, c: SourceColumn): ColumnBinding => {
       if (src.access && !this.dryCompile) src.access.use(c.index, c.reg);
+      if (src.external?.projection && !this.dryCompile) src.external.projection.add(c.name.toLowerCase());
       return { reg: c.reg, type: c.type, collation: c.collation, affinity: c.affinity };
     };
     const rowidOf = (src: Source): ColumnBinding => {

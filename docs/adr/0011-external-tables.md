@@ -76,7 +76,7 @@ columns, and filters on them prune whole files.
 |---|---|---|
 | CSV / TSV | built in (streaming, extends the M4 importer) | Required. `delimiter`, `quote`, `escape`, `header`, `null`, `skip`, `encoding`, `on_error`. Types are inferred once at creation and stored, unless declared. |
 | JSON / NDJSON | built in | NDJSON streams. |
-| Parquet | `@smaltdb/parquet` (hyparquet) | Footer first, then only the needed column chunks of row groups that survive row-group statistics (used as zone maps). Codecs beyond Snappy come via hyparquet-compressors. |
+| Parquet | hyparquet, an optional peer dependency loaded on first use (a separate chunk of the engine worker) | Footer first, then only the needed column chunks of row groups that survive row-group statistics (used as zone maps). Codecs beyond Snappy come via hyparquet-compressors. |
 | Excel (.xlsx, .xlsb, .ods), **deferred** (see the decisions below) | `@smaltdb/excel` (SheetJS Community Edition, a pinned version vendored from the SheetJS CDN) | Whole file (it is a zip archive); cached formula values; dates converted by the declared type or `dates = 'iso'`. |
 
 **Excel sheet and range references** use Excel's own syntax:
@@ -182,7 +182,8 @@ The core stays dependency-free. It includes the CSV and JSON readers, HTTP and `
 interface and the dialect printers.
 
 Optional packages, loaded with dynamic `import()` inside the engine worker on first use:
-- `@smaltdb/parquet`
+- ~~`@smaltdb/parquet`~~: Parquet uses hyparquet (and hyparquet-compressors) as optional peer dependencies loaded
+  with dynamic `import()`; the engine worker build puts them in separate chunks. No wrapper package is needed.
 - `@smaltdb/excel`
 - ~~`@smaltdb/s3`~~: SigV4 and Azure Shared Key turned out to be about 150 lines on WebCrypto, so object-store
   signing is in the core (no `aws4fetch` dependency).
@@ -213,7 +214,7 @@ Bidirectional sync, conflict policies and resolvers belong to the plugin.
 |---|---|
 | M8.1 ✅ | `CREATE CONNECTION` / `CREATE EXTERNAL TABLE`, catalog and information_schema, async fetch phase, `file:` and HTTP sources, CSV and JSON readers, `read_csv` / `read_json`, caching through materialized views. Follow-ups ✅: freshness of such caches (`REFRESH … IF CHANGED` revalidates the recorded ETag / Last-Modified / file times with HEAD requests or stats), refresh policies (`refresh_every`, `refresh_on_reconnect`) run by the engine worker, credential callbacks across the worker boundary, export over external data |
 | M8.2 ✅ | S3 and S3-compatible stores and Azure Blob Storage (signing on WebCrypto in the core, credential providers with AWS keys / Azure SAS, account key or bearer tokens / presigned URLs, also as callbacks across the worker), globs over listings, local directories and registered files, Hive partitions with pruning from WHERE conditions |
-| M8.3 | Parquet: footer, column chunks, row-group pruning, ranged fetches, `read_parquet` |
+| M8.3 ✅ | Parquet: footer, column chunks, row-group pruning, ranged fetches, `read_parquet` (hyparquet 1.31; tested against files written by pyarrow) |
 | M8.4 | Excel: sheets, A1 ranges, tables and defined names, dates, `read_excel`. **Deferred** (after M8.5; library to be chosen then) |
 | M8.5 | Connector interface, dialect printers, the Neon / PlanetScale / libSQL / D1 connectors, `smaltdb-gateway` on Kysely, filter / projection / limit pushdown |
 | ~~M8.6~~ | Sync groundwork (change tracking, logical clock, id helpers): **moved to its own milestone** before the sync plugin, with its own ADR. Refresh policies for cached views stay in M8.1 |

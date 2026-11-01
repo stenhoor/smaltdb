@@ -52,6 +52,11 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   await db.exec('DROP MATERIALIZED VIEW prices_cache; DROP EXTERNAL TABLE prices; DROP CONNECTION site');
   await db.registerFile('stock', null);
 
+  // Parquet (M8.3) over HTTP: footer, column chunks and row groups by ranges; zstd via the optional compressors.
+  const pq = await db.query(`SELECT count(*), sum(amount), min(day), max(id) FROM read_parquet('${location.origin}/sales.parquet') WHERE id >= 1000`, undefined, { rowMode: 'array' });
+  const pqTypes = await db.query(`SELECT i64, d, ts, dec, lst FROM read_parquet('${location.origin}/types.parquet') WHERE i32 = 1`, undefined, { rowMode: 'array' });
+  check('Parquet over HTTP (zstd, row-group pruning, types)', JSON.stringify(pq) === JSON.stringify([[3000, 144154, '2024-01-21', 3999]]) && JSON.stringify(pqTypes) === JSON.stringify([[2 ** 40, '2024-02-29', '2024-01-02 03:04:05.678', 12.34, '[1,2]']]), [pq, pqTypes]);
+
   // Object-store signing (M8.2) runs on this browser's WebCrypto: AWS's published SigV4 test vector.
   const v4 = await signV4({ method: 'GET', url: 'https://examplebucket.s3.amazonaws.com/test.txt', headers: { Range: 'bytes=0-9' } }, { accessKeyId: 'AKIAIOSFODNN7EXAMPLE', secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' }, 'us-east-1', 's3', new Date('2013-05-24T00:00:00Z'));
   check('S3 request signing (SigV4 test vector) with WebCrypto', v4.authorization.endsWith('Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41'), v4.authorization);

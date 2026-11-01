@@ -54,6 +54,12 @@ What M1 adds:
 - **Record format:** property tests for round trips and for rowid key ordering.
 - **SQL smoke tests:** constraints, transactions, persistence, `EXPLAIN QUERY PLAN`.
 
+## Fixtures
+
+`test/fixtures/parquet` holds Parquet files written by pyarrow, an independent writer, so the reader is tested against
+what other tools produce: every common type, four codecs, row groups with statistics, and a Hive-partitioned dataset.
+Regenerate them with `pip install pyarrow && python3 scripts/gen-parquet-fixtures.py`.
+
 ## Timing in tests
 
 Tests must not depend on scheduling luck. CI runners are slower and busier than a development machine, and several
