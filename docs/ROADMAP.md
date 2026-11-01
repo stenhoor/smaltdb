@@ -29,6 +29,9 @@ Still open: running the browser tests and benchmarks on Firefox and WebKit, whic
   - `WITH` on DML;
   - the sqllogictest pass rate.
 
+Roadmap change (2026-11-01, agreed): the columnar segment format and zone maps move from M7 into M5, with materialized
+views as their first consumer; see [research/columnar-mv-assessment.md](research/columnar-mv-assessment.md).
+
 Optimizer follow-ups from M3: histograms and most-common values, transitive predicate inference, covering index scans.
 
 Carried over from M1, by decision (see [ADR 0003](adr/0003-m1-executor-and-transactions.md)):
@@ -43,8 +46,8 @@ Carried over from M1, by decision (see [ADR 0003](adr/0003-m1-executor-and-trans
 | **M2: Durability** ✅ (2026-10-31, group commit → M6) | WAL, group commit, recovery, checkpointing, transactions/savepoints, crash tests |
 | **M3: Optimizer** ✅ (2026-11-01, sqllogictest tracking → M4) | Statistics/ANALYZE, cost model, join ordering, access-path selection, EXPLAIN [ANALYZE], sqllogictest pass rate tracked |
 | **M4: Dialect breadth** | Window functions, CTEs (recursive), subquery decorrelation, ON CONFLICT, RETURNING, date/time, information_schema, sqlite_schema/pragmas, CSV/JSON import/export |
-| **M5: Materialized views** | Full refresh and `REFRESH … CONCURRENTLY` |
+| **M5: Materialized views + columnar segments** | Full refresh and `REFRESH … CONCURRENTLY` (copy-on-write swap); columnar segment format in pager pages, zone maps, columnar scans feeding the generated pipelines; MVs `WITH (storage = 'row' \| 'columnar')` ([research](research/columnar-mv-assessment.md)) |
 | **M6: Concurrency** | Multi-tab leader election, parallel reader workers (when crossOriginIsolated), cancellation, backpressure |
-| **M7: Analytics** | Columnar segments, zone maps, spill-to-OPFS, morsel parallelism |
+| **M7: Analytics** | Spill-to-OPFS, morsel parallelism, updatable columnar base tables (delta stores), MV matching (route queries to fresh columnar MVs) |
 | **1.0** | Format freeze, docs, performance targets met on Chromium, Firefox, and Safari |
 | **Post-1.0** | Incremental/on-commit MVs, triggers, JSON functions, JS UDFs, live queries, encryption at rest, SQLite import, ATTACH, locale collations, newer-browser fast paths (`readwrite-unsafe`, etc.) |

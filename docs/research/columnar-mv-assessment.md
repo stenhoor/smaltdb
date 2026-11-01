@@ -1,7 +1,7 @@
 # Should columnar storage (M7) come before materialized views (M5)?
 
 - Date: 2026-11-01
-- Status: recommendation, pending decision
+- Status: accepted (2026-11-01); the roadmap is updated
 - Spike: [bench/micro/columnar-spike.ts](../../bench/micro/columnar-spike.ts)
 
 ## Question
