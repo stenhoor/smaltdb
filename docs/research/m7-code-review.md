@@ -190,9 +190,17 @@ lifecycle, robustness and edge cases; **P** performance; **C** cleanup.
   schema.
 - *Integrity check:* `PRAGMA integrity_check` skipped main tables shadowed by a TEMP table, so their pages looked
   leaked ("page accounting"). Shadowed main tables are now checked.
-- *HAVING alias of an aggregate (open):* `SELECT g, sum(a) AS s FROM t GROUP BY g HAVING s > 100` fails with "misuse
-  of aggregate function sum()", also on the normal path. This is an older planner gap, not an M7 bug; SQLite accepts
-  it.
+- *HAVING alias of an aggregate (fixed):* `SELECT g, sum(a) AS s FROM t GROUP BY g HAVING s > 100` failed with "misuse
+  of aggregate function sum()", also on the normal path. This was an older planner gap, not an M7 bug; SQLite accepts
+  it. Select-list aliases now expand in the aggregate scope of their query (`Scope.aliasScope`), so `s` refers to the
+  aggregate. A table column still takes precedence over an alias of the same name. An alias of a GROUP BY term now
+  reads the group value, which also lets such queries use the fused aggregate.
+- *Correlated subqueries over aggregate rows (fixed, found with the fix above):* in an aggregate query, a correlated
+  subquery in the result, HAVING or ORDER BY read the outer columns as NULL, a silent wrong result:
+  `SELECT g, (SELECT max(w) FROM u WHERE u.g = t.g) FROM t GROUP BY g` returned NULL for every group, and
+  `HAVING EXISTS (… u.g = t.g …)` returned no rows. Aggregate output rows only held the group keys and aggregates. Outer
+  columns that a subquery reads are now carried by the aggregate like bare columns (`Scope.onOuterRef`), on both the
+  decorrelated and the per-row path. Tests: `test/having-alias.test.ts` (compared with SQLite).
 
 ### S3: lifecycle, robustness and edge cases
 
