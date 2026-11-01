@@ -85,6 +85,9 @@ REFRESH MATERIALIZED VIEW sales_by_day [CONCURRENTLY];
 >   readers and, unlike PostgreSQL, needs no unique index. The two forms differ only once concurrent readers arrive (M6).
 > - `WITH NO DATA` leaves the view unpopulated; reading it is an error until it is refreshed (PostgreSQL behaviour).
 > - The view is read-only (INSERT/UPDATE/DELETE/ALTER fail) and can have indexes, which every refresh rebuilds.
+> - `storage = 'columnar'` stores the rows as columnar segments: 8,192-row groups of encoded column chunks with zone
+>   maps (min/max/null count) that let scans skip row groups, and generated aggregate pipelines over the column
+>   arrays. Columnar views cannot have indexes. See [ADR 0008](adr/0008-materialized-views-and-columnar-segments.md).
 > - Catalog: `sqlite_schema` lists it with type `matview`; `information_schema.tables` reports `MATERIALIZED VIEW`, and
 >   `information_schema.materialized_views` gives the definition, storage, population state and last refresh time.
 

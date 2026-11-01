@@ -147,3 +147,19 @@ Decisions and their rationale: [ADR 0005](adr/0005-cost-based-optimizer.md).
 - **Verification.** The differential test `test/differential-joins.test.ts` runs random 2–4 table
   INNER/LEFT/CROSS/comma joins over tables of very different sizes against SQLite, with and without `ANALYZE`,
   in both code generation modes.
+
+## 8. What M5 adds: columnar scans
+
+- **Access path.** A `storage = 'columnar'` materialized view has one access path, `ColumnScan`. It decodes only
+  the referenced columns of each 8,192-row group. Comparisons of a column with a constant or parameter
+  (`=`, `<`, `<=`, `>`, `>=`) become zone-map tests that skip whole row groups. TEXT comparisons prune only under
+  BINARY collation. The filters above the scan still apply every predicate; zone maps only prune.
+- **Generated pipelines.** `Filter* → ColumnScan` under an aggregate or GROUP BY is fused into generated code
+  (`PipelineSource` `columns` in `codegen.ts`). Each row group binds its chunk arrays once, and rows read values
+  by index. A dense variant runs when every numeric chunk of the row group has no NULLs. Non-aggregate queries
+  use `ColumnScan` row by row.
+- **No row-store shortcuts.** The `count(*)` shortcut, statistics sampling and ANALYZE skip columnar views. Their
+  row count comes from the store header.
+- **EXPLAIN** shows `SCAN t (columnar[, fused scan + filter + …][, zone maps: col op ? …])`.
+
+See [ADR 0008](adr/0008-materialized-views-and-columnar-segments.md).

@@ -78,6 +78,7 @@ export default defineConfig({
           { text: '0005 Cost-based optimizer', link: '/adr/0005-cost-based-optimizer' },
           { text: '0006 Compact index keys', link: '/adr/0006-compact-index-keys-and-in-memory-mode' },
           { text: '0007 Compact cells', link: '/adr/0007-compact-cells-and-free-blocks' },
+          { text: '0008 Materialized views & columnar', link: '/adr/0008-materialized-views-and-columnar-segments' },
         ],
       },
       {
@@ -90,6 +91,7 @@ export default defineConfig({
           { text: 'M3 optimizer', link: '/research/m3-optimizer' },
           { text: 'M4 performance', link: '/research/m4-performance' },
           { text: 'Index engine work', link: '/research/index-engine-work' },
+          { text: 'M5 materialized views', link: '/research/m5-materialized-views' },
           { text: 'Result row shape', link: '/research/result-shape-benchmark' },
           { text: 'Columnar vs. MVs', link: '/research/columnar-mv-assessment' },
           { text: 'Vectorization review', link: '/research/vectorization-review' },

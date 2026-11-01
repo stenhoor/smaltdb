@@ -1,7 +1,7 @@
 # Storage Format
 
 > Status: draft. This is our own format, deliberately **not** SQLite-file compatible (ADR 0001).
-> Row B+trees ship in v1. Columnar segments come in a later milestone.
+> Row B+trees ship in v1. Columnar segments (M5) store columnar materialized views.
 
 ## 1. Files in OPFS
 
@@ -113,13 +113,21 @@ interior cell:  u32 child | u16 keyLen | key
     that component's length.
 - Supported: composite, unique, partial (`WHERE`), and expression indexes. Covering indexes are supported through `INCLUDE` columns, which is a non-SQLite extension.
 
-## 5. Columnar segments (milestone M7)
+## 5. Columnar segments
 
-For analytical (scan-heavy) tables, `CREATE TABLE … WITH (storage = 'column')` would use this layout:
-- Rows are grouped into **row groups** of about 64K rows. Each column of a row group is a chunk spread over one or more pages.
-- Encodings: plain, dictionary, RLE, bit-packing, frame-of-reference, and delta.
-- Every chunk stores **zone maps** (min/max/null count), so the planner can skip whole row groups.
-- Writes go to a row-oriented delta store, which a background step compacts into column segments.
+> **Implemented in M5** for `storage = 'columnar'` materialized views (`src/engine/storage/columnar.ts`,
+> [ADR 0008](adr/0008-materialized-views-and-columnar-segments.md)). Columnar base tables (with a row-oriented delta
+> store) remain in M7.
+
+- A columnar materialized view's tree is an ordinary B+tree keyed by `(u32 row group, u16 column)` (big-endian), so
+  chunks inherit WAL atomicity, overflow pages and free-page handling.
+- **Row groups** hold 8,192 rows. Each column of a row group is one encoded chunk:
+  `u8 encoding | u8 flags (1 = null bitmap) | u16 0 | u32 count | [null bitmap, padded to 8] | payload (8-aligned)`.
+  Encodings: all-NULL, F64, I32, dictionary text (u16/u32 codes), plain text, blob (u32 offsets), and a tagged
+  encoding for mixed types.
+- **Zone maps**: key `(rg, 0xFFFF)` holds the row count and, per column, the null count and numeric or BINARY text
+  (≤ 64 bytes) min/max. Scans skip row groups that cannot match a comparison with a constant or parameter.
+- **Header**: key `(0xFFFFFFFF, 0)` holds the number of row groups and rows.
 
 ## 6. Write-ahead log and durability
 
