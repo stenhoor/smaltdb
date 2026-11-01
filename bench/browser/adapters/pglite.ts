@@ -1,4 +1,5 @@
-import { ANALYTIC_DDL, type Adapter, analyticValues, importUrl, valueFor } from '../adapter.js';
+import { ANALYTIC_DDL, type Adapter, analyticValues, importUrl, valueFor, valuesSql } from '../adapter.js';
+import { JOIN_TABLES } from '../../shared/joins.js';
 
 /** PGlite (Postgres compiled to WASM), OPFS access-handle-pool storage. */
 export class PgliteAdapter implements Adapter {
@@ -58,6 +59,17 @@ export class PgliteAdapter implements Adapter {
     await this.db.exec('COMMIT');
   }
 
+  async loadRows(ddl: string, table: string, n: number, row: (i: number) => (number | string)[]): Promise<void> {
+    await this.db.exec(`DROP TABLE IF EXISTS ${table}; ${ddl.replace(/ REAL\b/g, ' DOUBLE PRECISION')}`);
+    await this.db.exec('BEGIN');
+    for (let from = 1; from <= n; from += 1000) await this.db.exec(`INSERT INTO ${table} VALUES ${valuesSql(from, Math.min(n, from + 999), row)}`);
+    await this.db.exec('COMMIT');
+  }
+
+  async exec(sql: string): Promise<void> {
+    await this.db.exec(sql);
+  }
+
   async query(sql: string): Promise<unknown[][]> {
     // Postgres integer division/avg types differ from SQLite; cast to match SQLite's results.
     const pg = sql.replace('avg(c)', 'avg(c)::float8').replace('avg(c * 1.1)', 'avg(c * 1.1)::float8').replace('sum(b * 2 + d)', 'sum(b * 2 + d)::int8');
@@ -66,7 +78,7 @@ export class PgliteAdapter implements Adapter {
   }
 
   async close(): Promise<void> {
-    await this.db.exec('DROP TABLE t; DROP TABLE IF EXISTS a');
+    await this.db.exec(['DROP TABLE t; DROP TABLE IF EXISTS a', ...JOIN_TABLES.map((t) => `DROP TABLE IF EXISTS ${t}`)].join('; '));
     await this.db.close();
   }
 }

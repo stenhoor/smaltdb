@@ -29,7 +29,7 @@ describe('statistics', () => {
     const db = build(200_000);
     const t = db.getTable('t')!;
     const tree = db.tree(t.rootPage);
-    const s = sampleTable(tree, t, tree.estimateCount());
+    const s = sampleTable(tree, t, tree.estimateCount())!;
     within(s.rows, 200_000, 1.5);
     within(s.ndv[1], 200_000, 2); // unique text
     expect(s.ndv[2]).toBe(5); // low cardinality
@@ -42,9 +42,24 @@ describe('statistics', () => {
     const db = build(1000);
     const t = db.getTable('t')!;
     const tree = db.tree(t.rootPage);
-    const s = sampleTable(tree, t, tree.estimateCount());
+    const s = sampleTable(tree, t, tree.estimateCount())!;
     expect(s.rows).toBe(1000);
     expect(s.ndv[2]).toBe(5);
     expect(s.nulls[4]).toBe(900);
+  });
+
+  it('returns no statistics when rowids cannot be sampled by position', () => {
+    const db = Database.openFile(new MemoryVfs().openSync('b.db'));
+    db.exec('CREATE TABLE t(id INTEGER PRIMARY KEY, v INT)');
+    const ins = db.prepare('INSERT INTO t VALUES (?, ?)');
+    db.exec('BEGIN');
+    for (let i = 0; i < 6000; i++) ins.run([9007199254740993n + BigInt(i) * 1000000000000n, i % 7]);
+    db.exec('COMMIT');
+    const t = db.getTable('t')!;
+    const tree = db.tree(t.rootPage);
+    const s = sampleTable(tree, t, tree.estimateCount());
+    // Either a usable sample or none at all — never a near-empty one.
+    if (s) expect(s.ndv[1]).toBe(7);
+    expect(db.query('SELECT count(*) FROM t WHERE v = 3').rows[0][0]).toBe(857);
   });
 });

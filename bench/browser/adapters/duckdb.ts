@@ -1,4 +1,5 @@
-import { ANALYTIC_DDL, type Adapter, analyticValues, valueFor } from '../adapter.js';
+import { ANALYTIC_DDL, type Adapter, analyticValues, valueFor, valuesSql } from '../adapter.js';
+import { JOIN_TABLES } from '../../shared/joins.js';
 
 /** DuckDB-WASM (EH build) with an OPFS-backed database file. */
 export class DuckdbAdapter implements Adapter {
@@ -73,6 +74,19 @@ export class DuckdbAdapter implements Adapter {
     await this.conn.query('CHECKPOINT');
   }
 
+  async loadRows(ddl: string, table: string, n: number, row: (i: number) => (number | string)[]): Promise<void> {
+    await this.conn.query(`DROP TABLE IF EXISTS ${table}`);
+    await this.conn.query(ddl.replace(/ REAL\b/g, ' DOUBLE'));
+    await this.conn.query('BEGIN TRANSACTION');
+    for (let from = 1; from <= n; from += 1000) await this.conn.query(`INSERT INTO ${table} VALUES ${valuesSql(from, Math.min(n, from + 999), row)}`);
+    await this.conn.query('COMMIT');
+    await this.conn.query('CHECKPOINT');
+  }
+
+  async exec(sql: string): Promise<void> {
+    await this.conn.query(sql);
+  }
+
   async query(sql: string): Promise<unknown[][]> {
     const r = await this.conn.query(sql);
     const names = r.schema.fields.map((f: { name: string }) => f.name);
@@ -86,6 +100,7 @@ export class DuckdbAdapter implements Adapter {
   async close(): Promise<void> {
     await this.conn.query('DROP TABLE t');
     await this.conn.query('DROP TABLE IF EXISTS a');
+    for (const t of JOIN_TABLES) await this.conn.query(`DROP TABLE IF EXISTS ${t}`);
     await this.conn.close();
     await this.db.terminate();
     this.worker.terminate();

@@ -12,7 +12,7 @@ import { MisuseError, SmaltError } from './errors.js';
 import { type StaticType, truthy } from './exec/convert.js';
 import { type CompileScope, type Compiled, type Fn, compileExpr } from './exec/expr.js';
 import type { FunctionContext } from './exec/functions.js';
-import { type ExecState, type Operator, explainRows } from './exec/operators.js';
+import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
 import { Planner, type QueryPlan, Registers } from './exec/planner.js';
 import { type ConflictMode, TableWriter } from './exec/write.js';
 import type {
@@ -343,9 +343,17 @@ export class Database implements FunctionContext {
       case 'release':
         return done({ exec: () => this.transactionControl(stmt), readonly: true, columns: [], columnTypes: [] });
       case 'explain': {
-        if (stmt.analyze) throw new SmaltError('SMALT_UNSUPPORTED', 'EXPLAIN ANALYZE is not supported yet');
         if (stmt.stmt.kind !== 'select') throw new SmaltError('SMALT_UNSUPPORTED', 'EXPLAIN is only supported for SELECT statements');
         const plan = planner.planSelect(stmt.stmt as SelectStmt, null);
+        if (stmt.analyze) {
+          const round = (x: number): number => Math.round(x * 1000) / 1000;
+          return done({
+            readonly: true,
+            rows: (r) => explainAnalyze(plan.root, r, planner.estimates).map((x) => [x.id, x.parent, x.detail, x.estRows === null ? null : Math.round(x.estRows), x.loops, x.rows, round(x.timeMs)]),
+            columns: ['id', 'parent', 'detail', 'est_rows', 'loops', 'rows', 'time_ms'],
+            columnTypes: ['int', 'int', 'text', 'int', 'int', 'int', 'real'],
+          });
+        }
         return done({
           readonly: true,
           rows: () => explainRows(plan.root).map((x) => [x.id, x.parent, 0, x.detail]),
@@ -515,7 +523,7 @@ export class Database implements FunctionContext {
   }
 
   /** Sampled statistics per table schema object (a schema reload drops them with the old objects). */
-  private readonly sampled = new WeakMap<TableSchema, { stats: TableStats; at: number }>();
+  private readonly sampled = new WeakMap<TableSchema, { stats: TableStats | undefined; at: number }>();
 
   /**
    * Statistics for a table that has not been ANALYZEd, computed on first use by the planner and

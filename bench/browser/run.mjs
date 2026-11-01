@@ -1,7 +1,7 @@
 // Engine comparison in a real browser.
 //
 //   npm run bench:browser -- [--engines smaltdb,sqlite-off,sqlite-journal] [--reps 5] [--rows 100000]
-//                            [--analytic-rows 200000] [--save] [--baseline sqlite-off]
+//                            [--analytic-rows 200000] [--no-joins] [--save] [--baseline sqlite-off]
 //
 // Each repetition runs every engine once in a fresh worker (engine order rotates per repetition).
 // Reports the median and spread per workload, and ratios versus the baseline engine with a verdict
@@ -72,7 +72,7 @@ const failures = [];
 for (let rep = 0; rep < reps; rep++) {
   const order = engines.map((_, i) => engines[(i + rep) % engines.length]);
   for (const engine of order) {
-    const r = await page.evaluate((msg) => window.runEngine(msg), { engine, rows, lookups, smallTxns, analyticRows });
+    const r = await page.evaluate((msg) => window.runEngine(msg), { engine, rows, lookups, smallTxns, analyticRows, joins: !process.argv.includes('--no-joins') });
     if (r.ok) runs[engine].push(r);
     else failures.push({ engine, rep, error: r.error });
     process.stdout.write(r.ok ? '.' : 'x');

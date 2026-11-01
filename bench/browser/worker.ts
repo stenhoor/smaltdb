@@ -4,6 +4,7 @@ import { DuckdbAdapter } from './adapters/duckdb.js';
 import { PgliteAdapter } from './adapters/pglite.js';
 import { SmaltdbAdapter } from './adapters/smaltdb.js';
 import { SqliteAdapter } from './adapters/sqlite.js';
+import { JOIN_DDL, JOIN_INDEXES, JOIN_QUERIES, JOIN_SIZES, JOIN_TABLES, joinRows } from '../shared/joins.js';
 
 export const factories: Record<string, () => Adapter> = {
   smaltdb: () => new SmaltdbAdapter(),
@@ -41,8 +42,8 @@ async function timed(out: WorkloadResult[], workload: string, ops: number, fn: (
   out.push({ workload, ops, ms, check: Array.isArray(r) ? canon(r as unknown[][]) : String(r) });
 }
 
-self.onmessage = async (e: MessageEvent<{ engine: string; rows: number; lookups: number; smallTxns: number; analyticRows: number }>) => {
-  const { engine, rows: N, lookups, smallTxns, analyticRows } = e.data;
+self.onmessage = async (e: MessageEvent<{ engine: string; rows: number; lookups: number; smallTxns: number; analyticRows: number; joins: boolean }>) => {
+  const { engine, rows: N, lookups, smallTxns, analyticRows, joins } = e.data;
   try {
     const a = factories[engine]();
     const results: WorkloadResult[] = [];
@@ -72,6 +73,20 @@ self.onmessage = async (e: MessageEvent<{ engine: string; rows: number; lookups:
       for (let i = 0; i < 5; i++) await timed(reps, 'x', analyticRows, () => a.query(sql));
       const sorted = reps.map((x) => x.ms).sort((x, y) => x - y);
       results.push({ workload: `analytic: ${name} (repeat, median of 5)`, ops: analyticRows, ms: sorted[2], check: reps[0].check });
+    }
+    if (joins) {
+      const total = JOIN_TABLES.reduce((n, t) => n + JOIN_SIZES[t], 0);
+      await timed(results, `load join tables (${total} rows, 2 indexes)`, total, async () => {
+        for (let i = 0; i < JOIN_TABLES.length; i++) await a.loadRows(JOIN_DDL[i], JOIN_TABLES[i], JOIN_SIZES[JOIN_TABLES[i]], joinRows[JOIN_TABLES[i]]);
+        for (const ix of JOIN_INDEXES) await a.exec(ix);
+      });
+      for (const [name, sql] of Object.entries(JOIN_QUERIES)) {
+        await timed(results, `join: ${name} (first run)`, 1, () => a.query(sql));
+        const reps: WorkloadResult[] = [];
+        for (let i = 0; i < 5; i++) await timed(reps, 'x', 1, () => a.query(sql));
+        const sorted = reps.map((x) => x.ms).sort((x, y) => x - y);
+        results.push({ workload: `join: ${name} (repeat, median of 5)`, ops: 1, ms: sorted[2], check: reps[0].check });
+      }
     }
     await a.close();
     postMessage({ ok: true, engine: a.name, config: a.config, atomicCommits: a.atomicCommits, openMs, results, version: (a as { libVersion?: string }).libVersion });

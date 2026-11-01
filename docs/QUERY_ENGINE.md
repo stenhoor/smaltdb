@@ -33,6 +33,10 @@ or when statistics drift by more than a threshold.
 
 ## 3. Cost-based optimization
 
+> **Status (M3):** statistics, a cost model, join ordering and per-step join methods are implemented; see §7
+> and [ADR 0005](adr/0005-cost-based-optimizer.md). Histograms, most-common values, DPccp, merge join, covering
+> scans, multi-index OR and skip-scan are not implemented yet. The bullets below describe the target design.
+
 - **Cardinality estimation** uses per-column statistics: row count, NDV (HyperLogLog), equi-depth histograms,
   most-common values, and null fraction. It assumes independence and applies a correlation dampening factor.
 - **Cost model** components: page I/O (cached vs. OPFS), CPU per tuple per operator, and memory and spill cost.
@@ -65,6 +69,8 @@ or when statistics drift by more than a threshold.
 
 - `EXPLAIN <stmt>`: the physical plan tree with estimated rows and cost.
 - `EXPLAIN ANALYZE <stmt>`: the same tree with actual rows, time per operator, pages read, and cache hits.
+  *Implemented in M3 (SELECT only):* columns `id, parent, detail, est_rows, loops, rows, time_ms`. Pages read and
+  cache hits are not reported yet.
 - `EXPLAIN QUERY PLAN`: SQLite-compatible summary output.
 - Plans are also available as JSON for tooling.
 
@@ -80,10 +86,10 @@ Source: `src/engine/exec/` — `planner.ts`, `operators.ts`, `expr.ts`, `functio
   which closures cannot have because instances of a closure literal share feedback. Other nodes, and every slow path, call the closure
   compiler, which defines the semantics. Differential tests run in both modes (`SMALT_NO_CODEGEN=1` forces closures). Zero allocation per row in scans,
   filters, and joins. See [ADR 0003](adr/0003-m1-executor-and-transactions.md).
-- **Access paths** (heuristic, chosen per table from conjuncts that reference only that table and earlier ones): rowid
+- **Access paths** (M1: heuristic; since M3 costed, see §7), from conjuncts that reference only that table and earlier ones: rowid
   equality / `IN` / range; index equality prefix plus a range on the next ASC column, used only when collation and affinity make
   the index order match the comparison; otherwise a full scan. `x BETWEEN a AND b` is split into two bounds.
-- **Joins**, in FROM order (cost-based ordering comes in M3):
+- **Joins** (M1: in FROM order; since M3 cost-based, see §7):
   - index or rowid nested loop when the inner side can be probed with values from outer rows;
   - otherwise a hash join on equality conjuncts, built once per execution, with affinity and collation applied to both key sides;
   - otherwise a nested loop, with uncorrelated derived tables materialized.
@@ -101,3 +107,33 @@ Source: `src/engine/exec/` — `planner.ts`, `operators.ts`, `expr.ts`, `functio
   evaluates the conjuncts. Three consumers are fused: ungrouped aggregates (`FusedScanAggregate`), GROUP BY with an inline hash aggregate
   (`FusedGroupAggregate`), and anything else via row batches (`FusedScanFilter`). Range/index scans, joins, DISTINCT aggregates,
   predicates with subqueries and bare columns in aggregates keep the operator-at-a-time plan.
+
+## 7. What M3 implements
+
+Sources: `src/engine/exec/planner.ts` (cost model, join order), `src/engine/exec/stats.ts` (ANALYZE, sampling),
+`src/engine/database.ts` (`smalt_stat`, plan drift), `src/engine/exec/operators.ts` (`explainAnalyze`).
+Decisions and their rationale: [ADR 0005](adr/0005-cost-based-optimizer.md).
+
+- **Statistics.** `ANALYZE [table]` stores per-table row count, distinct values (HyperLogLog) and NULL counts,
+  and per-index rows per key prefix, as JSON in `smalt_stat`. Tables without them get sampled statistics on
+  first use: an exact scan up to 4096 rows, otherwise about 1.5k rows from jittered runs with the Duj1
+  distinct-value estimator. Sampled statistics are cached until the table's size changes 4×.
+- **Cardinality.** Row counts come from the B+tree shape. Selectivity is 1/NDV for equality (1/max NDV for
+  equi-joins), fixed fractions for ranges, `!=` and LIKE, k/NDV for IN, and the NULL fraction for IS NULL.
+- **Access paths** are costed alternatives: full scan, rowid `=`/IN/range, and index equality prefix plus
+  range. An index costs a probe plus a fetch per matching row, so a scan wins when the filter is not selective.
+- **Join order.** Runs of INNER/comma/CROSS sources are ordered by dynamic programming over subsets (up to 8
+  sources; greedy beyond). LEFT JOIN sources keep their position. Joins without a join conjunct are
+  penalized, so cross products come last.
+- **Join method per step**: index nested loop, hash join, or nested loop over a materialized inner side,
+  whichever is cheapest for the estimated outer rows.
+- **Plan drift.** Cached plans record the table sizes they assumed and are re-planned when a table grows
+  or shrinks 4×.
+- **`EXPLAIN ANALYZE`** shows, per operator, the planner's estimate (rows per loop), loops, actual rows and
+  inclusive time. Operators without an EXPLAIN QUERY PLAN line appear under their class name (FILTER, PROJECT, …).
+- **Generated code in joins.** Standalone scans of join sources run as fused scan + filter pipelines. Text
+  `=`/`!=` under BINARY collation is generated code. `textcol = 'literal'` in a fused scan is checked on the raw
+  UTF-8 bytes before the row is decoded.
+- **Verification.** The differential test `test/differential-joins.test.ts` runs random 2–4 table
+  INNER/LEFT/CROSS/comma joins over tables of very different sizes against SQLite, with and without `ANALYZE`,
+  in both code generation modes.

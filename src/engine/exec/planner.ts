@@ -869,12 +869,14 @@ export class Planner {
       // In joins, standalone full scans of this source run as generated scan + filter pipelines.
       if (multi && !access.dependsOnOuter) leaf = this.tryFuseScanFilter(leaf, scope);
 
+      const method = access.dependsOnOuter ? 'inl' : step.method;
+      // Rows the leaf yields per loop: the inner side of an index nested loop sees one outer row.
+      this.estimates.set(leaf, method === 'inl' ? step.rows / Math.max(1, outerRows) : step.filtered);
       if (root === null) {
         root = leaf;
       } else {
         const innerRegs = (): number[] => this.sourceRegs(src);
         const rest = isLeft ? onInfos.filter((c) => !c.placed) : [];
-        const method = access.dependsOnOuter ? 'inl' : step.method;
         if (method === 'inl') {
           root = new NestedLoopJoin(root, leaf, isLeft, innerRegs, this.andAll(rest, cs));
           rest.forEach((c) => (c.placed = true));
@@ -897,6 +899,7 @@ export class Planner {
       }
       placed.add(p);
       outerRows = isLeft ? Math.max(outerRows, step.rows) : step.rows;
+      if (root !== leaf) this.estimates.set(root, outerRows);
       // Remaining WHERE / inner-ON conjuncts whose dependencies are now all available.
       for (const c of pool) {
         if (c.placed || c.deps === null || c.deps.size === 0 || ![...c.deps].every((d) => placed.has(d))) continue;
@@ -1227,6 +1230,9 @@ export class Planner {
     return src.estRows;
   }
 
+  /** Planner row estimates per operator (per loop for inner sides), shown by EXPLAIN ANALYZE. */
+  readonly estimates = new WeakMap<Operator, number>();
+
   /** Root page -> row estimate (from the tree shape) each costed table had when this plan was made. */
   readonly rowAssumptions = new Map<number, number>();
 
@@ -1325,7 +1331,7 @@ export class Planner {
     pool: ConjunctInfo[],
     scope: Scope,
     cs: CompileScope,
-  ): { cost: number; rows: number; method: 'first' | 'inl' | 'hash' | 'nl'; option: AccessOption; candidates: ConjunctInfo[] } {
+  ): { cost: number; rows: number; filtered: number; method: 'first' | 'inl' | 'hash' | 'nl'; option: AccessOption; candidates: ConjunctInfo[] } {
     const p = t.position;
     const avail = (c: ConjunctInfo): boolean => c.deps !== null && c.deps.has(p) && [...c.deps].every((d) => d === p || placed.has(d));
     const candidates = pool.filter((c) => !c.placed && avail(c));
@@ -1338,7 +1344,7 @@ export class Planner {
     const opts = this.accessOptions(t, p, candidates, scope, cs);
     const standalone = this.bestStandalone(opts);
     if (placed.size === 0) {
-      return { cost: standalone.cost, rows: Math.max(1, filtered), method: 'first', option: standalone, candidates };
+      return { cost: standalone.cost, rows: Math.max(1, filtered), filtered: Math.max(1, filtered), method: 'first', option: standalone, candidates };
     }
     const outRows = Math.max(1, outerRows * filtered * joinSel);
     let best: { cost: number; method: 'inl' | 'hash' | 'nl'; option: AccessOption } = {
@@ -1356,7 +1362,7 @@ export class Planner {
       const c = standalone.cost + filtered * COST.hashBuild + outerRows * COST.hashProbe;
       if (c < best.cost) best = { cost: c, method: 'hash', option: standalone };
     }
-    return { cost: best.cost + outRows * COST.outRow, rows: outRows, method: best.method, option: best.option, candidates };
+    return { cost: best.cost + outRows * COST.outRow, rows: outRows, filtered: Math.max(1, filtered), method: best.method, option: best.option, candidates };
   }
 
   /**

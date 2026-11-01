@@ -80,4 +80,29 @@ describe('SQL smoke', () => {
     d.exec('INSERT INTO t VALUES (3); COMMIT');
     expect(d.query('SELECT x FROM t ORDER BY x').rows).toEqual([[1], [3]]);
   });
+
+  it('EXPLAIN ANALYZE reports loops, actual rows and estimates per operator, and leaves the plan reusable', () => {
+    const d = db();
+    d.exec('CREATE TABLE a(id INTEGER PRIMARY KEY, g INT); CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INT); CREATE INDEX b_a ON b(a_id)');
+    for (let i = 1; i <= 50; i++) d.exec(`INSERT INTO a VALUES (${i}, ${i % 5})`);
+    for (let i = 1; i <= 200; i++) d.exec(`INSERT INTO b VALUES (${i}, ${(i % 50) + 1})`);
+    const sql = 'SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id WHERE a.g = 1';
+    const res = d.query('EXPLAIN ANALYZE ' + sql);
+    expect(res.columns).toEqual(['id', 'parent', 'detail', 'est_rows', 'loops', 'rows', 'time_ms']);
+    const byDetail = (re: RegExp) => res.rows.find((r) => re.test(String(r[2])))!;
+    expect(byDetail(/\b(SCAN|SEARCH) a\b/)[4]).toBe(1);
+    expect(byDetail(/\b(SCAN|SEARCH) b\b/)[4]).toBeGreaterThanOrEqual(1);
+    // The filtered access to a (fused, or a FILTER over the scan) carries an estimate and 10 actual rows.
+    expect(res.rows.some((r) => r[5] === 10 && typeof r[3] === 'number')).toBe(true);
+    expect(res.rows[0][5]).toBe(40); // root produces the query's rows
+    expect(res.rows.every((r) => typeof r[6] === 'number' && (r[6] as number) >= 0)).toBe(true);
+    // Index nested loop: the inner side runs once per outer row.
+    const point = d.query('EXPLAIN ANALYZE SELECT b.id FROM a JOIN b ON b.a_id = a.id WHERE a.id IN (3, 7)').rows;
+    const inner = point.find((r) => /SEARCH b USING INDEX b_a/.test(String(r[2])))!;
+    expect(inner[4]).toBe(2);
+    expect(inner[5]).toBe(8);
+    // The instrumented operators were restored: the same SQL still runs normally.
+    expect(d.query(sql).rows.length).toBe(40);
+    expect(d.query('EXPLAIN ANALYZE ' + sql).rows[0][5]).toBe(40);
+  });
 });

@@ -91,6 +91,19 @@ export class SqliteAdapter implements Adapter {
     st.finalize();
   }
 
+  async loadRows(ddl: string, table: string, n: number, row: (i: number) => (number | string)[]): Promise<void> {
+    this.db.exec(ddl);
+    const st = this.db.prepare(`INSERT INTO ${table} VALUES (${row(1).map(() => '?').join(', ')})`);
+    this.db.exec('BEGIN');
+    for (let i = 1; i <= n; i++) st.bind(row(i)).stepReset();
+    this.db.exec('COMMIT');
+    st.finalize();
+  }
+
+  async exec(sql: string): Promise<void> {
+    this.db.exec(sql);
+  }
+
   async query(sql: string): Promise<unknown[][]> {
     return this.db.selectArrays(sql);
   }

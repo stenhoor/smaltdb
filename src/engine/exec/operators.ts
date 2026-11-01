@@ -1159,6 +1159,72 @@ export function explainRows(root: Operator): { id: number; parent: number; detai
   return out;
 }
 
+export interface AnalyzeRow {
+  id: number;
+  parent: number;
+  detail: string;
+  /** Planner estimate (rows per loop), when the planner costed this operator. */
+  estRows: number | null;
+  loops: number;
+  rows: number;
+  /** Inclusive wall time in open + next, milliseconds. */
+  timeMs: number;
+}
+
+/**
+ * EXPLAIN ANALYZE: run the plan to completion with every operator instrumented (per instance) for
+ * loops (open calls), rows produced and inclusive time, then restore the operators.
+ */
+export function explainAnalyze(root: Operator, r: SqlValue[], estimates: WeakMap<Operator, number>): AnalyzeRow[] {
+  const out: AnalyzeRow[] = [];
+  const restore: (() => void)[] = [];
+  const now = (): number => performance.now();
+  let id = 0;
+  const walk = (op: Operator, parent: number): void => {
+    const row: AnalyzeRow = { id: ++id, parent, detail: op.detail || op.constructor.name.replace(/([a-z])([A-Z])/g, '$1 $2').toUpperCase(), estRows: estimates.get(op) ?? null, loops: 0, rows: 0, timeMs: 0 };
+    out.push(row);
+    const o = op as { open: Operator['open']; next: Operator['next'] };
+    const open = o.open;
+    const next = o.next;
+    o.open = function (this: Operator, regs: SqlValue[]): void {
+      row.loops++;
+      const t0 = now();
+      try {
+        open.call(this, regs);
+      } finally {
+        row.timeMs += now() - t0;
+      }
+    };
+    o.next = function (this: Operator): boolean {
+      const t0 = now();
+      try {
+        const ok = next.call(this);
+        if (ok) row.rows++;
+        return ok;
+      } finally {
+        row.timeMs += now() - t0;
+      }
+    };
+    restore.push(() => {
+      delete (o as Partial<typeof o>).open;
+      delete (o as Partial<typeof o>).next;
+    });
+    for (const c of op.children) walk(c, row.id);
+  };
+  walk(root, 0);
+  try {
+    root.open(r);
+    try {
+      while (root.next());
+    } finally {
+      root.close();
+    }
+  } finally {
+    for (const f of restore) f();
+  }
+  return out;
+}
+
 /**
  * Single-table scan + WHERE + aggregates (no GROUP BY) fused into one generated function that walks
  * the leaf pages directly. Produces one row of aggregate results, like HashAggregate.

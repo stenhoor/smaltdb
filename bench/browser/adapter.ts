@@ -23,6 +23,10 @@ export interface Adapter {
   smallTxns(start: number, count: number): Promise<void>;
   /** Load the analytical table `a` with n rows (see analyticRow) in one transaction. */
   loadAnalytic(n: number): Promise<void>;
+  /** Create a table (`ddl`) and load rows row(1..n) into it in one transaction. */
+  loadRows(ddl: string, table: string, n: number, row: (i: number) => (number | string)[]): Promise<void>;
+  /** Execute a statement without results (e.g. CREATE INDEX). */
+  exec(sql: string): Promise<void>;
   /** Run a read-only query and return its rows as value arrays. */
   query(sql: string): Promise<unknown[][]>;
   close(): Promise<void>;
@@ -54,6 +58,13 @@ export function analyticValues(from: number, to: number): string {
     rows.push(`(${id},${b},${c},${d},'${e}')`);
   }
   return rows.join(',');
+}
+
+/** Multi-row VALUES list for rows from..to of a row generator (strings quoted). */
+export function valuesSql(from: number, to: number, row: (i: number) => (number | string)[]): string {
+  const out: string[] = [];
+  for (let i = from; i <= to; i++) out.push(`(${row(i).map((v) => (typeof v === 'string' ? `'${v.replace(/'/g, "''")}'` : String(v))).join(',')})`);
+  return out.join(',');
 }
 
 /** Dynamic import that bundlers leave alone (competitor libraries are served from /nm/). */

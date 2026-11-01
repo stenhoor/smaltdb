@@ -165,7 +165,7 @@ const SAMPLE_RUN_ROWS = 48;
  * and f1 the values seen exactly once; it gives N for all-distinct samples and d when nothing is
  * a singleton.
  */
-export function sampleTable(tree: BTree, table: TableSchema, estimatedRows: number): TableStats {
+export function sampleTable(tree: BTree, table: TableSchema, estimatedRows: number): TableStats | undefined {
   if (estimatedRows <= EXACT_STATS_ROWS) return analyzeTable(tree, table);
   const n = table.columns.length;
   const freq = Array.from({ length: n }, () => new Map<number, number>());
@@ -174,7 +174,7 @@ export function sampleTable(tree: BTree, table: TableSchema, estimatedRows: numb
   let sampled = 0;
   const c = tree.cursor();
   try {
-    if (!c.first()) return { rows: 0, ndv: new Array(n).fill(0), nulls };
+    if (!c.first()) return undefined;
     c.loadKey();
     const lo = Number(readRowidKey(c.keyBytes, c.keyOffset));
     c.last();
@@ -213,8 +213,10 @@ export function sampleTable(tree: BTree, table: TableSchema, estimatedRows: numb
   } finally {
     c.close();
   }
+  // Too few rows to say anything (e.g. rowids beyond ±2^53 cannot be seeked by position): no statistics.
+  if (sampled < 64) return undefined;
   const N = Math.max(estimatedRows, sampled);
-  const ns = Math.max(1, sampled);
+  const ns = sampled;
   const ndv = freq.map((m, k) => {
     if (k === table.rowidAlias) return N;
     let f1 = 0;
