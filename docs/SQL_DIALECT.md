@@ -149,8 +149,23 @@ DROP CONNECTION [IF EXISTS] api;          -- fails while an external table uses 
   2024`, `month IN (1, 2)`, `year + month > 2030`, …) skip the files they exclude before anything is fetched. Not for
   a LEFT-joined table, with RIGHT / FULL joins, or for `read_csv` / `read_json` calls. `REFRESH … IF CHANGED` over a
   pattern compares the listing (each file's ETag or modification time).
-- **Formats:** `csv`, `tsv`, `json` (an array of objects, or of arrays with declared columns), `ndjson`; taken from
-  `format` or the file extension.
+- **Formats:** `csv`, `tsv`, `json` (an array of objects, or of arrays with declared columns), `ndjson`, `parquet`
+  (M8.3); taken from `format` or the file extension. `read_parquet(location, …)` reads Parquet ad hoc.
+- **Parquet** (M8.3) is read with [hyparquet](https://github.com/hyparam/hyparquet), an optional dependency
+  (`npm install hyparquet`, plus `hyparquet-compressors` for gzip, zstd, brotli and lz4; Snappy is built in), loaded
+  on first use (a separate chunk of the engine worker).
+  - *Reads only what the statement needs:* the footer (the first 16 KB from the end), then only the column chunks of
+    the columns the statement uses, by HTTP Range requests (S3, Azure and HTTP), Blob slices or file reads; files under
+    64 KB are read in one request. Columns that are not read are NULL to the scan.
+  - *Row groups:* `column op constant` (`=`, `<`, `<=`, `>`, `>=`), `BETWEEN` and `IN (…)` in WHERE skip the row groups
+    whose statistics (min, max, null count) rule them out, as zone maps do for columnar tables. Not for a LEFT-joined
+    source or with RIGHT / FULL joins.
+  - *Types:* integers (also unsigned; INT64 beyond 2^53 stay exact) and booleans are INTEGER, floats and decimals REAL,
+    strings, enums, JSON and UUIDs TEXT, dates `YYYY-MM-DD` and timestamps `YYYY-MM-DD HH:MM:SS[.fraction]` (UTC) TEXT
+    like SQLite's date functions produce, binary BLOB, and lists, structs and maps JSON text. An external table's
+    columns come from the footer alone.
+  - Browsers need CORS on the server that allows the `Range` header and exposes `Content-Length` (and `ETag` for
+    `IF CHANGED`); without a usable size the file is read in one request.
 - **Reader options:** `header` (default true), `delimiter`, `quote`, `null` (text read as NULL; unquoted empty fields are
   NULL anyway), `skip` (leading records), `encoding` (default utf-8). Unknown options are errors.
 - **Types:** declared columns convert values by affinity (text that does not convert stays text). Inferred columns are

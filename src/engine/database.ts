@@ -136,11 +136,14 @@ interface ExternalTableDef {
   sql: string;
 }
 
+/** For Parquet, the source of its schema only (the footer): what planning and column inference need. */
+const schemaSourceOf = (s: ExternalSource): ExternalSource => (s.format === 'parquet' ? { ...s, key: `${s.key}|schema`, schemaOnly: true } : s);
+
 /** An external source a materialized view read at its last refresh (smalt_extcache). */
 interface ExternalCacheEntry {
   label: string;
   location: string;
-  format: 'csv' | 'json';
+  format: 'csv' | 'json' | 'parquet';
   options: Record<string, SqlValue>;
   connection: string | null;
   validator: string | null;
@@ -965,7 +968,7 @@ export class Database implements FunctionContext {
     const regs = new Registers(ps.paramCount);
     const planner = new Planner(this.plannerDeps(this.rewritePolicy(stmt)), regs);
     planner.sqlText = ps.text;
-    const done = (p: Omit<Program, 'regCount'>): Program => ({ ...p, regCount: regs.count, rowAssumptions: planner.rowAssumptions, externals: planner.externals });
+    const done = (p: Omit<Program, 'regCount'>): Program => ({ ...p, regCount: regs.count, rowAssumptions: planner.rowAssumptions, externals: planner.finishExternals() });
     switch (stmt.kind) {
       case 'select': {
         const plan = planner.planSelect(stmt, null);
@@ -1523,6 +1526,7 @@ export class Database implements FunctionContext {
     const planner = new Planner(this.plannerDeps(), regs);
     planner.sqlText = sql;
     const plan = planner.planSelect(select, null);
+    const externals = planner.finishExternals();
     const r: SqlValue[] = new Array(regs.count).fill(null);
     const root = plan.root;
     try {
@@ -1532,7 +1536,7 @@ export class Database implements FunctionContext {
     } finally {
       root.close();
     }
-    return planner.externals;
+    return externals;
   }
 
   /** Upsert (or with `meta` null, delete) a view's row in smalt_matview. */
@@ -2318,8 +2322,8 @@ export class Database implements FunctionContext {
     const source = this.externalSourceOf({ name: stmt.name, options: stmt.with }, columns.length ? columns : undefined);
     let text = sql;
     if (columns.length === 0) {
-      // Columns inferred from the source now (fetched by the async API), and stored with the table.
-      const data = this.external.data(source);
+      // Columns inferred from the source now (fetched by the async API; Parquet: only its footer), and stored with the table.
+      const data = this.external.data(schemaSourceOf(source));
       if (data.columns.length === 0) throw externalError(source, 'no columns found (the source is empty)');
       columns = data.columns.map((c) => ({ name: c.name, declType: c.declType || 'ANY' }));
       const cols = columns.map((c) => `${quoteIdent(c.name)} ${c.declType}`).join(', ');
@@ -2351,7 +2355,7 @@ export class Database implements FunctionContext {
   /** @internal `read_csv(location, …)` / `read_json(location, …)`: columns come from the loaded data. */
   private externalFunctionScan(name: string, args: SqlValue[], named: Record<string, SqlValue>): ExternalScan | undefined {
     const source = this.externalFunctionSource(name, args, named);
-    const data = this.external.data(source);
+    const data = this.external.data(schemaSourceOf(source));
     return { label: source.label, source, columns: data.columns, rows: () => this.external.data(source).rows };
   }
 
@@ -2371,7 +2375,7 @@ export class Database implements FunctionContext {
         const named = Object.entries(f.named ?? {});
         if (f.args.every(lit) && named.every(([, e]) => lit(e))) {
           try {
-            out.push(this.externalFunctionSource(f.name, f.args.map((a) => a.value!), Object.fromEntries(named.map(([k, e]) => [k, e.value!]))));
+            out.push(schemaSourceOf(this.externalFunctionSource(f.name, f.args.map((a) => a.value!), Object.fromEntries(named.map(([k, e]) => [k, e.value!])))));
           } catch {
             // Planning reports it.
           }
@@ -2391,7 +2395,7 @@ export class Database implements FunctionContext {
     checkReaderOptions(named, new Set(['connection']), label);
     const { connection: _c, ...options } = named;
     if (options.format === undefined || options.format === null) {
-      options.format = name === 'read_json' ? 'json' : /\.tsv([?#]|$)/i.test(location) ? 'tsv' : 'csv';
+      options.format = name === 'read_json' ? 'json' : name === 'read_parquet' ? 'parquet' : /\.tsv([?#]|$)/i.test(location) ? 'tsv' : 'csv';
     }
     const fmt = formatOf(location, options, label);
     const key = `fn:${name}:${JSON.stringify([location, Object.entries(named).sort()], (_k, v) => (typeof v === 'bigint' ? `${v}n` : v))}`;
