@@ -1,6 +1,9 @@
 # Worker & Concurrency Model
 
-> Status: draft. Decided (ADR 0001): multi-tab sharing via leader election; parallel reader pool only when cross-origin isolated.
+> Status: §2 (multi-tab), §5 (messaging, backpressure, cancellation) and the basic mode of §3 are **implemented in M6**
+> ([ADR 0009](adr/0009-concurrency.md)): `src/engine/server.ts`, `src/engine/worker.ts`, `src/client/index.ts`.
+> Not yet: the parallel reader pool (§3, "Parallel") and MVCC snapshots. Readers and writers of different tabs are
+> serialized instead (see ADR 0009).
 
 ## 1. Constraints that shape the design
 

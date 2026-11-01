@@ -21,7 +21,24 @@ memory and is discarded when it is closed. It has no file, no write-ahead log an
 Transactions, savepoints and statement rollback work as usual: each page's contents before its
 first change in a transaction are kept in memory for rollback.
 
-*(planned)* `workers`, `multiTab`, streaming iteration (`stmt.stream`), `insertColumns`, `explain`, and import/export helpers.
+**Implemented in M6:**
+- **Streaming.** `db.stream(sql, params?, { rowMode, batchSize, highWaterMark, signal })` and `stmt.stream(params?, opts)`
+  return async iterators over result batches: `for await (const rows of db.stream(sql)) …`. The engine sends at most
+  `highWaterMark` batches (default 4) ahead of the consumer and pauses until they are consumed. Leaving the loop early
+  closes the result. While a stream is open, the same tab's writes fail with `SMALT_BUSY`, other tabs' writes wait, and
+  reads continue.
+- **Cancellation.** `signal` (an `AbortSignal`) on `query`, `exec`, `stream` and prepared statements. A queued request or
+  an open stream stops at once. On cross-origin isolated pages, a statement that is already running in this tab's
+  engine worker is interrupted and rolled back; elsewhere it is stopped at its next result batch. The error code is
+  `SMALT_INTERRUPT`.
+- **Multi-tab.** `open(name, { multiTab })` defaults to on for OPFS databases when Web Locks and BroadcastChannel exist.
+  - *Ownership:* one tab's engine worker owns the file (`db.isLeader`). Other tabs send it their requests.
+  - *Transactions:* a transaction belongs to its tab, and the other tabs' statements wait until it ends. If a tab closes
+    with a transaction open, its transaction is rolled back.
+  - *Failover:* when the owning tab closes, a waiting tab takes over and recovers committed data. Requests in flight
+    then fail with `SMALT_RETRY` (safe to retry), and statements prepared under the old owner must be prepared again.
+
+*(planned)* parallel reader workers (`workers`), `insertColumns`, `explain`.
 The draft below shows the long-term shape.
 
 ```ts
