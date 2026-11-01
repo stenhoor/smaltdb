@@ -553,9 +553,10 @@ class Pipeline {
             const k = this.em.constant(t.bytes);
             const L = t.bytes.length;
             // NULL or a different byte string: the conjunct is not true, skip the row undecoded.
-            const head = `if (${bd.isNull}) continue; { const s = ${bd.st}; if (${bd.fin} - s !== ${L}) continue;`;
-            if (L <= 16) return `${head}${L ? ` if (!(${Array.from(t.bytes, (x, j) => `b[s + ${j}] === ${x}`).join(' && ')})) continue;` : ''} }`;
-            return `${head} const q = ${k}; let j = 0; while (j < ${L} && b[s + j] === q[j]) j++; if (j !== ${L}) continue; }`;
+            // The literal's bytes live in K (not in the source), so statements differing only in the literal share code.
+            const head = `if (${bd.isNull}) continue; { const s = ${bd.st}; if (${bd.fin} - s !== ${L}) continue; const q = ${k};`;
+            if (L <= 16) return `${head}${L ? ` if (!(${Array.from(t.bytes, (_, j) => `b[s + ${j}] === q[${j}]`).join(' && ')})) continue;` : ''} }`;
+            return `${head} let j = 0; while (j < ${L} && b[s + j] === q[j]) j++; if (j !== ${L}) continue; }`;
           })
       : undefined;
     emitDecode(spec, dec, assign, pre);
@@ -595,8 +596,22 @@ class Pipeline {
 }
 
 /** Compile generated source `return function ...` with the given parameter names and arguments. */
+const pipelineFactories = new Map<string, (...args: unknown[]) => unknown>();
+
+/**
+ * Compile generated source `return function ...` with the given parameter names and arguments.
+ * Factories are cached by source: statements with the same shape (constants live in `K`) reuse one
+ * function literal, so V8 shares its feedback and optimized code instead of warming up again.
+ */
 function compileFn<T>(params: string[], src: string, args: unknown[]): T {
-  return new Function(...params, `"use strict"; ${src}`)(...args) as T;
+  const key = params.join(',') + '\n' + src;
+  let factory = pipelineFactories.get(key);
+  if (factory === undefined) {
+    factory = new Function(...params, `"use strict"; ${src}`) as (...args: unknown[]) => unknown;
+    if (pipelineFactories.size > 500) pipelineFactories.clear();
+    pipelineFactories.set(key, factory);
+  }
+  return factory(...args) as T;
 }
 
 /**
