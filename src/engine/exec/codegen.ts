@@ -26,10 +26,35 @@ export interface CodegenHelpers {
   negate: (v: SqlValue) => SqlValue;
 }
 
+/**
+ * A generated value. When `nul` is set, `v` always holds a non-null JS value (0 placeholder when the
+ * SQL value is NULL) and `nul` is a JS boolean expression for SQL NULL. Keeping NULL out of numeric
+ * variables lets V8 keep them unboxed. Without `nul`, `v` may itself be `null`.
+ */
 interface Gen {
-  /** JS expression (identifier or literal) holding the value. */
   v: string;
   type: StaticType;
+  nul?: string;
+}
+
+/** JS boolean expression: the value is SQL NULL. */
+function nullOf(g: Gen): string {
+  return g.nul ?? `(${g.v} === null)`;
+}
+
+/** JS expression for the value as a nullable SqlValue. */
+function plain(g: Gen): string {
+  if (g.nul === undefined) return g.v;
+  if (g.nul === 'false') return g.v;
+  if (g.nul === 'true') return 'null';
+  return `(${g.nul} ? null : ${g.v})`;
+}
+
+function orNull(a: string, b: string): string {
+  if (a === 'false') return b;
+  if (b === 'false') return a;
+  if (a === 'true' || b === 'true') return 'true';
+  return `(${a} || ${b})`;
 }
 
 const ARITH = new Set(['+', '-', '*', '/', '%']);
@@ -83,25 +108,35 @@ class Emitter {
     return `K[${this.consts.length - 1}]`;
   }
 
+  /** How generated code reads register `reg` (fused pipelines map decoded columns to flagged locals). */
+  regRef: (reg: number, type: StaticType) => { v: string; nul?: string } = (reg) => ({ v: `r[${reg}]` });
+  /** Set when a closure-compiled node was emitted: it reads the register file directly. */
+  usesRegisterFile = false;
+
+  private reg(reg: number, type: StaticType): Gen {
+    return { ...this.regRef(reg, type), type };
+  }
+
   private viaFallback(e: Expr): Gen {
     const c = this.fallback(e);
-    if (c.reg !== undefined) return { v: `r[${c.reg}]`, type: c.type };
+    if (c.reg !== undefined) return this.reg(c.reg, c.type);
     if (c.constant) return this.literal(c.fn([]), c.type);
+    this.usesRegisterFile = true;
     const v = this.tmp();
     this.lines.push(`const ${v} = ${this.konst(c.fn)}(r);`);
     return { v, type: c.type };
   }
 
   private literal(value: SqlValue, type: StaticType): Gen {
-    if (value === null) return { v: 'null', type: 'null' };
-    if (typeof value === 'number' && Number.isFinite(value)) return { v: Object.is(value, -0) ? '0' : `(${String(value)})`, type };
-    return { v: this.konst(value), type };
+    if (value === null) return { v: '0', nul: 'true', type: 'null' };
+    if (typeof value === 'number' && Number.isFinite(value)) return { v: Object.is(value, -0) ? '0' : `(${String(value)})`, nul: 'false', type };
+    return { v: this.konst(value), nul: 'false', type };
   }
 
-  /** Emit `e`; returns null when the node is not natively supported (caller falls back). */
+  /** Emit `e` (unsupported node kinds go through the closure compiler). */
   gen(e: Expr): Gen {
     const g = this.groupReg(e);
-    if (g) return { v: `r[${g.reg}]`, type: g.type };
+    if (g) return this.reg(g.reg, g.type);
     switch (e.kind) {
       case 'literal':
         return this.literal(e.value, typeof e.value === 'number' ? (e.isReal || !Number.isSafeInteger(e.value) ? 'real' : 'int') : typeof e.value === 'bigint' ? 'int' : e.value === null ? 'null' : typeof e.value === 'string' ? 'text' : 'blob');
@@ -127,14 +162,21 @@ class Emitter {
         if (e.op === 'NOT') {
           const a = this.gen(e.operand);
           const v = this.tmp();
-          this.lines.push(`const ${v} = ${this.truthyExpr(a)}; const n${v} = ${v} === null ? null : ${v} ? 0 : 1;`);
+          if (isNum(a.type) || a.type === 'null') {
+            const nul = nullOf(a);
+            this.lines.push(`const ${v}n = ${nul}; const ${v} = ${v}n ? 0 : (${a.v} != 0 ? 0 : 1);`);
+            return { v, nul: `${v}n`, type: 'int' };
+          }
+          this.lines.push(`const ${v} = T(${plain(a)}); const n${v} = ${v} === null ? null : ${v} ? 0 : 1;`);
           return { v: 'n' + v, type: 'int' };
         }
         if (e.op === '-') {
           const a = this.gen(e.operand);
           const v = this.tmp();
-          this.lines.push(`const ${v} = (typeof ${a.v} === 'number' && ${a.v} !== 0) ? -${a.v} : H.negate(${a.v});`);
-          return { v, type: isNum(a.type) ? a.type : 'num' };
+          this.lines.push(
+            `let ${v}n = ${nullOf(a)}; let ${v} = 0; if (!${v}n) { const x = ${a.v}; if (typeof x === 'number') ${v} = x === 0 ? 0 : -x; else { const s = H.negate(x); if (s === null) ${v}n = true; else ${v} = s; } }`,
+          );
+          return { v, nul: `${v}n`, type: isNum(a.type) ? a.type : 'num' };
         }
         return this.viaFallback(e);
       default:
@@ -144,12 +186,23 @@ class Emitter {
 
   /** JS boolean expression: the value is a true SQL condition (NULL and 0 are false). */
   isTrue(a: Gen): string {
-    return `(${this.truthyExpr(a)} === true)`;
+    if (isNum(a.type) || a.type === 'null') return a.nul !== undefined ? `(!${a.nul} && ${a.v} != 0)` : `(${a.v} !== null && ${a.v} != 0)`;
+    return `(T(${plain(a)}) === true)`;
+  }
+
+  /** JS expression for the value as a nullable SqlValue (for helpers and aggregate states). */
+  value(a: Gen): string {
+    return plain(a);
+  }
+
+  /** JS boolean expression: the value is SQL NULL. */
+  isNull(a: Gen): string {
+    return nullOf(a);
   }
 
   private truthyExpr(a: Gen): string {
-    if (isNum(a.type) || a.type === 'null') return `(${a.v} === null ? null : ${a.v} != 0)`;
-    return `T(${a.v})`;
+    if (isNum(a.type) || a.type === 'null') return `(${nullOf(a)} ? null : ${a.v} != 0)`;
+    return `T(${plain(a)})`;
   }
 
   private logic(op: 'AND' | 'OR', le: Expr, re: Expr): Gen {
@@ -176,45 +229,48 @@ class Emitter {
   private compare(op: string, a: Gen, b: Gen): Gen {
     const jsOp = op === '=' ? '==' : op === '!=' ? '!=' : op;
     const v = this.tmp();
-    this.lines.push(`const ${v} = (${a.v} === null || ${b.v} === null) ? null : (${a.v} ${jsOp} ${b.v} ? 1 : 0);`);
-    return { v, type: 'int' };
+    const nul = orNull(nullOf(a), nullOf(b));
+    this.lines.push(`const ${v}n = ${nul}; const ${v} = ${v}n ? 0 : (${a.v} ${jsOp} ${b.v} ? 1 : 0);`);
+    return { v, nul: `${v}n`, type: 'int' };
   }
 
   private arith(op: string, a: Gen, b: Gen): Gen {
     const real = a.type === 'real' || b.type === 'real';
     const bothInt = a.type === 'int' && b.type === 'int';
     const type: StaticType = real ? 'real' : bothInt ? 'int' : 'num';
-    const slow = `H.arith[${JSON.stringify(op + (real ? 'R' : ''))}]`;
-    const x = a.v;
-    const y = b.v;
     const v = this.tmp();
+    const vn = `${v}n`;
+    const slowFn = `H.arith[${JSON.stringify(op + (real ? 'R' : ''))}]`;
+    const x = 'x';
+    const y = 'y';
+    const slow = `{ const s = ${slowFn}(x, y); if (s === null) ${vn} = true; else ${v} = s; }`;
     let intFast: string;
     switch (op) {
       case '/':
-        intFast = `if (${y} === 0) ${v} = null; else if (${x} > -2147483648 && ${x} < 2147483648 && ${y} > -2147483648 && ${y} < 2147483648) ${v} = Math.trunc(${x} / ${y}) + 0; else ${v} = ${slow}(${x}, ${y});`;
+        intFast = `if (y === 0) ${vn} = true; else if (x > -2147483648 && x < 2147483648 && y > -2147483648 && y < 2147483648) ${v} = Math.trunc(x / y) + 0; else ${slow}`;
         break;
       case '%':
-        intFast = `if (${y} === 0) ${v} = null; else if (${y} === -1) ${v} = 0; else ${v} = (${x} % ${y}) + 0;`;
+        intFast = `if (y === 0) ${vn} = true; else if (y === -1) ${v} = 0; else ${v} = (x % y) + 0;`;
         break;
       default:
-        intFast = `{ const z = ${x} ${op} ${y}; ${v} = Number.isSafeInteger(z) ? z + 0 : ${slow}(${x}, ${y}); }`;
+        intFast = `{ const z = x ${op} y; if (Number.isSafeInteger(z)) ${v} = z + 0; else ${slow} }`;
     }
     let realFast: string;
     switch (op) {
       case '/':
-        realFast = `if (${y} === 0) ${v} = null; else { const z = ${x} / ${y}; ${v} = z === z ? z : null; }`;
+        realFast = `if (y === 0) ${vn} = true; else { const z = x / y; if (z === z) ${v} = z; else ${vn} = true; }`;
         break;
       case '%':
-        realFast = `${v} = ${slow}(${x}, ${y});`;
+        realFast = slow;
         break;
       default:
-        realFast = `{ const z = ${x} ${op} ${y}; ${v} = z === z ? z : null; }`;
+        realFast = `{ const z = x ${op} y; if (z === z) ${v} = z; else ${vn} = true; }`;
     }
-    const fast = real ? realFast : bothInt ? intFast : `if (Number.isSafeInteger(${x}) && Number.isSafeInteger(${y})) { ${intFast} } else { ${realFast} }`;
+    const fast = real ? realFast : bothInt ? intFast : `if (Number.isSafeInteger(x) && Number.isSafeInteger(y)) { ${intFast} } else { ${realFast} }`;
     this.lines.push(
-      `let ${v}; if (${x} === null || ${y} === null) ${v} = null; else if (typeof ${x} === 'number' && typeof ${y} === 'number') { ${fast} } else ${v} = ${slow}(${x}, ${y});`,
+      `let ${vn} = ${orNull(nullOf(a), nullOf(b))}; let ${v} = 0; if (!${vn}) { const ${x} = ${a.v}; const ${y} = ${b.v}; if (typeof x === 'number' && typeof y === 'number') { ${fast} } else ${slow} }`,
     );
-    return { v, type };
+    return { v, nul: vn, type };
   }
 }
 
@@ -230,7 +286,7 @@ export function generate(
 ): { fn: (r: SqlValue[]) => SqlValue; type: StaticType; source: string } {
   const em = new Emitter(fallback, groupReg);
   const g = em.gen(e);
-  const body = `${em.lines.join('\n')}\nreturn ${g.v};`;
+  const body = `${em.lines.join('\n')}\nreturn ${em.value(g)};`;
   let factory = factories.get(body);
   if (factory === undefined) {
     factory = new Function('H', 'K', 'T', `"use strict"; return function smaltExpr(r) {\n${body}\n};`) as Factory;
@@ -281,7 +337,11 @@ const loaderFactories = new Map<string, (H: LoaderHelpers) => Loader>();
  * into registers. Assumes the cell is inline and the record has all columns; the caller checks
  * `cellIsFast` first.
  */
-function emitDecode(spec: LoaderSpec, L: string[]): void {
+/** Assignment of a decoded value: `assign(reg, expr)` returns a statement. Default writes the register file. */
+type Assign = (reg: number, expr: string) => string;
+const toRegister: Assign = (reg, expr) => `r[${reg}] = ${expr};`;
+
+function emitDecode(spec: LoaderSpec, L: string[], assign: Assign = toRegister): void {
   const n = spec.types.length;
   const bitmap = (n + 7) >>> 3;
   L.push('const kl = b[off] | (b[off + 1] << 8); const vo = off + 7 + kl;');
@@ -300,23 +360,23 @@ function emitDecode(spec: LoaderSpec, L: string[]): void {
         // Values that fit in int32 are produced as int32 so V8 keeps them as small integers (fast % and /).
         value =
           `{ const o = fx + ${sl}; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24);` +
-          ` r[${reg}] = (hi === 0 && lo >= 0) || (hi === -1 && lo < 0) ? lo : (hi >= -2097152 && hi <= 2097151) ? hi * 4294967296 + (lo >>> 0) : H.readInt64(dv, o); }`;
+          ` ${assign(reg, '(hi === 0 && lo >= 0) || (hi === -1 && lo < 0) ? lo : (hi >= -2097152 && hi <= 2097151) ? hi * 4294967296 + (lo >>> 0) : H.readInt64(dv, o)')} }`;
       } else if (t === 'REAL') {
-        value = `r[${reg}] = dv.getFloat64(fx + ${sl}, true);`;
+        value = assign(reg, `dv.getFloat64(fx + ${sl}, true)`);
       } else {
         const endOf = (j: number): string => `(wide ? dv.getUint32(vt + ${4 * j}, true) : (b[vt + ${2 * j}] | (b[vt + ${2 * j + 1}] << 8)))`;
         const st = sl === 0 ? 'vd' : `vd + ${endOf(sl - 1)}`;
         const fin = `vd + ${endOf(sl)}`;
-        if (t === 'TEXT') value = `r[${reg}] = H.utf8(b, ${st}, ${fin});`;
-        else if (t === 'BLOB') value = `r[${reg}] = b.slice(${st}, ${fin});`;
-        else value = `r[${reg}] = H.tagged(b, dv, ${st}, ${fin});`;
+        if (t === 'TEXT') value = assign(reg, `H.utf8(b, ${st}, ${fin})`);
+        else if (t === 'BLOB') value = assign(reg, `b.slice(${st}, ${fin})`);
+        else value = assign(reg, `H.tagged(b, dv, ${st}, ${fin})`);
       }
-      L.push(`if (${isNull}) r[${reg}] = null; else ${value}`);
+      L.push(`if (${isNull}) { ${assign(reg, 'null')} } else { ${value} }`);
     }
   }
   if (spec.rowidRegs.length > 0) {
     L.push('{ const id = H.rowid(b, off + 7);');
-    for (const reg of spec.rowidRegs) L.push(`r[${reg}] = id;`);
+    for (const reg of spec.rowidRegs) L.push(assign(reg, 'id'));
     L.push('}');
   }
 }
@@ -382,6 +442,15 @@ export function generateFusedAggregate(
   fallback: (e: Expr) => FallbackNode,
 ): (r: SqlValue[], states: unknown[]) => void {
   const em = new Emitter(fallback, () => undefined);
+  // Decoded columns live in JS locals (no boxing into the shared register array). Registers are
+  // resolved lazily while emitting, so collect the ones referenced.
+  // Numeric columns get a separate NULL flag (c5 / c5n) so the value variable stays an unboxed number.
+  const localRegs = new Map<number, boolean>(); // reg -> flagged
+  em.regRef = (reg, type) => {
+    const flagged = type === 'int' || type === 'real';
+    if (!localRegs.has(reg)) localRegs.set(reg, flagged);
+    return localRegs.get(reg) ? { v: `c${reg}`, nul: `c${reg}n` } : { v: `c${reg}` };
+  };
   const rowLines: string[] = [];
   const take = (): string[] => {
     const l = em.lines;
@@ -399,7 +468,7 @@ export function generateFusedAggregate(
     else {
       const g = em.gen(a.arg!);
       body.push(...take());
-      body.push(a.kind === 'count' ? `if (${g.v} !== null) S${i}.n++;` : `S${i}.step1(${g.v});`);
+      body.push(a.kind === 'count' ? `if (!${em.isNull(g)}) S${i}.n++;` : `S${i}.step1(${em.value(g)});`);
     }
     if (a.filter) {
       const f = em.gen(a.filter);
@@ -407,17 +476,36 @@ export function generateFusedAggregate(
     } else rowLines.push(`{ ${body.join(' ')} }`);
   });
   const spec = loaderSpec(); // decode list is final now
+  const decodedRegs = new Set<number>([...spec.rowidRegs]);
+  for (let i = 1; i < spec.decode.length; i += 2) decodedRegs.add(spec.decode[i]);
+  // Closure-compiled nodes read the register file, so then mirror decoded values into it.
+  const mirror = em.usesRegisterFile;
+  const assign: Assign = (reg, expr) => {
+    const m = mirror ? (expr === 'null' ? ` r[${reg}] = null;` : ` r[${reg}] = c${reg};`) : '';
+    if (!localRegs.has(reg)) return mirror ? `r[${reg}] = ${expr};` : '';
+    if (!localRegs.get(reg)) return `c${reg} = ${expr};${m}`;
+    return expr === 'null' ? `c${reg}n = true; c${reg} = 0;${m}` : `c${reg}n = false; c${reg} = ${expr};${m}`;
+  };
   const dec: string[] = [];
-  emitDecode(spec, dec);
+  emitDecode(spec, dec, assign);
+  // Registers referenced by expressions but not decoded here (e.g. outer-query columns) are read from the register file.
+  const outer = [...localRegs.keys()].filter((reg) => !decodedRegs.has(reg));
+  const locals = [...localRegs.keys()].filter((reg) => decodedRegs.has(reg));
+  const load = (reg: number): string =>
+    localRegs.get(reg) ? `{ const t = r[${reg}]; c${reg}n = t === null; c${reg} = c${reg}n ? 0 : t; }` : `c${reg} = r[${reg}];`;
+  const reloadAfterSlow = locals.map(load).join(' ');
+  const declLocals = locals.map((reg) => (localRegs.get(reg) ? `c${reg} = 0, c${reg}n = true` : `c${reg} = null`)).join(', ');
   const src = [
     ...aggs.map((_, i) => `const S${i} = S[${i}];`),
+    ...outer.map((reg) => (localRegs.get(reg) ? `const c${reg}n = r[${reg}] === null; const c${reg} = c${reg}n ? 0 : r[${reg}];` : `const c${reg} = r[${reg}];`)),
     'let f = H.first();',
     'try {',
     '  while (f !== null) {',
     '    const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);',
     '    for (let i = 0; i < n; i++) {',
     '      const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);',
-    `      if (${cellIsFast(spec)}) { ${dec.join(' ')} } else H.slow(f, off, r);`,
+    locals.length ? `      let ${declLocals};` : '',
+    `      if (${cellIsFast(spec)}) { ${dec.join(' ')} } else { H.slow(f, off, r); ${reloadAfterSlow} }`,
     ...rowLines.map((l) => '      ' + l),
     '    }',
     '    f = H.next(f);',
