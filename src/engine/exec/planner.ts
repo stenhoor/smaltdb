@@ -23,11 +23,18 @@ import {
   type Compiled,
   type Fn,
   compileExpr,
+  compileNode,
   comparisonCollation,
   comparisonConverters,
   conjuncts,
 } from './expr.js';
-import { type FunctionContext, aggregateFunctions } from './functions.js';
+import { type AggregateState, type FunctionContext, aggregateFunctions } from './functions.js';
+import { type FusedAggSpec, type FusedHelpers, codegenEnabled, generateFusedAggregate } from './codegen.js';
+import { CODEGEN_HELPERS_FOR_FUSION } from './expr.js';
+import type { Frame } from '../storage/pager.js';
+import { PH_RIGHT } from '../storage/format.js';
+
+const FUSABLE_AGGS = new Set(['count', 'sum', 'total', 'avg', 'min', 'max']);
 import {
   type AggSpec,
   Compound,
@@ -35,6 +42,7 @@ import {
   Distinct,
   type ExecState,
   Filter,
+  FusedScanAggregate,
   HashAggregate,
   HashJoin,
   IndexScan,
@@ -399,6 +407,9 @@ export class Planner {
             collation: args[0]?.collSrc ? args[0].collation : Collation.Binary,
             star: call.star,
             isMinMax: call.name === 'min' || call.name === 'max',
+            name: call.name,
+            argAsts: call.args,
+            filterAst: call.filter,
           };
           aggs.push(spec);
           aggAsts.push(call);
@@ -453,7 +464,8 @@ export class Planner {
     }
 
     if (agg) {
-      root = new HashAggregate(root, agg.groupFns, agg.groupColls, agg.groupRegs, agg.aggs, [...agg.bare]);
+      const fused = agg.groupFns.length === 0 && agg.bare.size === 0 ? this.tryFuseAggregate(root, agg.aggs, scope) : null;
+      root = fused ?? new HashAggregate(root, agg.groupFns, agg.groupColls, agg.groupRegs, agg.aggs, [...agg.bare]);
       if (having) root = new Filter(root, having);
     }
 
@@ -496,6 +508,49 @@ export class Planner {
       columns: [{ name, type: 'int', collation: Collation.Binary, affinity: 'NONE' }],
       correlated: false,
     };
+  }
+
+  /**
+   * Fuse `Filter* -> full TableScan` under an ungrouped aggregate into one generated function
+   * (FusedScanAggregate). Returns null when the shape or the aggregates do not qualify.
+   */
+  private tryFuseAggregate(src: Operator, aggs: AggSpec[], scope: Scope): Operator | null {
+    if (!codegenEnabled() || aggs.length === 0) return null;
+    const preds: Expr[] = [];
+    let node: Operator = src;
+    while (node instanceof Filter) {
+      if (!node.ast) return null;
+      preds.push(node.ast);
+      node = node.child;
+    }
+    if (!(node instanceof TableScan) || node.lo || node.hi) return null;
+    const specs: FusedAggSpec[] = [];
+    for (const a of aggs) {
+      if (a.distinct || !FUSABLE_AGGS.has(a.name) || a.argAsts.length > 1) return null;
+      if (a.name === 'count') specs.push(a.star ? { kind: 'countStar', filter: a.filterAst } : { kind: 'count', arg: a.argAsts[0], filter: a.filterAst });
+      else specs.push({ kind: 'step', arg: a.argAsts[0], filter: a.filterAst });
+    }
+    const access = node.access;
+    const cs = this.compileScope(scope);
+    const tree = access.tree;
+    const pager = tree.pager;
+    const helpers: FusedHelpers = {
+      ...CODEGEN_HELPERS_FOR_FUSION,
+      first: () => {
+        const f = tree.descendForCursor(null, false);
+        return f;
+      },
+      next: (page) => {
+        const f = page as Frame;
+        const nx = f.view.getUint32(PH_RIGHT, true);
+        pager.release(f);
+        return nx === 0 ? null : pager.get(nx);
+      },
+      release: (page) => pager.release(page as Frame),
+      slow: (page, off, r) => access.loadCell(page, off, r),
+    };
+    const run = generateFusedAggregate(preds.reverse(), specs, () => access.loaderSpec(), helpers, (e) => compileNode(e, cs));
+    return new FusedScanAggregate(access, aggs, run as (r: SqlValue[], states: AggregateState[]) => void);
   }
 
   /** Register of the rowid if `e` names the rowid of the single source, else -1. */
@@ -682,7 +737,7 @@ export class Planner {
       let leaf = access.leaf;
       const local = candidates.filter((c) => c.deps!.size === 1);
       for (const c of local) {
-        leaf = new Filter(leaf, compileExpr(c.expr, cs).fn);
+        leaf = new Filter(leaf, compileExpr(c.expr, cs).fn, c.expr);
         c.placed = true;
       }
 
@@ -714,14 +769,14 @@ export class Planner {
       // Remaining WHERE / inner-ON conjuncts whose dependencies are now all available.
       for (const c of pool) {
         if (c.placed || c.deps === null || c.deps.size === 0 || maxDep(c.deps) !== p) continue;
-        root = new Filter(root, compileExpr(c.expr, cs).fn);
+        root = new Filter(root, compileExpr(c.expr, cs).fn, c.expr);
         c.placed = true;
       }
     }
     // Constant / correlated-only / subquery conjuncts.
     for (const c of pool) {
       if (c.placed) continue;
-      root = new Filter(root!, compileExpr(c.expr, cs).fn);
+      root = new Filter(root!, compileExpr(c.expr, cs).fn, c.expr);
       c.placed = true;
     }
     return root!;

@@ -39,6 +39,8 @@ export interface ScalarFunction {
 
 export interface AggregateState {
   step(args: SqlValue[]): void;
+  /** Single-argument step (used by generated code; same semantics as step([v])). */
+  step1?(v: SqlValue): void;
   final(): SqlValue;
 }
 
@@ -605,7 +607,11 @@ class SumState implements AggregateState {
   ) {}
 
   step(args: SqlValue[]): void {
-    let v = args[0];
+    this.step1(args[0]);
+  }
+
+  step1(arg: SqlValue): void {
+    let v = arg;
     if (v === null) return;
     if (typeof v === 'string' || v instanceof Uint8Array) v = toNumeric(v)!;
     this.count++;
@@ -674,7 +680,10 @@ class MinMaxState implements AggregateState {
     private readonly collation: Collation,
   ) {}
   step(args: SqlValue[]): void {
-    const v = args[0];
+    this.step1(args[0]);
+  }
+
+  step1(v: SqlValue): void {
     this.changed = false;
     if (v === null) return;
     if (this.best === null || this.sign * compareValues(v, this.best, this.collation) < 0) {

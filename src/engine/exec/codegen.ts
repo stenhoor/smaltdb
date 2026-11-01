@@ -142,6 +142,11 @@ class Emitter {
     }
   }
 
+  /** JS boolean expression: the value is a true SQL condition (NULL and 0 are false). */
+  isTrue(a: Gen): string {
+    return `(${this.truthyExpr(a)} === true)`;
+  }
+
   private truthyExpr(a: Gen): string {
     if (isNum(a.type) || a.type === 'null') return `(${a.v} === null ? null : ${a.v} != 0)`;
     return `T(${a.v})`;
@@ -271,15 +276,16 @@ const loaderFactories = new Map<string, (H: LoaderHelpers) => Loader>();
  * types baked in. Returns false (caller uses the generic reader) for cells whose value is in
  * overflow pages or whose record has a different column count (older rows after ADD COLUMN).
  */
-export function generateLoader(spec: LoaderSpec, helpers: LoaderHelpers): Loader {
+/**
+ * Emit statements that decode the cell at byte offset `off` of a leaf page (`b`: bytes, `dv`: view)
+ * into registers. Assumes the cell is inline and the record has all columns; the caller checks
+ * `cellIsFast` first.
+ */
+function emitDecode(spec: LoaderSpec, L: string[]): void {
   const n = spec.types.length;
   const bitmap = (n + 7) >>> 3;
-  const L: string[] = [];
-  L.push('const p = c.page; const b = p.bytes; const dv = p.view; const off = c.cellOffset();');
-  L.push('if (b[off + 2] & 1) return false;'); // overflow value
   L.push('const kl = b[off] | (b[off + 1] << 8); const vo = off + 7 + kl;');
   if (spec.decode.length > 0) {
-    L.push(`if ((b[vo + 1] | (b[vo + 2] << 8)) !== ${n}) return false;`);
     L.push(`const bm = vo + 3; const fx = bm + ${bitmap}; const vt = fx + ${spec.fixedSize};`);
     const needsVar = spec.decode.some((_, i) => i % 2 === 0 && !(spec.types[spec.decode[i]] === 'INTEGER' || spec.types[spec.decode[i]] === 'REAL'));
     if (needsVar) L.push(`const wide = (b[vo] & 1) === 1; const vd = vt + ${spec.varCount} * (wide ? 4 : 2);`);
@@ -287,32 +293,50 @@ export function generateLoader(spec: LoaderSpec, helpers: LoaderHelpers): Loader
       const col = spec.decode[i];
       const reg = spec.decode[i + 1];
       const t = spec.types[col];
-      const s = spec.slots[col];
+      const sl = spec.slots[col];
       const isNull = `(b[bm + ${col >>> 3}] & ${1 << (col & 7)}) !== 0`;
       let value: string;
       if (t === 'INTEGER') {
-        const o = `fx + ${s}`;
+        // Values that fit in int32 are produced as int32 so V8 keeps them as small integers (fast % and /).
         value =
-          // Values that fit in int32 are produced as int32 so V8 keeps them as small integers (fast % and /).
-          `{ const o = ${o}; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24);` +
+          `{ const o = fx + ${sl}; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24);` +
           ` r[${reg}] = (hi === 0 && lo >= 0) || (hi === -1 && lo < 0) ? lo : (hi >= -2097152 && hi <= 2097151) ? hi * 4294967296 + (lo >>> 0) : H.readInt64(dv, o); }`;
       } else if (t === 'REAL') {
-        value = `r[${reg}] = dv.getFloat64(fx + ${s}, true);`;
+        value = `r[${reg}] = dv.getFloat64(fx + ${sl}, true);`;
       } else {
-        const end = (j: number): string => `(wide ? dv.getUint32(vt + ${4 * j}, true) : (b[vt + ${2 * j}] | (b[vt + ${2 * j + 1}] << 8)))`;
-        const start = s === 0 ? 'vd' : `vd + ${end(s - 1)}`;
-        const fin = `vd + ${end(s)}`;
-        if (t === 'TEXT') value = `r[${reg}] = H.utf8(b, ${start}, ${fin});`;
-        else if (t === 'BLOB') value = `r[${reg}] = b.slice(${start}, ${fin});`;
-        else value = `r[${reg}] = H.tagged(b, dv, ${start}, ${fin});`;
+        const endOf = (j: number): string => `(wide ? dv.getUint32(vt + ${4 * j}, true) : (b[vt + ${2 * j}] | (b[vt + ${2 * j + 1}] << 8)))`;
+        const st = sl === 0 ? 'vd' : `vd + ${endOf(sl - 1)}`;
+        const fin = `vd + ${endOf(sl)}`;
+        if (t === 'TEXT') value = `r[${reg}] = H.utf8(b, ${st}, ${fin});`;
+        else if (t === 'BLOB') value = `r[${reg}] = b.slice(${st}, ${fin});`;
+        else value = `r[${reg}] = H.tagged(b, dv, ${st}, ${fin});`;
       }
       L.push(`if (${isNull}) r[${reg}] = null; else ${value}`);
     }
   }
   if (spec.rowidRegs.length > 0) {
-    L.push('const id = H.rowid(b, off + 7);');
+    L.push('{ const id = H.rowid(b, off + 7);');
     for (const reg of spec.rowidRegs) L.push(`r[${reg}] = id;`);
+    L.push('}');
   }
+}
+
+/** JS condition: the cell at `off` can be decoded by emitDecode (inline value, full-width record). */
+function cellIsFast(spec: LoaderSpec): string {
+  if (spec.decode.length === 0) return '!(b[off + 2] & 1)';
+  return `!(b[off + 2] & 1) && (b[off + 7 + (b[off] | (b[off + 1] << 8)) + 1] | (b[off + 7 + (b[off] | (b[off + 1] << 8)) + 2] << 8)) === ${spec.types.length}`;
+}
+
+/**
+ * Generate a row decoder that reads directly from the leaf page bytes, with column offsets and
+ * types baked in. Returns false (caller uses the generic reader) for cells whose value is in
+ * overflow pages or whose record has a different column count (older rows after ADD COLUMN).
+ */
+export function generateLoader(spec: LoaderSpec, helpers: LoaderHelpers): Loader {
+  const L: string[] = [];
+  L.push('const p = c.page; const b = p.bytes; const dv = p.view; const off = c.cellOffset();');
+  L.push(`if (!(${cellIsFast(spec)})) return false;`);
+  emitDecode(spec, L);
   L.push('return true;');
   const body = L.join('\n');
   let factory = loaderFactories.get(body);
@@ -322,4 +346,88 @@ export function generateLoader(spec: LoaderSpec, helpers: LoaderHelpers): Loader
     loaderFactories.set(body, factory);
   }
   return factory(helpers);
+}
+
+// ------------------------------------------------------------------ fused scan + filter + aggregate
+
+export interface FusedAggSpec {
+  kind: 'countStar' | 'count' | 'step';
+  /** Argument expression (count/step). */
+  arg?: Expr;
+  filter?: Expr;
+}
+
+export interface FusedHelpers extends LoaderHelpers, CodegenHelpers {
+  /** First leaf page of the table (pinned), or null. */
+  first(): { bytes: Uint8Array; view: DataView } | null;
+  /** Release `page` and return the next leaf (pinned), or null. */
+  next(page: { bytes: Uint8Array; view: DataView }): { bytes: Uint8Array; view: DataView } | null;
+  release(page: { bytes: Uint8Array; view: DataView }): void;
+  /** Generic decode of one cell (overflow values, short records). */
+  slow(page: { bytes: Uint8Array; view: DataView }, off: number, r: SqlValue[]): void;
+}
+
+/**
+ * Generate one function that scans every leaf of a table, decodes the needed columns, evaluates
+ * the WHERE conjuncts and steps the aggregates — no per-row operator calls. Expressions are
+ * emitted with the same generator as single expressions (closure compiler for other nodes).
+ * Column references are resolved (and added to the decode list) while emitting, so the decode
+ * section is generated last.
+ */
+export function generateFusedAggregate(
+  preds: Expr[],
+  aggs: FusedAggSpec[],
+  loaderSpec: () => LoaderSpec,
+  helpers: FusedHelpers,
+  fallback: (e: Expr) => FallbackNode,
+): (r: SqlValue[], states: unknown[]) => void {
+  const em = new Emitter(fallback, () => undefined);
+  const rowLines: string[] = [];
+  const take = (): string[] => {
+    const l = em.lines;
+    em.lines = [];
+    return l;
+  };
+  // WHERE: every conjunct must be true (NULL counts as false).
+  for (const p of preds) {
+    const g = em.gen(p);
+    rowLines.push(...take(), `if (!${em.isTrue(g)}) continue;`);
+  }
+  aggs.forEach((a, i) => {
+    const body: string[] = [];
+    if (a.kind === 'countStar') body.push(`S${i}.n++;`);
+    else {
+      const g = em.gen(a.arg!);
+      body.push(...take());
+      body.push(a.kind === 'count' ? `if (${g.v} !== null) S${i}.n++;` : `S${i}.step1(${g.v});`);
+    }
+    if (a.filter) {
+      const f = em.gen(a.filter);
+      rowLines.push(`{ ${take().join(' ')} if (${em.isTrue(f)}) { ${body.join(' ')} } }`);
+    } else rowLines.push(`{ ${body.join(' ')} }`);
+  });
+  const spec = loaderSpec(); // decode list is final now
+  const dec: string[] = [];
+  emitDecode(spec, dec);
+  const src = [
+    ...aggs.map((_, i) => `const S${i} = S[${i}];`),
+    'let f = H.first();',
+    'try {',
+    '  while (f !== null) {',
+    '    const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);',
+    '    for (let i = 0; i < n; i++) {',
+    '      const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);',
+    `      if (${cellIsFast(spec)}) { ${dec.join(' ')} } else H.slow(f, off, r);`,
+    ...rowLines.map((l) => '      ' + l),
+    '    }',
+    '    f = H.next(f);',
+    '  }',
+    '} finally { if (f !== null) H.release(f); }',
+  ].join('\n');
+  const factory = new Function('H', 'K', 'T', `"use strict"; return function smaltFusedAggregate(r, S) {\n${src}\n};`) as (
+    H: FusedHelpers,
+    K: unknown[],
+    T: typeof truthy,
+  ) => (r: SqlValue[], states: unknown[]) => void;
+  return factory(helpers, em.consts, truthy);
 }

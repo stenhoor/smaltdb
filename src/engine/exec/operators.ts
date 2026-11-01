@@ -2,7 +2,7 @@ import { SmaltError } from '../errors.js';
 import type { BTree, BTreeCursor } from '../storage/btree.js';
 import { KeyEncoder, ROWID_KEY_SIZE, decodeKey, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
 import { type RecordReader, decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
-import { type LoaderHelpers, codegenEnabled, generateLoader } from './codegen.js';
+import { type LoaderHelpers, type LoaderSpec, codegenEnabled, generateLoader } from './codegen.js';
 
 const LOADER_HELPERS: LoaderHelpers = { readInt64, utf8: decodeUtf8, tagged: decodeTagged, rowid: readRowidKey };
 import { Collation, type SqlValue, compareValues } from '../values.js';
@@ -76,20 +76,47 @@ export class TableAccess {
     this.loadGeneric(c, r);
   }
 
+  /** Layout + decode list for generated decoders (call once the decode list is final). */
+  loaderSpec(): LoaderSpec {
+    const layout = this.reader.layout;
+    return {
+      types: layout.types,
+      slots: layout.full.slot,
+      fixedSize: layout.full.fixedSize,
+      varCount: layout.full.varCount,
+      decode: this.decode,
+      rowidRegs: this.rowidReg >= 0 ? [this.rowidReg, ...this.extraRowidRegs] : [],
+    };
+  }
+
   private buildLoader(): ((c: BTreeCursor, r: SqlValue[]) => boolean) | null {
     if (!codegenEnabled()) return null;
-    const layout = this.reader.layout;
-    return generateLoader(
-      {
-        types: layout.types,
-        slots: layout.full.slot,
-        fixedSize: layout.full.fixedSize,
-        varCount: layout.full.varCount,
-        decode: this.decode,
-        rowidRegs: this.rowidReg >= 0 ? [this.rowidReg, ...this.extraRowidRegs] : [],
-      },
-      LOADER_HELPERS,
-    ) as unknown as (c: BTreeCursor, r: SqlValue[]) => boolean;
+    return generateLoader(this.loaderSpec(), LOADER_HELPERS) as unknown as (c: BTreeCursor, r: SqlValue[]) => boolean;
+  }
+
+  /** Generic decode of the cell at `off` in leaf `page` (for generated scans' slow path). */
+  loadCell(page: { bytes: Uint8Array; view: DataView }, off: number, r: SqlValue[]): void {
+    const d = this.decode;
+    if (d.length > 0) {
+      const b = page.bytes;
+      const kl = b[off] | (b[off + 1] << 8);
+      let bytes = b;
+      let start = off + 7 + kl;
+      let len = page.view.getUint32(off + 3, true);
+      if (b[off + 2] & 1) {
+        bytes = this.tree.readValue(page, off);
+        start = 0;
+        len = bytes.length;
+      }
+      const rd = this.reader;
+      rd.reset(bytes, start, len);
+      for (let i = 0; i < d.length; i += 2) r[d[i + 1]] = rd.column(d[i]);
+    }
+    if (this.rowidReg >= 0) {
+      const id = readRowidKey(page.bytes, off + 7);
+      r[this.rowidReg] = id;
+      for (const x of this.extraRowidRegs) r[x] = id;
+    }
   }
 
   /** Generic decoder (always correct; used for overflow values, short records, and without codegen). */
@@ -443,6 +470,8 @@ export class Filter implements Operator {
   constructor(
     readonly child: Operator,
     readonly pred: Fn,
+    /** Source predicate (lets the planner fuse scan + filter + aggregate into generated code). */
+    readonly ast?: import('../sql/ast.js').Expr,
   ) {
     this.children = [child];
   }
@@ -740,6 +769,10 @@ export interface AggSpec {
   collation: Collation;
   star: boolean;
   isMinMax: boolean;
+  /** Function name and argument / FILTER ASTs (for pipeline fusion). */
+  name: string;
+  argAsts: import('../sql/ast.js').Expr[];
+  filterAst?: import('../sql/ast.js').Expr;
 }
 
 interface Group {
@@ -1124,4 +1157,44 @@ export function explainRows(root: Operator): { id: number; parent: number; detai
   };
   walk(root, 0);
   return out;
+}
+
+/**
+ * Single-table scan + WHERE + aggregates (no GROUP BY) fused into one generated function that walks
+ * the leaf pages directly. Produces one row of aggregate results, like HashAggregate.
+ */
+export class FusedScanAggregate implements Operator {
+  readonly children: Operator[] = [];
+  private r!: SqlValue[];
+  private done = false;
+  private states: AggregateState[] = [];
+
+  constructor(
+    readonly access: TableAccess,
+    readonly aggs: AggSpec[],
+    /** Generated: run(r, states) consumes the whole table. */
+    readonly run: (r: SqlValue[], states: AggregateState[]) => void,
+  ) {}
+
+  get detail(): string {
+    return `SCAN ${this.access.tableName} (fused scan + filter + aggregate)`;
+  }
+
+  open(r: SqlValue[]): void {
+    this.r = r;
+    this.done = false;
+    this.states = this.aggs.map((a) => a.def.create(a.star ? [] : a.argTypes, a.collation));
+    this.run(r, this.states);
+  }
+
+  next(): boolean {
+    if (this.done) return false;
+    this.done = true;
+    for (let i = 0; i < this.aggs.length; i++) this.r[this.aggs[i].outReg] = this.states[i].final();
+    return true;
+  }
+
+  close(): void {
+    this.states = [];
+  }
 }

@@ -22,6 +22,8 @@ import {
 } from './convert.js';
 import { type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type CodegenHelpers, codegenEnabled, generate, isCodegenRoot } from './codegen.js';
+import { decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
+import { readRowidKey } from '../storage/key-codec.js';
 
 export type { Fn };
 
@@ -982,3 +984,15 @@ export function isTrue(v: SqlValue): boolean {
   if (typeof v === 'number') return v !== 0;
   return truthy(v) === true;
 }
+
+/** Expression helpers plus row-decoding helpers, for fused pipelines. */
+export const CODEGEN_HELPERS_FOR_FUSION = {
+  get arith() {
+    return CODEGEN_HELPERS.arith;
+  },
+  negate: (v: SqlValue) => negate(v),
+  readInt64,
+  utf8: decodeUtf8,
+  tagged: decodeTagged,
+  rowid: readRowidKey,
+};
