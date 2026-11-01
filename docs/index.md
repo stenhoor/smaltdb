@@ -2,7 +2,7 @@
 layout: home
 
 hero:
-  name: smaltdb
+  name: 'sm<span class="alt">alt</span>db'
   text: Small. Alternate. Fast.
   tagline: A fast alternative database for the browser, written in TypeScript.
   image:

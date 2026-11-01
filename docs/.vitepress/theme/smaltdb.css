@@ -113,3 +113,14 @@
 
 /* Keep the hero mark in proportion with the name. */
 .VPHero .image-src { max-width: 200px; max-height: 200px; }
+
+/* Hero wordmark: Martian Mono 600, "alt" in smalt (matches the logo files). */
+.VPHero .name {
+  font-family: var(--smalt-brand-font);
+  font-weight: 600;
+  letter-spacing: -0.06em;
+}
+.VPHero .name .alt {
+  color: var(--vp-c-brand-1);
+  -webkit-text-fill-color: var(--vp-c-brand-1);
+}
