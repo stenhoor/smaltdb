@@ -71,7 +71,7 @@ export interface CredentialProvider {
 }
 
 /** The subset of `fetch` the sources use (injectable for tests and custom transports). */
-export type FetchFn = (url: string, init: { headers: Record<string, string>; signal?: AbortSignal }) => Promise<{
+export type FetchFn = (url: string, init: { method?: 'GET' | 'HEAD'; headers: Record<string, string>; signal?: AbortSignal }) => Promise<{
   ok: boolean;
   status: number;
   statusText: string;
@@ -349,7 +349,17 @@ export class ExternalRegistry {
     return null;
   }
 
-  private async fetchBytes(source: ExternalSource, signal?: AbortSignal): Promise<{ bytes: Uint8Array; validator: string | null }> {
+  /**
+   * The source's current validator (ETag or Last-Modified, a file's mtime and size, a registered
+   * File's lastModified and size) without reading it: a HEAD request or a stat. null when the source
+   * has none (a registered Blob or bytes): it then counts as changed.
+   */
+  async currentValidator(source: ExternalSource, signal?: AbortSignal): Promise<string | null> {
+    return (await this.fetchBytes(source, signal, true)).validator;
+  }
+
+  /** `head`: only the validator (no body). */
+  private async fetchBytes(source: ExternalSource, signal?: AbortSignal, head = false): Promise<{ bytes: Uint8Array; validator: string | null }> {
     const conn = source.connection;
     const type = conn ? String(conn.options.type ?? 'http').toLowerCase() : null;
     if (type !== null && type !== 'http' && type !== 'https') {
@@ -360,23 +370,23 @@ export class ExternalRegistry {
       const name = loc.slice(5);
       const f = this.files.get(name);
       if (f === undefined) throw externalError(source, `no file is registered as '${name}' (registerFile)`);
-      return { bytes: await fileBytes(f), validator: null };
+      return fileBytes(f, head);
     }
     const url = this.url(source);
-    if (url !== null) return this.fetchUrl(source, url, signal);
+    if (url !== null) return this.fetchUrl(source, url, signal, head);
     if (SCHEME.test(loc) && !/^[a-z]:[\\/]/i.test(loc)) throw externalError(source, `unsupported location '${loc}' (http(s) URLs, file:<name>, or a path in Node)`);
     if (!isNode()) throw externalError(source, `'${loc}' is a local path: in a browser, register the file (registerFile) and use file:<name>`);
     const fsName = 'node:fs/promises';
     const fs = (await import(/* @vite-ignore */ fsName)) as { readFile(p: string): Promise<Uint8Array>; stat(p: string): Promise<{ mtimeMs: number; size: number }> };
     try {
-      const [bytes, st] = await Promise.all([fs.readFile(loc), fs.stat(loc)]);
+      const [bytes, st] = await Promise.all([head ? new Uint8Array(0) : fs.readFile(loc), fs.stat(loc)]);
       return { bytes, validator: `${st.mtimeMs}:${st.size}` };
     } catch (e) {
       throw externalError(source, (e as Error).message);
     }
   }
 
-  private async fetchUrl(source: ExternalSource, url: string, signal?: AbortSignal): Promise<{ bytes: Uint8Array; validator: string | null }> {
+  private async fetchUrl(source: ExternalSource, url: string, signal?: AbortSignal, head = false): Promise<{ bytes: Uint8Array; validator: string | null }> {
     const headers: Record<string, string> = {};
     const credName = source.connection?.options.credentials;
     if (credName !== undefined && credName !== null) {
@@ -385,27 +395,34 @@ export class ExternalRegistry {
       if (!url.startsWith(p.endpoint)) {
         throw externalError(source, `credentials '${credName}' are bound to ${p.endpoint}; refusing to send them to ${url}`);
       }
-      Object.assign(headers, typeof p.headers === 'function' ? await p.headers(url) : p.headers);
+      try {
+        Object.assign(headers, typeof p.headers === 'function' ? await p.headers(url) : p.headers);
+      } catch (e) {
+        throw externalError(source, (e as Error).message); // a provider that failed or refused
+      }
     }
     const fetchFn = this.fetchFn ?? (globalThis.fetch as unknown as FetchFn | undefined);
     if (!fetchFn) throw externalError(source, 'no fetch available in this environment');
     let res: Awaited<ReturnType<FetchFn>>;
     try {
-      res = await fetchFn(url, { headers, signal });
+      res = await fetchFn(url, head ? { method: 'HEAD', headers, signal } : { headers, signal });
     } catch (e) {
       if ((e as Error).name === 'AbortError') throw new SmaltError('SMALT_INTERRUPT', 'interrupted');
       throw externalError(source, `fetching ${url} failed: ${(e as Error).message} (a network error, or a CORS error: the server must allow this origin)`);
     }
     if (!res.ok) throw externalError(source, `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ''} for ${url}`);
-    const bytes = new Uint8Array(await res.arrayBuffer());
+    const bytes = head ? new Uint8Array(0) : new Uint8Array(await res.arrayBuffer());
     return { bytes, validator: res.headers.get('etag') ?? res.headers.get('last-modified') };
   }
 }
 
-async function fileBytes(f: FileSource): Promise<Uint8Array> {
-  if (typeof f === 'string') return new TextEncoder().encode(f);
-  if (f instanceof Uint8Array) return f;
-  if (f instanceof ArrayBuffer) return new Uint8Array(f);
+/** A registered file's bytes and validator (a File's lastModified and size; none for Blobs and bytes). */
+async function fileBytes(f: FileSource, head = false): Promise<{ bytes: Uint8Array; validator: string | null }> {
+  if (typeof f === 'string') return { bytes: new TextEncoder().encode(f), validator: null };
+  if (f instanceof Uint8Array) return { bytes: f, validator: null };
+  if (f instanceof ArrayBuffer) return { bytes: new Uint8Array(f), validator: null };
   const blob = 'getFile' in f ? await f.getFile() : f;
-  return new Uint8Array(await blob.arrayBuffer());
+  const lastModified = (blob as { lastModified?: number }).lastModified;
+  const validator = typeof lastModified === 'number' ? `${lastModified}:${blob.size}` : null;
+  return { bytes: head ? new Uint8Array(0) : new Uint8Array(await blob.arrayBuffer()), validator };
 }

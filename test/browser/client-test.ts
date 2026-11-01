@@ -38,6 +38,16 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   await db.exec('CREATE MATERIALIZED VIEW prices_cache AS SELECT * FROM prices');
   const cached = await db.query('SELECT count(*), sum(price) FROM prices_cache', undefined, { rowMode: 'array' });
   check('external: cached in a materialized view', JSON.stringify(cached) === JSON.stringify([[3, 3.5]]), cached);
+  // Credentials computed per request by a callback in this tab (the engine worker asks for them).
+  const asked: string[] = [];
+  await db.registerCredentials('site-token', { endpoint: location.origin + '/', headers: async (url) => (asked.push(url), { 'x-token': 'abc' }) });
+  await db.exec(`CREATE CONNECTION site_auth WITH (url = '${location.origin}', credentials = 'site-token')`);
+  await db.exec("CREATE EXTERNAL TABLE prices_auth WITH (connection = 'site_auth', location = 'prices.csv')");
+  const csv = await db.exportCSV('SELECT name FROM prices_auth ORDER BY id');
+  check('external: credentials callback asked per request; export over external data', csv === 'name\napple\n"pear, green"\nplum\n' && asked.length === 2 && asked[1] === location.origin + '/prices.csv', [csv, asked]);
+  await db.exec('REFRESH MATERIALIZED VIEW prices_cache IF CHANGED');
+  await db.exec('DROP EXTERNAL TABLE prices_auth; DROP CONNECTION site_auth');
+  await db.registerCredentials('site-token', null);
   await db.exec('DROP MATERIALIZED VIEW prices_cache; DROP EXTERNAL TABLE prices; DROP CONNECTION site');
   await db.registerFile('stock', null);
 

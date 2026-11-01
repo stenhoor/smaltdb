@@ -136,6 +136,16 @@ interface ExternalTableDef {
   sql: string;
 }
 
+/** An external source a materialized view read at its last refresh (smalt_extcache). */
+interface ExternalCacheEntry {
+  label: string;
+  location: string;
+  format: 'csv' | 'json';
+  options: Record<string, SqlValue>;
+  connection: string | null;
+  validator: string | null;
+}
+
 /** Catalog key of a connection (connections have their own namespace). */
 const connectionKey = (name: string): string => `\u0000connection:${name.toLowerCase()}`;
 const quoteIdent = (name: string): string => '"' + name.replace(/"/g, '""') + '"';
@@ -537,6 +547,18 @@ export class Database implements FunctionContext {
     if (params !== undefined && stmts.length > 1) throw new MisuseError('parameters can only be bound with a single statement');
     for (const ps of stmts) {
       const st = new Statement(this, ps, ps.text);
+      const s = ps.stmt;
+      if (s.kind === 'refresh' && s.ifChanged) {
+        // Revalidate the view's sources first (HEAD requests, stats): the refresh runs only if needed.
+        const key = s.name.toLowerCase();
+        this.refreshDecisions.set(key, await this.matviewChanged(s.name, options.signal));
+        try {
+          await this.withExternal(options.signal, st, () => st.run(params));
+        } finally {
+          this.refreshDecisions.delete(key);
+        }
+        continue;
+      }
       await this.withExternal(options.signal, st, () => st.run(params));
     }
   }
@@ -546,7 +568,8 @@ export class Database implements FunctionContext {
    * (a view over `read_csv`, a materialized view's query) is loaded and the statement retried; each
    * attempt is atomic, so a retry starts from a clean state.
    */
-  private async withExternal<T>(signal: AbortSignal | undefined, st: Statement, run: () => T): Promise<T> {
+  /** @internal (also used by the export functions) */
+  async withExternal<T>(signal: AbortSignal | undefined, st: Statement, run: () => T): Promise<T> {
     const held = new Set<string>();
     const load = async (sources: ExternalSource[]): Promise<boolean> => {
       const need = sources.filter((s) => !held.has(s.key));
@@ -754,6 +777,7 @@ export class Database implements FunctionContext {
   }
 
   private catalogSnapshot(): CatalogSnapshot {
+    for (const t of this.tables.values()) if (t.matview) this.matviewPolicy(t.matview);
     return {
       tables: [...this.tables.values(), ...this.shadowedMain.values()],
       views: [...this.views.values()].map((v) => ({ name: v.name, sql: v.sql, selectPos: v.select.pos })),
@@ -1202,6 +1226,8 @@ export class Database implements FunctionContext {
   // ---------------------------------------------------------------- materialized views
 
   private static readonly MATVIEW_SQL = 'CREATE TABLE smalt_matview(name TEXT, layout TEXT, populated INTEGER, refreshed_at TEXT)';
+  /** M8.1: the external sources a materialized view read at its last refresh, with their validators (JSON). */
+  private static readonly EXTCACHE_SQL = 'CREATE TABLE smalt_extcache(name TEXT, sources TEXT)';
 
   /**
    * CREATE MATERIALIZED VIEW: the result columns become a table (types from the query), filled by
@@ -1214,7 +1240,8 @@ export class Database implements FunctionContext {
     const tempDep = this.tempDependency(stmt.select);
     if (tempDep) throw new SmaltError('SMALT_ERROR', `materialized view ${stmt.name} cannot reference TEMP object ${tempDep}`);
     const opts = stmt.with ?? {};
-    for (const k of Object.keys(opts)) if (k !== 'storage' && k !== 'refresh' && k !== 'location') throw new SmaltError('SMALT_ERROR', `unknown materialized view option: ${k}`);
+    for (const k of Object.keys(opts)) if (!['storage', 'refresh', 'location', 'refresh_every', 'refresh_on_reconnect'].includes(k)) throw new SmaltError('SMALT_ERROR', `unknown materialized view option: ${k}`);
+    if (opts.refresh_every !== undefined && opts.refresh_every !== null && !(Number(opts.refresh_every) > 0)) throw new SmaltError('SMALT_ERROR', 'refresh_every must be a positive number of seconds');
     const location = String(opts.location ?? 'file').toLowerCase();
     if (location !== 'file' && location !== 'memory') throw new SmaltError('SMALT_ERROR', `location must be 'file' or 'memory'`);
     const inMemory = location === 'memory' && this.mem !== null;
@@ -1251,6 +1278,11 @@ export class Database implements FunctionContext {
     const mv = this.tables.get(stmt.name.toLowerCase());
     if (!mv?.matview) throw new SmaltError('SMALT_ERROR', `no such materialized view: ${stmt.name}`);
     if (stmt.concurrently && !stmt.withData) throw new SmaltError('SMALT_ERROR', 'REFRESH ... CONCURRENTLY cannot be used with WITH NO DATA');
+    if (stmt.ifChanged) {
+      const changed = this.refreshDecisions.get(mv.name.toLowerCase());
+      if (changed === undefined) throw new SmaltError('SMALT_ASYNC_REQUIRED', `REFRESH … IF CHANGED checks the sources of ${mv.name}: run it with execAsync, or through the worker client`);
+      if (!changed) return { changes: 0, lastInsertRowid: this.lastRowid };
+    }
     const memory = mv.rootPage >= MEM_BASE;
     // A memory-resident view changes no stored schema: the file (and its cookie) stay untouched.
     if (!memory) this.dirtySchema = true;
@@ -1289,8 +1321,9 @@ export class Database implements FunctionContext {
     const vals: SqlValue[] = new Array(ncols).fill(null);
     const key = new Uint8Array(ROWID_KEY_SIZE);
     let rowid = 0;
+    let sources: ExternalSource[] = [];
     try {
-      this.runSelect(info.select, info.sql, (r, outRegs) => {
+      sources = this.runSelect(info.select, info.sql, (r, outRegs) => {
         if (outRegs.length !== ncols) throw new SmaltError('SMALT_ERROR', `materialized view ${mv.name}: the query now returns ${outRegs.length} columns, the view has ${ncols}`);
         for (let i = 0; i < ncols; i++) {
           const v = r[outRegs[i]];
@@ -1326,7 +1359,107 @@ export class Database implements FunctionContext {
     info.fresh = true;
     info.refreshedAt = new Date().toISOString();
     this.writeMatviewMeta(mv.name, { populated: true, refreshedAt: info.refreshedAt, fresh: true });
+    this.writeExternalCache(mv.name, sources);
     return rowid;
+  }
+
+  /**
+   * Record what a materialized view's last refresh read from external sources and their validators
+   * (for `REFRESH … IF CHANGED`); a view over local data only has no row. Memory views keep it at
+   * runtime only (their rows are gone after reopening anyway).
+   */
+  private writeExternalCache(name: string, sources: ExternalSource[]): void {
+    const unique = [...new Map(sources.map((s) => [s.key, s])).values()];
+    const entries = unique.map((s) => ({
+      label: s.label,
+      location: s.location,
+      format: s.format,
+      options: s.options,
+      connection: s.connection?.name ?? null,
+      validator: this.external.data(s).validator,
+    }));
+    const lower = name.toLowerCase();
+    if (this.memViews.has(lower)) {
+      if (entries.length) this.memExtCache.set(lower, entries);
+      else this.memExtCache.delete(lower);
+      return;
+    }
+    let t = this.tables.get('smalt_extcache');
+    if (!t) {
+      if (entries.length === 0) return;
+      this.createTable(parseOne(Database.EXTCACHE_SQL).stmt as CreateTableStmt, Database.EXTCACHE_SQL, true);
+      t = this.tables.get('smalt_extcache')!;
+    }
+    this.upsertMetaRow(t, name, entries.length ? () => [name, JSON.stringify(entries)] : null);
+  }
+
+  private readonly memExtCache = new Map<string, ExternalCacheEntry[]>();
+
+  /** The external sources of a materialized view's last refresh (empty for local-only views). */
+  private externalCacheOf(name: string): ExternalCacheEntry[] {
+    const lower = name.toLowerCase();
+    const mem = this.memExtCache.get(lower);
+    if (mem) return mem;
+    if (!this.tables.has('smalt_extcache')) return [];
+    const rows = this.query('SELECT sources FROM smalt_extcache WHERE lower(name) = ?', [lower]).rows;
+    return rows.length ? (JSON.parse(rows[0][0] as string) as ExternalCacheEntry[]) : [];
+  }
+
+  /**
+   * Whether `REFRESH … IF CHANGED` must refresh: the view is unpopulated or stale (a base table
+   * changed), or an external source it read has a different validator now (or has none, like a
+   * registered Blob). Revalidating is a HEAD request or a stat, not a download.
+   */
+  private async matviewChanged(name: string, signal?: AbortSignal): Promise<boolean> {
+    const mv = this.tables.get(name.toLowerCase());
+    if (!mv?.matview) throw new SmaltError('SMALT_ERROR', `no such materialized view: ${name}`);
+    if (!mv.matview.populated || !mv.matview.fresh) return true;
+    const entries = this.externalCacheOf(mv.name);
+    const checks = await Promise.all(
+      entries.map(async (e) => {
+        if (e.validator === null) return true;
+        const conn = e.connection === null ? undefined : this.connections.get(e.connection.toLowerCase());
+        if (e.connection !== null && !conn) return true; // gone: the refresh reports it
+        const source: ExternalSource = { key: `check:${e.location}`, label: e.label, location: e.location, format: e.format, options: e.options, connection: conn && { name: conn.name, options: conn.options } };
+        return (await this.external.currentValidator(source, signal)) !== e.validator;
+      }),
+    );
+    return checks.some(Boolean);
+  }
+
+  /** Decisions of `REFRESH … IF CHANGED` statements about to run (set by execAsync after checking). */
+  private readonly refreshDecisions = new Map<string, boolean>();
+
+  /** @internal Refresh policy of a materialized view (`refresh_every`, `refresh_on_reconnect`). */
+  matviewPolicy(info: NonNullable<TableSchema['matview']>): { every: number | null; onReconnect: boolean } {
+    if (!info.policy) {
+      const w = (parseOne(info.sql).stmt as CreateViewStmt).with ?? {};
+      const every = w.refresh_every === undefined || w.refresh_every === null ? null : Number(w.refresh_every);
+      const r = w.refresh_on_reconnect;
+      info.policy = { every, onReconnect: r !== undefined && r !== null && ['1', 'true', 'yes', 'on'].includes(String(r).toLowerCase()) };
+    }
+    return info.policy;
+  }
+
+  /**
+   * @internal Materialized views with an automatic refresh policy, for the engine worker's
+   * scheduler: name, policy and the time of the last refresh (ms; 0 if never).
+   */
+  refreshPolicies(): { name: string; every: number | null; onReconnect: boolean; refreshedAt: number }[] {
+    const out = [];
+    for (const t of this.tables.values()) {
+      if (!t.matview) continue;
+      const p = this.matviewPolicy(t.matview);
+      if (p.every === null && !p.onReconnect) continue;
+      out.push({ name: t.name, ...p, refreshedAt: t.matview.refreshedAt ? Date.parse(t.matview.refreshedAt) : 0 });
+    }
+    return out;
+  }
+
+  /** @internal The outcome of an automatic refresh (shown in information_schema.materialized_views). */
+  noteRefreshResult(name: string, error: string | null): void {
+    const mv = this.tables.get(name.toLowerCase());
+    if (mv?.matview) mv.matview.lastRefreshError = error;
   }
 
   /** Point a materialized view (and its indexes) at new trees and free the old ones. */
@@ -1378,7 +1511,8 @@ export class Database implements FunctionContext {
   }
 
   /** Run a query to completion; `emit` reads each result row from the registers `r[outRegs[i]]`. */
-  private runSelect(select: SelectStmt, sql: string, emit: (r: SqlValue[], outRegs: number[]) => void): void {
+  /** Run `select`, passing each row to `emit`; returns the external sources it read (M8). */
+  private runSelect(select: SelectStmt, sql: string, emit: (r: SqlValue[], outRegs: number[]) => void): ExternalSource[] {
     const regs = new Registers(0);
     const planner = new Planner(this.plannerDeps(), regs);
     planner.sqlText = sql;
@@ -1392,6 +1526,7 @@ export class Database implements FunctionContext {
     } finally {
       root.close();
     }
+    return planner.externals;
   }
 
   /** Upsert (or with `meta` null, delete) a view's row in smalt_matview. */
@@ -2567,6 +2702,7 @@ export class Database implements FunctionContext {
       this.freshTree(mv.rootPage).destroy();
       this.removeCatalogRow(mv.name);
       this.writeMatviewMeta(mv.name, null);
+      this.writeExternalCache(mv.name, []);
       if (this.memViews.delete(lower)) this.memDirty = true;
       this.tables.delete(lower);
       this.schemaChanged();
@@ -2920,7 +3056,7 @@ export class Database implements FunctionContext {
   private targetTable(name: string, schema?: string): TableSchema {
     if (schema && schema.toLowerCase() !== 'main') throw new SmaltError('SMALT_ERROR', `unknown database ${schema}`);
     const lower = name.toLowerCase();
-    if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat' || lower === 'smalt_matview' || lower === 'smalt_columnar') throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
+    if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat' || lower === 'smalt_matview' || lower === 'smalt_columnar' || lower === 'smalt_extcache') throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
     const t = this.getTable(lower, schema);
     if (!t) {
       if (this.views.has(lower)) throw new SmaltError('SMALT_ERROR', `cannot modify ${name} because it is a view`);

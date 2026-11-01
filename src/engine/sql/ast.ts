@@ -494,6 +494,8 @@ export interface RefreshStmt extends Node {
   concurrently: boolean;
   /** `WITH NO DATA` empties the view and marks it unpopulated (PostgreSQL). */
   withData: boolean;
+  /** smaltdb `IF CHANGED`: refresh only when a base table or an external source changed since the last refresh. */
+  ifChanged?: boolean;
   schema?: string;
   name: string;
 }

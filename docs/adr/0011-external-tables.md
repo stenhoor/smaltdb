@@ -209,7 +209,7 @@ Bidirectional sync, conflict policies and resolvers belong to the plugin.
 
 | Part | Scope |
 |---|---|
-| M8.1 ✅ | `CREATE CONNECTION` / `CREATE EXTERNAL TABLE`, catalog and information_schema, async fetch phase, `file:` and HTTP sources, CSV and JSON readers, `read_csv` / `read_json`, caching through materialized views. **Not yet:** freshness of such caches from ETag / Last-Modified and refresh policies (validators are already captured per fetch), credential callbacks across the worker boundary (the worker client takes static headers), and `export` over external data |
+| M8.1 ✅ | `CREATE CONNECTION` / `CREATE EXTERNAL TABLE`, catalog and information_schema, async fetch phase, `file:` and HTTP sources, CSV and JSON readers, `read_csv` / `read_json`, caching through materialized views. Follow-ups ✅: freshness of such caches (`REFRESH … IF CHANGED` revalidates the recorded ETag / Last-Modified / file times with HEAD requests or stats), refresh policies (`refresh_every`, `refresh_on_reconnect`) run by the engine worker, credential callbacks across the worker boundary, export over external data |
 | M8.2 | S3 (aws4fetch, credential providers, presigned URLs), globs and partitioned paths |
 | M8.3 | Parquet: footer, column chunks, row-group pruning, ranged fetches, `read_parquet` |
 | M8.4 | Excel: sheets, A1 ranges, tables and defined names, dates, `read_excel`. **Deferred** (after M8.5; library to be chosen then) |

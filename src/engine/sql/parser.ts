@@ -1301,8 +1301,16 @@ class Parser {
     }
     const q = this.qualifiedName();
     if (this.acceptKw('CONCURRENTLY')) concurrently = true;
+    let ifChanged = false;
+    if (this.isKw('IF')) {
+      this.p++;
+      if (!this.acceptWord('CHANGED')) this.fail();
+      ifChanged = true;
+    }
     const withData = this.optWithData() ?? true;
-    return { kind: 'refresh', pos, concurrently, withData, schema: q.schema, name: q.name, end: this.ends[this.p - 1] };
+    const stmt: A.RefreshStmt = { kind: 'refresh', pos, concurrently, withData, schema: q.schema, name: q.name, end: this.ends[this.p - 1] };
+    if (ifChanged) stmt.ifChanged = true;
+    return stmt;
   }
 
   /** Optional `WITH DATA` / `WITH NO DATA` (materialized views); undefined when absent. */

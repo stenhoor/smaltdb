@@ -137,6 +137,13 @@ export interface MatViewInfo {
   fresh?: boolean;
   /** Base tables the view reads (lower case, through views). */
   deps?: Set<string>;
+  /**
+   * Refresh policy (M8.1, `WITH (refresh_every = seconds, refresh_on_reconnect = true)`): run by the
+   * engine worker as `REFRESH … IF CHANGED`. Parsed from `sql` on first use.
+   */
+  policy?: { every: number | null; onReconnect: boolean };
+  /** The last automatic refresh failed with this message (runtime only). */
+  lastRefreshError?: string | null;
 }
 
 /** Automatic index name for the n-th (1-based) UNIQUE/PRIMARY KEY constraint of a table. */

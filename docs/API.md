@@ -104,13 +104,16 @@ Post-v1: UDF registration, live queries / change notifications, and framework bi
 | Call | Notes |
 |---|---|
 | `db.registerFile(name, file)` | Makes `file` readable as `file:<name>`: a `File` / `Blob`, a File System Access handle, bytes or text. `null` removes it. Registered files live in the engine worker's memory; nothing is copied into the database. |
-| `db.registerCredentials(name, { endpoint, headers })` | Headers for connections that name these credentials (`CREATE CONNECTION … WITH (credentials = 'name')`), sent only with requests to URLs that start with `endpoint`. They are never stored in SQL or the database file, so they must be registered again after reopening. `null` removes them. |
+| `db.registerCredentials(name, { endpoint, headers })` | Headers for connections that name these credentials (`CREATE CONNECTION … WITH (credentials = 'name')`), sent only with requests to URLs that start with `endpoint`. `headers` is an object, or a function `(url) => headers` (sync or async) for tokens that change: the function stays in this tab, and the engine worker asks it for every request (it fails a request after 30 s without an answer, or at once when the tab closes). Credentials are never stored in SQL or the database file, so they must be registered again after reopening. `null` removes them. |
+
+Registered files and credentials live in the owning engine worker. When another tab takes over (multi-tab), each tab
+registers its own again with the new owner automatically. `exportCSV` / `exportJSON` work over external data too.
 
 In-process (`smaltdb/engine`, Node and tests), statements over external data run with
 `await db.queryAsync(sql, params?, { signal })`, `db.runAsync(…)` and `db.execAsync(…)`; the synchronous `query` /
 `run` / `exec` fail with `SMALT_ASYNC_REQUIRED` for them. The engine `Database` also has `registerFile`,
 `registerCredentials` (whose `headers` may be a function of the URL, sync or async) and `setFetch(fetchFn)` to replace
-the transport.
+the transport. `exportCSVAsync` / `exportJSONAsync` export queries over external data.
 
 Imports run as one prepared INSERT, in one transaction (or inside the caller's). Every constraint, type
 conversion and foreign key applies. On error the import is rolled back, and the message names the CSV line or
