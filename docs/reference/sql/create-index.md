@@ -95,4 +95,4 @@ Without `active = 1` in the query, the partial index is not a candidate and the 
 CREATE INDEX person_city_incl ON person(city) INCLUDE (email)
 ```
 
-Indexes on TEMP tables live in memory with the table. Index statistics come from [`ANALYZE`](./explain#analyze). To remove an index, use [`DROP INDEX`](./drop#drop-index); to list them, [`PRAGMA index_list`](./pragmas#index-list) or [`information_schema.statistics`](./information-schema#statistics).
+Indexes on TEMP tables live in memory with the table. A schema qualifier names the index's schema, which must be its table's, as in SQLite: `CREATE INDEX temp.i ON t(x)` needs a TEMP table `t` (`cannot create a TEMP index on non-TEMP table "t"`), and `CREATE INDEX main.i ON t(x)` a main one (`no such table: main.t`). Index statistics come from [`ANALYZE`](./explain#analyze). To remove an index, use [`DROP INDEX`](./drop#drop-index); to list them, [`PRAGMA index_list`](./pragmas#index-list) or [`information_schema.statistics`](./information-schema#statistics).

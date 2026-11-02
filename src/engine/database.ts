@@ -206,6 +206,9 @@ export class Database implements FunctionContext {
   readonly external = new ExternalRegistry();
   /** TEMP views: this connection only, never stored (they shadow main-schema views, like SQLite's temp schema). */
   private readonly tempViews = new Map<string, ViewSchema>();
+  /** Creation order of TEMP tables, indexes and views: temp.sqlite_schema lists them in it, as SQLite does. */
+  private readonly tempSeq = new WeakMap<object, number>();
+  private nextTempSeq = 0;
   private catalogTable!: TableSchema;
   /** Incremented on every schema change (prepared statements recompile). */
   schemaVersion = 0;
@@ -376,7 +379,7 @@ export class Database implements FunctionContext {
         const lower = o.name.toLowerCase();
         const t = this.tables.get(lower);
         if (t && t.rootPage >= MEM_BASE) return true;
-        if (!o.schema && this.tempViews.has(lower)) return true; // TEMP views exist in this connection only
+        if ((!o.schema || String(o.schema).toLowerCase() === 'temp') && this.tempViews.has(lower)) return true; // TEMP views exist in this connection only
         const v = this.getView(lower);
         if (v && !seen.has(lower)) {
           seen.add(lower);
@@ -664,9 +667,10 @@ export class Database implements FunctionContext {
    */
   getTable(name: string, schema?: string): TableSchema | undefined {
     const lower = name.toLowerCase();
-    if (CATALOG_NAMES.has(lower)) return this.catalogTable;
-    const t = this.tables.get(lower);
     const s = schema?.toLowerCase();
+    // temp.sqlite_schema is the TEMP catalog, a virtual table (see tempSchemaRows).
+    if (CATALOG_NAMES.has(lower)) return s === 'temp' ? undefined : this.catalogTable;
+    const t = this.tables.get(lower);
     if (s === 'main') return t?.temp ? this.shadowedMain.get(lower) : t;
     if (s === 'temp') return t?.temp ? t : undefined;
     return t;
@@ -763,6 +767,12 @@ export class Database implements FunctionContext {
       const vt = informationSchema(name, this.catalogSnapshot());
       return vt && { columns: vt.columns, rows: () => vt.rows() };
     }
+    if (schema === 'temp') {
+      // temp.sqlite_schema (sqlite_temp_schema): the TEMP catalog, which is never stored.
+      if (!CATALOG_NAMES.has(name.toLowerCase())) return undefined;
+      const types: StaticType[] = ['text', 'text', 'text', 'int', 'text'];
+      return { columns: ['type', 'name', 'tbl_name', 'rootpage', 'sql'].map((c, i) => ({ name: c, type: types[i] })), rows: () => this.tempSchemaRows() };
+    }
     const lower = name.toLowerCase();
     if (!lower.startsWith('pragma_')) return undefined;
     const pragma = lower.slice('pragma_'.length);
@@ -782,6 +792,19 @@ export class Database implements FunctionContext {
         }
       },
     };
+  }
+
+  /** Rows of temp.sqlite_schema, in creation order. rootpage is the root page in the memory store. */
+  private tempSchemaRows(): SqlValue[][] {
+    const page = (root: number): number => (root >= MEM_BASE ? root - MEM_BASE : root);
+    const out: [number, SqlValue[]][] = [];
+    const seq = (o: object): number => this.tempSeq.get(o) ?? 0;
+    for (const t of this.tempTables.values()) {
+      out.push([seq(t), ['table', t.name, t.name, page(t.rootPage), t.sql]]);
+      for (const ix of t.indexes) out.push([seq(ix), ['index', ix.name, t.name, page(ix.rootPage), ix.sql ?? null]]);
+    }
+    for (const v of this.tempViews.values()) out.push([seq(v), ['view', v.name, v.name, 0, v.sql]]);
+    return out.sort((a, b) => a[0] - b[0]).map((x) => x[1]);
   }
 
   private catalogSnapshot(): CatalogSnapshot {
@@ -832,8 +855,11 @@ export class Database implements FunctionContext {
     };
   }
 
-  /** @internal View by name (for the planner). */
-  getView(name: string): ViewSchema | undefined {
+  /** @internal View by name (for the planner); `schema` 'main' or 'temp' asks for that schema's view only. */
+  getView(name: string, schema?: string): ViewSchema | undefined {
+    const s = schema?.toLowerCase();
+    if (s === 'main') return this.views.get(name.toLowerCase());
+    if (s === 'temp') return this.tempViews.get(name.toLowerCase());
     return this.tempViews.get(name.toLowerCase()) ?? this.views.get(name.toLowerCase());
   }
 
@@ -1061,7 +1087,7 @@ export class Database implements FunctionContext {
         }
         return t;
       },
-      getView: (n) => this.getView(n),
+      getView: (n, schema) => this.getView(n, schema),
       virtualTable: (schema, n) => this.virtualTable(schema, n),
       openTree: (root) => this.tree(root),
       sampledStats: (t) => this.sampledStats(t),
@@ -2404,6 +2430,7 @@ export class Database implements FunctionContext {
 
   private createView(stmt: CreateViewStmt, sql: string): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    if (stmt.temp && stmt.schema?.toLowerCase() === 'main') throw new SmaltError('SMALT_ERROR', 'temporary table name must be unqualified');
     // A view over TEMP objects is itself TEMP (as in SQLite); asked for in main, it is an error.
     const tempDep = stmt.temp || stmt.schema?.toLowerCase() === 'temp' ? undefined : this.tempDependency(stmt.select);
     if (tempDep && stmt.schema?.toLowerCase() === 'main') throw new SmaltError('SMALT_ERROR', `view ${stmt.name} cannot reference TEMP object ${tempDep}`);
@@ -2413,7 +2440,9 @@ export class Database implements FunctionContext {
         if (stmt.ifNotExists) return none;
         throw new SmaltError('SMALT_ERROR', `view ${stmt.name} already exists`);
       }
-      this.tempViews.set(lower, { name: stmt.name, sql, columns: stmt.columns, select: stmt.select });
+      const view: ViewSchema = { name: stmt.name, sql, columns: stmt.columns, select: stmt.select };
+      this.tempViews.set(lower, view);
+      this.tempSeq.set(view, this.nextTempSeq++);
       this.schemaVersion++; // re-plan statements; nothing is stored
       return none;
     }
@@ -2431,7 +2460,10 @@ export class Database implements FunctionContext {
   private createTable(stmt: CreateTableStmt, sql: string, internal = false): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const columnar = tableStorage(stmt) === 'columnar';
-    if (stmt.temp) {
+    const schema = stmt.schema?.toLowerCase();
+    if (schema !== undefined && schema !== 'main' && schema !== 'temp') throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
+    if (stmt.temp && schema === 'main') throw new SmaltError('SMALT_ERROR', 'temporary table name must be unqualified');
+    if (stmt.temp || schema === 'temp') {
       if (columnar) throw new SmaltError('SMALT_UNSUPPORTED', 'TEMP tables cannot be columnar');
       return this.createTempTable(stmt, sql);
     }
@@ -2486,6 +2518,8 @@ export class Database implements FunctionContext {
       table.indexes.push({ name, table: table.name, rootPage: this.createTree(true), columns: spec.columns, unique: true, origin: spec.origin, constraintName: spec.constraintName });
     });
     this.tempTables.set(lower, table);
+    this.tempSeq.set(table, this.nextTempSeq++);
+    for (const idx of table.indexes) this.tempSeq.set(idx, this.nextTempSeq++);
     this.memDirty = true;
     const main = this.tables.get(lower);
     if (main && !main.temp) this.shadowedMain.set(lower, main);
@@ -2498,8 +2532,15 @@ export class Database implements FunctionContext {
   private createIndex(stmt: CreateIndexStmt, sql: string): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     if (stmt.ifNotExists && this.catalog.has(stmt.name.toLowerCase())) return none;
-    const table = this.tables.get(stmt.table.toLowerCase());
-    if (!table) throw new SmaltError('SMALT_ERROR', this.views.has(stmt.table.toLowerCase()) ? 'views may not be indexed' : `no such table: ${stmt.table}`);
+    // The qualifier names the index's schema, which must be its table's (as in SQLite).
+    const schema = stmt.schema?.toLowerCase();
+    if (schema !== undefined && schema !== 'main' && schema !== 'temp') throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
+    const table = schema === undefined ? this.tables.get(stmt.table.toLowerCase()) : this.getTable(stmt.table, schema);
+    if (!table) {
+      if (schema === 'temp' && this.getTable(stmt.table, 'main')) throw new SmaltError('SMALT_ERROR', `cannot create a TEMP index on non-TEMP table "${stmt.table}"`);
+      if (this.views.has(stmt.table.toLowerCase())) throw new SmaltError('SMALT_ERROR', 'views may not be indexed');
+      throw new SmaltError('SMALT_ERROR', `no such table: ${schema === 'main' ? 'main.' : ''}${stmt.table}`);
+    }
     if (table.matview?.storage === 'columnar') throw new SmaltError('SMALT_ERROR', `columnar materialized view ${table.name} cannot be indexed (zone maps prune its scans)`);
     if (table.columnar) throw new SmaltError('SMALT_UNSUPPORTED', `columnar table ${table.name} cannot be indexed (zone maps prune its scans)`);
     if (table.temp) {
@@ -2522,6 +2563,7 @@ export class Database implements FunctionContext {
     this.indexes.set(idx.name.toLowerCase(), idx);
     if (idx.unique) this.checkUniqueIndex(table, idx); // existing rows may already collide
     if (table.temp) {
+      this.tempSeq.set(idx, this.nextTempSeq++);
       this.schemaVersion++;
       return none;
     }
@@ -3071,7 +3113,7 @@ export class Database implements FunctionContext {
   // ---------------------------------------------------------------- DML
 
   private targetTable(name: string, schema?: string): TableSchema {
-    if (schema && schema.toLowerCase() !== 'main') throw new SmaltError('SMALT_ERROR', `unknown database ${schema}`);
+    if (schema && !['main', 'temp'].includes(schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${schema}`);
     const lower = name.toLowerCase();
     if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat' || lower === 'smalt_matview' || lower === 'smalt_columnar' || lower === 'smalt_extcache') throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
     const t = this.getTable(lower, schema);

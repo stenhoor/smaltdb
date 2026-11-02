@@ -351,4 +351,4 @@ FROM sqlite_schema WHERE name NOT LIKE 'smalt\_%' ESCAPE '\' OR type = 'index'
 
 For an external table created without a column list, `sql` is a rewritten statement that includes the inferred columns.
 
-TEMP objects are not in `sqlite_schema`, and there is no `sqlite_temp_schema` / `sqlite_temp_master`; `temp.sqlite_schema` shows the main catalog.
+TEMP objects are not in `sqlite_schema`. As in SQLite, `temp.sqlite_schema` (also `temp.sqlite_master`, `sqlite_temp_schema` and `sqlite_temp_master`) lists them, with the same columns, in creation order: TEMP tables, their indexes and TEMP views. Their `rootpage` is the page in the in-memory store that holds TEMP objects, and their `sql` is the statement as written.

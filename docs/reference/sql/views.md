@@ -26,7 +26,7 @@ SELECT * FROM daily ORDER BY day
 - As in SQLite, the query is resolved when the view is used, not when it is created: a view may name a table created later, and a view whose table was dropped fails when read (`no such table`).
 - Views are read-only: `INSERT`, `UPDATE` and `DELETE` fail with `cannot modify v because it is a view`, and views cannot be indexed or altered.
 - Simple views (a plain projection, filter or join over tables: no aggregates, `GROUP BY`, `DISTINCT`, window functions, `ORDER BY`, `LIMIT`, compound, `WITH` or subquery expressions) are merged into the query that uses them, so their tables use indexes as if written out directly.
-- A `TEMP` view exists only for this connection and shadows a main view of the same name. A view that reads a TEMP table or view becomes TEMP automatically; asking for it in `main` (`CREATE VIEW main.v …`) fails.
+- A `TEMP` view exists only for this connection and shadows a main view of the same name. A view that reads a TEMP table or view becomes TEMP automatically; asking for it in `main` (`CREATE VIEW main.v …`) fails. `CREATE VIEW temp.v` is the same as `CREATE TEMP VIEW v`; `CREATE TEMP VIEW main.v` fails with `temporary table name must be unqualified`. `temp.v` and `main.v` read that schema's view.
 
 ## DROP VIEW
 

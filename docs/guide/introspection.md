@@ -209,7 +209,7 @@ SELECT sql FROM sqlite_schema WHERE name = 'books_cheap';
 | --- |
 | CREATE INDEX books_cheap ON books(price) WHERE price < 10 |
 
-Unlike `information_schema`, `sqlite_schema` also lists smaltdb's internal tables once they exist, such as `smalt_stat` (created by `ANALYZE`) and `smalt_matview` (created with the first materialized view). To hide them, filter on `NOT (type = 'table' AND name LIKE 'smalt\_%' ESCAPE '\')`; a plain filter on the name would also hide automatic indexes, whose names start with `smalt_autoindex_`. The catalog cannot be modified directly. `TEMP` objects are not listed.
+Unlike `information_schema`, `sqlite_schema` also lists smaltdb's internal tables once they exist, such as `smalt_stat` (created by `ANALYZE`) and `smalt_matview` (created with the first materialized view). To hide them, filter on `NOT (type = 'table' AND name LIKE 'smalt\_%' ESCAPE '\')`; a plain filter on the name would also hide automatic indexes, whose names start with `smalt_autoindex_`. The catalog cannot be modified directly. `TEMP` objects are listed in `temp.sqlite_schema` (also `sqlite_temp_schema`, `sqlite_temp_master`), as in SQLite.
 
 ## Pragma functions
 
@@ -372,4 +372,4 @@ In smaltdb 0.8.3, `smaltdb_version()` returns `'0.1.0'`, not the package version
 - `information_schema` exists (SQLite has none).
 - `sqlite_schema` has extra object types: `matview`, `external` and `connection`.
 - `PRAGMA table_list`, `PRAGMA database_list` and most other SQLite pragmas are not supported and fail with `SMALT_UNSUPPORTED`.
-- `TEMP` objects do not appear in `sqlite_schema` or `information_schema`.
+- `TEMP` objects do not appear in `information_schema`.

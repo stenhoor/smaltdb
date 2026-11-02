@@ -110,7 +110,7 @@ export interface PlannerEnv {
    */
   virtualTable?(schema: string | undefined, name: string): { columns: { name: string; type: StaticType }[]; rows: (args: SqlValue[]) => SqlValue[][] } | undefined;
   /** A view's definition, expanded where the view is referenced. */
-  getView?(name: string): { name: string; sql: string; columns?: string[]; select: SelectStmt } | undefined;
+  getView?(name: string, schema?: string): { name: string; sql: string; columns?: string[]; select: SelectStmt } | undefined;
   openTree(rootPage: number): BTree;
   /** On-demand statistics for a table without ANALYZE results (sampled; cached by the database). */
   sampledStats?(table: TableSchema): TableStats | undefined;
@@ -220,6 +220,7 @@ interface CteEntry {
 }
 
 const ROWID_NAMES = new Set(['rowid', 'oid', '_rowid_']);
+const TEMP_CATALOG = new Set(['sqlite_temp_schema', 'sqlite_temp_master']);
 
 class Scope {
   sources: Source[] = [];
@@ -493,8 +494,8 @@ export class Planner {
   private flatten(core: SelectCore, orderBy: OrderingTerm[], scope: Scope | null): { core: SelectCore; orderBy: OrderingTerm[]; changed: boolean } {
     if (core.kind !== 'select' || !core.from || flatteningDisabled()) return { core, orderBy, changed: false };
     return flattenCore(core, orderBy, {
-      getTable: (n) => this.env.getTable(n),
-      getView: (n) => this.env.getView?.(n),
+      getTable: (n, schema) => this.env.getTable(n, schema),
+      getView: (n, schema) => this.env.getView?.(n, schema),
       isCte: (n) => scope?.findCte(n) !== undefined,
       text: this.sqlText,
     });
@@ -1421,6 +1422,20 @@ export class Planner {
       return;
     }
     const isInfoSchema = item.kind === 'table' && item.schema?.toLowerCase() === 'information_schema';
+    // The TEMP catalog: temp.sqlite_schema / temp.sqlite_master, also named sqlite_temp_schema / sqlite_temp_master.
+    const tempCatalog =
+      item.kind === 'table' && (item.schema === undefined ? !scope.findCte(item.name) && TEMP_CATALOG.has(item.name.toLowerCase()) : item.schema.toLowerCase() === 'temp' && (TEMP_CATALOG.has(item.name.toLowerCase()) || ['sqlite_schema', 'sqlite_master'].includes(item.name.toLowerCase())));
+    if (tempCatalog) {
+      const vt = this.env.virtualTable?.('temp', 'sqlite_schema');
+      if (vt) {
+        const regs = vt.columns.map(() => this.regs.alloc());
+        const root = new VirtualScan('temp.sqlite_schema', () => vt.rows([]), regs);
+        const columns: ResultColumnInfo[] = vt.columns.map((c) => ({ name: c.name, type: c.type, collation: Collation.Binary, affinity: 'NONE' }));
+        const cols: SourceColumn[] = columns.map((c, i) => ({ name: c.name, reg: regs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: '', index: i }));
+        scope.sources.push({ name: (item as { alias?: string }).alias ?? item.name, cols, rowidReg: -1, sub: { root, outRegs: regs, columns, correlated: false }, lateral: false, joinType, on: [], hidden: new Set(), position });
+        return;
+      }
+    }
     if (item.kind === 'function' || isInfoSchema) {
       const vt = this.env.virtualTable?.(isInfoSchema ? 'information_schema' : undefined, item.name);
       if (!vt) {
@@ -1453,8 +1468,8 @@ export class Planner {
       return;
     }
     const view =
-      item.kind === 'table' && (!item.schema || item.schema.toLowerCase() === 'main') && !(!item.schema && scope.findCte(item.name)) && !this.env.getTable(item.name)
-        ? this.env.getView?.(item.name)
+      item.kind === 'table' && (!item.schema || ['main', 'temp'].includes(item.schema.toLowerCase())) && !(!item.schema && scope.findCte(item.name)) && !this.env.getTable(item.name, item.schema)
+        ? this.env.getView?.(item.name, item.schema)
         : undefined;
     if (item.kind === 'subquery' || view || (item.kind === 'table' && !item.schema && scope.findCte(item.name))) {
       let select: SelectStmt;

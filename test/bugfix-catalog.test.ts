@@ -58,3 +58,53 @@ describe('external table option "null"', () => {
     db.exec('CREATE TABLE q2(x)');
   });
 });
+
+describe('temp. and main. qualifiers on CREATE; the TEMP catalog', () => {
+  it('CREATE TABLE / INDEX / VIEW temp.x create TEMP objects; DML and SELECT reach them', () => {
+    const d = mem();
+    d.exec('CREATE TABLE temp.t7(x); INSERT INTO temp.t7 VALUES (1); CREATE INDEX temp.i7 ON t7(x); CREATE VIEW temp.v AS SELECT x FROM t7');
+    expect(d.query('SELECT * FROM temp.t7').rows).toEqual([[1]]);
+    expect(d.query('UPDATE temp.t7 SET x = 2 RETURNING *').rows).toEqual([[2]]);
+    expect(d.query('SELECT * FROM temp.v').rows).toEqual([[2]]);
+    expect(d.query('SELECT count(*) FROM sqlite_schema').rows).toEqual([[0]]);
+    d.exec('CREATE TABLE main.t8(x); CREATE VIEW v AS SELECT 9 AS x');
+    expect(d.query('SELECT name FROM main.sqlite_schema').rows).toEqual([['t8'], ['v']]);
+    expect(d.query('SELECT (SELECT x FROM main.v), (SELECT x FROM temp.v), (SELECT x FROM v)').rows).toEqual([[9, 2, 2]]);
+    d.exec('DELETE FROM temp.t7; DROP VIEW temp.v; DROP INDEX temp.i7; DROP TABLE temp.t7');
+    expect(d.query('SELECT count(*) FROM temp.sqlite_schema').rows).toEqual([[0]]);
+  });
+
+  it('rejects qualifiers as SQLite does', async () => {
+    const d = mem();
+    d.exec('CREATE TABLE m(x); CREATE TEMP TABLE t(x)');
+    const msg = async (sql: string): Promise<string> => (await errorOf(() => d.exec(sql))).message;
+    expect(await msg('CREATE INDEX temp.i ON m(x)')).toBe('cannot create a TEMP index on non-TEMP table "m"');
+    expect(await msg('CREATE INDEX main.i ON t(x)')).toBe('no such table: main.t');
+    expect(await msg('CREATE INDEX temp.i ON nope(x)')).toBe('no such table: nope');
+    expect(await msg('CREATE INDEX nope.i ON m(x)')).toBe('unknown database nope');
+    expect(await msg('CREATE TEMP TABLE main.t9(x)')).toBe('temporary table name must be unqualified');
+    expect(await msg('CREATE TEMP VIEW main.v AS SELECT 1')).toBe('temporary table name must be unqualified');
+    expect(await msg('CREATE TABLE nope.t(x)')).toBe('unknown database nope');
+    expect(await msg('CREATE TEMP VIEW nope.v AS SELECT 1')).toBe('unknown database nope');
+  });
+
+  it('temp.sqlite_schema, sqlite_temp_schema and sqlite_temp_master list TEMP objects in creation order', () => {
+    const d = mem();
+    d.exec('CREATE TABLE m(x); CREATE TABLE temp.t7(x); CREATE INDEX temp.i7 ON t7(x); CREATE VIEW temp.v AS SELECT 1; CREATE TEMP TABLE t10(x UNIQUE); CREATE INDEX i8 ON t7(x)');
+    const temp = [
+      ['table', 't7', 't7', 'CREATE TABLE temp.t7(x)'],
+      ['index', 'i7', 't7', 'CREATE INDEX temp.i7 ON t7(x)'],
+      ['view', 'v', 'v', 'CREATE VIEW temp.v AS SELECT 1'],
+      ['table', 't10', 't10', 'CREATE TEMP TABLE t10(x UNIQUE)'],
+      ['index', 'smalt_autoindex_t10_1', 't10', null],
+      ['index', 'i8', 't7', 'CREATE INDEX i8 ON t7(x)'],
+    ];
+    for (const from of ['temp.sqlite_schema', 'temp.sqlite_master', 'sqlite_temp_schema', 'sqlite_temp_master', 'temp.sqlite_temp_schema']) {
+      expect(d.query(`SELECT type, name, tbl_name, sql FROM ${from}`).rows).toEqual(temp);
+    }
+    expect(d.query('SELECT name FROM sqlite_schema').rows).toEqual([['m']]);
+    expect(() => d.query('SELECT * FROM main.sqlite_temp_master')).toThrow('no such table: main.sqlite_temp_master');
+    // A CTE of the same name wins.
+    expect(d.query('WITH sqlite_temp_schema(n) AS (SELECT 5) SELECT n FROM sqlite_temp_schema').rows).toEqual([[5]]);
+  });
+});

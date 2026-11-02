@@ -124,9 +124,8 @@ INSERT INTO u VALUES ('x')
 
 ### Temporary tables
 
-- `CREATE TABLE temp.name (…)` creates a regular (main) table: the `temp.` qualifier is ignored. Use `CREATE TEMP TABLE name (…)`.
 - TEMP tables cannot be altered (`SMALT_UNSUPPORTED`).
-- There is no `sqlite_temp_schema` (or `sqlite_temp_master`); TEMP objects are not listed anywhere. `temp.sqlite_schema` shows the main catalog.
+- `temp.sqlite_schema` lists the `sql` of TEMP objects as written (`CREATE TEMP TABLE t(x)`); SQLite stores a normalised `CREATE TABLE t(x)`.
 
 ### Index keys
 

@@ -267,9 +267,19 @@ SELECT (SELECT v FROM scratch) AS plain, (SELECT v FROM main.scratch) AS main, (
 | --- | --- | --- |
 | temp | main | temp |
 
-Temp tables are not listed in `sqlite_schema` or `information_schema`, cannot be altered (`ALTER TABLE is not supported for TEMP table`), and cannot be columnar. A view that reads a temp table is itself temporary, and a materialized view cannot read one.
+Temp tables are listed in [`temp.sqlite_schema`](./information-schema#sqlite-schema), not in `sqlite_schema` or `information_schema`. They cannot be altered (`ALTER TABLE is not supported for TEMP table`), and cannot be columnar. A view that reads a temp table is itself temporary, and a materialized view cannot read one.
 
-`CREATE TABLE temp.name (…)` does **not** make a temp table: the `temp.` qualifier is ignored and a main table is created. Use `CREATE TEMP TABLE`.
+`CREATE TABLE temp.name (…)` also makes a temp table, and `CREATE TABLE main.name (…)` a main one. As in SQLite, `CREATE TEMP TABLE main.name` fails with `temporary table name must be unqualified`, and any other qualifier with `unknown database x` (`SMALT_ERROR`).
+
+```sql
+CREATE TABLE temp.notes(v TEXT);
+SELECT type, name FROM temp.sqlite_schema
+```
+
+| type | name |
+| --- | --- |
+| table | scratch |
+| table | notes |
 
 ## Not supported
 
