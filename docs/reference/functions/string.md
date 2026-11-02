@@ -4,7 +4,7 @@ Functions that build, measure, search and format text. The concatenation operato
 
 Unless stated otherwise, a NULL argument gives a NULL result, and numbers are converted to text the way `CAST(x AS TEXT)` converts them. Lengths and positions count characters (Unicode code points), not bytes or UTF-16 units.
 
-## Length
+## Measuring text
 
 ### length {#length}
 

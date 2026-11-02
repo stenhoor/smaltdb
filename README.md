@@ -108,7 +108,7 @@ See [docs/TESTING.md](docs/TESTING.md) for details.
 
 - Mixed OLTP + reporting workload. Databases up to ~1 GB.
 - Own storage format (not SQLite-file compatible). Row B+trees, with opt-in columnar tables later.
-- STRICT typing by default. SQLite affinity is available through `LOOSE` tables.
+- STRICT typing: values must fit the column type (`ANY` columns hold anything). SQLite-style `LOOSE` tables are not supported yet.
 - TypeScript, no WASM. Supports Chromium, Firefox, and Safari/iOS.
 - Multi-tab sharing via leader election. Parallel reader workers where OPFS supports `readwrite-unsafe` handles (Chromium).
 - Snapshot isolation with a single writer. Minimum browsers: Chrome 108, Firefox 111, Safari 17.

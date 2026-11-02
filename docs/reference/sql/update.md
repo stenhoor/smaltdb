@@ -44,7 +44,7 @@ SELECT changes() AS changed
 
 ## OR conflict-action
 
-As for [INSERT](./insert#conflict-actions-or): `OR IGNORE` skips rows whose new values would violate a constraint, and `OR REPLACE` deletes the rows they would collide with. `OR FAIL` and `OR ROLLBACK` behave like `OR ABORT`.
+As for [INSERT](./insert#conflict-actions): `OR IGNORE` skips rows whose new values would violate a constraint, and `OR REPLACE` deletes the rows they would collide with. `OR FAIL` and `OR ROLLBACK` behave like `OR ABORT`.
 
 ```sql
 UPDATE OR IGNORE item SET name = 'pen' WHERE id = 2;

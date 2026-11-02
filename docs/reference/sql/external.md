@@ -40,7 +40,7 @@ SELECT connection_name, connection_type, url, credentials, options FROM informat
 | --- | --- | --- | --- | --- |
 | web | http | `https://data.example.com/v1/` | api-token | {} |
 | lake | s3 | NULL | aws | {"region":"eu-west-1","bucket":"analytics"} |
-| minio | s3 | NULL | NULL | {"endpoint":"http://localhost:9000","bucket":"test"} |
+| minio | s3 | NULL | NULL | `{"endpoint":"http://localhost:9000","bucket":"test"}` |
 | blobs | azure | NULL | az | {"account":"mystore","container":"exports"} |
 
 Creating a connection does not contact the endpoint. Errors (`SMALT_ERROR`):

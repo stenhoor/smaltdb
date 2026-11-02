@@ -150,7 +150,7 @@ INSERT INTO account(handle, balance) VALUES ('bob', -5)
 
 The error message names the constraint when it has a name (`CHECK constraint failed: no_overdraft`) and shows the expression otherwise.
 
-An `ON CONFLICT` clause on a constraint is accepted but ignored: conflicts are handled by the statement's [`OR` action](./insert#conflict-actions-or) (default `ABORT`). In SQLite the constraint's clause is the default for statements that give none.
+An `ON CONFLICT` clause on a constraint is accepted but ignored: conflicts are handled by the statement's [`OR` action](./insert#conflict-actions) (default `ABORT`). In SQLite the constraint's clause is the default for statements that give none.
 
 ### DEFAULT
 

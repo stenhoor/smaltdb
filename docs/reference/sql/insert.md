@@ -96,7 +96,7 @@ SELECT id, sku FROM stock WHERE id > 3
 WITH x AS (SELECT 1) INSERT INTO stock(sku) VALUES ('clip')
 ```
 
-## Conflict actions (OR …)
+## Conflict actions
 
 `INSERT OR action` says what happens when a row violates a `PRIMARY KEY`, `UNIQUE`, `NOT NULL` or `CHECK` constraint.
 

@@ -62,7 +62,7 @@ SELECT 42 AS i, 0x1F AS hex, 1e3 AS r, 'it''s' AS s, x'CAFE' AS b, TRUE AS t, ty
 | --- | --- | --- | --- | --- | --- | --- |
 | 42 | 31 | 1000 | it's | x'cafe' | 1 | real |
 
-Integers are 64-bit. A decimal integer literal outside the 64-bit range becomes a REAL, as in SQLite. A hexadecimal literal is read as a 64-bit two's complement number, so `0xFFFFFFFFFFFFFFFF` is -1; one with more than 16 hex digits is a syntax error (`hex literal too big`).
+Integers are 64-bit. A decimal integer literal outside the 64-bit range becomes a REAL, as in SQLite. A hexadecimal literal is read as a 64-bit two's complement number, so `0xFFFFFFFFFFFFFFFF` is -1; one larger than 64 bits is a syntax error (`hex literal too big`).
 
 ```sql
 SELECT 0xFFFFFFFFFFFFFFFF AS hex, typeof(9223372036854775807) AS max_int, typeof(9223372036854775808) AS beyond
@@ -142,7 +142,7 @@ A statement can contain parameters, whose values are bound when it runs (see [Qu
 | `?NNN` | slot NNN, from 1 to 32766 |
 | `:name`, `@name`, `$name` | a slot assigned on first use; the same name reuses it |
 
-Named parameters are bound from an object whose keys are the names without the prefix (`{ name: 1 }` binds `:name`, `@name` and `$name`), or by position. A statement must be given exactly the number of values its highest slot needs; otherwise it fails with `SMALT_RANGE` (`statement expects 2 parameter(s)`).
+Values are bound from an array, by slot, or from an object whose keys are the names without the prefix (`{ name: 1 }` binds `:name`, `@name` and `$name`). An array must have exactly as many values as the highest slot, otherwise the statement fails with `SMALT_RANGE` (`statement expects 2 parameter(s), got 3`). With an object, every named parameter needs a key (`missing value for parameter :name`); extra keys are ignored.
 
 ```ts
 const rows = await db.query('SELECT ? + ?2 AS a, :x AS b', [1, 2, 'third']);
