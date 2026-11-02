@@ -1,11 +1,14 @@
 // Builds dist/: smaltdb.js (client), smaltdb-worker.js (engine worker), engine.js (synchronous engine for Node/workers).
 import { build } from 'esbuild';
-import { rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 
 // Start clean: chunk names carry content hashes, so old ones would otherwise pile up (and be published).
 rmSync('dist', { recursive: true, force: true });
 
-const common = { bundle: true, format: 'esm', target: 'es2022', sourcemap: true, logLevel: 'warning', minify: process.argv.includes('--minify') };
+// smaltdb_version() returns the package version (src/engine/exec/functions.ts).
+const { version } = JSON.parse(readFileSync('package.json', 'utf8'));
+const define = { __SMALTDB_VERSION__: JSON.stringify(version) };
+const common = { bundle: true, format: 'esm', target: 'es2022', sourcemap: true, logLevel: 'warning', minify: process.argv.includes('--minify'), define };
 await Promise.all([
   build({ ...common, entryPoints: ['src/client/index.ts'], outfile: 'dist/smaltdb.js', platform: 'browser' }),
   // Code splitting: the Parquet reader (hyparquet) is a chunk the worker loads on first use.

@@ -2,6 +2,7 @@
  * Regression tests for catalog, DDL and external-table bugs found while writing the user docs.
  * Expected values were checked against SQLite (@sqlite.org/sqlite-wasm) where SQLite has the feature.
  */
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
 import { EngineServer } from '../src/engine/server.js';
@@ -227,6 +228,13 @@ describe('REFRESH MATERIALIZED VIEW … IF CHANGED through every async entry poi
     expect(prep.kind).toBe('ok');
     expect((await call({ op: 'stmtRun', stmt: (prep as { stmt: number }).stmt })).kind).toBe('ok');
     expect(n()).toBe(3);
+  });
+});
+
+describe('smaltdb_version()', () => {
+  it('is the version in package.json', () => {
+    const { version } = JSON.parse(readFileSync('package.json', 'utf8')) as { version: string };
+    expect(mem().query('SELECT smaltdb_version()').rows).toEqual([[version]]);
   });
 });
 

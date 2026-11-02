@@ -80,7 +80,7 @@ Operators (`||`, `LIKE`, `GLOB`, arithmetic, comparisons), `CASE` and `CAST` are
 | [`row_number()`](./window#row_number) | window | Row number within the partition |
 | [`rtrim(X [, CHARS])`](./string#rtrim) | scalar | Remove characters from the end |
 | [`sign(X)`](./math#sign) | scalar | -1, 0 or 1 |
-| [`smaltdb_version()`](./scalar#smaltdb_version) | scalar | A version string (currently always `0.1.0`) |
+| [`smaltdb_version()`](./scalar#smaltdb_version) | scalar | The smaltdb package version |
 | [`strftime(FORMAT, TIME, MOD, …)`](./datetime#strftime) | scalar | Formatted date and time |
 | [`string_agg(X, SEP)`](./aggregate#string_agg) | aggregate | Same as `group_concat(X, SEP)` |
 | [`substr(X, START [, LENGTH])`](./string#substr) | scalar | Part of a string or blob |

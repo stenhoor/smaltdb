@@ -353,7 +353,7 @@ The smaltdb extensions to `information_schema` are described with their features
 
 ## smaltdb_version()
 
-`smaltdb_version()` returns the engine's version as text:
+`smaltdb_version()` returns the version of the smaltdb package as text, such as `'0.8.3'`:
 
 ```sql
 SELECT typeof(smaltdb_version()) AS type;
@@ -363,9 +363,7 @@ SELECT typeof(smaltdb_version()) AS type;
 | --- |
 | text |
 
-::: warning
-In smaltdb 0.8.3, `smaltdb_version()` returns `'0.1.0'`, not the package version. Read the version from the package (`smaltdb/package.json`) when you need it. `sqlite_version()` does not exist.
-:::
+`sqlite_version()` does not exist.
 
 ## Differences from SQLite
 
