@@ -101,21 +101,29 @@ SELECT * FROM seq
 
 When the largest rowid is already 9223372036854775807, a row inserted without a key gets a random free rowid, as in SQLite (`SMALT_FULL` with `AUTOINCREMENT`). In SQLite an `AUTOINCREMENT` table stays full even after that row is deleted; in smaltdb the next key is again one more than the largest left.
 
-### Conflict clauses
+### OR FAIL
 
-- `ON CONFLICT` clauses in `CREATE TABLE` constraints (`UNIQUE ON CONFLICT REPLACE`, `NOT NULL ON CONFLICT IGNORE`) are accepted and ignored. In SQLite they set the default conflict action for the constraint. Use `INSERT OR …` or an upsert instead.
-- `INSERT OR FAIL` and `UPDATE OR FAIL` behave like `OR ABORT`: rows the statement changed before the failing one are undone too.
-- `OR ROLLBACK` behaves like `OR ABORT`: the statement is undone, but an enclosing transaction stays open.
+`INSERT OR FAIL` and `UPDATE OR FAIL`, and a constraint's `ON CONFLICT FAIL`, behave like `ABORT`: rows the statement changed before the failing one are undone too. In SQLite they are kept.
 
 ```sql
-CREATE TABLE u(k TEXT UNIQUE ON CONFLICT IGNORE);
+CREATE TABLE u(k TEXT UNIQUE);
 INSERT INTO u VALUES ('x');
 ```
 
 <!-- docs:error SMALT_CONSTRAINT_UNIQUE -->
 ```sql
-INSERT INTO u VALUES ('x')
+INSERT OR FAIL INTO u VALUES ('y'), ('x')
 ```
+
+```sql
+SELECT count(*) AS n FROM u
+```
+
+| n |
+| --- |
+| 1 |
+
+SQLite keeps `'y'` and returns 2.
 
 ### Constraint expressions
 
@@ -184,6 +192,8 @@ The supported `PRAGMA`s are listed in [PRAGMA](../reference/sql/pragmas).
 
 - `RIGHT JOIN` and `FULL JOIN` work (SQLite has them since 3.39), except with `USING` or `NATURAL`.
 - In `GROUP BY` or `DISTINCT` over `NOCASE` or `RTRIM` text, values that compare equal form one group; smaltdb shows the spelling of the first row it scanned, which can differ from SQLite's choice.
+- A failing constant subexpression in a part of an expression that is not needed is not evaluated: `SELECT a AND abs(-9223372036854775808) FROM t` gives 0 for rows where `a` is 0. SQLite evaluates such constants once before the first row, so it fails (except in `CASE`, `iif`, `coalesce` and similar, where both skip it, and next to a literal `0` or `1` as in `x AND 0`).
+- `char()` of a surrogate code point (U+D800–U+DFFF) gives U+FFFD; SQLite emits invalid UTF-8.
 - `'now'`, `CURRENT_TIMESTAMP` and friends are read once per statement, so every row of a statement sees the same time (SQLite guarantees this only within one step).
 - Plain `EXPLAIN` returns the same rows as `EXPLAIN QUERY PLAN`, and the plan texts differ from SQLite's in places. `EXPLAIN ANALYZE` is an addition.
 

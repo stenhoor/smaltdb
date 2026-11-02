@@ -23,6 +23,7 @@ import {
 import { currentTimeText } from './datetime.js';
 import { type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type CodegenHelpers, codegenEnabled, generate, isCodegenRoot } from './codegen.js';
+import { WINDOW_ARITY } from './window.js';
 import { decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
 import { readRowidKey } from '../storage/key-codec.js';
 
@@ -93,10 +94,19 @@ function literalType(v: SqlValue, isReal: boolean | undefined): StaticType {
   }
 }
 
-/** Fold a node whose inputs are all constant (and deterministic). */
+/**
+ * Fold a node whose inputs are all constant (and deterministic). A node whose evaluation raises
+ * is left unfolded (and no longer constant), so the error is raised only if it runs: it may sit in
+ * a branch that never does, e.g. `CASE WHEN 1 THEN 1 ELSE abs(-9223372036854775808) END`.
+ */
 function fold(c: Compiled): Compiled {
   if (!c.constant) return c;
-  const v = c.fn(NO_REGS);
+  let v: SqlValue;
+  try {
+    v = c.fn(NO_REGS);
+  } catch {
+    return { ...c, constant: false };
+  }
   return { ...c, fn: () => v };
 }
 
@@ -862,6 +872,8 @@ function compileLike(op: string, not: boolean, x: Compiled, pat: Compiled, escap
   const fp = pat.fn;
   const fe = escape?.fn;
   const xr = x.type === 'real';
+  const pr = pat.type === 'real';
+  const er = escape?.type === 'real';
   return fold({
     fn: (r) => {
       const v = fx(r);
@@ -871,11 +883,11 @@ function compileLike(op: string, not: boolean, x: Compiled, pat: Compiled, escap
       if (fe) {
         const e = fe(r);
         if (e === null) return null;
-        const es = toText(e)!;
+        const es = toText(e, er)!;
         if (Array.from(es).length !== 1) throw new SmaltError('SMALT_ERROR', 'ESCAPE expression must be a single character');
         esc = es.codePointAt(0)!;
       }
-      const m = likeMatch(toText(p)!, toText(v, xr)!, esc, glob);
+      const m = likeMatch(toText(p, pr)!, toText(v, xr)!, esc, glob);
       return m !== not ? 1 : 0;
     },
     type: 'int',
@@ -962,9 +974,23 @@ function compileCall(e: CallExpr, scope: CompileScope): Compiled {
     return { fn: () => currentTimeText(name, ctx.now()), type: 'text', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
   }
   const def = scalarFunctions.get(name);
-  if (!def) throw new SmaltError('SMALT_ERROR', `no such function: ${name}`);
+  if (!def) {
+    if (Object.hasOwn(WINDOW_ARITY, name)) {
+      // A window-only function without OVER (SQLite checks the argument count first).
+      const [lo, hi] = WINDOW_ARITY[name];
+      if (e.args.length < lo || e.args.length > hi) throw new SmaltError('SMALT_ERROR', `wrong number of arguments to function ${name}()`);
+      throw new SmaltError('SMALT_ERROR', `misuse of window function ${name}()`);
+    }
+    throw new SmaltError('SMALT_ERROR', `no such function: ${name}`);
+  }
   const n = e.args.length;
   if (n < def.minArgs || (def.maxArgs >= 0 && n > def.maxArgs)) throw new SmaltError('SMALT_ERROR', `wrong number of arguments to function ${name}()`);
+  if (name === 'likelihood') {
+    // SQLite: the probability must be a REAL literal (not an integer, not negated) from 0.0 to 1.0.
+    const p = e.args[1];
+    if (p.kind !== 'literal' || !p.isReal || typeof p.value !== 'number' || Object.is(p.value, -0) || !(p.value >= 0 && p.value <= 1))
+      throw new SmaltError('SMALT_ERROR', 'second argument to likelihood() must be a constant between 0.0 and 1.0');
+  }
   const args = e.args.map((a) => compileNode(a, scope));
   const compiledArgs: CompiledArg[] = args.map((a) => ({ fn: a.fn, type: a.type, collation: a.collation }));
   const { fn, type } = def.compile(compiledArgs, scope.funcCtx);

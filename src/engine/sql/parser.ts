@@ -176,6 +176,22 @@ class Parser {
     this.kws = t.kws;
   }
 
+  /**
+   * Truth value (0 or 1) of an operand SQLite treats as always false / always true in AND/OR:
+   * TRUE, FALSE, or an unsigned decimal or hex integer literal that fits in 31 bits (possibly in
+   * parentheses). Undefined for anything else.
+   */
+  private plainIntLiteral(e: A.Expr): number | undefined {
+    if (e.kind !== 'literal' || typeof e.value !== 'number' || e.isReal) return undefined;
+    const text = this.src
+      .slice(e.pos, e.end)
+      .replace(/^[\s(]+|[\s)]+$/g, '')
+      .toLowerCase();
+    if (text === 'true' || text === 'false') return e.value;
+    if (!/^(?:[0-9]+|0x[0-9a-f]+)$/.test(text) || e.value < 0 || e.value > 0x7fffffff) return undefined;
+    return e.value === 0 ? 0 : 1;
+  }
+
   // ---------------------------------------------------------------- token helpers
 
   atEof(): boolean {
@@ -1178,9 +1194,13 @@ class Parser {
         const onConflict = this.optConflictClause();
         return pk ? { pos, name, kind: 'primaryKey', columns, autoincrement, onConflict, end: this.ends[this.p - 1] } : { pos, name, kind: 'unique', columns, onConflict, end: this.ends[this.p - 1] };
       }
-      case 'CHECK':
+      case 'CHECK': {
         this.p++;
-        return { pos, name, kind: 'check', expr: this.parenExpr(), end: this.ends[this.p - 1] };
+        const expr = this.parenExpr();
+        // SQLite accepts (and ignores) an ON CONFLICT clause on a table CHECK constraint.
+        this.optConflictClause();
+        return { pos, name, kind: 'check', expr, end: this.ends[this.p - 1] };
+      }
       case 'FOREIGN': {
         this.p++;
         this.expectKw('KEY');
@@ -1442,7 +1462,13 @@ class Parser {
           if (prec < min) return left;
           this.p++;
           const right = this.exprPrec(prec + 1);
-          left = { kind: 'binary', pos: left.pos, op: kw, left, right, end: this.ends[this.p - 1] };
+          const end = this.ends[this.p - 1];
+          // SQLite: `x AND 0` / `x OR 1`, where the 0 or 1 is a plain integer literal (or FALSE/TRUE),
+          // is that constant without evaluating x, on either side.
+          const absorbing = kw === 'AND' ? 0 : 1;
+          if (this.plainIntLiteral(left) === absorbing || this.plainIntLiteral(right) === absorbing) {
+            left = { kind: 'literal', pos: left.pos, value: absorbing, isReal: undefined, end };
+          } else left = { kind: 'binary', pos: left.pos, op: kw, left, right, end };
           continue;
         }
         case 'COLLATE':

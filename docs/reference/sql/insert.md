@@ -116,9 +116,33 @@ WITH x AS (SELECT 1) INSERT INTO stock(sku) VALUES ('clip')
 | --- | --- |
 | `ABORT` (default) | the statement fails and its changes are undone; an enclosing transaction stays open |
 | `FAIL` | same as `ABORT` (see below) |
-| `ROLLBACK` | same as `ABORT` (see below) |
+| `ROLLBACK` | the statement fails and the enclosing transaction is rolled back; outside a transaction, same as `ABORT` |
 | `IGNORE` | the conflicting row is skipped; the statement goes on |
-| `REPLACE` | rows that conflict on a `PRIMARY KEY` or `UNIQUE` constraint are deleted first, then the row is inserted |
+| `REPLACE` | rows that conflict on a `PRIMARY KEY` or `UNIQUE` constraint are deleted first, then the row is inserted; a NULL for a `NOT NULL` column with a default gets the default; a `CHECK` failure is handled as `ABORT` |
+
+Without an `OR` action, each constraint's own `ON CONFLICT` clause applies (see [CREATE TABLE](./create-table#on-conflict)), and `ABORT` where it has none. `CHECK` constraints have no clause of their own. The statement's action, when given, applies to every constraint.
+
+After `OR ROLLBACK` fails, no transaction is open: a following `COMMIT` fails with `cannot commit - no transaction is active`.
+
+```sql
+CREATE TABLE tags(name TEXT UNIQUE);
+INSERT INTO tags VALUES ('a');
+BEGIN;
+INSERT INTO tags VALUES ('b');
+```
+
+<!-- docs:error SMALT_CONSTRAINT_UNIQUE -->
+```sql
+INSERT OR ROLLBACK INTO tags VALUES ('a')
+```
+
+```sql
+SELECT name FROM tags
+```
+
+| name |
+| --- |
+| a |
 
 ```sql
 INSERT OR IGNORE INTO stock VALUES (1, 'pen', 99), (6, 'tape', 5);
@@ -134,11 +158,7 @@ SELECT * FROM stock WHERE id IN (1, 2, 6)
 
 A `REPLACE` that deletes rows applies foreign-key actions to them, as in SQLite.
 
-Differences from SQLite:
-
-- `OR FAIL` behaves like `OR ABORT`: rows inserted by the statement before the failing one are undone too.
-- `OR ROLLBACK` behaves like `OR ABORT`: the enclosing transaction is not rolled back.
-- `ON CONFLICT` clauses inside `CREATE TABLE` constraints (`UNIQUE ON CONFLICT IGNORE`) are accepted but ignored; only the statement's action counts.
+Difference from SQLite: `FAIL` (as `OR FAIL`, or a constraint's `ON CONFLICT FAIL`) behaves like `ABORT`: rows inserted by the statement before the failing one are undone too.
 
 ## Upsert (ON CONFLICT)
 

@@ -113,7 +113,7 @@ INSERT INTO task(project_id, title, estimate_h) VALUES (1, 'Design', 8), (1, 'Bu
 INSERT INTO task(project_id, title, estimate_h) VALUES (1, 'Nothing', 0)
 ```
 
-The error is `CHECK constraint failed: positive_estimate`. To insert-or-update instead of failing on a duplicate key, use [`ON CONFLICT … DO UPDATE`](../reference/sql/insert#upsert-on-conflict).
+The error is `CHECK constraint failed: positive_estimate`. To insert-or-update instead of failing on a duplicate key, use [`ON CONFLICT … DO UPDATE`](../reference/sql/insert#upsert-on-conflict). To skip or replace duplicates by default, give the constraint an [`ON CONFLICT` clause](../reference/sql/create-table#on-conflict), such as `UNIQUE ON CONFLICT IGNORE`.
 
 ## Foreign keys
 

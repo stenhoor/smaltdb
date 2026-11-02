@@ -379,6 +379,28 @@ SELECT CURRENT_DATE, CURRENT_TIME, CURRENT_TIMESTAMP, datetime('now', 'subsec') 
 
 Writing them with parentheses, as in `current_date()`, is a syntax error (`SMALT_SYNTAX`), as in SQLite.
 
+## In indexes and CHECK constraints {#indexes-and-check-constraints}
+
+The date and time functions may be used in index expressions, in a partial index's `WHERE` clause, and in `CHECK` constraints. There, as in SQLite, a call that reads the clock or the time zone fails when it runs: a time value of `'now'`, `'subsec'` or `'subsecond'`, no time value at all (`date()`), and the `'localtime'` and `'utc'` modifiers. The error is `non-deterministic use of date() in an index` or `… in a CHECK constraint`, naming the function. Whether a call reads the clock can depend on the row, so the error comes from the row that does it, when it is inserted or updated (or when `CREATE INDEX` indexes the existing rows).
+
+```sql
+CREATE TABLE event(at TEXT);
+CREATE INDEX event_day ON event(date(at));
+INSERT INTO event VALUES ('2024-03-15 13:45:30');
+SELECT at FROM event WHERE date(at) = '2024-03-15'
+```
+
+| at |
+| --- |
+| 2024-03-15 13:45:30 |
+
+<!-- docs:error SMALT_ERROR -->
+```sql
+INSERT INTO event VALUES ('now')
+```
+
+`CURRENT_DATE`, `CURRENT_TIME` and `CURRENT_TIMESTAMP` are always prohibited in an index (`non-deterministic functions prohibited in index expressions`). A `DEFAULT` may use any of them.
+
 ## Differences from SQLite {#differences}
 
 The results match SQLite 3.54 with these exceptions:
@@ -386,5 +408,3 @@ The results match SQLite 3.54 with these exceptions:
 - `'now'` is read once per statement execution. SQLite guarantees a stable `'now'` only within one step of a statement, so a long query in SQLite can see the clock move; in smaltdb it cannot.
 - A REAL result with no fractional part, such as `unixepoch(…, 'subsec')` on a whole second, reports `typeof` `'integer'`.
 - Modifier chains whose intermediate values exceed about ±2^53 milliseconds (e.g. `'+400000000000000 seconds', '-400000000000000 seconds'`) can be off by a few milliseconds, because smaltdb computes in JavaScript doubles where SQLite uses 64-bit integers.
-- smaltdb treats every date and time function as non-deterministic. An index expression may not use them at all: `CREATE INDEX i ON t(date(x))` fails with `non-deterministic functions prohibited in index expressions`, while SQLite allows it as long as `'now'` and `localtime` are not used. Store the derived value in its own column and index that instead.
-- In `CHECK` constraints it is the other way round: SQLite rejects `'now'` and `'localtime'` there, smaltdb accepts them.

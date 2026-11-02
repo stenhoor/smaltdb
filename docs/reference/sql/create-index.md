@@ -62,8 +62,11 @@ As in SQLite, the expressions must be deterministic and cannot contain subquerie
 
 | Expression | Error |
 | --- | --- |
-| `random()`, `datetime('now')`, … | `non-deterministic functions prohibited in index expressions` |
+| `random()`, `changes()`, `CURRENT_TIMESTAMP`, … | `non-deterministic functions prohibited in index expressions` |
 | `(SELECT …)` | `subqueries prohibited in index expressions` |
+| a parameter (`?`) | `parameters prohibited in index expressions` |
+
+The date and time functions are allowed, in expressions and in the `WHERE` clause, as long as they do not read the clock or the time zone. When one does, for a row being indexed (a time value of `'now'`, `'subsec'` or none at all, or the `'localtime'` or `'utc'` modifier), the statement fails with `non-deterministic use of date() in an index` (naming the function), as in SQLite. See [Date and time functions](../functions/datetime#indexes-and-check-constraints).
 
 ## Partial indexes
 
