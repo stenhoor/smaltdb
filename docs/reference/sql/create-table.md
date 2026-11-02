@@ -31,7 +31,7 @@ table-constraint:
   [CONSTRAINT name]
   { PRIMARY KEY (column [COLLATE c] [ASC | DESC] [, ...]) [conflict-clause]
   | UNIQUE (column [COLLATE c] [ASC | DESC] [, ...]) [conflict-clause]
-  | CHECK (expr)
+  | CHECK (expr) [conflict-clause]
   | FOREIGN KEY (column [, ...]) REFERENCES foreign-table [(column [, ...])] [fk-action ...] [deferrable] }
 
 fk-action:
@@ -150,7 +150,28 @@ INSERT INTO account(handle, balance) VALUES ('bob', -5)
 
 The error message names the constraint when it has a name (`CHECK constraint failed: no_overdraft`) and shows the expression otherwise.
 
-An `ON CONFLICT` clause on a constraint is accepted but ignored: conflicts are handled by the statement's [`OR` action](./insert#conflict-actions) (default `ABORT`). In SQLite the constraint's clause is the default for statements that give none.
+### ON CONFLICT {#on-conflict}
+
+An `ON CONFLICT` clause on a `PRIMARY KEY`, `UNIQUE` or `NOT NULL` constraint sets what an `INSERT` or `UPDATE` without its own [`OR` action](./insert#conflict-actions) does when a row violates that constraint: `ABORT` (the default), `FAIL`, `ROLLBACK`, `IGNORE` or `REPLACE`, with the meanings listed there. A statement's `OR` action overrides it, and an upsert's `ON CONFLICT … DO` clause takes precedence for its target. On a table `CHECK` constraint the clause is accepted and ignored, as in SQLite.
+
+```sql
+CREATE TABLE visit(page TEXT UNIQUE ON CONFLICT IGNORE, hits INTEGER NOT NULL ON CONFLICT REPLACE DEFAULT 0);
+INSERT INTO visit VALUES ('home', 5), ('home', 9), ('about', NULL);
+SELECT * FROM visit ORDER BY page
+```
+
+| page | hits |
+| --- | --- |
+| about | 0 |
+| home | 5 |
+
+As in SQLite:
+
+- When a row violates several constraints, the first one checked decides: the rowid (`INTEGER PRIMARY KEY`) first, then the other `PRIMARY KEY` and `UNIQUE` constraints and unique indexes, the most recently created first, with those whose action is `REPLACE` last. An `INTEGER PRIMARY KEY … ON CONFLICT REPLACE` is checked after all of them.
+- For `NOT NULL ON CONFLICT REPLACE`, a NULL gets the column's default; without a default, it fails as `ABORT`. If a column has several `NOT NULL` clauses, the last one counts.
+- Identical `UNIQUE` / `PRIMARY KEY` constraints share one action; two different ones fail with `conflicting ON CONFLICT clauses specified`.
+
+The clauses are part of the stored `CREATE TABLE` text, so they apply after the database is reopened. `FAIL` behaves like `ABORT` (see [INSERT](./insert#conflict-actions)).
 
 ### DEFAULT
 

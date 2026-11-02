@@ -50,9 +50,14 @@ SELECT ifnull(NULL, 'fallback') AS a, ifnull(0, 'fallback') AS b;
 
 ```
 iif(COND, X, Y)
+iif(COND, X)
+iif(COND1, X1, COND2, X2, …, [ELSE])
+if(…)
 ```
 
-Returns `X` when `COND` is true and `Y` otherwise. `COND` is true when it is a non-zero number; text and blobs are converted to a number first (`'abc'` counts as 0), and NULL counts as false. It is the same as `CASE WHEN COND THEN X ELSE Y END`.
+Returns `X` when `COND` is true and `Y` otherwise. `COND` is true when it is a non-zero number; text and blobs are converted to a number first (`'abc'` counts as 0), and NULL counts as false. It is the same as `CASE WHEN COND THEN X ELSE Y END`, and only the chosen argument is evaluated.
+
+With two arguments, the result is NULL when `COND` is false. With more, the arguments are condition/value pairs tried in order, and an odd last argument is the value when no condition is true (NULL without one). `if` is another name for `iif` (both as in SQLite 3.48 and later). Fewer than two arguments fail with `wrong number of arguments to function iif()`.
 
 ```sql
 SELECT iif(5 > 3, 'yes', 'no') AS a, iif(NULL, 'yes', 'no') AS b, iif('0.5', 'yes', 'no') AS c;
@@ -62,13 +67,17 @@ SELECT iif(5 > 3, 'yes', 'no') AS a, iif(NULL, 'yes', 'no') AS b, iif('0.5', 'ye
 | --- | --- | --- |
 | yes | no | yes |
 
-::: warning Differs from SQLite
-`iif` takes exactly three arguments. SQLite 3.48 and later also accept `iif(COND, X)` (NULL when false), more condition/value pairs, and the alias `if()`. smaltdb has none of these.
-:::
+```sql
+SELECT iif(0, 'yes') AS a, iif(0, 'one', 1, 'two') AS b, if(0, 'one', 0, 'two', 'other') AS c;
+```
+
+| a | b | c |
+| --- | --- | --- |
+| NULL | two | other |
 
 <!-- docs:error SMALT_ERROR -->
 ```sql
-SELECT iif(1, 'yes');
+SELECT iif(1);
 ```
 
 ### nullif {#nullif}
@@ -233,7 +242,7 @@ Returns `X` unchanged (SQLite's hint that `X` is usually false; ignored).
 likelihood(X, P)
 ```
 
-Returns `X` unchanged (SQLite's hint that `X` is true with probability `P`; ignored).
+Returns `X` unchanged (SQLite's hint that `X` is true with probability `P`; ignored). `P` must be a REAL literal from 0.0 to 1.0, such as `0.9` or `1.0`; anything else, including an integer literal like `1`, fails with `second argument to likelihood() must be a constant between 0.0 and 1.0`, as in SQLite.
 
 ```sql
 SELECT likely(5) AS a, unlikely('b') AS b, likelihood(7, 0.9) AS c;
@@ -243,9 +252,10 @@ SELECT likely(5) AS a, unlikely('b') AS b, likelihood(7, 0.9) AS c;
 | --- | --- | --- |
 | 5 | b | 7 |
 
-::: warning Differs from SQLite
-SQLite requires `P` to be a constant between 0.0 and 1.0 and fails otherwise. smaltdb does not check `P`.
-:::
+<!-- docs:error SMALT_ERROR -->
+```sql
+SELECT likelihood(7, 2);
+```
 
 ## Last statement and version
 

@@ -156,9 +156,15 @@ SELECT '[' || trim('  a b  ') || ']' AS a, '[' || ltrim('  a b  ') || ']' AS b, 
 | --- | --- | --- | --- | --- |
 | [a b] | [a b  ] | [  a b] | hi | c |
 
-::: warning Differs from SQLite
-A REAL argument without a fractional part is converted to text without the `.0` before trimming: `trim(12.0, '1')` is `'2'` in smaltdb and `'2.0'` in SQLite.
-:::
+A number is trimmed as its text form, so a REAL keeps its decimal point:
+
+```sql
+SELECT trim(12.0, '1') AS a, rtrim(12.0, '0') AS b, ltrim(-0.5, '-') AS c;
+```
+
+| a | b | c |
+| --- | --- | --- |
+| 2.0 | 12. | 0.5 |
 
 ### replace {#replace}
 
@@ -218,18 +224,18 @@ SELECT concat_ws('-', '2024', '03', NULL, '15') AS a, concat_ws(', ', NULL) AS b
 char(X, …)
 ```
 
-Returns a string made of the characters whose Unicode code points are the arguments. Arguments are converted to integers. With no arguments, the result is the empty string.
+Returns a string made of the characters whose Unicode code points are the arguments. Each argument is converted to an integer: a REAL is truncated, text and blobs use their leading digits (`'65'` is 65, `'1e2'` is 1), and NULL is 0, so it adds the character U+0000. A code point below 0 or above U+10FFFF gives the replacement character U+FFFD. With no arguments, the result is the empty string.
 
 ```sql
-SELECT char(72, 105) AS a, char(128512) AS b, char() AS c;
+SELECT char(72, 105) AS a, char(128512) AS b, char() AS c, hex(char(72, NULL, 105)) AS d, hex(char(-1)) AS e;
 ```
 
-| a | b | c |
-| --- | --- | --- |
-| Hi | 😀 | |
+| a | b | c | d | e |
+| --- | --- | --- | --- | --- |
+| Hi | 😀 | | 480069 | EFBFBD |
 
 ::: warning Differs from SQLite
-NULL arguments are skipped (SQLite treats them as code point 0), and a negative code point gives U+0000 (SQLite gives U+FFFD).
+A code point in the surrogate range U+D800–U+DFFF gives U+FFFD. SQLite encodes it as is, which is not valid UTF-8.
 :::
 
 ### unicode {#unicode}
@@ -295,20 +301,20 @@ printf(FORMAT, ARG, …)
 format(FORMAT, ARG, …)
 ```
 
-`format` is another name for `printf`. Returns `FORMAT` with each `%` conversion replaced by the next argument, formatted as in C `printf`. If `FORMAT` is NULL, the result is NULL. A missing argument counts as NULL (0 for numbers, empty for strings); extra arguments are ignored.
+`format` is another name for `printf`. Returns `FORMAT` with each `%` conversion replaced by the next argument, formatted like SQLite's `printf()` (a port of SQLite's formatter, so the output is the same, byte for byte). If `FORMAT` is NULL, or there are no arguments at all, the result is NULL. A missing argument counts as NULL (0 for numbers, empty for strings); extra arguments are ignored.
 
-A conversion is `%[flags][width][.precision]type`. `width` and `precision` may be `*` to take them from the next argument. Length modifiers (`l`, `ll`, `h`) are accepted and ignored.
+A conversion is `%[flags][width][.precision]type`. `width` and `precision` may be `*` to take them from the next argument; a negative `*` width left-aligns. `l` and `ll` before the type are accepted and ignored. A `%` followed by anything that is not a conversion (`%y`, `%hd`, `%5` at the end) ends the output there: `printf('a%yb')` is `'a'`. A `%` that is the last character is copied.
 
 | Type | Output |
 | --- | --- |
-| `d`, `i` | Signed integer. |
-| `u` | Integer (see the note below). |
+| `d`, `i` | Signed integer. A REAL is truncated; text uses its leading integer (`'12abc'` is 12, `'1e3'` is 1). |
+| `u` | The integer as an unsigned 64-bit value: `printf('%u', -5)` is `18446744073709551611`. |
 | `f` | Fixed-point decimal; precision is the digits after the point (default 6). |
 | `e`, `E` | Exponent form, e.g. `1.23e+03`. |
-| `g`, `G` | `%e` or `%f`, whichever is shorter; precision is significant digits. |
-| `x`, `X`, `o` | Hexadecimal (lower or upper case) or octal, of the value as an unsigned 64-bit integer. |
-| `c` | The first character of the argument's text. |
-| `s`, `z` | The argument as text; precision limits the number of characters. NULL gives an empty string. |
+| `g`, `G` | `%e` when the exponent is below -4 or not below the precision, otherwise `%f`; precision is significant digits (default 6); trailing zeros are removed. |
+| `x`, `X`, `o` | Hexadecimal (lower or upper case) or octal, of the integer as an unsigned 64-bit value. |
+| `c` | The first character of the argument's text; with a precision, that character repeated that many times. The width counts characters. |
+| `s`, `z` | The argument as text; precision limits its length. NULL gives an empty string. |
 | `q` | The text with single quotes doubled. NULL gives `(NULL)`. |
 | `Q` | Like `q`, wrapped in single quotes. NULL gives `NULL` without quotes. |
 | `w` | The text with double quotes doubled (for identifiers). NULL gives `(NULL)`. |
@@ -317,12 +323,14 @@ A conversion is `%[flags][width][.precision]type`. `width` and `precision` may b
 | Flag | Effect |
 | --- | --- |
 | `-` | Left-align within the width. |
-| `+` | Always print a sign for numbers. |
+| `+` | Always print a sign for signed numbers. |
 | space | Print a space in place of a `+` sign. |
 | `0` | Pad numbers with zeros to the width. |
-| `,` | Thousands separators for `%d` / `%i` / `%u`. |
-| `#` | For `%g` / `%G`, keep trailing zeros. |
-| `!` | Accepted and ignored. |
+| `,` | Thousands separators for `%d` / `%i` / `%u`, and for the integer part of `%f` / `%g`. |
+| `#` | Keep trailing zeros for `%g` / `%G`; always print the decimal point for `%f` / `%e`; prefix `0x` / `0X` / `0` for `%x` / `%X` / `%o`. |
+| `!` | Widths and precisions of `%s`, `%z`, `%q`, `%Q`, `%w` count characters instead of bytes. For numbers: up to 20 significant digits instead of 16, `%f` and `%e` drop trailing zeros, and a whole number keeps `.0` (`printf('%!g', 2)` and `printf('%!.3f', 2)` are `2.0`). |
+
+Without `!`, widths and precisions count UTF-8 bytes, as in SQLite: `printf('%5s|', 'é')` pads to five bytes, giving three spaces. Floating-point values are rounded to 16 significant digits (20 with `!`), so `printf('%.20f', 0.1)` ends in zeros.
 
 ```sql
 SELECT printf('%d|%5d|%-5d|%05d|%+d|%,d', 42, 42, 42, 42, 42, 1234567) AS ints;
@@ -333,12 +341,12 @@ SELECT printf('%d|%5d|%-5d|%05d|%+d|%,d', 42, 42, 42, 42, 42, 1234567) AS ints;
 | 42\|   42\|42   \|00042\|+42\|1,234,567 |
 
 ```sql
-SELECT printf('%.2f', 3.14159) AS a, printf('%e', 31415.9) AS b, printf('%g', 0.0001) AS c, printf('%x', 255) AS d, printf('%.3s', 'hello') AS e;
+SELECT printf('%.2f', 3.14159) AS a, printf('%e', 31415.9) AS b, printf('%g', 0.0001) AS c, printf('%x', 255) AS d, printf('%.3s', 'hello') AS e, printf('%g', 1000000) AS f, printf('%u', -1) AS g;
 ```
 
-| a | b | c | d | e |
-| --- | --- | --- | --- | --- |
-| 3.14 | 3.141590e+04 | 0.0001 | ff | hel |
+| a | b | c | d | e | f | g |
+| --- | --- | --- | --- | --- | --- | --- |
+| 3.14 | 3.141590e+04 | 0.0001 | ff | hel | 1e+06 | 18446744073709551615 |
 
 `%q` and `%Q` build SQL text safely:
 
@@ -350,8 +358,3 @@ SELECT printf('SELECT * FROM t WHERE name = %Q', 'O''Brien') AS sql;
 | --- |
 | SELECT * FROM t WHERE name = 'O''Brien' |
 
-::: warning Differs from SQLite
-- `%g` and `%G` keep trailing zeros in exponent form: `printf('%g', 1000000)` is `'1.00000e+06'` (SQLite: `'1e+06'`).
-- `%u` prints negative numbers with a minus sign (SQLite prints them as unsigned 64-bit values).
-- An unknown conversion such as `%y` is copied to the output (SQLite stops formatting there).
-:::

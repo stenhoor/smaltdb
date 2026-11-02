@@ -244,7 +244,7 @@ FROM emp ORDER BY name
 | --- | --- | --- | --- |
 | INTEGER | longest numeric prefix, truncated (`'12abc'` → 12, `'abc'` → 0) | truncates toward zero; clamps to the 64-bit range | the bytes read as text, then converted like text |
 | REAL | longest numeric prefix | unchanged | like text |
-| TEXT | unchanged | up to 15 significant digits (17 when needed to read back the same number), always with a decimal point or exponent (`1.0`, `1.0e+20`) | the bytes as UTF-8 |
+| TEXT | unchanged | as SQLite's `printf('%!.17g', x)`: 17 significant digits, fewer when the 17-digit form ends in a run of zeros or nines and the shorter one reads back the same number (`0.1`, not `0.10000000000000001`); always with a decimal point or exponent; the exponent form for exponents below -4 or above 16 (`1.0`, `1000000000000000.0`, `1.0e+17`) | the bytes as UTF-8 |
 | BLOB | the UTF-8 bytes | the text form's bytes | unchanged |
 | NUMERIC | the numeric prefix, as INTEGER when it is integral | unchanged | like text |
 

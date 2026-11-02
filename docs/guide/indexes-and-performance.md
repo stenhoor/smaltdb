@@ -151,7 +151,7 @@ EXPLAIN QUERY PLAN SELECT * FROM orders WHERE lower(customer) = 'c42';
 | --- | --- | --- | --- |
 | 1 | 0 | 0 | SEARCH orders USING INDEX orders_lower_customer (=?) |
 
-Index expressions must be deterministic and cannot contain subqueries or parameters, as in SQLite:
+Index expressions must be deterministic and cannot contain subqueries or parameters, as in SQLite. Date and time functions are allowed as long as they do not read the clock (see [CREATE INDEX](../reference/sql/create-index)):
 
 <!-- docs:error SMALT_ERROR -->
 ```sql

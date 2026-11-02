@@ -100,7 +100,7 @@ The number of rows up to and including the current row's last peer, divided by t
 ntile(N) OVER (…)
 ```
 
-Splits the partition into `N` buckets of nearly equal size and returns the bucket number (1 to `N`) of the current row. When the rows do not divide evenly, the first buckets get one row more. `N` must be a positive integer, or the query fails with `argument of ntile must be a positive integer`; a REAL is truncated (`ntile(2.5)` is `ntile(2)`).
+Splits the partition into `N` buckets of nearly equal size and returns the bucket number (1 to `N`) of the current row. When the rows do not divide evenly, the first buckets get one row more. `N` is converted to an integer as in SQLite: a REAL is truncated (`ntile(2.5)` is `ntile(2)`), and text uses its leading digits (`ntile('2')` is `ntile(2)`). If the result is not positive, the query fails with `argument of ntile must be a positive integer`.
 
 ```sql
 SELECT player, team, points,
@@ -122,10 +122,6 @@ ORDER BY team, points, player;
 | ann | red | 10 | 1 | 1 | 1 | 0 | 0.3333333333333333 | 1 |
 | bob | red | 20 | 2 | 2 | 2 | 0.5 | 1 | 1 |
 | cat | red | 20 | 3 | 2 | 2 | 0.5 | 1 | 2 |
-
-::: warning Differs from SQLite
-`ntile` requires a numeric argument: `ntile('2')` fails in smaltdb, while SQLite converts the text.
-:::
 
 ## Navigation functions
 
@@ -256,8 +252,7 @@ ORDER BY points, player;
 
 | Message | Cause |
 | --- | --- |
-| `misuse of window function f()` | A window function inside `WHERE`, `GROUP BY`, `HAVING`, or inside another window function's arguments (there smaltdb names the outer function, SQLite the inner one). |
-| `no such function: row_number` | A built-in window function without `OVER`. (SQLite reports `misuse of window function` here.) |
+| `misuse of window function f()` | A window function inside `WHERE`, `GROUP BY`, `HAVING`, or inside another window function's arguments (`f` is the inner function, as in SQLite), or a built-in window function such as `row_number()` without `OVER`. |
 | `f() may not be used as a window function` | `OVER` on a scalar function. |
 | `DISTINCT is not supported for window functions` | `count(DISTINCT x) OVER (…)`. |
 | `FILTER clause may only be used with aggregate window functions` | `FILTER` on `rank()` and the other built-in window functions. |
