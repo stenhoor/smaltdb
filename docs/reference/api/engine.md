@@ -83,7 +83,7 @@ console.log(again.query('SELECT a FROM t').rows); // [['kept']]
 
 `query` and `run` keep compiled statements in a cache keyed by the SQL text (see `statementCacheSize`); `exec` compiles each time.
 
-`BindParams` is `readonly SqlValue[] | Readonly<Record<string, SqlValue>>`, the same as the client's [`Params`](./client#params). `QueryResult` is `{ columns: string[]; rows: SqlValue[][] }`.
+`BindParams` is `readonly (SqlValue | boolean | undefined)[] | Readonly<Record<string, SqlValue | boolean>>`, the same as the client's [`Params`](./client#params). `QueryResult` is `{ columns: string[]; rows: SqlValue[][] }`.
 
 Engine calls are synchronous: a long query blocks the thread until it finishes. There is no `signal`. A host can install an interrupt check with `setInterruptCheck(fn)`, which the engine calls every few hundred page reads; `fn` stops the statement by throwing a `SmaltError` with code `SMALT_INTERRUPT`, and must reset its own trigger before it throws.
 
@@ -95,7 +95,9 @@ Statements that read [external data](../../guide/external-data) (`read_csv`, `re
 |---|---|
 | `queryAsync(sql, params?, options?: { signal?: AbortSignal }): Promise<QueryResult>` | `query` that fetches external sources first. |
 | `runAsync(sql, params?, options?): Promise<RunResult>` | `run` that fetches external sources first. |
-| `execAsync(sql, params?, options?): Promise<void>` | `exec` that fetches external sources first, statement by statement. Also needed for `REFRESH MATERIALIZED VIEW … IF CHANGED`. |
+| `execAsync(sql, params?, options?): Promise<void>` | `exec` that fetches external sources first, statement by statement. |
+
+The three async methods also run `REFRESH MATERIALIZED VIEW … IF CHANGED`, which checks the view's sources before it refreshes; the synchronous ones fail with `SMALT_ASYNC_REQUIRED` for it.
 | `registerFile(name: string, file: FileSource \| null): void` | Make `file` readable as `file:<name>`. `FileSource` is `Blob \| Uint8Array \| ArrayBuffer \| string \| { getFile(): Promise<Blob> }`; a string is the file's text. `null` removes it. |
 | `registerCredentials(name: string, provider: CredentialProvider \| null): void` | Credentials a connection names. `CredentialProvider` has the fields of the client's [`CredentialsProvider`](./client#credentialsprovider); functions are called in this thread. |
 | `setFetch(fetchFn: FetchFn \| null): void` | Replace the transport for HTTP(S) and object store requests (default: the global `fetch`). |
@@ -202,7 +204,7 @@ A VFS (virtual file system) gives the engine its files. Opening a file is asynch
 | Class | Description |
 |---|---|
 | `MemoryVfs` | Files in a `Map` in memory. Files stay as long as the `MemoryVfs` object, so a database can be closed and opened again from it. For tests and Node. |
-| `OpfsVfs` | Files in OPFS, under the directory `smaltdb` (option `rootDir`). Works only in a dedicated worker, where OPFS sync access handles exist. `OpfsVfs.isSupported()` checks for them. This is what the engine worker uses. |
+| `OpfsVfs` | Files in OPFS, under the directory `smaltdb` (option `rootDir`). Works only in a dedicated worker, where OPFS sync access handles exist; elsewhere `open` rejects with `SMALT_CANTOPEN`. `OpfsVfs.isSupported()` checks for them. This is what the engine worker uses. |
 
 smaltdb ships no VFS for the Node file system. To store files somewhere else, implement the interfaces:
 
@@ -236,7 +238,7 @@ Engine methods throw `SmaltError` (or a subclass) with the same `code` and `mess
 | `MisuseError` | `SMALT_MISUSE` |
 | `CorruptionError` | `SMALT_CORRUPT` |
 
-Other codes are thrown as plain `SmaltError` objects (or an internal subclass): check `code`, not the class. Errors from the host, such as a `TypeError` when `OpfsVfs` is used where OPFS does not exist, pass through unchanged.
+Other codes are thrown as plain `SmaltError` objects (or an internal subclass): check `code`, not the class. `OpfsVfs` used where OPFS sync access handles do not exist (Node, a page's main thread) throws `SMALT_CANTOPEN`. Other errors from the host pass through unchanged.
 
 ```ts
 import { Database, SmaltError, SqlSyntaxError } from 'smaltdb/engine';

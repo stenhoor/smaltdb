@@ -18,9 +18,10 @@
  *   transaction is rolled back.
  */
 import { type BindParams, Database, RowCursor, type Statement } from './database.js';
-import { SmaltError } from './errors.js';
+import { MisuseError, SmaltError } from './errors.js';
 import { AsyncRequiredError } from './external/external.js';
 import { exportCSV, exportCSVAsync, exportJSON, exportJSONAsync, importCSV, importJSON } from './io/import-export.js';
+import { parse } from './sql/parser.js';
 import type { Vfs } from './vfs/types.js';
 import { type ReaderSettings, type Request, type Response, type WireMaterial, encodeColumns } from '../shared/protocol.js';
 import type { SqlValue } from './values.js';
@@ -106,6 +107,8 @@ export class EngineServer {
   private readonly statements = new Map<number, Statement>();
   private nextStmt = 1;
   private txOwner: string | null = null;
+  /** Sessions whose transaction a request of theirs ended (COMMIT or ROLLBACK), until they ask with 'endTransaction'. */
+  private readonly txEnded = new Map<string, 'commit' | 'rollback'>();
   private pumping = false;
   private current: Job | null = null;
   private interruptFlag: Int32Array | null = null;
@@ -266,6 +269,7 @@ export class EngineServer {
       }
     }
     if (this.txOwner === session) this.txOwner = null;
+    this.txEnded.delete(session);
     this.unblock();
     this.kick();
   }
@@ -354,6 +358,7 @@ export class EngineServer {
   private async run(job: Job): Promise<void> {
     const { session, req } = job;
     this.current = job;
+    const owned = this.txOwner === session && !!this.db?.inTransaction;
     try {
       await this.handle(session, req);
     } catch (err) {
@@ -376,6 +381,8 @@ export class EngineServer {
       const db = this.db;
       this.txOwner = db?.inTransaction ? session : null;
       if (this.txOwner !== null) this.watch(this.txOwner);
+      if (this.txOwner === session) this.txEnded.delete(session);
+      else if (owned && db) this.txEnded.set(session, db.lastTransactionEnd ?? 'rollback');
     }
   }
 
@@ -424,16 +431,36 @@ export class EngineServer {
           try {
             r = d.run(req.sql, req.params as BindParams); // cached statement: the common case
           } catch (e) {
-            // It reads external data (M8): the attempt was rolled back; fetch, then run it.
-            if (!(e instanceof AsyncRequiredError)) throw e;
+            // Several statements: the same error as the engine's exec(sql, params).
+            if (e instanceof SmaltError && e.code === 'SMALT_SYNTAX' && isScript(req.sql)) throw new MisuseError('parameters can only be bound with a single statement');
+            // It reads external data (M8), or is REFRESH … IF CHANGED: the attempt was rolled back;
+            // fetch (or check the sources), then run it.
+            if (!(e instanceof SmaltError && e.code === 'SMALT_ASYNC_REQUIRED')) throw e;
             r = await this.withAbort(session, id, (signal) => d.runAsync(req.sql, req.params as BindParams, { signal }));
           }
           this.send(session, { id, kind: 'ok', changes: r.changes, lastInsertRowid: r.lastInsertRowid });
         } else {
           // Statement by statement; those that read external data (M8) fetch it first.
+          const before = d.totalChanges();
           await this.withAbort(session, id, (signal) => d.execAsync(req.sql, undefined, { signal }));
-          this.send(session, { id, kind: 'ok', changes: d.changes(), lastInsertRowid: d.lastInsertRowid() });
+          // `changes` of the script's last INSERT, UPDATE or DELETE; 0 when it ran none (changes() still
+          // holds an earlier request's count then).
+          this.send(session, { id, kind: 'ok', changes: d.totalChanges() === before ? 0 : d.changes(), lastInsertRowid: d.lastInsertRowid() });
         }
+        return;
+      }
+      case 'endTransaction': {
+        // The end of a client's db.transaction(): COMMIT / ROLLBACK, unless the callback already ended it.
+        const d = this.requireDb();
+        if (d.inTransaction) {
+          d.exec(req.commit ? 'COMMIT' : 'ROLLBACK');
+          this.send(session, { id, kind: 'ok' });
+          return;
+        }
+        const ended = this.txEnded.get(session);
+        this.txEnded.delete(session);
+        if (!ended) throw new SmaltError('SMALT_ERROR', `cannot ${req.commit ? 'commit' : 'rollback'} - no transaction is active`);
+        this.send(session, { id, kind: 'ok', ended });
         return;
       }
       case 'registerFile':
@@ -536,8 +563,13 @@ export class EngineServer {
     }
   }
 
-  /** Whether `st` reads external tables or `read_csv` / `read_json` (M8): those run on the async path. */
+  /**
+   * Whether `st` reads external tables or `read_csv` / `read_json` (M8), or is `REFRESH … IF
+   * CHANGED` (which checks its view's sources first): those run on the async path.
+   */
   private readsExternal(st: Statement): boolean {
+    const s = st.parsed.stmt;
+    if (s.kind === 'refresh' && s.ifChanged) return true;
     try {
       return st.externalSources.length > 0;
     } catch (e) {
@@ -729,4 +761,13 @@ export function defaultOpen(vfs: () => Vfs): ServerOptions['open'] {
     const options = { pageSize: req.pageSize, cacheSizeBytes: req.cacheSizeBytes, syncOnCommit: req.syncOnCommit };
     return req.storage === 'memory' || req.name === ':memory:' ? Database.openMemory(options) : Database.open(vfs(), `${req.name}.db`, options);
   };
+}
+
+/** Whether `sql` parses as more than one statement. */
+function isScript(sql: string): boolean {
+  try {
+    return parse(sql).length > 1;
+  } catch {
+    return false;
+  }
 }

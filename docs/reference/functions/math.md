@@ -83,7 +83,7 @@ SELECT round(2.675, 2) AS r;
 sign(X)
 ```
 
-`-1`, `0` or `1` for a negative, zero or positive number. NULL, text and blobs give NULL.
+`-1`, `0` or `1` for a negative, zero or positive number. Text that is a number, with optional spaces around it (`'3'`, `' -2.5 '`, `'1e3'`), counts as that number; other text, blobs and NULL give NULL.
 
 ```sql
 SELECT sign(-2.5) AS a, sign(0) AS b, sign(42) AS c, sign(NULL) AS d;
@@ -93,17 +93,13 @@ SELECT sign(-2.5) AS a, sign(0) AS b, sign(42) AS c, sign(NULL) AS d;
 | --- | --- | --- | --- |
 | -1 | 0 | 1 | NULL |
 
-::: warning Differs from SQLite
-SQLite converts numeric text, so `sign('3')` is 1 there. In smaltdb any text argument gives NULL.
-:::
-
 ```sql
-SELECT sign('3') AS s;
+SELECT sign('3') AS a, sign(' -2.5 ') AS b, sign('3x') AS c, sign(x'01') AS d;
 ```
 
-| s |
-| --- |
-| NULL |
+| a | b | c | d |
+| --- | --- | --- | --- |
+| 1 | -1 | NULL | NULL |
 
 ## random {#random}
 

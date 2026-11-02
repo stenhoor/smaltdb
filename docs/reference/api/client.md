@@ -17,7 +17,8 @@ The guide explains the concepts: [databases](../../guide/databases), [queries](.
 | [`PreparedStatement`](#preparedstatement) | class | A compiled statement |
 | [`SmaltdbError`](#smaltdberror) | class | The error type of every failed call |
 | [`OpenOptions`](#openoptions) | type | Options of `open` |
-| [`Queryable`](#queryable) | type | The `tx` handle of `transaction` |
+| [`Queryable`](#queryable) | type | `query` and `exec`: what `Database` and the `tx` handle share |
+| [`Transaction`](#transaction-1), [`TransactionStatement`](#transactionstatement) | type | The `tx` handle of `transaction`, and a prepared statement used through it |
 | [`QueryOptions`](#queryoptions), [`StreamOptions`](#streamoptions) | type | Options of queries and streams |
 | [`RowMode`](#rowmode) | type | `'object' \| 'array' \| 'columnar'` |
 | [`RunResult`](#runresult) | type | Result of `exec` and `run` |
@@ -90,7 +91,7 @@ await db.exec('CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)');
 const { changes } = await db.exec('UPDATE kv SET v = ? WHERE k = ?', ['on', 'theme']);
 ```
 
-Resolves to a [`RunResult`](#runresult). For a script, its fields describe the last `INSERT`, `UPDATE` or `DELETE`. `exec` calls on one `Database` run in call order and wait for a running [`transaction`](#transaction).
+Resolves to a [`RunResult`](#runresult). For a script, `changes` is that of the script's last `INSERT`, `UPDATE` or `DELETE`, or `0` if it has none; for a single statement other than those (a `SELECT`, DDL), it is `0`. With `params` and several statements, rejects with `SMALT_MISUSE`. `exec` calls on one `Database` run in call order and wait for a running [`transaction`](#transaction).
 
 ### stream
 
@@ -105,7 +106,7 @@ for await (const batch of db.stream<{ amount: number }>('SELECT amount FROM paym
 }
 ```
 
-The engine sends at most `highWaterMark` batches ahead and then waits for the loop. Leaving the loop early closes the result. While a stream is open on the owning engine worker, writes from this tab reject with `SMALT_BUSY`; see [streaming](../../guide/queries#streaming). `stream` does not wait for a running [`transaction`](#transaction): called during one, it runs inside it.
+The engine sends at most `highWaterMark` batches ahead and then waits for the loop. Leaving the loop early closes the result. While a stream is open on the owning engine worker, writes from this tab reject with `SMALT_BUSY`; see [streaming](../../guide/queries#streaming). Called while a [`transaction`](#transaction) of this `Database` runs, the stream starts when the transaction has ended; to stream inside the transaction, use `tx.stream`.
 
 ### prepare
 
@@ -121,7 +122,7 @@ await byId.finalize();
 
 ### transaction
 
-`db.transaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T>`
+`db.transaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T>`
 
 Runs `fn` in a transaction: `BEGIN`, then `fn(tx)`, then `COMMIT` when the promise `fn` returns resolves, or `ROLLBACK` when it rejects (the error is passed on). Resolves to `fn`'s result.
 
@@ -133,13 +134,15 @@ const id = await db.transaction(async (tx) => {
 });
 ```
 
-Run statements through `tx`. While `fn` runs, `query`, `exec`, `prepare`, `transaction`, the import and export methods and `close` on the same `Database` wait for the transaction to end, so awaiting them inside `fn` never finishes. `stream` and the methods of a `PreparedStatement` run inside the transaction. Rejects with `SMALT_ERROR` if a transaction opened with SQL `BEGIN` is already open. See [transactions](../../guide/transactions).
+Run statements through `tx` (a [`Transaction`](#transaction-1)). While `fn` runs, every other call on the same `Database` and its prepared statements (`query`, `exec`, `stream`, `prepare`, `transaction`, the import and export methods, `close`, and `query`, `stream` and `run` of a `PreparedStatement`) waits for the transaction to end, so awaiting one inside `fn` never finishes. Rejects with `SMALT_ERROR` if a transaction opened with SQL `BEGIN` is already open.
+
+If `fn` ends the transaction itself through `tx`: after a `COMMIT`, the promise resolves to `fn`'s result; after a `ROLLBACK`, it rejects with `SMALT_ERROR` ("the transaction was rolled back inside the transaction callback"). See [transactions](../../guide/transactions).
 
 ### importCSV
 
 `db.importCSV(table: string, source: ImportSource, options?: CsvImportOptions): Promise<{ rows: number }>`
 
-Inserts the CSV records of `source` into `table`, in one transaction (or inside the open SQL transaction). Resolves to the number of rows inserted. Rejects, with nothing inserted, if any row fails. See [CsvImportOptions](#csvimportoptions) and [importCSV](../../guide/import-export#importcsv).
+Inserts the CSV records of `source` into `table`, in one transaction (or in a savepoint of the open SQL transaction). Resolves to the number of rows inserted. Rejects, with nothing inserted and no table created, if any row fails. See [CsvImportOptions](#csvimportoptions) and [importCSV](../../guide/import-export#importcsv).
 
 ```ts
 const { rows } = await db.importCSV('people', 'name,age\nAnn,31\nBob,27\n');
@@ -220,7 +223,7 @@ Counts of queries answered by [parallel reader](../../guide/databases#parallel-r
 
 ### Other members
 
-`epoch` and the methods marked `@internal` in the type declarations (`attachWorker`, `attachShared`, `request`, `cancel`, `rawQuery`, `rawExec`, `openStream`, `replayRegistrations`) are used by the client itself and are not part of the API.
+`epoch` and the methods marked `@internal` in the type declarations (`attachWorker`, `attachShared`, `request`, `cancel`, `withLock`, `afterTransaction`, `rawQuery`, `rawExec`, `openStream`, `replayRegistrations`) are used by the client itself and are not part of the API.
 
 ## PreparedStatement
 
@@ -241,7 +244,7 @@ for (const msg of ['started', 'ready']) await insert.run({ level: 'info', msg })
 await insert.finalize();
 ```
 
-The methods do not wait for a running [`transaction`](#transaction): called during one, they run inside it. With multi-tab access, a statement prepared before the owning tab changed rejects with `SMALT_RETRY` (`finalize` resolves without doing anything); prepare it again.
+While a [`transaction`](#transaction) of the `Database` runs, `query`, `stream` and `run` wait for it to end, like the `Database` methods; `run` also runs in call order with `exec`. Inside the transaction, use [`tx.statement(stmt)`](#transactionstatement). The members `db`, `rawQuery`, `rawStream` and `rawRun` are internal. With multi-tab access, a statement prepared before the owning tab changed rejects with `SMALT_RETRY` (`finalize` resolves without doing anything); prepare it again.
 
 ## SmaltdbError
 
@@ -274,7 +277,31 @@ async function countRows(q: Queryable, table: 'people' | 'orders'): Promise<numb
 }
 ```
 
-The interface of the `tx` argument of [`transaction`](#transaction): `query` and `exec`, with the same signatures as on `Database`. `Database` implements it too, so functions that take a `Queryable` work inside and outside transactions.
+`query` and `exec`, with the same signatures as on `Database`. `Database` and the [`Transaction`](#transaction-1) handle implement it, so functions that take a `Queryable` work inside and outside transactions.
+
+### Transaction
+
+The `tx` argument of [`transaction`](#transaction). Everything run through it is part of the transaction. It works only while the callback runs: afterwards, its methods (and those of statements from `statement`) reject with `SMALT_MISUSE`.
+
+| Member | Signature | Description |
+|---|---|---|
+| `query` | as [`db.query`](#query) | Run a query in the transaction. |
+| `exec` | as [`db.exec`](#exec) | Run statements in the transaction. |
+| `stream` | as [`db.stream`](#stream) | Stream a query's result in the transaction. |
+| `statement` | `statement(stmt: PreparedStatement): TransactionStatement` | Use a statement prepared on this `Database` in the transaction. Throws `SMALT_MISUSE` for a statement of another `Database`. |
+
+```ts
+const insert = await db.prepare('INSERT INTO log(level, msg) VALUES (?, ?)');
+await db.transaction(async (tx) => {
+  const ins = tx.statement(insert);
+  await ins.run(['info', 'one']);
+  await ins.run(['info', 'two']);
+});
+```
+
+### TransactionStatement
+
+A prepared statement used through [`tx.statement()`](#transaction-1): `columns`, `paramCount`, and `query`, `stream` and `run` with the signatures of [`PreparedStatement`](#preparedstatement), running in the transaction. It has no `finalize`: finalize the `PreparedStatement` itself.
 
 ### QueryOptions
 
@@ -300,7 +327,7 @@ The interface of the `tx` argument of [`transaction`](#transaction): `query` and
 
 | Field | Type | Description |
 |---|---|---|
-| `changes` | `number` | Rows changed by the `INSERT`, `UPDATE` or `DELETE`. |
+| `changes` | `number` | Rows changed by the `INSERT`, `UPDATE` or `DELETE`; `0` for other statements. |
 | `lastInsertRowid` | `number` \| `bigint` | The rowid of the most recent successful `INSERT` on the engine's connection. |
 
 ### ArrayResult
@@ -325,9 +352,9 @@ A SQL value in JavaScript: NULL, INTEGER (`number`, or `bigint` outside ±(2^53 
 
 ### Params
 
-`type Params = readonly SqlValue[] | Readonly<Record<string, SqlValue>>`
+`type Params = readonly (SqlValue | boolean | undefined)[] | Readonly<Record<string, SqlValue | boolean>>`
 
-Positional values for `?` / `?NNN`, or an object for `:name`, `@name` and `$name`. See [parameters](../../guide/queries#parameters).
+Positional values for `?` / `?NNN`, or an object for `:name`, `@name` and `$name`. `true` and `false` bind as `1` and `0`, `undefined` in an array as NULL, and `NaN` as NULL. A `bigint` outside the 64-bit INTEGER range, and an object for a statement with `?` or `?NNN` placeholders, reject with `SMALT_RANGE`. See [parameters](../../guide/queries#parameters).
 
 ### ImportSource
 
@@ -344,14 +371,14 @@ Text, UTF-8 bytes, or a `Blob` / `File`.
 | `delimiter` | `string` | `','` | Single-character field separator. |
 | `quote` | `string` | `'"'` | Single-character quote. |
 | `emptyAsNull` | `boolean` | `true` | Unquoted empty fields become NULL; quoted `""` is always an empty string. |
-| `create` | `boolean` | `false` | Create a missing table, inferring `INTEGER`, `REAL` or `TEXT` per column. |
+| `create` | `boolean` | `false` | Create a missing table, inferring `INTEGER`, `REAL` or `TEXT` per column. If the import fails, the table is removed again. |
 
 ### JsonImportOptions
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `columns` | `string[]` | the table's columns | Target columns for arrays of arrays. |
-| `create` | `boolean` | `false` | Create a missing table, inferring column types from the values. |
+| `create` | `boolean` | `false` | Create a missing table, inferring column types from the values. If the import fails, the table is removed again. |
 
 ### CsvExportOptions
 

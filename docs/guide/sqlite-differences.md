@@ -84,7 +84,7 @@ INSERT INTO code VALUES (NULL, 'none')
 
 ### AUTOINCREMENT
 
-`AUTOINCREMENT` is accepted but has no effect: after the row with the largest key is deleted, its key can be used again. SQLite never reuses keys with `AUTOINCREMENT`, and allows the keyword only on an `INTEGER PRIMARY KEY` (smaltdb accepts it on any primary key).
+`AUTOINCREMENT` is allowed only on an `INTEGER PRIMARY KEY`, as in SQLite, but it does not stop keys from being reused: after the row with the largest key is deleted, its key can be used again. SQLite never reuses keys with `AUTOINCREMENT`.
 
 ```sql
 CREATE TABLE seq(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
@@ -99,34 +99,40 @@ SELECT * FROM seq
 | 1 | a |
 | 2 | c |
 
-When the largest rowid is already 9223372036854775807, inserting a row without a key fails with `SMALT_FULL`; SQLite tries random free rowids.
+When the largest rowid is already 9223372036854775807, a row inserted without a key gets a random free rowid, as in SQLite (`SMALT_FULL` with `AUTOINCREMENT`). In SQLite an `AUTOINCREMENT` table stays full even after that row is deleted; in smaltdb the next key is again one more than the largest left.
 
-### Conflict clauses
+### OR FAIL
 
-- `ON CONFLICT` clauses in `CREATE TABLE` constraints (`UNIQUE ON CONFLICT REPLACE`, `NOT NULL ON CONFLICT IGNORE`) are accepted and ignored. In SQLite they set the default conflict action for the constraint. Use `INSERT OR …` or an upsert instead.
-- `INSERT OR FAIL` and `UPDATE OR FAIL` behave like `OR ABORT`: rows the statement changed before the failing one are undone too.
-- `OR ROLLBACK` behaves like `OR ABORT`: the statement is undone, but an enclosing transaction stays open.
+`INSERT OR FAIL` and `UPDATE OR FAIL`, and a constraint's `ON CONFLICT FAIL`, behave like `ABORT`: rows the statement changed before the failing one are undone too. In SQLite they are kept.
 
 ```sql
-CREATE TABLE u(k TEXT UNIQUE ON CONFLICT IGNORE);
+CREATE TABLE u(k TEXT UNIQUE);
 INSERT INTO u VALUES ('x');
 ```
 
 <!-- docs:error SMALT_CONSTRAINT_UNIQUE -->
 ```sql
-INSERT INTO u VALUES ('x')
+INSERT OR FAIL INTO u VALUES ('y'), ('x')
 ```
+
+```sql
+SELECT count(*) AS n FROM u
+```
+
+| n |
+| --- |
+| 1 |
+
+SQLite keeps `'y'` and returns 2.
 
 ### Constraint expressions
 
-- A `CHECK` constraint may contain a subquery, and a `DEFAULT (expr)` may contain a subquery. SQLite rejects both.
-- `ALTER TABLE … ADD COLUMN` accepts a `REFERENCES` column with a non-NULL default; existing rows are not checked. SQLite rejects it while foreign keys are on.
+- `ALTER TABLE … ADD COLUMN` rejects a `NOT NULL` column without a default, and a non-constant default such as `CURRENT_TIMESTAMP`, even on an empty table. SQLite rejects them only when the table has rows.
 
 ### Temporary tables
 
-- `CREATE TABLE temp.name (…)` creates a regular (main) table: the `temp.` qualifier is ignored. Use `CREATE TEMP TABLE name (…)`.
 - TEMP tables cannot be altered (`SMALT_UNSUPPORTED`).
-- There is no `sqlite_temp_schema` (or `sqlite_temp_master`); TEMP objects are not listed anywhere. `temp.sqlite_schema` shows the main catalog.
+- `temp.sqlite_schema` lists the `sql` of TEMP objects as written (`CREATE TEMP TABLE t(x)`); SQLite stores a normalised `CREATE TABLE t(x)`.
 
 ### Index keys
 
@@ -147,7 +153,6 @@ These are rejected. Statements the parser does not know fail with a syntax error
 | generated columns | `SMALT_UNSUPPORTED` | compute in queries or views |
 | `CREATE TABLE … AS SELECT` | `SMALT_UNSUPPORTED` | `CREATE TABLE`, then `INSERT … SELECT` |
 | `LOOSE` (dynamic typing) | `SMALT_UNSUPPORTED` | `ANY` columns |
-| `INSERT … DEFAULT VALUES` | fails with an error (engine bug) | name one column with its default |
 | `WITH … INSERT … VALUES` | `SMALT_UNSUPPORTED` | `WITH … INSERT … SELECT` |
 | `UPDATE` / `DELETE` with `ORDER BY` or `LIMIT` | `SMALT_UNSUPPORTED` | `WHERE rowid IN (SELECT rowid … LIMIT n)` |
 | row values: `(a, b) = (1, 2)`, `SET (a, b) = …` | syntax error / `SMALT_UNSUPPORTED` | separate terms |
@@ -160,7 +165,6 @@ These are rejected. Statements the parser does not know fail with a syntax error
 | application-defined functions and collations | no API | |
 | `EXPLAIN` of statements other than `SELECT` | `SMALT_UNSUPPORTED` | |
 | `EXPLAIN` bytecode listing | plain `EXPLAIN` returns the query plan | |
-| `ANALYZE main.t` (schema-qualified) | `no such table or index` | `ANALYZE t` |
 | most `PRAGMA`s (`user_version`, `cache_size`, `busy_timeout`, `synchronous`, …) | `SMALT_UNSUPPORTED` | [open options](./databases) |
 
 <!-- docs:error SMALT_UNSUPPORTED -->
@@ -188,6 +192,8 @@ The supported `PRAGMA`s are listed in [PRAGMA](../reference/sql/pragmas).
 
 - `RIGHT JOIN` and `FULL JOIN` work (SQLite has them since 3.39), except with `USING` or `NATURAL`.
 - In `GROUP BY` or `DISTINCT` over `NOCASE` or `RTRIM` text, values that compare equal form one group; smaltdb shows the spelling of the first row it scanned, which can differ from SQLite's choice.
+- A failing constant subexpression in a part of an expression that is not needed is not evaluated: `SELECT a AND abs(-9223372036854775808) FROM t` gives 0 for rows where `a` is 0. SQLite evaluates such constants once before the first row, so it fails (except in `CASE`, `iif`, `coalesce` and similar, where both skip it, and next to a literal `0` or `1` as in `x AND 0`).
+- `char()` of a surrogate code point (U+D800–U+DFFF) gives U+FFFD; SQLite emits invalid UTF-8.
 - `'now'`, `CURRENT_TIMESTAMP` and friends are read once per statement, so every row of a statement sees the same time (SQLite guarantees this only within one step).
 - Plain `EXPLAIN` returns the same rows as `EXPLAIN QUERY PLAN`, and the plan texts differ from SQLite's in places. `EXPLAIN ANALYZE` is an addition.
 

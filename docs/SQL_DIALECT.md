@@ -282,16 +282,19 @@ functions, and `VACUUM`. Plain `EXPLAIN` returns the `EXPLAIN QUERY PLAN` output
 - An integral REAL with magnitude below 2^53 stored in an `ANY`/`NUMERIC` column, or flowing through an untyped expression, reads back as
   INTEGER. This affects `typeof()`, text conversion and integer division (ADR 0003, decision 2). REALs outside ±2^53, such as int64-overflow
   results, are always treated as REAL, because smaltdb represents such integers as `bigint`.
-- `AUTOINCREMENT` is accepted but behaves like a plain `INTEGER PRIMARY KEY` (the max rowid + 1 can be reused after deleting
-  the largest row).
+- `AUTOINCREMENT` (only on an `INTEGER PRIMARY KEY`, as in SQLite) behaves like a plain `INTEGER PRIMARY KEY` (the max rowid + 1
+  can be reused after deleting the largest row), except that once the largest rowid is 2^63 − 1 inserts fail with `SMALT_FULL`
+  instead of picking random rowids.
 - PRIMARY KEY columns are always NOT NULL.
-- `OR FAIL` behaves like `OR ABORT`.
+- `FAIL` (`OR FAIL`, or a constraint's `ON CONFLICT FAIL`) behaves like `ABORT`. `OR ROLLBACK` and `ON CONFLICT ROLLBACK`
+  roll back the enclosing transaction, and a constraint's `ON CONFLICT` action is its default resolution, as in SQLite.
+- `char()` of a surrogate code point (U+D800–U+DFFF) gives U+FFFD; SQLite emits the invalid UTF-8 bytes.
 - In `GROUP BY` / `DISTINCT` over NOCASE or RTRIM text, values that compare equal form one group, and which spelling is returned is unspecified.
   smaltdb returns the first row in scan order; SQLite returns the first in its own sort order, which can differ.
 - Date/time: `'now'` (and `CURRENT_*`) is read once per statement execution, so every row of a query sees the same instant (SQLite
   guarantees this only within one `sqlite3_step()`). `unixepoch(…, 'subsec')` returns a REAL that reads back as INTEGER when it has no
   fractional part (the integral-REAL deviation above). Julian-day arithmetic is done in doubles, exact up to ±2^53 ms, so modifier chains whose
   intermediate values exceed that (e.g. `'+400000000000000 seconds', '-400000000000000 seconds'`) can be off by a few milliseconds where
-  SQLite's int64 arithmetic is exact. Date functions are not rejected in CHECK constraints (SQLite rejects `'now'`
-  and `'localtime'` there).
+  SQLite's int64 arithmetic is exact. As in SQLite, date functions may appear in index expressions and CHECK constraints,
+  where reading the clock or time zone (`'now'`, `'localtime'`, `'utc'`, …) fails at run time.
 - Index keys must fit in about a quarter of a page (≈2 KB with 8 KiB pages); SQLite allows larger keys via overflow pages.

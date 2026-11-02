@@ -40,6 +40,7 @@ Operators (`||`, `LIKE`, `GLOB`, arithmetic, comparisons), `CASE` and `CAST` are
 | [`group_concat(X [, SEP])`](./aggregate#group_concat) | aggregate | Values joined into text |
 | [`hex(X)`](./string#hex) | scalar | Upper-case hexadecimal of the bytes |
 | [`ifnull(X, Y)`](./scalar#ifnull) | scalar | `X` if not NULL, else `Y` |
+| [`if(COND, X, …)`](./scalar#iif) | scalar | Same as `iif` |
 | [`iif(COND, X, Y)`](./scalar#iif) | scalar | `X` if `COND` is true, else `Y` |
 | [`instr(X, Y)`](./string#instr) | scalar | Position of `Y` in `X` |
 | [`julianday(TIME, MOD, …)`](./datetime#julianday) | scalar | Julian day number |
@@ -66,7 +67,7 @@ Operators (`||`, `LIKE`, `GLOB`, arithmetic, comparisons), `CASE` and `CAST` are
 | [`pragma_index_list(TABLE)`](./table-valued#pragma_index_list) | table-valued | Indexes of a table |
 | [`pragma_index_xinfo(INDEX)`](./table-valued#pragma_index_xinfo) | table-valued | All columns of an index |
 | [`pragma_table_info(TABLE)`](./table-valued#pragma_table_info) | table-valued | Columns of a table |
-| [`pragma_table_xinfo(TABLE)`](./table-valued#pragma_table_xinfo) | table-valued | Same as `pragma_table_info` |
+| [`pragma_table_xinfo(TABLE)`](./table-valued#pragma_table_xinfo) | table-valued | `pragma_table_info` plus `hidden` |
 | [`printf(FORMAT, …)`](./string#printf) | scalar | C-style formatted text |
 | [`quote(X)`](./string#quote) | scalar | Value as an SQL literal |
 | [`random()`](./math#random) | scalar | Random 64-bit integer |
@@ -80,7 +81,7 @@ Operators (`||`, `LIKE`, `GLOB`, arithmetic, comparisons), `CASE` and `CAST` are
 | [`row_number()`](./window#row_number) | window | Row number within the partition |
 | [`rtrim(X [, CHARS])`](./string#rtrim) | scalar | Remove characters from the end |
 | [`sign(X)`](./math#sign) | scalar | -1, 0 or 1 |
-| [`smaltdb_version()`](./scalar#smaltdb_version) | scalar | A version string (currently always `0.1.0`) |
+| [`smaltdb_version()`](./scalar#smaltdb_version) | scalar | The smaltdb package version |
 | [`strftime(FORMAT, TIME, MOD, …)`](./datetime#strftime) | scalar | Formatted date and time |
 | [`string_agg(X, SEP)`](./aggregate#string_agg) | aggregate | Same as `group_concat(X, SEP)` |
 | [`substr(X, START [, LENGTH])`](./string#substr) | scalar | Part of a string or blob |
@@ -110,7 +111,6 @@ These SQLite functions are **not** implemented. Each fails with `SMALT_ERROR` `n
 | JSON | `json`, `jsonb`, `json_array`, `json_array_length`, `json_extract`, `json_insert`, `json_object`, `json_patch`, `json_quote`, `json_remove`, `json_replace`, `json_set`, `json_type`, `json_valid`, `json_group_array`, `json_group_object`, and the table-valued `json_each` and `json_tree`. The `->` and `->>` operators fail with `SMALT_UNSUPPORTED`. |
 | Aggregates | `median`, `percentile`, `percentile_cont`, `percentile_disc` |
 | Text | `unhex`, `unistr`, `unistr_quote`, and the function forms `like(…)` and `glob(…)` (the `LIKE` and `GLOB` operators work). `REGEXP` has no implementation. |
-| Conditionals | `if(…)` (use `iif` with three arguments) |
 | SQLite-specific | `sqlite_version`, `sqlite_source_id`, `sqlite_compileoption_get`, `sqlite_compileoption_used`, `sqlite_offset`, `load_extension`, `subtype` |
 | Table-valued | `generate_series` (use a recursive CTE; see [SELECT](../sql/select)) |
 

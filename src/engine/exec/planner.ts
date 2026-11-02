@@ -110,7 +110,7 @@ export interface PlannerEnv {
    */
   virtualTable?(schema: string | undefined, name: string): { columns: { name: string; type: StaticType }[]; rows: (args: SqlValue[]) => SqlValue[][] } | undefined;
   /** A view's definition, expanded where the view is referenced. */
-  getView?(name: string): { name: string; sql: string; columns?: string[]; select: SelectStmt } | undefined;
+  getView?(name: string, schema?: string): { name: string; sql: string; columns?: string[]; select: SelectStmt } | undefined;
   openTree(rootPage: number): BTree;
   /** On-demand statistics for a table without ANALYZE results (sampled; cached by the database). */
   sampledStats?(table: TableSchema): TableStats | undefined;
@@ -220,6 +220,7 @@ interface CteEntry {
 }
 
 const ROWID_NAMES = new Set(['rowid', 'oid', '_rowid_']);
+const TEMP_CATALOG = new Set(['sqlite_temp_schema', 'sqlite_temp_master']);
 
 class Scope {
   sources: Source[] = [];
@@ -493,8 +494,8 @@ export class Planner {
   private flatten(core: SelectCore, orderBy: OrderingTerm[], scope: Scope | null): { core: SelectCore; orderBy: OrderingTerm[]; changed: boolean } {
     if (core.kind !== 'select' || !core.from || flatteningDisabled()) return { core, orderBy, changed: false };
     return flattenCore(core, orderBy, {
-      getTable: (n) => this.env.getTable(n),
-      getView: (n) => this.env.getView?.(n),
+      getTable: (n, schema) => this.env.getTable(n, schema),
+      getView: (n, schema) => this.env.getView?.(n, schema),
       isCte: (n) => scope?.findCte(n) !== undefined,
       text: this.sqlText,
     });
@@ -647,7 +648,9 @@ export class Planner {
           if (!call.star && (n < def.minArgs || n > def.maxArgs || (call.name === 'count' && n === 0))) {
             throw new SmaltError('SMALT_ERROR', `wrong number of arguments to function ${call.name}()`);
           }
-          if (call.args.some(containsAggregate)) throw new SmaltError('SMALT_ERROR', `misuse of aggregate function ${call.name}()`);
+          // SQLite names the nested aggregate: max(sum(a)) is a misuse of sum().
+          const inner = call.args.map(firstAggregateCall).find((x) => x !== undefined);
+          if (inner) throw new SmaltError('SMALT_ERROR', `misuse of aggregate function ${inner.name}()`);
           if (call.orderBy?.length) throw new SmaltError('SMALT_UNSUPPORTED', 'ORDER BY inside aggregate functions is not supported yet');
           if (call.distinct && n !== 1) throw new SmaltError('SMALT_ERROR', 'DISTINCT aggregates must have exactly one argument');
           const args = call.args.map((a) => compileExpr(a, baseCompile));
@@ -811,7 +814,11 @@ export class Planner {
     }
     if (call.distinct) throw new SmaltError('SMALT_ERROR', 'DISTINCT is not supported for window functions');
     if (builtin && call.filter) throw new SmaltError('SMALT_ERROR', `FILTER clause may only be used with aggregate window functions`);
-    for (const a of call.args) if (containsWindow(a)) throw new SmaltError('SMALT_ERROR', `misuse of window function ${name}()`);
+    // SQLite names the nested window function: sum(rank() OVER ()) OVER () is a misuse of rank().
+    for (const a of call.args) {
+      const inner = firstWindowCall(a);
+      if (inner) throw new SmaltError('SMALT_ERROR', `misuse of window function ${inner.name}()`);
+    }
     const spec = this.resolveWindowSpec(call.over!, core);
     const args = call.args.map((a) => compileExpr(a, scope));
     // One WindowDef per distinct (PARTITION BY, ORDER BY, frame).
@@ -1421,6 +1428,20 @@ export class Planner {
       return;
     }
     const isInfoSchema = item.kind === 'table' && item.schema?.toLowerCase() === 'information_schema';
+    // The TEMP catalog: temp.sqlite_schema / temp.sqlite_master, also named sqlite_temp_schema / sqlite_temp_master.
+    const tempCatalog =
+      item.kind === 'table' && (item.schema === undefined ? !scope.findCte(item.name) && TEMP_CATALOG.has(item.name.toLowerCase()) : item.schema.toLowerCase() === 'temp' && (TEMP_CATALOG.has(item.name.toLowerCase()) || ['sqlite_schema', 'sqlite_master'].includes(item.name.toLowerCase())));
+    if (tempCatalog) {
+      const vt = this.env.virtualTable?.('temp', 'sqlite_schema');
+      if (vt) {
+        const regs = vt.columns.map(() => this.regs.alloc());
+        const root = new VirtualScan('temp.sqlite_schema', () => vt.rows([]), regs);
+        const columns: ResultColumnInfo[] = vt.columns.map((c) => ({ name: c.name, type: c.type, collation: Collation.Binary, affinity: 'NONE' }));
+        const cols: SourceColumn[] = columns.map((c, i) => ({ name: c.name, reg: regs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: '', index: i }));
+        scope.sources.push({ name: (item as { alias?: string }).alias ?? item.name, cols, rowidReg: -1, sub: { root, outRegs: regs, columns, correlated: false }, lateral: false, joinType, on: [], hidden: new Set(), position });
+        return;
+      }
+    }
     if (item.kind === 'function' || isInfoSchema) {
       const vt = this.env.virtualTable?.(isInfoSchema ? 'information_schema' : undefined, item.name);
       if (!vt) {
@@ -1453,8 +1474,8 @@ export class Planner {
       return;
     }
     const view =
-      item.kind === 'table' && (!item.schema || item.schema.toLowerCase() === 'main') && !(!item.schema && scope.findCte(item.name)) && !this.env.getTable(item.name)
-        ? this.env.getView?.(item.name)
+      item.kind === 'table' && (!item.schema || ['main', 'temp'].includes(item.schema.toLowerCase())) && !(!item.schema && scope.findCte(item.name)) && !this.env.getTable(item.name, item.schema)
+        ? this.env.getView?.(item.name, item.schema)
         : undefined;
     if (item.kind === 'subquery' || view || (item.kind === 'table' && !item.schema && scope.findCte(item.name))) {
       let select: SelectStmt;
@@ -2812,6 +2833,32 @@ function coreReferences(core: SelectCore, name: string): boolean {
 function selectReferences(s: SelectStmt, name: string): boolean {
   if (s.with?.ctes.some((c) => sameName(c.name, name))) return false; // shadowed
   return coreReferences(s.core, name) || s.compound.some((c) => coreReferences(c.core, name));
+}
+
+/** The first window function call (`f(...) OVER ...`) in `e`, if any. */
+function firstWindowCall(e: Expr): CallExpr | undefined {
+  let found: CallExpr | undefined;
+  walk(e, (x) => {
+    if (found) return false;
+    if (x.kind === 'call' && x.over !== undefined) {
+      found = x;
+      return false;
+    }
+  });
+  return found;
+}
+
+/** The first aggregate call in `e`, if any. */
+function firstAggregateCall(e: Expr): CallExpr | undefined {
+  let found: CallExpr | undefined;
+  walk(e, (x) => {
+    if (found) return false;
+    if (isAggregateCall(x)) {
+      found = x as CallExpr;
+      return false;
+    }
+  });
+  return found;
 }
 
 function containsWindow(e: Expr | undefined): boolean {

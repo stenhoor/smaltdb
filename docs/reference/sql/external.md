@@ -16,7 +16,7 @@ Options by `type`:
 
 | Option | `http` (default) | `s3` | `azure` | Meaning |
 | --- | --- | --- | --- | --- |
-| `type` | ✓ | ✓ | ✓ | `'http'` (also `'https'`), `'s3'` or `'azure'` |
+| `type` | ✓ | ✓ | ✓ | `'http'` (also `'https'`, the same type), `'s3'` or `'azure'`, in any case; other values fail (`type 'ftp' is not supported`) |
 | `url` | ✓ | | | base URL; relative locations resolve against it |
 | `region` | | ✓ | | AWS region (default `us-east-1`) |
 | `bucket` | | ✓ | | bucket for relative locations |
@@ -113,7 +113,7 @@ SELECT column_name, data_type FROM information_schema.columns WHERE table_name =
 
 ```sql
 CREATE EXTERNAL TABLE products_typed (id INTEGER, name TEXT, price REAL, added TEXT)
-  WITH (location = 'file:sql-products.csv', "null" = 'NA');
+  WITH (location = 'file:sql-products.csv', null = 'NA');
 SELECT name, price, typeof(price) AS t FROM products_typed
 ```
 
@@ -123,9 +123,7 @@ SELECT name, price, typeof(price) AS t FROM products_typed
 | Notebook | 4.25 | real |
 | Stapler | NULL | null |
 
-::: warning `null` is a reserved word
-In `WITH (…)`, write the option as `"null"`, as above (`null = 'NA'` is a syntax error). Declare the columns when you use it: with inferred columns, the stored definition is written back without the quotes and cannot be read again, which breaks later schema changes (a known engine bug). [`read_csv`](../functions/table-valued) takes `null => 'NA'` without quotes.
-:::
+Option names may be keywords, so `null = 'NA'` and `"null" = 'NA'` are the same option. The definition stored for a table with inferred columns quotes such names (`"null" = 'NA'`).
 
 **Types.** Declared types work like [column affinity](./types#declared-types): INTEGER and REAL columns turn numeric-looking text into numbers, TEXT columns keep text. Text that does not convert stays text (no error), so a declared type is a conversion, not a guarantee. Inferred CSV columns are INTEGER, REAL or TEXT; inferred JSON columns are INTEGER, REAL, TEXT, or ANY when the values mix.
 
@@ -204,9 +202,9 @@ SELECT (SELECT city FROM cities WHERE id = 2) AS city, (SELECT count(*) FROM cou
 
 ### Using external tables
 
-- They are read-only and have no indexes. Every statement that uses one reads the source again; to read it once, cache it in a [materialized view](./views) and refresh it with `REFRESH … IF CHANGED`.
+- They are read-only and have no indexes: `INSERT`, `UPDATE` and `DELETE` fail with `table x may not be modified`, `CREATE INDEX` with `table x may not be indexed`, `ALTER TABLE` with `table x may not be altered` (`SMALT_ERROR`). Every statement that uses one reads the source again; to read it once, cache it in a [materialized view](./views) and refresh it with `REFRESH … IF CHANGED`.
 - They work in joins, subqueries, views and `INSERT … SELECT`.
-- `information_schema.tables` shows them as `EXTERNAL`, [`information_schema.external_tables`](./information-schema#external-tables) lists their location, format, connection and options, and `sqlite_schema` lists them with type `external`.
+- `information_schema.tables` shows them as `EXTERNAL`, [`information_schema.external_tables`](./information-schema#external-tables) lists their location, format, connection and options, and `sqlite_schema` lists them with type `external`. [`PRAGMA table_info`](./pragmas#table-info) and `pragma_table_info` list their columns.
 - [`PRAGMA matview_rewrite`](./pragmas#matview-rewrite) never answers queries from a materialized view over external data.
 
 ```sql

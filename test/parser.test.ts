@@ -708,7 +708,7 @@ describe('transactions and utility statements', () => {
 
   it('ANALYZE / VACUUM', () => {
     expect(one('ANALYZE')).toMatchObject({ kind: 'analyze', pos: 0, target: undefined });
-    expect(one('ANALYZE main.t')).toMatchObject({ target: 'main.t' });
+    expect(one('ANALYZE main.t')).toMatchObject({ schema: 'main', target: 't' });
     expect(one('VACUUM')).toMatchObject({ kind: 'vacuum', pos: 0 });
   });
 });

@@ -176,6 +176,22 @@ class Parser {
     this.kws = t.kws;
   }
 
+  /**
+   * Truth value (0 or 1) of an operand SQLite treats as always false / always true in AND/OR:
+   * TRUE, FALSE, or an unsigned decimal or hex integer literal that fits in 31 bits (possibly in
+   * parentheses). Undefined for anything else.
+   */
+  private plainIntLiteral(e: A.Expr): number | undefined {
+    if (e.kind !== 'literal' || typeof e.value !== 'number' || e.isReal) return undefined;
+    const text = this.src
+      .slice(e.pos, e.end)
+      .replace(/^[\s(]+|[\s)]+$/g, '')
+      .toLowerCase();
+    if (text === 'true' || text === 'false') return e.value;
+    if (!/^(?:[0-9]+|0x[0-9a-f]+)$/.test(text) || e.value < 0 || e.value > 0x7fffffff) return undefined;
+    return e.value === 0 ? 0 : 1;
+  }
+
   // ---------------------------------------------------------------- token helpers
 
   atEof(): boolean {
@@ -353,11 +369,13 @@ class Parser {
         const pos = this.pos();
         this.p++;
         let target: string | undefined;
+        let schema: string | undefined;
         if (this.isNameAt(this.p)) {
           const q = this.qualifiedName();
-          target = q.schema !== undefined ? `${q.schema}.${q.name}` : q.name;
+          target = q.name;
+          schema = q.schema;
         }
-        return { kind: 'analyze', pos, target, end: this.ends[this.p - 1] };
+        return { kind: 'analyze', pos, target, schema, end: this.ends[this.p - 1] };
       }
       case 'VACUUM': {
         const pos = this.pos();
@@ -675,7 +693,8 @@ class Parser {
       }
     }
     const upsert: A.UpsertClause[] = [];
-    while (this.isKw('ON') && this.kws[this.p + 1] === 'CONFLICT') upsert.push(this.upsertClause());
+    // SQLite's grammar has no upsert clause after DEFAULT VALUES.
+    while (source.kind !== 'default' && this.isKw('ON') && this.kws[this.p + 1] === 'CONFLICT') upsert.push(this.upsertClause());
     const returning = this.optReturning();
     return { kind: 'insert', pos, with: w, or, schema: q.schema, table: q.name, alias, columns, source, upsert, returning, end: this.ends[this.p - 1] };
   }
@@ -904,12 +923,15 @@ class Parser {
     return { kind: 'createExternalTable', pos, ifNotExists, name: q.name, columns, with: w, end: this.ends[this.p - 1] };
   }
 
-  /** smaltdb `( key = literal, ... )` storage options (after WITH). Keys are lower-cased. */
+  /**
+   * smaltdb `( key = literal, ... )` storage options (after WITH). Keys are lower-cased; a key may
+   * be a keyword (`null = 'NA'`), as option names are not column names.
+   */
   private withOptions(): Record<string, SqlValue> {
     const out: Record<string, SqlValue> = {};
     this.expectOp('(');
     do {
-      const key = this.name().toLowerCase();
+      const key = (this.kinds[this.p] === TK_KW ? this.src.slice(this.starts[this.p], this.ends[this.p++]) : this.name()).toLowerCase();
       this.expectOp('=');
       out[key] = this.optionValue().value;
     } while (this.acceptOp(','));
@@ -1138,6 +1160,7 @@ class Parser {
         else this.expectKw('IMMEDIATE');
       }
       fk.deferrable = !not && deferred;
+      fk.isDeferrable = !not;
     }
     return fk;
   }
@@ -1166,13 +1189,18 @@ class Parser {
         if (pk) this.expectKw('KEY');
         this.expectOp('(');
         const columns = this.indexedColumns();
+        const autoincrement = pk && this.acceptKw('AUTOINCREMENT'); // PRIMARY KEY (x AUTOINCREMENT), as in SQLite
         this.expectOp(')');
         const onConflict = this.optConflictClause();
-        return pk ? { pos, name, kind: 'primaryKey', columns, onConflict, end: this.ends[this.p - 1] } : { pos, name, kind: 'unique', columns, onConflict, end: this.ends[this.p - 1] };
+        return pk ? { pos, name, kind: 'primaryKey', columns, autoincrement, onConflict, end: this.ends[this.p - 1] } : { pos, name, kind: 'unique', columns, onConflict, end: this.ends[this.p - 1] };
       }
-      case 'CHECK':
+      case 'CHECK': {
         this.p++;
-        return { pos, name, kind: 'check', expr: this.parenExpr(), end: this.ends[this.p - 1] };
+        const expr = this.parenExpr();
+        // SQLite accepts (and ignores) an ON CONFLICT clause on a table CHECK constraint.
+        this.optConflictClause();
+        return { pos, name, kind: 'check', expr, end: this.ends[this.p - 1] };
+      }
       case 'FOREIGN': {
         this.p++;
         this.expectKw('KEY');
@@ -1434,7 +1462,13 @@ class Parser {
           if (prec < min) return left;
           this.p++;
           const right = this.exprPrec(prec + 1);
-          left = { kind: 'binary', pos: left.pos, op: kw, left, right, end: this.ends[this.p - 1] };
+          const end = this.ends[this.p - 1];
+          // SQLite: `x AND 0` / `x OR 1`, where the 0 or 1 is a plain integer literal (or FALSE/TRUE),
+          // is that constant without evaluating x, on either side.
+          const absorbing = kw === 'AND' ? 0 : 1;
+          if (this.plainIntLiteral(left) === absorbing || this.plainIntLiteral(right) === absorbing) {
+            left = { kind: 'literal', pos: left.pos, value: absorbing, isReal: undefined, end };
+          } else left = { kind: 'binary', pos: left.pos, op: kw, left, right, end };
           continue;
         }
         case 'COLLATE':

@@ -30,7 +30,7 @@ The type argument only describes the rows for TypeScript; nothing checks it at r
 
 | Field | Type | Meaning |
 |---|---|---|
-| `changes` | `number` | Rows inserted, updated or deleted by the statement |
+| `changes` | `number` | Rows inserted, updated or deleted by the statement; `0` for any other statement, such as a `SELECT` |
 | `lastInsertRowid` | `number` \| `bigint` | The rowid of the most recent successful `INSERT` on the engine's connection (an `UPDATE` or `DELETE` leaves it unchanged) |
 
 ```ts
@@ -38,7 +38,7 @@ const r = await db.exec('UPDATE users SET active = 0 WHERE last_seen < ?', ['202
 console.log(r.changes);
 ```
 
-Without parameters, `exec()` accepts a script of several statements separated by `;` and runs them in order. Each statement commits on its own unless the script contains `BEGIN … COMMIT`. If a statement fails, the ones before it stay done and the rest do not run. For a script, `changes` is the count of the last `INSERT`, `UPDATE` or `DELETE` in it.
+Without parameters, `exec()` accepts a script of several statements separated by `;` and runs them in order. Each statement commits on its own unless the script contains `BEGIN … COMMIT`. If a statement fails, the ones before it stay done and the rest do not run. For a script, `changes` is the count of the last `INSERT`, `UPDATE` or `DELETE` in it, or `0` if it has none.
 
 ```ts
 await db.exec(`
@@ -47,7 +47,7 @@ await db.exec(`
 `);
 ```
 
-With parameters, `exec()` runs exactly one statement; a script with parameters fails with `SMALT_SYNTAX`. Rows of a `SELECT` run with `exec()` are discarded.
+With parameters, `exec()` runs exactly one statement; a script with parameters fails with `SMALT_MISUSE` ("parameters can only be bound with a single statement"). Rows of a `SELECT` run with `exec()` are discarded.
 
 ### Prepared statements
 
@@ -153,7 +153,7 @@ Rules:
 
 - An array must have exactly as many values as the statement has parameter slots, or the call rejects with `SMALT_RANGE`. Named placeholders count as slots in order of first appearance, so an array also binds them.
 - With an object, every named placeholder needs a key: a missing key (or a key whose value is `undefined`) rejects with `SMALT_RANGE`. Extra keys are ignored.
-- With an object, plain `?` placeholders are not bound and stay NULL. Do not mix `?` and named placeholders when you bind with an object.
+- An object binds named placeholders only. If the statement also has `?` or `?NNN` placeholders, binding it with an object rejects with `SMALT_RANGE`; bind it with an array instead.
 - A statement without placeholders takes no parameters. Pass `undefined` (or leave the argument out); an empty array `[]` also works.
 
 ## Values
@@ -162,20 +162,22 @@ Rules:
 
 | JavaScript value | SQL value |
 |---|---|
-| `null` | NULL |
+| `null`, `undefined` (in an array) | NULL |
 | `number` with an integer value | INTEGER |
-| other `number` | REAL |
-| `bigint` | INTEGER |
+| other `number`, including `Infinity` and `-Infinity` | REAL |
+| `NaN` | NULL, as in SQLite |
+| `bigint` from −2^63 to 2^63 − 1 | INTEGER |
+| `true`, `false` | INTEGER `1`, `0` |
 | `string` | TEXT |
 | `Uint8Array` | BLOB |
 | other typed arrays and `DataView` | BLOB of their bytes |
 
 A value is then converted to the column's type where the table's typing rules allow it, so `3` in a `REAL` column is stored as `3.0`, and `'7'` in an `INTEGER` column is stored as `7`. See [data types](../reference/sql/types).
 
-The TypeScript type of parameters (`Params`) allows only `SqlValue`: `null | number | bigint | string | Uint8Array`. At run time:
+The TypeScript type of parameters, `Params`, accepts these values: `SqlValue` (`null | number | bigint | string | Uint8Array`), `boolean`, and `undefined` in an array. Also:
 
-- `true` and `false` are bound as `1` and `0`. TypeScript rejects them, so convert with `Number(flag)` or `flag ? 1 : 0`.
-- `undefined` in an array is bound as NULL. In an object it counts as a missing value (`SMALT_RANGE`).
+- `undefined` as a value in an object counts as a missing value (`SMALT_RANGE`).
+- A `bigint` outside the 64-bit range of INTEGER rejects with `SMALT_RANGE` ("integer … is out of range").
 - `Date`, `ArrayBuffer` and other objects reject with `SMALT_MISMATCH` ("unsupported parameter type"). Pass dates as text (`date.toISOString()`) or numbers; wrap an `ArrayBuffer` in a `Uint8Array`.
 
 ```sql
@@ -223,7 +225,7 @@ Calls on one `Database` run in the engine worker one at a time, in the order the
 
 - `query()` and `stream()` calls do not wait for each other: start several and await them together with `Promise.all`. With [parallel readers](./databases#parallel-readers) they may run at the same time.
 - `exec()`, `prepare()`, the import and export methods and `close()` wait for each other on the client, so they run in call order.
-- While a [`db.transaction()`](./transactions) callback runs, `db.query`, `db.exec`, `db.prepare`, the import and export methods and `db.close` wait until it ends. `db.stream` and the methods of prepared statements do not wait: they run at once, inside the open transaction. See [transactions](./transactions#what-waits-for-a-transaction).
+- While a [`db.transaction()`](./transactions) callback runs, every other call on the same `Database` and its prepared statements waits until it ends. Inside the callback, use the `tx` handle. See [transactions](./transactions#what-waits-for-a-transaction).
 
 ## Cancellation
 

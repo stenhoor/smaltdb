@@ -64,7 +64,7 @@ SELECT id, full_name, tier FROM client
 | --- | --- | --- |
 | 1 | Ann | 1 |
 
-The same restrictions as in SQLite apply (each `SMALT_ERROR`):
+These restrictions apply (each `SMALT_ERROR`):
 
 | Column definition | Error |
 | --- | --- |
@@ -72,8 +72,10 @@ The same restrictions as in SQLite apply (each `SMALT_ERROR`):
 | `UNIQUE` | `Cannot add a UNIQUE column` |
 | a default that is not a constant (`(expr)`, `CURRENT_TIMESTAMP`) | `Cannot add a column with non-constant default` |
 | `NOT NULL` without a non-NULL default | `Cannot add a NOT NULL column with default value NULL` |
+| `REFERENCES` with a non-NULL default, while foreign keys are on and the table has rows | `Cannot add a REFERENCES column with non-NULL default value` |
+| a subquery in `CHECK` | `error in table t after add column: subqueries prohibited in CHECK constraints` |
 
-A `REFERENCES` clause with a non-NULL default is accepted; existing rows are not checked against the parent table (SQLite rejects such a column while foreign keys are on). Generated columns fail with `SMALT_UNSUPPORTED`.
+SQLite applies the `NOT NULL` and non-constant default rules only when the table has rows; smaltdb applies them to empty tables too. Generated columns fail with `SMALT_UNSUPPORTED`.
 
 <!-- docs:error SMALT_ERROR -->
 ```sql

@@ -10,8 +10,18 @@ import {
   toBlob,
   toNumeric,
   toText,
+  truthy,
 } from './convert.js';
+import { sqlPrintf, valueInt64 } from './printf.js';
 import { dateFn, datetimeFn, juliandayFn, strftimeFn, timeFn, timediffFn, unixepochFn } from './datetime.js';
+
+/**
+ * The package version, replaced at build time from package.json (esbuild `define` in
+ * scripts/build.mjs, and in vitest.config.ts for tests), so it cannot drift from the package.
+ * Bundles made without the define (benchmarks, sqllogictest) report 'unknown'.
+ */
+declare const __SMALTDB_VERSION__: string | undefined;
+const SMALTDB_VERSION: string = typeof __SMALTDB_VERSION__ === 'string' ? __SMALTDB_VERSION__ : 'unknown';
 
 /** A compiled expression: reads the register file and returns a value. */
 export type Fn = (r: SqlValue[]) => SqlValue;
@@ -29,6 +39,19 @@ export interface FunctionContext {
   totalChanges(): number;
   /** Current time in Unix milliseconds; the same value for every call within one statement execution. */
   now(): number;
+  /** Set while evaluating an index expression or CHECK constraint (see DateTimeContext.pureContext). */
+  pureContext?: string;
+}
+
+/** `base` for evaluating an index expression or CHECK constraint (`where`: 'an index', 'a CHECK constraint'). */
+export function pureFunctionContext(base: FunctionContext, where: string): FunctionContext {
+  return {
+    lastInsertRowid: () => base.lastInsertRowid(),
+    changes: () => base.changes(),
+    totalChanges: () => base.totalChanges(),
+    now: () => base.now(),
+    pureContext: where,
+  };
 }
 
 export interface ScalarFunction {
@@ -37,6 +60,11 @@ export interface ScalarFunction {
   maxArgs: number;
   /** False for random() etc. (never constant-folded). */
   deterministic: boolean;
+  /**
+   * The date and time functions: not constant-folded, but allowed in index expressions and CHECK
+   * constraints, where they fail at run time if they read the clock or time zone (SQLite).
+   */
+  pureDate?: boolean;
   compile(args: CompiledArg[], ctx: FunctionContext): { fn: Fn; type: StaticType };
 }
 
@@ -54,7 +82,7 @@ export interface AggregateFunction {
   create(argTypes: StaticType[], collation: Collation): AggregateState;
 }
 
-const isRealType = (t: StaticType): boolean => t === 'real';
+const isRealType = (t: StaticType | undefined): boolean => t === 'real';
 
 // ------------------------------------------------------------------ helpers
 
@@ -96,6 +124,11 @@ function simple(
   };
 }
 
+/** A date/time function: never constant-folded, but allowed in indexes and CHECK constraints. */
+function dateFunction(min: number, max: number, type: StaticType, impl: (vals: SqlValue[], args: CompiledArg[], ctx: FunctionContext) => SqlValue): ScalarFunction {
+  return { ...simple(min, max, type, impl, false), pureDate: true };
+}
+
 /** Count code points (SQLite measures text length in characters, not UTF-16 units). */
 function charLength(s: string): number {
   let n = s.length;
@@ -111,18 +144,21 @@ function charLength(s: string): number {
 
 const SURROGATE = /[\uD800-\uDFFF]/;
 
+/** Text that SQLite's numeric affinity turns into a number (decimal only; surrounding spaces allowed). */
+const NUMERIC_TEXT = /^[ \t\n\v\f\r]*[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?[ \t\n\v\f\r]*$/;
+
 function toInt(v: SqlValue): number {
   const n = castToInteger(v);
   return n === null ? 0 : Number(n);
 }
 
-function substr(x: SqlValue, startV: SqlValue, lenV: SqlValue | undefined): SqlValue {
+function substr(x: SqlValue, startV: SqlValue, lenV: SqlValue | undefined, isReal: boolean): SqlValue {
   if (x === null || startV === null || lenV === null) return null;
   let p1 = toInt(startV);
   let p2: number;
   let negP2 = false;
   const isBlob = x instanceof Uint8Array;
-  const chars: string | string[] | Uint8Array = isBlob ? (x as Uint8Array) : typeof x === 'string' ? x : toText(x)!;
+  const chars: string | string[] | Uint8Array = isBlob ? (x as Uint8Array) : typeof x === 'string' ? x : toText(x, isReal)!;
   const useArray = !isBlob && SURROGATE.test(chars as string);
   const seq: string | string[] | Uint8Array = useArray ? Array.from(chars as string) : chars;
   const len = seq.length;
@@ -162,13 +198,13 @@ function substr(x: SqlValue, startV: SqlValue, lenV: SqlValue | undefined): SqlV
 }
 
 function trimImpl(mode: 0 | 1 | 2) {
-  return (v: SqlValue[]): SqlValue => {
+  return (v: SqlValue[], args: CompiledArg[]): SqlValue => {
     const x = v[0];
     if (x === null) return null;
-    const s = toText(x)!;
+    const s = toText(x, isRealType(args[0].type))!;
     const set = v.length > 1 ? v[1] : ' ';
     if (set === null) return null;
-    const chars = new Set(Array.from(toText(set)!));
+    const chars = new Set(Array.from(toText(set, isRealType(args[1]?.type))!));
     const arr = Array.from(s);
     let a = 0;
     let b = arr.length;
@@ -219,124 +255,9 @@ function round(x: SqlValue, nV: SqlValue): SqlValue {
   return Number(v.toFixed(n));
 }
 
-/** Minimal printf: %d %i %u %f %e %E %g %G %x %X %o %c %s %q %Q %w %%, with flags, width, precision. */
 function printf(args: SqlValue[], types: CompiledArg[]): SqlValue {
-  if (args[0] === null) return null;
-  const fmt = toText(args[0])!;
-  let ai = 1;
-  const next = (): SqlValue => (ai < args.length ? args[ai++] : null);
-  let out = '';
-  for (let i = 0; i < fmt.length; i++) {
-    const c = fmt[i];
-    if (c !== '%') {
-      out += c;
-      continue;
-    }
-    let j = i + 1;
-    let flags = '';
-    while (j < fmt.length && '-+ 0#,!'.includes(fmt[j])) flags += fmt[j++];
-    let width = '';
-    while (j < fmt.length && /\d/.test(fmt[j])) width += fmt[j++];
-    if (fmt[j] === '*') {
-      width = String(toInt(next()));
-      j++;
-    }
-    let precision: number | undefined;
-    if (fmt[j] === '.') {
-      j++;
-      let p = '';
-      if (fmt[j] === '*') {
-        p = String(toInt(next()));
-        j++;
-      } else while (j < fmt.length && /\d/.test(fmt[j])) p += fmt[j++];
-      precision = p === '' ? 0 : Number(p);
-    }
-    while (fmt[j] === 'l' || fmt[j] === 'h') j++;
-    const conv = fmt[j];
-    i = j;
-    let s: string;
-    switch (conv) {
-      case '%':
-        out += '%';
-        continue;
-      case 'd':
-      case 'i':
-      case 'u': {
-        const v = castToInteger(next() ?? 0) ?? 0;
-        s = (typeof v === 'bigint' ? v : BigInt(v)).toString();
-        if (flags.includes(',')) s = s.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-        if (flags.includes('+') && !s.startsWith('-')) s = '+' + s;
-        else if (flags.includes(' ') && !s.startsWith('-')) s = ' ' + s;
-        break;
-      }
-      case 'f':
-      case 'e':
-      case 'E':
-      case 'g':
-      case 'G': {
-        const v = Number(toNumeric(next() ?? 0) ?? 0);
-        const p = precision ?? 6;
-        if (conv === 'f') s = v.toFixed(Math.min(p, 100));
-        else if (conv === 'e' || conv === 'E') s = v.toExponential(Math.min(p, 100)).replace(/e([+-])(\d)$/, 'e$10$2');
-        else {
-          s = v.toPrecision(Math.max(1, Math.min(p || 1, 100)));
-          if (!flags.includes('#') && s.includes('.') && !s.includes('e')) s = s.replace(/\.?0+$/, '');
-          s = s.replace(/e([+-])(\d)$/, 'e$10$2');
-        }
-        if (conv === 'E' || conv === 'G') s = s.toUpperCase();
-        if (flags.includes('+') && v >= 0) s = '+' + s;
-        break;
-      }
-      case 'x':
-      case 'X':
-      case 'o': {
-        const v = castToInteger(next() ?? 0) ?? 0;
-        const big = BigInt.asUintN(64, typeof v === 'bigint' ? v : BigInt(v));
-        s = big.toString(conv === 'o' ? 8 : 16);
-        if (conv === 'X') s = s.toUpperCase();
-        break;
-      }
-      case 'c': {
-        const t = toText(next()) ?? '';
-        s = Array.from(t)[0] ?? '';
-        break;
-      }
-      case 's':
-      case 'z': {
-        const v = next();
-        const ti = ai - 1;
-        s = v === null ? '' : toText(v, isRealType(types[ti]?.type ?? 'any'))!;
-        if (precision !== undefined) s = Array.from(s).slice(0, precision).join('');
-        break;
-      }
-      case 'q':
-      case 'Q':
-      case 'w': {
-        const v = next();
-        if (v === null) s = conv === 'Q' ? 'NULL' : '(NULL)';
-        else {
-          const t = toText(v)!;
-          s = conv === 'w' ? t.replace(/"/g, '""') : t.replace(/'/g, "''");
-          if (conv === 'Q') s = "'" + s + "'";
-        }
-        break;
-      }
-      default:
-        // Unknown conversion: emit verbatim.
-        out += fmt.slice(i - (j - i), j + 1);
-        continue;
-    }
-    const w = width === '' ? 0 : Number(width);
-    if (s.length < w) {
-      if (flags.includes('-')) s = s.padEnd(w);
-      else if (flags.includes('0') && /^[+-]?\d/.test(s)) {
-        const sign = /^[+-]/.test(s) ? s[0] : '';
-        s = sign + s.slice(sign.length).padStart(w - sign.length, '0');
-      } else s = s.padStart(w);
-    }
-    out += s;
-  }
-  return out;
+  if (args.length === 0) return null;
+  return sqlPrintf(args[0], args, types.map((t) => isRealType(t.type)));
 }
 
 function randomInt64(): number | bigint {
@@ -362,6 +283,36 @@ function commonType(args: CompiledArg[]): StaticType {
 }
 
 // ------------------------------------------------------------------ scalar registry
+
+/**
+ * iif(C1, V1 [, C2, V2 ...] [, ELSE]) and its alias if(): the same as
+ * CASE WHEN C1 THEN V1 [WHEN C2 THEN V2 ...] [ELSE ELSE] END (SQLite 3.48+).
+ */
+const IIF: ScalarFunction = {
+  minArgs: 2,
+  maxArgs: -1,
+  deterministic: true,
+  compile(args) {
+    const n = args.length;
+    const conds: Fn[] = [];
+    const vals: Fn[] = [];
+    for (let i = 0; i + 1 < n; i += 2) {
+      conds.push(args[i].fn);
+      vals.push(args[i + 1].fn);
+    }
+    const els = n % 2 === 1 ? args[n - 1].fn : undefined;
+    const valueArgs = args.filter((_a, i) => i % 2 === 1 || i === n - 1);
+    const type = commonType(els ? valueArgs : [...valueArgs, { fn: () => null, type: 'null', collation: Collation.Binary }]);
+    const m = conds.length;
+    return {
+      type,
+      fn: (r) => {
+        for (let i = 0; i < m; i++) if (truthy(conds[i](r)) === true) return vals[i](r);
+        return els ? els(r) : null;
+      },
+    };
+  },
+};
 
 export const scalarFunctions = new Map<string, ScalarFunction>([
   [
@@ -411,27 +362,8 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
       },
     },
   ],
-  [
-    'iif',
-    {
-      minArgs: 3,
-      maxArgs: 3,
-      deterministic: true,
-      compile([c, a, b]) {
-        const fc = c.fn;
-        const fa = a.fn;
-        const fb = b.fn;
-        return {
-          type: commonType([a, b]),
-          fn: (r) => {
-            const v = fc(r);
-            const t = v === null ? false : typeof v === 'number' ? v !== 0 : Number(toNumeric(v)) !== 0;
-            return t ? fa(r) : fb(r);
-          },
-        };
-      },
-    },
-  ],
+  ['iif', IIF],
+  ['if', IIF],
   ['nullif', simple(2, 2, firstArgType, ([a, b], args) => (a !== null && b !== null && compareValues(a, b, args[0].collation) === 0 ? null : a))],
   [
     'length',
@@ -452,8 +384,8 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
   ],
   ['lower', simple(1, 1, 'text', ([x], args) => (x === null ? null : asciiLower(toText(x, isRealType(args[0].type))!)))],
   ['upper', simple(1, 1, 'text', ([x], args) => (x === null ? null : asciiUpper(toText(x, isRealType(args[0].type))!)))],
-  ['substr', simple(2, 3, (a) => (a[0].type === 'blob' ? 'blob' : 'text'), (v) => substr(v[0], v[1], v.length > 2 ? v[2] : undefined))],
-  ['substring', simple(2, 3, (a) => (a[0].type === 'blob' ? 'blob' : 'text'), (v) => substr(v[0], v[1], v.length > 2 ? v[2] : undefined))],
+  ['substr', simple(2, 3, (a) => (a[0].type === 'blob' ? 'blob' : 'text'), (v, args) => substr(v[0], v[1], v.length > 2 ? v[2] : undefined, isRealType(args[0].type)))],
+  ['substring', simple(2, 3, (a) => (a[0].type === 'blob' ? 'blob' : 'text'), (v, args) => substr(v[0], v[1], v.length > 2 ? v[2] : undefined, isRealType(args[0].type)))],
   ['trim', simple(1, 2, 'text', trimImpl(0))],
   ['ltrim', simple(1, 2, 'text', trimImpl(1))],
   ['rtrim', simple(1, 2, 'text', trimImpl(2))],
@@ -469,19 +401,21 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
   ],
   [
     'instr',
-    simple(2, 2, 'int', ([x, y]) => {
+    simple(2, 2, 'int', ([x, y], args) => {
       if (x === null || y === null) return null;
+      const xr = isRealType(args[0].type);
+      const yr = isRealType(args[1].type);
       if (x instanceof Uint8Array || y instanceof Uint8Array) {
-        const a = toBlob(x)!;
-        const b = toBlob(y)!;
+        const a = toBlob(x, xr)!;
+        const b = toBlob(y, yr)!;
         outer: for (let i = 0; i + b.length <= a.length; i++) {
           for (let j = 0; j < b.length; j++) if (a[i + j] !== b[j]) continue outer;
           return i + 1;
         }
         return 0;
       }
-      const s = toText(x)!;
-      const i = s.indexOf(toText(y)!);
+      const s = toText(x, xr)!;
+      const i = s.indexOf(toText(y, yr)!);
       return i < 0 ? 0 : charLength(s.slice(0, i)) + 1;
     }),
   ],
@@ -510,8 +444,12 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
   [
     'char',
     simple(0, -1, 'text', (v) => {
+      // SQLite: each argument as sqlite3_value_int64() (NULL is 0); out of range gives U+FFFD.
       let s = '';
-      for (const x of v) if (x !== null) s += String.fromCodePoint(Math.max(0, Math.min(0x10ffff, toInt(x))));
+      for (const x of v) {
+        const c = valueInt64(x);
+        s += String.fromCodePoint(c < 0n || c > 0x10ffffn ? 0xfffd : Number(c));
+      }
       return s;
     }),
   ],
@@ -560,17 +498,18 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
   [
     'sign',
     simple(1, 1, 'int', ([x]) => {
-      if (x === null) return null;
-      const n = typeof x === 'string' || x instanceof Uint8Array ? null : x;
-      if (n === null) return null;
+      // SQLite: text that is entirely a number (surrounding spaces allowed) counts; blobs and other text give NULL.
+      if (x === null || x instanceof Uint8Array) return null;
+      if (typeof x === 'string' && !NUMERIC_TEXT.test(x)) return null;
+      const n = typeof x === 'string' ? Number(x.replace(/^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g, '')) : x;
       return n > 0 ? 1 : n < 0 ? -1 : 0;
     }),
   ],
   ['likely', simple(1, 1, firstArgType, ([x]) => x)],
   ['unlikely', simple(1, 1, firstArgType, ([x]) => x)],
   ['likelihood', simple(2, 2, firstArgType, ([x]) => x)],
-  ['printf', simple(1, -1, 'text', printf)],
-  ['format', simple(1, -1, 'text', printf)],
+  ['printf', simple(0, -1, 'text', printf)],
+  ['format', simple(0, -1, 'text', printf)],
   [
     'concat',
     simple(1, -1, 'text', (v, args) => {
@@ -583,7 +522,7 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
     'concat_ws',
     simple(2, -1, 'text', (v, args) => {
       if (v[0] === null) return null;
-      const sep = toText(v[0])!;
+      const sep = toText(v[0], isRealType(args[0].type))!;
       const parts: string[] = [];
       for (let i = 1; i < v.length; i++) if (v[i] !== null) parts.push(toText(v[i], isRealType(args[i].type))!);
       return parts.join(sep);
@@ -592,15 +531,15 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
   ['last_insert_rowid', simple(0, 0, 'int', (_v, _a, ctx) => ctx.lastInsertRowid(), false)],
   ['changes', simple(0, 0, 'int', (_v, _a, ctx) => ctx.changes(), false)],
   ['total_changes', simple(0, 0, 'int', (_v, _a, ctx) => ctx.totalChanges(), false)],
-  ['smaltdb_version', simple(0, 0, 'text', () => '0.1.0')],
+  ['smaltdb_version', simple(0, 0, 'text', () => SMALTDB_VERSION)],
   // Date and time (datetime.ts). Not constant-folded: 'now' and 'localtime' depend on when they run.
-  ['date', simple(0, -1, 'text', (v, _a, ctx) => dateFn(v, ctx), false)],
-  ['time', simple(0, -1, 'text', (v, _a, ctx) => timeFn(v, ctx), false)],
-  ['datetime', simple(0, -1, 'text', (v, _a, ctx) => datetimeFn(v, ctx), false)],
-  ['julianday', simple(0, -1, 'real', (v, _a, ctx) => juliandayFn(v, ctx), false)],
-  ['unixepoch', simple(0, -1, 'num', (v, _a, ctx) => unixepochFn(v, ctx), false)],
-  ['strftime', simple(0, -1, 'text', (v, _a, ctx) => strftimeFn(v, ctx), false)],
-  ['timediff', simple(2, 2, 'text', (v, _a, ctx) => timediffFn(v, ctx), false)],
+  ['date', dateFunction(0, -1, 'text', (v, _a, ctx) => dateFn(v, ctx))],
+  ['time', dateFunction(0, -1, 'text', (v, _a, ctx) => timeFn(v, ctx))],
+  ['datetime', dateFunction(0, -1, 'text', (v, _a, ctx) => datetimeFn(v, ctx))],
+  ['julianday', dateFunction(0, -1, 'real', (v, _a, ctx) => juliandayFn(v, ctx))],
+  ['unixepoch', dateFunction(0, -1, 'num', (v, _a, ctx) => unixepochFn(v, ctx))],
+  ['strftime', dateFunction(0, -1, 'text', (v, _a, ctx) => strftimeFn(v, ctx))],
+  ['timediff', dateFunction(2, 2, 'text', (v, _a, ctx) => timediffFn(v, ctx))],
 ]);
 
 // ------------------------------------------------------------------ aggregates
@@ -713,12 +652,13 @@ class GroupConcatState implements AggregateState {
   constructor(
     private readonly argReal: boolean,
     private readonly hasSep: boolean,
+    private readonly sepReal = false,
   ) {}
   step(args: SqlValue[]): void {
     const v = args[0];
     if (v === null) return;
     if (this.parts === null) this.parts = [];
-    else this.seps.push(this.hasSep ? (args[1] === null ? '' : toText(args[1])!) : ',');
+    else this.seps.push(this.hasSep ? (args[1] === null ? '' : toText(args[1], this.sepReal)!) : ',');
     this.parts.push(toText(v, this.argReal)!);
   }
   final(): SqlValue {
@@ -746,8 +686,8 @@ export const aggregateFunctions = new Map<string, AggregateFunction>([
   ['avg', { minArgs: 1, maxArgs: 1, resultType: () => 'real', create: (t) => new SumState('avg', t[0] === 'real') }],
   ['min', { minArgs: 1, maxArgs: 1, resultType: (t) => t[0], create: (_t, c) => new MinMaxState(1, c) }],
   ['max', { minArgs: 1, maxArgs: 1, resultType: (t) => t[0], create: (_t, c) => new MinMaxState(-1, c) }],
-  ['group_concat', { minArgs: 1, maxArgs: 2, resultType: () => 'text', create: (t) => new GroupConcatState(t[0] === 'real', t.length > 1) }],
-  ['string_agg', { minArgs: 2, maxArgs: 2, resultType: () => 'text', create: (t) => new GroupConcatState(t[0] === 'real', true) }],
+  ['group_concat', { minArgs: 1, maxArgs: 2, resultType: () => 'text', create: (t) => new GroupConcatState(t[0] === 'real', t.length > 1, t[1] === 'real') }],
+  ['string_agg', { minArgs: 2, maxArgs: 2, resultType: () => 'text', create: (t) => new GroupConcatState(t[0] === 'real', true, t[1] === 'real') }],
 ]);
 
 /** Format helper re-exported for EXPLAIN and tests. */

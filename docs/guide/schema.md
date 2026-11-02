@@ -81,7 +81,7 @@ CREATE TABLE membership(
 INSERT INTO membership(project_id, user_name) VALUES (1, 'ann'), (1, 'bob'), (2, 'ann');
 ```
 
-`AUTOINCREMENT` is accepted but does not prevent reuse of a deleted largest key; see [CREATE TABLE](../reference/sql/create-table#primary-key).
+`AUTOINCREMENT` is allowed only on an `INTEGER PRIMARY KEY` and does not prevent reuse of a deleted largest key; see [CREATE TABLE](../reference/sql/create-table#primary-key).
 
 ## Constraints
 
@@ -113,7 +113,7 @@ INSERT INTO task(project_id, title, estimate_h) VALUES (1, 'Design', 8), (1, 'Bu
 INSERT INTO task(project_id, title, estimate_h) VALUES (1, 'Nothing', 0)
 ```
 
-The error is `CHECK constraint failed: positive_estimate`. To insert-or-update instead of failing on a duplicate key, use [`ON CONFLICT … DO UPDATE`](../reference/sql/insert#upsert-on-conflict).
+The error is `CHECK constraint failed: positive_estimate`. To insert-or-update instead of failing on a duplicate key, use [`ON CONFLICT … DO UPDATE`](../reference/sql/insert#upsert-on-conflict). To skip or replace duplicates by default, give the constraint an [`ON CONFLICT` clause](../reference/sql/create-table#on-conflict), such as `UNIQUE ON CONFLICT IGNORE`.
 
 ## Foreign keys
 
@@ -225,7 +225,7 @@ SELECT p.name FROM project p JOIN selected s ON s.id = p.id
 | --- |
 | Mobile app |
 
-Temp tables can have indexes and constraints, roll back with transactions, and hide a regular table of the same name (`main.name` still reaches it). They cannot be altered, cannot be columnar, and are not listed in `sqlite_schema` or `information_schema`. Write `CREATE TEMP TABLE`, not `CREATE TABLE temp.name`: the latter creates a regular table. See [Temporary tables](../reference/sql/create-table#temporary-tables).
+Temp tables can have indexes and constraints, roll back with transactions, and hide a regular table of the same name (`main.name` still reaches it). They cannot be altered, cannot be columnar, and are listed in `temp.sqlite_schema` rather than `sqlite_schema` (and not in `information_schema`). `CREATE TABLE temp.name` is the same as `CREATE TEMP TABLE name`. See [Temporary tables](../reference/sql/create-table#temporary-tables).
 
 ## Tables for analytics
 

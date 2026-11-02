@@ -42,9 +42,10 @@ The general error for SQL that refers to things that do not exist or uses them w
 - an unknown table, column, function, view, index, savepoint or connection;
 - an object that already exists (`CREATE TABLE` without `IF NOT EXISTS`);
 - transaction control out of place: `BEGIN` inside a transaction, `COMMIT` or `ROLLBACK` without one;
+- a `db.transaction()` callback that ran `ROLLBACK` itself (`the transaction was rolled back inside the transaction callback`);
 - a query that is valid syntax but not valid SQL (an aggregate in `GROUP BY`, a compound `SELECT` whose sides have different column counts, an ambiguous column name);
 - an integer overflow in arithmetic or `sum()`;
-- bad import data: malformed CSV or JSON, a wrong field count, an unknown column name.
+- bad import data: malformed CSV or JSON, a JSON item that is not an object or array (or does not match the first item's kind), a wrong field count, an unknown column name.
 
 **Remedy:** fix the SQL or the data.
 
@@ -55,7 +56,7 @@ SELECT * FROM no_such_table;
 
 ## SMALT_SYNTAX
 
-The SQL does not parse. The message gives the token and position: `SELEC 1` fails with `near "SELEC": syntax error (line 1, column 1)`. `query()`, `prepare()` and `exec()` with parameters accept one statement only; a second statement is reported as a syntax error.
+The SQL does not parse. The message gives the token and position: `SELEC 1` fails with `near "SELEC": syntax error (line 1, column 1)`. `query()` and `prepare()` accept one statement only; a second statement is reported as a syntax error. (`exec()` with parameters reports it as `SMALT_MISUSE`.)
 
 **Remedy:** fix the SQL. See the [SQL reference](../sql/).
 
@@ -160,11 +161,13 @@ The parameters do not match the statement:
 
 - an array with the wrong number of values (`statement expects 2 parameter(s), got 1`);
 - no parameters for a statement that has placeholders (`statement expects 1 parameter(s)`);
-- an object without a key for a named parameter (`missing value for parameter :id`).
+- an object without a key for a named parameter (`missing value for parameter :id`);
+- an object for a statement that has `?` or `?NNN` placeholders (`statement has positional parameters (? or ?NNN): bind them with an array, not an object`);
+- a `bigint` outside the 64-bit INTEGER range (`parameter ?1: integer 9223372036854775808 is out of range (INTEGER values are 64-bit signed)`).
 
 Also raised by the CSV import when `delimiter` or `quote` is not a single character.
 
-**Remedy:** pass one value per placeholder. See [parameters](../../guide/queries#parameters).
+**Remedy:** pass one value per placeholder, within range. See [parameters](../../guide/queries#parameters).
 
 <!-- docs:error SMALT_RANGE -->
 ```sql
@@ -186,13 +189,13 @@ INSERT INTO docs VALUES (hex(zeroblob(10000)));
 
 ## SMALT_FULL
 
-A new row needs a rowid, but the largest rowid in the table is already the largest 64-bit integer. Message: `database or disk is full (rowid space exhausted)`. SQLite would pick a random unused rowid instead.
+A new row needs a rowid, the largest rowid in the table is already the largest 64-bit integer, and no free one was found: as in SQLite, 100 random candidates were all taken, or the table is `AUTOINCREMENT` (which never picks random rowids). Message: `database or disk is full (rowid space exhausted)`.
 
 **Remedy:** do not store values near 2^63 − 1 in an `INTEGER PRIMARY KEY`; use a separate column for them.
 
 <!-- docs:error SMALT_FULL -->
 ```sql
-CREATE TABLE seq(id INTEGER PRIMARY KEY, v TEXT);
+CREATE TABLE seq(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
 INSERT INTO seq VALUES (9223372036854775807, 'max');
 INSERT INTO seq(v) VALUES ('next');
 ```
@@ -232,7 +235,9 @@ The API was used in a way that cannot work:
 |---|---|
 | `database is closed` | A call on a closed `Database` (client or engine). |
 | `statement is finalized` | A call on a `PreparedStatement` after `finalize()`. |
-| `parameters can only be bound with a single statement` | Engine `exec` / `execAsync` with parameters and several statements. |
+| `parameters can only be bound with a single statement` | `exec` (client or engine) or engine `execAsync` with parameters and several statements. |
+| `the transaction has ended: use tx only while the transaction callback runs` | A method of a `db.transaction()` handle (`tx`) called after its callback finished. |
+| `the statement was prepared on another Database` | `tx.statement(stmt)` with a statement of another `Database`. |
 | `invalid page size …` | A `pageSize` that is not a power of two from 512 to 65536. |
 
 Low-level engine classes (pager, b-tree, VFS) raise it for invalid calls as well.
@@ -252,13 +257,13 @@ SELECT * FROM read_csv('file:not-registered.csv');
 
 ## SMALT_ASYNC_REQUIRED
 
-Engine only. A synchronous call (`query`, `run`, `exec`, `Statement.run` …) was given a statement that reads external data, which must be fetched first. The client never raises it: the engine worker uses the async path.
+Engine only. A synchronous call (`query`, `run`, `exec`, `Statement.run` …) was given a statement that reads external data, which must be fetched first, or `REFRESH MATERIALIZED VIEW … IF CHANGED`, which checks its sources first. The client never raises it: the engine worker uses the async path.
 
 **Remedy:** use `queryAsync`, `runAsync` or `execAsync`. See the [engine API](./engine#external-data).
 
 ## SMALT_CANTOPEN
 
-A file cannot be opened: OPFS refused to open or create it, or a file that must exist does not (engine `MemoryVfs.open` with `create: false`, a parallel reader opening a database that was never written).
+A file cannot be opened: OPFS refused to open or create it, OPFS sync access handles do not exist where the engine runs (engine `OpfsVfs` in Node, on a page's main thread, or in a browser without OPFS), or a file that must exist does not (engine `MemoryVfs.open` with `create: false`, a parallel reader opening a database that was never written).
 
 **Remedy:** check that OPFS is available and the storage quota is not exhausted.
 

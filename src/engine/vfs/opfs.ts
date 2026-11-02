@@ -117,6 +117,7 @@ export class OpfsVfs implements Vfs {
     const parts = [this.rootDir, ...path.split('/')].filter((p) => p.length > 0);
     const name = parts.pop();
     if (!name) throw new SmaltError('SMALT_MISUSE', `invalid path: ${path}`);
+    if (!OpfsVfs.isSupported()) throw new SmaltError('SMALT_CANTOPEN', `cannot open ${path}: OPFS sync access handles are not available here (they exist only in a dedicated worker of a browser that supports OPFS)`);
     let dir = await navigator.storage.getDirectory();
     for (const part of parts) dir = await dir.getDirectoryHandle(part, { create });
     return { dir, name };

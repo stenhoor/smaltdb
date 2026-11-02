@@ -4,12 +4,38 @@ import { BTree } from '../storage/btree.js';
 import { KeyEncoder, ROWID_KEY_SIZE, readIndexRowid, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
 import { RecordEncoder, RecordReader } from '../storage/record.js';
 import type { Pager } from '../storage/pager.js';
-import type { SqlValue } from '../values.js';
+import { type SqlValue, normalizeInt } from '../values.js';
 
 export type ConflictMode = 'ABORT' | 'FAIL' | 'IGNORE' | 'REPLACE' | 'ROLLBACK';
 
 const I64_MAX = 2n ** 63n - 1n;
 const EMPTY = new Uint8Array(0);
+
+/** A constraint failure under conflict action `mode` (ROLLBACK also ends the transaction). */
+export function constraintError(code: string, message: string, mode: ConflictMode): ConstraintError {
+  const e = new ConstraintError(code, message);
+  e.rollback = mode === 'ROLLBACK';
+  return e;
+}
+
+/**
+ * The order in which SQLite checks a table's unique indexes: its index list, where each new
+ * index goes first, except that an index whose ON CONFLICT action is REPLACE goes after those
+ * that are not (sqlite3CreateIndex()).
+ */
+function uniqueCheckOrder(indexes: readonly IndexSchema[]): number[] {
+  const isReplace = (i: number): boolean => indexes[i].onConflict === 'REPLACE';
+  const list: number[] = [];
+  for (let i = 0; i < indexes.length; i++) {
+    if (!isReplace(i) || list.length === 0 || isReplace(list[0])) list.unshift(i);
+    else {
+      let k = 0;
+      while (k + 1 < list.length && !isReplace(list[k + 1])) k++;
+      list.splice(k + 1, 0, i);
+    }
+  }
+  return list.filter((i) => indexes[i].unique);
+}
 
 /**
  * Row-level writes for one table: record encoding, rowid assignment, unique-constraint checks,
@@ -36,7 +62,11 @@ export class TableWriter {
     this.indexTrees = table.indexes.map((i) => treeFor(i.rootPage));
     this.enc = new RecordEncoder(table.layout);
     this.reader = new RecordReader(table.layout, table.recordDefaults);
+    this.checkOrder = uniqueCheckOrder(table.indexes);
   }
+
+  /** Unique indexes (positions in `table.indexes`) in the order SQLite checks them. */
+  private readonly checkOrder: number[];
 
   protected key(rowid: number | bigint): Uint8Array {
     writeRowidKey(this.rowidKey, 0, rowid);
@@ -58,9 +88,26 @@ export class TableWriter {
       c.close();
     }
     const m = this.maxRowid;
-    if (typeof m === 'bigint' ? m >= I64_MAX : false) throw new SmaltError('SMALT_FULL', 'database or disk is full (rowid space exhausted)');
+    if (typeof m === 'bigint' && m >= I64_MAX) return this.randomRowid();
     const next = typeof m === 'number' ? (Number.isSafeInteger(m + 1) ? m + 1 : BigInt(m) + 1n) : m + 1n;
     return next;
+  }
+
+  /**
+   * The largest rowid is taken: like SQLite, try up to 100 random rowids in 1 .. 2^62 and fail
+   * with SMALT_FULL only if all are in use. An AUTOINCREMENT table fails at once (SQLite never
+   * reuses rowids there).
+   */
+  protected randomRowid(): number | bigint {
+    const full = new SmaltError('SMALT_FULL', 'database or disk is full (rowid space exhausted)');
+    if (this.table.autoincrement) throw full;
+    const r = new BigUint64Array(1);
+    for (let i = 0; i < 100; i++) {
+      globalThis.crypto.getRandomValues(r);
+      const v = normalizeInt((r[0] & (I64_MAX >> 1n)) + 1n);
+      if (!this.rowExists(v)) return v;
+    }
+    throw full;
   }
 
   private noteRowid(rowid: number | bigint): void {
@@ -173,24 +220,35 @@ export class TableWriter {
   /**
    * Resolve uniqueness conflicts for writing `row` at `rowid` (ignoring row `except`).
    * Returns false if the row must be skipped (IGNORE). REPLACE deletes conflicting rows.
+   * `override` is the statement's OR action; without one, each constraint's ON CONFLICT action
+   * applies (default ABORT). As in SQLite, the rowid is checked first (last when its action is
+   * REPLACE by default), then unique indexes newest first, those that REPLACE by default last.
    */
-  resolveConflicts(row: readonly SqlValue[], rowid: number | bigint, except: number | bigint | null, mode: ConflictMode): boolean {
-    // eslint-disable-next-line eqeqeq
-    if ((except === null || rowid != except) && this.rowExists(rowid)) {
-      if (mode === 'IGNORE') return false;
-      if (mode === 'REPLACE') this.deleteRow(rowid, undefined, false, true);
-      else throw new ConstraintError(this.conflictCode(null), this.conflictMessage(null));
-    }
-    for (let i = 0; i < this.table.indexes.length; i++) {
+  resolveConflicts(row: readonly SqlValue[], rowid: number | bigint, except: number | bigint | null, override: ConflictMode | undefined): boolean {
+    const rowidMode = override ?? this.table.pkConflict ?? 'ABORT';
+    const deferRowid = rowidMode === 'REPLACE' && override === undefined && this.table.indexes.length > 0;
+    if (!deferRowid && !this.resolveRowid(rowid, except, rowidMode)) return false;
+    for (const i of this.checkOrder) {
+      const idx = this.table.indexes[i];
+      const mode = override ?? idx.onConflict ?? 'ABORT';
       for (;;) {
         const other = this.uniqueConflict(i, row, except, rowid);
         if (other === null) break;
         if (mode === 'IGNORE') return false;
-        if (mode !== 'REPLACE') {
-          throw new ConstraintError(this.conflictCode(this.table.indexes[i]), this.conflictMessage(this.table.indexes[i]));
-        }
+        if (mode !== 'REPLACE') throw constraintError(this.conflictCode(idx), this.conflictMessage(idx), mode);
         this.deleteRow(other, undefined, false, true);
       }
+    }
+    if (deferRowid && !this.resolveRowid(rowid, except, rowidMode)) return false;
+    return true;
+  }
+
+  private resolveRowid(rowid: number | bigint, except: number | bigint | null, mode: ConflictMode): boolean {
+    // eslint-disable-next-line eqeqeq
+    if ((except === null || rowid != except) && this.rowExists(rowid)) {
+      if (mode === 'IGNORE') return false;
+      if (mode === 'REPLACE') this.deleteRow(rowid, undefined, false, true);
+      else throw constraintError(this.conflictCode(null), this.conflictMessage(null), mode);
     }
     return true;
   }

@@ -1,10 +1,14 @@
 import { SmaltError } from '../errors.js';
-import type { ColumnConstraint, CreateIndexStmt, CreateTableStmt, Expr, FkAction, ForeignKeyClause, IndexedColumn } from '../sql/ast.js';
+import type { ColumnConstraint, ColumnDef, ConflictAction, CreateIndexStmt, CreateTableStmt, Expr, FkAction, ForeignKeyClause, IndexedColumn } from '../sql/ast.js';
+import { anyNode } from '../sql/ast-util.js';
 import { RecordLayout, type StorageType } from '../storage/record.js';
+import { realToText } from '../util/fp.js';
 import { Collation, type SqlValue, collationByName, normalizeInt } from '../values.js';
 
 /** Thrown for constraint violations; `code` mirrors SQLite extended result codes. */
 export class ConstraintError extends SmaltError {
+  /** Raised under the ROLLBACK conflict resolution: the whole transaction is rolled back. */
+  rollback = false;
   constructor(code: string, message: string) {
     super(code, message);
     this.name = 'ConstraintError';
@@ -19,6 +23,8 @@ export interface ColumnSchema {
   notNull: boolean;
   /** NOT NULL was written (PRAGMA table_info reports this; PRIMARY KEY columns are also enforced NOT NULL). */
   declaredNotNull?: boolean;
+  /** `NOT NULL ON CONFLICT ...`: the resolution when the statement gives none (default ABORT). */
+  notNullConflict?: ConflictAction;
   defaultExpr?: Expr;
   collation: Collation;
   /** Part of the PRIMARY KEY. */
@@ -56,6 +62,8 @@ export interface IndexSchema {
   origin: 'c' | 'u' | 'pk';
   /** Name given with `CONSTRAINT name` (constraint-backed indexes). */
   constraintName?: string;
+  /** `UNIQUE / PRIMARY KEY ... ON CONFLICT ...`: the resolution when the statement gives none (default ABORT). */
+  onConflict?: ConflictAction;
   where?: Expr;
   /** Evaluators for expression columns and the partial-index WHERE (absent for plain indexes). */
   eval?: IndexEval;
@@ -71,6 +79,8 @@ export interface TableSchema {
   columns: ColumnSchema[];
   /** Column index of the INTEGER PRIMARY KEY, or -1. */
   rowidAlias: number;
+  /** `INTEGER PRIMARY KEY ON CONFLICT ...`: the resolution for rowid conflicts when the statement gives none. */
+  pkConflict?: ConflictAction;
   strict: boolean;
   indexes: IndexSchema[];
   checks: { name?: string; expr: Expr }[];
@@ -87,6 +97,8 @@ export interface TableSchema {
   matview?: MatViewInfo;
   /** TEMP table: memory store, not in the persisted catalog, visible to this connection only. */
   temp?: boolean;
+  /** Declared AUTOINCREMENT: once the largest rowid is taken, inserts fail instead of picking random rowids. */
+  autoincrement?: boolean;
   /**
    * Columnar base table (`WITH (storage = 'columnar')`, M7.3): `rootPage` is the row-format delta
    * store; older rows live in column segments, minus the rowids in the deletion tree.
@@ -203,35 +215,9 @@ function typeName(v: SqlValue): string {
   }
 }
 
-/**
- * REAL -> TEXT conversion following SQLite's `%!.15g` (falling back to 17 significant digits when
- * 15 do not round-trip): exponent form when exp < -4 or exp >= 15, and always a decimal point.
- */
+/** SQLite's text form of a REAL (`%!.17g`, shortened when a shorter form round-trips). */
 export function formatReal(x: number): string {
-  if (Number.isNaN(x)) return 'NaN';
-  if (x === Infinity) return 'Inf';
-  if (x === -Infinity) return '-Inf';
-  if (x === 0) return '0.0';
-  let s = x.toExponential(14);
-  if (Number(s) !== x) s = x.toExponential(16);
-  const e = s.indexOf('e');
-  const exp = Number(s.slice(e + 1));
-  let mant = s.slice(0, e);
-  const neg = mant.charCodeAt(0) === 45; // '-'
-  if (neg) mant = mant.slice(1);
-  let digits = mant.replace('.', '');
-  let end = digits.length;
-  while (end > 1 && digits.charCodeAt(end - 1) === 48) end--;
-  digits = digits.slice(0, end);
-  let out: string;
-  if (exp < -4 || exp >= 15) {
-    out = digits[0] + '.' + (digits.length > 1 ? digits.slice(1) : '0') + 'e' + (exp < 0 ? '-' : '+') + String(Math.abs(exp)).padStart(2, '0');
-  } else if (exp >= 0) {
-    out = digits.length <= exp + 1 ? digits + '0'.repeat(exp + 1 - digits.length) + '.0' : digits.slice(0, exp + 1) + '.' + digits.slice(exp + 1);
-  } else {
-    out = '0.' + '0'.repeat(-exp - 1) + digits;
-  }
-  return neg ? '-' + out : out;
+  return realToText(x);
 }
 
 /** SQLite's text representation of a value (for CAST AS TEXT, ||, TEXT columns). */
@@ -330,6 +316,7 @@ export interface ImplicitIndexSpec {
   origin: 'u' | 'pk';
   columns: IndexColumnSchema[];
   constraintName?: string;
+  onConflict?: ConflictAction;
 }
 
 /** A FOREIGN KEY constraint (child columns -> parent table columns). */
@@ -343,7 +330,10 @@ export interface ForeignKeySchema {
   refColumns?: string[];
   onDelete: FkAction;
   onUpdate: FkAction;
+  /** Checked at COMMIT (DEFERRABLE INITIALLY DEFERRED). */
   deferrable: boolean;
+  /** Declared DEFERRABLE, with either INITIALLY clause. */
+  isDeferrable: boolean;
 }
 
 /**
@@ -354,7 +344,12 @@ export function buildTableSchema(
   stmt: CreateTableStmt,
   sql: string,
   rootPage: number,
-): { table: TableSchema; implicitIndexes: ImplicitIndexSpec[] } {
+): {
+  table: TableSchema;
+  implicitIndexes: ImplicitIndexSpec[];
+  /** Two identical UNIQUE / PRIMARY KEY constraints give different ON CONFLICT actions (an error on CREATE TABLE). */
+  conflictingOnConflict: boolean;
+} {
   if (stmt.options.withoutRowid) throw new SmaltError('SMALT_UNSUPPORTED', 'WITHOUT ROWID tables are not supported yet');
   if (stmt.options.loose) throw new SmaltError('SMALT_UNSUPPORTED', 'LOOSE tables are not supported yet');
   if (stmt.asSelect) throw new SmaltError('SMALT_UNSUPPORTED', 'CREATE TABLE ... AS SELECT is not supported yet');
@@ -370,12 +365,15 @@ export function buildTableSchema(
     if (constraintsOf(cs, 'generated').length) throw new SmaltError('SMALT_UNSUPPORTED', 'generated columns are not supported yet');
     const coll = constraintsOf(cs, 'collate')[0] as { collation: string } | undefined;
     const dflt = constraintsOf(cs, 'default')[0] as { expr: Expr } | undefined;
+    // Like SQLite, the last NOT NULL clause decides the column's ON CONFLICT action.
+    const notNulls = constraintsOf(cs, 'notNull') as { onConflict?: ConflictAction }[];
     columns.push({
       name: def.name,
       declaredType: def.type ?? '',
       type: storageTypeFor(def.type),
       notNull: constraintsOf(cs, 'notNull').length > 0,
       declaredNotNull: constraintsOf(cs, 'notNull').length > 0,
+      notNullConflict: notNulls.length ? notNulls[notNulls.length - 1].onConflict : undefined,
       defaultExpr: dflt?.expr,
       collation: toCollation(coll?.collation, Collation.Binary),
       primaryKey: false,
@@ -387,10 +385,11 @@ export function buildTableSchema(
   const checks: { name?: string; expr: Expr }[] = [];
   let pkSeen = false;
   let rowidAlias = -1;
+  let pkConflict: ConflictAction | undefined;
 
   const fks: ForeignKeySchema[] = [];
   let pkName: string | undefined;
-  const addPk = (cols: { index: number; desc: boolean; collation?: string }[], name?: string): void => {
+  const addPk = (cols: { index: number; desc: boolean; collation?: string }[], name?: string, onConflict?: ConflictAction): void => {
     if (pkSeen) throw new SmaltError('SMALT_ERROR', `table "${stmt.name}" has more than one primary key`);
     pkSeen = true;
     pkName = name;
@@ -402,20 +401,22 @@ export function buildTableSchema(
     if (cols.length === 1 && columns[cols[0].index].declaredType === 'INTEGER' && !cols[0].desc) {
       rowidAlias = cols[0].index;
       columns[rowidAlias].rowidAlias = true;
+      pkConflict = onConflict;
       return;
     }
     implicit.push({
       origin: 'pk',
       columns: cols.map((c) => ({ column: c.index, desc: c.desc, collation: toCollation(c.collation, columns[c.index].collation) })),
       constraintName: name,
+      onConflict,
     });
   };
 
   // Column constraints first, then table constraints (SQLite numbers autoindexes in this order).
   stmt.columns.forEach((def, i) => {
     for (const c of def.constraints) {
-      if (c.kind === 'primaryKey') addPk([{ index: i, desc: c.desc }], c.name);
-      else if (c.kind === 'unique') implicit.push({ origin: 'u', columns: [{ column: i, desc: false, collation: columns[i].collation }], constraintName: c.name });
+      if (c.kind === 'primaryKey') addPk([{ index: i, desc: c.desc }], c.name, c.onConflict);
+      else if (c.kind === 'unique') implicit.push({ origin: 'u', columns: [{ column: i, desc: false, collation: columns[i].collation }], constraintName: c.name, onConflict: c.onConflict });
       else if (c.kind === 'check') checks.push({ name: c.name, expr: c.expr });
       else if (c.kind === 'references') fks.push(fkSchema(c.name, [i], c));
     }
@@ -428,8 +429,8 @@ export function buildTableSchema(
         if (index < 0) throw new SmaltError('SMALT_ERROR', `no such column: ${name}`);
         return { index, desc: ic.desc, collation: indexedColumnCollation(ic) };
       });
-      if (tc.kind === 'primaryKey') addPk(cols, tc.name);
-      else implicit.push({ origin: 'u', columns: cols.map((c) => ({ column: c.index, desc: c.desc, collation: toCollation(c.collation, columns[c.index].collation) })), constraintName: tc.name });
+      if (tc.kind === 'primaryKey') addPk(cols, tc.name, tc.onConflict);
+      else implicit.push({ origin: 'u', columns: cols.map((c) => ({ column: c.index, desc: c.desc, collation: toCollation(c.collation, columns[c.index].collation) })), constraintName: tc.name, onConflict: tc.onConflict });
     } else if (tc.kind === 'check') {
       checks.push({ name: tc.name, expr: tc.expr });
     } else if (tc.kind === 'foreignKey') {
@@ -443,6 +444,24 @@ export function buildTableSchema(
   }
   // Drop UNIQUE constraints that duplicate the rowid alias (always unique anyway).
   const filtered = implicit.filter((s) => !(s.columns.length === 1 && s.columns[0].column === rowidAlias));
+  // SQLite merges identical UNIQUE / PRIMARY KEY constraints into one index, whose ON CONFLICT
+  // action is the one given (two different ones are an error). smaltdb keeps one index per
+  // constraint (the stored layout), so give all of them the merged action.
+  let conflictingOnConflict = false;
+  for (let i = 0; i < filtered.length; i++) {
+    for (let j = 0; j < i; j++) {
+      const a = filtered[j];
+      const b = filtered[i];
+      if (a.columns.length !== b.columns.length || !a.columns.every((c, k) => c.column === b.columns[k].column && c.collation === b.columns[k].collation)) continue;
+      if (a.onConflict !== b.onConflict) {
+        if (a.onConflict !== undefined && b.onConflict !== undefined) conflictingOnConflict = true;
+        else {
+          const merged = a.onConflict ?? b.onConflict;
+          for (const x of filtered) if (x.columns.length === a.columns.length && x.columns.every((c, k) => c.column === a.columns[k].column && c.collation === a.columns[k].collation)) x.onConflict = merged;
+        }
+      }
+    }
+  }
 
   const types = columns.map((c) => c.type);
   const table: TableSchema = {
@@ -450,6 +469,7 @@ export function buildTableSchema(
     rootPage,
     columns,
     rowidAlias,
+    pkConflict,
     strict: true,
     indexes: [],
     checks,
@@ -459,14 +479,17 @@ export function buildTableSchema(
     // Rows written before ALTER TABLE ADD COLUMN lack the new column: they read its (constant) default.
     recordDefaults: columns.map((c) => literalValue(c.defaultExpr)),
   };
-  return { table, implicitIndexes: filtered };
+  if (rowidAlias >= 0 && (stmt.columns.some((d) => d.constraints.some((c) => c.kind === 'primaryKey' && c.autoincrement)) || stmt.constraints.some((c) => c.kind === 'primaryKey' && c.autoincrement))) {
+    table.autoincrement = true;
+  }
+  return { table, implicitIndexes: filtered, conflictingOnConflict };
 }
 
 function fkSchema(name: string | undefined, columns: number[], c: ForeignKeyClause): ForeignKeySchema {
   if (c.columns && c.columns.length !== columns.length) {
     throw new SmaltError('SMALT_ERROR', `number of columns in foreign key does not match the number of columns in the referenced table`);
   }
-  return { name, columns, table: c.table, refColumns: c.columns, onDelete: c.onDelete ?? 'NO ACTION', onUpdate: c.onUpdate ?? 'NO ACTION', deferrable: !!c.deferrable };
+  return { name, columns, table: c.table, refColumns: c.columns, onDelete: c.onDelete ?? 'NO ACTION', onUpdate: c.onUpdate ?? 'NO ACTION', deferrable: !!c.deferrable, isDeferrable: !!c.isDeferrable };
 }
 
 export function buildIndexSchema(stmt: CreateIndexStmt, sql: string, table: TableSchema, rootPage: number): IndexSchema {
@@ -500,6 +523,47 @@ export function literalValue(e: Expr | undefined): SqlValue {
 }
 
 /** Whether a default is constant in SQLite's ALTER TABLE ADD COLUMN sense. */
+/**
+ * CREATE TABLE only (stored definitions are not re-checked, so existing databases still open):
+ * SQLite's rules for DEFAULT and CHECK expressions, and AUTOINCREMENT only on the column that
+ * aliases the rowid.
+ */
+export function checkNewTable(stmt: CreateTableStmt, table: TableSchema): void {
+  checkConstraintExprs(
+    stmt.columns,
+    stmt.constraints.flatMap((c) => (c.kind === 'check' ? [c.expr] : [])),
+  );
+  const on = stmt.columns.some((d) => d.constraints.some((c) => c.kind === 'primaryKey' && c.autoincrement)) || stmt.constraints.some((c) => c.kind === 'primaryKey' && c.autoincrement);
+  if (on && table.rowidAlias < 0) throw new SmaltError('SMALT_ERROR', 'AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY');
+}
+
+const isSubquery = (n: Record<string, unknown>): boolean => n.kind === 'subquery' || n.kind === 'exists' || n.kind === 'inSelect';
+
+/** SQLite's parse-time rules for a CHECK expression (`prefix` names the ALTER TABLE context). */
+export function checkCheckExpr(e: Expr, prefix = ''): void {
+  if (anyNode(e, isSubquery)) throw new SmaltError('SMALT_ERROR', `${prefix}subqueries prohibited in CHECK constraints`);
+  if (anyNode(e, (n) => n.kind === 'param')) throw new SmaltError('SMALT_ERROR', `${prefix}parameters prohibited in CHECK constraints`);
+}
+
+/** SQLite's parse-time rule for DEFAULT: no subqueries, column references or parameters (functions are allowed). */
+export function checkDefaultExpr(column: string, e: Expr): void {
+  if (anyNode(e, (n) => isSubquery(n) || n.kind === 'column' || n.kind === 'param')) throw new SmaltError('SMALT_ERROR', `default value of column [${column}] is not constant`);
+}
+
+/**
+ * CREATE TABLE / ADD COLUMN only (stored definitions are not re-checked, so existing databases
+ * still open): DEFAULT and CHECK expressions, in the order they appear, as SQLite checks them.
+ */
+export function checkConstraintExprs(columns: ColumnDef[], tableChecks: Expr[], checkPrefix = ''): void {
+  for (const def of columns) {
+    for (const c of def.constraints) {
+      if (c.kind === 'default') checkDefaultExpr(def.name, c.expr);
+      else if (c.kind === 'check') checkCheckExpr(c.expr, checkPrefix);
+    }
+  }
+  for (const e of tableChecks) checkCheckExpr(e, checkPrefix);
+}
+
 export function isConstantDefault(e: Expr): boolean {
   if (e.kind === 'literal') return true;
   return e.kind === 'unary' && (e.op === '-' || e.op === '+') && e.operand.kind === 'literal' && (typeof e.operand.value === 'number' || typeof e.operand.value === 'bigint');

@@ -7,6 +7,7 @@
  * 'now' comes from FunctionContext.now() (fixed for one statement execution); 'localtime' and 'utc'
  * use the host time zone through JS Date, as SQLite uses the OS zone through localtime_r().
  */
+import { SmaltError } from '../errors.js';
 import type { SqlValue } from '../values.js';
 import { asciiLower, toText } from './convert.js';
 
@@ -14,6 +15,22 @@ import { asciiLower, toText } from './convert.js';
 export interface DateTimeContext {
   /** Current time in Unix milliseconds, stable for one statement execution. */
   now(): number;
+  /**
+   * Set when evaluating an index expression ('an index') or a CHECK constraint ('a CHECK
+   * constraint'): there, 'now', 'subsec', no time value, and the 'localtime' and 'utc' modifiers
+   * raise "non-deterministic use of F() in ..." (SQLite's sqlite3NotPureFunc()).
+   */
+  pureContext?: string;
+}
+
+/** The context and SQL function name of the call being evaluated (for notPure()). */
+let curCtx: DateTimeContext | undefined;
+let curFn = '';
+
+/** SQLite's sqlite3NotPureFunc(): fail when the current call must be deterministic. */
+function notPure(): void {
+  const where = curCtx?.pureContext;
+  if (where) throw new SmaltError('SMALT_ERROR', `non-deterministic use of ${curFn}() in ${where}`);
 }
 
 /** Julian day of 1970-01-01 00:00:00 times 86400000. */
@@ -263,13 +280,17 @@ function setRawDateNumber(p: DateTime, r: number): void {
 function parseDateOrTime(ctx: DateTimeContext, z: string, p: DateTime): boolean {
   if (!parseYyyyMmDd(z, p)) return false;
   if (!parseHhMmSs(z, 0, p)) return false;
-  if (ieq(z, 'now')) return setDateTimeToCurrent(ctx, p);
+  if (ieq(z, 'now')) {
+    notPure();
+    return setDateTimeToCurrent(ctx, p);
+  }
   const r = atof(z);
   if (r !== null) {
     setRawDateNumber(p, r);
     return false;
   }
   if (ieq(z, 'subsec') || ieq(z, 'subsecond')) {
+    notPure();
     p.useSubsec = true;
     return setDateTimeToCurrent(ctx, p);
   }
@@ -482,6 +503,7 @@ function parseModifier(z: string, p: DateTime, idx: number): boolean {
       break;
     case 'l':
       if (ieq(z, 'localtime')) {
+        notPure();
         if (!p.isLocal) toLocaltime(p);
         rc = false;
         p.isUtc = false;
@@ -500,6 +522,7 @@ function parseModifier(z: string, p: DateTime, idx: number): boolean {
           rc = false;
         }
       } else if (ieq(z, 'utc')) {
+        notPure();
         if (!p.isUtc) {
           computeJD(p);
           const iOrigJD = p.iJD;
@@ -724,7 +747,11 @@ function argText(v: SqlValue): string | null {
 function isDate(ctx: DateTimeContext, args: readonly SqlValue[], start: number): DateTime | null {
   const p = new DateTime();
   const argc = args.length - start;
-  if (argc === 0) return setDateTimeToCurrent(ctx, p) ? null : p;
+  curCtx = ctx;
+  if (argc === 0) {
+    notPure();
+    return setDateTimeToCurrent(ctx, p) ? null : p;
+  }
   const v0 = args[start];
   if (typeof v0 === 'number' || typeof v0 === 'bigint') {
     setRawDateNumber(p, Number(v0));
@@ -1013,6 +1040,7 @@ function timediff(ctx: DateTimeContext, a: SqlValue, b: SqlValue): string | null
 // ------------------------------------------------------------------ SQL functions
 
 export function dateFn(args: readonly SqlValue[], ctx: DateTimeContext): SqlValue {
+  curFn = 'date';
   const x = isDate(ctx, args, 0);
   if (x === null) return null;
   computeYMD(x);
@@ -1020,6 +1048,7 @@ export function dateFn(args: readonly SqlValue[], ctx: DateTimeContext): SqlValu
 }
 
 export function timeFn(args: readonly SqlValue[], ctx: DateTimeContext): SqlValue {
+  curFn = 'time';
   const x = isDate(ctx, args, 0);
   if (x === null) return null;
   computeHMS(x);
@@ -1027,6 +1056,7 @@ export function timeFn(args: readonly SqlValue[], ctx: DateTimeContext): SqlValu
 }
 
 export function datetimeFn(args: readonly SqlValue[], ctx: DateTimeContext): SqlValue {
+  curFn = 'datetime';
   const x = isDate(ctx, args, 0);
   if (x === null) return null;
   computeYMD_HMS(x);
@@ -1034,6 +1064,7 @@ export function datetimeFn(args: readonly SqlValue[], ctx: DateTimeContext): Sql
 }
 
 export function juliandayFn(args: readonly SqlValue[], ctx: DateTimeContext): SqlValue {
+  curFn = 'julianday';
   const x = isDate(ctx, args, 0);
   if (x === null) return null;
   computeJD(x);
@@ -1041,6 +1072,7 @@ export function juliandayFn(args: readonly SqlValue[], ctx: DateTimeContext): Sq
 }
 
 export function unixepochFn(args: readonly SqlValue[], ctx: DateTimeContext): SqlValue {
+  curFn = 'unixepoch';
   const x = isDate(ctx, args, 0);
   if (x === null) return null;
   computeJD(x);
@@ -1049,6 +1081,7 @@ export function unixepochFn(args: readonly SqlValue[], ctx: DateTimeContext): Sq
 }
 
 export function strftimeFn(args: readonly SqlValue[], ctx: DateTimeContext): SqlValue {
+  curFn = 'strftime';
   if (args.length === 0) return null;
   const fmt = argText(args[0]);
   if (fmt === null) return null;
@@ -1058,6 +1091,7 @@ export function strftimeFn(args: readonly SqlValue[], ctx: DateTimeContext): Sql
 }
 
 export function timediffFn(args: readonly SqlValue[], ctx: DateTimeContext): SqlValue {
+  curFn = 'timediff';
   return timediff(ctx, args[0], args[1]);
 }
 

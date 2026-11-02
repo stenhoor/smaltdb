@@ -29,9 +29,9 @@ column-constraint:
 
 table-constraint:
   [CONSTRAINT name]
-  { PRIMARY KEY (column [COLLATE c] [ASC | DESC] [, ...]) [conflict-clause]
+  { PRIMARY KEY (column [COLLATE c] [ASC | DESC] [, ...] [AUTOINCREMENT]) [conflict-clause]
   | UNIQUE (column [COLLATE c] [ASC | DESC] [, ...]) [conflict-clause]
-  | CHECK (expr)
+  | CHECK (expr) [conflict-clause]
   | FOREIGN KEY (column [, ...]) REFERENCES foreign-table [(column [, ...])] [fk-action ...] [deferrable] }
 
 fk-action:
@@ -119,13 +119,13 @@ SELECT (SELECT rowid FROM k1) AS k1_rowid, (SELECT rowid FROM k2) AS k2_rowid
 | --- | --- |
 | 1 | 1 |
 
-`AUTOINCREMENT` is accepted but changes nothing: a deleted largest rowid can be used again. (SQLite never reuses one with `AUTOINCREMENT`, and allows it only on `INTEGER PRIMARY KEY`.)
+`AUTOINCREMENT` is allowed only on an `INTEGER PRIMARY KEY` (`AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY`), as in SQLite. It does not stop reuse: a deleted largest rowid can be used again (SQLite never reuses one with `AUTOINCREMENT`).
 
-When the largest rowid is 9223372036854775807, inserting a row without one fails with `SMALT_FULL` (SQLite tries random rowids instead).
+When the largest rowid is 9223372036854775807, a row inserted without one gets a random unused rowid between 1 and 2^62, as in SQLite. After 100 candidates that are all taken, or at once in an `AUTOINCREMENT` table, the insert fails with `SMALT_FULL`.
 
 ### NOT NULL, UNIQUE, CHECK
 
-`NOT NULL` rejects NULL. `UNIQUE` allows any number of NULLs, as in SQLite; it compares with the column's collation (or the one given in a table constraint). `CHECK (expr)` rejects a row when the expression is false (NULL passes). Unlike SQLite, a `CHECK` expression may contain a subquery.
+`NOT NULL` rejects NULL. `UNIQUE` allows any number of NULLs, as in SQLite; it compares with the column's collation (or the one given in a table constraint). `CHECK (expr)` rejects a row when the expression is false (NULL passes). As in SQLite, a `CHECK` expression may not contain a subquery (`subqueries prohibited in CHECK constraints`) or a parameter, and a `DEFAULT` may not contain a subquery, a column or a parameter (`default value of column [x] is not constant`); functions such as `random()` are allowed.
 
 ```sql
 CREATE TABLE account(
@@ -150,7 +150,28 @@ INSERT INTO account(handle, balance) VALUES ('bob', -5)
 
 The error message names the constraint when it has a name (`CHECK constraint failed: no_overdraft`) and shows the expression otherwise.
 
-An `ON CONFLICT` clause on a constraint is accepted but ignored: conflicts are handled by the statement's [`OR` action](./insert#conflict-actions) (default `ABORT`). In SQLite the constraint's clause is the default for statements that give none.
+### ON CONFLICT {#on-conflict}
+
+An `ON CONFLICT` clause on a `PRIMARY KEY`, `UNIQUE` or `NOT NULL` constraint sets what an `INSERT` or `UPDATE` without its own [`OR` action](./insert#conflict-actions) does when a row violates that constraint: `ABORT` (the default), `FAIL`, `ROLLBACK`, `IGNORE` or `REPLACE`, with the meanings listed there. A statement's `OR` action overrides it, and an upsert's `ON CONFLICT … DO` clause takes precedence for its target. On a table `CHECK` constraint the clause is accepted and ignored, as in SQLite.
+
+```sql
+CREATE TABLE visit(page TEXT UNIQUE ON CONFLICT IGNORE, hits INTEGER NOT NULL ON CONFLICT REPLACE DEFAULT 0);
+INSERT INTO visit VALUES ('home', 5), ('home', 9), ('about', NULL);
+SELECT * FROM visit ORDER BY page
+```
+
+| page | hits |
+| --- | --- |
+| about | 0 |
+| home | 5 |
+
+As in SQLite:
+
+- When a row violates several constraints, the first one checked decides: the rowid (`INTEGER PRIMARY KEY`) first, then the other `PRIMARY KEY` and `UNIQUE` constraints and unique indexes, the most recently created first, with those whose action is `REPLACE` last. An `INTEGER PRIMARY KEY … ON CONFLICT REPLACE` is checked after all of them.
+- For `NOT NULL ON CONFLICT REPLACE`, a NULL gets the column's default; without a default, it fails as `ABORT`. If a column has several `NOT NULL` clauses, the last one counts.
+- Identical `UNIQUE` / `PRIMARY KEY` constraints share one action; two different ones fail with `conflicting ON CONFLICT clauses specified`.
+
+The clauses are part of the stored `CREATE TABLE` text, so they apply after the database is reopened. `FAIL` behaves like `ABORT` (see [INSERT](./insert#conflict-actions)).
 
 ### DEFAULT
 
@@ -267,9 +288,19 @@ SELECT (SELECT v FROM scratch) AS plain, (SELECT v FROM main.scratch) AS main, (
 | --- | --- | --- |
 | temp | main | temp |
 
-Temp tables are not listed in `sqlite_schema` or `information_schema`, cannot be altered (`ALTER TABLE is not supported for TEMP table`), and cannot be columnar. A view that reads a temp table is itself temporary, and a materialized view cannot read one.
+Temp tables are listed in [`temp.sqlite_schema`](./information-schema#sqlite-schema), not in `sqlite_schema` or `information_schema`. They cannot be altered (`ALTER TABLE is not supported for TEMP table`), and cannot be columnar. A view that reads a temp table is itself temporary, and a materialized view cannot read one.
 
-`CREATE TABLE temp.name (…)` does **not** make a temp table: the `temp.` qualifier is ignored and a main table is created. Use `CREATE TEMP TABLE`.
+`CREATE TABLE temp.name (…)` also makes a temp table, and `CREATE TABLE main.name (…)` a main one. As in SQLite, `CREATE TEMP TABLE main.name` fails with `temporary table name must be unqualified`, and any other qualifier with `unknown database x` (`SMALT_ERROR`).
+
+```sql
+CREATE TABLE temp.notes(v TEXT);
+SELECT type, name FROM temp.sqlite_schema
+```
+
+| type | name |
+| --- | --- |
+| table | scratch |
+| table | notes |
 
 ## Not supported
 

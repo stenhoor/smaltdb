@@ -7,7 +7,7 @@
 ```text
 EXPLAIN [QUERY PLAN] select
 EXPLAIN ANALYZE select
-ANALYZE [table-or-index]
+ANALYZE [schema | [schema.]table-or-index]
 ```
 
 The examples use this table:
@@ -108,11 +108,11 @@ EXPLAIN QUERY PLAN UPDATE visit SET ms = 0 WHERE id = 1
 
 | Form | Analyzes |
 | --- | --- |
-| `ANALYZE` | every table and row-storage materialized view in the database |
-| `ANALYZE table` | one table (or materialized view) |
-| `ANALYZE index` | the table the index belongs to |
+| `ANALYZE` or `ANALYZE main` | every table and row-storage materialized view in the database |
+| `ANALYZE [main.]table` | one table (or materialized view) |
+| `ANALYZE [main.]index` | the table the index belongs to |
 
-TEMP tables and columnar tables and views are skipped. An unknown name fails with `no such table or index: x`. A schema-qualified name (`ANALYZE main.t`) also fails with that message.
+TEMP tables and columnar tables and views are skipped, so `ANALYZE temp`, `ANALYZE temp.t` and `ANALYZE` of a TEMP table's index do nothing. An unknown name fails with `no such table or index: x` (`no such table or index: main.x` when qualified), and an unknown schema with `unknown database x`.
 
 ```sql
 ANALYZE visit;
