@@ -158,15 +158,15 @@ describe('S2 TEMP isolation', () => {
 });
 
 describe('S2 columnar rowid space', () => {
-  it('18: INSERT past the largest rowid fails instead of wrapping', async () => {
+  it('18: INSERT past the largest rowid picks a free random rowid (as SQLite) instead of wrapping', async () => {
     const db = await fileDb();
     db.exec("CREATE TABLE c(id INTEGER PRIMARY KEY, g INT) WITH (storage = 'columnar')");
     // 8192 rows in one statement: compaction moves them, the maximum included, into a row group.
     db.exec('WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 8191) INSERT INTO c SELECT i, 0 FROM n');
     db.exec('INSERT INTO c VALUES (9223372036854775807, 1)');
     db.exec('WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 8192) INSERT INTO c SELECT 10000 + i, 0 FROM n');
-    expect(() => db.exec('INSERT INTO c(g) VALUES (7)')).toThrow(/full|exhausted/i);
-    expect(db.query('SELECT min(id) > 0 FROM c').rows).toEqual([[1]]);
+    expect(db.query('INSERT INTO c(g) VALUES (7) RETURNING id > 0 AND id <= 4611686018427387904').rows).toEqual([[1]]);
+    expect(db.query('SELECT count(*), count(DISTINCT id), min(id) > 0 FROM c').rows).toEqual([[16385, 16385, 1]]);
   });
 });
 

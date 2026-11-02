@@ -169,7 +169,7 @@ A smaltdb extension. Never shows secrets: `credentials` is only the name of a pr
 | Column | Meaning |
 | --- | --- |
 | `connection_name` | name |
-| `connection_type` | the `type` option as written (`http` when none) |
+| `connection_type` | `http`, `s3` or `azure`: the `type` option in lower case, with `https` shown as `http` (`http` when none) |
 | `url` | the `url` option, or NULL |
 | `credentials` | the `credentials` option, or NULL |
 | `options` | the other options as a JSON object |
@@ -191,8 +191,8 @@ One row per `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` and `CHECK` constraint. Const
 | `constraint_catalog`, `constraint_schema`, `constraint_name` | the constraint |
 | `table_catalog`, `table_schema`, `table_name` | its table |
 | `constraint_type` | `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` or `CHECK` |
-| `is_deferrable` | `YES` for a `DEFERRABLE INITIALLY DEFERRED` foreign key, else `NO` |
-| `initially_deferred` | always `NO` |
+| `is_deferrable` | `YES` for a foreign key declared `DEFERRABLE` (with or without `INITIALLY …`), else `NO` |
+| `initially_deferred` | `YES` for `DEFERRABLE INITIALLY DEFERRED`, the only form checked at `COMMIT`; else `NO` |
 
 ```sql
 SELECT constraint_name, table_name, constraint_type, is_deferrable FROM information_schema.table_constraints
@@ -351,4 +351,4 @@ FROM sqlite_schema WHERE name NOT LIKE 'smalt\_%' ESCAPE '\' OR type = 'index'
 
 For an external table created without a column list, `sql` is a rewritten statement that includes the inferred columns.
 
-TEMP objects are not in `sqlite_schema`, and there is no `sqlite_temp_schema` / `sqlite_temp_master`; `temp.sqlite_schema` shows the main catalog.
+TEMP objects are not in `sqlite_schema`. As in SQLite, `temp.sqlite_schema` (also `temp.sqlite_master`, `sqlite_temp_schema` and `sqlite_temp_master`) lists them, with the same columns, in creation order: TEMP tables, their indexes and TEMP views. Their `rootpage` is the page in the in-memory store that holds TEMP objects, and their `sql` is the statement as written.

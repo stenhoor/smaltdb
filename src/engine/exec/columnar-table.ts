@@ -215,9 +215,11 @@ export class ColumnarTableWriter extends TableWriter {
     this.segMax ??= maxSegmentRowid(this.store, this.rowidCol);
     if (n > this.segMax) return n;
     const m = this.segMax;
-    // Like TableWriter.newRowid: past the largest rowid there is no next one.
-    if (typeof m === 'bigint' && m >= I64_MAX) throw new SmaltError('SMALT_FULL', 'database or disk is full (rowid space exhausted)');
-    return typeof m === 'number' && Number.isSafeInteger(m + 1) ? m + 1 : BigInt(m) + 1n;
+    // Like TableWriter.newRowid: past the largest rowid, a random free one.
+    if (typeof m === 'bigint' && m >= I64_MAX) return this.randomRowid();
+    const next = typeof m === 'number' && Number.isSafeInteger(m + 1) ? m + 1 : BigInt(m) + 1n;
+    // Taken only when the row store's largest rowid is the maximum (n was then a random one).
+    return this.rowExists(next) ? this.randomRowid() : next;
   }
 
   override rowExists(rowid: Rowid): boolean {

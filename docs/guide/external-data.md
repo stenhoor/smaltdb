@@ -307,7 +307,8 @@ SELECT * FROM price_list WHERE price > 30;
 What to know:
 
 - **Re-read by every statement.** An external table has no stored rows and no indexes; each statement that reads it fetches the source again. For repeat reads, [cache it in a materialized view](#caching-in-a-materialized-view).
-- **Read-only.** `INSERT`, `UPDATE`, `DELETE`, `CREATE INDEX` and `ALTER TABLE` do not apply.
+- **Read-only.** `INSERT`, `UPDATE` and `DELETE` fail with `table x may not be modified`, `CREATE INDEX` with `table x may not be indexed` and `ALTER TABLE` with `table x may not be altered` (`SMALT_ERROR`).
+- **`PRAGMA table_info(x)`** and `pragma_table_info('x')` list its columns.
 - **Columns cannot have constraints** (`PRIMARY KEY`, `NOT NULL`, …).
 - **Creating without a column list reads the source**, so in the in-process engine it needs `execAsync()`.
 - **Dropping** with `DROP EXTERNAL TABLE [IF EXISTS] name` removes only the catalog entry, never the source. `DROP TABLE` refuses an external table.
@@ -614,7 +615,7 @@ SELECT count(*) AS n FROM products_local;
 | --- |
 | 5 |
 
-`IF CHANGED` is asynchronous: run it with `db.exec()` in the worker client, or `execAsync()` in the in-process engine.
+`IF CHANGED` is asynchronous: any call through the worker client runs it; in the in-process engine, use `execAsync()`, `runAsync()` or `queryAsync()`.
 
 ### Refreshing automatically
 

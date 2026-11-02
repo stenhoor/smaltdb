@@ -292,16 +292,12 @@ From JavaScript, `exec()` and a prepared statement's `run()` return `changes` an
 smaltdb_version()
 ```
 
-Returns a version string. smaltdb has no `sqlite_version()` function.
-
-::: warning
-In this release `smaltdb_version()` returns the fixed text `'0.1.0'`, which is not the package version. Do not use it to detect the installed version.
-:::
+Returns the version of the smaltdb package as text, such as `'0.8.3'` (the `version` in its `package.json`). smaltdb has no `sqlite_version()` function.
 
 ```sql
-SELECT smaltdb_version() AS v;
+SELECT smaltdb_version() GLOB '[0-9]*.[0-9]*.[0-9]*' AS is_version;
 ```
 
-| v |
+| is_version |
 | --- |
-| 0.1.0 |
+| 1 |

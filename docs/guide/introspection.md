@@ -209,7 +209,7 @@ SELECT sql FROM sqlite_schema WHERE name = 'books_cheap';
 | --- |
 | CREATE INDEX books_cheap ON books(price) WHERE price < 10 |
 
-Unlike `information_schema`, `sqlite_schema` also lists smaltdb's internal tables once they exist, such as `smalt_stat` (created by `ANALYZE`) and `smalt_matview` (created with the first materialized view). To hide them, filter on `NOT (type = 'table' AND name LIKE 'smalt\_%' ESCAPE '\')`; a plain filter on the name would also hide automatic indexes, whose names start with `smalt_autoindex_`. The catalog cannot be modified directly. `TEMP` objects are not listed.
+Unlike `information_schema`, `sqlite_schema` also lists smaltdb's internal tables once they exist, such as `smalt_stat` (created by `ANALYZE`) and `smalt_matview` (created with the first materialized view). To hide them, filter on `NOT (type = 'table' AND name LIKE 'smalt\_%' ESCAPE '\')`; a plain filter on the name would also hide automatic indexes, whose names start with `smalt_autoindex_`. The catalog cannot be modified directly. `TEMP` objects are listed in `temp.sqlite_schema` (also `sqlite_temp_schema`, `sqlite_temp_master`), as in SQLite.
 
 ## Pragma functions
 
@@ -218,7 +218,7 @@ These pragmas return rows describing one table or index, as in SQLite. Each can 
 | Function | Argument | Columns |
 | --- | --- | --- |
 | `pragma_table_info` | table | `cid`, `name`, `type`, `notnull`, `dflt_value`, `pk` |
-| `pragma_table_xinfo` | table | Same as `table_info` (smaltdb has no hidden columns) |
+| `pragma_table_xinfo` | table | `table_info`'s columns and `hidden` (always 0: smaltdb has no hidden or generated columns) |
 | `pragma_index_list` | table | `seq`, `name`, `unique`, `origin`, `partial` |
 | `pragma_index_info` | index | `seqno`, `cid`, `name` |
 | `pragma_index_xinfo` | index | `seqno`, `cid`, `name`, `desc`, `coll`, `key` |
@@ -353,7 +353,7 @@ The smaltdb extensions to `information_schema` are described with their features
 
 ## smaltdb_version()
 
-`smaltdb_version()` returns the engine's version as text:
+`smaltdb_version()` returns the version of the smaltdb package as text, such as `'0.8.3'`:
 
 ```sql
 SELECT typeof(smaltdb_version()) AS type;
@@ -363,13 +363,11 @@ SELECT typeof(smaltdb_version()) AS type;
 | --- |
 | text |
 
-::: warning
-In smaltdb 0.8.3, `smaltdb_version()` returns `'0.1.0'`, not the package version. Read the version from the package (`smaltdb/package.json`) when you need it. `sqlite_version()` does not exist.
-:::
+`sqlite_version()` does not exist.
 
 ## Differences from SQLite
 
 - `information_schema` exists (SQLite has none).
 - `sqlite_schema` has extra object types: `matview`, `external` and `connection`.
 - `PRAGMA table_list`, `PRAGMA database_list` and most other SQLite pragmas are not supported and fail with `SMALT_UNSUPPORTED`.
-- `TEMP` objects do not appear in `sqlite_schema` or `information_schema`.
+- `TEMP` objects do not appear in `information_schema`.

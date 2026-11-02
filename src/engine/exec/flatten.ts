@@ -22,8 +22,8 @@ import { and, anyNode as anyNodeIn } from '../sql/ast-util.js';
 const anyNode = (e: unknown, pred: (x: Record<string, unknown>) => boolean): boolean => anyNodeIn(e, pred, false);
 
 export interface FlattenContext {
-  getTable(name: string): TableSchema | undefined;
-  getView(name: string): { name: string; sql: string; columns?: string[]; select: SelectStmt } | undefined;
+  getTable(name: string, schema?: string): TableSchema | undefined;
+  getView(name: string, schema?: string): { name: string; sql: string; columns?: string[]; select: SelectStmt } | undefined;
   /** Whether `name` is a CTE visible to this query (CTE references are not flattened). */
   isCte(name: string): boolean;
   /** SQL text the AST positions refer to (names unaliased result columns of FROM subqueries). */
@@ -233,8 +233,8 @@ export function flattenCore(core: SelectCoreSelect, orderBy: OrderingTerm[], ctx
       if (!it.alias) return; // anonymous: rare, leave as a sub-plan
       select = it.select;
       ref = it.alias;
-    } else if (it.kind === 'table' && (!it.schema || it.schema.toLowerCase() === 'main') && !(!it.schema && ctx.isCte(it.name)) && !ctx.getTable(it.name)) {
-      const v = ctx.getView(it.name);
+    } else if (it.kind === 'table' && (!it.schema || ['main', 'temp'].includes(it.schema.toLowerCase())) && !(!it.schema && ctx.isCte(it.name)) && !ctx.getTable(it.name, it.schema)) {
+      const v = ctx.getView(it.name, it.schema);
       if (!v || ctx.expanding?.has(v.name.toLowerCase())) return;
       select = v.select;
       names = v.columns;

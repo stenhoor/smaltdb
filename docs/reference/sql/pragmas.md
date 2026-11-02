@@ -259,7 +259,18 @@ As in SQLite, `notnull` is 0 for an `INTEGER PRIMARY KEY` that was not declared 
 
 ### table_xinfo
 
-The same columns and rows as `table_info` (there are no hidden or generated columns to add).
+The columns and rows of `table_info`, plus `hidden`, as in SQLite. It is always 0: smaltdb has no hidden or generated columns (SQLite's 1, 2 and 3).
+
+```sql
+PRAGMA table_xinfo(parent)
+```
+
+| cid | name | type | notnull | dflt_value | pk | hidden |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | id | INTEGER | 0 | NULL | 1 | 0 |
+| 1 | code | TEXT | 1 | 'x' | 0 | 0 |
+
+For an [external table](./external), `table_info` and `table_xinfo` list its columns, and `index_list` and `foreign_key_list` give no rows.
 
 ### index_list
 

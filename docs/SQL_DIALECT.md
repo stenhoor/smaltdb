@@ -282,8 +282,9 @@ functions, and `VACUUM`. Plain `EXPLAIN` returns the `EXPLAIN QUERY PLAN` output
 - An integral REAL with magnitude below 2^53 stored in an `ANY`/`NUMERIC` column, or flowing through an untyped expression, reads back as
   INTEGER. This affects `typeof()`, text conversion and integer division (ADR 0003, decision 2). REALs outside ±2^53, such as int64-overflow
   results, are always treated as REAL, because smaltdb represents such integers as `bigint`.
-- `AUTOINCREMENT` is accepted but behaves like a plain `INTEGER PRIMARY KEY` (the max rowid + 1 can be reused after deleting
-  the largest row).
+- `AUTOINCREMENT` (only on an `INTEGER PRIMARY KEY`, as in SQLite) behaves like a plain `INTEGER PRIMARY KEY` (the max rowid + 1
+  can be reused after deleting the largest row), except that once the largest rowid is 2^63 − 1 inserts fail with `SMALT_FULL`
+  instead of picking random rowids.
 - PRIMARY KEY columns are always NOT NULL.
 - `OR FAIL` behaves like `OR ABORT`.
 - In `GROUP BY` / `DISTINCT` over NOCASE or RTRIM text, values that compare equal form one group, and which spelling is returned is unspecified.

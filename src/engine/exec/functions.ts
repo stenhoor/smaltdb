@@ -13,6 +13,14 @@ import {
 } from './convert.js';
 import { dateFn, datetimeFn, juliandayFn, strftimeFn, timeFn, timediffFn, unixepochFn } from './datetime.js';
 
+/**
+ * The package version, replaced at build time from package.json (esbuild `define` in
+ * scripts/build.mjs, and in vitest.config.ts for tests), so it cannot drift from the package.
+ * Bundles made without the define (benchmarks, sqllogictest) report 'unknown'.
+ */
+declare const __SMALTDB_VERSION__: string | undefined;
+const SMALTDB_VERSION: string = typeof __SMALTDB_VERSION__ === 'string' ? __SMALTDB_VERSION__ : 'unknown';
+
 /** A compiled expression: reads the register file and returns a value. */
 export type Fn = (r: SqlValue[]) => SqlValue;
 
@@ -592,7 +600,7 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
   ['last_insert_rowid', simple(0, 0, 'int', (_v, _a, ctx) => ctx.lastInsertRowid(), false)],
   ['changes', simple(0, 0, 'int', (_v, _a, ctx) => ctx.changes(), false)],
   ['total_changes', simple(0, 0, 'int', (_v, _a, ctx) => ctx.totalChanges(), false)],
-  ['smaltdb_version', simple(0, 0, 'text', () => '0.1.0')],
+  ['smaltdb_version', simple(0, 0, 'text', () => SMALTDB_VERSION)],
   // Date and time (datetime.ts). Not constant-folded: 'now' and 'localtime' depend on when they run.
   ['date', simple(0, -1, 'text', (v, _a, ctx) => dateFn(v, ctx), false)],
   ['time', simple(0, -1, 'text', (v, _a, ctx) => timeFn(v, ctx), false)],

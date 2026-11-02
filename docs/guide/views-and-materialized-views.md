@@ -178,7 +178,7 @@ SELECT is_fresh FROM information_schema.materialized_views WHERE table_name = 's
 For a view over external data, `IF CHANGED` asks each source whether it changed (an HTTP `HEAD` request, a file's modification time) without downloading it; see [External data](./external-data#caching-in-a-materialized-view).
 
 ::: warning IF CHANGED needs the asynchronous API
-Checking sources is asynchronous. Through the worker client, run it with `db.exec()`. In the in-process engine (`smaltdb/engine`), use `execAsync()`; `exec()`, `run()`, `query()` and also `queryAsync()` and `runAsync()` fail with `SMALT_ASYNC_REQUIRED`.
+Checking sources is asynchronous. Through the worker client, any call runs it. In the in-process engine (`smaltdb/engine`), use `execAsync()`, `runAsync()` or `queryAsync()`; `exec()`, `run()` and `query()` fail with `SMALT_ASYNC_REQUIRED`.
 :::
 
 ### Creating without data

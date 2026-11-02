@@ -189,13 +189,13 @@ INSERT INTO docs VALUES (hex(zeroblob(10000)));
 
 ## SMALT_FULL
 
-A new row needs a rowid, but the largest rowid in the table is already the largest 64-bit integer. Message: `database or disk is full (rowid space exhausted)`. SQLite would pick a random unused rowid instead.
+A new row needs a rowid, the largest rowid in the table is already the largest 64-bit integer, and no free one was found: as in SQLite, 100 random candidates were all taken, or the table is `AUTOINCREMENT` (which never picks random rowids). Message: `database or disk is full (rowid space exhausted)`.
 
 **Remedy:** do not store values near 2^63 − 1 in an `INTEGER PRIMARY KEY`; use a separate column for them.
 
 <!-- docs:error SMALT_FULL -->
 ```sql
-CREATE TABLE seq(id INTEGER PRIMARY KEY, v TEXT);
+CREATE TABLE seq(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
 INSERT INTO seq VALUES (9223372036854775807, 'max');
 INSERT INTO seq(v) VALUES ('next');
 ```
@@ -257,7 +257,7 @@ SELECT * FROM read_csv('file:not-registered.csv');
 
 ## SMALT_ASYNC_REQUIRED
 
-Engine only. A synchronous call (`query`, `run`, `exec`, `Statement.run` …) was given a statement that reads external data, which must be fetched first. The client never raises it: the engine worker uses the async path.
+Engine only. A synchronous call (`query`, `run`, `exec`, `Statement.run` …) was given a statement that reads external data, which must be fetched first, or `REFRESH MATERIALIZED VIEW … IF CHANGED`, which checks its sources first. The client never raises it: the engine worker uses the async path.
 
 **Remedy:** use `queryAsync`, `runAsync` or `execAsync`. See the [engine API](./engine#external-data).
 

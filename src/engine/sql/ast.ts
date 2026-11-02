@@ -390,13 +390,16 @@ export interface ForeignKeyClause {
   columns?: string[];
   onDelete?: FkAction;
   onUpdate?: FkAction;
+  /** Checked at COMMIT: DEFERRABLE INITIALLY DEFERRED (SQLite's only deferred form). */
   deferrable?: boolean;
+  /** Declared DEFERRABLE (any INITIALLY), as information_schema reports it. */
+  isDeferrable?: boolean;
 }
 
 export type FkAction = 'SET NULL' | 'SET DEFAULT' | 'CASCADE' | 'RESTRICT' | 'NO ACTION';
 
 export type TableConstraint = Node & { name?: string } & (
-    | { kind: 'primaryKey'; columns: IndexedColumn[]; onConflict?: ConflictAction }
+    | { kind: 'primaryKey'; columns: IndexedColumn[]; autoincrement?: boolean; onConflict?: ConflictAction }
     | { kind: 'unique'; columns: IndexedColumn[]; onConflict?: ConflictAction }
     | { kind: 'check'; expr: Expr }
     | { kind: 'foreignKey'; /** Child columns. */ columns: string[]; references: ForeignKeyClause }
@@ -547,7 +550,9 @@ export interface PragmaStmt extends Node {
 
 export interface AnalyzeStmt extends Node {
   kind: 'analyze';
+  /** A schema (`main`, `temp`) or a table or index name. */
   target?: string;
+  schema?: string;
 }
 
 export interface VacuumStmt extends Node {
