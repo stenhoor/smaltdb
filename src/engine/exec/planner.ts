@@ -647,7 +647,9 @@ export class Planner {
           if (!call.star && (n < def.minArgs || n > def.maxArgs || (call.name === 'count' && n === 0))) {
             throw new SmaltError('SMALT_ERROR', `wrong number of arguments to function ${call.name}()`);
           }
-          if (call.args.some(containsAggregate)) throw new SmaltError('SMALT_ERROR', `misuse of aggregate function ${call.name}()`);
+          // SQLite names the nested aggregate: max(sum(a)) is a misuse of sum().
+          const inner = call.args.map(firstAggregateCall).find((x) => x !== undefined);
+          if (inner) throw new SmaltError('SMALT_ERROR', `misuse of aggregate function ${inner.name}()`);
           if (call.orderBy?.length) throw new SmaltError('SMALT_UNSUPPORTED', 'ORDER BY inside aggregate functions is not supported yet');
           if (call.distinct && n !== 1) throw new SmaltError('SMALT_ERROR', 'DISTINCT aggregates must have exactly one argument');
           const args = call.args.map((a) => compileExpr(a, baseCompile));
@@ -811,7 +813,11 @@ export class Planner {
     }
     if (call.distinct) throw new SmaltError('SMALT_ERROR', 'DISTINCT is not supported for window functions');
     if (builtin && call.filter) throw new SmaltError('SMALT_ERROR', `FILTER clause may only be used with aggregate window functions`);
-    for (const a of call.args) if (containsWindow(a)) throw new SmaltError('SMALT_ERROR', `misuse of window function ${name}()`);
+    // SQLite names the nested window function: sum(rank() OVER ()) OVER () is a misuse of rank().
+    for (const a of call.args) {
+      const inner = firstWindowCall(a);
+      if (inner) throw new SmaltError('SMALT_ERROR', `misuse of window function ${inner.name}()`);
+    }
     const spec = this.resolveWindowSpec(call.over!, core);
     const args = call.args.map((a) => compileExpr(a, scope));
     // One WindowDef per distinct (PARTITION BY, ORDER BY, frame).
@@ -2812,6 +2818,32 @@ function coreReferences(core: SelectCore, name: string): boolean {
 function selectReferences(s: SelectStmt, name: string): boolean {
   if (s.with?.ctes.some((c) => sameName(c.name, name))) return false; // shadowed
   return coreReferences(s.core, name) || s.compound.some((c) => coreReferences(c.core, name));
+}
+
+/** The first window function call (`f(...) OVER ...`) in `e`, if any. */
+function firstWindowCall(e: Expr): CallExpr | undefined {
+  let found: CallExpr | undefined;
+  walk(e, (x) => {
+    if (found) return false;
+    if (x.kind === 'call' && x.over !== undefined) {
+      found = x;
+      return false;
+    }
+  });
+  return found;
+}
+
+/** The first aggregate call in `e`, if any. */
+function firstAggregateCall(e: Expr): CallExpr | undefined {
+  let found: CallExpr | undefined;
+  walk(e, (x) => {
+    if (found) return false;
+    if (isAggregateCall(x)) {
+      found = x as CallExpr;
+      return false;
+    }
+  });
+  return found;
 }
 
 function containsWindow(e: Expr | undefined): boolean {

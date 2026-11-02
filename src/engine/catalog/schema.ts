@@ -1,6 +1,7 @@
 import { SmaltError } from '../errors.js';
 import type { ColumnConstraint, CreateIndexStmt, CreateTableStmt, Expr, FkAction, ForeignKeyClause, IndexedColumn } from '../sql/ast.js';
 import { RecordLayout, type StorageType } from '../storage/record.js';
+import { realToText } from '../util/fp.js';
 import { Collation, type SqlValue, collationByName, normalizeInt } from '../values.js';
 
 /** Thrown for constraint violations; `code` mirrors SQLite extended result codes. */
@@ -203,35 +204,9 @@ function typeName(v: SqlValue): string {
   }
 }
 
-/**
- * REAL -> TEXT conversion following SQLite's `%!.15g` (falling back to 17 significant digits when
- * 15 do not round-trip): exponent form when exp < -4 or exp >= 15, and always a decimal point.
- */
+/** SQLite's text form of a REAL (`%!.17g`, shortened when a shorter form round-trips). */
 export function formatReal(x: number): string {
-  if (Number.isNaN(x)) return 'NaN';
-  if (x === Infinity) return 'Inf';
-  if (x === -Infinity) return '-Inf';
-  if (x === 0) return '0.0';
-  let s = x.toExponential(14);
-  if (Number(s) !== x) s = x.toExponential(16);
-  const e = s.indexOf('e');
-  const exp = Number(s.slice(e + 1));
-  let mant = s.slice(0, e);
-  const neg = mant.charCodeAt(0) === 45; // '-'
-  if (neg) mant = mant.slice(1);
-  let digits = mant.replace('.', '');
-  let end = digits.length;
-  while (end > 1 && digits.charCodeAt(end - 1) === 48) end--;
-  digits = digits.slice(0, end);
-  let out: string;
-  if (exp < -4 || exp >= 15) {
-    out = digits[0] + '.' + (digits.length > 1 ? digits.slice(1) : '0') + 'e' + (exp < 0 ? '-' : '+') + String(Math.abs(exp)).padStart(2, '0');
-  } else if (exp >= 0) {
-    out = digits.length <= exp + 1 ? digits + '0'.repeat(exp + 1 - digits.length) + '.0' : digits.slice(0, exp + 1) + '.' + digits.slice(exp + 1);
-  } else {
-    out = '0.' + '0'.repeat(-exp - 1) + digits;
-  }
-  return neg ? '-' + out : out;
+  return realToText(x);
 }
 
 /** SQLite's text representation of a value (for CAST AS TEXT, ||, TEXT columns). */

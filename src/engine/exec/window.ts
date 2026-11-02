@@ -12,6 +12,7 @@ import type { Fn } from './functions.js';
 import type { AggregateFunction } from './functions.js';
 import type { Operator } from './operators.js';
 import { type StaticType, truthy } from './convert.js';
+import { valueInt64 } from './printf.js';
 
 export type FrameUnit = 'ROWS' | 'RANGE' | 'GROUPS';
 export type BoundKind = 'unboundedPreceding' | 'preceding' | 'currentRow' | 'following' | 'unboundedFollowing';
@@ -258,7 +259,8 @@ export class Window implements Operator {
             return;
           case 'ntile': {
             const v = rows[idx[ps]].args[ci][0];
-            const buckets = typeof v === 'bigint' ? Number(v) : typeof v === 'number' ? Math.trunc(v) : NaN;
+            // As sqlite3_value_int64(): REALs truncate, text and blobs use their leading integer, NULL is 0.
+            const buckets = Number(valueInt64(v));
             if (!(buckets > 0)) throw new SmaltError('SMALT_ERROR', 'argument of ntile must be a positive integer');
             const per = Math.floor(size / buckets);
             const big = size % buckets; // the first `big` buckets get one extra row
