@@ -15,7 +15,7 @@ can keep data in an optional in-memory cache for speed, and runs inside Web Work
 > cost-based planner, views and materialized views, columnar tables, multi-tab access with parallel readers, spilling
 > sorts and aggregates, and external tables over CSV, JSON and Parquet files on HTTP, S3 and Azure Blob Storage
 > (milestones M0–M8.3 of the [roadmap](docs/ROADMAP.md)). The SQL dialect follows SQLite and is checked against it with
-> differential tests and a sqllogictest subset; see the [supported SQL](docs/SQL_DIALECT.md). Benchmarks against
+> differential tests and a sqllogictest subset; see the [SQL reference](docs/reference/sql/index.md). Benchmarks against
 > crash-safe SQLite WASM: [methodology and results](docs/research/benchmark-methodology.md). The on-disk format may
 > still change before 1.0.
 
@@ -67,14 +67,21 @@ await db.close();
 
 ## Documentation
 
+For users:
+- [Getting started](docs/guide/getting-started.md) and [quick start](docs/guide/quick-start.md)
+- [User guide](docs/guide/databases.md) and [FAQ](docs/guide/faq.md)
+- [SQL reference](docs/reference/sql/index.md), [functions](docs/reference/functions/index.md) and [API](docs/reference/api/client.md)
+
+Design and internals:
+
 | Document | Contents |
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System overview, components, threading model |
 | [docs/STORAGE_FORMAT.md](docs/STORAGE_FORMAT.md) | On-disk layout, pages, B+trees, WAL, caching |
 | [docs/QUERY_ENGINE.md](docs/QUERY_ENGINE.md) | Parser → binder → optimizer → execution |
-| [docs/SQL_DIALECT.md](docs/SQL_DIALECT.md) | Supported SQL, type system, information_schema, materialized views |
+| [docs/SQL_DIALECT.md](docs/SQL_DIALECT.md) | Design notes for the SQL dialect and its implementation status |
 | [docs/WORKER_MODEL.md](docs/WORKER_MODEL.md) | Workers, concurrency, transactions, multi-tab |
-| [docs/API.md](docs/API.md) | Public JavaScript API (draft) |
+| [docs/API.md](docs/API.md) | Design notes for the JavaScript API |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Performance targets, benchmarks, profiling strategy |
 | [docs/TESTING.md](docs/TESTING.md) | Test strategy and correctness tooling |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Milestones |

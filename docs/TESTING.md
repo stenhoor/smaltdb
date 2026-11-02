@@ -60,6 +60,21 @@ What M1 adds:
 what other tools produce: every common type, four codecs, row groups with statistics, and a Hive-partitioned dataset.
 Regenerate them with `pip install pyarrow && python3 scripts/gen-parquet-fixtures.py`.
 
+## Documentation examples
+
+`test/docs-examples.test.ts` keeps the user documentation (`docs/guide`, `docs/reference`) honest:
+- Every `sql` block runs. A page runs top to bottom on one fresh in-memory database, and the files in `docs/examples/`
+  are registered as `file:<name>`.
+- A Markdown table directly after a `sql` block is the expected result of the block's last statement. The header row
+  is the column names, `NULL` is NULL, blobs are `x'hex'`, and numbers print as JavaScript does (REAL 2.0 is `2`).
+- Every `ts` block is type-checked against the public API: `smaltdb` and `smaltdb/engine` resolve to `src/`. `db` is
+  predeclared as a client `Database` unless the block declares its own.
+- Markers go in an HTML comment on the line before a block:
+  - `<!-- docs:skip -->`: the block is not run, e.g. a URL or S3 example.
+  - `<!-- docs:error SMALT_CODE -->`: the block's last statement must fail with this code.
+  - `<!-- docs:unordered -->`: compare the rows in any order.
+  - `<!-- docs:setup SQL -->`: hidden SQL that runs before the block.
+
 ## Timing in tests
 
 Tests must not depend on scheduling luck. CI runners are slower and busier than a development machine, and several

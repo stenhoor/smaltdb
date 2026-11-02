@@ -11,11 +11,14 @@ hero:
     alt: smaltdb
   actions:
     - theme: brand
-      text: Public API
-      link: /API
+      text: Get started
+      link: /guide/getting-started
     - theme: alt
-      text: Architecture
-      link: /ARCHITECTURE
+      text: Quick start
+      link: /guide/quick-start
+    - theme: alt
+      text: SQL reference
+      link: /reference/sql/
 
 features:
   - title: Off the main thread
@@ -24,6 +27,10 @@ features:
     details: Data lives in the Origin Private File System. Commits are atomic and durable through a write-ahead log.
   - title: SQLite-flavoured SQL
     details: The dialect is based on SQLite, so existing SQL knowledge carries over.
+  - title: Analytics built in
+    details: Columnar tables and materialized views with zone maps, spilling sorts and parallel readers.
+  - title: External data
+    details: Query CSV, JSON and Parquet files, URLs, S3 and Azure Blob storage with plain SQL.
   - title: Introspection
     details: An information_schema, plus sqlite_schema and PRAGMA compatibility.
 ---
