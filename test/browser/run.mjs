@@ -12,11 +12,19 @@ const playwright = loadPlaywright();
 const out = '.cache/browser-test';
 mkdirSync(out, { recursive: true });
 await build({ entryPoints: ['test/browser/opfs-worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/opfs-worker.js`, logLevel: 'warning' });
-await build({ entryPoints: ['test/browser/client-test.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/client-test.js`, logLevel: 'warning' });
+// Plugins (ADR 0012) from source, as the packages would resolve: the engines and the client helpers.
+const plugins = {
+  '@smaltdb/parquet': './plugins/parquet/src/index.ts',
+  '@smaltdb/io': './plugins/io/src/index.ts',
+  '@smaltdb/io/client': './plugins/io/src/client.ts',
+  '@smaltdb/external': './plugins/external/src/index.ts',
+  '@smaltdb/external/client': './plugins/external/src/client.ts',
+};
+await build({ entryPoints: ['test/browser/client-test.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/client-test.js`, logLevel: 'warning', alias: plugins });
 await build({ entryPoints: ['test/browser/tab-test.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/tab-test.js`, logLevel: 'warning' });
 await build({ entryPoints: ['src/engine/worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/smaltdb-worker.js`, logLevel: 'warning' });
-// A worker entry with plugins, as applications write it (ADR 0012); the client test reads Parquet through it.
-await build({ entryPoints: ['test/browser/plugin-worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/plugin-worker.js`, logLevel: 'warning', alias: { '@smaltdb/parquet': './plugins/parquet/src/index.ts' } });
+// A worker entry with plugins, as applications write it (ADR 0012); the client test reads external data, CSV and Parquet through it.
+await build({ entryPoints: ['test/browser/plugin-worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/plugin-worker.js`, logLevel: 'warning', alias: plugins });
 // External data (M8): a CSV the client test reads over HTTP from this server.
 writeFileSync(`${out}/prices.csv`, 'id,name,price\n1,apple,1.5\n2,"pear, green",2\n3,plum,\n');
 // …and Parquet files written by pyarrow (M8.3), read with Range requests.

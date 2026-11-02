@@ -7,12 +7,14 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Database } from '../src/engine/database.js';
-import { EngineServer } from '../src/engine/server.js';
-import { MemoryVfs } from '../src/engine/vfs/memory.js';
-import type { FetchFn } from '../src/engine/external/external.js';
-import { type Request, type Response, columnValue } from '../src/shared/protocol.js';
-import { until } from './helpers/wait.js';
+import { Database } from '../../../src/engine/database.js';
+import { EngineServer } from '../../../src/engine/server.js';
+import { MemoryVfs } from '../../../src/engine/vfs/memory.js';
+import io from '@smaltdb/io';
+import external from '../src/index.js';
+import { type FetchFn, registerCredentials, registerFile, setFetch } from '../src/client.js';
+import { type Request, type Response, columnValue } from '../../../src/shared/protocol.js';
+import { until } from '../../../test/helpers/wait.js';
 
 const errorOf = async (p: Promise<unknown> | (() => unknown)): Promise<{ code: string; message: string }> => {
   try {
@@ -38,14 +40,16 @@ function fakeFetch(files: Record<string, string>, log: { url: string; headers: R
   };
 }
 
+const plugins = [external, io];
+
 async function memDb(): Promise<Database> {
-  return Database.open(new MemoryVfs(), 'db');
+  return Database.open(new MemoryVfs(), 'db', { plugins });
 }
 
 describe('CSV reader', () => {
   it('infers columns and types, keeps quoted text, empty fields are NULL', async () => {
     const db = await memDb();
-    db.registerFile('p', 'id,name,price,code\n1,apple,1.5,007\n2,"pear, ""green""",2,010\n3,,,\n');
+    await registerFile(db, 'p', 'id,name,price,code\n1,apple,1.5,007\n2,"pear, ""green""",2,010\n3,,,\n');
     const r = await db.queryAsync("SELECT * FROM read_csv('file:p')");
     expect(r.columns).toEqual(['id', 'name', 'price', 'code']);
     expect(r.rows).toEqual([
@@ -58,20 +62,20 @@ describe('CSV reader', () => {
 
   it('honors header, delimiter, quote, null, skip and tsv', async () => {
     const db = await memDb();
-    db.registerFile('semi', "# exported 2026\n'a;b';2;NA\nc;3;x\n");
+    await registerFile(db, 'semi', "# exported 2026\n'a;b';2;NA\nc;3;x\n");
     expect((await db.queryAsync("SELECT * FROM read_csv('file:semi', header => false, delimiter => ';', quote => '''', null => 'NA', skip => 1)")).rows).toEqual([
       ['a;b', 2, null],
       ['c', 3, 'x'],
     ]);
-    db.registerFile('t.tsv', 'k\tv\nx\t1\n');
+    await registerFile(db, 't.tsv', 'k\tv\nx\t1\n');
     expect(await db.queryAsync("SELECT * FROM read_csv('file:t.tsv')")).toEqual({ columns: ['k', 'v'], rows: [['x', 1]] });
-    db.registerFile('dup', 'a,a,\n1,2,3\n');
+    await registerFile(db, 'dup', 'a,a,\n1,2,3\n');
     expect((await db.queryAsync("SELECT * FROM read_csv('file:dup')")).columns).toEqual(['a', 'a_2', 'column3']);
   });
 
   it('reports malformed input with the source and line', async () => {
     const db = await memDb();
-    db.registerFile('bad', 'a,b\n1,2\n3\n');
+    await registerFile(db, 'bad', 'a,b\n1,2\n3\n');
     expect(await errorOf(db.queryAsync("SELECT * FROM read_csv('file:bad')"))).toEqual({ code: 'SMALT_EXTERNAL', message: "read_csv('file:bad'): CSV line 3: expected 2 fields but found 1" });
     expect((await errorOf(db.queryAsync("SELECT * FROM read_csv('file:bad', delim => ';')"))).message).toMatch(/unknown option 'delim'/);
     expect((await errorOf(db.queryAsync("SELECT * FROM read_csv('file:nope')"))).message).toMatch(/no file is registered as 'nope'/);
@@ -81,7 +85,7 @@ describe('CSV reader', () => {
 describe('JSON reader', () => {
   it('reads arrays of objects and NDJSON, typing columns', async () => {
     const db = await memDb();
-    db.registerFile('a.json', '[{"id":1,"tags":["x"],"ok":true},{"id":2.5,"name":"b","ok":false}]');
+    await registerFile(db, 'a.json', '[{"id":1,"tags":["x"],"ok":true},{"id":2.5,"name":"b","ok":false}]');
     expect(await db.queryAsync("SELECT * FROM read_json('file:a.json')")).toEqual({
       columns: ['id', 'tags', 'ok', 'name'],
       rows: [
@@ -89,9 +93,9 @@ describe('JSON reader', () => {
         [2.5, null, 0, 'b'],
       ],
     });
-    db.registerFile('b', '{"k":"a","v":1}\n\n{"k":"b","v":2}\n');
+    await registerFile(db, 'b', '{"k":"a","v":1}\n\n{"k":"b","v":2}\n');
     expect((await db.queryAsync("SELECT sum(v) FROM read_json('file:b', format => 'ndjson')")).rows).toEqual([[3]]);
-    db.registerFile('bad.json', '[1, {"a": 2}]');
+    await registerFile(db, 'bad.json', '[1, {"a": 2}]');
     expect((await errorOf(db.queryAsync("SELECT * FROM read_json('file:bad.json')"))).message).toMatch(/objects or arrays/);
   });
 });
@@ -99,11 +103,11 @@ describe('JSON reader', () => {
 describe('external tables', () => {
   it('declared or inferred columns, persisted with the catalog, never with secrets', async () => {
     const vfs = new MemoryVfs();
-    const db = await Database.open(vfs, 'db');
+    const db = await Database.open(vfs, 'db', { plugins });
     const log: { url: string; headers: Record<string, string> }[] = [];
-    db.setFetch(fakeFetch({ 'https://api.example.com/v1/kv.csv': 'k,v\n1,10\n2,20\n' }, log));
-    db.registerCredentials('tok', { endpoint: 'https://api.example.com/', headers: { authorization: 'Bearer s3cret' } });
-    db.registerFile('p', 'id;label\n1;one\n2;two\n');
+    await setFetch(db, fakeFetch({ 'https://api.example.com/v1/kv.csv': 'k,v\n1,10\n2,20\n' }, log));
+    await registerCredentials(db, 'tok', { endpoint: 'https://api.example.com/', headers: { authorization: 'Bearer s3cret' } });
+    await registerFile(db, 'p', 'id;label\n1;one\n2;two\n');
     await db.execAsync("CREATE CONNECTION api WITH (url = 'https://api.example.com/v1', credentials = 'tok')");
     await db.execAsync("CREATE EXTERNAL TABLE kv WITH (connection = 'api', location = 'kv.csv')");
     await db.execAsync("CREATE EXTERNAL TABLE labels (id INTEGER, label TEXT) WITH (location = 'file:p', format = 'csv', delimiter = ';')");
@@ -126,22 +130,22 @@ describe('external tables', () => {
     ]);
     expect(db.query('SELECT * FROM information_schema.connections').rows).toEqual([['api', 'http', 'https://api.example.com/v1', 'tok', '{}']]);
     db.close();
-    const again = await Database.open(vfs, 'db');
+    const again = await Database.open(vfs, 'db', { plugins });
     const stored = again.query("SELECT group_concat(sql, ' | ') FROM smalt_schema WHERE type IN ('external', 'connection')").rows[0][0] as string;
     expect(stored).toContain('CREATE EXTERNAL TABLE "kv" ("k" INTEGER, "v" INTEGER)');
     expect(stored).not.toContain('s3cret');
     // Credentials are runtime state: after reopening they must be registered again.
-    again.setFetch(fakeFetch({ 'https://api.example.com/v1/kv.csv': 'k,v\n1,10\n' }));
+    await setFetch(again, fakeFetch({ 'https://api.example.com/v1/kv.csv': 'k,v\n1,10\n' }));
     expect((await errorOf(again.queryAsync('SELECT * FROM kv'))).message).toMatch(/no credentials are registered as 'tok'/);
-    again.registerCredentials('tok', { endpoint: 'https://api.example.com/', headers: {} });
+    await registerCredentials(again, 'tok', { endpoint: 'https://api.example.com/', headers: {} });
     expect((await again.queryAsync('SELECT * FROM kv')).rows).toEqual([[1, 10]]);
   });
 
   it('sends credentials only to their endpoint', async () => {
     const db = await memDb();
     const log: { url: string; headers: Record<string, string> }[] = [];
-    db.setFetch(fakeFetch({ 'https://evil.example.net/x.csv': 'a\n1\n' }, log));
-    db.registerCredentials('tok', { endpoint: 'https://api.example.com/', headers: { authorization: 'Bearer s3cret' } });
+    await setFetch(db, fakeFetch({ 'https://evil.example.net/x.csv': 'a\n1\n' }, log));
+    await registerCredentials(db, 'tok', { endpoint: 'https://api.example.com/', headers: { authorization: 'Bearer s3cret' } });
     db.exec("CREATE CONNECTION c WITH (url = 'https://evil.example.net', credentials = 'tok')");
     await db.execAsync("CREATE EXTERNAL TABLE x (a INT) WITH (connection = 'c', location = 'x.csv')");
     expect((await errorOf(db.queryAsync('SELECT * FROM x'))).message).toBe("x: credentials 'tok' are bound to https://api.example.com/; refusing to send them to https://evil.example.net/x.csv");
@@ -150,7 +154,7 @@ describe('external tables', () => {
 
   it('rules: names, options, DROP', async () => {
     const db = await memDb();
-    db.registerFile('f', 'a\n1\n');
+    await registerFile(db, 'f', 'a\n1\n');
     expect((await errorOf(() => db.exec("CREATE EXTERNAL TABLE e (a INT) WITH (location = 'file:f', colour = 'red')"))).message).toMatch(/unknown option 'colour'/);
     expect((await errorOf(() => db.exec("CREATE EXTERNAL TABLE e (a INT) WITH (location = 'file:f.xlsx')"))).message).toMatch(/cannot tell the format/);
     expect((await errorOf(() => db.exec("CREATE EXTERNAL TABLE e (a INT PRIMARY KEY) WITH (location = 'file:f', format = 'csv')"))).message).toMatch(/cannot have constraints/);
@@ -169,7 +173,7 @@ describe('external tables', () => {
 
   it('a rolled-back CREATE leaves nothing behind', async () => {
     const db = await memDb();
-    db.registerFile('f', 'a\n1\n');
+    await registerFile(db, 'f', 'a\n1\n');
     db.exec('BEGIN');
     // Inferring the columns needs the data: through the synchronous API it fails, and is undone.
     expect((await errorOf(() => db.exec("CREATE EXTERNAL TABLE e WITH (location = 'file:f', format = 'csv')"))).code).toBe('SMALT_ASYNC_REQUIRED');
@@ -181,7 +185,7 @@ describe('external tables', () => {
 describe('the async API', () => {
   it('the synchronous API refuses statements over external data', async () => {
     const db = await memDb();
-    db.registerFile('f', 'a\n1\n');
+    await registerFile(db, 'f', 'a\n1\n');
     await db.execAsync("CREATE EXTERNAL TABLE e (a INT) WITH (location = 'file:f', format = 'csv')");
     db.exec('CREATE TABLE t(a INT)');
     for (const sql of ['SELECT * FROM e', "SELECT * FROM read_csv('file:f')", 'INSERT INTO t SELECT * FROM e']) {
@@ -195,7 +199,7 @@ describe('the async API', () => {
 
   it('views, materialized views and INSERT … SELECT over external data', async () => {
     const db = await memDb();
-    db.registerFile('f', 'g,x\n1,10\n1,20\n2,5\n');
+    await registerFile(db, 'f', 'g,x\n1,10\n1,20\n2,5\n');
     await db.execAsync("CREATE VIEW v AS SELECT g, sum(x) AS s FROM read_csv('file:f') GROUP BY g");
     expect((await db.queryAsync('SELECT * FROM v ORDER BY g')).rows).toEqual([
       [1, 30],
@@ -210,7 +214,7 @@ describe('the async API', () => {
     // A cache of external data is never used to answer queries implicitly (the source may change).
     db.exec('PRAGMA matview_rewrite = 1');
     expect((await errorOf(() => db.query('SELECT g, sum(x) FROM e GROUP BY g'))).code).toBe('SMALT_ASYNC_REQUIRED');
-    db.registerFile('f', 'g,x\n1,1\n');
+    await registerFile(db, 'f', 'g,x\n1,1\n');
     await db.execAsync('REFRESH MATERIALIZED VIEW m');
     expect(db.query('SELECT * FROM m').rows).toEqual([[1, 1]]);
     db.exec('CREATE TABLE t(g INT, x INT)');
@@ -222,7 +226,7 @@ describe('the async API', () => {
     let inFlight = 0;
     let maxInFlight = 0;
     const calls: string[] = [];
-    db.setFetch(async (url) => {
+    await setFetch(db, async (url) => {
       calls.push(url);
       inFlight++;
       maxInFlight = Math.max(maxInFlight, inFlight);
@@ -242,7 +246,7 @@ describe('the async API', () => {
 
   it('an abort stops the fetch', async () => {
     const db = await memDb();
-    db.setFetch((_url, init) => new Promise((_resolve, reject) => init.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })))));
+    await setFetch(db, (_url, init) => new Promise((_resolve, reject) => init.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })))));
     const ac = new AbortController();
     const p = db.queryAsync("SELECT * FROM read_csv('https://h/slow.csv')", undefined, { signal: ac.signal });
     ac.abort();
@@ -280,9 +284,35 @@ describe('sources', () => {
     const path = join(dir, 'x.json');
     writeFileSync(path, '[{"a":1},{"a":2}]');
     expect((await db.queryAsync(`SELECT sum(a) FROM read_json('${path}')`)).rows).toEqual([[3]]);
-    db.registerFile('bytes', new TextEncoder().encode('a\n5\n'));
-    db.registerFile('blob', new Blob(['a\n7\n']));
+    await registerFile(db, 'bytes', new TextEncoder().encode('a\n5\n'));
+    await registerFile(db, 'blob', new Blob(['a\n7\n']));
     expect((await db.queryAsync("SELECT (SELECT a FROM read_csv('file:bytes')) + (SELECT a FROM read_csv('file:blob'))")).rows).toEqual([[12]]);
+  });
+});
+
+describe('patterns and URLs', () => {
+  it('wildcards only in a URL path; an http connection without url lists local paths; option lists', async () => {
+    const db = await memDb();
+    const urls: string[] = [];
+    await setFetch(db, async (url) => {
+      urls.push(url);
+      return { ok: true, status: 200, statusText: 'OK', headers: { get: () => null }, arrayBuffer: async () => new TextEncoder().encode('a\n1\n').buffer as ArrayBuffer };
+    });
+    expect(await errorOf(db.queryAsync("SELECT * FROM read_csv('https://example.com/*.csv')"))).toEqual({
+      code: 'SMALT_EXTERNAL',
+      message: "read_csv('https://example.com/*.csv'): wildcards need a source that can be listed (S3, Azure, local paths or registered files), not an HTTP URL",
+    });
+    db.exec("CREATE CONNECTION api WITH (url = 'https://h/v1')");
+    expect((await db.queryAsync("SELECT a FROM read_csv('a.csv?v=1', connection => 'api', format => 'csv')")).rows).toEqual([[1]]);
+    expect(urls).toEqual(['https://h/v1/a.csv?v=1']);
+    const dir = mkdtempSync(join(tmpdir(), 'smaltdb-noconn-'));
+    writeFileSync(join(dir, 'x.csv'), 'n\n4\n');
+    writeFileSync(join(dir, 'y.csv'), 'n\n5\n');
+    db.exec("CREATE CONNECTION local WITH (type = 'http')");
+    expect((await db.queryAsync(`SELECT sum(n) FROM read_csv('${dir}/*.csv', connection => 'local')`)).rows).toEqual([[9]]);
+    expect((await errorOf(() => db.exec("CREATE CONNECTION c WITH (type = 's3', url = 'https://x')"))).message).toBe(
+      "connection c: unknown option 'url' for type s3 (type, region, bucket, endpoint, url_style, credentials)",
+    );
   });
 });
 
@@ -312,7 +342,7 @@ describe('through the engine server (worker protocol)', () => {
 
   it('registers files, creates external tables and queries them', async () => {
     const t = await setup();
-    await t.result(t.send({ op: 'registerFile', name: 'f', file: 'a,b\n1,x\n2,y\n' }));
+    await t.result(t.send({ op: 'pluginCall', plugin: '@smaltdb/external', method: 'registerFile', args: ['f', 'a,b\n1,x\n2,y\n'] }));
     await t.result(t.send({ op: 'exec', sql: "CREATE EXTERNAL TABLE e WITH (location = 'file:f', format = 'csv'); CREATE TABLE t(a INT, b TEXT); INSERT INTO t SELECT * FROM e" }));
     expect(await t.result(t.send({ op: 'query', sql: 'SELECT e.b, t.a FROM e JOIN t USING (a) ORDER BY 1' }))).toEqual([
       ['x', 1],
@@ -327,7 +357,7 @@ describe('through the engine server (worker protocol)', () => {
 
   it('a cancel stops a request waiting on its fetch', async () => {
     const t = await setup();
-    t.db.setFetch((_url, init) => new Promise((_resolve, reject) => init.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })))));
+    await setFetch(t.db, (_url, init) => new Promise((_resolve, reject) => init.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })))));
     const q = t.send({ op: 'query', sql: "SELECT * FROM read_csv('https://h/slow.csv')" });
     await until('the fetch to start', () => true);
     t.send({ op: 'cancel', target: q });

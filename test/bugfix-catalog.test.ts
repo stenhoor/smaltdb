@@ -13,6 +13,9 @@ import { MemoryVfs } from '../src/engine/vfs/memory.js';
 import type { Request, Response } from '../src/shared/protocol.js';
 import type { SqlValue } from '../src/engine/values.js';
 import { until } from './helpers/wait.js';
+import external from '@smaltdb/external';
+import { registerFile } from '@smaltdb/external/client';
+import io from '@smaltdb/io';
 
 const mem = (): Database => Database.openFile(new MemoryVfs().openSync('t.db'));
 
@@ -51,8 +54,8 @@ describe('INSERT ... DEFAULT VALUES', () => {
 describe('external table option "null"', () => {
   it('stores re-parseable SQL for inferred columns; keyword keys parse; old stored text still opens', async () => {
     const vfs = new MemoryVfs();
-    let db = await Database.open(vfs, 'db');
-    db.registerFile('x.csv', 'a,b\n1,NA\n2,z\n');
+    let db = await Database.open(vfs, 'db', { plugins: [external, io] });
+    await registerFile(db, 'x.csv', 'a,b\n1,NA\n2,z\n');
     await db.execAsync(`CREATE EXTERNAL TABLE p WITH (location='file:x.csv', "null"='NA')`);
     expect(db.query("SELECT sql FROM sqlite_schema WHERE name = 'p'").rows).toEqual([[`CREATE EXTERNAL TABLE "p" ("a" INTEGER, "b" TEXT) WITH (location = 'file:x.csv', "null" = 'NA')`]]);
     await db.execAsync(`CREATE EXTERNAL TABLE p2 WITH (location='file:x.csv', null='NA')`);
@@ -60,8 +63,8 @@ describe('external table option "null"', () => {
     await db.execAsync(`CREATE EXTERNAL TABLE p3 ("a" INTEGER, "b" TEXT) WITH (location = 'file:x.csv', null = 'NA')`);
     db.exec('CREATE TABLE q(x)');
     db.close();
-    db = await Database.open(vfs, 'db');
-    db.registerFile('x.csv', 'a,b\n1,NA\n2,z\n');
+    db = await Database.open(vfs, 'db', { plugins: [external, io] });
+    await registerFile(db, 'x.csv', 'a,b\n1,NA\n2,z\n');
     for (const t of ['p', 'p2', 'p3']) expect((await db.queryAsync(`SELECT * FROM ${t}`)).rows).toEqual([[1, null], [2, 'z']]);
     db.exec('CREATE TABLE q2(x)');
   });
@@ -137,7 +140,7 @@ describe('ANALYZE with a schema', () => {
 
 describe('information_schema.connections.connection_type', () => {
   it('is the normalised type: lower case, https shown as http', () => {
-    const d = mem();
+    const d = Database.openMemory({ plugins: [external] });
     d.exec("CREATE CONNECTION a WITH (type = 'https', url = 'https://x.org/')");
     d.exec("CREATE CONNECTION b WITH (type = 'S3', region = 'eu', bucket = 'b')");
     d.exec("CREATE CONNECTION c WITH (url = 'https://x.org/')");
@@ -172,8 +175,8 @@ describe('information_schema.table_constraints deferrability', () => {
 
 describe('external tables in pragmas and writes', () => {
   it('table_info lists the columns; writes, indexes and ALTER fail clearly', async () => {
-    const db = await Database.open(new MemoryVfs(), 'db');
-    db.registerFile('x.csv', 'a,b\n1,NA\n2,z\n');
+    const db = await Database.open(new MemoryVfs(), 'db', { plugins: [external, io] });
+    await registerFile(db, 'x.csv', 'a,b\n1,NA\n2,z\n');
     await db.execAsync("CREATE EXTERNAL TABLE ext WITH (location = 'file:x.csv')");
     const cols = [
       [0, 'a', 'INTEGER', 0, null, 0],

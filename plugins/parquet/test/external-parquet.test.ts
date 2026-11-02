@@ -1,5 +1,5 @@
 /**
- * Parquet (M8.3, ADR 0011; the @smaltdb/parquet plugin, ADR 0012): read with hyparquet from files written by pyarrow (an independent
+ * Parquet (M8.3, ADR 0011; the @smaltdb/parquet plugin, ADR 0012, with @smaltdb/external for local paths, files and HTTP): read with hyparquet from files written by pyarrow (an independent
  * writer; scripts/gen-parquet-fixtures.py). Remote files are read with HTTP Range requests: only the
  * footer, the column chunks the statement uses and the row groups its filters cannot rule out.
  */
@@ -7,14 +7,16 @@ import { readFileSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Database } from '../src/engine/database.js';
-import { MemoryVfs } from '../src/engine/vfs/memory.js';
-import parquet from '@smaltdb/parquet';
+import { Database } from '../../../src/engine/database.js';
+import { MemoryVfs } from '../../../src/engine/vfs/memory.js';
+import external from '@smaltdb/external';
+import { registerFile } from '@smaltdb/external/client';
+import parquet from '../src/index.js';
 
 const F = 'test/fixtures/parquet';
 
 async function db(): Promise<Database> {
-  return Database.open(new MemoryVfs(), 'db', { plugins: [parquet] });
+  return Database.open(new MemoryVfs(), 'db', { plugins: [external, parquet] });
 }
 
 describe('Parquet values and types', () => {
@@ -64,7 +66,7 @@ describe('Parquet values and types', () => {
       [2024, 1, 404803],
       [2024, 2, 404805],
     ]);
-    d.registerFile('bad.parquet', 'not parquet at all');
+    await registerFile(d, 'bad.parquet', 'not parquet at all');
     expect((await d.queryAsync("SELECT * FROM read_parquet('file:bad.parquet')").catch((e: Error) => e.message)) as string).toMatch(/not a readable Parquet file/);
   });
 });
