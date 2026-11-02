@@ -20,6 +20,9 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import external from '@smaltdb/external';
+import { registerFile } from '@smaltdb/external/client';
+import io from '@smaltdb/io';
 import parquet from '@smaltdb/parquet';
 import { Database } from '../src/engine/database.js';
 import { parse } from '../src/engine/sql/parser.js';
@@ -122,7 +125,7 @@ function show(v: SqlValue): string {
   return String(v);
 }
 
-function registerExamples(db: Database): void {
+async function registerExamples(db: Database): Promise<void> {
   let names: string[] = [];
   try {
     names = readdirSync(EXAMPLES);
@@ -131,7 +134,7 @@ function registerExamples(db: Database): void {
   }
   for (const n of names) {
     const p = join(EXAMPLES, n);
-    if (statSync(p).isFile()) db.registerFile(n, new Uint8Array(readFileSync(p)));
+    if (statSync(p).isFile()) await registerFile(db, n, new Uint8Array(readFileSync(p)));
   }
 }
 
@@ -150,8 +153,8 @@ describe('documentation SQL examples', () => {
   for (const page of all) {
     it(page, async () => {
       // Every plugin is installed (ADR 0012), as an application that uses them would.
-      const db = Database.openMemory({ plugins: [parquet] });
-      registerExamples(db);
+      const db = Database.openMemory({ plugins: [external, io, parquet] });
+      await registerExamples(db);
       try {
         for (const b of blocks(readFileSync(page, 'utf8'))) {
           const where = `${page}:${b.line}`;
@@ -239,6 +242,10 @@ describe('documentation TypeScript examples', () => {
             'smaltdb/engine': [join(root, 'src/engine/index.ts')],
             'smaltdb/worker-runtime': [join(root, 'src/engine/worker-runtime.ts')],
             '@smaltdb/parquet': [join(root, 'plugins/parquet/src/index.ts')],
+            '@smaltdb/io': [join(root, 'plugins/io/src/index.ts')],
+            '@smaltdb/io/client': [join(root, 'plugins/io/src/client.ts')],
+            '@smaltdb/external': [join(root, 'plugins/external/src/index.ts')],
+            '@smaltdb/external/client': [join(root, 'plugins/external/src/client.ts')],
           },
         },
         files,

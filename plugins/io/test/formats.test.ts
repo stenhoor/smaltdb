@@ -26,7 +26,7 @@ function memSource(files: Map<string, string | Uint8Array>): SmaltPlugin {
         prefixes: ['mem:'],
         async open(target) {
           const f = file(target.location);
-          return { validator: String(f.length), bytes: async () => (typeof f === 'string' ? new TextEncoder().encode(f) : f) };
+          return { bytes: async () => ({ bytes: typeof f === 'string' ? new TextEncoder().encode(f) : f, validator: String(f.length) }) };
         },
         async validator(target) {
           return String(file(target.location).length);

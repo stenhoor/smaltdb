@@ -27,5 +27,6 @@ export {
   type SourceContext,
   type OpenedFile,
   type ListedFile,
+  type AskError,
   type Zone,
 } from './plugin.js';

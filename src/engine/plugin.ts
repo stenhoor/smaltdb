@@ -53,8 +53,9 @@ export interface PluginHost {
   onSessionClosed(listener: (session: string) => void): void;
   /**
    * Ask the client session `session` a question, answered by the handler the application set with
-   * `onPluginMessage(plugin, handler)` (e.g. fresh credentials). Rejects after `timeoutMs` (default
-   * 30 s), when the session closes, or in-process, where there is no client to ask.
+   * `onPluginMessage(plugin, handler)` (e.g. fresh credentials). It rejects with an {@link AskError}:
+   * after `timeoutMs` (default 30 s), when the session closes, when the handler fails or is missing,
+   * or in-process, where there is no client to ask. Plugins word their own messages from its `reason`.
    */
   ask(session: string, message: unknown, timeoutMs?: number): Promise<unknown>;
   /** Glob helpers, for sources that list files: the regular expression and the fixed prefix of a pattern. */
@@ -67,6 +68,19 @@ export interface ConnectionTypeSpec {
   options: string[];
   aliases?: string[];
   validate?(options: Record<string, SqlValue>): void;
+}
+
+/** Why {@link PluginHost.ask} failed, for the plugin to word its own message. */
+export interface AskError extends Error {
+  code: 'SMALT_EXTERNAL' | 'SMALT_MISUSE';
+  reason: 'timeout' | 'closed' | 'failed' | 'no-session';
+  /** For 'failed': the handler's error message (or that the tab has no handler). */
+  detail?: string;
+}
+
+/** An {@link AskError}. */
+export function askError(reason: AskError['reason'], message: string, detail?: string): AskError {
+  return Object.assign(new SmaltError(reason === 'no-session' ? 'SMALT_MISUSE' : 'SMALT_EXTERNAL', message), { reason, detail }) as unknown as AskError;
 }
 
 /** A plugin method: runs in the engine with the database and the calling session. */
@@ -163,13 +177,15 @@ export interface SourceContext {
   signal?: AbortSignal;
 }
 
-/** An opened file: its validator (ETag, Last-Modified, mtime and size; null: none) and its contents. */
+/**
+ * An opened file. Each way of reading it also returns its validator (ETag, Last-Modified, a file's
+ * mtime and size; null: none), taken from the same response or stat as the data.
+ */
 export interface OpenedFile {
-  validator: string | null;
   /** The whole file. */
-  bytes(): Promise<Uint8Array>;
+  bytes(): Promise<{ bytes: Uint8Array; validator: string | null }>;
   /** Random access, for formats that read parts (absent: the whole file is read). */
-  random?(): Promise<RandomAccessFile>;
+  random?(): Promise<{ file: RandomAccessFile; validator: string | null }>;
   close?(): Promise<void>;
 }
 
@@ -196,6 +212,12 @@ export interface SourceHandler {
   open(target: SourceTarget, ctx: SourceContext): Promise<OpenedFile>;
   /** The validator only (a HEAD request, a stat): for REFRESH … IF CHANGED. */
   validator(target: SourceTarget, ctx: SourceContext): Promise<string | null>;
+  /**
+   * Whether `target` is a pattern to list. Default: the location has a wildcard (`*`, `?`, `[`, `{`),
+   * ignoring a URL's query after `?` for `scheme://` locations. A source decides itself when its
+   * locations resolve differently (a key relative to a connection, `?` as a wildcard in object keys).
+   */
+  isPattern?(target: SourceTarget): boolean;
   /** The files a pattern (`*`, `**`, `?`, `[…]`, `{a,b}`) matches, sorted by path. Without it, patterns are errors. */
   list?(target: SourceTarget, ctx: SourceContext): Promise<ListedFile[]>;
 }
@@ -279,7 +301,7 @@ export class PluginRegistry {
         this.sources.push(s);
       },
       addConnectionType: (type, spec) => {
-        const entry = { type: type.toLowerCase(), options: new Set(['type', 'credentials', ...spec.options.map((o) => o.toLowerCase())]), validate: spec.validate };
+        const entry = { type: type.toLowerCase(), options: new Set(['type', ...spec.options.map((o) => o.toLowerCase()), 'credentials']), validate: spec.validate };
         for (const t of [type, ...(spec.aliases ?? [])].map((x) => x.toLowerCase())) {
           if (this.connectionTypes.has(t)) throw taken('connection type', t);
           this.connectionTypes.set(t, entry);
@@ -291,7 +313,7 @@ export class PluginRegistry {
       },
       onSessionClosed: (listener) => void this.sessionListeners.push(listener),
       ask: (session, message, timeoutMs = 30_000) => {
-        if (!this.asker) return Promise.reject(new SmaltError('SMALT_MISUSE', `plugin ${p.name}: there is no client session to ask (in-process)`));
+        if (!this.asker) return Promise.reject(askError('no-session', `plugin ${p.name}: there is no client session to ask (in-process)`));
         return this.asker(session, p.name, message, timeoutMs);
       },
       glob: { isGlob, regExp: globRegExp, prefix: globPrefix },
@@ -391,7 +413,7 @@ export class PluginRegistry {
     const spec = this.connectionTypes.get(t);
     if (!spec) {
       if (KNOWN_CONNECTIONS[t]) throw pluginMissing(`connection ${name}`, `a ${t} connection`, KNOWN_CONNECTIONS[t]);
-      const known = [...new Set([...this.connectionTypes.values()].map((x) => x.type))].sort();
+      const known = [...new Set([...this.connectionTypes.values()].map((x) => x.type))]; // registration order
       throw new SmaltError('SMALT_ERROR', `connection ${name}: type '${type}' is not supported${known.length ? ` (${known.join(', ')})` : ''}`);
     }
     for (const k of Object.keys(options)) {

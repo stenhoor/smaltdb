@@ -263,10 +263,11 @@ export class ExternalRegistry {
     return source.connection ? { location, connection: { name: source.connection.name, options: source.connection.options } } : { location };
   }
 
-  /** Whether the location is a pattern to list (wildcards in the path, not in a URL's query). */
+  /** Whether the location is a pattern to list (the source decides; default: wildcards in the path, not in a URL's query). */
   private isPattern(source: ExternalSource, handler: SourceHandler): boolean {
+    const target = this.targetOf(source);
     const path = /^[a-z][a-z0-9+.-]*:\/\//i.test(source.location) ? source.location.replace(/[?#].*$/, '') : source.location;
-    if (!isGlob(path)) return false;
+    if (!(handler.isPattern ? handler.isPattern(target) : isGlob(path))) return false;
     if (!handler.list) throw externalError(source, `wildcards need a source that can be listed, not ${handler.name}`);
     return true;
   }
@@ -344,11 +345,18 @@ export class ExternalRegistry {
     return this.guard(source, async () => {
       const file = await handler.open(target, ctx);
       try {
-        const result =
-          reader.access === 'random'
-            ? await reader.read(file.random ? await file.random() : fromBytes(await file.bytes()), request)
-            : await reader.read(await file.bytes(), request);
-        return { parsed: { columns: typed(result.columns, result.rows), rows: result.rows }, validator: file.validator };
+        let validator: string | null;
+        let result: { columns: ExternalColumn[]; rows: SqlValue[][] };
+        if (reader.access === 'random') {
+          const r = file.random ? await file.random() : await file.bytes().then((b) => ({ file: fromBytes(b.bytes), validator: b.validator }));
+          validator = r.validator;
+          result = await reader.read(r.file, request);
+        } else {
+          const b = await file.bytes();
+          validator = b.validator;
+          result = await reader.read(b.bytes, request);
+        }
+        return { parsed: { columns: typed(result.columns, result.rows), rows: result.rows }, validator };
       } finally {
         await file.close?.();
       }

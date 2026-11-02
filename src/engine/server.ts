@@ -21,7 +21,7 @@ import { type BindParams, Database, RowCursor, type Statement } from './database
 import { MisuseError, SmaltError, errorCode } from './errors.js';
 import { AsyncRequiredError } from './external/external.js';
 import { parse } from './sql/parser.js';
-import type { SmaltPlugin } from './plugin.js';
+import { type SmaltPlugin, askError } from './plugin.js';
 import type { Vfs } from './vfs/types.js';
 import { type ReaderSettings, type Request, type Response, encodeColumns } from '../shared/protocol.js';
 import type { SqlValue } from './values.js';
@@ -143,12 +143,12 @@ export class EngineServer {
 
   /** Ask `session`'s handler for `plugin` a question (wired to the database's plugins when it opens). */
   private askSession(session: string, plugin: string, message: unknown, timeoutMs: number): Promise<unknown> {
-    if (session === EngineServer.INTERNAL) return Promise.reject(new SmaltError('SMALT_MISUSE', `${plugin}: there is no client session to ask`));
+    if (session === EngineServer.INTERNAL) return Promise.reject(askError('no-session', `${plugin}: there is no client session to ask`));
     const request = this.nextAsk++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pluginAsks.delete(request);
-        reject(new SmaltError('SMALT_EXTERNAL', `${plugin}: the client did not answer within ${Math.round(timeoutMs / 1000)} s`));
+        reject(askError('timeout', `${plugin}: the client did not answer within ${Math.round(timeoutMs / 1000)} s`));
       }, timeoutMs);
       (timer as { unref?: () => void }).unref?.();
       this.pluginAsks.set(request, { session, plugin, resolve, reject, timer });
@@ -218,7 +218,7 @@ export class EngineServer {
         this.pluginAsks.delete(req.target);
         clearTimeout(ask.timer);
         if (req.error === undefined) ask.resolve(req.value);
-        else ask.reject(new SmaltError('SMALT_EXTERNAL', `${ask.plugin}: ${req.error}`));
+        else ask.reject(askError('failed', `${ask.plugin}: ${req.error}`, req.error));
       }
       return;
     }
@@ -245,7 +245,7 @@ export class EngineServer {
       if (ask.session !== session) continue;
       this.pluginAsks.delete(id);
       clearTimeout(ask.timer);
-      ask.reject(new SmaltError('SMALT_EXTERNAL', `${ask.plugin}: the tab that would answer closed`));
+      ask.reject(askError('closed', `${ask.plugin}: the tab that would answer closed`));
     }
     // What it registered with plugins (credentials callbacks, …) went with it.
     this.db?.external.plugins.sessionClosed(session);

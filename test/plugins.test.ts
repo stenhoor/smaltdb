@@ -54,7 +54,7 @@ function testPlugin(log: string[] = []): SmaltPlugin {
           const text = files.get(name);
           if (text === undefined) throw new Error(`no file ${name}`);
           log.push(`open ${name}`);
-          return { validator: `v${text.length}`, bytes: async () => new TextEncoder().encode(text) };
+          return { bytes: async () => ({ bytes: new TextEncoder().encode(text), validator: `v${text.length}` }) };
         },
         async validator(target) {
           const text = files.get(target.location.replace(/^mem:/, ''));
@@ -141,7 +141,7 @@ describe('plugins', () => {
     expect(db.query("SELECT connection_type FROM information_schema.connections WHERE connection_name = 'c'").rows).toEqual([['mem']]);
     await db.execAsync("CREATE EXTERNAL TABLE x WITH (connection = 'c', location = 'x.lines')");
     expect((await db.queryAsync('SELECT line FROM x')).rows).toEqual([['q']]);
-    await expect(db.execAsync("CREATE CONNECTION d WITH (type = 'mem', url = 'x')")).rejects.toMatchObject({ message: "connection d: unknown option 'url' for type mem (type, credentials, root)" });
+    await expect(db.execAsync("CREATE CONNECTION d WITH (type = 'mem', url = 'x')")).rejects.toMatchObject({ message: "connection d: unknown option 'url' for type mem (type, root, credentials)" });
     await expect(db.execAsync("CREATE CONNECTION d WITH (type = 'mem', root = 'x')")).rejects.toMatchObject({ code: 'SMALT_ERROR', message: 'connection d: root must end with /' });
     await expect(db.execAsync("CREATE CONNECTION d WITH (type = 'ftp')")).rejects.toMatchObject({ code: 'SMALT_ERROR', message: "connection d: type 'ftp' is not supported (mem)" });
     // A type smaltdb's own plugins provide names the plugin to install.
