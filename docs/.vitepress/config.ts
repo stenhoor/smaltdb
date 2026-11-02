@@ -164,6 +164,7 @@ export default defineConfig({
           { text: '0009 Concurrency', link: '/adr/0009-concurrency' },
           { text: '0010 Analytics & mixed storage', link: '/adr/0010-analytics-and-mixed-storage' },
           { text: '0011 External tables', link: '/adr/0011-external-tables' },
+          { text: '0012 Plugins (proposed)', link: '/adr/0012-plugins' },
         ],
       },
       {
