@@ -1,0 +1,5 @@
+# exported 2026-03-31
+region;month;revenue
+north;2026-01;1200
+south;2026-01;NA
+north;2026-02;1350

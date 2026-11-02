@@ -208,7 +208,7 @@ describe('documentation TypeScript examples', () => {
       blocks(readFileSync(page, 'utf8')).forEach((b, n) => {
         if (!['ts', 'typescript'].includes(b.lang) || b.markers.includes('docs:skip')) return;
         // `db` (an open client database) is predeclared unless the block makes its own.
-        const declaresDb = /\b(const|let|var)\s+db\b|\bdb\s*[,)]\s*=>|\(\s*db\b/.test(b.code);
+        const declaresDb = /\b(const|let|var)\s+db\b|\(\s*db\s*(:[^)]*)?\)\s*=>|\bfunction\s*\w*\s*\(\s*db\b/.test(b.code);
         const prelude = declaresDb ? '' : "declare const db: import('smaltdb').Database;\n";
         const name = `${page.replace(/[\\/]/g, '_').replace(/\.md$/, '')}_${n}.ts`;
         writeFileSync(join(dir, name), `${prelude}${b.code}\nexport {};\n`);
