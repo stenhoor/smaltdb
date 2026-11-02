@@ -17,8 +17,12 @@
       "smaltdb": ["./src/client/index.ts"],
       "smaltdb/engine": ["./src/engine/index.ts"],
       "smaltdb/worker-runtime": ["./src/engine/worker-runtime.ts"],
-      "@smaltdb/parquet": ["./plugins/parquet/src/index.ts"]
+      "@smaltdb/parquet": ["./plugins/parquet/src/index.ts"],
+      "@smaltdb/io": ["./plugins/io/src/index.ts"],
+      "@smaltdb/io/client": ["./plugins/io/src/client.ts"],
+      "@smaltdb/external": ["./plugins/external/src/index.ts"],
+      "@smaltdb/external/client": ["./plugins/external/src/client.ts"]
     }
   },
-  "include": ["src", "test", "bench", "plugins/*/src"]
+  "include": ["src", "test", "bench", "plugins/*/src", "plugins/*/test"]
 }

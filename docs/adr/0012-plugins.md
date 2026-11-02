@@ -1,6 +1,7 @@
 # ADR 0012: Plugins: a dependency-free core, optional features as packages
 
-- **Status:** accepted (2026-11-02). Steps 1 and 2 are implemented; see the implementation plan.
+- **Status:** accepted (2026-11-02); amended 2026-11-02: one repository per plugin, and the full interface (sources,
+  connection types, methods, questions to client sessions). See the implementation plan for progress.
 - **Date:** 2026-11-02
 
 ## Context
@@ -61,8 +62,11 @@ only the pieces it uses.
 
 ### 2. Packaging
 
-- **One repository.** The plugins live in the same repository as npm workspaces under `plugins/` (`plugins/external`,
-  `plugins/io`, `plugins/parquet`). The core stays at the root and publishes as `smaltdb`.
+- **One repository per plugin** (amended; the first version kept plugins in this repository as npm workspaces):
+  `stenhoor/smaltdb-parquet`, `stenhoor/smaltdb-external`, `stenhoor/smaltdb-io`. The core repository contains no
+  plugins and no third-party runtime dependencies, so a licence scan of it, its lockfile included, finds none. Each
+  plugin repository has its own licence, lockfile, tests, CI and releases, and a scan of one shows only that plugin's
+  dependencies. The core tests the plugin interface with test plugins defined in its own test suite.
 - **Notices travel with each package.** Every package has its own `LICENSE`. A package that depends on third-party
   code declares it as a normal `dependency`, so npm installs it with its own licence file next to it, where scanners
   expect it.
@@ -145,14 +149,22 @@ interface SmaltPlugin {
 
 | Registration | Used by | Example |
 |---|---|---|
-| `addSource(scheme, handler)` | external tables, `read_*` | `s3`, `az`, `https`, `file` (fetch, ranged reads, HEAD validators, listing) |
-| `addConnectionType(type, spec)` | `CREATE CONNECTION` | `s3`: allowed options, defaults, request signer |
-| `addFormat(name, reader)` | external tables, `read_*` | `csv`, `json`, `parquet`: file extensions, schema inference, a row reader with projection and zone (statistics) hooks |
+| `addSource(handler)` | external tables, `read_*` | location prefixes (`https://`, `s3://`, `az://`, `file:`), connection types, plain paths: open (whole file or random access), validator (HEAD, stat), list (patterns) |
+| `addConnectionType(type, spec)` | `CREATE CONNECTION` | `s3`: allowed options, aliases, a check of the options |
+| `addFormat(reader)` | external tables, `read_*` | `csv`, `json`, `parquet`: names and aliases, file extensions, options, a reader with projection and zone (statistics) hooks |
 | `addTableFunction(name, spec)` | `FROM f(…)` | `read_parquet` → the `parquet` format |
-| `addMethod(name, handler)` | client calls | `importCSV`, `registerFile`, `registerCredentials` |
+| `addMethod(name, handler)` | `callPlugin` | `importCSV`, `registerFile`, `registerCredentials` |
+| `onSessionClosed(listener)` | tabs that go away | drop the credential callbacks a tab registered |
+| `ask(session, message)` | questions to a tab | fresh credentials for one request, answered by the tab's `onPluginMessage` handler |
 
-**Calling a plugin method from the client.** The client gets one generic request,
-`db.callPlugin(plugin, method, args, transfer?)`. Each plugin package also exports client helpers that wrap it:
+Host helpers: `glob` (pattern matching for sources that list files) and `formatReal` (REALs as SQLite prints them).
+Methods get a `MethodContext`: the engine `db`, the calling `session`, a `signal`, and `query(sql, params)`, which
+fetches external data first and returns rows with their columns' static types.
+
+**Calling a plugin method.** The client and the engine `Database` both have
+`callPlugin(plugin, method, args, options)`. On the client, `lock` makes the call wait for other requests and
+transactions, and `replay` re-sends it to a new owner tab (state that lives in the engine worker, such as registered
+files). Each plugin package exports helpers that wrap it, working with either `Database`:
 
 ```ts
 import { importCSV } from '@smaltdb/io/client';
@@ -163,8 +175,9 @@ await importCSV(db, 'sales', file);
 The existing methods move out of the core client this way: `db.importCSV`, `db.importJSON`, `db.exportCSV`,
 `db.exportJSON`, `db.registerFile` and `db.registerCredentials`.
 
-**Messages initiated by the engine.** Some messages go from the engine to the client, such as the credential callback
-that asks a tab for a fresh token. These become plugin messages through the same channel.
+**Messages initiated by the engine.** `host.ask(session, message)` sends a `pluginAsk` message to that tab, whose
+handler (`db.onPluginMessage(plugin, handler)`) answers with `pluginReply`. Asks time out (30 s by default) and fail
+when the tab closes.
 
 **User-defined functions.** `addScalarFunction` and `addAggregateFunction` follow the same pattern. They are
 deliberately not in the first version (section 6).
@@ -184,8 +197,9 @@ The catalog records, for each external table and connection, the format, source 
 ### 6. API stability
 
 - **Phase 1:** the plugin interface is internal and marked experimental. Its first users are our own three plugins.
-- **Phase 2:** the interface becomes public and documented, possibly with user-defined functions, once those plugins
-  have shipped one release without interface changes.
+- **Phase 2:** the interface is declared stable as API version 1, public and documented, once all three plugins run
+  on it unchanged from their own repositories. Nothing is published before then (owner's decision, 2026-11-02).
+  User-defined functions come later as an addition to version 1.
 - **Versioning:** `apiVersion` lets a later engine reject an incompatible plugin with a clear message instead of
   failing at run time.
 
@@ -212,24 +226,18 @@ The catalog records, for each external table and connection, the format, source 
   - Getting started gains the worker-entry pattern.
   - The reference pages say which plugin provides each function and statement.
   - The `docs:examples` harness loads all plugins.
-- **Process.** Releases publish four packages, so `prepublishOnly` and the release steps cover the workspaces.
+- **Process.** A release publishes the core from this repository and each plugin from its own.
 
 ## Implementation plan
 
-1. **Plugin host.** ✅
-   - Done: the plugin registry (`src/engine/plugin.ts`), `serve()` in `smaltdb/worker-runtime`,
-     `Database.open(…, { plugins })`, `SMALT_PLUGIN_MISSING`, and `addFormat` / `addTableFunction` with random-access
-     and whole-file readers.
-   - Deferred to steps 3 and 4, where they are first needed: `addSource`, `addConnectionType`, `addMethod`, and
-     `callPlugin` with plugin messages. The built-in CSV/JSON formats and sources stay behind the same seams until
-     then.
-2. **Parquet out.** ✅ Move Parquet to `plugins/parquet`. Remove `hyparquet` from the core's peer dependencies and from
-   `dist/`. This step alone fixes the licence finding.
-3. **External sources out.** Move the sources, signing, globs and credentials to `plugins/external`.
-4. **CSV/JSON out.** Move the CSV/JSON formats and import/export to `plugins/io`.
-5. **Tests.** Tests that use these features load the plugins. A new test checks that a core-only engine:
-   - opens a database with external tables;
-   - reports `SMALT_PLUGIN_MISSING`.
-6. **Release.** Update the docs and publish 0.9.0: `smaltdb` and the three `@smaltdb/*` packages.
-
-Steps 1 and 2 can ship on their own as 0.9.0-beta if the licence finding needs fixing before the rest is done.
+1. **Plugin host.** ✅ The registry (`src/engine/plugin.ts`), `serve()` in `smaltdb/worker-runtime`,
+   `Database.open(…, { plugins })`, `SMALT_PLUGIN_MISSING`, `addFormat`, `addTableFunction`.
+2. **Parquet out.** ✅ `@smaltdb/parquet`; `hyparquet` is no longer a dependency of the core or in `dist/`.
+3. **The full interface.** ✅ `addSource`, `addConnectionType`, `addMethod`, `onSessionClosed`, `ask`, `callPlugin`,
+   `onPluginMessage`, the `pluginCall` / `pluginAsk` / `pluginReply` protocol. Core keeps only the external-data
+   framework: SQL, catalog, fetch phase, patterns, partitions, pruning, validators.
+4. **External sources and CSV/JSON out.** `@smaltdb/external` (sources, signing, credentials, registered files) and
+   `@smaltdb/io` (CSV/JSON formats, import and export).
+5. **Separate repositories.** Each plugin moves to its own repository with its tests; the core keeps test plugins.
+6. **Declare API version 1 stable**, with a public reference for writing plugins.
+7. **Release** 0.9.0: `smaltdb` and the three `@smaltdb/*` packages, together.

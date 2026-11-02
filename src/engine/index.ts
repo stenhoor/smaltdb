@@ -10,6 +10,22 @@ export { KeyEncoder, encodeKey, decodeKey, Collation, type KeyColumn, type SqlVa
 export { crc32c } from './storage/crc32c.js';
 export { Database, Statement, RowCursor, type RunResult, type QueryResult, type BindParams, type DatabaseOptions } from './database.js';
 export { parse, parseOne, SqlSyntaxError } from './sql/parser.js';
-export { importCSV, importJSON, exportCSV, exportJSON, exportCSVAsync, exportJSONAsync, type CsvImportOptions, type JsonImportOptions, type CsvExportOptions, type JsonExportOptions } from './io/import-export.js';
-export type { CredentialProvider, FetchFn, FileSource } from './external/external.js';
-export { PLUGIN_API_VERSION, type SmaltPlugin, type PluginHost, type FormatReader, type FormatRequest, type FormatResult, type FormatColumn, type RandomAccessFile, type Zone } from './plugin.js';
+export {
+  PLUGIN_API_VERSION,
+  type SmaltPlugin,
+  type PluginHost,
+  type PluginMethod,
+  type MethodContext,
+  type ConnectionTypeSpec,
+  type FormatReader,
+  type FormatRequest,
+  type FormatResult,
+  type FormatColumn,
+  type RandomAccessFile,
+  type SourceHandler,
+  type SourceTarget,
+  type SourceContext,
+  type OpenedFile,
+  type ListedFile,
+  type Zone,
+} from './plugin.js';

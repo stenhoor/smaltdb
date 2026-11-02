@@ -20,11 +20,10 @@
 import { type BindParams, Database, RowCursor, type Statement } from './database.js';
 import { MisuseError, SmaltError } from './errors.js';
 import { AsyncRequiredError } from './external/external.js';
-import { exportCSV, exportCSVAsync, exportJSON, exportJSONAsync, importCSV, importJSON } from './io/import-export.js';
 import { parse } from './sql/parser.js';
 import type { SmaltPlugin } from './plugin.js';
 import type { Vfs } from './vfs/types.js';
-import { type ReaderSettings, type Request, type Response, type WireMaterial, encodeColumns } from '../shared/protocol.js';
+import { type ReaderSettings, type Request, type Response, encodeColumns } from '../shared/protocol.js';
 import type { SqlValue } from './values.js';
 
 /** Sends a response to a session. */
@@ -138,23 +137,23 @@ export class EngineServer {
 
   // ---------------------------------------------------------------- credential callbacks (M8.1)
 
-  /** Credentials whose headers come from a session's callback: name -> session. */
-  private readonly credentialOwners = new Map<string, string>();
-  /** Questions to sessions' credentials callbacks, by question id. */
-  private readonly credentialAsks = new Map<number, { session: string; name: string; resolve: (m: WireMaterial) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  /** Plugins' questions to sessions (`PluginHost.ask`), by question id. */
+  private readonly pluginAsks = new Map<number, { session: string; plugin: string; resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private nextAsk = 1;
 
-  /** Ask `session` for the credentials of a `method` request to `url` (its callback for credentials `name`). */
-  private askCredentials(session: string, name: string, url: string, method: 'GET' | 'HEAD'): Promise<WireMaterial> {
+  /** Ask `session`'s handler for `plugin` a question (wired to the database's plugins when it opens). */
+  private askSession(session: string, plugin: string, message: unknown, timeoutMs: number): Promise<unknown> {
+    if (session === EngineServer.INTERNAL) return Promise.reject(new SmaltError('SMALT_MISUSE', `${plugin}: there is no client session to ask`));
     const request = this.nextAsk++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.credentialAsks.delete(request);
-        reject(new SmaltError('SMALT_EXTERNAL', `credentials '${name}': the provider did not answer within 30 s`));
-      }, 30_000);
+        this.pluginAsks.delete(request);
+        reject(new SmaltError('SMALT_EXTERNAL', `${plugin}: the client did not answer within ${Math.round(timeoutMs / 1000)} s`));
+      }, timeoutMs);
       (timer as { unref?: () => void }).unref?.();
-      this.credentialAsks.set(request, { session, name, resolve, reject, timer });
-      this.send(session, { id: 0, kind: 'credentials', request, name, url, method });
+      this.pluginAsks.set(request, { session, plugin, resolve, reject, timer });
+      if (session !== EngineServer.LOCAL) this.watch(session);
+      this.send(session, { id: 0, kind: 'pluginAsk', request, plugin, message });
     });
   }
 
@@ -212,14 +211,14 @@ export class EngineServer {
 
   /** A request from `session`. Credits and cancellations act immediately; the rest queue. */
   receive(session: string, req: Request): void {
-    if (req.op === 'credentialsReply') {
-      // Answers a question asked while a request waits on its fetch: never queued behind it.
-      const ask = this.credentialAsks.get(req.target);
+    if (req.op === 'pluginReply') {
+      // Answers a question asked while a request waits (e.g. on a fetch): never queued behind it.
+      const ask = this.pluginAsks.get(req.target);
       if (ask && ask.session === session) {
-        this.credentialAsks.delete(req.target);
+        this.pluginAsks.delete(req.target);
         clearTimeout(ask.timer);
-        if (req.material) ask.resolve(req.material);
-        else ask.reject(new SmaltError('SMALT_EXTERNAL', `credentials '${ask.name}': ${req.error ?? 'no credentials'}`));
+        if (req.error === undefined) ask.resolve(req.value);
+        else ask.reject(new SmaltError('SMALT_EXTERNAL', `${ask.plugin}: ${req.error}`));
       }
       return;
     }
@@ -242,18 +241,14 @@ export class EngineServer {
   /** A session went away: drop its work, close its streams, roll back its transaction. */
   sessionGone(session: string): void {
     this.watched.delete(session);
-    for (const [id, ask] of this.credentialAsks) {
+    for (const [id, ask] of this.pluginAsks) {
       if (ask.session !== session) continue;
-      this.credentialAsks.delete(id);
+      this.pluginAsks.delete(id);
       clearTimeout(ask.timer);
-      ask.reject(new SmaltError('SMALT_EXTERNAL', `credentials '${ask.name}': the tab that provides them closed`));
+      ask.reject(new SmaltError('SMALT_EXTERNAL', `${ask.plugin}: the tab that would answer closed`));
     }
-    // Its callbacks went with it.
-    for (const [name, owner] of this.credentialOwners) {
-      if (owner !== session) continue;
-      this.credentialOwners.delete(name);
-      this.db?.registerCredentials(name, null);
-    }
+    // What it registered with plugins (credentials callbacks, …) went with it.
+    this.db?.external.plugins.sessionClosed(session);
     for (let i = this.queue.length - 1; i >= 0; i--) if (this.queue[i].session === session) this.queue.splice(i, 1);
     for (const m of this.morselJobs) if (m.session === session) m.cancelled = true;
     for (let i = this.streams.length - 1; i >= 0; i--) {
@@ -408,6 +403,8 @@ export class EngineServer {
           return;
         }
         this.db = await this.options.open(req);
+        // Plugins ask client sessions questions (credentials callbacks, …) through this server.
+        this.db.external.plugins.asker = (sess, plugin, message, timeoutMs) => this.askSession(sess, plugin, message, timeoutMs);
         if (this.options.refreshTimer !== false && this.refreshTimer === null) {
           this.refreshTimer = setInterval(() => this.refreshTick(), 1000);
           (this.refreshTimer as { unref?: () => void }).unref?.(); // Node: do not keep the process alive
@@ -464,22 +461,10 @@ export class EngineServer {
         this.send(session, { id, kind: 'ok', ended });
         return;
       }
-      case 'registerFile':
-        this.requireDb().registerFile(req.name, req.file);
-        this.send(session, { id, kind: 'ok' });
-        return;
-      case 'registerCredentials': {
-        const p = req.provider;
-        const name = req.name;
-        // A callback stays in the registering tab: the engine asks it for each request's headers.
-        this.requireDb().registerCredentials(
-          name,
-          p && (p.callback ? { endpoint: p.endpoint, resolve: (url, method) => this.askCredentials(session, name, url, method) } : { endpoint: p.endpoint, headers: p.headers, aws: p.aws, azure: p.azure }),
-        );
-        if (p?.callback) this.credentialOwners.set(name, session);
-        else this.credentialOwners.delete(name);
-        if (session !== EngineServer.LOCAL) this.watch(session);
-        this.send(session, { id, kind: 'ok' });
+      case 'pluginCall': {
+        const d = this.requireDb();
+        const value = await this.withAbort(session, id, (signal) => d.callPlugin(req.plugin, req.method, req.args, { session, signal }));
+        this.send(session, { id, kind: 'ok', value });
         return;
       }
       case 'query': {
@@ -520,26 +505,6 @@ export class EngineServer {
         this.statements.delete(req.stmt);
         this.send(session, { id, kind: 'ok' });
         return;
-      case 'import': {
-        const d = this.requireDb();
-        const text = new TextDecoder().decode(req.data);
-        const r = req.format === 'csv' ? importCSV(d, req.table, text, req.options) : importJSON(d, req.table, text, req.options);
-        this.send(session, { id, kind: 'ok', changes: r.rows });
-        return;
-      }
-      case 'export': {
-        const d = this.requireDb();
-        const params = req.params as SqlValue[] | Record<string, SqlValue> | undefined;
-        // Queries over external data (M8) fetch their sources first; the rest run as before.
-        const external = this.readsExternal(d.prepare(req.sql));
-        const text = external
-          ? await this.withAbort(session, id, (signal) => (req.format === 'csv' ? exportCSVAsync(d, req.sql, params, req.options, signal) : exportJSONAsync(d, req.sql, params, req.options, signal)))
-          : req.format === 'csv'
-            ? exportCSV(d, req.sql, params, req.options)
-            : exportJSON(d, req.sql, params, req.options);
-        this.send(session, { id, kind: 'ok', text });
-        return;
-      }
       case 'close':
         if (session !== EngineServer.LOCAL) {
           // Another tab detaching: forget its state, keep the database open.

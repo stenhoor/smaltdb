@@ -54,12 +54,9 @@ import { parse, parseOne } from './sql/parser.js';
 import {
   AsyncRequiredError,
   type ConnectionInfo,
-  type CredentialProvider,
   type ExternalColumn,
   type ExternalSource,
   ExternalRegistry,
-  type FetchFn,
-  type FileSource,
   checkReaderOptions,
   externalError,
   formatOf,
@@ -158,18 +155,7 @@ interface ExternalCacheEntry {
 const connectionKey = (name: string): string => `\u0000connection:${name.toLowerCase()}`;
 const quoteIdent = (name: string): string => '"' + name.replace(/"/g, '""') + '"';
 const sqlLiteral = (v: SqlValue): string => (v === null ? 'NULL' : typeof v === 'string' ? `'${v.replace(/'/g, "''")}'` : String(v));
-/** Options of each connection type (M8.1 http, M8.2 s3 and azure). Never secrets: those come from credentials providers. */
-const CONNECTION_OPTIONS: Record<string, ReadonlySet<string>> = {
-  http: new Set(['type', 'url', 'credentials']),
-  s3: new Set(['type', 'region', 'bucket', 'endpoint', 'url_style', 'credentials']),
-  azure: new Set(['type', 'account', 'container', 'endpoint', 'credentials']),
-};
 
-/** A connection's type: the `type` option lower-cased, default 'http'; 'https' is another name for 'http'. */
-function connectionType(options: Record<string, SqlValue>): string {
-  const type = String(options.type ?? 'http').toLowerCase();
-  return type === 'https' ? 'http' : type;
-}
 
 interface CatalogEntry {
   type: 'table' | 'index' | 'view' | 'matview' | 'external' | 'connection';
@@ -628,24 +614,24 @@ export class Database implements FunctionContext {
     }
   }
 
-  /** Make `file` readable as `file:<name>` (a File, Blob, file handle, bytes or text); null removes it. */
-  registerFile(name: string, file: FileSource | null): void {
-    if (file === null) this.external.files.delete(name);
-    else this.external.files.set(name, file);
-  }
-
   /**
-   * Credentials a connection refers to by name (`credentials = 'name'`): headers for requests to
-   * URLs that start with `provider.endpoint` (never sent elsewhere). null removes them.
+   * Call method `method` of plugin `plugin` (ADR 0012), e.g. `@smaltdb/io`'s importCSV. Plugins
+   * export helpers that call this (`importCSV(db, …)`); `session` is the calling client session
+   * (`'local'` in-process).
    */
-  registerCredentials(name: string, provider: CredentialProvider | null): void {
-    if (provider === null) this.external.credentials.delete(name);
-    else this.external.credentials.set(name, provider);
+  async callPlugin(plugin: string, method: string, args: unknown[], options: { session?: string; signal?: AbortSignal } = {}): Promise<unknown> {
+    this.checkOpen();
+    const signal = options.signal;
+    const query = async (sql: string, params?: BindParams): Promise<{ columns: string[]; rows: SqlValue[][]; columnTypes: StaticType[] }> => {
+      const st = this.prepare(sql);
+      return this.withExternal(signal, st, () => ({ columns: st.columns, rows: st.all(params), columnTypes: st.columnTypes }));
+    };
+    return this.external.plugins.call({ db: this, session: options.session ?? 'local', signal, query }, plugin, method, args);
   }
 
-  /** Transport for http(s) sources (default: the global fetch). */
-  setFetch(fetchFn: FetchFn | null): void {
-    this.external.fetchFn = fetchFn;
+  /** The plugins installed in this engine (name and version). */
+  get plugins(): readonly { name: string; version: string }[] {
+    return this.external.plugins.plugins;
   }
 
   close(): void {
@@ -853,8 +839,7 @@ export class Database implements FunctionContext {
         let fmt: string | null = format === undefined || format === null ? null : String(format).toLowerCase();
         if (fmt === null) {
           try {
-            const f = formatOf(String(location), x.options, x.name, this.external.plugins);
-            fmt = f.delimiter === '\t' ? 'tsv' : f.format;
+            fmt = formatOf(String(location), x.options, x.name, this.external.plugins).name;
           } catch {
             fmt = null;
           }
@@ -863,7 +848,7 @@ export class Database implements FunctionContext {
       }),
       connections: [...this.connections.values()].map((c) => ({
         name: c.name,
-        type: connectionType(c.options),
+        type: this.external.plugins.connectionType(String(c.options.type ?? 'http')),
         url: c.options.url === undefined || c.options.url === null ? null : String(c.options.url),
         credentials: c.options.credentials === undefined || c.options.credentials === null ? null : String(c.options.credentials),
         options: JSON.stringify(Object.fromEntries(Object.entries(c.options).filter(([k]) => !['type', 'url', 'credentials'].includes(k)))),
@@ -2310,17 +2295,8 @@ export class Database implements FunctionContext {
       if (stmt.ifNotExists) return none;
       throw new SmaltError('SMALT_ERROR', `connection ${stmt.name} already exists`);
     }
-    const type = connectionType(stmt.with);
-    const allowed = CONNECTION_OPTIONS[type];
-    if (!allowed) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: type '${type}' is not supported (http, s3, azure)`);
-    for (const k of Object.keys(stmt.with)) if (!allowed.has(k)) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: unknown option '${k}' for type ${type} (${[...allowed].join(', ')})`);
-    for (const k of ['url', 'endpoint']) {
-      const v = stmt.with[k];
-      if (v !== undefined && v !== null && !/^https?:\/\//i.test(String(v))) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: ${k} must be an http(s) URL`);
-    }
-    if (type === 'azure' && !stmt.with.account) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: an azure connection needs account (the storage account name)`);
-    const style = stmt.with.url_style;
-    if (style !== undefined && style !== null && !['path', 'virtual'].includes(String(style).toLowerCase())) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: url_style must be 'path' or 'virtual'`);
+    // Types, their options and checks come from plugins (@smaltdb/external: http, s3, azure).
+    this.external.plugins.checkConnection(stmt.name, stmt.with);
     this.dirtySchema = true;
     this.addCatalogRow('connection', stmt.name, stmt.name, 0, sql, connectionKey(stmt.name));
     this.connections.set(lower, { name: stmt.name, options: stmt.with, sql });
@@ -2358,7 +2334,7 @@ export class Database implements FunctionContext {
     const { location, connection: _c, ...options } = def.options;
     if (typeof location !== 'string' || location === '') throw new SmaltError('SMALT_ERROR', `external table ${def.name}: location is required`);
     const fmt = formatOf(location, def.options, def.name, this.external.plugins);
-    return { key: `table:${def.name.toLowerCase()}`, label: def.name, location, format: fmt.format, pushdown: !!fmt.reader?.pushdown, options, connection: this.connectionOf(def.options, def.name), columns };
+    return { key: `table:${def.name.toLowerCase()}`, label: def.name, location, format: fmt.name, pushdown: !!fmt.pushdown, options, connection: this.connectionOf(def.options, def.name), columns };
   }
 
   private createExternalTable(stmt: CreateExternalTableStmt, sql: string): RunResult {
@@ -2366,7 +2342,7 @@ export class Database implements FunctionContext {
     const lower = stmt.name.toLowerCase();
     if (stmt.ifNotExists && this.externals.has(lower)) return none;
     this.checkNewName(stmt.name, 'external');
-    checkReaderOptions(stmt.with, new Set(['location', 'connection', ...this.external.plugins.extraOptions()]), stmt.name);
+    checkReaderOptions(stmt.with, new Set(['location', 'connection', ...this.external.plugins.readerOptions()]), stmt.name);
     const seen = new Set<string>();
     for (const c of stmt.columns) {
       if (c.constraints.length > 0) throw new SmaltError('SMALT_ERROR', `external table ${stmt.name}: columns cannot have constraints`);
@@ -2447,14 +2423,12 @@ export class Database implements FunctionContext {
     if (args.length !== 1 || typeof args[0] !== 'string') throw new SmaltError('SMALT_ERROR', `${name}() takes a location (text) and named options`);
     const location = args[0];
     const label = `${name}('${location}')`;
-    checkReaderOptions(named, new Set(['connection', ...this.external.plugins.extraOptions()]), label);
     const { connection: _c, ...options } = named;
-    if (options.format === undefined || options.format === null) {
-      options.format = this.external.plugins.functionFormat(name) ?? (name === 'read_json' ? 'json' : /\.tsv([?#]|$)/i.test(location) ? 'tsv' : 'csv');
-    }
+    if (options.format === undefined || options.format === null) options.format = this.external.plugins.functionFormat(name, location);
     const fmt = formatOf(location, options, label, this.external.plugins);
+    checkReaderOptions(named, new Set(['connection', ...this.external.plugins.readerOptions()]), label);
     const key = `fn:${name}:${JSON.stringify([location, Object.entries(named).sort()], (_k, v) => (typeof v === 'bigint' ? `${v}n` : v))}`;
-    return { key, label, location, format: fmt.format, pushdown: !!fmt.reader?.pushdown, options, connection: this.connectionOf(named, label) };
+    return { key, label, location, format: fmt.name, pushdown: !!fmt.pushdown, options, connection: this.connectionOf(named, label) };
   }
 
   private createView(stmt: CreateViewStmt, sql: string): RunResult {

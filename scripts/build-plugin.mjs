@@ -2,15 +2,16 @@
 // Third-party packages are never bundled: they stay imports, installed by npm with their own licences (ADR 0012).
 import { build } from 'esbuild';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 
 rmSync('dist', { recursive: true, force: true });
 const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
 const external = [...Object.keys(pkg.dependencies ?? {}), ...Object.keys(pkg.peerDependencies ?? {}), 'smaltdb/*'];
+// src/index.ts is the plugin (for the engine); src/client.ts, when present, the helpers applications call.
 await build({
-  entryPoints: ['src/index.ts'],
-  outfile: 'dist/index.js',
+  entryPoints: ['src/index.ts', ...(existsSync('src/client.ts') ? ['src/client.ts'] : [])],
+  outdir: 'dist',
   bundle: true,
   format: 'esm',
   platform: 'neutral',

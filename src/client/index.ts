@@ -2,9 +2,8 @@
  * smaltdb client API. Runs on the main thread (or any worker) and talks to the engine worker.
  * See docs/API.md.
  */
-import type { CsvExportOptions, CsvImportOptions, JsonExportOptions, JsonImportOptions } from '../engine/io/import-export.js';
 import type { SqlValue } from '../engine/values.js';
-import { type BusMessage, type Params, type Request, type RequestBody, type Response, type WireColumn, type WireCredentials, type WireMaterial, columnValue } from '../shared/protocol.js';
+import { type BusMessage, type Params, type Request, type RequestBody, type Response, type WireColumn, columnValue } from '../shared/protocol.js';
 
 export type { SqlValue, Params };
 
@@ -311,8 +310,8 @@ export class Database implements Queryable {
   }
 
   private onMessage(msg: Response): void {
-    if (msg.kind === 'credentials') {
-      void this.answerCredentials(msg);
+    if (msg.kind === 'pluginAsk') {
+      void this.answerPlugin(msg);
       return;
     }
     const p = this.pending.get(msg.id);
@@ -501,89 +500,52 @@ export class Database implements Queryable {
   }
 
   /**
-   * Import CSV into `table` in one transaction (constraints and conversions apply). `source` may be
-   * text, bytes or a Blob/File. With `{ create: true }` a missing table is created with column types
-   * inferred from the data. Returns the number of rows inserted.
+   * Call method `method` of plugin `plugin` in the engine worker (ADR 0012). Plugins export helpers
+   * that call this, e.g. `importCSV(db, …)` from `@smaltdb/io`, so applications rarely call it
+   * directly. Options:
+   * - `lock`: wait for (and hold off) other requests and transactions of this Database, as `exec` does.
+   * - `replay`: a key under which the call is sent again to a new engine worker when this tab takes
+   *   over a shared database (state that lives in the worker, such as registered files). A later
+   *   call with the same key replaces it; `dropReplay` removes it.
    */
-  importCSV(table: string, source: ImportSource, options: CsvImportOptions = {}): Promise<{ rows: number }> {
-    return this.importData('csv', table, source, options as Record<string, unknown>);
-  }
-
-  /** Import a JSON array (of objects or arrays) or NDJSON into `table`; see {@link importCSV}. */
-  importJSON(table: string, source: ImportSource, options: JsonImportOptions = {}): Promise<{ rows: number }> {
-    return this.importData('json', table, source, options as Record<string, unknown>);
-  }
-
-  /** Run a query and return its result as CSV text (header row first by default). */
-  exportCSV(sql: string, params?: Params, options: CsvExportOptions = {}): Promise<string> {
-    return this.withLock(async () => ((await this.request({ op: 'export', format: 'csv', sql, params, options: options as Record<string, unknown> })) as { text: string }).text);
-  }
-
-  /** Run a query and return its result as a JSON array of objects (or NDJSON with `{ format: 'ndjson' }`). */
-  exportJSON(sql: string, params?: Params, options: JsonExportOptions = {}): Promise<string> {
-    return this.withLock(async () => ((await this.request({ op: 'export', format: 'json', sql, params, options: options as Record<string, unknown> })) as { text: string }).text);
-  }
-
-  private async importData(format: 'csv' | 'json', table: string, source: ImportSource, options: Record<string, unknown>): Promise<{ rows: number }> {
-    let data: Uint8Array;
-    if (typeof source === 'string') data = new TextEncoder().encode(source);
-    else if (source instanceof Uint8Array) data = source;
-    else if (source instanceof ArrayBuffer) data = new Uint8Array(source);
-    else data = new Uint8Array(await source.arrayBuffer());
-    return this.withLock(async () => ({ rows: ((await this.request({ op: 'import', format, table, data, options })) as { changes: number }).changes }));
+  callPlugin(plugin: string, method: string, args: unknown[], options: { lock?: boolean; replay?: string; dropReplay?: boolean; signal?: AbortSignal } = {}): Promise<unknown> {
+    if (options.replay !== undefined) {
+      if (options.dropReplay) this.replays.delete(options.replay);
+      else this.replays.set(options.replay, { plugin, method, args });
+    }
+    const call = async (): Promise<unknown> => ((await this.request({ op: 'pluginCall', plugin, method, args }, options.signal)) as { value?: unknown }).value;
+    return options.lock ? this.withLock(call) : call();
   }
 
   /**
-   * Make a file readable by SQL as `file:<name>` (M8 external data), e.g. a `File` from an
-   * `<input type="file">` or a File System Access handle: `CREATE EXTERNAL TABLE t WITH (location = 'file:<name>', …)`
-   * or `read_csv('file:<name>')`. Pass null to remove it. Files are not stored in the database.
+   * Answer plugin `plugin`'s questions from the engine (e.g. fresh credentials for a request): the
+   * handler's value (or promise) is the answer. One handler per plugin; null removes it.
    */
-  async registerFile(name: string, file: Blob | Uint8Array | ArrayBuffer | string | { getFile(): Promise<Blob> } | null): Promise<void> {
-    if (file === null) this.registeredFiles.delete(name);
-    else this.registeredFiles.set(name, file);
-    await this.request({ op: 'registerFile', name, file });
+  onPluginMessage(plugin: string, handler: ((message: unknown) => unknown) | null): void {
+    if (handler === null) this.pluginHandlers.delete(plugin);
+    else this.pluginHandlers.set(plugin, handler);
   }
 
-  /**
-   * Credentials that connections name (`CREATE CONNECTION c WITH (url = …, credentials = '<name>')`):
-   * `headers` are sent only with requests to URLs that start with `endpoint`. They live in the engine
-   * worker's memory, never in SQL or the database file. Pass null to remove them.
-   */
-  async registerCredentials(name: string, provider: CredentialsProvider | null): Promise<void> {
-    if (provider === null) this.registeredCredentials.delete(name);
-    else this.registeredCredentials.set(name, provider);
-    await this.request({ op: 'registerCredentials', name, provider: provider && wireProvider(provider) });
-  }
+  /** Calls to send again to a new owner (another tab taking over), by replay key. */
+  private readonly replays = new Map<string, { plugin: string; method: string; args: unknown[] }>();
+  private readonly pluginHandlers = new Map<string, (message: unknown) => unknown>();
 
-  // Files and credentials live in the owning worker's memory: kept here to register them again with
-  // a new owner (another tab taking over).
-  private readonly registeredFiles = new Map<string, Blob | Uint8Array | ArrayBuffer | string | { getFile(): Promise<Blob> }>();
-  private readonly registeredCredentials = new Map<string, CredentialsProvider>();
-
-  /** @internal After a change of owner: register this tab's files and credentials with it. */
+  /** @internal After a change of owner: send this tab's replayable plugin calls (registered files, credentials) to it. */
   replayRegistrations(): void {
-    for (const [name, file] of this.registeredFiles) void this.request({ op: 'registerFile', name, file }).catch(() => undefined);
-    for (const [name, p] of this.registeredCredentials) void this.request({ op: 'registerCredentials', name, provider: wireProvider(p) }).catch(() => undefined);
+    for (const c of this.replays.values()) void this.request({ op: 'pluginCall', plugin: c.plugin, method: c.method, args: c.args }).catch(() => undefined);
   }
 
-  /** The engine needs credentials from one of this tab's providers (some part is a function). */
-  private async answerCredentials(msg: Extract<Response, { kind: 'credentials' }>): Promise<void> {
-    const p = this.registeredCredentials.get(msg.name);
-    let reply: { material?: WireMaterial; error?: string };
+  /** A plugin in the engine asks this tab's handler a question. */
+  private async answerPlugin(msg: Extract<Response, { kind: 'pluginAsk' }>): Promise<void> {
+    const h = this.pluginHandlers.get(msg.plugin);
+    let reply: { value?: unknown; error?: string };
     try {
-      if (!p) throw new Error('not registered in this tab');
-      reply = {
-        material: {
-          headers: typeof p.headers === 'function' ? await p.headers(msg.url) : p.headers,
-          aws: typeof p.aws === 'function' ? await p.aws() : p.aws,
-          azure: typeof p.azure === 'function' ? await p.azure() : p.azure,
-          url: p.presign ? await p.presign(msg.url, msg.method) : undefined,
-        },
-      };
+      if (!h) throw new Error(`this tab has no handler for ${msg.plugin} (onPluginMessage)`);
+      reply = { value: await h(msg.message) };
     } catch (e) {
       reply = { error: e instanceof Error ? e.message : String(e) };
     }
-    this.link?.send({ id: 0, op: 'credentialsReply', target: msg.request, ...reply } as Request);
+    this.link?.send({ id: 0, op: 'pluginReply', target: msg.request, ...reply });
   }
 
   /** Prepare a statement for repeated execution. */
@@ -786,34 +748,3 @@ function materialize(columns: string[], batches: { length: number; cols: WireCol
   if (mode === 'array') (rows as unknown as ArrayResult).columns = columns;
   return rows;
 }
-
-/** Data accepted by importCSV / importJSON. */
-export type ImportSource = string | Uint8Array | ArrayBuffer | Blob;
-
-type AwsKeys = { accessKeyId: string; secretAccessKey: string; sessionToken?: string };
-type AzureAuth = { sasToken: string } | { accountKey: string } | { bearerToken: string };
-
-/**
- * Credentials for connections (M8), used only for requests to URLs that start with `endpoint`.
- * Any part may be a value or a function computed per request (a token refreshed on demand, keys from
- * STS or Cognito); functions stay in this tab and the engine asks them for each request.
- */
-export interface CredentialsProvider {
-  endpoint: string;
-  /** Extra headers (`authorization: Bearer …`). */
-  headers?: Record<string, string> | ((url: string) => Record<string, string> | Promise<Record<string, string>>);
-  /** AWS keys: requests on s3 connections are signed (Signature Version 4). */
-  aws?: AwsKeys | (() => AwsKeys | Promise<AwsKeys>);
-  /** Azure: a SAS token, the account key (Shared Key signing) or an Entra ID bearer token. */
-  azure?: AzureAuth | (() => AzureAuth | Promise<AzureAuth>);
-  /** Issues a presigned URL for each request (used instead of the request URL). */
-  presign?: (url: string, method: 'GET' | 'HEAD') => string | Promise<string>;
-}
-
-function wireProvider(p: CredentialsProvider): WireCredentials {
-  const fn = typeof p.headers === 'function' || typeof p.aws === 'function' || typeof p.azure === 'function' || p.presign !== undefined;
-  if (fn) return { endpoint: p.endpoint, callback: true };
-  return { endpoint: p.endpoint, headers: p.headers as Record<string, string> | undefined, aws: p.aws as AwsKeys | undefined, azure: p.azure as AzureAuth | undefined };
-}
-export type { CsvExportOptions, CsvImportOptions, JsonExportOptions, JsonImportOptions } from '../engine/io/import-export.js';
-

@@ -42,19 +42,11 @@ export type Request = { id: number } & (
    * the session already ended it, the reply's `ended` says how instead.
    */
   | { op: 'endTransaction'; commit: boolean }
-  | { op: 'import'; format: 'csv' | 'json'; table: string; data: Uint8Array; options?: Record<string, unknown> }
-  | { op: 'export'; format: 'csv' | 'json'; sql: string; params?: Params; options?: Record<string, unknown> }
   | { op: 'close' }
-  /** M8: make a File / Blob / file handle / bytes / text readable as `file:<name>` (null removes it). */
-  | { op: 'registerFile'; name: string; file: Blob | Uint8Array | ArrayBuffer | string | { getFile(): Promise<Blob> } | null }
-  /**
-   * M8: credentials a connection names: headers sent only to URLs that start with `endpoint` (null
-   * removes them). `callback`: the engine asks this session for the headers of each request instead
-   * (a 'credentials' message, answered with 'credentialsReply').
-   */
-  | { op: 'registerCredentials'; name: string; provider: WireCredentials | null }
-  /** Answer to a 'credentials' message: the credential material for that request, or why there is none. */
-  | { op: 'credentialsReply'; target: number; material?: WireMaterial; error?: string }
+  /** Call a plugin's method (ADR 0012); the reply's `value` is its result. */
+  | { op: 'pluginCall'; plugin: string; method: string; args: unknown[] }
+  /** Answer to a 'pluginAsk' message: the client handler's value, or why it failed. */
+  | { op: 'pluginReply'; target: number; value?: unknown; error?: string }
   /** Grant `n` more batches to the stream of request `target`. */
   | { op: 'credit'; target: number; n: number }
   /** Stop request `target`: dequeue it or close its stream (running statements: interrupt flag). */
@@ -100,27 +92,10 @@ export type WireColumn =
   | { t: 'str'; data: (string | null)[] }
   | { t: 'any'; data: SqlValue[] };
 
-/** Static credentials for a connection (M8), or `callback`: ask the registering session per request. */
-export interface WireCredentials {
-  endpoint: string;
-  headers?: Record<string, string>;
-  aws?: { accessKeyId: string; secretAccessKey: string; sessionToken?: string };
-  azure?: { sasToken: string } | { accountKey: string } | { bearerToken: string };
-  callback?: boolean;
-}
-
-/** What authenticates one request (headers, keys to sign with, or a presigned URL). */
-export interface WireMaterial {
-  headers?: Record<string, string>;
-  aws?: { accessKeyId: string; secretAccessKey: string; sessionToken?: string };
-  azure?: { sasToken: string } | { accountKey: string } | { bearerToken: string };
-  url?: string;
-}
-
 export type Response =
-  /** M8: the engine needs credentials for a `method` request to `url` from this session's callback `name`. */
-  | { id: 0; kind: 'credentials'; request: number; name: string; url: string; method: 'GET' | 'HEAD' }
-  | { id: number; kind: 'ok'; changes?: number; lastInsertRowid?: number | bigint; stmt?: number; columns?: string[]; paramCount?: number; capabilities?: unknown; text?: string; ended?: 'commit' | 'rollback' }
+  /** A plugin asks this session's handler for plugin `plugin` a question (e.g. fresh credentials); answered with 'pluginReply'. */
+  | { id: 0; kind: 'pluginAsk'; request: number; plugin: string; message: unknown }
+  | { id: number; kind: 'ok'; changes?: number; lastInsertRowid?: number | bigint; stmt?: number; columns?: string[]; paramCount?: number; capabilities?: unknown; value?: unknown; ended?: 'commit' | 'rollback' }
   /** `reader`: which parallel reader worker serves the result (absent: the owner). */
   | { id: number; kind: 'columns'; columns: string[]; reader?: number; /** Merged from this many morsels (parallel readers). */ morsels?: number }
   | { id: number; kind: 'batch'; length: number; cols: WireColumn[] }
