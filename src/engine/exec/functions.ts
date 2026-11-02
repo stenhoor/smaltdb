@@ -31,6 +31,19 @@ export interface FunctionContext {
   totalChanges(): number;
   /** Current time in Unix milliseconds; the same value for every call within one statement execution. */
   now(): number;
+  /** Set while evaluating an index expression or CHECK constraint (see DateTimeContext.pureContext). */
+  pureContext?: string;
+}
+
+/** `base` for evaluating an index expression or CHECK constraint (`where`: 'an index', 'a CHECK constraint'). */
+export function pureFunctionContext(base: FunctionContext, where: string): FunctionContext {
+  return {
+    lastInsertRowid: () => base.lastInsertRowid(),
+    changes: () => base.changes(),
+    totalChanges: () => base.totalChanges(),
+    now: () => base.now(),
+    pureContext: where,
+  };
 }
 
 export interface ScalarFunction {
@@ -39,6 +52,11 @@ export interface ScalarFunction {
   maxArgs: number;
   /** False for random() etc. (never constant-folded). */
   deterministic: boolean;
+  /**
+   * The date and time functions: not constant-folded, but allowed in index expressions and CHECK
+   * constraints, where they fail at run time if they read the clock or time zone (SQLite).
+   */
+  pureDate?: boolean;
   compile(args: CompiledArg[], ctx: FunctionContext): { fn: Fn; type: StaticType };
 }
 
@@ -96,6 +114,11 @@ function simple(
       };
     },
   };
+}
+
+/** A date/time function: never constant-folded, but allowed in indexes and CHECK constraints. */
+function dateFunction(min: number, max: number, type: StaticType, impl: (vals: SqlValue[], args: CompiledArg[], ctx: FunctionContext) => SqlValue): ScalarFunction {
+  return { ...simple(min, max, type, impl, false), pureDate: true };
 }
 
 /** Count code points (SQLite measures text length in characters, not UTF-16 units). */
@@ -502,13 +525,13 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
   ['total_changes', simple(0, 0, 'int', (_v, _a, ctx) => ctx.totalChanges(), false)],
   ['smaltdb_version', simple(0, 0, 'text', () => '0.1.0')],
   // Date and time (datetime.ts). Not constant-folded: 'now' and 'localtime' depend on when they run.
-  ['date', simple(0, -1, 'text', (v, _a, ctx) => dateFn(v, ctx), false)],
-  ['time', simple(0, -1, 'text', (v, _a, ctx) => timeFn(v, ctx), false)],
-  ['datetime', simple(0, -1, 'text', (v, _a, ctx) => datetimeFn(v, ctx), false)],
-  ['julianday', simple(0, -1, 'real', (v, _a, ctx) => juliandayFn(v, ctx), false)],
-  ['unixepoch', simple(0, -1, 'num', (v, _a, ctx) => unixepochFn(v, ctx), false)],
-  ['strftime', simple(0, -1, 'text', (v, _a, ctx) => strftimeFn(v, ctx), false)],
-  ['timediff', simple(2, 2, 'text', (v, _a, ctx) => timediffFn(v, ctx), false)],
+  ['date', dateFunction(0, -1, 'text', (v, _a, ctx) => dateFn(v, ctx))],
+  ['time', dateFunction(0, -1, 'text', (v, _a, ctx) => timeFn(v, ctx))],
+  ['datetime', dateFunction(0, -1, 'text', (v, _a, ctx) => datetimeFn(v, ctx))],
+  ['julianday', dateFunction(0, -1, 'real', (v, _a, ctx) => juliandayFn(v, ctx))],
+  ['unixepoch', dateFunction(0, -1, 'num', (v, _a, ctx) => unixepochFn(v, ctx))],
+  ['strftime', dateFunction(0, -1, 'text', (v, _a, ctx) => strftimeFn(v, ctx))],
+  ['timediff', dateFunction(2, 2, 'text', (v, _a, ctx) => timediffFn(v, ctx))],
 ]);
 
 // ------------------------------------------------------------------ aggregates

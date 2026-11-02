@@ -16,14 +16,14 @@ import {
 import { MisuseError, SmaltError } from './errors.js';
 import { type StaticType, truthy } from './exec/convert.js';
 import { type CompileScope, type Compiled, type Fn, compileExpr } from './exec/expr.js';
-import { type FunctionContext, aggregateFunctions, scalarFunctions } from './exec/functions.js';
+import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
 import { EXTERNAL_FUNCTIONS, type ExternalScan, Planner, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
 import { type MatviewCandidate, matchMatview } from './exec/mv-match.js';
-import { type ConflictMode, TableWriter } from './exec/write.js';
+import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import type { ReaderSettings } from '../shared/protocol.js';
 import type {
   AlterTableStmt,
@@ -878,7 +878,7 @@ export class Database implements FunctionContext {
         const name = autoIndexName(table.name, i + 1);
         const root = autoRoots.get(name.toLowerCase());
         if (root === undefined) throw new SmaltError('SMALT_CORRUPT', `missing automatic index ${name}`);
-        const idx: IndexSchema = { name, table: table.name, rootPage: root, columns: spec.columns, unique: true, origin: spec.origin, constraintName: spec.constraintName };
+        const idx: IndexSchema = { name, table: table.name, rootPage: root, columns: spec.columns, unique: true, origin: spec.origin, constraintName: spec.constraintName, onConflict: spec.onConflict };
         table.indexes.push(idx);
         this.indexes.set(name.toLowerCase(), idx);
       });
@@ -975,7 +975,7 @@ export class Database implements FunctionContext {
         return done({ plan, readonly: true, columns: plan.columns.map((c) => c.name), columnTypes: plan.columns.map((c) => c.type) });
       }
       case 'insert': {
-        const single = stmt.source.kind === 'values' && stmt.source.rows.length === 1 && (stmt.or ?? 'ABORT') !== 'REPLACE' && !stmt.upsert.length && !this.fkInvolvedNow(stmt.table);
+        const single = stmt.source.kind === 'values' && stmt.source.rows.length === 1 && !this.mayReplace(stmt) && !stmt.upsert.length && !this.fkInvolvedNow(stmt.table);
         const c = this.compileInsert(stmt, planner);
         return done(this.dmlProgram(c, single));
       }
@@ -1212,6 +1212,9 @@ export class Database implements FunctionContext {
         this.memDirty = false;
         this.loadSchema();
       } else this.loadSchemaIfChanged();
+      // A constraint failure under ROLLBACK (INSERT OR ROLLBACK, or ON CONFLICT ROLLBACK) also
+      // rolls back the enclosing transaction, as in SQLite.
+      if (e instanceof ConstraintError && e.rollback && !this.autocommit) this.rollbackTransaction();
       throw e;
     }
     if (journal) pager.commitStatement();
@@ -2439,7 +2442,8 @@ export class Database implements FunctionContext {
     if (!internal) this.checkNewName(stmt.name, 'table');
     this.dirtySchema = true;
     const root = BTree.create(this.pager);
-    const { table, implicitIndexes } = buildTableSchema(stmt, sql, root);
+    const { table, implicitIndexes, conflictingOnConflict } = buildTableSchema(stmt, sql, root);
+    if (conflictingOnConflict) throw new SmaltError('SMALT_ERROR', 'conflicting ON CONFLICT clauses specified');
     if (columnar) {
       // Columnar tables are scanned, not probed: no secondary structures to keep in step.
       if (implicitIndexes.length > 0) throw new SmaltError('SMALT_UNSUPPORTED', 'columnar tables support no UNIQUE or PRIMARY KEY constraints other than INTEGER PRIMARY KEY');
@@ -2457,7 +2461,7 @@ export class Database implements FunctionContext {
     implicitIndexes.forEach((spec, i) => {
       const name = autoIndexName(table.name, i + 1);
       const iroot = BTree.create(this.pager);
-      const idx: IndexSchema = { name, table: table.name, rootPage: iroot, columns: spec.columns, unique: true, origin: spec.origin, constraintName: spec.constraintName };
+      const idx: IndexSchema = { name, table: table.name, rootPage: iroot, columns: spec.columns, unique: true, origin: spec.origin, constraintName: spec.constraintName, onConflict: spec.onConflict };
       table.indexes.push(idx);
       this.indexes.set(name.toLowerCase(), idx);
       this.addCatalogRow('index', name, table.name, iroot, null);
@@ -2479,11 +2483,12 @@ export class Database implements FunctionContext {
       throw new SmaltError('SMALT_ERROR', `table ${stmt.name} already exists`);
     }
     if (lower.startsWith('smalt_') || lower.startsWith('sqlite_')) throw new SmaltError('SMALT_ERROR', `object name reserved for internal use: ${stmt.name}`);
-    const { table, implicitIndexes } = buildTableSchema(stmt, sql, this.createTree(true));
+    const { table, implicitIndexes, conflictingOnConflict } = buildTableSchema(stmt, sql, this.createTree(true));
+    if (conflictingOnConflict) throw new SmaltError('SMALT_ERROR', 'conflicting ON CONFLICT clauses specified');
     table.temp = true;
     implicitIndexes.forEach((spec, i) => {
       const name = autoIndexName(table.name, i + 1);
-      table.indexes.push({ name, table: table.name, rootPage: this.createTree(true), columns: spec.columns, unique: true, origin: spec.origin, constraintName: spec.constraintName });
+      table.indexes.push({ name, table: table.name, rootPage: this.createTree(true), columns: spec.columns, unique: true, origin: spec.origin, constraintName: spec.constraintName, onConflict: spec.onConflict });
     });
     this.tempTables.set(lower, table);
     this.memDirty = true;
@@ -2604,7 +2609,8 @@ export class Database implements FunctionContext {
     if (!idx.where && !idx.columns.some((c) => c.expr)) return;
     const n = table.columns.length;
     const planner = new Planner({ getTable: (x) => this.getTable(x), openTree: (root) => this.tree(root), funcCtx: this, state: this.state }, new Registers(n + 1));
-    const scope = this.rowScope(table, undefined, 0, n, planner);
+    // Date functions may appear, but fail if they read the clock or time zone (as in SQLite).
+    const scope = { ...this.rowScope(table, undefined, 0, n, planner), funcCtx: pureFunctionContext(this, 'an index') };
     const check = (e: Expr, what: string): void => {
       const go = (x: unknown): void => {
         if (Array.isArray(x)) return x.forEach(go);
@@ -2615,7 +2621,7 @@ export class Database implements FunctionContext {
         if (o.kind === 'call') {
           const name = String(o.name);
           const def = scalarFunctions.get(name);
-          if ((def && !def.deterministic) || name === 'current_time' || name === 'current_date' || name === 'current_timestamp') {
+          if ((def && !def.deterministic && !def.pureDate) || name === 'current_time' || name === 'current_date' || name === 'current_timestamp') {
             throw new SmaltError('SMALT_ERROR', `non-deterministic functions prohibited in ${what}`);
           }
         }
@@ -3161,7 +3167,7 @@ export class Database implements FunctionContext {
     checks: { fn: Fn; name: string }[],
     regs: SqlValue[],
     base: number,
-    mode: ConflictMode,
+    override: ConflictMode | undefined,
     defaults: (Fn | null)[],
   ): boolean {
     for (let i = 0; i < table.columns.length; i++) {
@@ -3169,19 +3175,23 @@ export class Database implements FunctionContext {
       if (col.rowidAlias) continue;
       let v = coerceForColumn(row[i], col, table.name, real[i]);
       if (v === null && col.notNull) {
+        // The statement's OR action, else the column's NOT NULL ON CONFLICT action.
+        const mode = override ?? col.notNullConflict ?? 'ABORT';
         if (mode === 'IGNORE') return false;
         if (mode === 'REPLACE' && defaults[i]) v = coerceForColumn(defaults[i]!(regs), col, table.name);
-        if (v === null) throw new ConstraintError('SMALT_CONSTRAINT_NOTNULL', `NOT NULL constraint failed: ${table.name}.${col.name}`);
+        if (v === null) throw constraintError('SMALT_CONSTRAINT_NOTNULL', `NOT NULL constraint failed: ${table.name}.${col.name}`, mode);
       }
       row[i] = v;
     }
     if (checks.length) {
+      // CHECK constraints have no ON CONFLICT action of their own; REPLACE acts as ABORT.
+      const mode = override ?? 'ABORT';
       for (let i = 0; i < row.length; i++) regs[base + i] = row[i];
       for (const c of checks) {
         const v = c.fn(regs);
         if (v !== null && truthy(v) === false) {
           if (mode === 'IGNORE') return false;
-          throw new ConstraintError('SMALT_CONSTRAINT_CHECK', `CHECK constraint failed: ${c.name}`);
+          throw constraintError('SMALT_CONSTRAINT_CHECK', `CHECK constraint failed: ${c.name}`, mode);
         }
       }
     }
@@ -3191,7 +3201,20 @@ export class Database implements FunctionContext {
   private compileChecks(table: TableSchema, scope: CompileScope, sql: string): { fn: Fn; name: string }[] {
     // Unnamed checks are reported by their text, which lives in the table's SQL (not the statement's).
     void sql;
-    return table.checks.map((c) => ({ fn: compileExpr(c.expr, scope).fn, name: c.name ?? table.sql.slice(c.expr.pos, c.expr.end) }));
+    const checkScope = { ...scope, funcCtx: pureFunctionContext(scope.funcCtx, 'a CHECK constraint') };
+    return table.checks.map((c) => ({ fn: compileExpr(c.expr, checkScope).fn, name: c.name ?? table.sql.slice(c.expr.pos, c.expr.end) }));
+  }
+
+  /** Whether an INSERT may delete rows to resolve conflicts (OR REPLACE, or a constraint's ON CONFLICT REPLACE). */
+  private mayReplace(stmt: InsertStmt): boolean {
+    if (stmt.or !== undefined) return stmt.or === 'REPLACE';
+    let table: TableSchema | undefined;
+    try {
+      table = this.getTable(stmt.table);
+    } catch {
+      return false; // compileInsert reports it
+    }
+    return !!table && (table.pkConflict === 'REPLACE' || table.indexes.some((i) => i.onConflict === 'REPLACE') || table.columns.some((c) => c.notNullConflict === 'REPLACE'));
   }
 
   /** Normalize a rowid value (INTEGER PRIMARY KEY must hold an integer). */
@@ -3225,7 +3248,8 @@ export class Database implements FunctionContext {
           return i;
         })
       : table.columns.map((_, i) => i);
-    const mode: ConflictMode = stmt.or ?? 'ABORT';
+    // The statement's OR action; without one, each constraint's ON CONFLICT action applies.
+    const mode: ConflictMode | undefined = stmt.or;
     const emptyScope = planner.compileScope(planner.newScope());
     const defaults: (Fn | null)[] = table.columns.map((c) => (c.defaultExpr ? compileExpr(c.defaultExpr, emptyScope).fn : null));
     const defaultReal = table.columns.map((c) => (c.defaultExpr ? compileExpr(c.defaultExpr, emptyScope).type === 'real' : false));
@@ -3494,7 +3518,8 @@ export class Database implements FunctionContext {
       }
       sets.push({ col, c: compileExpr(s.value, scope) });
     }
-    const mode: ConflictMode = stmt.or ?? 'ABORT';
+    // The statement's OR action; without one, each constraint's ON CONFLICT action applies.
+    const mode: ConflictMode | undefined = stmt.or;
     const ncols = table.columns.length;
     const emptyScope = planner.compileScope(planner.newScope());
     const defaults: (Fn | null)[] = table.columns.map((c) => (c.defaultExpr ? compileExpr(c.defaultExpr, emptyScope).fn : null));

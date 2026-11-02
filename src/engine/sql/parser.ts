@@ -1186,9 +1186,13 @@ class Parser {
         const onConflict = this.optConflictClause();
         return pk ? { pos, name, kind: 'primaryKey', columns, onConflict, end: this.ends[this.p - 1] } : { pos, name, kind: 'unique', columns, onConflict, end: this.ends[this.p - 1] };
       }
-      case 'CHECK':
+      case 'CHECK': {
         this.p++;
-        return { pos, name, kind: 'check', expr: this.parenExpr(), end: this.ends[this.p - 1] };
+        const expr = this.parenExpr();
+        // SQLite accepts (and ignores) an ON CONFLICT clause on a table CHECK constraint.
+        this.optConflictClause();
+        return { pos, name, kind: 'check', expr, end: this.ends[this.p - 1] };
+      }
       case 'FOREIGN': {
         this.p++;
         this.expectKw('KEY');
