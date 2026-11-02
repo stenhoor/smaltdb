@@ -20,7 +20,7 @@ import { type StaticType, truthy } from './exec/convert.js';
 import { type CompileScope, type Compiled, type Fn, compileExpr } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
-import { EXTERNAL_FUNCTIONS, type ExternalScan, Planner, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
+import { type ExternalScan, Planner, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
@@ -74,6 +74,7 @@ import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec
 import { type CatalogSnapshot, informationSchema } from './catalog/information-schema.js';
 import { type SchemaLookup, applyEdits, quoteIdent as quoteIdentIfNeeded, renameColumnEdits, renameTableEdits } from './catalog/alter.js';
 import { ForeignKeys } from './exec/fk.js';
+import { PluginRegistry, type SmaltPlugin } from './plugin.js';
 import { Collation, type SqlValue } from './values.js';
 import type { Vfs, VfsFile } from './vfs/types.js';
 
@@ -91,6 +92,8 @@ export interface QueryResult {
 export type BindParams = readonly (SqlValue | boolean | undefined)[] | Readonly<Record<string, SqlValue | boolean>>;
 
 export interface DatabaseOptions extends PagerOptions {
+  /** Plugins to install (ADR 0012), e.g. `@smaltdb/parquet`. */
+  plugins?: readonly SmaltPlugin[];
   /** Prepared-statement cache entries for exec/query helpers (default 64). */
   statementCacheSize?: number;
   /** 'wal' (default): atomic, durable commits via `<path>-wal`. 'off': in-place writes (not crash-atomic). */
@@ -138,14 +141,14 @@ interface ExternalTableDef {
   sql: string;
 }
 
-/** For Parquet, the source of its schema only (the footer): what planning and column inference need. */
-const schemaSourceOf = (s: ExternalSource): ExternalSource => (s.format === 'parquet' ? { ...s, key: `${s.key}|schema`, schemaOnly: true } : s);
+/** For formats that read only what they need (Parquet), the source of its schema only (the footer): what planning and column inference need. */
+const schemaSourceOf = (s: ExternalSource): ExternalSource => (s.pushdown ? { ...s, key: `${s.key}|schema`, schemaOnly: true } : s);
 
 /** An external source a materialized view read at its last refresh (smalt_extcache). */
 interface ExternalCacheEntry {
   label: string;
   location: string;
-  format: 'csv' | 'json' | 'parquet';
+  format: string;
   options: Record<string, SqlValue>;
   connection: string | null;
   validator: string | null;
@@ -211,7 +214,8 @@ export class Database implements FunctionContext {
   private readonly connections = new Map<string, ConnectionInfo & { sql: string }>();
   private readonly externals = new Map<string, ExternalTableDef>();
   /** M8: registered files, credential providers and the data loaded for running statements. */
-  readonly external = new ExternalRegistry();
+  /** External data (M8): registered files and credentials, loaded sources, and plugin formats (ADR 0012). */
+  readonly external: ExternalRegistry;
   /** TEMP views: this connection only, never stored (they shadow main-schema views, like SQLite's temp schema). */
   private readonly tempViews = new Map<string, ViewSchema>();
   /** Creation order of TEMP tables, indexes and views: temp.sqlite_schema lists them in it, as SQLite does. */
@@ -275,6 +279,7 @@ export class Database implements FunctionContext {
   private readonly spill: SpillArea;
 
   private constructor(file: VfsFile | null, options: DatabaseOptions, walFile?: VfsFile, reader = false, spillFile: { file: VfsFile; release: () => void } | null = null) {
+    this.external = new ExternalRegistry(new PluginRegistry(options.plugins));
     this.pager = file === null ? Pager.openMemory(options) : reader ? Pager.openReader(file, walFile!, options) : Pager.open(file, options, walFile);
     this.spill = new SpillArea(spillFile?.file ?? null, options.workMem ?? DEFAULT_WORK_MEM, spillFile?.release ?? null);
     this.mem = file === null ? null : Pager.openMemory({ pageSize: this.pager.pageSize });
@@ -848,7 +853,7 @@ export class Database implements FunctionContext {
         let fmt: string | null = format === undefined || format === null ? null : String(format).toLowerCase();
         if (fmt === null) {
           try {
-            const f = formatOf(String(location), x.options, x.name);
+            const f = formatOf(String(location), x.options, x.name, this.external.plugins);
             fmt = f.delimiter === '\t' ? 'tsv' : f.format;
           } catch {
             fmt = null;
@@ -1091,6 +1096,7 @@ export class Database implements FunctionContext {
       rewriteSelect: rewrite ? (select, text) => this.matviewRewrite(select, text, rewrite.exclude) : undefined,
       externalTable: (n) => this.externalTableScan(n),
       externalFunction: (n, args, named) => this.externalFunctionScan(n, args, named),
+      isExternalFunction: (n) => this.external.plugins.isExternalFunction(n),
       getTable: (n, schema) => {
         const t = this.getTable(n, schema);
         if (t?.matview && !t.matview.populated) {
@@ -2351,8 +2357,8 @@ export class Database implements FunctionContext {
   private externalSourceOf(def: Omit<ExternalTableDef, 'sql' | 'columns'>, columns: ExternalColumn[] | undefined): ExternalSource {
     const { location, connection: _c, ...options } = def.options;
     if (typeof location !== 'string' || location === '') throw new SmaltError('SMALT_ERROR', `external table ${def.name}: location is required`);
-    const fmt = formatOf(location, def.options, def.name);
-    return { key: `table:${def.name.toLowerCase()}`, label: def.name, location, format: fmt.format, options, connection: this.connectionOf(def.options, def.name), columns };
+    const fmt = formatOf(location, def.options, def.name, this.external.plugins);
+    return { key: `table:${def.name.toLowerCase()}`, label: def.name, location, format: fmt.format, pushdown: !!fmt.reader?.pushdown, options, connection: this.connectionOf(def.options, def.name), columns };
   }
 
   private createExternalTable(stmt: CreateExternalTableStmt, sql: string): RunResult {
@@ -2360,7 +2366,7 @@ export class Database implements FunctionContext {
     const lower = stmt.name.toLowerCase();
     if (stmt.ifNotExists && this.externals.has(lower)) return none;
     this.checkNewName(stmt.name, 'external');
-    checkReaderOptions(stmt.with, new Set(['location', 'connection']), stmt.name);
+    checkReaderOptions(stmt.with, new Set(['location', 'connection', ...this.external.plugins.extraOptions()]), stmt.name);
     const seen = new Set<string>();
     for (const c of stmt.columns) {
       if (c.constraints.length > 0) throw new SmaltError('SMALT_ERROR', `external table ${stmt.name}: columns cannot have constraints`);
@@ -2419,7 +2425,7 @@ export class Database implements FunctionContext {
       if (Array.isArray(x)) return x.forEach(walk);
       if (typeof x !== 'object' || x === null || Object.getPrototypeOf(x) !== Object.prototype) return;
       const o = x as Record<string, unknown>;
-      if (o.kind === 'function' && EXTERNAL_FUNCTIONS.has(o.name as string)) {
+      if (o.kind === 'function' && this.external.plugins.isExternalFunction(o.name as string)) {
         const f = o as unknown as { name: string; args: { kind: string; value?: SqlValue }[]; named?: Record<string, { kind: string; value?: SqlValue }> };
         const named = Object.entries(f.named ?? {});
         if (f.args.every(lit) && named.every(([, e]) => lit(e))) {
@@ -2441,14 +2447,14 @@ export class Database implements FunctionContext {
     if (args.length !== 1 || typeof args[0] !== 'string') throw new SmaltError('SMALT_ERROR', `${name}() takes a location (text) and named options`);
     const location = args[0];
     const label = `${name}('${location}')`;
-    checkReaderOptions(named, new Set(['connection']), label);
+    checkReaderOptions(named, new Set(['connection', ...this.external.plugins.extraOptions()]), label);
     const { connection: _c, ...options } = named;
     if (options.format === undefined || options.format === null) {
-      options.format = name === 'read_json' ? 'json' : name === 'read_parquet' ? 'parquet' : /\.tsv([?#]|$)/i.test(location) ? 'tsv' : 'csv';
+      options.format = this.external.plugins.functionFormat(name) ?? (name === 'read_json' ? 'json' : /\.tsv([?#]|$)/i.test(location) ? 'tsv' : 'csv');
     }
-    const fmt = formatOf(location, options, label);
+    const fmt = formatOf(location, options, label, this.external.plugins);
     const key = `fn:${name}:${JSON.stringify([location, Object.entries(named).sort()], (_k, v) => (typeof v === 'bigint' ? `${v}n` : v))}`;
-    return { key, label, location, format: fmt.format, options, connection: this.connectionOf(named, label) };
+    return { key, label, location, format: fmt.format, pushdown: !!fmt.reader?.pushdown, options, connection: this.connectionOf(named, label) };
   }
 
   private createView(stmt: CreateViewStmt, sql: string): RunResult {

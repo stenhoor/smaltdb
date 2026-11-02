@@ -12,3 +12,4 @@ export { Database, Statement, RowCursor, type RunResult, type QueryResult, type 
 export { parse, parseOne, SqlSyntaxError } from './sql/parser.js';
 export { importCSV, importJSON, exportCSV, exportJSON, exportCSVAsync, exportJSONAsync, type CsvImportOptions, type JsonImportOptions, type CsvExportOptions, type JsonExportOptions } from './io/import-export.js';
 export type { CredentialProvider, FetchFn, FileSource } from './external/external.js';
+export { PLUGIN_API_VERSION, type SmaltPlugin, type PluginHost, type FormatReader, type FormatRequest, type FormatResult, type FormatColumn, type RandomAccessFile, type Zone } from './plugin.js';

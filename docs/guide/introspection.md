@@ -353,7 +353,7 @@ The smaltdb extensions to `information_schema` are described with their features
 
 ## smaltdb_version()
 
-`smaltdb_version()` returns the version of the smaltdb package as text, such as `'0.8.3'`:
+`smaltdb_version()` returns the version of the smaltdb package as text, such as `'0.9.0'`:
 
 ```sql
 SELECT typeof(smaltdb_version()) AS type;

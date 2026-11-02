@@ -53,7 +53,7 @@ Rejects with `SMALT_BUSY` if another engine worker holds the OPFS file without s
 | `pageSize` | `number` | `8192` | Page size in bytes for a new database (a power of two, 512 to 65536). Ignored for an existing one. |
 | `cacheMB` | `number` | `16` | Page cache budget in MiB. |
 | `durable` | `boolean` | `true` | Flush to storage on every commit. With `false`, recent commits can be lost in a crash. |
-| `worker` | `URL` \| `string` \| `Worker` | `new URL('./smaltdb-worker.js', import.meta.url)` | Where the engine worker comes from: a script URL (started as a module worker) or a `Worker`. See [loading the engine worker](../../guide/getting-started#loading-the-engine-worker). |
+| `worker` | `() => Worker` \| `URL` \| `string` \| `Worker` | `new URL('./smaltdb-worker.js', import.meta.url)` | Where the engine worker comes from: a function that starts it (use this for a worker entry with [plugins](../../guide/plugins)), a script URL (started as a module worker) or a `Worker`. See [loading the engine worker](../../guide/getting-started#loading-the-engine-worker). |
 | `multiTab` | `boolean` | `true` for OPFS when `navigator.locks` and `BroadcastChannel` exist | Share the database with other tabs of the origin. Never applies to in-memory databases. See [multi-tab access](../../guide/databases#multi-tab-access). |
 
 ## Database

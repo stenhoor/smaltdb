@@ -1,19 +1,23 @@
-// Builds dist/: smaltdb.js (client), smaltdb-worker.js (engine worker), engine.js (synchronous engine for Node/workers).
+// Builds dist/: smaltdb.js (client), smaltdb-worker.js (default engine worker), worker-runtime.js (serve() for
+// application worker entries with plugins), engine.js (synchronous engine for Node/workers).
 import { build } from 'esbuild';
 import { readFileSync, rmSync } from 'node:fs';
 
-// Start clean: chunk names carry content hashes, so old ones would otherwise pile up (and be published).
+// Start clean, so files from older builds are never published.
 rmSync('dist', { recursive: true, force: true });
 
 // smaltdb_version() returns the package version (src/engine/exec/functions.ts).
 const { version } = JSON.parse(readFileSync('package.json', 'utf8'));
 const define = { __SMALTDB_VERSION__: JSON.stringify(version) };
 const common = { bundle: true, format: 'esm', target: 'es2022', sourcemap: true, logLevel: 'warning', minify: process.argv.includes('--minify'), define };
+// No third-party code is bundled: optional features that depend on other packages are plugins,
+// published separately with their own dependencies (ADR 0012).
 await Promise.all([
   build({ ...common, entryPoints: ['src/client/index.ts'], outfile: 'dist/smaltdb.js', platform: 'browser' }),
-  // Code splitting: the Parquet reader (hyparquet) is a chunk the worker loads on first use.
-  build({ ...common, entryPoints: { 'smaltdb-worker': 'src/engine/worker.ts' }, outdir: 'dist', splitting: true, chunkNames: 'chunks/[name]-[hash]', platform: 'browser' }),
-  // Node / workers: the optional Parquet packages are resolved at run time (peer dependencies).
-  build({ ...common, entryPoints: ['src/engine/index.ts'], outfile: 'dist/engine.js', platform: 'neutral', external: ['hyparquet', 'hyparquet-compressors'] }),
+  // The default engine worker (no plugins), and the runtime applications build their own worker entry with.
+  build({ ...common, entryPoints: ['src/engine/worker.ts'], outfile: 'dist/smaltdb-worker.js', platform: 'browser' }),
+  build({ ...common, entryPoints: ['src/engine/worker-runtime.ts'], outfile: 'dist/worker-runtime.js', platform: 'browser' }),
+  // Node / workers: the synchronous engine.
+  build({ ...common, entryPoints: ['src/engine/index.ts'], outfile: 'dist/engine.js', platform: 'neutral' }),
 ]);
 console.log('built dist/');

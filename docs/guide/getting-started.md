@@ -14,7 +14,10 @@ The package has three entry points:
 |---|---|---|
 | `smaltdb` | `dist/smaltdb.js` | The client: `open()` a database from a page or a worker. The engine runs in its own worker. |
 | `smaltdb/engine` | `dist/engine.js` | The engine itself, synchronous and in-process: Node, tests, tools, or inside your own worker. See [the engine API](../reference/api/engine). |
-| `smaltdb/worker` | `dist/smaltdb-worker.js` | The engine worker script, for setups that need its path (see [below](#loading-the-engine-worker)). |
+| `smaltdb/worker` | `dist/smaltdb-worker.js` | The default engine worker script (no plugins), for setups that need its path (see [below](#loading-the-engine-worker)). |
+| `smaltdb/worker-runtime` | `dist/worker-runtime.js` | `serve()`, to write your own engine worker entry with [plugins](./plugins). |
+
+The package has no runtime dependencies. Optional features that depend on other projects, such as Parquet, are separate [plugin](./plugins) packages.
 
 Type declarations ship with the package. The engine needs Node 20 or later when you run it in Node.
 
@@ -61,14 +64,13 @@ So the worker is found next to the module that contains the client code. The fil
 node_modules/smaltdb/dist/
   smaltdb.js           the client
   smaltdb-worker.js    the engine worker (a module worker)
-  chunks/              code the worker loads on first use (the Parquet reader)
 ```
 
 How this works with your build:
 
 - **Vite.** Works without configuration. Vite recognises the `new Worker(new URL(…, import.meta.url))` pattern and emits the worker as an asset, in the dev server and in production builds (checked with Vite 8). A production build may warn that `node:fs/promises` "has been externalized for browser compatibility": that import is only used when the engine runs in Node, and the warning can be ignored.
 - **No bundler.** If the page loads `dist/smaltdb.js` as an ES module from where the package files are served, the worker URL resolves to `dist/smaltdb-worker.js` next to it.
-- **Other bundlers.** A bundler that understands the same pattern emits the worker the same way. If yours does not, or it moves the client code so the relative URL no longer points at the worker, copy `dist/smaltdb-worker.js` and the `dist/chunks/` folder to your site and pass the worker's URL with the `worker` option.
+- **Other bundlers.** A bundler that understands the same pattern emits the worker the same way. If yours does not, or it moves the client code so the relative URL no longer points at the worker, copy `dist/smaltdb-worker.js` to your site and pass the worker's URL with the `worker` option.
 
 The `worker` option overrides where the engine worker comes from:
 
@@ -79,7 +81,7 @@ import { open } from 'smaltdb';
 const db = await open('app', { worker: new URL('/smaltdb-worker.js', location.href) });
 ```
 
-You can also pass a `Worker` you created yourself. Prefer a URL: with [multi-tab access](./databases#multi-tab-access), a tab that takes over the database later starts its engine worker from the option.
+You can also pass a function that starts the worker, which is how you load a worker entry with [plugins](./plugins), or a `Worker` you created yourself. Prefer a function or a URL: with [multi-tab access](./databases#multi-tab-access), a tab that takes over the database later starts its engine worker from the option, and a `Worker` object can only be used once.
 
 ## Browser requirements
 
@@ -125,7 +127,7 @@ Storage in Node:
 - `OpfsVfs` needs OPFS, which Node does not have: opening a file with it rejects with `SMALT_CANTOPEN`.
 - smaltdb ships no VFS for the Node file system. To persist to disk, implement the `Vfs` interface (see [the engine API](../reference/api/engine#vfs)).
 
-Reading Parquet files needs the optional `hyparquet` package in Node (`npm install hyparquet`), plus `hyparquet-compressors` for codecs other than Snappy. The browser worker in `dist/` already contains the Parquet reader. See [external data](./external-data).
+Reading Parquet files needs the `@smaltdb/parquet` plugin, in Node as in the browser: `Database.openMemory({ plugins: [parquet] })`. See [plugins](./plugins).
 
 ## Next steps
 

@@ -1,5 +1,5 @@
 /**
- * Parquet (M8.3, ADR 0011): read with hyparquet from files written by pyarrow (an independent
+ * Parquet (M8.3, ADR 0011; the @smaltdb/parquet plugin, ADR 0012): read with hyparquet from files written by pyarrow (an independent
  * writer; scripts/gen-parquet-fixtures.py). Remote files are read with HTTP Range requests: only the
  * footer, the column chunks the statement uses and the row groups its filters cannot rule out.
  */
@@ -9,11 +9,12 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
+import parquet from '@smaltdb/parquet';
 
 const F = 'test/fixtures/parquet';
 
 async function db(): Promise<Database> {
-  return Database.open(new MemoryVfs(), 'db');
+  return Database.open(new MemoryVfs(), 'db', { plugins: [parquet] });
 }
 
 describe('Parquet values and types', () => {

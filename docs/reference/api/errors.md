@@ -244,9 +244,15 @@ Low-level engine classes (pager, b-tree, VFS) raise it for invalid calls as well
 
 **Remedy:** fix the calling code.
 
+## SMALT_PLUGIN_MISSING
+
+A statement needs a [plugin](../../guide/plugins) the engine does not have, e.g. `read_parquet('file:x.parquet'): reading Parquet needs the @smaltdb/parquet plugin (install it and add it to the engine's plugins)`. It is raised when the statement is planned or run, never when a database is opened.
+
+**Remedy:** install the plugin and add it to the engine: `serve({ plugins: [...] })` in the engine worker entry, or `Database.open(…, { plugins })` with `smaltdb/engine`.
+
 ## SMALT_EXTERNAL
 
-Reading [external data](../../guide/external-data) failed. The message starts with the source (`read_csv('file:x.csv'): …`, a URL, an external table) and says why: no file registered under that name, an HTTP error, a network failure, a file that does not parse, a missing optional package (`reading Parquet needs the hyparquet package`), or credentials that could not be obtained (a credentials callback that failed, did not answer within 30 seconds, or whose tab closed).
+Reading [external data](../../guide/external-data) failed. The message starts with the source (`read_csv('file:x.csv'): …`, a URL, an external table) and says why: no file registered under that name, an HTTP error, a network failure, a file that does not parse, a missing optional package (`this file uses a codec that needs the hyparquet-compressors package`), or credentials that could not be obtained (a credentials callback that failed, did not answer within 30 seconds, or whose tab closed).
 
 **Remedy:** depends on the cause. Network and HTTP errors are often temporary and can be retried.
 

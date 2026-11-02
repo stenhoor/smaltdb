@@ -1,7 +1,7 @@
 /**
  * Every SQL example in the user documentation (docs/guide, docs/reference) runs here, and every
  * result table printed under one must match what the engine returns. TypeScript examples are
- * type-checked against the public API. See docs/TESTING.md ("Documentation examples").
+ * type-checked against the public API (and the plugins in plugins/). See docs/TESTING.md ("Documentation examples").
  *
  * A page runs top to bottom on one fresh in-memory database, so an earlier block's tables are
  * visible to later ones. Files in docs/examples/ are registered as `file:<name>`.
@@ -20,6 +20,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import parquet from '@smaltdb/parquet';
 import { Database } from '../src/engine/database.js';
 import { parse } from '../src/engine/sql/parser.js';
 import type { SqlValue } from '../src/engine/values.js';
@@ -148,7 +149,8 @@ describe('documentation SQL examples', () => {
   });
   for (const page of all) {
     it(page, async () => {
-      const db = Database.openMemory();
+      // Every plugin is installed (ADR 0012), as an application that uses them would.
+      const db = Database.openMemory({ plugins: [parquet] });
       registerExamples(db);
       try {
         for (const b of blocks(readFileSync(page, 'utf8'))) {
@@ -235,6 +237,8 @@ describe('documentation TypeScript examples', () => {
           paths: {
             smaltdb: [join(root, 'src/client/index.ts')],
             'smaltdb/engine': [join(root, 'src/engine/index.ts')],
+            'smaltdb/worker-runtime': [join(root, 'src/engine/worker-runtime.ts')],
+            '@smaltdb/parquet': [join(root, 'plugins/parquet/src/index.ts')],
           },
         },
         files,

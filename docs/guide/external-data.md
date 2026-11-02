@@ -108,7 +108,7 @@ SELECT * FROM read_parquet('file:ext-sales.parquet');
 | 2026-03-03 | west | plum | 6 | 1.1 |
 | 2026-03-18 | south | pear | 8 | 0.8 |
 
-Parquet needs an extra package; see [Parquet](#parquet) below.
+Parquet needs the `@smaltdb/parquet` plugin; see [Parquet](#parquet) below.
 
 ### Using the results
 
@@ -502,10 +502,10 @@ Pruning applies to external tables, not to `read_csv()` and `read_json()` calls.
 
 ## Parquet
 
-Parquet files are read with [hyparquet](https://github.com/hyparam/hyparquet), an optional peer dependency that is loaded the first time a statement reads Parquet. Install it next to smaltdb:
+Parquet is provided by the `@smaltdb/parquet` [plugin](./plugins), which reads files with [hyparquet](https://github.com/hyparam/hyparquet). Install it and add it to your engine worker:
 
 ```sh
-npm install hyparquet
+npm install @smaltdb/parquet
 ```
 
 Snappy compression is built in. For gzip, zstd, brotli or LZ4-compressed files, also install the decompressors:
@@ -514,7 +514,7 @@ Snappy compression is built in. For gzip, zstd, brotli or LZ4-compressed files, 
 npm install hyparquet-compressors
 ```
 
-Without the package, reading Parquet fails with `SMALT_EXTERNAL` and a message naming the package to install.
+Without the plugin, reading Parquet fails with `SMALT_PLUGIN_MISSING`, and the message names the plugin to install.
 
 ### Reading only what is needed
 

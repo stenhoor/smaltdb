@@ -12,7 +12,13 @@
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": ["node"],
+    "paths": {
+      "smaltdb": ["./src/client/index.ts"],
+      "smaltdb/engine": ["./src/engine/index.ts"],
+      "smaltdb/worker-runtime": ["./src/engine/worker-runtime.ts"],
+      "@smaltdb/parquet": ["./plugins/parquet/src/index.ts"]
+    }
   },
-  "include": ["src", "test", "bench"]
+  "include": ["src", "test", "bench", "plugins/*/src"]
 }
