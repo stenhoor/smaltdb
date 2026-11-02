@@ -143,3 +143,21 @@ describe('information_schema.connections.connection_type', () => {
     expect(() => d.exec("CREATE CONNECTION f WITH (type = 'ftp')")).toThrow("connection f: type 'ftp' is not supported (http, s3, azure)");
   });
 });
+
+describe('information_schema.table_constraints deferrability', () => {
+  it('is_deferrable for any DEFERRABLE, initially_deferred for INITIALLY DEFERRED', () => {
+    const d = mem();
+    d.exec('CREATE TABLE p(id INTEGER PRIMARY KEY)');
+    d.exec(
+      'CREATE TABLE c(a REFERENCES p, b REFERENCES p DEFERRABLE, c REFERENCES p DEFERRABLE INITIALLY DEFERRED, d REFERENCES p DEFERRABLE INITIALLY IMMEDIATE, e REFERENCES p NOT DEFERRABLE, f REFERENCES p NOT DEFERRABLE INITIALLY DEFERRED)',
+    );
+    expect(d.query("SELECT constraint_name, is_deferrable, initially_deferred FROM information_schema.table_constraints WHERE table_name = 'c'").rows).toEqual([
+      ['c_a_fkey', 'NO', 'NO'],
+      ['c_b_fkey', 'YES', 'NO'],
+      ['c_c_fkey', 'YES', 'YES'],
+      ['c_d_fkey', 'YES', 'NO'],
+      ['c_e_fkey', 'NO', 'NO'],
+      ['c_f_fkey', 'NO', 'NO'],
+    ]);
+  });
+});

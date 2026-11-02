@@ -1144,6 +1144,7 @@ class Parser {
         else this.expectKw('IMMEDIATE');
       }
       fk.deferrable = !not && deferred;
+      fk.isDeferrable = !not;
     }
     return fk;
   }

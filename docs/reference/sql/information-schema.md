@@ -191,8 +191,8 @@ One row per `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` and `CHECK` constraint. Const
 | `constraint_catalog`, `constraint_schema`, `constraint_name` | the constraint |
 | `table_catalog`, `table_schema`, `table_name` | its table |
 | `constraint_type` | `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` or `CHECK` |
-| `is_deferrable` | `YES` for a `DEFERRABLE INITIALLY DEFERRED` foreign key, else `NO` |
-| `initially_deferred` | always `NO` |
+| `is_deferrable` | `YES` for a foreign key declared `DEFERRABLE` (with or without `INITIALLY …`), else `NO` |
+| `initially_deferred` | `YES` for `DEFERRABLE INITIALLY DEFERRED`, the only form checked at `COMMIT`; else `NO` |
 
 ```sql
 SELECT constraint_name, table_name, constraint_type, is_deferrable FROM information_schema.table_constraints

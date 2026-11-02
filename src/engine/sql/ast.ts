@@ -390,7 +390,10 @@ export interface ForeignKeyClause {
   columns?: string[];
   onDelete?: FkAction;
   onUpdate?: FkAction;
+  /** Checked at COMMIT: DEFERRABLE INITIALLY DEFERRED (SQLite's only deferred form). */
   deferrable?: boolean;
+  /** Declared DEFERRABLE (any INITIALLY), as information_schema reports it. */
+  isDeferrable?: boolean;
 }
 
 export type FkAction = 'SET NULL' | 'SET DEFAULT' | 'CASCADE' | 'RESTRICT' | 'NO ACTION';

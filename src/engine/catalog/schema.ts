@@ -343,7 +343,10 @@ export interface ForeignKeySchema {
   refColumns?: string[];
   onDelete: FkAction;
   onUpdate: FkAction;
+  /** Checked at COMMIT (DEFERRABLE INITIALLY DEFERRED). */
   deferrable: boolean;
+  /** Declared DEFERRABLE, with either INITIALLY clause. */
+  isDeferrable: boolean;
 }
 
 /**
@@ -466,7 +469,7 @@ function fkSchema(name: string | undefined, columns: number[], c: ForeignKeyClau
   if (c.columns && c.columns.length !== columns.length) {
     throw new SmaltError('SMALT_ERROR', `number of columns in foreign key does not match the number of columns in the referenced table`);
   }
-  return { name, columns, table: c.table, refColumns: c.columns, onDelete: c.onDelete ?? 'NO ACTION', onUpdate: c.onUpdate ?? 'NO ACTION', deferrable: !!c.deferrable };
+  return { name, columns, table: c.table, refColumns: c.columns, onDelete: c.onDelete ?? 'NO ACTION', onUpdate: c.onUpdate ?? 'NO ACTION', deferrable: !!c.deferrable, isDeferrable: !!c.isDeferrable };
 }
 
 export function buildIndexSchema(stmt: CreateIndexStmt, sql: string, table: TableSchema, rootPage: number): IndexSchema {

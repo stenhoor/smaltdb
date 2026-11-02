@@ -155,7 +155,7 @@ export function informationSchema(name: string, cat: CatalogSnapshot): VirtualTa
         columns: [t('constraint_catalog'), t('constraint_schema'), t('constraint_name'), t('table_catalog'), t('table_schema'), t('table_name'), t('constraint_type'), t('is_deferrable'), t('initially_deferred')],
         rows: () =>
           userTables().flatMap((x) =>
-            constraints(x).map((c) => [CATALOG, SCHEMA, c.name, CATALOG, SCHEMA, x.name, c.type, yesNo(c.fk?.deferrable ?? false), 'NO']),
+            constraints(x).map((c) => [CATALOG, SCHEMA, c.name, CATALOG, SCHEMA, x.name, c.type, yesNo(c.fk?.isDeferrable ?? false), yesNo(c.fk?.deferrable ?? false)]),
           ),
       };
     case 'key_column_usage':
