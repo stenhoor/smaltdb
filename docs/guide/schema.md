@@ -81,7 +81,7 @@ CREATE TABLE membership(
 INSERT INTO membership(project_id, user_name) VALUES (1, 'ann'), (1, 'bob'), (2, 'ann');
 ```
 
-`AUTOINCREMENT` is accepted but does not prevent reuse of a deleted largest key; see [CREATE TABLE](../reference/sql/create-table#primary-key).
+`AUTOINCREMENT` is allowed only on an `INTEGER PRIMARY KEY` and does not prevent reuse of a deleted largest key; see [CREATE TABLE](../reference/sql/create-table#primary-key).
 
 ## Constraints
 

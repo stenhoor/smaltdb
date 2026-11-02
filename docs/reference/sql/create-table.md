@@ -29,7 +29,7 @@ column-constraint:
 
 table-constraint:
   [CONSTRAINT name]
-  { PRIMARY KEY (column [COLLATE c] [ASC | DESC] [, ...]) [conflict-clause]
+  { PRIMARY KEY (column [COLLATE c] [ASC | DESC] [, ...] [AUTOINCREMENT]) [conflict-clause]
   | UNIQUE (column [COLLATE c] [ASC | DESC] [, ...]) [conflict-clause]
   | CHECK (expr)
   | FOREIGN KEY (column [, ...]) REFERENCES foreign-table [(column [, ...])] [fk-action ...] [deferrable] }
@@ -119,13 +119,13 @@ SELECT (SELECT rowid FROM k1) AS k1_rowid, (SELECT rowid FROM k2) AS k2_rowid
 | --- | --- |
 | 1 | 1 |
 
-`AUTOINCREMENT` is accepted but changes nothing: a deleted largest rowid can be used again. (SQLite never reuses one with `AUTOINCREMENT`, and allows it only on `INTEGER PRIMARY KEY`.)
+`AUTOINCREMENT` is allowed only on an `INTEGER PRIMARY KEY` (`AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY`), as in SQLite. It does not stop reuse: a deleted largest rowid can be used again (SQLite never reuses one with `AUTOINCREMENT`).
 
-When the largest rowid is 9223372036854775807, inserting a row without one fails with `SMALT_FULL` (SQLite tries random rowids instead).
+When the largest rowid is 9223372036854775807, a row inserted without one gets a random unused rowid between 1 and 2^62, as in SQLite. After 100 candidates that are all taken, or at once in an `AUTOINCREMENT` table, the insert fails with `SMALT_FULL`.
 
 ### NOT NULL, UNIQUE, CHECK
 
-`NOT NULL` rejects NULL. `UNIQUE` allows any number of NULLs, as in SQLite; it compares with the column's collation (or the one given in a table constraint). `CHECK (expr)` rejects a row when the expression is false (NULL passes). Unlike SQLite, a `CHECK` expression may contain a subquery.
+`NOT NULL` rejects NULL. `UNIQUE` allows any number of NULLs, as in SQLite; it compares with the column's collation (or the one given in a table constraint). `CHECK (expr)` rejects a row when the expression is false (NULL passes). As in SQLite, a `CHECK` expression may not contain a subquery (`subqueries prohibited in CHECK constraints`) or a parameter, and a `DEFAULT` may not contain a subquery, a column or a parameter (`default value of column [x] is not constant`); functions such as `random()` are allowed.
 
 ```sql
 CREATE TABLE account(

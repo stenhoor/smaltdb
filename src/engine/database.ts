@@ -7,6 +7,8 @@ import {
   autoIndexName,
   buildIndexSchema,
   buildTableSchema,
+  checkConstraintExprs,
+  checkNewTable,
   coerceForColumn,
   findColumn,
   isColumnar,
@@ -2485,6 +2487,7 @@ export class Database implements FunctionContext {
     this.dirtySchema = true;
     const root = BTree.create(this.pager);
     const { table, implicitIndexes } = buildTableSchema(stmt, sql, root);
+    if (!internal) checkNewTable(stmt, table);
     if (columnar) {
       // Columnar tables are scanned, not probed: no secondary structures to keep in step.
       if (implicitIndexes.length > 0) throw new SmaltError('SMALT_UNSUPPORTED', 'columnar tables support no UNIQUE or PRIMARY KEY constraints other than INTEGER PRIMARY KEY');
@@ -2525,6 +2528,7 @@ export class Database implements FunctionContext {
     }
     if (lower.startsWith('smalt_') || lower.startsWith('sqlite_')) throw new SmaltError('SMALT_ERROR', `object name reserved for internal use: ${stmt.name}`);
     const { table, implicitIndexes } = buildTableSchema(stmt, sql, this.createTree(true));
+    checkNewTable(stmt, table);
     table.temp = true;
     implicitIndexes.forEach((spec, i) => {
       const name = autoIndexName(table.name, i + 1);
@@ -3039,13 +3043,28 @@ export class Database implements FunctionContext {
     this.validateAfterAlter(' after rename', '');
   }
 
+  private hasRows(table: TableSchema): boolean {
+    const c = this.tree(table.rootPage).cursor();
+    try {
+      return c.first();
+    } finally {
+      c.close();
+    }
+  }
+
   private addColumn(table: TableSchema, def: ColumnDef, alterSql: string): void {
     if (findColumn(table, def.name) >= 0) throw new SmaltError('SMALT_ERROR', `duplicate column name: ${def.name}`);
     const cons = def.constraints;
     if (cons.some((c) => c.kind === 'primaryKey')) throw new SmaltError('SMALT_ERROR', 'Cannot add a PRIMARY KEY column');
     if (cons.some((c) => c.kind === 'unique')) throw new SmaltError('SMALT_ERROR', 'Cannot add a UNIQUE column');
     if (cons.some((c) => c.kind === 'generated')) throw new SmaltError('SMALT_UNSUPPORTED', 'generated columns are not supported yet');
+    checkConstraintExprs([def], [], `error in table ${table.name} after add column: `);
     const dflt = cons.find((c) => c.kind === 'default') as { expr: Expr } | undefined;
+    // As in SQLite: with foreign keys on, existing rows would get a default that may reference nothing.
+    const nonNullDefault = dflt !== undefined && !(dflt.expr.kind === 'literal' && dflt.expr.value === null);
+    if (this.fk.enabled && nonNullDefault && cons.some((c) => c.kind === 'references') && this.hasRows(table)) {
+      throw new SmaltError('SMALT_ERROR', 'Cannot add a REFERENCES column with non-NULL default value');
+    }
     if (dflt && !isConstantDefault(dflt.expr)) throw new SmaltError('SMALT_ERROR', 'Cannot add a column with non-constant default');
     if (cons.some((c) => c.kind === 'notNull') && literalValue(dflt?.expr) === null) {
       throw new SmaltError('SMALT_ERROR', 'Cannot add a NOT NULL column with default value NULL');

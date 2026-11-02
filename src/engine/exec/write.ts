@@ -4,7 +4,7 @@ import { BTree } from '../storage/btree.js';
 import { KeyEncoder, ROWID_KEY_SIZE, readIndexRowid, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
 import { RecordEncoder, RecordReader } from '../storage/record.js';
 import type { Pager } from '../storage/pager.js';
-import type { SqlValue } from '../values.js';
+import { type SqlValue, normalizeInt } from '../values.js';
 
 export type ConflictMode = 'ABORT' | 'FAIL' | 'IGNORE' | 'REPLACE' | 'ROLLBACK';
 
@@ -58,9 +58,26 @@ export class TableWriter {
       c.close();
     }
     const m = this.maxRowid;
-    if (typeof m === 'bigint' ? m >= I64_MAX : false) throw new SmaltError('SMALT_FULL', 'database or disk is full (rowid space exhausted)');
+    if (typeof m === 'bigint' && m >= I64_MAX) return this.randomRowid();
     const next = typeof m === 'number' ? (Number.isSafeInteger(m + 1) ? m + 1 : BigInt(m) + 1n) : m + 1n;
     return next;
+  }
+
+  /**
+   * The largest rowid is taken: like SQLite, try up to 100 random rowids in 1 .. 2^62 and fail
+   * with SMALT_FULL only if all are in use. An AUTOINCREMENT table fails at once (SQLite never
+   * reuses rowids there).
+   */
+  protected randomRowid(): number | bigint {
+    const full = new SmaltError('SMALT_FULL', 'database or disk is full (rowid space exhausted)');
+    if (this.table.autoincrement) throw full;
+    const r = new BigUint64Array(1);
+    for (let i = 0; i < 100; i++) {
+      globalThis.crypto.getRandomValues(r);
+      const v = normalizeInt((r[0] & (I64_MAX >> 1n)) + 1n);
+      if (!this.rowExists(v)) return v;
+    }
+    throw full;
   }
 
   private noteRowid(rowid: number | bigint): void {

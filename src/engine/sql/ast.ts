@@ -399,7 +399,7 @@ export interface ForeignKeyClause {
 export type FkAction = 'SET NULL' | 'SET DEFAULT' | 'CASCADE' | 'RESTRICT' | 'NO ACTION';
 
 export type TableConstraint = Node & { name?: string } & (
-    | { kind: 'primaryKey'; columns: IndexedColumn[]; onConflict?: ConflictAction }
+    | { kind: 'primaryKey'; columns: IndexedColumn[]; autoincrement?: boolean; onConflict?: ConflictAction }
     | { kind: 'unique'; columns: IndexedColumn[]; onConflict?: ConflictAction }
     | { kind: 'check'; expr: Expr }
     | { kind: 'foreignKey'; /** Child columns. */ columns: string[]; references: ForeignKeyClause }

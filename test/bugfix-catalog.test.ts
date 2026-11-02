@@ -3,8 +3,11 @@
  * Expected values were checked against SQLite (@sqlite.org/sqlite-wasm) where SQLite has the feature.
  */
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { buildTableSchema } from '../src/engine/catalog/schema.js';
 import { Database } from '../src/engine/database.js';
+import type { CreateTableStmt } from '../src/engine/sql/ast.js';
+import { parseOne } from '../src/engine/sql/parser.js';
 import { EngineServer } from '../src/engine/server.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
 import type { Request, Response } from '../src/shared/protocol.js';
@@ -235,6 +238,88 @@ describe('smaltdb_version()', () => {
   it('is the version in package.json', () => {
     const { version } = JSON.parse(readFileSync('package.json', 'utf8')) as { version: string };
     expect(mem().query('SELECT smaltdb_version()').rows).toEqual([[version]]);
+  });
+});
+
+describe('CREATE TABLE / ADD COLUMN checks SQLite makes', () => {
+  const msg = async (d: Database, sql: string): Promise<string> => (await errorOf(() => d.exec(sql))).message;
+
+  it('AUTOINCREMENT only on an INTEGER PRIMARY KEY (also as a table constraint)', async () => {
+    const d = mem();
+    for (const sql of [
+      'CREATE TABLE a1(x TEXT PRIMARY KEY AUTOINCREMENT)',
+      'CREATE TABLE a2(x INT PRIMARY KEY AUTOINCREMENT)',
+      'CREATE TABLE a3(x INTEGER PRIMARY KEY DESC AUTOINCREMENT)',
+      'CREATE TABLE a6(x INTEGER, y, PRIMARY KEY(x, y AUTOINCREMENT))',
+      'CREATE TEMP TABLE a7(x TEXT PRIMARY KEY AUTOINCREMENT)',
+    ]) {
+      expect(await msg(d, sql)).toBe('AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY');
+    }
+    d.exec('CREATE TABLE a4(x INTEGER, PRIMARY KEY(x AUTOINCREMENT)); CREATE TABLE a5(x INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO a4 VALUES (NULL)');
+    expect(d.query('SELECT x FROM a4').rows).toEqual([[1]]);
+  });
+
+  it('CHECK and DEFAULT reject subqueries, column references and parameters', async () => {
+    const d = mem();
+    d.exec('CREATE TABLE z(a)');
+    for (const sql of ['CREATE TABLE c1(x CHECK (x > (SELECT 1)))', 'CREATE TABLE c2(x, CHECK (EXISTS (SELECT 1)))', 'CREATE TABLE c3(x CHECK (x IN z))', 'CREATE TEMP TABLE c4(x CHECK (x IN (SELECT a FROM z)))']) {
+      expect(await msg(d, sql)).toBe('subqueries prohibited in CHECK constraints');
+    }
+    expect((await errorOf(() => d.run('CREATE TABLE c5(x CHECK (x > ?))', [1]))).message).toBe('parameters prohibited in CHECK constraints');
+    expect(await msg(d, 'CREATE TABLE d1(x DEFAULT (1 IN (SELECT 1)))')).toBe('default value of column [x] is not constant');
+    expect(await msg(d, 'CREATE TABLE d2(x DEFAULT ((SELECT 1)))')).toBe('default value of column [x] is not constant');
+    expect(await msg(d, 'CREATE TABLE d3(x, y DEFAULT (x + 1))')).toBe('default value of column [y] is not constant');
+    expect((await errorOf(() => d.run('CREATE TABLE d4(x DEFAULT (?))', [1]))).message).toBe('default value of column [x] is not constant');
+    expect(await msg(d, 'ALTER TABLE z ADD COLUMN b CHECK ((SELECT 1))')).toBe('error in table z after add column: subqueries prohibited in CHECK constraints');
+    expect(await msg(d, 'ALTER TABLE z ADD COLUMN c DEFAULT (1 IN (SELECT 1))')).toBe('default value of column [c] is not constant');
+    d.exec("CREATE TABLE ok(x DEFAULT (random()), y CHECK (y IN (1, 2)), z DEFAULT abc)");
+  });
+
+  it('stored definitions are not re-checked, so databases created before these checks still open', () => {
+    // The catalog loader builds schemas with buildTableSchema only; the new checks run on CREATE / ADD COLUMN.
+    for (const sql of ['CREATE TABLE a(x TEXT PRIMARY KEY AUTOINCREMENT)', 'CREATE TABLE c(x CHECK (x > (SELECT 1)), y DEFAULT (1 IN (SELECT 1)))']) {
+      expect(() => buildTableSchema(parseOne(sql).stmt as CreateTableStmt, sql, 2)).not.toThrow();
+    }
+  });
+
+  it('ADD COLUMN … REFERENCES with a non-NULL default fails when foreign keys are on and the table has rows', async () => {
+    const d = mem();
+    d.exec('CREATE TABLE p(id INTEGER PRIMARY KEY); INSERT INTO p VALUES (1); CREATE TABLE ch(a)');
+    d.exec('ALTER TABLE ch ADD COLUMN z DEFAULT 1 REFERENCES p'); // empty table: allowed, as in SQLite
+    d.exec('INSERT INTO ch(a) VALUES (5)');
+    for (const col of ['c DEFAULT 1 REFERENCES p', "g DEFAULT 'x' REFERENCES p", 'h DEFAULT (1) REFERENCES p', 'n INTEGER DEFAULT -1 CONSTRAINT q REFERENCES p']) {
+      expect(await errorOf(() => d.exec(`ALTER TABLE ch ADD COLUMN ${col}`))).toEqual({ code: 'SMALT_ERROR', message: 'Cannot add a REFERENCES column with non-NULL default value' });
+    }
+    d.exec('ALTER TABLE ch ADD COLUMN d DEFAULT NULL REFERENCES p; ALTER TABLE ch ADD COLUMN e REFERENCES p; ALTER TABLE ch ADD COLUMN f DEFAULT (NULL) REFERENCES p');
+    d.exec('PRAGMA foreign_keys = off; ALTER TABLE ch ADD COLUMN o DEFAULT 1 REFERENCES p');
+    expect(d.query('SELECT * FROM ch').rows).toEqual([[5, 1, null, null, null, 1]]);
+  });
+});
+
+describe('rowid exhaustion', () => {
+  it('picks random free rowids in 1 .. 2^62 once the largest rowid is taken, as SQLite does', () => {
+    const d = mem();
+    d.exec("CREATE TABLE t(x); INSERT INTO t(rowid, x) VALUES (9223372036854775807, 'max')");
+    for (let i = 0; i < 5; i++) expect(d.query("INSERT INTO t(x) VALUES ('r') RETURNING rowid > 0 AND rowid <= 4611686018427387904").rows).toEqual([[1]]);
+    d.exec('CREATE TABLE b(id INTEGER PRIMARY KEY, x); INSERT INTO b VALUES (9223372036854775807, 1); INSERT INTO b(x) VALUES (2)');
+    expect(d.query('SELECT count(DISTINCT id) FROM b').rows).toEqual([[2]]);
+  });
+
+  it('fails with SMALT_FULL after 100 taken candidates, and at once for AUTOINCREMENT', async () => {
+    const d = mem();
+    d.exec('CREATE TABLE t(x); INSERT INTO t(rowid, x) VALUES (1, 1), (9223372036854775807, 2)');
+    const spy = vi.spyOn(globalThis.crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView | null>(a: T): T => {
+      (a as unknown as BigUint64Array).fill(0n); // candidate 1, which is taken
+      return a;
+    });
+    try {
+      expect((await errorOf(() => d.exec('INSERT INTO t(x) VALUES (3)'))).code).toBe('SMALT_FULL');
+      expect(spy).toHaveBeenCalledTimes(100);
+    } finally {
+      spy.mockRestore();
+    }
+    d.exec('CREATE TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT, x); INSERT INTO a VALUES (9223372036854775807, 1)');
+    expect((await errorOf(() => d.exec('INSERT INTO a(x) VALUES (2)'))).code).toBe('SMALT_FULL');
   });
 });
 

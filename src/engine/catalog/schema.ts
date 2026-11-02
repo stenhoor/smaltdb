@@ -1,5 +1,6 @@
 import { SmaltError } from '../errors.js';
-import type { ColumnConstraint, CreateIndexStmt, CreateTableStmt, Expr, FkAction, ForeignKeyClause, IndexedColumn } from '../sql/ast.js';
+import type { ColumnConstraint, ColumnDef, CreateIndexStmt, CreateTableStmt, Expr, FkAction, ForeignKeyClause, IndexedColumn } from '../sql/ast.js';
+import { anyNode } from '../sql/ast-util.js';
 import { RecordLayout, type StorageType } from '../storage/record.js';
 import { Collation, type SqlValue, collationByName, normalizeInt } from '../values.js';
 
@@ -87,6 +88,8 @@ export interface TableSchema {
   matview?: MatViewInfo;
   /** TEMP table: memory store, not in the persisted catalog, visible to this connection only. */
   temp?: boolean;
+  /** Declared AUTOINCREMENT: once the largest rowid is taken, inserts fail instead of picking random rowids. */
+  autoincrement?: boolean;
   /**
    * Columnar base table (`WITH (storage = 'columnar')`, M7.3): `rootPage` is the row-format delta
    * store; older rows live in column segments, minus the rowids in the deletion tree.
@@ -462,6 +465,9 @@ export function buildTableSchema(
     // Rows written before ALTER TABLE ADD COLUMN lack the new column: they read its (constant) default.
     recordDefaults: columns.map((c) => literalValue(c.defaultExpr)),
   };
+  if (rowidAlias >= 0 && (stmt.columns.some((d) => d.constraints.some((c) => c.kind === 'primaryKey' && c.autoincrement)) || stmt.constraints.some((c) => c.kind === 'primaryKey' && c.autoincrement))) {
+    table.autoincrement = true;
+  }
   return { table, implicitIndexes: filtered };
 }
 
@@ -503,6 +509,47 @@ export function literalValue(e: Expr | undefined): SqlValue {
 }
 
 /** Whether a default is constant in SQLite's ALTER TABLE ADD COLUMN sense. */
+/**
+ * CREATE TABLE only (stored definitions are not re-checked, so existing databases still open):
+ * SQLite's rules for DEFAULT and CHECK expressions, and AUTOINCREMENT only on the column that
+ * aliases the rowid.
+ */
+export function checkNewTable(stmt: CreateTableStmt, table: TableSchema): void {
+  checkConstraintExprs(
+    stmt.columns,
+    stmt.constraints.flatMap((c) => (c.kind === 'check' ? [c.expr] : [])),
+  );
+  const on = stmt.columns.some((d) => d.constraints.some((c) => c.kind === 'primaryKey' && c.autoincrement)) || stmt.constraints.some((c) => c.kind === 'primaryKey' && c.autoincrement);
+  if (on && table.rowidAlias < 0) throw new SmaltError('SMALT_ERROR', 'AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY');
+}
+
+const isSubquery = (n: Record<string, unknown>): boolean => n.kind === 'subquery' || n.kind === 'exists' || n.kind === 'inSelect';
+
+/** SQLite's parse-time rules for a CHECK expression (`prefix` names the ALTER TABLE context). */
+export function checkCheckExpr(e: Expr, prefix = ''): void {
+  if (anyNode(e, isSubquery)) throw new SmaltError('SMALT_ERROR', `${prefix}subqueries prohibited in CHECK constraints`);
+  if (anyNode(e, (n) => n.kind === 'param')) throw new SmaltError('SMALT_ERROR', `${prefix}parameters prohibited in CHECK constraints`);
+}
+
+/** SQLite's parse-time rule for DEFAULT: no subqueries, column references or parameters (functions are allowed). */
+export function checkDefaultExpr(column: string, e: Expr): void {
+  if (anyNode(e, (n) => isSubquery(n) || n.kind === 'column' || n.kind === 'param')) throw new SmaltError('SMALT_ERROR', `default value of column [${column}] is not constant`);
+}
+
+/**
+ * CREATE TABLE / ADD COLUMN only (stored definitions are not re-checked, so existing databases
+ * still open): DEFAULT and CHECK expressions, in the order they appear, as SQLite checks them.
+ */
+export function checkConstraintExprs(columns: ColumnDef[], tableChecks: Expr[], checkPrefix = ''): void {
+  for (const def of columns) {
+    for (const c of def.constraints) {
+      if (c.kind === 'default') checkDefaultExpr(def.name, c.expr);
+      else if (c.kind === 'check') checkCheckExpr(c.expr, checkPrefix);
+    }
+  }
+  for (const e of tableChecks) checkCheckExpr(e, checkPrefix);
+}
+
 export function isConstantDefault(e: Expr): boolean {
   if (e.kind === 'literal') return true;
   return e.kind === 'unary' && (e.op === '-' || e.op === '+') && e.operand.kind === 'literal' && (typeof e.operand.value === 'number' || typeof e.operand.value === 'bigint');

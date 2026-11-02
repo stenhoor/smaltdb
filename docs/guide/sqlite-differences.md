@@ -84,7 +84,7 @@ INSERT INTO code VALUES (NULL, 'none')
 
 ### AUTOINCREMENT
 
-`AUTOINCREMENT` is accepted but has no effect: after the row with the largest key is deleted, its key can be used again. SQLite never reuses keys with `AUTOINCREMENT`, and allows the keyword only on an `INTEGER PRIMARY KEY` (smaltdb accepts it on any primary key).
+`AUTOINCREMENT` is allowed only on an `INTEGER PRIMARY KEY`, as in SQLite, but it does not stop keys from being reused: after the row with the largest key is deleted, its key can be used again. SQLite never reuses keys with `AUTOINCREMENT`.
 
 ```sql
 CREATE TABLE seq(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
@@ -99,7 +99,7 @@ SELECT * FROM seq
 | 1 | a |
 | 2 | c |
 
-When the largest rowid is already 9223372036854775807, inserting a row without a key fails with `SMALT_FULL`; SQLite tries random free rowids.
+When the largest rowid is already 9223372036854775807, a row inserted without a key gets a random free rowid, as in SQLite (`SMALT_FULL` with `AUTOINCREMENT`). In SQLite an `AUTOINCREMENT` table stays full even after that row is deleted; in smaltdb the next key is again one more than the largest left.
 
 ### Conflict clauses
 
@@ -119,8 +119,7 @@ INSERT INTO u VALUES ('x')
 
 ### Constraint expressions
 
-- A `CHECK` constraint may contain a subquery, and a `DEFAULT (expr)` may contain a subquery. SQLite rejects both.
-- `ALTER TABLE … ADD COLUMN` accepts a `REFERENCES` column with a non-NULL default; existing rows are not checked. SQLite rejects it while foreign keys are on.
+- `ALTER TABLE … ADD COLUMN` rejects a `NOT NULL` column without a default, and a non-constant default such as `CURRENT_TIMESTAMP`, even on an empty table. SQLite rejects them only when the table has rows.
 
 ### Temporary tables
 

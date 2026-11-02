@@ -1173,9 +1173,10 @@ class Parser {
         if (pk) this.expectKw('KEY');
         this.expectOp('(');
         const columns = this.indexedColumns();
+        const autoincrement = pk && this.acceptKw('AUTOINCREMENT'); // PRIMARY KEY (x AUTOINCREMENT), as in SQLite
         this.expectOp(')');
         const onConflict = this.optConflictClause();
-        return pk ? { pos, name, kind: 'primaryKey', columns, onConflict, end: this.ends[this.p - 1] } : { pos, name, kind: 'unique', columns, onConflict, end: this.ends[this.p - 1] };
+        return pk ? { pos, name, kind: 'primaryKey', columns, autoincrement, onConflict, end: this.ends[this.p - 1] } : { pos, name, kind: 'unique', columns, onConflict, end: this.ends[this.p - 1] };
       }
       case 'CHECK':
         this.p++;
