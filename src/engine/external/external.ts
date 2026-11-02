@@ -8,7 +8,7 @@
  * and `@smaltdb/parquet`. This file resolves a location to a plugin's source, expands patterns,
  * reads Hive partitions, merges files, and keeps the loaded rows for the statement.
  */
-import { SmaltError } from '../errors.js';
+import { SmaltError, errorCode } from '../errors.js';
 import type { StaticType } from '../exec/convert.js';
 import { type FormatReader, PluginRegistry, type RandomAccessFile, type SourceHandler, type SourceTarget } from '../plugin.js';
 import type { Zone } from '../storage/columnar.js';
@@ -323,7 +323,8 @@ export class ExternalRegistry {
     try {
       return await fn();
     } catch (e) {
-      if (e instanceof SmaltError) throw e;
+      // SmaltErrors, and plugin errors that carry a SMALT_ code, pass through unchanged.
+      if (e instanceof SmaltError || errorCode(e) !== 'SMALT_INTERNAL') throw e;
       if ((e as Error)?.name === 'AbortError') throw new SmaltError('SMALT_INTERRUPT', 'interrupted');
       throw externalError(source, (e as Error)?.message ?? String(e));
     }

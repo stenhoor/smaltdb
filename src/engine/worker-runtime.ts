@@ -23,7 +23,7 @@
  *   answers the queries it is given from a snapshot of the latest commit, straight to the client.
  */
 import { Database } from './database.js';
-import { SmaltError } from './errors.js';
+import { SmaltError, errorCode } from './errors.js';
 import { EngineServer, type PartialTask, type ReaderPool, defaultOpen } from './server.js';
 import type { SqlValue } from './values.js';
 import { detectCapabilities } from './vfs/capabilities.js';
@@ -243,7 +243,7 @@ export function serve(options: ServeOptions = {}): void {
       try {
         server.receive(EngineServer.LOCAL, req);
       } catch (err) {
-        const code = err instanceof SmaltError ? err.code : 'SMALT_INTERNAL';
+        const code = errorCode(err);
         scope.postMessage({ id: req.id, kind: 'error', code, message: err instanceof Error ? err.message : String(err) } satisfies Response);
       }
     };

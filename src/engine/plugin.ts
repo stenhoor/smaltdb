@@ -326,8 +326,10 @@ export class PluginRegistry {
   formatMissing(label: string, name: string): SmaltError {
     const n = name.toLowerCase();
     const plugin = KNOWN_FORMATS[n];
-    if (plugin) return pluginMissing(label, `the ${n} format`, plugin);
     const known = [...this.formatNames.keys()].sort();
+    // smaltdb's plugin for it is installed and has no such format (`format = 'txt'`: txt is only an extension).
+    if (plugin && this.plugins.some((p) => p.name === plugin)) return new SmaltError('SMALT_EXTERNAL', `${label}: unsupported format '${name}' (${known.join(', ')})`);
+    if (plugin) return pluginMissing(label, `the ${n} format`, plugin);
     return new SmaltError('SMALT_PLUGIN_MISSING', `${label}: no installed plugin provides the '${name}' format${known.length ? ` (installed: ${known.join(', ')})` : ''}`);
   }
 

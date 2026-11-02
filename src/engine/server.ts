@@ -18,7 +18,7 @@
  *   transaction is rolled back.
  */
 import { type BindParams, Database, RowCursor, type Statement } from './database.js';
-import { MisuseError, SmaltError } from './errors.js';
+import { MisuseError, SmaltError, errorCode } from './errors.js';
 import { AsyncRequiredError } from './external/external.js';
 import { parse } from './sql/parser.js';
 import type { SmaltPlugin } from './plugin.js';
@@ -297,7 +297,7 @@ export class EngineServer {
   }
 
   private fail(session: string, id: number, err: unknown): void {
-    const code = err instanceof SmaltError ? err.code : 'SMALT_INTERNAL';
+    const code = errorCode(err);
     // Some engines (WebKit) raise DOMExceptions with an empty message: keep the name then.
     this.send(session, { id, kind: 'error', code, message: err instanceof Error ? err.message || err.name : String(err) });
   }
