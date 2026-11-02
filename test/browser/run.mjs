@@ -15,6 +15,8 @@ await build({ entryPoints: ['test/browser/opfs-worker.ts'], bundle: true, format
 await build({ entryPoints: ['test/browser/client-test.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/client-test.js`, logLevel: 'warning' });
 await build({ entryPoints: ['test/browser/tab-test.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/tab-test.js`, logLevel: 'warning' });
 await build({ entryPoints: ['src/engine/worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/smaltdb-worker.js`, logLevel: 'warning' });
+// A worker entry with plugins, as applications write it (ADR 0012); the client test reads Parquet through it.
+await build({ entryPoints: ['test/browser/plugin-worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/plugin-worker.js`, logLevel: 'warning', alias: { '@smaltdb/parquet': './plugins/parquet/src/index.ts' } });
 // External data (M8): a CSV the client test reads over HTTP from this server.
 writeFileSync(`${out}/prices.csv`, 'id,name,price\n1,apple,1.5\n2,"pear, green",2\n3,plum,\n');
 // …and Parquet files written by pyarrow (M8.3), read with Range requests.

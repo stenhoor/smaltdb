@@ -133,10 +133,11 @@ export interface PlannerEnv {
   externalTable?(name: string): ExternalScan | undefined;
   /** M8: a reading table function (`read_csv`, `read_json`) called with constant arguments. */
   externalFunction?(name: string, args: SqlValue[], named: Record<string, SqlValue>): ExternalScan | undefined;
+  /** Whether `name` is a table function over external data (built in or from a plugin). */
+  isExternalFunction?(name: string): boolean;
 }
 
 /** Table functions that read external data (their arguments must be constants). */
-export const EXTERNAL_FUNCTIONS: ReadonlySet<string> = new Set(['read_csv', 'read_json', 'read_parquet']);
 
 /** An external source as the planner scans it. */
 export interface ExternalScan {
@@ -1422,8 +1423,8 @@ export class Planner {
       const columns: ResultColumnInfo[] = ext.columns.map((c) => ({ name: c.name, type: c.type, declType: c.declType, collation: Collation.Binary, affinity: affinityOfStorage(storageTypeFor(c.declType)) }));
       const sub: QueryPlan = { root, outRegs: regs, columns, correlated: false };
       const cols: SourceColumn[] = columns.map((c, i) => ({ name: c.name, reg: regs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '', index: i }));
-      // Parquet reads only the columns the statement uses (recorded as they resolve).
-      if (ext.source.format === 'parquet') ext.source.projection ??= new Set();
+      // Formats with pushdown (Parquet) read only the columns the statement uses (recorded as they resolve).
+      if (ext.source.pushdown) ext.source.projection ??= new Set();
       scope.sources.push({ name: (item as { alias?: string }).alias ?? (item as { name: string }).name, cols, rowidReg: -1, sub, lateral: false, joinType, on: [], hidden: new Set(), position, external: ext.source, externalTable: item.kind === 'table' });
       return;
     }
@@ -1931,7 +1932,7 @@ export class Planner {
       const keys: string[] = [];
       for (const c of pool) {
         if (c.deps === null || c.deps.size !== 1 || !c.deps.has(src.position)) continue;
-        if (ext.format === 'parquet') {
+        if (ext.pushdown) {
           const zone = this.rowGroupCheck(c.expr, src);
           if (zone) {
             (ext.rowGroupPrune ??= []).push(zone);
@@ -2053,7 +2054,7 @@ export class Planner {
   /** `item` as an external table or a `read_csv` / `read_json` call, if it is one. */
   private externalScan(item: FromItem, scope: Scope): ExternalScan | undefined {
     if (item.kind === 'function') {
-      if (!EXTERNAL_FUNCTIONS.has(item.name) || !this.env.externalFunction) return undefined;
+      if (!this.env.isExternalFunction?.(item.name) || !this.env.externalFunction) return undefined;
       const cs = this.compileScope(scope);
       const value = (e: Expr): SqlValue => {
         const c = compileExpr(e, cs);

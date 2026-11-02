@@ -204,7 +204,7 @@ smaltdb has no JSON functions (`json_extract`, `->>`, …), so nested values can
 read_parquet(LOCATION [, hive_partitioning => …] [, connection => …])
 ```
 
-Reads a Parquet file. Only the columns the query uses are fetched, and row groups whose statistics rule them out are skipped; for remote files this uses HTTP range requests. Reading Parquet needs the optional package `hyparquet` (and `hyparquet-compressors` for codecs other than Snappy and uncompressed); without it the call fails with `reading Parquet needs the hyparquet package`.
+Reads a Parquet file. Only the columns the query uses are fetched, and row groups whose statistics rule them out are skipped; for remote files this uses HTTP range requests. `read_parquet` is provided by the [`@smaltdb/parquet` plugin](../../guide/plugins) (plus `hyparquet-compressors` for codecs other than Snappy and uncompressed); without the plugin the call fails with `SMALT_PLUGIN_MISSING`: `reading Parquet needs the @smaltdb/parquet plugin`.
 
 | Parquet type | SQL value |
 | --- | --- |

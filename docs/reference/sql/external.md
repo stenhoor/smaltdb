@@ -160,7 +160,7 @@ SELECT year, sum(amount) FROM sales WHERE year >= 2024 GROUP BY year;
 | `tsv` | `.tsv` | CSV with a tab delimiter |
 | `json` | `.json` | an array of objects (keys become columns, matched without regard to case), or of arrays (`column1`, …) |
 | `ndjson` | `.ndjson`, `.jsonl` | one JSON value per line |
-| `parquet` | `.parquet`, `.pq` | needs the optional `hyparquet` package; reads only the columns and row groups a statement needs |
+| `parquet` | `.parquet`, `.pq` | needs the [`@smaltdb/parquet` plugin](../../guide/plugins); reads only the columns and row groups a statement needs |
 
 A location without a known extension needs `format` (`cannot tell the format of 'x': add format = 'csv', 'json' or 'parquet'`). JSON and NDJSON are told apart by the content, so either `format` reads both. In JSON, `true`/`false` become 1/0, and nested arrays and objects become JSON text.
 

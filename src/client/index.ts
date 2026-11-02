@@ -17,8 +17,13 @@ export interface OpenOptions {
   cacheMB?: number;
   /** Flush to storage on every commit (default true). */
   durable?: boolean;
-  /** Override the engine worker: a URL/string to load, or an existing Worker. */
-  worker?: URL | string | Worker;
+  /**
+   * Override the engine worker: a function that starts one (called again when this tab takes over
+   * a shared database), a URL/string to load, or an existing Worker. For a worker entry with
+   * plugins (ADR 0012), use a function, so bundlers see the worker:
+   * `worker: () => new Worker(new URL('./db-worker.ts', import.meta.url), { type: 'module' })`.
+   */
+  worker?: (() => Worker) | URL | string | Worker;
   /**
    * Share the database with other tabs of this origin (default: on for OPFS when Web Locks and
    * BroadcastChannel exist). One tab's engine worker owns the file; other tabs send it their
@@ -115,6 +120,7 @@ function defaultWorker(): Worker {
 }
 
 function makeWorker(options: OpenOptions): Worker {
+  if (typeof options.worker === 'function') return options.worker();
   if (options.worker instanceof Worker) return options.worker;
   if (options.worker !== undefined) return new Worker(options.worker, { type: 'module', name: 'smaltdb' });
   return defaultWorker();

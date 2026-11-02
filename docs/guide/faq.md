@@ -21,7 +21,7 @@ move data across, export it from SQLite as CSV or JSON and [import it](./import-
 
 ### Is it ready for production?
 
-The current version is 0.8.3. The on-disk format may still change before 1.0, so a later version might not open a
+The current version is 0.9.0. The on-disk format may still change before 1.0, so a later version might not open a
 database written by this one. Keep a way to rebuild or re-import your data, for example
 [exportJSON](./import-export) or a server copy.
 
@@ -31,9 +31,11 @@ These are the minified sizes, with the gzipped size in brackets:
 
 | File | What it is | Size |
 |---|---|---|
-| `smaltdb.js` | the client you import | 10 KB (4 KB) |
-| `smaltdb-worker.js` | the engine, in its worker | 449 KB (142 KB) |
-| two Parquet chunks | loaded only on first Parquet use | 179 KB (95 KB) |
+| `smaltdb.js` | the client you import | 12 KB (4 KB) |
+| `smaltdb-worker.js` | the engine, in its worker | 471 KB (150 KB) |
+
+Optional features that depend on other packages are [plugins](./plugins) and are not included. For example, the
+Parquet plugin adds hyparquet and, if you install it, hyparquet-compressors to your worker bundle.
 
 ## Storage
 

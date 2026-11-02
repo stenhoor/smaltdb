@@ -29,7 +29,7 @@ Each `open()` call returns its own `Database` with its own worker, unless multi-
 | `pageSize` | `number` | `8192` | Page size in bytes for a **new** database: a power of two from 512 to 65536. Ignored when the database already exists. |
 | `cacheMB` | `number` | `16` | Page cache budget in MiB for the engine worker. |
 | `multiTab` | `boolean` | `true` for OPFS when Web Locks and `BroadcastChannel` exist | Share the database with other tabs of the same origin. See [multi-tab access](#multi-tab-access). |
-| `worker` | `URL` \| `string` \| `Worker` | `new URL('./smaltdb-worker.js', import.meta.url)` | Where the engine worker comes from. See [loading the engine worker](./getting-started#loading-the-engine-worker). |
+| `worker` | `() => Worker` \| `URL` \| `string` \| `Worker` | `new URL('./smaltdb-worker.js', import.meta.url)` | Where the engine worker comes from: a function that starts it (for [plugins](./plugins)), a URL, or a `Worker`. See [loading the engine worker](./getting-started#loading-the-engine-worker). |
 
 ```ts
 import { open } from 'smaltdb';

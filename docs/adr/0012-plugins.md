@@ -1,6 +1,6 @@
 # ADR 0012: Plugins: a dependency-free core, optional features as packages
 
-- **Status:** proposed
+- **Status:** accepted (2026-11-02). Steps 1 and 2 are implemented; see the implementation plan.
 - **Date:** 2026-11-02
 
 ## Context
@@ -99,13 +99,17 @@ It then passes that file to `open()`:
 import { open } from 'smaltdb';
 
 const db = await open('app', {
-  worker: new URL('./db-worker.ts', import.meta.url),
+  worker: () => new Worker(new URL('./db-worker.ts', import.meta.url), { type: 'module' }),
 });
 ```
 
 **Why this design:**
 - **Bundlers handle it statically.** Every import is static, so bundlers resolve, bundle and tree-shake it like any
-  other code. Vite already recognises `new Worker(new URL(…, import.meta.url))`.
+  other code.
+- **The option is a function that creates the worker.** Vite recognises `new Worker(new URL(…, import.meta.url))`
+  only when it is written out, so the `worker` option accepts a function. A bare URL passed as the option is not
+  recognised: Vite treated the `.ts` entry as an asset in testing. The client calls the function again when the tab
+  takes over a shared database.
 - **No run-time module URLs.** Those would break with bundlers and Content Security Policy.
 - **Type-checked.** Plugin options are typed.
 
@@ -212,12 +216,14 @@ The catalog records, for each external table and connection, the format, source 
 
 ## Implementation plan
 
-1. **Plugin host.**
-   - Add the core plugin host, `serve()` in `smaltdb/worker-runtime`, `Database.open(…, { plugins })`,
-     `callPlugin`, plugin messages and `SMALT_PLUGIN_MISSING`.
-   - Turn the existing external-data code into registrations behind the host, still in the core repository, so
-     behaviour is unchanged and every test passes.
-2. **Parquet out.** Move Parquet to `plugins/parquet`. Remove `hyparquet` from the core's peer dependencies and from
+1. **Plugin host.** ✅
+   - Done: the plugin registry (`src/engine/plugin.ts`), `serve()` in `smaltdb/worker-runtime`,
+     `Database.open(…, { plugins })`, `SMALT_PLUGIN_MISSING`, and `addFormat` / `addTableFunction` with random-access
+     and whole-file readers.
+   - Deferred to steps 3 and 4, where they are first needed: `addSource`, `addConnectionType`, `addMethod`, and
+     `callPlugin` with plugin messages. The built-in CSV/JSON formats and sources stay behind the same seams until
+     then.
+2. **Parquet out.** ✅ Move Parquet to `plugins/parquet`. Remove `hyparquet` from the core's peer dependencies and from
    `dist/`. This step alone fixes the licence finding.
 3. **External sources out.** Move the sources, signing, globs and credentials to `plugins/external`.
 4. **CSV/JSON out.** Move the CSV/JSON formats and import/export to `plugins/io`.

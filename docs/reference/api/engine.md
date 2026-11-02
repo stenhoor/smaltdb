@@ -25,6 +25,7 @@ The SQL, the values, the parameters and the errors are the same as in the client
 | [`SmaltError`, `CorruptionError`, `MisuseError`, `SqlSyntaxError`](#errors) | Error classes |
 | [`parse`, `parseOne`](#parsing) | The SQL parser |
 | [`detectCapabilities`, `Capabilities`](#detectcapabilities) | Browser feature detection |
+| [`PLUGIN_API_VERSION`, `SmaltPlugin`, `PluginHost`, `FormatReader`, …](#plugins) | The plugin interface (experimental) |
 | Types: `RunResult`, `QueryResult`, `BindParams`, `DatabaseOptions`, `SqlValue`, `CsvImportOptions`, `JsonImportOptions`, `CsvExportOptions`, `JsonExportOptions`, `CredentialProvider`, `FetchFn`, `FileSource` | Described below |
 | `Pager`, `Frame`, `BTree`, `BTreeCursor`, `KeyEncoder`, `encodeKey`, `decodeKey`, `Collation`, `crc32c`, and their types | [Low-level storage](#low-level-storage) |
 
@@ -64,6 +65,7 @@ console.log(again.query('SELECT a FROM t').rows); // [['kept']]
 | `verifyChecksums` | `boolean` | `true` | Check page checksums on every read from storage. |
 | `walAutoCheckpointBytes` | `number` | 4 MiB | Copy the write-ahead log into the database file once it reaches this size. |
 | `readAheadBytes` | `number` | 64 KiB | On a cache miss, read this aligned extent around the page in one call (`0` disables). |
+| `plugins` | `SmaltPlugin[]` | none | [Plugins](../../guide/plugins) to install, e.g. `[parquet]` from `@smaltdb/parquet`. |
 | `sharedHandles` | `boolean` | `false` | Open OPFS files with `readwrite-unsafe` handles so other workers can open them too. You must then make sure only one connection writes. |
 
 ### Running SQL
@@ -226,6 +228,29 @@ export type { Vfs, VfsFile, OpenOptions };
 | `close(): void` | Close the file. |
 
 `OpenOptions` has `create` (default `true`: create a missing file) and `shared` (OPFS only: open with a `readwrite-unsafe` handle).
+
+## Plugins
+
+`DatabaseOptions.plugins` installs [plugins](../../guide/plugins) into this engine instance. In the browser, plugins
+are installed in the engine worker with `serve({ plugins })` from `smaltdb/worker-runtime`.
+
+```ts
+import { serve } from 'smaltdb/worker-runtime';
+import parquet from '@smaltdb/parquet';
+
+serve({ plugins: [parquet] });
+```
+
+| Export | Description |
+|---|---|
+| `serve(options?: { plugins?: SmaltPlugin[] })` (`smaltdb/worker-runtime`) | Makes the current dedicated worker an engine worker, with these plugins in it and in its parallel readers. Call it once, at the top level of the worker script; a second call fails with `SMALT_MISUSE`. |
+| `PLUGIN_API_VERSION` | The plugin interface version this engine implements (`1`). |
+| `SmaltPlugin`, `PluginHost`, `FormatReader`, `FormatRequest`, `FormatResult`, `FormatColumn`, `RandomAccessFile`, `Zone` | Types for writing plugins. |
+
+Opening fails with `SMALT_MISUSE` when a plugin was written for another `apiVersion`, when the same plugin is listed
+twice, or when two plugins define the same format or table function.
+
+The plugin interface is experimental: it may change between minor versions until it is declared stable.
 
 ## Errors
 

@@ -11,7 +11,7 @@
 It stores data in the [Origin Private File System (OPFS)](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system),
 can keep data in an optional in-memory cache for speed, and runs inside Web Workers so the main thread never blocks.
 
-> **Status: 0.8.3, preview.** Durable, atomic commits on OPFS (write-ahead log, crash-injection tested), a
+> **Status: 0.9.0, preview.** Durable, atomic commits on OPFS (write-ahead log, crash-injection tested), a
 > cost-based planner, views and materialized views, columnar tables, multi-tab access with parallel readers, spilling
 > sorts and aggregates, and external tables over CSV, JSON and Parquet files on HTTP, S3 and Azure Blob Storage
 > (milestones M0–M8.3 of the [roadmap](docs/ROADMAP.md)). The SQL dialect follows SQLite and is checked against it with
@@ -25,13 +25,14 @@ can keep data in an optional in-memory cache for speed, and runs inside Web Work
 npm install smaltdb
 ```
 
-The engine runs in a module worker, `dist/smaltdb-worker.js` (with its `dist/chunks/`), which the client loads with
+The engine runs in a module worker, `dist/smaltdb-worker.js`, which the client loads with
 `new URL('./smaltdb-worker.js', import.meta.url)`, the standard pattern that Vite bundles with no configuration. With other setups, copy
-those files to your site and pass the worker's URL: `open('app', { worker: new URL('/smaltdb-worker.js', location.href) })`.
+that file to your site and pass the worker's URL: `open('app', { worker: new URL('/smaltdb-worker.js', location.href) })`.
 Storage works on any page; interrupting a running statement uses `SharedArrayBuffer`, which needs a cross-origin
-isolated page (COOP / COEP headers). In the browser, Parquet support is part of the worker (loaded on first use); with
-`smaltdb/engine` in Node it needs `npm install hyparquet` (and `hyparquet-compressors` for codecs other than Snappy).
-See [Getting started](docs/guide/getting-started.md).
+isolated page (COOP / COEP headers). The core package has no dependencies. Parquet support is the `@smaltdb/parquet`
+plugin, installed into the engine through a worker entry you write (`serve({ plugins: [parquet] })`) and start with
+`open('app', { worker: () => new Worker(new URL('./db-worker.ts', import.meta.url), { type: 'module' }) })`; see
+[Getting started](docs/guide/getting-started.md) and [Plugins](docs/guide/plugins.md).
 
 ## Quick start
 

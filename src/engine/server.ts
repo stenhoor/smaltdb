@@ -22,6 +22,7 @@ import { MisuseError, SmaltError } from './errors.js';
 import { AsyncRequiredError } from './external/external.js';
 import { exportCSV, exportCSVAsync, exportJSON, exportJSONAsync, importCSV, importJSON } from './io/import-export.js';
 import { parse } from './sql/parser.js';
+import type { SmaltPlugin } from './plugin.js';
 import type { Vfs } from './vfs/types.js';
 import { type ReaderSettings, type Request, type Response, type WireMaterial, encodeColumns } from '../shared/protocol.js';
 import type { SqlValue } from './values.js';
@@ -756,9 +757,9 @@ const nextTask: (fn: () => void) => void = (() => {
 })();
 
 /** Default opener: OPFS file `<name>.db` (with WAL) or an in-memory database. */
-export function defaultOpen(vfs: () => Vfs): ServerOptions['open'] {
+export function defaultOpen(vfs: () => Vfs, plugins: readonly SmaltPlugin[] = []): ServerOptions['open'] {
   return async (req) => {
-    const options = { pageSize: req.pageSize, cacheSizeBytes: req.cacheSizeBytes, syncOnCommit: req.syncOnCommit };
+    const options = { pageSize: req.pageSize, cacheSizeBytes: req.cacheSizeBytes, syncOnCommit: req.syncOnCommit, plugins };
     return req.storage === 'memory' || req.name === ':memory:' ? Database.openMemory(options) : Database.open(vfs(), `${req.name}.db`, options);
   };
 }

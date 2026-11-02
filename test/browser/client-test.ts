@@ -9,7 +9,7 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   const timings: Record<string, number> = {};
   const check = (name: string, ok: boolean, detail?: unknown) => checks.push({ name, ok, detail: detail === undefined ? undefined : JSON.stringify(detail) });
 
-  const db = await open('client-test', { worker: new URL('./smaltdb-worker.js', location.href) });
+  const db = await open('client-test', { worker: () => new Worker(new URL('./plugin-worker.js', location.href), { type: 'module' }) });
   await db.exec('DROP TABLE IF EXISTS items');
   await db.exec('CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT NOT NULL, price REAL, qty INT)');
   let t0 = performance.now();
@@ -279,7 +279,7 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   await db.close();
 
   // Reopen: data persisted in OPFS.
-  const db2 = await open('client-test', { worker: new URL('./smaltdb-worker.js', location.href) });
+  const db2 = await open('client-test', { worker: new URL('./plugin-worker.js', location.href) });
   const n = await db2.query('SELECT count(*) AS n FROM items');
   check('persisted across close/reopen', n[0].n === 2000, n);
   await db2.exec('DROP TABLE items');
