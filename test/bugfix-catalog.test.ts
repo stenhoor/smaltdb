@@ -4,7 +4,11 @@
  */
 import { describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
+import { EngineServer } from '../src/engine/server.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
+import type { Request, Response } from '../src/shared/protocol.js';
+import type { SqlValue } from '../src/engine/values.js';
+import { until } from './helpers/wait.js';
 
 const mem = (): Database => Database.openFile(new MemoryVfs().openSync('t.db'));
 
@@ -181,6 +185,48 @@ describe('external tables in pragmas and writes', () => {
     }
     expect(await errorOf(() => db.exec('CREATE INDEX ei ON ext(a)'))).toEqual({ code: 'SMALT_ERROR', message: 'table ext may not be indexed' });
     expect(await errorOf(() => db.exec('ALTER TABLE ext ADD COLUMN c'))).toEqual({ code: 'SMALT_ERROR', message: 'table ext may not be altered' });
+  });
+});
+
+describe('REFRESH MATERIALIZED VIEW … IF CHANGED through every async entry point', () => {
+  it('runs with queryAsync and runAsync as with execAsync', async () => {
+    const db = await Database.open(new MemoryVfs(), 'db');
+    db.exec('CREATE TABLE t(x INT); INSERT INTO t VALUES (1); CREATE MATERIALIZED VIEW c AS SELECT count(*) AS n FROM t');
+    db.exec('INSERT INTO t VALUES (2)');
+    expect(await db.runAsync('REFRESH MATERIALIZED VIEW c IF CHANGED')).toMatchObject({ changes: 1 });
+    expect(db.query('SELECT n FROM c').rows).toEqual([[2]]);
+    expect(await db.runAsync('REFRESH MATERIALIZED VIEW c IF CHANGED')).toMatchObject({ changes: 0 }); // unchanged: not refreshed
+    db.exec('INSERT INTO t VALUES (3)');
+    expect(await db.queryAsync('REFRESH MATERIALIZED VIEW c IF CHANGED')).toEqual({ columns: [], rows: [] });
+    expect(db.query('SELECT n FROM c').rows).toEqual([[3]]);
+    expect((await errorOf(() => db.run('REFRESH MATERIALIZED VIEW c IF CHANGED'))).code).toBe('SMALT_ASYNC_REQUIRED');
+  });
+
+  it('runs through the engine server: query, exec with parameters, prepared statements', async () => {
+    const db = await Database.open(new MemoryVfs(), 'db');
+    const log: Response[] = [];
+    const server = new EngineServer((_s, msg) => log.push(msg), { open: () => db, refreshTimer: false });
+    let id = 1;
+    const call = async (body: Record<string, unknown>): Promise<Response> => {
+      const rid = id++;
+      server.receive(EngineServer.LOCAL, { ...body, id: rid } as Request);
+      await until(`request ${rid}`, () => log.some((m) => m.id === rid && (m.kind === 'ok' || m.kind === 'error' || m.kind === 'done')));
+      return log.find((m) => m.id === rid && (m.kind === 'ok' || m.kind === 'error' || m.kind === 'done'))!;
+    };
+    await call({ op: 'open', name: 'db', storage: 'memory' });
+    db.exec('CREATE TABLE t(x INT); CREATE MATERIALIZED VIEW c AS SELECT count(*) AS n FROM t');
+    const n = (): SqlValue => db.query('SELECT n FROM c').rows[0][0];
+    db.exec('INSERT INTO t VALUES (1)');
+    expect((await call({ op: 'query', sql: 'REFRESH MATERIALIZED VIEW c IF CHANGED' })).kind).not.toBe('error');
+    expect(n()).toBe(1);
+    db.exec('INSERT INTO t VALUES (2)');
+    expect((await call({ op: 'exec', sql: 'REFRESH MATERIALIZED VIEW c IF CHANGED', params: [] })).kind).toBe('ok');
+    expect(n()).toBe(2);
+    db.exec('INSERT INTO t VALUES (3)');
+    const prep = await call({ op: 'prepare', sql: 'REFRESH MATERIALIZED VIEW c IF CHANGED' });
+    expect(prep.kind).toBe('ok');
+    expect((await call({ op: 'stmtRun', stmt: (prep as { stmt: number }).stmt })).kind).toBe('ok');
+    expect(n()).toBe(3);
   });
 });
 

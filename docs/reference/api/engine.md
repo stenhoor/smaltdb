@@ -95,7 +95,9 @@ Statements that read [external data](../../guide/external-data) (`read_csv`, `re
 |---|---|
 | `queryAsync(sql, params?, options?: { signal?: AbortSignal }): Promise<QueryResult>` | `query` that fetches external sources first. |
 | `runAsync(sql, params?, options?): Promise<RunResult>` | `run` that fetches external sources first. |
-| `execAsync(sql, params?, options?): Promise<void>` | `exec` that fetches external sources first, statement by statement. Also needed for `REFRESH MATERIALIZED VIEW … IF CHANGED`. |
+| `execAsync(sql, params?, options?): Promise<void>` | `exec` that fetches external sources first, statement by statement. |
+
+The three async methods also run `REFRESH MATERIALIZED VIEW … IF CHANGED`, which checks the view's sources before it refreshes; the synchronous ones fail with `SMALT_ASYNC_REQUIRED` for it.
 | `registerFile(name: string, file: FileSource \| null): void` | Make `file` readable as `file:<name>`. `FileSource` is `Blob \| Uint8Array \| ArrayBuffer \| string \| { getFile(): Promise<Blob> }`; a string is the file's text. `null` removes it. |
 | `registerCredentials(name: string, provider: CredentialProvider \| null): void` | Credentials a connection names. `CredentialProvider` has the fields of the client's [`CredentialsProvider`](./client#credentialsprovider); functions are called in this thread. |
 | `setFetch(fetchFn: FetchFn \| null): void` | Replace the transport for HTTP(S) and object store requests (default: the global `fetch`). |

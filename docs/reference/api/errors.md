@@ -252,7 +252,7 @@ SELECT * FROM read_csv('file:not-registered.csv');
 
 ## SMALT_ASYNC_REQUIRED
 
-Engine only. A synchronous call (`query`, `run`, `exec`, `Statement.run` …) was given a statement that reads external data, which must be fetched first. The client never raises it: the engine worker uses the async path.
+Engine only. A synchronous call (`query`, `run`, `exec`, `Statement.run` …) was given a statement that reads external data, which must be fetched first, or `REFRESH MATERIALIZED VIEW … IF CHANGED`, which checks its sources first. The client never raises it: the engine worker uses the async path.
 
 **Remedy:** use `queryAsync`, `runAsync` or `execAsync`. See the [engine API](./engine#external-data).
 

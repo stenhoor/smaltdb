@@ -424,8 +424,9 @@ export class EngineServer {
           try {
             r = d.run(req.sql, req.params as BindParams); // cached statement: the common case
           } catch (e) {
-            // It reads external data (M8): the attempt was rolled back; fetch, then run it.
-            if (!(e instanceof AsyncRequiredError)) throw e;
+            // It reads external data (M8), or is REFRESH … IF CHANGED: the attempt was rolled back;
+            // fetch (or check the sources), then run it.
+            if (!(e instanceof SmaltError && e.code === 'SMALT_ASYNC_REQUIRED')) throw e;
             r = await this.withAbort(session, id, (signal) => d.runAsync(req.sql, req.params as BindParams, { signal }));
           }
           this.send(session, { id, kind: 'ok', changes: r.changes, lastInsertRowid: r.lastInsertRowid });
@@ -536,8 +537,13 @@ export class EngineServer {
     }
   }
 
-  /** Whether `st` reads external tables or `read_csv` / `read_json` (M8): those run on the async path. */
+  /**
+   * Whether `st` reads external tables or `read_csv` / `read_json` (M8), or is `REFRESH … IF
+   * CHANGED` (which checks its view's sources first): those run on the async path.
+   */
   private readsExternal(st: Statement): boolean {
+    const s = st.parsed.stmt;
+    if (s.kind === 'refresh' && s.ifChanged) return true;
     try {
       return st.externalSources.length > 0;
     } catch (e) {

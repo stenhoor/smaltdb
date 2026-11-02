@@ -547,14 +547,14 @@ export class Database implements FunctionContext {
   async queryAsync(sql: string, params?: BindParams, options: { signal?: AbortSignal } = {}): Promise<QueryResult> {
     this.checkOpen();
     const st = this.prepare(sql);
-    return this.withExternal(options.signal, st, () => ({ columns: st.columns, rows: st.all(params) }));
+    return this.runExternal(options.signal, st, () => ({ columns: st.columns, rows: st.all(params) }));
   }
 
   /** `run` for a statement that may read external data. */
   async runAsync(sql: string, params?: BindParams, options: { signal?: AbortSignal } = {}): Promise<RunResult> {
     this.checkOpen();
     const st = this.prepare(sql);
-    return this.withExternal(options.signal, st, () => st.run(params));
+    return this.runExternal(options.signal, st, () => st.run(params));
   }
 
   /** `exec` for statements that may read external data (CREATE EXTERNAL TABLE, materialized views over it, …). */
@@ -564,19 +564,21 @@ export class Database implements FunctionContext {
     if (params !== undefined && stmts.length > 1) throw new MisuseError('parameters can only be bound with a single statement');
     for (const ps of stmts) {
       const st = new Statement(this, ps, ps.text);
-      const s = ps.stmt;
-      if (s.kind === 'refresh' && s.ifChanged) {
-        // Revalidate the view's sources first (HEAD requests, stats): the refresh runs only if needed.
-        const key = s.name.toLowerCase();
-        this.refreshDecisions.set(key, await this.matviewChanged(s.name, options.signal));
-        try {
-          await this.withExternal(options.signal, st, () => st.run(params));
-        } finally {
-          this.refreshDecisions.delete(key);
-        }
-        continue;
-      }
-      await this.withExternal(options.signal, st, () => st.run(params));
+      await this.runExternal(options.signal, st, () => st.run(params));
+    }
+  }
+
+  /** `withExternal` for the async API; `REFRESH … IF CHANGED` first checks its view's sources. */
+  private async runExternal<T>(signal: AbortSignal | undefined, st: Statement, run: () => T): Promise<T> {
+    const s = st.parsed.stmt;
+    if (s.kind !== 'refresh' || !s.ifChanged) return this.withExternal(signal, st, run);
+    // Revalidate the view's sources first (HEAD requests, stats): the refresh runs only if needed.
+    const key = s.name.toLowerCase();
+    this.refreshDecisions.set(key, await this.matviewChanged(s.name, signal));
+    try {
+      return await this.withExternal(signal, st, run);
+    } finally {
+      this.refreshDecisions.delete(key);
     }
   }
 

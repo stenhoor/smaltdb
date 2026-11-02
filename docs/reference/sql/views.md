@@ -156,7 +156,7 @@ SELECT * FROM product_totals ORDER BY product
 - the view is unpopulated, or a local table it reads changed since its last refresh; or
 - an [external](./external) source it read has changed. Each source's validator from the last refresh (an HTTP ETag or Last-Modified, a local file's modification time and size, a registered `File`'s `lastModified` and size) is checked with a HEAD request or a stat, not a download. A source without a validator, such as registered bytes or a `Blob`, always counts as changed.
 
-`IF CHANGED` needs the asynchronous API: `execAsync` in-process, or any call through the `smaltdb` client. With the synchronous engine API, or as the last statement passed to `queryAsync`/`runAsync`, it fails with `SMALT_ASYNC_REQUIRED`.
+`IF CHANGED` needs the asynchronous API: `execAsync`, `runAsync` or `queryAsync` in-process, or any call through the `smaltdb` client. With the synchronous engine API it fails with `SMALT_ASYNC_REQUIRED`.
 
 ```sql
 REFRESH MATERIALIZED VIEW daily_cache IF CHANGED;

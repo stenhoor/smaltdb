@@ -615,7 +615,7 @@ SELECT count(*) AS n FROM products_local;
 | --- |
 | 5 |
 
-`IF CHANGED` is asynchronous: run it with `db.exec()` in the worker client, or `execAsync()` in the in-process engine.
+`IF CHANGED` is asynchronous: any call through the worker client runs it; in the in-process engine, use `execAsync()`, `runAsync()` or `queryAsync()`.
 
 ### Refreshing automatically
 
