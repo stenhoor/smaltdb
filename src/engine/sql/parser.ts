@@ -353,11 +353,13 @@ class Parser {
         const pos = this.pos();
         this.p++;
         let target: string | undefined;
+        let schema: string | undefined;
         if (this.isNameAt(this.p)) {
           const q = this.qualifiedName();
-          target = q.schema !== undefined ? `${q.schema}.${q.name}` : q.name;
+          target = q.name;
+          schema = q.schema;
         }
-        return { kind: 'analyze', pos, target, end: this.ends[this.p - 1] };
+        return { kind: 'analyze', pos, target, schema, end: this.ends[this.p - 1] };
       }
       case 'VACUUM': {
         const pos = this.pos();

@@ -1053,7 +1053,7 @@ export class Database implements FunctionContext {
       case 'pragma':
         return done(this.compilePragma(stmt, planner));
       case 'analyze':
-        return done({ exec: () => this.analyze(stmt.target), readonly: false, columns: [], columnTypes: [] });
+        return done({ exec: () => this.analyze(stmt.target, stmt.schema), readonly: false, columns: [], columnTypes: [] });
       case 'refresh':
         return done({ exec: () => this.refreshMatview(stmt), readonly: false, columns: [], columnTypes: [] });
       default:
@@ -2156,22 +2156,27 @@ export class Database implements FunctionContext {
 
   private static readonly STAT_SQL = 'CREATE TABLE smalt_stat(tbl TEXT, idx TEXT, stat TEXT)';
 
-  /** ANALYZE [table]: gather optimizer statistics and store them in smalt_stat. */
-  private analyze(target: string | undefined): RunResult {
+  /** ANALYZE [schema | [schema.]table-or-index]: gather optimizer statistics and store them in smalt_stat. */
+  private analyze(target: string | undefined, schema?: string): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     // Main tables only (shadowed ones included): statistics are stored in the file, keyed by name.
     const mainTables = [...this.tables.values(), ...this.shadowedMain.values()].filter((t) => !t.temp);
     let tables = mainTables.filter((t) => !t.system && t.name.toLowerCase() !== 'smalt_stat' && !isColumnar(t));
+    const s = schema?.toLowerCase();
+    if (s !== undefined && s !== 'main' && s !== 'temp') throw new SmaltError('SMALT_ERROR', `unknown database ${schema}`);
+    // As in SQLite, a bare schema name analyzes that schema (TEMP tables are never analyzed).
+    if (s === undefined && target?.toLowerCase() === 'temp') return none;
+    if (s === undefined && target?.toLowerCase() === 'main') target = undefined;
     if (target) {
-      const t = this.getTable(target, 'main');
-      const idx = this.indexes.get(target.toLowerCase());
-      if (!t && this.tempTables.has(target.toLowerCase())) return none; // TEMP tables are not analyzed
+      const lower = target.toLowerCase();
+      const t = s === 'temp' ? undefined : this.getTable(target, 'main');
+      const idx = this.indexes.get(lower);
+      const idxOwner = idx && this.tables.get(idx.table.toLowerCase());
+      const tempTarget = this.tempTables.has(lower) || idxOwner?.temp === true;
+      if (!t && tempTarget && s !== 'main') return none; // TEMP tables are not analyzed
       if (t) tables = isColumnar(t) ? [] : [t];
-      else if (idx) {
-        const owner = this.tables.get(idx.table.toLowerCase())!;
-        tables = owner.temp ? [] : [owner];
-      }
-      else throw new SmaltError('SMALT_ERROR', `no such table or index: ${target}`);
+      else if (idxOwner && !idxOwner.temp && s !== 'temp') tables = [idxOwner];
+      else throw new SmaltError('SMALT_ERROR', `no such table or index: ${s ? `${schema}.` : ''}${target}`);
     }
     if (!this.tables.has('smalt_stat')) {
       this.createTable(parseOne(Database.STAT_SQL).stmt as CreateTableStmt, Database.STAT_SQL, true);

@@ -108,3 +108,21 @@ describe('temp. and main. qualifiers on CREATE; the TEMP catalog', () => {
     expect(d.query('WITH sqlite_temp_schema(n) AS (SELECT 5) SELECT n FROM sqlite_temp_schema').rows).toEqual([[5]]);
   });
 });
+
+describe('ANALYZE with a schema', () => {
+  it('accepts main., temp. and a bare schema name like SQLite', () => {
+    const d = mem();
+    d.exec('CREATE TABLE t(x); CREATE INDEX i ON t(x); INSERT INTO t VALUES (1), (2); CREATE TABLE u(y)');
+    d.exec('ANALYZE main.t');
+    expect(d.query('SELECT DISTINCT tbl FROM smalt_stat').rows).toEqual([['t']]);
+    d.exec('ANALYZE main.i; ANALYZE temp');
+    expect(d.query('SELECT DISTINCT tbl FROM smalt_stat').rows).toEqual([['t']]);
+    d.exec('ANALYZE main');
+    expect(d.query('SELECT DISTINCT tbl FROM smalt_stat ORDER BY 1').rows).toEqual([['t'], ['u']]);
+    d.exec('CREATE TEMP TABLE tt(x); CREATE INDEX ti ON tt(x); ANALYZE temp.tt; ANALYZE temp.ti');
+    expect(() => d.exec('ANALYZE nope.t')).toThrow('unknown database nope');
+    expect(() => d.exec('ANALYZE main.nope')).toThrow('no such table or index: main.nope');
+    expect(() => d.exec('ANALYZE main.tt')).toThrow('no such table or index: main.tt');
+    expect(() => d.exec('ANALYZE temp.t')).toThrow('no such table or index: temp.t');
+  });
+});

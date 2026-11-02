@@ -547,7 +547,9 @@ export interface PragmaStmt extends Node {
 
 export interface AnalyzeStmt extends Node {
   kind: 'analyze';
+  /** A schema (`main`, `temp`) or a table or index name. */
   target?: string;
+  schema?: string;
 }
 
 export interface VacuumStmt extends Node {

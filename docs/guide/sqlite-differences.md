@@ -158,7 +158,6 @@ These are rejected. Statements the parser does not know fail with a syntax error
 | application-defined functions and collations | no API | |
 | `EXPLAIN` of statements other than `SELECT` | `SMALT_UNSUPPORTED` | |
 | `EXPLAIN` bytecode listing | plain `EXPLAIN` returns the query plan | |
-| `ANALYZE main.t` (schema-qualified) | `no such table or index` | `ANALYZE t` |
 | most `PRAGMA`s (`user_version`, `cache_size`, `busy_timeout`, `synchronous`, …) | `SMALT_UNSUPPORTED` | [open options](./databases) |
 
 <!-- docs:error SMALT_UNSUPPORTED -->
