@@ -15,7 +15,7 @@ The examples use this table:
 ```sql
 CREATE TABLE visit(id INTEGER PRIMARY KEY, page TEXT, ms INTEGER);
 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n LIMIT 2000)
-INSERT INTO visit SELECT i, '/p' || (i % 40), i % 300 FROM n;
+INSERT INTO visit SELECT i, '/p' || (i % 500), i % 300 FROM n;
 CREATE INDEX visit_page ON visit(page);
 ```
 
@@ -87,8 +87,8 @@ A run of this example gave (times vary):
 
 ```text
 id | parent | detail                                   | est_rows | loops | rows | time_ms
- 1 |      0 | PROJECT                                  | NULL     |     1 |   50 | 0.4
- 2 |      1 | SEARCH visit USING INDEX visit_page (=?) | 50       |     1 |   50 | 0.35
+ 1 |      0 | PROJECT                                  | NULL     |     1 |    4 | 0.815
+ 2 |      1 | SEARCH visit USING INDEX visit_page (=?) | 4        |     1 |    4 | 0.696
 ```
 
 `EXPLAIN ANALYZE` is a smaltdb extension; SQLite has no equivalent statement. `EXPLAIN ANALYZE name` without a query is `EXPLAIN` of the statement `ANALYZE name`, which is not supported (see below).
@@ -104,7 +104,7 @@ EXPLAIN QUERY PLAN UPDATE visit SET ms = 0 WHERE id = 1
 
 ## ANALYZE
 
-`ANALYZE` counts rows, distinct values and NULLs per column and per index, and stores them. The cost-based planner uses them to choose indexes and join orders. Without statistics it uses fixed guesses.
+`ANALYZE` counts rows, distinct values and NULLs per column and per index, and stores them. The cost-based planner uses them to choose indexes and join orders. Without them it estimates from the size of the B+trees and from a sample of the table.
 
 | Form | Analyzes |
 | --- | --- |
