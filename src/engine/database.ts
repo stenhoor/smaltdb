@@ -3215,7 +3215,13 @@ export class Database implements FunctionContext {
     }
     const table = this.targetTable(stmt.table, stmt.schema);
     const ncols = table.columns.length;
-    const targets: number[] = stmt.columns
+    if (stmt.source.kind === 'default' && stmt.columns) {
+      throw new SmaltError('SMALT_ERROR', `0 values for ${stmt.columns.length} columns`);
+    }
+    // DEFAULT VALUES supplies no values: every column takes its default.
+    const targets: number[] = stmt.source.kind === 'default'
+      ? []
+      : stmt.columns
       ? stmt.columns.map((name) => {
           const i = findColumn(table, name);
           if (i < 0) {

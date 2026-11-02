@@ -675,7 +675,8 @@ class Parser {
       }
     }
     const upsert: A.UpsertClause[] = [];
-    while (this.isKw('ON') && this.kws[this.p + 1] === 'CONFLICT') upsert.push(this.upsertClause());
+    // SQLite's grammar has no upsert clause after DEFAULT VALUES.
+    while (source.kind !== 'default' && this.isKw('ON') && this.kws[this.p + 1] === 'CONFLICT') upsert.push(this.upsertClause());
     const returning = this.optReturning();
     return { kind: 'insert', pos, with: w, or, schema: q.schema, table: q.name, alias, columns, source, upsert, returning, end: this.ends[this.p - 1] };
   }

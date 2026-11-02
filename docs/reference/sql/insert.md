@@ -52,11 +52,23 @@ Errors: `table stock has 3 columns but 1 values were supplied`, `table stock has
 
 `DEFAULT` as a value inside `VALUES` (`VALUES (DEFAULT)`) is a syntax error, as in SQLite; leave the column out of the column list instead.
 
-::: warning DEFAULT VALUES
-`INSERT INTO t DEFAULT VALUES` is parsed but currently fails instead of inserting a row of defaults (a known engine bug). Name at least one column instead: `INSERT INTO t(qty) VALUES (0)`.
-:::
+## DEFAULT VALUES
 
-<!-- docs:error SMALT_MISMATCH -->
+`DEFAULT VALUES` inserts one row in which every column gets its `DEFAULT` (or NULL), and the rowid is assigned as above. It takes no column list (`0 values for 1 columns`, `SMALT_ERROR`) and, as in SQLite, no upsert clause; `OR` conflict actions and `RETURNING` work.
+
+```sql
+CREATE TABLE tick(id INTEGER PRIMARY KEY, n INTEGER DEFAULT 0);
+INSERT INTO tick DEFAULT VALUES;
+INSERT INTO tick DEFAULT VALUES RETURNING *
+```
+
+| id | n |
+| --- | --- |
+| 2 | 0 |
+
+Constraints still apply: `stock` has `sku TEXT NOT NULL` without a default.
+
+<!-- docs:error SMALT_CONSTRAINT_NOTNULL -->
 ```sql
 INSERT INTO stock DEFAULT VALUES
 ```

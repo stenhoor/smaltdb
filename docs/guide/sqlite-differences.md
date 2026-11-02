@@ -147,7 +147,6 @@ These are rejected. Statements the parser does not know fail with a syntax error
 | generated columns | `SMALT_UNSUPPORTED` | compute in queries or views |
 | `CREATE TABLE … AS SELECT` | `SMALT_UNSUPPORTED` | `CREATE TABLE`, then `INSERT … SELECT` |
 | `LOOSE` (dynamic typing) | `SMALT_UNSUPPORTED` | `ANY` columns |
-| `INSERT … DEFAULT VALUES` | fails with an error (engine bug) | name one column with its default |
 | `WITH … INSERT … VALUES` | `SMALT_UNSUPPORTED` | `WITH … INSERT … SELECT` |
 | `UPDATE` / `DELETE` with `ORDER BY` or `LIMIT` | `SMALT_UNSUPPORTED` | `WHERE rowid IN (SELECT rowid … LIMIT n)` |
 | row values: `(a, b) = (1, 2)`, `SET (a, b) = …` | syntax error / `SMALT_UNSUPPORTED` | separate terms |
