@@ -39,3 +39,22 @@ describe('INSERT ... DEFAULT VALUES', () => {
     expect(await errorOf(() => d.exec('INSERT INTO n DEFAULT VALUES'))).toEqual({ code: 'SMALT_CONSTRAINT_NOTNULL', message: 'NOT NULL constraint failed: n.x' });
   });
 });
+
+describe('external table option "null"', () => {
+  it('stores re-parseable SQL for inferred columns; keyword keys parse; old stored text still opens', async () => {
+    const vfs = new MemoryVfs();
+    let db = await Database.open(vfs, 'db');
+    db.registerFile('x.csv', 'a,b\n1,NA\n2,z\n');
+    await db.execAsync(`CREATE EXTERNAL TABLE p WITH (location='file:x.csv', "null"='NA')`);
+    expect(db.query("SELECT sql FROM sqlite_schema WHERE name = 'p'").rows).toEqual([[`CREATE EXTERNAL TABLE "p" ("a" INTEGER, "b" TEXT) WITH (location = 'file:x.csv', "null" = 'NA')`]]);
+    await db.execAsync(`CREATE EXTERNAL TABLE p2 WITH (location='file:x.csv', null='NA')`);
+    // The text earlier versions stored for p (an unquoted keyword key).
+    await db.execAsync(`CREATE EXTERNAL TABLE p3 ("a" INTEGER, "b" TEXT) WITH (location = 'file:x.csv', null = 'NA')`);
+    db.exec('CREATE TABLE q(x)');
+    db.close();
+    db = await Database.open(vfs, 'db');
+    db.registerFile('x.csv', 'a,b\n1,NA\n2,z\n');
+    for (const t of ['p', 'p2', 'p3']) expect((await db.queryAsync(`SELECT * FROM ${t}`)).rows).toEqual([[1, null], [2, 'z']]);
+    db.exec('CREATE TABLE q2(x)');
+  });
+});

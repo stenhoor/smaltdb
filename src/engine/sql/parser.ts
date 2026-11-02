@@ -905,12 +905,15 @@ class Parser {
     return { kind: 'createExternalTable', pos, ifNotExists, name: q.name, columns, with: w, end: this.ends[this.p - 1] };
   }
 
-  /** smaltdb `( key = literal, ... )` storage options (after WITH). Keys are lower-cased. */
+  /**
+   * smaltdb `( key = literal, ... )` storage options (after WITH). Keys are lower-cased; a key may
+   * be a keyword (`null = 'NA'`), as option names are not column names.
+   */
   private withOptions(): Record<string, SqlValue> {
     const out: Record<string, SqlValue> = {};
     this.expectOp('(');
     do {
-      const key = this.name().toLowerCase();
+      const key = (this.kinds[this.p] === TK_KW ? this.src.slice(this.starts[this.p], this.ends[this.p++]) : this.name()).toLowerCase();
       this.expectOp('=');
       out[key] = this.optionValue().value;
     } while (this.acceptOp(','));

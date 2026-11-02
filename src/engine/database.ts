@@ -70,7 +70,7 @@ import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordEncoder, RecordReader } from './storage/record.js';
 import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec/stats.js';
 import { type CatalogSnapshot, informationSchema } from './catalog/information-schema.js';
-import { type SchemaLookup, applyEdits, renameColumnEdits, renameTableEdits } from './catalog/alter.js';
+import { type SchemaLookup, applyEdits, quoteIdent as quoteIdentIfNeeded, renameColumnEdits, renameTableEdits } from './catalog/alter.js';
 import { ForeignKeys } from './exec/fk.js';
 import { Collation, type SqlValue } from './values.js';
 import type { Vfs, VfsFile } from './vfs/types.js';
@@ -2327,7 +2327,7 @@ export class Database implements FunctionContext {
       if (data.columns.length === 0) throw externalError(source, 'no columns found (the source is empty)');
       columns = data.columns.map((c) => ({ name: c.name, declType: c.declType || 'ANY' }));
       const cols = columns.map((c) => `${quoteIdent(c.name)} ${c.declType}`).join(', ');
-      const opts = Object.entries(stmt.with).map(([k, v]) => `${k} = ${sqlLiteral(v)}`).join(', ');
+      const opts = Object.entries(stmt.with).map(([k, v]) => `${quoteIdentIfNeeded(k)} = ${sqlLiteral(v)}`).join(', ');
       text = `CREATE EXTERNAL TABLE ${quoteIdent(stmt.name)} (${cols}) WITH (${opts})`;
     }
     this.dirtySchema = true;
