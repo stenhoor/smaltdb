@@ -88,7 +88,7 @@ What each feature needs from the browser, from the client and worker code:
 | Feature | Needs | Without it |
 |---|---|---|
 | The engine | Module workers (`new Worker(url, { type: 'module' })`) | smaltdb does not run. |
-| Persistent storage (`storage: 'opfs'`, the default) | OPFS with `FileSystemSyncAccessHandle` in dedicated workers | `open()` fails. Use `storage: 'memory'`, which needs no OPFS. |
+| Persistent storage (`storage: 'opfs'`, the default) | OPFS with `FileSystemSyncAccessHandle` in dedicated workers | `open()` fails with `SMALT_CANTOPEN`. Use `storage: 'memory'`, which needs no OPFS. |
 | Sharing one database between tabs | Web Locks (`navigator.locks`) and `BroadcastChannel` | Each `open()` owns the file alone; a second tab that opens it fails with `SMALT_BUSY`. |
 | Stopping a statement that is already running (`signal`) | A cross-origin isolated page (`crossOriginIsolated` and `SharedArrayBuffer`) | Aborting still removes queued requests and closes streams, but a running statement runs to the end. See [cancellation](./queries#cancellation). |
 | Parallel reader workers | Multi-tab access, OPFS sync handles with `mode: 'readwrite-unsafe'`, and more than one CPU core | Reads run on the owning engine worker. |
@@ -122,7 +122,7 @@ Storage in Node:
 
 - `Database.openMemory()` gives an in-memory database.
 - `Database.open(new MemoryVfs(), 'app.db')` gives a file-format database whose files live in the `MemoryVfs` object, in process memory.
-- `OpfsVfs` needs OPFS, which Node does not have.
+- `OpfsVfs` needs OPFS, which Node does not have: opening a file with it rejects with `SMALT_CANTOPEN`.
 - smaltdb ships no VFS for the Node file system. To persist to disk, implement the `Vfs` interface (see [the engine API](../reference/api/engine#vfs)).
 
 Reading Parquet files needs the optional `hyparquet` package in Node (`npm install hyparquet`), plus `hyparquet-compressors` for codecs other than Snappy. The browser worker in `dist/` already contains the Parquet reader. See [external data](./external-data).

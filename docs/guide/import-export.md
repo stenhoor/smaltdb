@@ -20,7 +20,7 @@ Both imports:
 - are all or nothing: if a row fails, every row of the import is rolled back and the call rejects. The error has the code of the underlying failure, and the message names the CSV line or JSON item, for example `CSV line 3: NOT NULL constraint failed: people.name`;
 - resolve to `{ rows }`, the number of rows inserted.
 
-If a transaction opened with SQL `BEGIN` is open, the import runs inside it and commits or rolls back with it. Do not call the import methods inside a [`db.transaction()`](./transactions#what-waits-for-a-transaction) callback: they wait for the transaction to end.
+If a transaction opened with SQL `BEGIN` is open, the import runs inside it, in a savepoint: if a row fails, the import's rows (and a table it created) are rolled back, the transaction stays open with your earlier statements, and it commits or rolls back with the rest of the transaction. Do not call the import methods inside a [`db.transaction()`](./transactions#what-waits-for-a-transaction) callback: they wait for the transaction to end.
 
 Column names are matched to the table's columns without regard to case. Columns the data does not mention take their `DEFAULT` (or NULL).
 
@@ -66,7 +66,7 @@ await db.importCSV('scores', 'player,points,ratio\nann,12,0.5\nbob,7,\n', { crea
 // CREATE TABLE "scores"("player" TEXT, "points" INTEGER, "ratio" REAL)
 ```
 
-The created table has no primary key or constraints. Create the table yourself when you need them. If the import then fails, its rows are rolled back but the created table stays, empty.
+The created table has no primary key or constraints. Create the table yourself when you need them. The table is created in the import's transaction: if the import fails, the table is removed again with its rows.
 
 ## importJSON
 
@@ -95,19 +95,19 @@ Accepted input:
 | JSON | SQL |
 |---|---|
 | `null` | NULL |
-| number | INTEGER if it has an integer value (so `1.0` is `1`), else REAL; then converted to the column's type |
+| number | An integer written without fraction or exponent is INTEGER if it fits in 64 bits, exactly, also beyond 2^53; beyond 64 bits it is REAL, as in SQLite. Another number is INTEGER if it has an integer value below 2^53 in magnitude (so `1.0` is `1`), else REAL. Then converted to the column's type |
 | string | TEXT, then converted to the column's type |
 | `true` / `false` | `1` / `0` |
 | array or object | TEXT holding its JSON |
 
-Numbers go through `JSON.parse`, so integers beyond 2^53 lose precision before they reach the engine. Write such values as JSON strings and import them into a `TEXT` column.
+Input with a run of 16 or more digits (an integer that `JSON.parse` could round) is read by a slower parser that keeps such integers exact; other input goes through `JSON.parse` alone. Nested arrays and objects keep their exact integers in the stored JSON text.
 
 ```ts
 await db.importJSON('events', '{"id": 3, "kind": "click"}\n{"id": 4, "kind": "view"}\n'); // NDJSON
 await db.importJSON('events', '[[5, "click"]]', { columns: ['id', 'kind'] }); // arrays
 ```
 
-Mixing objects and arrays in one input fails with `SMALT_ERROR`.
+Mixing objects and arrays in one input fails with `SMALT_ERROR`, as does any other kind of item. The message names the first offending item, for example `JSON item 1: expected an object or an array, found a number (…)` for `[1, 2]`, or `JSON item 3: expected an object like JSON item 1, found an array (…)`.
 
 ## exportCSV
 

@@ -117,7 +117,8 @@ export function inferType(values: SqlValue[]): string {
     if (v === null) continue;
     any = true;
     if (typeof v === 'number' || typeof v === 'bigint') {
-      if (typeof v === 'number' && !Number.isInteger(v)) type = 'REAL';
+      // Integers come as safe numbers or bigints; other numbers (1.5, 1e20) are REAL.
+      if (typeof v === 'number' && !Number.isSafeInteger(v)) type = 'REAL';
       continue;
     }
     if (typeof v !== 'string') return 'ANY';
@@ -143,8 +144,29 @@ export function numericOrText(s: string): SqlValue {
   return s;
 }
 
-/** Insert rows (values per target column) into `table` in one transaction. */
+/**
+ * Insert rows (values per target column) into `table` in one transaction, or in a savepoint of the
+ * caller's open transaction: on failure nothing is left behind, including a table it created.
+ */
 function load(db: Database, table: string, columns: string[], rows: Iterable<{ values: SqlValue[]; where: string; present?: boolean[] }>, create: boolean, sample: SqlValue[][]): number {
+  const own = !db.inTransaction;
+  db.exec(own ? 'BEGIN' : 'SAVEPOINT smaltdb_import');
+  try {
+    const n = loadRows(db, table, columns, rows, create, sample);
+    db.exec(own ? 'COMMIT' : 'RELEASE smaltdb_import');
+    return n;
+  } catch (e) {
+    if (own) {
+      if (db.inTransaction) db.exec('ROLLBACK');
+    } else {
+      db.exec('ROLLBACK TO smaltdb_import');
+      db.exec('RELEASE smaltdb_import');
+    }
+    throw e;
+  }
+}
+
+function loadRows(db: Database, table: string, columns: string[], rows: Iterable<{ values: SqlValue[]; where: string; present?: boolean[] }>, create: boolean, sample: SqlValue[][]): number {
   let t = db.getTable(table);
   if (!t) {
     if (!create) throw new SmaltError('SMALT_ERROR', `no such table: ${table}`);
@@ -172,25 +194,17 @@ function load(db: Database, table: string, columns: string[], rows: Iterable<{ v
     }
     return { st, pick };
   };
-  const own = !db.inTransaction;
-  if (own) db.exec('BEGIN');
   let n = 0;
-  try {
-    for (const r of rows) {
-      const vals = r.values.map((v, i) => (loose[i] && typeof v === 'string' ? numericOrText(v) : v));
-      const { st, pick } = stmtFor(r.present);
-      try {
-        st.run(pick.map((k) => vals[k]));
-      } catch (e) {
-        const err = e as SmaltError;
-        throw new SmaltError(err.code ?? 'SMALT_ERROR', `${r.where}: ${err.message}`);
-      }
-      n++;
+  for (const r of rows) {
+    const vals = r.values.map((v, i) => (loose[i] && typeof v === 'string' ? numericOrText(v) : v));
+    const { st, pick } = stmtFor(r.present);
+    try {
+      st.run(pick.map((k) => vals[k]));
+    } catch (e) {
+      const err = e as SmaltError;
+      throw new SmaltError(err.code ?? 'SMALT_ERROR', `${r.where}: ${err.message}`);
     }
-    if (own) db.exec('COMMIT');
-  } catch (e) {
-    if (own && db.inTransaction) db.exec('ROLLBACK');
-    throw e;
+    n++;
   }
   return n;
 }
@@ -236,9 +250,126 @@ export function importCSV(db: Database, table: string, text: string, opts: CsvIm
 export function jsonValue(v: unknown): SqlValue {
   if (v === null || v === undefined) return null;
   if (typeof v === 'boolean') return v ? 1 : 0;
-  if (typeof v === 'number' || typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'string' || typeof v === 'bigint') return v;
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return stringifyExact(v); // holds bigints
+  }
+}
+
+/** JSON.stringify that writes bigints (from parseJson) as their exact digits. */
+function stringifyExact(v: unknown): string {
+  if (typeof v === 'bigint') return v.toString();
+  if (Array.isArray(v)) return '[' + v.map(stringifyExact).join(',') + ']';
+  if (v !== null && typeof v === 'object') return '{' + Object.entries(v).map(([k, x]) => JSON.stringify(k) + ':' + stringifyExact(x)).join(',') + '}';
   return JSON.stringify(v);
 }
+
+const INT64_MIN = -(BigInt(2) ** BigInt(63));
+const INT64_MAX = BigInt(2) ** BigInt(63) - BigInt(1);
+/** A 16-digit run: only then can the text hold an integer that JSON.parse would round (2^53 has 16 digits). */
+const LONG_DIGITS = /\d{16}/;
+const JSON_NUMBER = /-?(?:0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?/y;
+
+/**
+ * JSON.parse, except that integers beyond ±(2^53 − 1) keep their exact value as bigints (as
+ * SQLite reads them) when they fit in 64 bits; larger ones become REAL numbers, as in SQLite.
+ * Text without a 16-digit run takes JSON.parse alone.
+ */
+export function parseJson(text: string): unknown {
+  const value = JSON.parse(text); // validates (and reports errors as JSON.parse does)
+  return LONG_DIGITS.test(text) ? parseValidJson(text) : value;
+}
+
+/** A parser for text that JSON.parse accepted, reading integers exactly. */
+function parseValidJson(text: string): unknown {
+  let i = 0;
+  const ws = (): void => {
+    for (;;) {
+      const c = text.charCodeAt(i);
+      if (c === 0x20 || c === 0x0a || c === 0x0d || c === 0x09) i++;
+      else return;
+    }
+  };
+  const str = (): string => {
+    const start = i++;
+    let escaped = false;
+    for (;;) {
+      const c = text.charCodeAt(i++);
+      if (c === 0x22) break;
+      if (c === 0x5c) {
+        escaped = true;
+        i++;
+      }
+    }
+    return escaped ? (JSON.parse(text.slice(start, i)) as string) : text.slice(start + 1, i - 1);
+  };
+  const num = (): number | bigint => {
+    JSON_NUMBER.lastIndex = i;
+    const m = JSON_NUMBER.exec(text)!;
+    i += m[0].length;
+    if (m[1] !== undefined || m[2] !== undefined) return Number(m[0]);
+    const n = Number(m[0]);
+    if (Number.isSafeInteger(n)) return n;
+    const b = BigInt(m[0]);
+    return b >= INT64_MIN && b <= INT64_MAX ? b : n;
+  };
+  const value = (): unknown => {
+    ws();
+    const c = text[i];
+    if (c === '{') {
+      i++;
+      const o: Record<string, unknown> = {};
+      ws();
+      if (text[i] === '}') {
+        i++;
+        return o;
+      }
+      for (;;) {
+        ws();
+        const k = str();
+        ws();
+        i++; // ':'
+        // Like JSON.parse: an own property even for "__proto__".
+        Object.defineProperty(o, k, { value: value(), writable: true, enumerable: true, configurable: true });
+        ws();
+        if (text[i++] === '}') return o;
+      }
+    }
+    if (c === '[') {
+      i++;
+      const a: unknown[] = [];
+      ws();
+      if (text[i] === ']') {
+        i++;
+        return a;
+      }
+      for (;;) {
+        a.push(value());
+        ws();
+        if (text[i++] === ']') return a;
+      }
+    }
+    if (c === '"') return str();
+    if (c === 't') {
+      i += 4;
+      return true;
+    }
+    if (c === 'f') {
+      i += 5;
+      return false;
+    }
+    if (c === 'n') {
+      i += 4;
+      return null;
+    }
+    return num();
+  };
+  return value();
+}
+
+const kindOf = (v: unknown): string => (v === null ? 'null' : Array.isArray(v) ? 'an array' : typeof v === 'object' ? 'an object' : typeof v === 'string' ? 'a string' : typeof v === 'boolean' ? 'a boolean' : 'a number');
 
 export function importJSON(db: Database, table: string, text: string, opts: JsonImportOptions = {}): { rows: number } {
   const body = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
@@ -247,7 +378,7 @@ export function importJSON(db: Database, table: string, text: string, opts: Json
   if (trimmed.startsWith('[')) {
     let arr: unknown;
     try {
-      arr = JSON.parse(body);
+      arr = parseJson(body);
     } catch (e) {
       throw new SmaltError('SMALT_ERROR', `invalid JSON: ${(e as Error).message}`);
     }
@@ -258,14 +389,21 @@ export function importJSON(db: Database, table: string, text: string, opts: Json
     body.split(/\r?\n/).forEach((l, i) => {
       if (l.trim() === '') return;
       try {
-        items.push({ value: JSON.parse(l), where: `NDJSON line ${i + 1}` });
+        items.push({ value: parseJson(l), where: `NDJSON line ${i + 1}` });
       } catch (e) {
         throw new SmaltError('SMALT_ERROR', `NDJSON line ${i + 1}: ${(e as Error).message}`);
       }
     });
   }
   if (items.length === 0) return { rows: 0 };
-  const objects = items.every((x) => x.value !== null && typeof x.value === 'object' && !Array.isArray(x.value));
+  // All objects or all arrays: say which item breaks the pattern set by the first one.
+  const firstKind = kindOf(items[0].value);
+  for (const x of items) {
+    const kind = kindOf(x.value);
+    if (kind !== 'an object' && kind !== 'an array') throw new SmaltError('SMALT_ERROR', `${x.where}: expected an object or an array, found ${kind} (JSON import expects an array of objects or of arrays, or NDJSON lines of either)`);
+    if (kind !== firstKind) throw new SmaltError('SMALT_ERROR', `${x.where}: expected ${firstKind} like ${items[0].where}, found ${kind} (all items must be objects or all arrays)`);
+  }
+  const objects = firstKind === 'an object';
   let columns: string[];
   if (objects) {
     // Union of keys in first-seen order; a row's missing keys take the column's DEFAULT.
@@ -273,7 +411,6 @@ export function importJSON(db: Database, table: string, text: string, opts: Json
     for (const x of items) for (const k of Object.keys(x.value as object)) if (!seen.has(k.toLowerCase())) seen.set(k.toLowerCase(), k);
     columns = [...seen.values()];
   } else {
-    if (!items.every((x) => Array.isArray(x.value))) throw new SmaltError('SMALT_ERROR', 'JSON import expects objects or arrays (not a mix)');
     const t = db.getTable(table);
     columns = opts.columns ?? t?.columns.map((c) => c.name) ?? [];
     if (!columns.length) throw new SmaltError('SMALT_ERROR', `no such table: ${table} (give columns to create it)`);

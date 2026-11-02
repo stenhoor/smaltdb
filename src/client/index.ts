@@ -148,6 +148,26 @@ export interface Queryable {
   exec(sql: string, params?: Params, options?: { signal?: AbortSignal }): Promise<RunResult>;
 }
 
+/**
+ * The `tx` handle of `db.transaction()`: everything it runs is part of the transaction. It works
+ * only while the callback runs; afterwards its methods reject with SMALT_MISUSE.
+ */
+export interface Transaction extends Queryable {
+  /** Stream a query's result inside the transaction (see Database.stream). */
+  stream<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(sql: string, params?: Params, options?: StreamOptions & { rowMode?: M }): AsyncIterableIterator<QueryResultFor<M, T>>;
+  /** Run a statement prepared with `db.prepare()` (before the transaction) inside the transaction. */
+  statement(stmt: PreparedStatement): TransactionStatement;
+}
+
+/** A prepared statement used through a transaction handle: `tx.statement(stmt)`. */
+export interface TransactionStatement {
+  readonly columns: string[];
+  readonly paramCount: number;
+  query<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params, options?: QueryOptions & { rowMode?: M }): Promise<QueryResultFor<M, T>>;
+  stream<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params, options?: StreamOptions & { rowMode?: M }): AsyncIterableIterator<QueryResultFor<M, T>>;
+  run(params?: Params, options?: { signal?: AbortSignal }): Promise<RunResult>;
+}
+
 /** Where requests go: this tab's engine worker, or another tab's over a BroadcastChannel. */
 interface Link {
   send(req: Request): void;
@@ -351,7 +371,8 @@ export class Database implements Queryable {
     this.link!.send({ id: 0, op: 'cancel', target: id });
   }
 
-  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
+  /** @internal Run `fn` after earlier writes and transactions of this client, holding back later ones. */
+  async withLock<T>(fn: () => Promise<T>): Promise<T> {
     const prev = this.lock;
     let release!: () => void;
     this.lock = new Promise((r) => (release = r));
@@ -388,7 +409,8 @@ export class Database implements Queryable {
     return this.afterTransaction(() => this.rawQuery(sql, params, options)) as Promise<QueryResultFor<M, T>>;
   }
 
-  private async afterTransaction<T>(fn: () => Promise<T>): Promise<T> {
+  /** @internal Run `fn` once this client's running transaction (if any) has ended. */
+  async afterTransaction<T>(fn: () => Promise<T>): Promise<T> {
     while (this.txRunning) await this.txRunning;
     return fn();
   }
@@ -402,18 +424,18 @@ export class Database implements Queryable {
    * Stream a query's result in batches: `for await (const rows of db.stream(sql)) …`. The engine
    * sends at most `highWaterMark` batches ahead and pauses until they are consumed; leaving the
    * loop early closes the result. While a stream is open, this tab's writes fail with SMALT_BUSY
-   * (other tabs' writes wait); reads continue.
+   * (other tabs' writes wait); reads continue. Like `query`, it starts after a running transaction.
    */
   stream<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(
     sql: string,
     params?: Params,
     options: StreamOptions & { rowMode?: M } = {},
   ): AsyncIterableIterator<QueryResultFor<M, T>> {
-    return this.openStream({ op: 'query', sql, params, batchSize: options.batchSize }, options) as AsyncIterableIterator<QueryResultFor<M, T>>;
+    return this.openStream({ op: 'query', sql, params, batchSize: options.batchSize }, options, true) as AsyncIterableIterator<QueryResultFor<M, T>>;
   }
 
-  /** @internal */
-  openStream(body: RequestBody, options: StreamOptions): AsyncIterableIterator<unknown> {
+  /** @internal `waitForTransaction`: send the request only once this client's running transaction has ended. */
+  openStream(body: RequestBody, options: StreamOptions, waitForTransaction = false): AsyncIterableIterator<unknown> {
     const hwm = Math.max(1, options.highWaterMark ?? 4);
     const mode = options.rowMode ?? 'object';
     const ready: unknown[] = [];
@@ -425,22 +447,28 @@ export class Database implements Queryable {
       wake?.();
       wake = null;
     };
-    const req = this.request({ ...body, credit: hwm } as RequestBody, options.signal, (msg) => {
-      if (msg.kind === 'columns') columns = msg.columns;
-      else if (msg.kind === 'batch') ready.push(materialize(columns, [{ length: msg.length, cols: msg.cols }], mode));
-      else if (msg.kind === 'done') finished = true;
-      else if (msg.kind === 'error') {
+    let id = -1;
+    const start = (): void => {
+      if (finished) return; // closed before it started
+      const req = this.request({ ...body, credit: hwm } as RequestBody, options.signal, (msg) => {
+        if (msg.kind === 'columns') columns = msg.columns;
+        else if (msg.kind === 'batch') ready.push(materialize(columns, [{ length: msg.length, cols: msg.cols }], mode));
+        else if (msg.kind === 'done') finished = true;
+        else if (msg.kind === 'error') {
+          finished = true;
+          failure = new SmaltdbError(msg.code, msg.message);
+        }
+        notify();
+      });
+      req.catch((e) => {
         finished = true;
-        failure = new SmaltdbError(msg.code, msg.message);
-      }
-      notify();
-    });
-    req.catch((e) => {
-      finished = true;
-      failure = e;
-      notify();
-    });
-    const id = req.id;
+        failure = e;
+        notify();
+      });
+      id = req.id;
+    };
+    if (waitForTransaction && this.txRunning) void this.afterTransaction(async () => start());
+    else start();
     const it: AsyncIterableIterator<unknown> = {
       [Symbol.asyncIterator]: () => it,
       next: async () => {
@@ -458,7 +486,7 @@ export class Database implements Queryable {
       return: async () => {
         if (!finished) {
           finished = true;
-          this.cancel(id);
+          if (id >= 0) this.cancel(id);
         }
         return { value: undefined, done: true };
       },
@@ -560,10 +588,12 @@ export class Database implements Queryable {
   }
 
   /**
-   * Run `fn` in a transaction: COMMIT on success, ROLLBACK if it throws. Other calls on this
-   * Database wait until the transaction finishes.
+   * Run `fn` in a transaction: COMMIT on success, ROLLBACK if it throws. Every other call on this
+   * Database and its prepared statements waits until the transaction finishes: run statements through
+   * `tx`. If `fn` ends the transaction itself, a COMMIT stands (the promise resolves) and a ROLLBACK
+   * rejects the promise with SMALT_ERROR.
    */
-  transaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
+  transaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T> {
     return this.withLock(async () => {
       let done!: () => void;
       this.txRunning = new Promise<void>((r) => (done = r));
@@ -576,22 +606,44 @@ export class Database implements Queryable {
     });
   }
 
-  private async runTransaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
-    {
-      await this.rawExec('BEGIN', undefined);
-      const tx: Queryable = {
-        query: (sql, params, options = {}) => this.rawQuery(sql, params, options) as never,
-        exec: (sql, params) => this.rawExec(sql, params),
-      };
-      try {
-        const result = await fn(tx);
-        await this.rawExec('COMMIT', undefined);
-        return result;
-      } catch (e) {
-        await this.rawExec('ROLLBACK', undefined).catch(() => undefined);
-        throw e;
-      }
+  private async runTransaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T> {
+    await this.rawExec('BEGIN', undefined);
+    let active = true;
+    const ended = (): SmaltdbError => new SmaltdbError('SMALT_MISUSE', 'the transaction has ended: use tx only while the transaction callback runs');
+    const tx: Transaction = {
+      query: (sql, params, options = {}) => (active ? this.rawQuery(sql, params, options) : Promise.reject(ended())) as never,
+      exec: (sql, params, options = {}) => (active ? this.rawExec(sql, params, options.signal) : Promise.reject(ended())),
+      stream: (sql, params, options = {}) => (active ? this.openStream({ op: 'query', sql, params, batchSize: options.batchSize }, options) : failingIterator(ended())) as never,
+      statement: (stmt) => {
+        if (stmt.db !== this) throw new SmaltdbError('SMALT_MISUSE', 'the statement was prepared on another Database');
+        return {
+          columns: stmt.columns,
+          paramCount: stmt.paramCount,
+          query: (params, options = {}) => (active ? stmt.rawQuery(params, options) : Promise.reject(ended())) as never,
+          stream: (params, options = {}) => (active ? stmt.rawStream(params, options) : failingIterator(ended())) as never,
+          run: (params, options = {}) => (active ? stmt.rawRun(params, options) : Promise.reject(ended())),
+        };
+      },
+    };
+    let result: T;
+    try {
+      result = await fn(tx);
+      active = false;
+    } catch (e) {
+      active = false;
+      await this.request({ op: 'endTransaction', commit: false }).catch(() => undefined);
+      throw e;
     }
+    let end: { ended?: 'commit' | 'rollback' };
+    try {
+      end = (await this.request({ op: 'endTransaction', commit: true })) as { ended?: 'commit' | 'rollback' };
+    } catch (e) {
+      await this.request({ op: 'endTransaction', commit: false }).catch(() => undefined);
+      throw e;
+    }
+    // The callback ran ROLLBACK itself: nothing it did was committed.
+    if (end.ended === 'rollback') throw new SmaltdbError('SMALT_ERROR', 'the transaction was rolled back inside the transaction callback');
+    return result;
   }
 
   /**
@@ -610,7 +662,8 @@ export class Database implements Queryable {
 export class PreparedStatement {
   /** @internal */
   constructor(
-    private readonly db: Database,
+    /** @internal */
+    readonly db: Database,
     private readonly id: number,
     readonly columns: string[],
     readonly paramCount: number,
@@ -622,19 +675,39 @@ export class PreparedStatement {
     if (this.epoch !== this.db.epoch) throw new SmaltdbError('SMALT_RETRY', 'the tab that owned the database changed; prepare the statement again');
   }
 
+  /** Run and return the rows (see Database.query); waits for a running transaction, like it. */
   async query<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params, options: QueryOptions & { rowMode?: M } = {}): Promise<QueryResultFor<M, T>> {
     this.check();
-    const res = (await this.db.request({ op: 'stmtQuery', stmt: this.id, params, batchSize: options.batchSize }, options.signal)) as { columns: string[]; batches: { length: number; cols: WireColumn[] }[] };
-    return materialize(res.columns, res.batches, options.rowMode ?? 'object') as QueryResultFor<M, T>;
+    return this.db.afterTransaction(() => this.rawQuery(params, options)) as Promise<QueryResultFor<M, T>>;
   }
 
-  /** Stream the statement's result in batches (see Database.stream). */
+  /** Stream the statement's result in batches (see Database.stream); starts after a running transaction. */
   stream<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params, options: StreamOptions & { rowMode?: M } = {}): AsyncIterableIterator<QueryResultFor<M, T>> {
     this.check();
-    return this.db.openStream({ op: 'stmtQuery', stmt: this.id, params, batchSize: options.batchSize }, options) as AsyncIterableIterator<QueryResultFor<M, T>>;
+    return this.db.openStream({ op: 'stmtQuery', stmt: this.id, params, batchSize: options.batchSize }, options, true) as AsyncIterableIterator<QueryResultFor<M, T>>;
   }
 
+  /** Run for effect (see Database.exec); runs in call order with exec and waits for a running transaction. */
   async run(params?: Params, options: { signal?: AbortSignal } = {}): Promise<RunResult> {
+    this.check();
+    return this.db.withLock(() => this.rawRun(params, options));
+  }
+
+  /** @internal Unlocked query (inside a transaction). */
+  async rawQuery(params: Params | undefined, options: QueryOptions): Promise<unknown> {
+    this.check();
+    const res = (await this.db.request({ op: 'stmtQuery', stmt: this.id, params, batchSize: options.batchSize }, options.signal)) as { columns: string[]; batches: { length: number; cols: WireColumn[] }[] };
+    return materialize(res.columns, res.batches, options.rowMode ?? 'object');
+  }
+
+  /** @internal */
+  rawStream(params: Params | undefined, options: StreamOptions): AsyncIterableIterator<unknown> {
+    this.check();
+    return this.db.openStream({ op: 'stmtQuery', stmt: this.id, params, batchSize: options.batchSize }, options);
+  }
+
+  /** @internal */
+  async rawRun(params: Params | undefined, options: { signal?: AbortSignal }): Promise<RunResult> {
     this.check();
     const r = (await this.db.request({ op: 'stmtRun', stmt: this.id, params }, options.signal)) as { changes: number; lastInsertRowid: number | bigint };
     return { changes: r.changes, lastInsertRowid: r.lastInsertRowid };
@@ -644,6 +717,16 @@ export class PreparedStatement {
     if (this.epoch !== this.db.epoch) return;
     await this.db.request({ op: 'finalize', stmt: this.id });
   }
+}
+
+/** An iterator whose first `next()` rejects with `err`. */
+function failingIterator(err: unknown): AsyncIterableIterator<never> {
+  const it: AsyncIterableIterator<never> = {
+    [Symbol.asyncIterator]: () => it,
+    next: () => Promise.reject(err),
+    return: async () => ({ value: undefined, done: true }),
+  };
+  return it;
 }
 
 function materialize(columns: string[], batches: { length: number; cols: WireColumn[] }[], mode: RowMode): unknown {

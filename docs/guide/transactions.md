@@ -44,39 +44,41 @@ async function transfer(from: number, to: number, amount: number): Promise<numbe
 
 If the first `UPDATE` violates the `CHECK` constraint, `tx.exec` rejects, `fn` throws, and nothing is changed.
 
-The `tx` argument has two methods, with the same signatures as on `Database`:
+The `tx` argument is the only way into the transaction. Its methods have the same signatures as on `Database` and `PreparedStatement`:
 
 | Method | Meaning |
 |---|---|
 | `tx.query(sql, params?, options?)` | Run a query inside the transaction. |
 | `tx.exec(sql, params?, options?)` | Run statements inside the transaction. |
+| `tx.stream(sql, params?, options?)` | Stream a query's result inside the transaction. |
+| `tx.statement(stmt)` | Use a prepared statement inside the transaction: the result has `query`, `stream` and `run`. |
+
+After the callback has finished, the methods of `tx` (and of statements from `tx.statement`) reject with `SMALT_MISUSE`.
 
 ### What waits for a transaction
 
-While the callback runs, other calls on the same `Database` are held back so that they do not land inside your transaction by accident:
-
-| Call on `db` during the callback | Behaviour |
-|---|---|
-| `db.query`, `db.exec`, `db.prepare`, `db.transaction`, `db.importCSV` / `importJSON` / `exportCSV` / `exportJSON`, `db.close` | Waits until the transaction has ended, then runs. |
-| `db.stream`, and `query` / `stream` / `run` of a `PreparedStatement` | Does **not** wait: runs at once, inside the open transaction, and is rolled back with it. |
+While the callback runs, every other call on the same `Database` waits until the transaction has ended, then runs on its own. This covers `db.query`, `db.exec`, `db.stream`, `db.prepare`, `db.transaction`, the import and export methods, `db.close`, and `query`, `stream` and `run` of a `PreparedStatement`. Code elsewhere in your app therefore never lands inside your transaction by accident, and is not rolled back with it.
 
 ::: warning Do not await `db` methods inside the callback
-Inside `fn`, use `tx`. Awaiting `db.query(…)` or `db.exec(…)` there never resolves: the call waits for the transaction, which waits for your callback. Nested `db.transaction()` calls hang the same way; use a [savepoint](#savepoints) instead.
+Inside `fn`, use `tx`. Awaiting `db.query(…)`, `db.exec(…)` or a prepared statement's `run(…)` there never resolves: the call waits for the transaction, which waits for your callback. Nested `db.transaction()` calls hang the same way; use a [savepoint](#savepoints) instead. The client cannot tell such a call from one made elsewhere in your app (JavaScript has no portable way to know which callback a call comes from), so it cannot fail it instead.
 :::
 
-Prepared statements and streams are the exception: you can use them inside the callback, and they take part in the transaction.
+To use a prepared statement in the transaction, prepare it before, and run it through `tx.statement()`:
 
 ```ts
 const insert = await db.prepare('INSERT INTO accounts(owner, balance) VALUES (?, ?)');
-await db.transaction(async () => {
-  for (const [owner, balance] of [['cy', 5], ['di', 7]] as const) await insert.run([owner, balance]);
+await db.transaction(async (tx) => {
+  const ins = tx.statement(insert);
+  for (const [owner, balance] of [['cy', 5], ['di', 7]] as const) await ins.run([owner, balance]);
 });
 await insert.finalize();
 ```
 
+While a stream is open, writes from this tab fail with `SMALT_BUSY`, also through `tx` (see [transactions and open streams](#transactions-and-open-streams)): read a `tx.stream()` to the end, or leave its loop, before the next write.
+
 ### Rules for the callback
 
-- Do not run `BEGIN`, `COMMIT` or `ROLLBACK` through `tx`. If the callback commits, the final `COMMIT` of `db.transaction()` fails with `SMALT_ERROR` ("cannot commit - no transaction is active") and the promise rejects, although the work was committed.
+- Do not run `BEGIN`, `COMMIT` or `ROLLBACK` through `tx`. If the callback does end the transaction: after a `COMMIT`, the work stays committed and `db.transaction()` resolves to the callback's result; after a `ROLLBACK`, nothing is committed and `db.transaction()` rejects with `SMALT_ERROR` ("the transaction was rolled back inside the transaction callback"). Statements run through `tx` after that point run outside any transaction.
 - `db.transaction()` fails with `SMALT_ERROR` ("cannot start a transaction within a transaction") if a transaction started with SQL `BEGIN` is still open.
 - A failed statement inside the callback does not end the transaction by itself (see [below](#when-a-statement-fails)). If you catch its error and carry on, the transaction commits with the statements that succeeded.
 

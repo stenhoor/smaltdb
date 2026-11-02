@@ -86,7 +86,7 @@ export interface QueryResult {
 }
 
 /** Parameters: positional array (slot 1 = index 0) or named object (`{ a: 1 }` matches `:a`, `@a`, `$a`). */
-export type BindParams = readonly SqlValue[] | Readonly<Record<string, SqlValue>>;
+export type BindParams = readonly (SqlValue | boolean | undefined)[] | Readonly<Record<string, SqlValue | boolean>>;
 
 export interface DatabaseOptions extends PagerOptions {
   /** Prepared-statement cache entries for exec/query helpers (default 64). */
@@ -1145,9 +1145,13 @@ export class Database implements FunctionContext {
     throw new SmaltError('SMALT_ERROR', `no such savepoint: ${name}`);
   }
 
+  /** @internal How the last explicit transaction ended (the server reports it to `db.transaction()`). */
+  lastTransactionEnd: 'commit' | 'rollback' | null = null;
+
   private commitTransaction(): void {
     // Deferred foreign-key violations keep the transaction open, as in SQLite.
     this.fk.checkCommit();
+    this.lastTransactionEnd = 'commit';
     if (this.sqlSavepoints.length) this.tx.releaseSavepoint(1);
     this.sqlSavepoints.length = 0;
     this.memSnapshots.length = 0;
@@ -1158,6 +1162,7 @@ export class Database implements FunctionContext {
   }
 
   private rollbackTransaction(): void {
+    this.lastTransactionEnd = 'rollback';
     this.fk.deferred = 0;
     this.sqlSavepoints.length = 0;
     this.txnFromSavepoint = false;
@@ -3983,14 +3988,17 @@ export class Statement {
     }
     if (Array.isArray(params)) {
       if (params.length !== n) throw new SmaltError('SMALT_RANGE', `statement expects ${n} parameter(s), got ${params.length}`);
-      for (let i = 0; i < n; i++) regs[i] = normalizeParam(params[i]);
+      for (let i = 0; i < n; i++) regs[i] = normalizeParam(params[i], i + 1);
     } else {
+      const names = this.parsed.paramNames;
+      // `?` and `?NNN` slots have no name to look up: an object cannot bind them.
+      if (names.size !== n) throw new SmaltError('SMALT_RANGE', 'statement has positional parameters (? or ?NNN): bind them with an array, not an object');
       const named = params as Record<string, SqlValue>;
-      for (const [name, slot] of this.parsed.paramNames) {
+      for (const [name, slot] of names) {
         const bare = name.slice(1);
         const v = Object.prototype.hasOwnProperty.call(named, name) ? named[name] : named[bare];
         if (v === undefined) throw new SmaltError('SMALT_RANGE', `missing value for parameter ${name}`);
-        regs[slot - 1] = normalizeParam(v);
+        regs[slot - 1] = normalizeParam(v, name);
       }
     }
     return regs;
@@ -4042,10 +4050,18 @@ export class Statement {
   }
 }
 
-function normalizeParam(v: SqlValue | boolean | undefined): SqlValue {
+const INT64_MIN = -(BigInt(2) ** BigInt(63));
+const INT64_MAX = BigInt(2) ** BigInt(63) - BigInt(1);
+
+/** A bound value as stored: booleans 1/0, undefined and NaN NULL (as SQLite binds NaN), bigints in 64-bit range. */
+function normalizeParam(v: SqlValue | boolean | undefined, slot: number | string): SqlValue {
+  if (typeof v === 'number') return v === v ? v : null;
   if (v === undefined) return null;
   if (typeof v === 'boolean') return v ? 1 : 0;
-  if (typeof v === 'bigint') return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v;
+  if (typeof v === 'bigint') {
+    if (v < INT64_MIN || v > INT64_MAX) throw new SmaltError('SMALT_RANGE', `parameter ${typeof slot === 'number' ? '?' + slot : slot}: integer ${v} is out of range (INTEGER values are 64-bit signed)`);
+    return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v;
+  }
   if (v !== null && typeof v === 'object' && !(v instanceof Uint8Array)) {
     if (ArrayBuffer.isView(v)) return new Uint8Array((v as ArrayBufferView).buffer, (v as ArrayBufferView).byteOffset, (v as ArrayBufferView).byteLength);
     throw new SmaltError('SMALT_MISMATCH', 'unsupported parameter type');
