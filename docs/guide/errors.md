@@ -38,8 +38,8 @@ Most errors point at the SQL or the data, and running the same call again gives 
 |---|---|---|
 | `SMALT_SYNTAX`, `SMALT_ERROR`, `SMALT_UNSUPPORTED` | The SQL is wrong or uses something smaltdb lacks | Fix the SQL |
 | `SMALT_CONSTRAINT_*` | The data breaks a constraint | Show the user, change the data, or use an upsert |
-| `SMALT_MISMATCH`, `SMALT_RANGE` | Wrong parameter types or counts | Fix the calling code |
-| `SMALT_MISUSE` | A closed database or finalized statement | Fix the calling code |
+| `SMALT_MISMATCH`, `SMALT_RANGE` | Wrong parameter types, counts or ranges | Fix the calling code |
+| `SMALT_MISUSE` | A closed database, a finalized statement, a `tx` handle used after its callback | Fix the calling code |
 
 Some errors depend on timing and can succeed later:
 
@@ -93,6 +93,7 @@ See [INSERT](../reference/sql/insert) for upserts.
 
 - A failed statement inside a transaction is undone by itself; the transaction stays open. See [when a statement fails](./transactions#when-a-statement-fails).
 - `db.transaction()` rolls back when its callback throws, so an uncaught error from `tx.exec` undoes the whole transaction and reaches your `catch`.
+- If the callback runs `ROLLBACK` itself, `db.transaction()` rejects with `SMALT_ERROR`, so the caller learns that nothing was committed.
 - If a transaction opened with SQL `BEGIN` fails halfway, send `ROLLBACK` yourself; otherwise it stays open.
 
 ## Retrying

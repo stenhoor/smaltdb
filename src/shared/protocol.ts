@@ -5,7 +5,12 @@
  */
 import type { SqlValue } from '../engine/values.js';
 
-export type Params = readonly SqlValue[] | Readonly<Record<string, SqlValue>>;
+/**
+ * Statement parameters: an array for `?` / `?NNN` slots or an object for named ones. Besides SQL
+ * values, `true` / `false` bind as 1 / 0 and `undefined` (in an array) as NULL; they cross the
+ * worker boundary unchanged (structured clone) and the engine converts them.
+ */
+export type Params = readonly (SqlValue | boolean | undefined)[] | Readonly<Record<string, SqlValue | boolean>>;
 
 export interface OpenRequest {
   op: 'open';
@@ -32,6 +37,11 @@ export type Request = { id: number } & (
   | { op: 'stmtRun'; stmt: number; params?: Params }
   | { op: 'stmtQuery'; stmt: number; params?: Params; batchSize?: number; credit?: number }
   | { op: 'finalize'; stmt: number }
+  /**
+   * End this session's transaction (db.transaction()): COMMIT (`commit`) or ROLLBACK. If a request of
+   * the session already ended it, the reply's `ended` says how instead.
+   */
+  | { op: 'endTransaction'; commit: boolean }
   | { op: 'import'; format: 'csv' | 'json'; table: string; data: Uint8Array; options?: Record<string, unknown> }
   | { op: 'export'; format: 'csv' | 'json'; sql: string; params?: Params; options?: Record<string, unknown> }
   | { op: 'close' }
@@ -110,7 +120,7 @@ export interface WireMaterial {
 export type Response =
   /** M8: the engine needs credentials for a `method` request to `url` from this session's callback `name`. */
   | { id: 0; kind: 'credentials'; request: number; name: string; url: string; method: 'GET' | 'HEAD' }
-  | { id: number; kind: 'ok'; changes?: number; lastInsertRowid?: number | bigint; stmt?: number; columns?: string[]; paramCount?: number; capabilities?: unknown; text?: string }
+  | { id: number; kind: 'ok'; changes?: number; lastInsertRowid?: number | bigint; stmt?: number; columns?: string[]; paramCount?: number; capabilities?: unknown; text?: string; ended?: 'commit' | 'rollback' }
   /** `reader`: which parallel reader worker serves the result (absent: the owner). */
   | { id: number; kind: 'columns'; columns: string[]; reader?: number; /** Merged from this many morsels (parallel readers). */ morsels?: number }
   | { id: number; kind: 'batch'; length: number; cols: WireColumn[] }

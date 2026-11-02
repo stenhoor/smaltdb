@@ -5,12 +5,12 @@
 **Implemented in M1:**
 - `open(name, { storage, pageSize, cacheMB, durable, worker })`
 - `db.query(sql, params?, { rowMode: 'object' | 'array' | 'columnar', batchSize })`
-- `db.exec(sql, params?)`, which returns `{ changes, lastInsertRowid }`. Without params it accepts a multi-statement script.
+- `db.exec(sql, params?)`, which returns `{ changes, lastInsertRowid }` (`changes` of its own last INSERT / UPDATE / DELETE, 0 if it ran none). Without params it accepts a multi-statement script; with params and several statements it fails with `SMALT_MISUSE`.
 - `db.prepare(sql)`, giving `stmt.query(params?, opts)`, `stmt.run(params?)`, and `stmt.finalize()`.
-- `db.transaction(async (tx) => ...)`: COMMIT on success, ROLLBACK on throw; other calls wait until it finishes.
+- `db.transaction(async (tx) => ...)`: COMMIT on success, ROLLBACK on throw; every other call on the database and its prepared statements waits until it finishes. `tx` has `query`, `exec`, `stream` and `statement(stmt)` (a prepared statement run inside the transaction). If the callback commits itself, the call resolves; if it rolls back itself, the call rejects with `SMALT_ERROR`.
 - `db.close()`.
 - Errors are `SmaltdbError` with a `code`, e.g. `SMALT_CONSTRAINT_UNIQUE`, `SMALT_SYNTAX`, `SMALT_UNSUPPORTED`.
-- Parameters are positional arrays, or objects keyed by name (`{ id: 1 }` matches `:id`, `@id`, `$id`).
+- Parameters are positional arrays, or objects keyed by name (`{ id: 1 }` matches `:id`, `@id`, `$id`; an object cannot bind `?` slots: `SMALT_RANGE`). Booleans bind as 1/0, `undefined` (in arrays) and NaN as NULL; a bigint outside 64 bits fails with `SMALT_RANGE`.
 
 The synchronous engine is also available directly (`smaltdb/engine`: `Database.open(vfs, path)`, `db.query/run/exec/prepare`),
 for use inside your own worker or in Node.
@@ -95,7 +95,7 @@ Post-v1: UDF registration, live queries / change notifications, and framework bi
 | Call | Notes |
 |---|---|
 | `db.importCSV(table, source, opts?)` → `{ rows }` | `source`: string, `Uint8Array`, `ArrayBuffer` or `Blob`/`File`. RFC 4180 (quoted fields, embedded delimiters/newlines, CRLF, BOM). An unquoted empty field is NULL; a quoted `""` is an empty string. Options: `header` (default true; maps fields by column name), `columns`, `delimiter`, `quote`, `emptyAsNull`, `create` (creates a missing table with INTEGER / REAL / TEXT inferred per column). |
-| `db.importJSON(table, source, opts?)` → `{ rows }` | A JSON array of objects (keys matched to columns case-insensitively; missing keys take the column DEFAULT) or of arrays (positional), or NDJSON. Booleans become 1/0; nested arrays and objects are stored as JSON text. Options: `create`, `columns`. |
+| `db.importJSON(table, source, opts?)` → `{ rows }` | A JSON array of objects (keys matched to columns case-insensitively; missing keys take the column DEFAULT) or of arrays (positional), or NDJSON. Booleans become 1/0; nested arrays and objects are stored as JSON text. Integers beyond 2^53 are read exactly (bigint) when they fit in 64 bits, and as REAL beyond that. Options: `create`, `columns`. |
 | `db.exportCSV(sql, params?, opts?)` → string | Header row by default. Values are quoted when needed; REALs print like SQLite (`2.0`); blobs print as hex. Options: `header`, `delimiter`, `nullString`, `crlf`. |
 | `db.exportJSON(sql, params?, opts?)` → string | An array of objects, or `{ format: 'ndjson' }`. Integers beyond 2^53 are written as exact digits. |
 
@@ -115,7 +115,7 @@ In-process (`smaltdb/engine`, Node and tests), statements over external data run
 `registerCredentials` (whose `headers` may be a function of the URL, sync or async) and `setFetch(fetchFn)` to replace
 the transport. `exportCSVAsync` / `exportJSONAsync` export queries over external data.
 
-Imports run as one prepared INSERT, in one transaction (or inside the caller's). Every constraint, type
-conversion and foreign key applies. On error the import is rolled back, and the message names the CSV line or
+Imports run as one prepared INSERT, in one transaction (or in a savepoint inside the caller's). Every constraint, type
+conversion and foreign key applies. On error the import is rolled back, including a table that `create` made, and the message names the CSV line or
 JSON item (`CSV line 3: NOT NULL constraint failed: t.v`). The same functions are exported from `smaltdb/engine`
 for direct use (`importCSV(db, table, text, opts)`, …).
