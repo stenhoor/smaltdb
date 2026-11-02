@@ -160,7 +160,13 @@ describe('documentation SQL examples', () => {
           if (b.lang !== 'sql' || b.markers.includes('docs:skip')) continue;
           const err = b.markers.map((m) => /^docs:error\s+(\S+)/.exec(m)?.[1]).find(Boolean);
           if (err) {
-            const stmts = parse(b.code);
+            // A syntax error anywhere in the block fails parse(): run the block as one script then.
+            let stmts: { text: string }[];
+            try {
+              stmts = parse(b.code);
+            } catch {
+              stmts = [{ text: b.code }];
+            }
             for (let i = 0; i < stmts.length - 1; i++) await db.execAsync(stmts[i].text);
             const got = await db.execAsync(stmts[stmts.length - 1].text).then(
               () => 'no error',
