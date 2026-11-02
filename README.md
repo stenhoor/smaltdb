@@ -26,11 +26,12 @@ npm install smaltdb
 ```
 
 The engine runs in a module worker, `dist/smaltdb-worker.js` (with its `dist/chunks/`), which the client loads with
-`new URL('./smaltdb-worker.js', import.meta.url)`: Vite and webpack 5 bundle it from there. With other setups, copy
+`new URL('./smaltdb-worker.js', import.meta.url)`, the standard pattern that Vite bundles with no configuration. With other setups, copy
 those files to your site and pass the worker's URL: `open('app', { worker: new URL('/smaltdb-worker.js', location.href) })`.
 Storage works on any page; interrupting a running statement uses `SharedArrayBuffer`, which needs a cross-origin
-isolated page (COOP / COEP headers). Parquet support needs `npm install hyparquet` (and `hyparquet-compressors` for
-codecs other than Snappy).
+isolated page (COOP / COEP headers). In the browser, Parquet support is part of the worker (loaded on first use); with
+`smaltdb/engine` in Node it needs `npm install hyparquet` (and `hyparquet-compressors` for codecs other than Snappy).
+See [Getting started](docs/guide/getting-started.md).
 
 ## Quick start
 
@@ -109,7 +110,7 @@ See [docs/TESTING.md](docs/TESTING.md) for details.
 - Own storage format (not SQLite-file compatible). Row B+trees, with opt-in columnar tables later.
 - STRICT typing by default. SQLite affinity is available through `LOOSE` tables.
 - TypeScript, no WASM. Supports Chromium, Firefox, and Safari/iOS.
-- Multi-tab sharing via leader election. Parallel workers when the page is cross-origin isolated.
+- Multi-tab sharing via leader election. Parallel reader workers where OPFS supports `readwrite-unsafe` handles (Chromium).
 - Snapshot isolation with a single writer. Minimum browsers: Chrome 108, Firefox 111, Safari 17.
 - Columnar wire protocol. `query()` returns objects by default.
 - Performance bar: beat SQLite WASM on every workload, and stay competitive with DuckDB-WASM on analytics ([ADR 0002](docs/adr/0002-second-round-decisions.md)).
