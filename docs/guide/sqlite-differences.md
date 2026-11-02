@@ -1,0 +1,202 @@
+# Differences from SQLite
+
+smaltdb's SQL is based on SQLite's: the same syntax, functions, NULL handling, comparison and affinity rules, and error messages wherever possible. This page lists every difference we know of. Each one was checked against the engine; the examples on this page run as part of the test suite.
+
+The two that affect almost every application:
+
+1. **Tables are STRICT by default.** Values must fit the column type.
+2. **Foreign keys are enforced by default.**
+
+## Types and values
+
+### Tables are STRICT
+
+Every table behaves like a SQLite `STRICT` table: a value is converted to the column's type only when nothing is lost, and otherwise rejected with `SMALT_CONSTRAINT_DATATYPE`. SQLite's ordinary tables store anything anywhere. SQLite-style dynamic typing (`LOOSE` tables) is not supported.
+
+```sql
+CREATE TABLE t(n INTEGER, s TEXT);
+INSERT INTO t VALUES ('42', 7);
+SELECT n, typeof(n) AS tn, s, typeof(s) AS ts FROM t
+```
+
+| n | tn | s | ts |
+| --- | --- | --- | --- |
+| 42 | integer | 7 | text |
+
+<!-- docs:error SMALT_CONSTRAINT_DATATYPE -->
+```sql
+INSERT INTO t(n) VALUES ('forty-two')
+```
+
+Unlike SQLite's `STRICT` tables, any type name is allowed and mapped by SQLite's affinity rules (`VARCHAR(20)` is TEXT; `BOOLEAN`, `DATE`, `DECIMAL` are NUMERIC). See [Data types](../reference/sql/types).
+
+### Integral REALs can become INTEGERs
+
+JavaScript has one number type, so smaltdb tracks REAL-ness statically. Where it cannot, an integral REAL turns into an INTEGER: in an `ANY` or `NUMERIC` column, and in arithmetic on numeric text. This changes `typeof()`, integer division and text conversion. REAL columns are not affected.
+
+```sql
+CREATE TABLE r(a ANY);
+INSERT INTO r VALUES (2.0);
+SELECT typeof(a) AS t, a / 4 AS q, typeof('5.0' + 0) AS t2 FROM r
+```
+
+| t | q | t2 |
+| --- | --- | --- |
+| integer | 0 | integer |
+
+SQLite returns `real`, `0.5` and `real`. See [REAL](../reference/sql/types#real).
+
+### Double-quoted strings
+
+A double-quoted name that is not a column is an error. SQLite falls back to treating it as a string literal.
+
+<!-- docs:error SMALT_ERROR -->
+```sql
+SELECT "hello"
+```
+
+## Tables and constraints
+
+### Foreign keys are on
+
+Foreign-key constraints are enforced unless you run `PRAGMA foreign_keys = OFF` (outside a transaction). In SQLite they are off until you turn them on. See [PRAGMA foreign_keys](../reference/sql/pragmas#foreign-keys).
+
+```sql
+PRAGMA foreign_keys
+```
+
+| foreign_keys |
+| --- |
+| 1 |
+
+### Primary keys are never NULL
+
+All `PRIMARY KEY` columns are NOT NULL. SQLite allows NULL in the primary key of an ordinary table unless it is an `INTEGER PRIMARY KEY`.
+
+```sql
+CREATE TABLE code(c TEXT PRIMARY KEY, label TEXT);
+```
+
+<!-- docs:error SMALT_CONSTRAINT_NOTNULL -->
+```sql
+INSERT INTO code VALUES (NULL, 'none')
+```
+
+### AUTOINCREMENT
+
+`AUTOINCREMENT` is accepted but has no effect: after the row with the largest key is deleted, its key can be used again. SQLite never reuses keys with `AUTOINCREMENT`, and allows the keyword only on an `INTEGER PRIMARY KEY` (smaltdb accepts it on any primary key).
+
+```sql
+CREATE TABLE seq(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+INSERT INTO seq(v) VALUES ('a'), ('b');
+DELETE FROM seq WHERE id = 2;
+INSERT INTO seq(v) VALUES ('c');
+SELECT * FROM seq
+```
+
+| id | v |
+| --- | --- |
+| 1 | a |
+| 2 | c |
+
+When the largest rowid is already 9223372036854775807, inserting a row without a key fails with `SMALT_FULL`; SQLite tries random free rowids.
+
+### Conflict clauses
+
+- `ON CONFLICT` clauses in `CREATE TABLE` constraints (`UNIQUE ON CONFLICT REPLACE`, `NOT NULL ON CONFLICT IGNORE`) are accepted and ignored. In SQLite they set the default conflict action for the constraint. Use `INSERT OR …` or an upsert instead.
+- `INSERT OR FAIL` and `UPDATE OR FAIL` behave like `OR ABORT`: rows the statement changed before the failing one are undone too.
+- `OR ROLLBACK` behaves like `OR ABORT`: the statement is undone, but an enclosing transaction stays open.
+
+```sql
+CREATE TABLE u(k TEXT UNIQUE ON CONFLICT IGNORE);
+INSERT INTO u VALUES ('x');
+```
+
+<!-- docs:error SMALT_CONSTRAINT_UNIQUE -->
+```sql
+INSERT INTO u VALUES ('x')
+```
+
+### Constraint expressions
+
+- A `CHECK` constraint may contain a subquery, and a `DEFAULT (expr)` may contain a subquery. SQLite rejects both.
+- `ALTER TABLE … ADD COLUMN` accepts a `REFERENCES` column with a non-NULL default; existing rows are not checked. SQLite rejects it while foreign keys are on.
+
+### Temporary tables
+
+- `CREATE TABLE temp.name (…)` creates a regular (main) table: the `temp.` qualifier is ignored. Use `CREATE TEMP TABLE name (…)`.
+- TEMP tables cannot be altered (`SMALT_UNSUPPORTED`).
+- There is no `sqlite_temp_schema` (or `sqlite_temp_master`); TEMP objects are not listed anywhere. `temp.sqlite_schema` shows the main catalog.
+
+### Index keys
+
+An index key must fit in about a quarter of a page (about 2 KB with the default 8 KiB pages); longer values fail with `SMALT_TOOBIG`. SQLite stores larger keys in overflow pages.
+
+## Not supported
+
+These are rejected. Statements the parser does not know fail with a syntax error (`SMALT_SYNTAX`); the others fail with `SMALT_UNSUPPORTED` unless noted.
+
+| Feature | Result | Instead |
+| --- | --- | --- |
+| `CREATE TRIGGER`, `DROP TRIGGER` | syntax error, `SMALT_UNSUPPORTED` | application code |
+| `ATTACH`, `DETACH` | syntax error | open several databases |
+| `CREATE VIRTUAL TABLE` (FTS, R*Tree, …) | syntax error | |
+| `VACUUM` | `SMALT_UNSUPPORTED` | freed pages are reused |
+| `REINDEX` | syntax error | |
+| `WITHOUT ROWID` tables | `SMALT_UNSUPPORTED` | a `PRIMARY KEY` on a rowid table |
+| generated columns | `SMALT_UNSUPPORTED` | compute in queries or views |
+| `CREATE TABLE … AS SELECT` | `SMALT_UNSUPPORTED` | `CREATE TABLE`, then `INSERT … SELECT` |
+| `LOOSE` (dynamic typing) | `SMALT_UNSUPPORTED` | `ANY` columns |
+| `INSERT … DEFAULT VALUES` | fails with an error (engine bug) | name one column with its default |
+| `WITH … INSERT … VALUES` | `SMALT_UNSUPPORTED` | `WITH … INSERT … SELECT` |
+| `UPDATE` / `DELETE` with `ORDER BY` or `LIMIT` | `SMALT_UNSUPPORTED` | `WHERE rowid IN (SELECT rowid … LIMIT n)` |
+| row values: `(a, b) = (1, 2)`, `SET (a, b) = …` | syntax error / `SMALT_UNSUPPORTED` | separate terms |
+| upsert target with `WHERE` | `SMALT_UNSUPPORTED` | |
+| `ON CONFLICT DO UPDATE` without a target | `SMALT_ERROR` | name the conflict columns |
+| `ORDER BY` inside aggregate arguments | `SMALT_UNSUPPORTED` | aggregate an ordered subquery |
+| `USING` / `NATURAL` with `RIGHT` or `FULL` joins | `SMALT_UNSUPPORTED` | `ON` |
+| `LEFT JOIN` whose right side is a parenthesized join | `SMALT_UNSUPPORTED` | a subquery |
+| JSON functions and the `->`, `->>` operators | `no such function` / `SMALT_UNSUPPORTED` | parse in JavaScript |
+| application-defined functions and collations | no API | |
+| `EXPLAIN` of statements other than `SELECT` | `SMALT_UNSUPPORTED` | |
+| `EXPLAIN` bytecode listing | plain `EXPLAIN` returns the query plan | |
+| `ANALYZE main.t` (schema-qualified) | `no such table or index` | `ANALYZE t` |
+| most `PRAGMA`s (`user_version`, `cache_size`, `busy_timeout`, `synchronous`, …) | `SMALT_UNSUPPORTED` | [open options](./databases) |
+
+<!-- docs:error SMALT_UNSUPPORTED -->
+```sql
+CREATE TABLE copy AS SELECT * FROM seq
+```
+
+<!-- docs:error SMALT_UNSUPPORTED -->
+```sql
+DELETE FROM seq WHERE id > 0 LIMIT 1
+```
+
+```sql
+DELETE FROM seq WHERE rowid IN (SELECT rowid FROM seq ORDER BY id LIMIT 1);
+SELECT id FROM seq
+```
+
+| id |
+| --- |
+| 2 |
+
+The supported `PRAGMA`s are listed in [PRAGMA](../reference/sql/pragmas).
+
+## Queries
+
+- `RIGHT JOIN` and `FULL JOIN` work (SQLite has them since 3.39), except with `USING` or `NATURAL`.
+- In `GROUP BY` or `DISTINCT` over `NOCASE` or `RTRIM` text, values that compare equal form one group; smaltdb shows the spelling of the first row it scanned, which can differ from SQLite's choice.
+- `'now'`, `CURRENT_TIMESTAMP` and friends are read once per statement, so every row of a statement sees the same time (SQLite guarantees this only within one step).
+- Plain `EXPLAIN` returns the same rows as `EXPLAIN QUERY PLAN`, and the plan texts differ from SQLite's in places. `EXPLAIN ANALYZE` is an addition.
+
+## Additions
+
+smaltdb also has things SQLite does not:
+
+- [`information_schema`](../reference/sql/information-schema) views;
+- [materialized views](../reference/sql/views) (`CREATE / REFRESH / DROP MATERIALIZED VIEW`);
+- [external tables and connections](../reference/sql/external), and the `read_csv`, `read_json`, `read_parquet` table functions;
+- [columnar tables](../reference/sql/create-table#columnar-tables) (`WITH (storage = 'columnar')`);
+- `EXPLAIN ANALYZE`, and the pragmas `work_mem`, `matview_rewrite`, `parallel_aggregates`, `spill_bytes` and `compact`.

@@ -1,0 +1,5 @@
+[
+  {"store": "Leeds", "opened": 2019, "manager": "Priya", "tags": ["flagship", "north"]},
+  {"store": "Bristol", "opened": 2021, "manager": null, "tags": []},
+  {"store": "York", "opened": 2024.5, "manager": "Sam"}
+]

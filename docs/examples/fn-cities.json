@@ -1,0 +1,4 @@
+[
+  {"name": "Oslo", "country": "NO", "population": 709037},
+  {"name": "Lyon", "country": "FR", "population": 522250, "capital": false}
+]

@@ -15,7 +15,7 @@ can keep data in an optional in-memory cache for speed, and runs inside Web Work
 > cost-based planner, views and materialized views, columnar tables, multi-tab access with parallel readers, spilling
 > sorts and aggregates, and external tables over CSV, JSON and Parquet files on HTTP, S3 and Azure Blob Storage
 > (milestones M0–M8.3 of the [roadmap](docs/ROADMAP.md)). The SQL dialect follows SQLite and is checked against it with
-> differential tests and a sqllogictest subset; see the [supported SQL](docs/SQL_DIALECT.md). Benchmarks against
+> differential tests and a sqllogictest subset; see the [SQL reference](docs/reference/sql/index.md). Benchmarks against
 > crash-safe SQLite WASM: [methodology and results](docs/research/benchmark-methodology.md). The on-disk format may
 > still change before 1.0.
 
@@ -26,11 +26,12 @@ npm install smaltdb
 ```
 
 The engine runs in a module worker, `dist/smaltdb-worker.js` (with its `dist/chunks/`), which the client loads with
-`new URL('./smaltdb-worker.js', import.meta.url)`: Vite and webpack 5 bundle it from there. With other setups, copy
+`new URL('./smaltdb-worker.js', import.meta.url)`, the standard pattern that Vite bundles with no configuration. With other setups, copy
 those files to your site and pass the worker's URL: `open('app', { worker: new URL('/smaltdb-worker.js', location.href) })`.
 Storage works on any page; interrupting a running statement uses `SharedArrayBuffer`, which needs a cross-origin
-isolated page (COOP / COEP headers). Parquet support needs `npm install hyparquet` (and `hyparquet-compressors` for
-codecs other than Snappy).
+isolated page (COOP / COEP headers). In the browser, Parquet support is part of the worker (loaded on first use); with
+`smaltdb/engine` in Node it needs `npm install hyparquet` (and `hyparquet-compressors` for codecs other than Snappy).
+See [Getting started](docs/guide/getting-started.md).
 
 ## Quick start
 
@@ -67,14 +68,21 @@ await db.close();
 
 ## Documentation
 
+For users:
+- [Getting started](docs/guide/getting-started.md) and [quick start](docs/guide/quick-start.md)
+- [User guide](docs/guide/databases.md) and [FAQ](docs/guide/faq.md)
+- [SQL reference](docs/reference/sql/index.md), [functions](docs/reference/functions/index.md) and [API](docs/reference/api/client.md)
+
+Design and internals:
+
 | Document | Contents |
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System overview, components, threading model |
 | [docs/STORAGE_FORMAT.md](docs/STORAGE_FORMAT.md) | On-disk layout, pages, B+trees, WAL, caching |
 | [docs/QUERY_ENGINE.md](docs/QUERY_ENGINE.md) | Parser → binder → optimizer → execution |
-| [docs/SQL_DIALECT.md](docs/SQL_DIALECT.md) | Supported SQL, type system, information_schema, materialized views |
+| [docs/SQL_DIALECT.md](docs/SQL_DIALECT.md) | Design notes for the SQL dialect and its implementation status |
 | [docs/WORKER_MODEL.md](docs/WORKER_MODEL.md) | Workers, concurrency, transactions, multi-tab |
-| [docs/API.md](docs/API.md) | Public JavaScript API (draft) |
+| [docs/API.md](docs/API.md) | Design notes for the JavaScript API |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Performance targets, benchmarks, profiling strategy |
 | [docs/TESTING.md](docs/TESTING.md) | Test strategy and correctness tooling |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Milestones |
@@ -100,9 +108,9 @@ See [docs/TESTING.md](docs/TESTING.md) for details.
 
 - Mixed OLTP + reporting workload. Databases up to ~1 GB.
 - Own storage format (not SQLite-file compatible). Row B+trees, with opt-in columnar tables later.
-- STRICT typing by default. SQLite affinity is available through `LOOSE` tables.
+- STRICT typing: values must fit the column type (`ANY` columns hold anything). SQLite-style `LOOSE` tables are not supported yet.
 - TypeScript, no WASM. Supports Chromium, Firefox, and Safari/iOS.
-- Multi-tab sharing via leader election. Parallel workers when the page is cross-origin isolated.
+- Multi-tab sharing via leader election. Parallel reader workers where OPFS supports `readwrite-unsafe` handles (Chromium).
 - Snapshot isolation with a single writer. Minimum browsers: Chrome 108, Firefox 111, Safari 17.
 - Columnar wire protocol. `query()` returns objects by default.
 - Performance bar: beat SQLite WASM on every workload, and stay competitive with DuckDB-WASM on analytics ([ADR 0002](docs/adr/0002-second-round-decisions.md)).
