@@ -169,7 +169,7 @@ A smaltdb extension. Never shows secrets: `credentials` is only the name of a pr
 | Column | Meaning |
 | --- | --- |
 | `connection_name` | name |
-| `connection_type` | the `type` option as written (`http` when none) |
+| `connection_type` | `http`, `s3` or `azure`: the `type` option in lower case, with `https` shown as `http` (`http` when none) |
 | `url` | the `url` option, or NULL |
 | `credentials` | the `credentials` option, or NULL |
 | `options` | the other options as a JSON object |

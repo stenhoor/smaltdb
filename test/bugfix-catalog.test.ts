@@ -126,3 +126,20 @@ describe('ANALYZE with a schema', () => {
     expect(() => d.exec('ANALYZE temp.t')).toThrow('no such table or index: temp.t');
   });
 });
+
+describe('information_schema.connections.connection_type', () => {
+  it('is the normalised type: lower case, https shown as http', () => {
+    const d = mem();
+    d.exec("CREATE CONNECTION a WITH (type = 'https', url = 'https://x.org/')");
+    d.exec("CREATE CONNECTION b WITH (type = 'S3', region = 'eu', bucket = 'b')");
+    d.exec("CREATE CONNECTION c WITH (url = 'https://x.org/')");
+    d.exec("CREATE CONNECTION e WITH (type = 'Azure', account = 'acc')");
+    expect(d.query('SELECT connection_name, connection_type FROM information_schema.connections ORDER BY 1').rows).toEqual([
+      ['a', 'http'],
+      ['b', 's3'],
+      ['c', 'http'],
+      ['e', 'azure'],
+    ]);
+    expect(() => d.exec("CREATE CONNECTION f WITH (type = 'ftp')")).toThrow("connection f: type 'ftp' is not supported (http, s3, azure)");
+  });
+});

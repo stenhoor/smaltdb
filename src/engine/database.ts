@@ -160,6 +160,12 @@ const CONNECTION_OPTIONS: Record<string, ReadonlySet<string>> = {
   azure: new Set(['type', 'account', 'container', 'endpoint', 'credentials']),
 };
 
+/** A connection's type: the `type` option lower-cased, default 'http'; 'https' is another name for 'http'. */
+function connectionType(options: Record<string, SqlValue>): string {
+  const type = String(options.type ?? 'http').toLowerCase();
+  return type === 'https' ? 'http' : type;
+}
+
 interface CatalogEntry {
   type: 'table' | 'index' | 'view' | 'matview' | 'external' | 'connection';
   name: string;
@@ -847,7 +853,7 @@ export class Database implements FunctionContext {
       }),
       connections: [...this.connections.values()].map((c) => ({
         name: c.name,
-        type: String(c.options.type ?? 'http'),
+        type: connectionType(c.options),
         url: c.options.url === undefined || c.options.url === null ? null : String(c.options.url),
         credentials: c.options.credentials === undefined || c.options.credentials === null ? null : String(c.options.credentials),
         options: JSON.stringify(Object.fromEntries(Object.entries(c.options).filter(([k]) => !['type', 'url', 'credentials'].includes(k)))),
@@ -2285,8 +2291,7 @@ export class Database implements FunctionContext {
       if (stmt.ifNotExists) return none;
       throw new SmaltError('SMALT_ERROR', `connection ${stmt.name} already exists`);
     }
-    let type = String(stmt.with.type ?? 'http').toLowerCase();
-    if (type === 'https') type = 'http';
+    const type = connectionType(stmt.with);
     const allowed = CONNECTION_OPTIONS[type];
     if (!allowed) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: type '${type}' is not supported (http, s3, azure)`);
     for (const k of Object.keys(stmt.with)) if (!allowed.has(k)) throw new SmaltError('SMALT_ERROR', `connection ${stmt.name}: unknown option '${k}' for type ${type} (${[...allowed].join(', ')})`);

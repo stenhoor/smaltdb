@@ -16,7 +16,7 @@ Options by `type`:
 
 | Option | `http` (default) | `s3` | `azure` | Meaning |
 | --- | --- | --- | --- | --- |
-| `type` | ✓ | ✓ | ✓ | `'http'` (also `'https'`), `'s3'` or `'azure'` |
+| `type` | ✓ | ✓ | ✓ | `'http'` (also `'https'`, the same type), `'s3'` or `'azure'`, in any case; other values fail (`type 'ftp' is not supported`) |
 | `url` | ✓ | | | base URL; relative locations resolve against it |
 | `region` | | ✓ | | AWS region (default `us-east-1`) |
 | `bucket` | | ✓ | | bucket for relative locations |
