@@ -779,7 +779,8 @@ export class Database implements FunctionContext {
       const types: StaticType[] = ['text', 'text', 'text', 'int', 'text'];
       return { columns: ['type', 'name', 'tbl_name', 'rootpage', 'sql'].map((c, i) => ({ name: c, type: types[i] })), rows: () => this.tempSchemaRows() };
     }
-    const lower = name.toLowerCase();
+    // As in SQLite, a schema qualifier on a pragma function (main.pragma_table_info) changes nothing.
+    const lower = name.toLowerCase().replace(/^(main|temp)\./, '');
     if (!lower.startsWith('pragma_')) return undefined;
     const pragma = lower.slice('pragma_'.length);
     let current: SqlValue[] = [];
@@ -2549,6 +2550,7 @@ export class Database implements FunctionContext {
     if (!table) {
       if (schema === 'temp' && this.getTable(stmt.table, 'main')) throw new SmaltError('SMALT_ERROR', `cannot create a TEMP index on non-TEMP table "${stmt.table}"`);
       if (this.views.has(stmt.table.toLowerCase())) throw new SmaltError('SMALT_ERROR', 'views may not be indexed');
+      if (schema !== 'temp' && this.externals.has(stmt.table.toLowerCase())) throw new SmaltError('SMALT_ERROR', `table ${stmt.table} may not be indexed`);
       throw new SmaltError('SMALT_ERROR', `no such table: ${schema === 'main' ? 'main.' : ''}${stmt.table}`);
     }
     if (table.matview?.storage === 'columnar') throw new SmaltError('SMALT_ERROR', `columnar materialized view ${table.name} cannot be indexed (zone maps prune its scans)`);
@@ -2869,7 +2871,7 @@ export class Database implements FunctionContext {
 
   private alterTable(stmt: AlterTableStmt, sql: string): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
-    if (stmt.schema && stmt.schema.toLowerCase() !== 'main') throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
+    if (stmt.schema && !['main', 'temp'].includes(stmt.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
     const lower = stmt.table.toLowerCase();
     if (CATALOG_NAMES.has(lower) || lower.startsWith('smalt_') || lower.startsWith('sqlite_')) {
       throw new SmaltError('SMALT_ERROR', `table ${CATALOG_NAMES.has(lower) ? 'sqlite_master' : stmt.table} may not be altered`);
@@ -2878,7 +2880,8 @@ export class Database implements FunctionContext {
       throw new SmaltError('SMALT_ERROR', stmt.action.kind === 'addColumn' ? 'Cannot add a column to a view' : `view ${stmt.table} may not be altered`);
     }
     const table = this.getTable(lower, stmt.schema);
-    if (!table) throw new SmaltError('SMALT_ERROR', `no such table: ${stmt.table}`);
+    if (!table && stmt.schema?.toLowerCase() !== 'temp' && this.externals.has(lower)) throw new SmaltError('SMALT_ERROR', `table ${stmt.table} may not be altered`);
+    if (!table) throw new SmaltError('SMALT_ERROR', `no such table: ${stmt.schema ? `${stmt.schema}.` : ''}${stmt.table}`);
     // TEMP tables have no catalog rows for ALTER to rewrite (main.t reaches a shadowed main table).
     if (table.temp) throw new SmaltError('SMALT_UNSUPPORTED', `ALTER TABLE is not supported for TEMP table ${table.name}`);
     if (table.matview) throw new SmaltError('SMALT_ERROR', `materialized view ${table.name} may not be altered`);
@@ -3129,6 +3132,8 @@ export class Database implements FunctionContext {
     const t = this.getTable(lower, schema);
     if (!t) {
       if (this.views.has(lower)) throw new SmaltError('SMALT_ERROR', `cannot modify ${name} because it is a view`);
+      // External tables are read-only (SQLite's wording for tables that cannot be written).
+      if (schema?.toLowerCase() !== 'temp' && this.externals.has(lower)) throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
       throw new SmaltError('SMALT_ERROR', `no such table: ${name}`);
     }
     if (t.matview) throw new SmaltError('SMALT_ERROR', `cannot change materialized view "${t.name}" (use REFRESH MATERIALIZED VIEW)`);
@@ -3684,10 +3689,19 @@ export class Database implements FunctionContext {
       return t;
     };
     const ro = (columns: string[], rows: () => SqlValue[][]): { columns: string[]; rows: () => SqlValue[][] } => ({ columns, rows });
+    /** An external table named by the argument (it has columns, but no indexes or foreign keys). */
+    const externalArg = (): ExternalTableDef | undefined => {
+      const n = arg();
+      return n && !this.getTable(n) ? this.externals.get(n.toLowerCase()) : undefined;
+    };
     switch (name) {
       case 'table_info':
-      case 'table_xinfo':
-        return ro(['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'], () => {
+      case 'table_xinfo': {
+        // table_xinfo adds `hidden`: always 0 (normal column), as smaltdb has no hidden or generated columns.
+        const xinfo = name === 'table_xinfo';
+        return ro(['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk', ...(xinfo ? ['hidden'] : [])], () => {
+          const ext = externalArg();
+          if (ext) return ext.columns.map((c, i) => [i, c.name, c.declType, 0, null, 0, ...(xinfo ? [0] : [])]);
           const t = tableArg();
           let pkn = 0;
           const pkOrder = new Map<number, number>();
@@ -3701,10 +3715,13 @@ export class Database implements FunctionContext {
             c.declaredNotNull ? 1 : 0,
             c.defaultExpr ? t.sql.slice(c.defaultExpr.pos, c.defaultExpr.end) : null,
             pkOrder.get(i) ?? 0,
+            ...(xinfo ? [0] : []),
           ]);
         });
+      }
       case 'index_list':
         return ro(['seq', 'name', 'unique', 'origin', 'partial'], () => {
+          if (externalArg()) return [];
           const t = tableArg();
           return t.indexes.map((idx, i) => [i, idx.name, idx.unique ? 1 : 0, idx.origin, idx.where ? 1 : 0]);
         });
@@ -3726,6 +3743,7 @@ export class Database implements FunctionContext {
         });
       case 'foreign_key_list':
         return ro(['id', 'seq', 'table', 'from', 'to', 'on_update', 'on_delete', 'match'], () => {
+          if (externalArg()) return [];
           const t = tableArg();
           // SQLite lists the last-declared foreign key first.
           return t.foreignKeys

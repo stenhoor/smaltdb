@@ -14,7 +14,7 @@ smaltdb has two kinds:
 | [`read_json(LOCATION, …)`](#read_json) | The rows of a JSON array or NDJSON file |
 | [`read_parquet(LOCATION, …)`](#read_parquet) | The rows of a Parquet file |
 | [`pragma_table_info(TABLE)`](#pragma_table_info) | The columns of a table |
-| [`pragma_table_xinfo(TABLE)`](#pragma_table_xinfo) | The same as `pragma_table_info` |
+| [`pragma_table_xinfo(TABLE)`](#pragma_table_xinfo) | `pragma_table_info` plus a `hidden` column |
 | [`pragma_index_list(TABLE)`](#pragma_index_list) | The indexes of a table |
 | [`pragma_index_info(INDEX)`](#pragma_index_info) | The key columns of an index |
 | [`pragma_index_xinfo(INDEX)`](#pragma_index_xinfo) | All columns of an index, with sort order and collation |
@@ -256,7 +256,8 @@ These are the table-valued forms of the schema [pragmas](../sql/pragmas): `SELEC
 
 - The argument is a table or index name as text. Unlike `PRAGMA table_info('nope')`, which fails, an unknown name gives no rows.
 - The argument may come from another table in the same `FROM`, for example to list the columns of every table (see the example under [pragma_table_info](#pragma_table_info)).
-- Only these six pragmas have a function form. A schema prefix (`main.pragma_table_info(…)`) and functions such as `pragma_foreign_keys()` or `pragma_index_list` without parentheses are not supported.
+- Only these six pragmas have a function form. A `main.` or `temp.` prefix (`main.pragma_table_info(…)`) is accepted and, as in SQLite, changes nothing. Functions such as `pragma_foreign_keys()`, and the forms without parentheses (`pragma_index_list WHERE arg = 't'`), are not supported.
+- For an [external table](../sql/external), `pragma_table_info` lists its columns (declared or inferred; `notnull`, `dflt_value` and `pk` are 0 or NULL), and `pragma_index_list` and `pragma_foreign_key_list` give no rows.
 
 The examples use this schema:
 
@@ -333,11 +334,17 @@ SELECT count(*) AS n FROM pragma_table_info('no_such_table');
 pragma_table_xinfo(TABLE)
 ```
 
-The same rows and columns as `pragma_table_info`. smaltdb has no hidden or generated columns.
+The rows and columns of `pragma_table_info`, plus a seventh column, `hidden`, as in SQLite. SQLite uses it for hidden columns of virtual tables (1) and generated columns (2, 3); smaltdb has neither, so it is always 0.
 
-::: warning Differs from SQLite
-SQLite's `table_xinfo` has a seventh column, `hidden`. smaltdb's has only the six columns of `table_info`.
-:::
+```sql
+SELECT name, hidden FROM pragma_table_xinfo('author');
+```
+
+| name | hidden |
+| --- | --- |
+| id | 0 |
+| name | 0 |
+| born | 0 |
 
 ### pragma_index_list {#pragma_index_list}
 

@@ -66,7 +66,7 @@ Operators (`||`, `LIKE`, `GLOB`, arithmetic, comparisons), `CASE` and `CAST` are
 | [`pragma_index_list(TABLE)`](./table-valued#pragma_index_list) | table-valued | Indexes of a table |
 | [`pragma_index_xinfo(INDEX)`](./table-valued#pragma_index_xinfo) | table-valued | All columns of an index |
 | [`pragma_table_info(TABLE)`](./table-valued#pragma_table_info) | table-valued | Columns of a table |
-| [`pragma_table_xinfo(TABLE)`](./table-valued#pragma_table_xinfo) | table-valued | Same as `pragma_table_info` |
+| [`pragma_table_xinfo(TABLE)`](./table-valued#pragma_table_xinfo) | table-valued | `pragma_table_info` plus `hidden` |
 | [`printf(FORMAT, …)`](./string#printf) | scalar | C-style formatted text |
 | [`quote(X)`](./string#quote) | scalar | Value as an SQL literal |
 | [`random()`](./math#random) | scalar | Random 64-bit integer |

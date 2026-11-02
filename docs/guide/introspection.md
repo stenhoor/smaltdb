@@ -218,7 +218,7 @@ These pragmas return rows describing one table or index, as in SQLite. Each can 
 | Function | Argument | Columns |
 | --- | --- | --- |
 | `pragma_table_info` | table | `cid`, `name`, `type`, `notnull`, `dflt_value`, `pk` |
-| `pragma_table_xinfo` | table | Same as `table_info` (smaltdb has no hidden columns) |
+| `pragma_table_xinfo` | table | `table_info`'s columns and `hidden` (always 0: smaltdb has no hidden or generated columns) |
 | `pragma_index_list` | table | `seq`, `name`, `unique`, `origin`, `partial` |
 | `pragma_index_info` | index | `seqno`, `cid`, `name` |
 | `pragma_index_xinfo` | index | `seqno`, `cid`, `name`, `desc`, `coll`, `key` |

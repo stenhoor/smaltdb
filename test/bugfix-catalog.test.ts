@@ -161,3 +161,42 @@ describe('information_schema.table_constraints deferrability', () => {
     ]);
   });
 });
+
+describe('external tables in pragmas and writes', () => {
+  it('table_info lists the columns; writes, indexes and ALTER fail clearly', async () => {
+    const db = await Database.open(new MemoryVfs(), 'db');
+    db.registerFile('x.csv', 'a,b\n1,NA\n2,z\n');
+    await db.execAsync("CREATE EXTERNAL TABLE ext WITH (location = 'file:x.csv')");
+    const cols = [
+      [0, 'a', 'INTEGER', 0, null, 0],
+      [1, 'b', 'TEXT', 0, null, 0],
+    ];
+    expect(db.query('PRAGMA table_info(ext)').rows).toEqual(cols);
+    expect(db.query("SELECT * FROM pragma_table_info('ext')").rows).toEqual(cols);
+    expect(db.query('PRAGMA table_xinfo(ext)').rows).toEqual(cols.map((r) => [...r, 0]));
+    expect(db.query('PRAGMA index_list(ext)').rows).toEqual([]);
+    expect(db.query('PRAGMA foreign_key_list(ext)').rows).toEqual([]);
+    for (const sql of ['INSERT INTO ext VALUES (1, 2)', 'REPLACE INTO main.ext VALUES (1, 2)', 'UPDATE ext SET a = 1', 'DELETE FROM ext']) {
+      expect(await errorOf(() => db.exec(sql))).toEqual({ code: 'SMALT_ERROR', message: 'table ext may not be modified' });
+    }
+    expect(await errorOf(() => db.exec('CREATE INDEX ei ON ext(a)'))).toEqual({ code: 'SMALT_ERROR', message: 'table ext may not be indexed' });
+    expect(await errorOf(() => db.exec('ALTER TABLE ext ADD COLUMN c'))).toEqual({ code: 'SMALT_ERROR', message: 'table ext may not be altered' });
+  });
+});
+
+describe('table_xinfo hidden column; schema-qualified pragma functions', () => {
+  it('matches SQLite', () => {
+    const d = mem();
+    d.exec("CREATE TABLE t(a INT PRIMARY KEY, b TEXT NOT NULL DEFAULT 'x', c)");
+    const xinfo = [
+      [0, 'a', 'INT', 0, null, 1, 0],
+      [1, 'b', 'TEXT', 1, "'x'", 0, 0],
+      [2, 'c', '', 0, null, 0, 0],
+    ];
+    expect(d.query('PRAGMA table_xinfo(t)').rows).toEqual(xinfo);
+    expect(d.query("SELECT * FROM pragma_table_xinfo('t')")).toEqual({ columns: ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk', 'hidden'], rows: xinfo });
+    expect(d.query('PRAGMA table_info(t)').columns).toEqual(['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk']);
+    expect(d.query("SELECT name FROM main.pragma_table_info('t')").rows).toEqual([['a'], ['b'], ['c']]);
+    expect(d.query("SELECT name FROM temp.pragma_table_info('t')").rows).toEqual([['a'], ['b'], ['c']]);
+  });
+});

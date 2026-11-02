@@ -202,9 +202,9 @@ SELECT (SELECT city FROM cities WHERE id = 2) AS city, (SELECT count(*) FROM cou
 
 ### Using external tables
 
-- They are read-only and have no indexes. Every statement that uses one reads the source again; to read it once, cache it in a [materialized view](./views) and refresh it with `REFRESH … IF CHANGED`.
+- They are read-only and have no indexes: `INSERT`, `UPDATE` and `DELETE` fail with `table x may not be modified`, `CREATE INDEX` with `table x may not be indexed`, `ALTER TABLE` with `table x may not be altered` (`SMALT_ERROR`). Every statement that uses one reads the source again; to read it once, cache it in a [materialized view](./views) and refresh it with `REFRESH … IF CHANGED`.
 - They work in joins, subqueries, views and `INSERT … SELECT`.
-- `information_schema.tables` shows them as `EXTERNAL`, [`information_schema.external_tables`](./information-schema#external-tables) lists their location, format, connection and options, and `sqlite_schema` lists them with type `external`.
+- `information_schema.tables` shows them as `EXTERNAL`, [`information_schema.external_tables`](./information-schema#external-tables) lists their location, format, connection and options, and `sqlite_schema` lists them with type `external`. [`PRAGMA table_info`](./pragmas#table-info) and `pragma_table_info` list their columns.
 - [`PRAGMA matview_rewrite`](./pragmas#matview-rewrite) never answers queries from a materialized view over external data.
 
 ```sql
