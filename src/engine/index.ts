@@ -29,5 +29,6 @@ export {
   type OpenedFile,
   type ListedFile,
   type AskError,
+  type StaticType,
   type Zone,
 } from './plugin.js';

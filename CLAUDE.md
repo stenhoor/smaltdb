@@ -30,7 +30,8 @@ Playwright is resolved globally in local containers (see `test/browser/playwrigh
   `test/plugins.test.ts`; never import a plugin from `src/`. Until 0.9.0 is on npm, `packed.json` pins `@smaltdb/io`
   and `@smaltdb/external` to commits for the docs examples and browser tests, and `scripts/fetch-packed.mjs` (the same
   file in all four repositories) installs them without touching `package.json` or the lockfile. A change to the plugin
-  interface lands here first; then the plugin repositories update their `smaltdb` pin.
+  interface lands here first; then the plugin repositories update their `smaltdb` pin. Plugin API version 1 is stable
+  ([ADR 0013](docs/adr/0013-plugin-api-v1.md)): additive changes only, or a new API version.
 - Read before changing things: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/TESTING.md](docs/TESTING.md),
   [docs/ROADMAP.md](docs/ROADMAP.md), and the decisions in [docs/adr/](docs/adr/README.md). A significant decision
   gets a new ADR.

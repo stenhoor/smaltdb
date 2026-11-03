@@ -6,6 +6,10 @@
  *
  * A plugin imports nothing from the engine at run time (only these types), so it works with any
  * copy of the engine an application bundles. Everything it needs comes through `PluginHost`.
+ *
+ * API version 1 is stable (ADR 0013): within it, changes are additive only (new optional members of what
+ * plugins implement, new PluginHost members, new fields passed in). Anything else is a new
+ * PLUGIN_API_VERSION. test/plugin-api.test.ts fails to type-check when a change would break a version 1 plugin.
  */
 import { SmaltError, errorCode } from './errors.js';
 import type { Database } from './database.js';

@@ -5,8 +5,9 @@ read from, connection types, and methods that the application calls. smaltdb's o
 `@smaltdb/io`, `@smaltdb/external` and `@smaltdb/parquet` ([ADR 0012](../../adr/0012-plugins)). The
 [plugins guide](../../guide/plugins) shows how to install them.
 
-This page describes the plugin interface, **API version 1**. It is not stable yet: it will be declared stable before
-the 0.9.0 release. Until then it may change, and a plugin may need changes when you upgrade smaltdb.
+This page describes the plugin interface, **API version 1**. It is stable: within version 1 it only gains
+additions, so a plugin written for it keeps working when you upgrade smaltdb. See
+[Versions and compatibility](#versions-and-compatibility).
 
 ```ts
 import type { SmaltPlugin, PluginHost, FormatReader, SourceHandler } from 'smaltdb/engine';
@@ -400,7 +401,8 @@ does with `ctx.session`.
 | `'failed'` | `SMALT_EXTERNAL` | The handler threw, or the tab has no handler for this plugin. `detail` holds the handler's error message, or `this tab has no handler for <plugin> (onPluginMessage)`. |
 | `'no-session'` | `SMALT_MISUSE` | There is no client to ask: the engine runs in-process (`Database.open()`, `Database.openMemory()`), where `ask` always fails this way. |
 
-`AskError` extends `Error` with `code`, `reason` and `detail?`.
+`AskError` extends `Error` with `code`, `reason` and `detail?`. A later version 1 engine may add reasons: treat one
+you don't know like `'failed'`.
 
 In the engine worker, `ask` sends the question to the session it is given. Work the engine does by itself, such as a
 [refresh policy](../../guide/views-and-materialized-views#refresh-policies), has no calling session, but sources do
@@ -454,6 +456,29 @@ plugin missing:
 | An external table over `x.kv`, with no `format` | `SMALT_EXTERNAL`: `cannot tell the format of 'x.kv': add format = '…'` |
 | A `mem:` location | `SMALT_EXTERNAL`: `unsupported location 'mem:…'` |
 | `CREATE CONNECTION c WITH (type = 'kvc')` | `SMALT_ERROR`: `connection c: type 'kvc' is not supported` |
+
+## Versions and compatibility
+
+`apiVersion` and `PLUGIN_API_VERSION` are `1`. Version 1 is stable ([ADR 0013](../../adr/0013-plugin-api-v1)): it
+covers the types on this page, the behaviour it describes, and `callPlugin` / `onPluginMessage` on both `Database`
+classes. Within version 1, smaltdb only adds:
+- optional members of what a plugin implements (`FormatReader`, `SourceHandler`, `OpenedFile`, `RandomFile`,
+  `ConnectionTypeSpec`, `SmaltPlugin`), and new fields in what the engine passes in (`FormatRequest`,
+  `SourceContext`, `MethodContext`);
+- new `PluginHost` members and new `callPlugin` options;
+- new values in string unions a plugin reads, such as `AskError` reasons and `StaticType`. Handle a value you don't
+  know.
+
+Anything that would break a version 1 plugin is a new API version, announced in the release notes with what plugins
+must change. An engine refuses a plugin written for a version it does not implement, with `SMALT_MISUSE` naming both
+versions (see [SmaltPlugin](#smaltplugin)).
+
+`MethodContext.db` is the engine `Database`: its API is the [engine API](./engine) and follows smaltdb's own
+versioning. The worker protocol between the client and the engine worker is internal.
+
+Declare `smaltdb` as an optional peer dependency (`"peerDependenciesMeta": { "smaltdb": { "optional": true } }`) and
+import only types from it. smaltdb's own plugins limit the range to the minor version they are released with, such as
+`>=0.9.0 <0.10.0`.
 
 ## How smaltdb's plugins use the interface
 

@@ -147,5 +147,5 @@ Every other table works as usual.
 ## Writing plugins
 
 The plugin interface is `SmaltPlugin` in `smaltdb/engine`, API version 1. See [Writing plugins](../reference/api/plugins).
-It is not stable yet: it will be declared stable before the 0.9.0 release. Until then, a plugin may need changes when
-you upgrade smaltdb.
+Version 1 is stable: within it the interface only gains additions, so a plugin written for it keeps working when you
+upgrade smaltdb.
