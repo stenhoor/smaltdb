@@ -68,6 +68,11 @@ export interface ScalarFunction {
    */
   pureDate?: boolean;
   compile(args: CompiledArg[], ctx: FunctionContext): { fn: Fn; type: StaticType };
+  /**
+   * The result type for these argument types, the same as `compile` gives, without compiling (binding types an
+   * expression before it is compiled). Absent: the binder compiles once to find out.
+   */
+  resultType?(args: readonly Pick<CompiledArg, 'type' | 'collation'>[]): StaticType;
 }
 
 export interface AggregateState {
@@ -109,6 +114,7 @@ function simple(
     minArgs: min,
     maxArgs: max,
     deterministic,
+    resultType: typeof type === 'function' ? (args) => type(args as CompiledArg[]) : () => type,
     compile(args, ctx) {
       const t = typeof type === 'function' ? type(args) : type;
       const n = args.length;

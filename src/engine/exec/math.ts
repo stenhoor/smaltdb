@@ -221,6 +221,7 @@ export function mathScalar(m: MathFunction): ScalarFunction {
     minArgs: m.arity,
     maxArgs: m.arity,
     deterministic: true,
+    resultType: () => 'real',
     compile(args: CompiledArg[]): { fn: Fn; type: StaticType } {
       const f = m.f;
       if (m.arity === 0) return { type: 'real', fn: () => f() };
@@ -289,6 +290,7 @@ export function roundingScalar(g: (x: number) => number): ScalarFunction {
     minArgs: 1,
     maxArgs: 1,
     deterministic: true,
+    resultType: ([arg]) => roundingType(arg.type),
     compile([arg]) {
       const a = arg.fn;
       const type = roundingType(arg.type);

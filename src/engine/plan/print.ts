@@ -38,5 +38,9 @@ export function printExpr(e: PlanExpr): string {
       return `${e.mode}(<${e.plan.op}>)`;
     case 'inSubquery':
       return `${printExpr(e.probe)} in (<${e.plan.op}>)`;
+    case 'slot':
+      return `r${e.reg}`;
+    case 'native':
+      return '<compiled>';
   }
 }

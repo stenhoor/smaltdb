@@ -83,10 +83,16 @@ generated-code snapshot from 3a and, from step 3, a budget for prepare time on s
   functions registered from the existing helpers, with the closure compiler calling them (its specialized fast paths
   stay). `ScalarFunction` gains an optional inline description so code generation recognises functions by id. A new
   snapshot test of generated source (expressions and fused pipelines) guards ADR 0003 performance through 3b–3c.
-- **3b, binder and compiler** (about 1.2k lines). `bindExpr(ast, scope)` produces a plan expression, in the same
-  recursion order as `compileNode`, so errors keep their order. `CompileScope` splits into a pure `locate` (name
-  resolution) and `column(ref)`, which marks the column as read. `Planner.resolveIn` splits the same way.
-  `compileExpr(ast, scope)` stays as a shim (`compilePlanExpr(bindExpr(…))`), so its roughly 60 callers don't change.
+- **3b, binder and compiler** (done). `bindExpr(ast, scope)` produces a plan expression, in the same recursion
+  order as the closure compiler, so errors keep their order; `compilePlanExpr` compiles it to the same closures.
+  Comparisons carry their collation, affinity conversions are explicit `sql.affinity_*` calls, and operators are
+  `sql.*` calls. Columns, GROUP BY keys and aggregate and window results bind to register `slot`s, and subqueries
+  and select-list aliases to `native` nodes (planned and compiled at bind time, as before), so name resolution and
+  projection pushdown are unchanged; positional `col` references come with the SQL front end (step 5), where the
+  split of `CompileScope` into a pure lookup and the column marking moves too. SQL metadata (affinity, collation
+  source) is a symbol-keyed property beside the plan. Functions gain an optional `resultType`, so binding types a
+  call without compiling it. `compileExpr` and `compileNode` keep their signatures; code generation still reads
+  the AST. Planning cost of small statements is unchanged within noise (`bench/micro/prepare.ts`).
 - **3c, code generation on plan expressions** (about 500 lines). The emitter switches on function ids instead of AST
   operators; `isCodegenRoot`, `mathCall` and `hasRuntimeInputs` read plan expressions.
 - **Risks.** Error order between binding and `def.compile`; one more allocation per node while planning; the fold

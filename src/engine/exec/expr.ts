@@ -16,6 +16,8 @@ import { ARITHMETIC_FUNCTIONS, BITWISE_FUNCTIONS, COMPARISON_FUNCTIONS, arithImp
 import { type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type CodegenHelpers, codegenEnabled, generate, isCodegenRoot } from './codegen.js';
 import { WINDOW_ARITY } from './window.js';
+import { type PlanExpr, call, lit, param, typeOf } from '../plan/expr.js';
+import type { CollationName } from '../plan/types.js';
 import { decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
 import { readRowidKey } from '../storage/key-codec.js';
 
@@ -163,61 +165,126 @@ const CODEGEN_HELPERS: CodegenHelpers = {
   negate: (v) => negate(v),
 };
 
-/** The closure compiler (defines expression semantics). */
+// ------------------------------------------------------------------ binding and compiling
+
+/**
+ * The closure compiler (defines expression semantics): binds the parser's expression to a plan expression
+ * (`bindExpr`), then compiles that (`compilePlanExpr`).
+ */
 export function compileNode(e: Expr, scope: CompileScope): Compiled {
+  return compilePlanExpr(bindExpr(e, scope), scope.funcCtx);
+}
+
+/** What SQL knows about a bound expression besides its type: its collation, where that came from, its affinity. */
+interface SqlMeta {
+  collation: Collation;
+  collSrc: CollSrc;
+  affinity: Affinity;
+}
+
+const NO_META: SqlMeta = { collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE' };
+
+/**
+ * SQL metadata of bound expressions, kept beside the plan rather than in it (ADR 0014: affinity and collation
+ * sources are SQL's, not the plan's): a symbol-keyed property, which serializing a plan leaves out. Nodes without
+ * it have none (BINARY, no source, no affinity).
+ */
+const SQL_META: unique symbol = Symbol('sql');
+type WithMeta = { [SQL_META]?: SqlMeta };
+const getMeta = (e: PlanExpr): SqlMeta | undefined => (e as WithMeta)[SQL_META];
+const setMeta = (e: PlanExpr, m: SqlMeta): void => {
+  (e as WithMeta)[SQL_META] = m;
+};
+
+const COLLATION_NAMES: readonly CollationName[] = ['binary', 'nocase', 'rtrim'];
+const collationName = (c: Collation): CollationName => COLLATION_NAMES[c];
+const collationId = (n: CollationName | undefined): Collation => (n === 'nocase' ? Collation.NoCase : n === 'rtrim' ? Collation.RTrim : Collation.Binary);
+
+function withMeta<T extends PlanExpr>(e: T, m: SqlMeta): T {
+  if (m.collation !== Collation.Binary || m.collSrc !== CollSrc.None || m.affinity !== 'NONE') setMeta(e, m);
+  return e;
+}
+
+const metaOf = (e: PlanExpr): SqlMeta => getMeta(e) ?? NO_META;
+
+/** The parts of a bound expression the SQL rules for comparisons read. */
+const operand = (e: PlanExpr): SqlOperand => ({ type: typeOf(e), ...metaOf(e) });
+
+const AFFINITY_CALLS = new Set(['sql.affinity_numeric', 'sql.affinity_text']);
+
+/** `left op right` with SQLite's collation and affinity rules made explicit: a collation attribute and conversion calls. */
+function bindComparison(op: string, a: PlanExpr, b: PlanExpr): PlanExpr {
+  const oa = operand(a);
+  const ob = operand(b);
+  const coll = comparisonCollation(oa, ob);
+  const [ca, cb] = comparisonConverters(oa, ob);
+  const wrap = (x: PlanExpr, conv: unknown): PlanExpr =>
+    conv === null ? x : call(conv === applyNumericAffinity ? 'sql.affinity_numeric' : 'sql.affinity_text', [x], typeOf(x));
+  return call(COMPARISON_FUNCTIONS[op], [wrap(a, ca), wrap(b, cb)], 'int', collationName(coll));
+}
+
+/**
+ * Bind an expression of the parser to a plan expression: resolve its names, type it, and make SQL's rules explicit
+ * (comparison collations, affinity conversions, the `sql.*` function for each operator). Subqueries are planned and
+ * select-list aliases compiled here, at the moment the closure compiler always did, so planning order, registers
+ * and errors are unchanged.
+ */
+export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
   if (scope.groupRef) {
     const g = scope.groupRef(e);
-    if (g) return { fn: regReader(g.reg), type: g.type, collation: g.collation, collSrc: g.collation ? CollSrc.Column : CollSrc.None, affinity: g.affinity, constant: false, reg: g.reg };
+    if (g) return withMeta({ k: 'slot', reg: g.reg, type: g.type }, { collation: g.collation, collSrc: g.collation ? CollSrc.Column : CollSrc.None, affinity: g.affinity });
   }
   switch (e.kind) {
     case 'literal':
-      return konst(e.value, literalType(e.value, e.isReal));
-    case 'param': {
-      const reg = e.index - 1;
-      return { fn: (r) => r[reg], type: 'any', collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false, reg };
-    }
+      return lit(e.value, literalType(e.value, e.isReal));
+    case 'param':
+      return param(e.index - 1);
     case 'column': {
       const b = scope.resolveColumn(e);
-      if (b.compiled) return b.compiled;
-      return {
-        fn: regReader(b.reg),
-        type: b.type,
-        collation: b.collation,
-        collSrc: CollSrc.Column,
-        affinity: b.affinity,
-        constant: false,
-        reg: b.reg,
-      };
+      if (b.compiled) return native(b.compiled);
+      return withMeta({ k: 'slot', reg: b.reg, type: b.type }, { collation: b.collation, collSrc: CollSrc.Column, affinity: b.affinity });
     }
     case 'collate': {
-      const inner = compileNode(e.expr, scope);
+      const inner = bindExpr(e.expr, scope);
       const c = collationByName(e.collation);
       if (c === undefined) throw new SmaltError('SMALT_ERROR', `no such collation sequence: ${e.collation}`);
-      return { ...inner, collation: c, collSrc: CollSrc.Explicit };
+      return withMeta({ ...inner }, { ...metaOf(inner), collation: c, collSrc: CollSrc.Explicit });
     }
-    case 'unary':
-      return compileUnary(e.op, compileNode(e.operand, scope));
+    case 'unary': {
+      const x = bindExpr(e.operand, scope);
+      switch (e.op) {
+        case 'NOT':
+          return { k: 'not', arg: x };
+        case '-':
+          return call('sql.neg', [x], isNumericType(typeOf(x)) ? typeOf(x) : 'num');
+        case '~':
+          return call('sql.bitnot', [x], 'int');
+        case '+':
+          // Unary plus is a no-op that strips affinity and collation (SQLite): the same value, without the metadata.
+          return stripped({ ...x });
+        default:
+          throw new SmaltError('SMALT_ERROR', `unknown unary operator ${(e as { op: string }).op}`);
+      }
+    }
     case 'binary':
-      return compileBinary(e.op, e.left, e.right, scope);
+      return bindBinary(e.op, bindExpr(e.left, scope), bindExpr(e.right, scope));
     case 'between': {
-      const x = compileNode(e.expr, scope);
-      const lo = compileNode(e.low, scope);
-      const hi = compileNode(e.high, scope);
-      const ge = comparison('>=', x, lo);
-      const le = comparison('<=', x, hi);
-      const both = and(ge, le);
-      return e.not ? compileUnary('NOT', both) : both;
+      const x = bindExpr(e.expr, scope);
+      const lo = bindExpr(e.low, scope);
+      const hi = bindExpr(e.high, scope);
+      const both: PlanExpr = { k: 'and', args: [bindComparison('>=', x, lo), bindComparison('<=', x, hi)] };
+      return e.not ? { k: 'not', arg: both } : both;
     }
-    case 'isNull': {
-      const x = compileNode(e.expr, scope);
-      const f = x.fn;
-      const not = e.not;
-      return fold({ fn: (r) => ((f(r) === null) !== not ? 1 : 0), type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: x.constant });
+    case 'isNull':
+      return { k: 'isNull', arg: bindExpr(e.expr, scope), not: e.not };
+    case 'inList': {
+      const x = bindExpr(e.expr, scope);
+      const list = e.list.map((v) => bindExpr(v, scope));
+      const inList = call('sql.in_list', [x, ...list], 'int');
+      return e.not ? { k: 'not', arg: inList } : inList;
     }
-    case 'inList':
-      return compileInList(e.not, compileNode(e.expr, scope), e.list.map((x) => compileNode(x, scope)));
     case 'inSelect': {
-      const probe = compileNode(e.expr, scope);
+      const probe = compilePlanExpr(bindExpr(e.expr, scope), scope.funcCtx);
       const test = scope.inSubquery(e.select, probe);
       const fn: Fn = e.not
         ? (r) => {
@@ -225,24 +292,247 @@ export function compileNode(e: Expr, scope: CompileScope): Compiled {
             return v === null ? null : v === 1 ? 0 : 1;
           }
         : test;
-      return { fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
+      return native({ fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false });
     }
     case 'exists': {
       const f = scope.existsSubquery(e.select);
       const fn: Fn = e.not ? (r) => (f(r) === 1 ? 0 : 1) : f;
-      return { fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
+      return native({ fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false });
     }
     case 'subquery':
-      return scope.scalarSubquery(e.select);
-    case 'like':
-      return compileLike(e.op, e.not, compileNode(e.expr, scope), compileNode(e.pattern, scope), e.escape ? compileNode(e.escape, scope) : undefined);
-    case 'case':
-      return compileCase(e, scope);
-    case 'cast':
-      return compileCast(compileNode(e.expr, scope), e.type);
+      return native(scope.scalarSubquery(e.select));
+    case 'like': {
+      const x = bindExpr(e.expr, scope);
+      const pat = bindExpr(e.pattern, scope);
+      const esc = e.escape ? bindExpr(e.escape, scope) : undefined;
+      if (e.op !== 'LIKE' && e.op !== 'GLOB') throw new SmaltError('SMALT_ERROR', `no such function: ${e.op.toLowerCase()}`);
+      const like = call(e.op === 'GLOB' ? 'sql.glob' : 'sql.like', esc ? [x, pat, esc] : [x, pat], 'int');
+      return e.not ? { k: 'not', arg: like } : like;
+    }
+    case 'case': {
+      const base = e.base ? bindExpr(e.base, scope) : undefined;
+      const whens = e.whens.map((w) => {
+        const when = bindExpr(w.when, scope);
+        return { when: base ? bindComparison('=', base, when) : when, then: bindExpr(w.then, scope) };
+      });
+      const els = e.else ? bindExpr(e.else, scope) : lit(null, 'null');
+      const types = [...whens.map((w) => typeOf(w.then)), typeOf(els)].filter((t) => t !== 'null');
+      let type: StaticType = types.length === 0 ? 'null' : types[0];
+      for (const t of types) if (t !== type) type = isNumericType(t) && isNumericType(type) ? 'num' : 'any';
+      return { k: 'case', whens, else: els, type };
+    }
+    case 'cast': {
+      const x = bindExpr(e.expr, scope);
+      const st = storageTypeFor(e.type);
+      const affinity = st === 'ANY' ? 'NUMERIC' : affinityOfStorage(st);
+      const to = st === 'ANY' || st === 'NUMERIC' ? 'num' : staticTypeOfStorage(st);
+      const m = metaOf(x);
+      return withMeta({ k: 'cast', fn: CAST_FUNCTIONS[st] ?? 'sql.cast_numeric', to, arg: x }, { collation: m.collation, collSrc: m.collSrc, affinity });
+    }
     case 'call':
-      return compileCall(e, scope);
+      return bindCall(e, scope);
   }
+}
+
+/** `e` with no SQL metadata, even where the node it copies had some (a compiled alias keeps its own otherwise). */
+function stripped(e: PlanExpr): PlanExpr {
+  setMeta(e, NO_META);
+  return e;
+}
+
+function native(c: Compiled): PlanExpr {
+  return { k: 'native', compiled: c, type: c.type };
+}
+
+function bindBinary(op: string, a: PlanExpr, b: PlanExpr): PlanExpr {
+  switch (op) {
+    case 'AND':
+      return { k: 'and', args: [a, b] };
+    case 'OR':
+      return { k: 'or', args: [a, b] };
+    case '=':
+    case '!=':
+    case '<':
+    case '<=':
+    case '>':
+    case '>=':
+    case 'IS':
+    case 'IS NOT':
+      return bindComparison(op, a, b);
+    case '+':
+    case '-':
+    case '*':
+    case '/':
+    case '%': {
+      const ta = typeOf(a);
+      const tb = typeOf(b);
+      return call(ARITHMETIC_FUNCTIONS[op], [a, b], ta === 'real' || tb === 'real' ? 'real' : ta === 'int' && tb === 'int' ? 'int' : 'num');
+    }
+    case '||':
+      return call('sql.concat', [a, b], 'text');
+    case '&':
+    case '|':
+    case '<<':
+    case '>>':
+      return call(BITWISE_FUNCTIONS[op], [a, b], 'int');
+    default:
+      throw new SmaltError('SMALT_UNSUPPORTED', `operator ${op} is not supported yet`);
+  }
+}
+
+const NO_FN: Fn = () => null;
+
+function bindCall(e: CallExpr, scope: CompileScope): PlanExpr {
+  if (e.over !== undefined) {
+    if (!scope.windowRef) throw new SmaltError('SMALT_ERROR', `misuse of window function ${e.name}()`);
+    const b = scope.windowRef(e);
+    return withMeta({ k: 'slot', reg: b.reg, type: b.type }, { collation: b.collation, collSrc: CollSrc.None, affinity: 'NONE' });
+  }
+  const name = e.name;
+  const isAgg = aggregateFunctions.has(name) && !((name === 'min' || name === 'max') && e.args.length > 1);
+  if (isAgg) {
+    if (!scope.aggregateRef) throw new SmaltError('SMALT_ERROR', `misuse of aggregate function ${name}()`);
+    const b = scope.aggregateRef(e);
+    return withMeta({ k: 'slot', reg: b.reg, type: b.type }, { collation: b.collation, collSrc: CollSrc.None, affinity: 'NONE' });
+  }
+  if (e.distinct || e.star || e.filter) throw new SmaltError('SMALT_ERROR', `DISTINCT/FILTER/* is only valid with aggregate functions`);
+  if (name === 'current_time' || name === 'current_date' || name === 'current_timestamp') {
+    const ctx = scope.funcCtx;
+    return native({ fn: () => currentTimeText(name, ctx.now()), type: 'text', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false });
+  }
+  const def = scalarFunctions.get(name);
+  if (!def) {
+    if (Object.hasOwn(WINDOW_ARITY, name)) {
+      // A window-only function without OVER (SQLite checks the argument count first).
+      const [lo, hi] = WINDOW_ARITY[name];
+      if (e.args.length < lo || e.args.length > hi) throw new SmaltError('SMALT_ERROR', `wrong number of arguments to function ${name}()`);
+      throw new SmaltError('SMALT_ERROR', `misuse of window function ${name}()`);
+    }
+    throw new SmaltError('SMALT_ERROR', `no such function: ${name}`);
+  }
+  const n = e.args.length;
+  if (n < def.minArgs || (def.maxArgs >= 0 && n > def.maxArgs)) throw new SmaltError('SMALT_ERROR', `wrong number of arguments to function ${name}()`);
+  if (name === 'likelihood') {
+    // SQLite: the probability must be a REAL literal (not an integer, not negated) from 0.0 to 1.0.
+    const p = e.args[1];
+    if (p.kind !== 'literal' || !p.isReal || typeof p.value !== 'number' || Object.is(p.value, -0) || !(p.value >= 0 && p.value <= 1))
+      throw new SmaltError('SMALT_ERROR', 'second argument to likelihood() must be a constant between 0.0 and 1.0');
+  }
+  const args = e.args.map((a) => bindExpr(a, scope));
+  // A function's result type follows from its arguments' types. Functions without `resultType` are compiled once
+  // to find out (compiling is cheap and never fails).
+  const info = args.map((a) => ({ fn: NO_FN, type: typeOf(a), collation: metaOf(a).collation }));
+  const type = def.resultType ? def.resultType(info) : def.compile(info, scope.funcCtx).type;
+  // Collation of a function result: from its first argument when that argument carries one.
+  const first = args[0] ? metaOf(args[0]) : NO_META;
+  const explicit = first.collSrc === CollSrc.Explicit;
+  return withMeta(call(name, args, type), { collation: explicit ? first.collation : Collation.Binary, collSrc: explicit ? CollSrc.Explicit : CollSrc.None, affinity: 'NONE' });
+}
+
+/** Compile a bound expression to a closure, with its SQL metadata. */
+export function compilePlanExpr(e: PlanExpr, ctx: FunctionContext): Compiled {
+  const c = compileBound(e, ctx);
+  const m = getMeta(e);
+  if (m === undefined) return c;
+  // A compiled alias or subquery is shared: copy it. Everything else was built just now for this node.
+  if (e.k === 'native') return { ...c, ...m };
+  c.collation = m.collation;
+  c.collSrc = m.collSrc;
+  c.affinity = m.affinity;
+  return c;
+}
+
+function compileBound(e: PlanExpr, ctx: FunctionContext): Compiled {
+  const sub = (x: PlanExpr): Compiled => compilePlanExpr(x, ctx);
+  switch (e.k) {
+    case 'lit':
+      return konst(e.value, e.type);
+    case 'param': {
+      const reg = e.index;
+      return { fn: (r) => r[reg], type: 'any', collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false, reg };
+    }
+    case 'slot':
+      return { fn: regReader(e.reg), type: e.type, collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false, reg: e.reg };
+    case 'native':
+      return e.compiled as Compiled;
+    case 'not': {
+      const a = e.arg;
+      // NOT LIKE, NOT GLOB and NOT IN compile to one closure, as their own forms.
+      if (a.k === 'call' && (a.fn === 'sql.like' || a.fn === 'sql.glob' || a.fn === 'sql.in_list')) return compileSqlCall(a, ctx, true);
+      return compileUnary('NOT', sub(a));
+    }
+    case 'and':
+      return and(sub(e.args[0]), sub(e.args[1]));
+    case 'or':
+      return or(sub(e.args[0]), sub(e.args[1]));
+    case 'isNull': {
+      const x = sub(e.arg);
+      const f = x.fn;
+      const not = e.not;
+      return fold({ fn: (r) => ((f(r) === null) !== not ? 1 : 0), type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: x.constant });
+    }
+    case 'case':
+      return compileCase(e, ctx);
+    case 'cast': {
+      const x = sub(e.arg);
+      const { fn } = sqlFunction(e.fn).compile([x], {});
+      return fold({ fn, type: e.to, collation: x.collation, collSrc: x.collSrc, affinity: 'NONE', constant: x.constant });
+    }
+    case 'call':
+      return e.fn.startsWith('sql.') ? compileSqlCall(e, ctx, false) : compileScalarCall(e, ctx);
+    case 'col':
+    case 'subquery':
+    case 'inSubquery':
+      throw new SmaltError('SMALT_INTERNAL', `plan expression ${e.k} cannot be compiled yet`);
+  }
+}
+
+/** A call of an `sql.*` function: the closure the SQL rules always built for that operator. */
+function compileSqlCall(e: Extract<PlanExpr, { k: 'call' }>, ctx: FunctionContext, negated: boolean): Compiled {
+  const sub = (x: PlanExpr): Compiled => compilePlanExpr(x, ctx);
+  const args = e.args;
+  switch (e.fn) {
+    case 'sql.in_list':
+      return compileInList(negated, sub(args[0]), args.slice(1).map(sub));
+    case 'sql.like':
+    case 'sql.glob': {
+      const [x, pat, esc] = args.map(sub);
+      const { fn } = sqlFunction(e.fn).compile(esc ? [x, pat, esc] : [x, pat], { negated });
+      return fold({ fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: x.constant && pat.constant && (esc?.constant ?? true) });
+    }
+    case 'sql.neg':
+      return compileUnary('-', sub(args[0]));
+    case 'sql.bitnot':
+      return compileUnary('~', sub(args[0]));
+    default:
+      if (e.collation !== undefined) {
+        // A comparison: its operands' affinity conversions run inside its closure, after the NULL checks.
+        const ops = args.map((x) => {
+          if (x.k === 'call' && AFFINITY_CALLS.has(x.fn)) {
+            const inner = sub(x.args[0]);
+            const real = inner.type === 'real';
+            const convert = x.fn === 'sql.affinity_numeric' ? applyNumericAffinity : (v: SqlValue) => applyTextAffinity(v, real);
+            return { c: inner, arg: { fn: inner.fn, type: inner.type, convert } };
+          }
+          const c = sub(x);
+          return { c, arg: { fn: c.fn, type: c.type, convert: null } };
+        });
+        const { fn } = sqlFunction(e.fn).compile(
+          ops.map((o) => o.arg),
+          { collation: collationId(e.collation) },
+        );
+        return fold({ fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: ops.every((o) => o.c.constant) });
+      }
+      return call2(e.fn, sub(args[0]), sub(args[1]));
+  }
+}
+
+function compileScalarCall(e: Extract<PlanExpr, { k: 'call' }>, ctx: FunctionContext): Compiled {
+  const def = scalarFunctions.get(e.fn)!;
+  const args = e.args.map((a) => compilePlanExpr(a, ctx));
+  const compiledArgs: CompiledArg[] = args.map((a) => ({ fn: a.fn, type: a.type, collation: a.collation }));
+  const { fn, type } = def.compile(compiledArgs, ctx);
+  return fold({ fn, type, collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: def.deterministic && args.every((a) => a.constant) });
 }
 
 function regReader(reg: number): Fn {
@@ -302,43 +592,11 @@ function or(a: Compiled, b: Compiled): Compiled {
 
 // ------------------------------------------------------------------ binary operators
 
-function compileBinary(op: string, le: Expr, re: Expr, scope: CompileScope): Compiled {
-  const a = compileNode(le, scope);
-  const b = compileNode(re, scope);
-  switch (op) {
-    case 'AND':
-      return and(a, b);
-    case 'OR':
-      return or(a, b);
-    case '=':
-    case '!=':
-    case '<':
-    case '<=':
-    case '>':
-    case '>=':
-    case 'IS':
-    case 'IS NOT':
-      return comparison(op, a, b);
-    case '+':
-    case '-':
-    case '*':
-    case '/':
-    case '%':
-      return arithmetic(op, a, b);
-    case '||':
-      return call2('sql.concat', a, b);
-    case '&':
-    case '|':
-    case '<<':
-    case '>>':
-      return call2(BITWISE_FUNCTIONS[op], a, b);
-    default:
-      throw new SmaltError('SMALT_UNSUPPORTED', `operator ${op} is not supported yet`);
-  }
-}
+/** What the SQL comparison rules read of an operand. */
+export type SqlOperand = Pick<Compiled, 'type' | 'affinity' | 'collation' | 'collSrc'>;
 
 /** Collation for a comparison: explicit COLLATE wins, then column collation, left before right. */
-export function comparisonCollation(a: Compiled, b: Compiled): Collation {
+export function comparisonCollation(a: SqlOperand, b: SqlOperand): Collation {
   if (a.collSrc === CollSrc.Explicit) return a.collation;
   if (b.collSrc === CollSrc.Explicit) return b.collation;
   if (a.collSrc === CollSrc.Column) return a.collation;
@@ -354,7 +612,7 @@ function isNumAff(a: Affinity): boolean {
  * Affinity conversions applied before comparing (SQLite §4.2): numeric affinity is applied to the
  * other operand if it has TEXT/BLOB/no affinity; TEXT affinity to an operand with no affinity.
  */
-export function comparisonConverters(a: Compiled, b: Compiled): [((v: SqlValue) => SqlValue) | null, ((v: SqlValue) => SqlValue) | null] {
+export function comparisonConverters(a: SqlOperand, b: SqlOperand): [((v: SqlValue) => SqlValue) | null, ((v: SqlValue) => SqlValue) | null] {
   let ca: ((v: SqlValue) => SqlValue) | null = null;
   let cb: ((v: SqlValue) => SqlValue) | null = null;
   if (isNumAff(a.affinity) && !isNumAff(b.affinity)) cb = applyNumericAffinity;
@@ -383,10 +641,6 @@ function comparison(op: string, a: Compiled, b: Compiled): Compiled {
   return fold({ fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: a.constant && b.constant });
 }
 
-function arithmetic(op: string, a: Compiled, b: Compiled): Compiled {
-  return call2(ARITHMETIC_FUNCTIONS[op], a, b);
-}
-
 // ------------------------------------------------------------------ IN, LIKE, CASE, CAST
 
 function compileInList(not: boolean, x: Compiled, list: Compiled[]): Compiled {
@@ -406,33 +660,12 @@ function compileInList(not: boolean, x: Compiled, list: Compiled[]): Compiled {
   return { ...base, constant: false, fn };
 }
 
-function compileLike(op: string, not: boolean, x: Compiled, pat: Compiled, escape?: Compiled): Compiled {
-  if (op !== 'LIKE' && op !== 'GLOB') throw new SmaltError('SMALT_ERROR', `no such function: ${op.toLowerCase()}`);
-  const { fn } = sqlFunction(op === 'GLOB' ? 'sql.glob' : 'sql.like').compile(escape ? [x, pat, escape] : [x, pat], { negated: not });
-  return fold({
-    fn,
-    type: 'int',
-    collation: 0,
-    collSrc: CollSrc.None,
-    affinity: 'NONE',
-    constant: x.constant && pat.constant && (escape?.constant ?? true),
-  });
-}
-
-function compileCase(e: Extract<Expr, { kind: 'case' }>, scope: CompileScope): Compiled {
-  const base = e.base ? compileNode(e.base, scope) : undefined;
-  const whens = e.whens.map((w) => {
-    const when = compileNode(w.when, scope);
-    const test = base ? comparison('=', base, when).fn : when.fn;
-    return { test, then: compileNode(w.then, scope) };
-  });
-  const els = e.else ? compileNode(e.else, scope) : konst(null, 'null');
+function compileCase(e: Extract<PlanExpr, { k: 'case' }>, ctx: FunctionContext): Compiled {
+  const whens = e.whens.map((w) => ({ test: compilePlanExpr(w.when, ctx).fn, then: compilePlanExpr(w.then, ctx) }));
+  const els = compilePlanExpr(e.else, ctx);
   const thens = whens.map((w) => w.then.fn);
   const tests = whens.map((w) => w.test);
   const elseFn = els.fn;
-  const types = [...whens.map((w) => w.then.type), els.type].filter((t) => t !== 'null');
-  let type: StaticType = types.length === 0 ? 'null' : types[0];
-  for (const t of types) if (t !== type) type = isNumericType(t) && isNumericType(type) ? 'num' : 'any';
   const n = tests.length;
   return fold({
     fn: (r) => {
@@ -442,7 +675,7 @@ function compileCase(e: Extract<Expr, { kind: 'case' }>, scope: CompileScope): C
       }
       return elseFn(r);
     },
-    type,
+    type: e.type,
     collation: 0,
     collSrc: CollSrc.None,
     affinity: 'NONE',
@@ -451,58 +684,6 @@ function compileCase(e: Extract<Expr, { kind: 'case' }>, scope: CompileScope): C
 }
 
 const CAST_FUNCTIONS: Record<string, string> = { INTEGER: 'sql.cast_integer', REAL: 'sql.cast_real', TEXT: 'sql.cast_text', BLOB: 'sql.cast_blob' };
-
-function compileCast(x: Compiled, typeName: string): Compiled {
-  const st = storageTypeFor(typeName);
-  const { fn } = sqlFunction(CAST_FUNCTIONS[st] ?? 'sql.cast_numeric').compile([x], {});
-  const affinity = st === 'ANY' ? 'NUMERIC' : affinityOfStorage(st);
-  const type = st === 'ANY' || st === 'NUMERIC' ? 'num' : staticTypeOfStorage(st);
-  return fold({ fn, type, collation: x.collation, collSrc: x.collSrc, affinity, constant: x.constant });
-}
-
-function compileCall(e: CallExpr, scope: CompileScope): Compiled {
-  if (e.over !== undefined) {
-    if (!scope.windowRef) throw new SmaltError('SMALT_ERROR', `misuse of window function ${e.name}()`);
-    const b = scope.windowRef(e);
-    return { fn: regReader(b.reg), type: b.type, collation: b.collation, collSrc: CollSrc.None, affinity: 'NONE', constant: false, reg: b.reg };
-  }
-  const name = e.name;
-  const isAgg = aggregateFunctions.has(name) && !((name === 'min' || name === 'max') && e.args.length > 1);
-  if (isAgg) {
-    if (!scope.aggregateRef) throw new SmaltError('SMALT_ERROR', `misuse of aggregate function ${name}()`);
-    const b = scope.aggregateRef(e);
-    return { fn: regReader(b.reg), type: b.type, collation: b.collation, collSrc: CollSrc.None, affinity: 'NONE', constant: false, reg: b.reg };
-  }
-  if (e.distinct || e.star || e.filter) throw new SmaltError('SMALT_ERROR', `DISTINCT/FILTER/* is only valid with aggregate functions`);
-  if (name === 'current_time' || name === 'current_date' || name === 'current_timestamp') {
-    const ctx = scope.funcCtx;
-    return { fn: () => currentTimeText(name, ctx.now()), type: 'text', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
-  }
-  const def = scalarFunctions.get(name);
-  if (!def) {
-    if (Object.hasOwn(WINDOW_ARITY, name)) {
-      // A window-only function without OVER (SQLite checks the argument count first).
-      const [lo, hi] = WINDOW_ARITY[name];
-      if (e.args.length < lo || e.args.length > hi) throw new SmaltError('SMALT_ERROR', `wrong number of arguments to function ${name}()`);
-      throw new SmaltError('SMALT_ERROR', `misuse of window function ${name}()`);
-    }
-    throw new SmaltError('SMALT_ERROR', `no such function: ${name}`);
-  }
-  const n = e.args.length;
-  if (n < def.minArgs || (def.maxArgs >= 0 && n > def.maxArgs)) throw new SmaltError('SMALT_ERROR', `wrong number of arguments to function ${name}()`);
-  if (name === 'likelihood') {
-    // SQLite: the probability must be a REAL literal (not an integer, not negated) from 0.0 to 1.0.
-    const p = e.args[1];
-    if (p.kind !== 'literal' || !p.isReal || typeof p.value !== 'number' || Object.is(p.value, -0) || !(p.value >= 0 && p.value <= 1))
-      throw new SmaltError('SMALT_ERROR', 'second argument to likelihood() must be a constant between 0.0 and 1.0');
-  }
-  const args = e.args.map((a) => compileNode(a, scope));
-  const compiledArgs: CompiledArg[] = args.map((a) => ({ fn: a.fn, type: a.type, collation: a.collation }));
-  const { fn, type } = def.compile(compiledArgs, scope.funcCtx);
-  // Collation of a function result: from its first argument when that argument carries one.
-  const collSrc = args[0]?.collSrc === CollSrc.Explicit ? CollSrc.Explicit : CollSrc.None;
-  return fold({ fn, type, collation: collSrc ? args[0].collation : 0, collSrc, affinity: 'NONE', constant: def.deterministic && args.every((a) => a.constant) });
-}
 
 /** Split a predicate into AND-ed conjuncts. */
 export function conjuncts(e: Expr | undefined, out: Expr[] = []): Expr[] {

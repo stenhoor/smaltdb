@@ -38,7 +38,18 @@ export type PlanExpr =
   /** A dependent evaluation: the first column of the nested plan's first row, or whether it has a row. */
   | { readonly k: 'subquery'; readonly mode: 'scalar' | 'exists'; readonly plan: NestedPlan; readonly type: PlanType; readonly collation: CollationName }
   /** Membership of `probe` in the nested plan's single column: 1, 0 or NULL. */
-  | { readonly k: 'inSubquery'; readonly probe: PlanExpr; readonly plan: NestedPlan; readonly collation: CollationName };
+  | { readonly k: 'inSubquery'; readonly probe: PlanExpr; readonly plan: NestedPlan; readonly collation: CollationName }
+  /**
+   * Internal, while the plan layer is built next to the current planner (ADR 0014, steps 3–5): a value the planner
+   * keeps in a register (a column of a source, a GROUP BY key, an aggregate or window result). Never serialized,
+   * rejected by the validator, and replaced by `col` when the SQL front end produces plans.
+   */
+  | { readonly k: 'slot'; readonly reg: number; readonly type: PlanType }
+  /**
+   * Internal, as `slot`: a subexpression the current planner compiled itself (a subquery, or a select-list alias
+   * that a name resolved to). `compiled` is an `exec/expr.ts` `Compiled`.
+   */
+  | { readonly k: 'native'; readonly compiled: object; readonly type: PlanType };
 
 /** The static type of an expression. */
 export function typeOf(e: PlanExpr): PlanType {
