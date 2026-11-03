@@ -1,7 +1,9 @@
 # ADR 0012: Plugins: a dependency-free core, optional features as packages
 
 - **Status:** accepted (2026-11-02); amended 2026-11-02: one repository per plugin, and the full interface (sources,
-  connection types, methods, questions to client sessions). See the implementation plan for progress.
+  connection types, methods, questions to client sessions); amended 2026-11-03: installing before the first publish,
+  the docs examples split by plugin, and API version 1 declared stable in [ADR 0013](0013-plugin-api-v1.md). See the
+  implementation plan for progress.
 - **Date:** 2026-11-02
 
 ## Context
@@ -80,8 +82,9 @@ only the pieces it uses.
   - The core's prebuilt worker contains core only.
   - An application that uses `@smaltdb/parquet` bundles `hyparquet` itself, through its own build, from the
     installed package and its licence.
-- **Versions.** While the API is experimental (section 6), each plugin's peer dependency on `smaltdb` pins the minor
-  version (`~0.9.0`).
+- **Versions.** Each plugin's peer dependency on `smaltdb` is limited to the minor version it is released with
+  (`>=0.9.0 <0.10.0`), and optional, since a plugin imports only types from it. What may change within plugin API
+  version 1 is in [ADR 0013](0013-plugin-api-v1.md).
 - **Releases.** Core and plugins are released together with the same version number.
 - **npm scope.** Publishing needs a free `smaltdb` organisation on npmjs.com, which the owner creates.
 
@@ -205,7 +208,8 @@ The catalog records, for each external table and connection, the format, source 
 - **Phase 1:** the plugin interface is internal and marked experimental. Its first users are our own three plugins.
 - **Phase 2:** the interface is declared stable as API version 1, public and documented, once all three plugins run
   on it unchanged from their own repositories. Nothing is published before then (owner's decision, 2026-11-02).
-  User-defined functions come later as an addition to version 1.
+  User-defined functions come later as an addition to version 1. Done: [ADR 0013](0013-plugin-api-v1.md) says what
+  version 1 covers and how it may change.
 - **Versioning:** `apiVersion` lets a later engine reject an incompatible plugin with a clear message instead of
   failing at run time.
 
@@ -245,10 +249,11 @@ The catalog records, for each external table and connection, the format, source 
 3. **The full interface.** ✅ `addSource`, `addConnectionType`, `addMethod`, `onSessionClosed`, `ask`, `callPlugin`,
    `onPluginMessage`, the `pluginCall` / `pluginAsk` / `pluginReply` protocol. Core keeps only the external-data
    framework: SQL, catalog, fetch phase, patterns, partitions, pruning, validators.
-4. **External sources and CSV/JSON out.** `@smaltdb/external` (sources, signing, credentials, registered files) and
+4. **External sources and CSV/JSON out.** ✅ `@smaltdb/external` (sources, signing, credentials, registered files) and
    `@smaltdb/io` (CSV/JSON formats, import and export).
 5. **Separate repositories.** ✅ Each plugin moves to its own repository with its tests; the core keeps test plugins.
    The plugins' tests that use the engine's internals (its server and worker protocol) import them from the source in
    the packed core build.
-6. **Declare API version 1 stable**, with a public reference for writing plugins.
+6. **Declare API version 1 stable**, with a public reference for writing plugins. ✅ [ADR 0013](0013-plugin-api-v1.md);
+   `test/plugin-api.test.ts` fails to type-check when a change would break a version 1 plugin.
 7. **Release** 0.9.0: `smaltdb` and the three `@smaltdb/*` packages, together.
