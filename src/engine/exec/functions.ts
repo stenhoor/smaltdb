@@ -608,6 +608,43 @@ class SumState implements AggregateState {
     this.addReal(Number(v));
   }
 
+  /** Rows removed (sliding window frames) since the state was created, and the largest |value| removed. */
+  private removed = 0;
+  private removedMax = 0;
+
+  /**
+   * Undo a step (sliding window frames), as SQLite's sumInverse does: once a REAL has been added the sum stays REAL.
+   * Integer sums subtract exactly; REAL sums keep the compensated (Neumaier) sum, whose error grows only with the
+   * square of epsilon per update, and ask for a rebuild when even that could show next to the result. An integer
+   * sum that would overflow asks for a rebuild too, rather than failing on an intermediate value.
+   */
+  inverse(args: SqlValue[]): boolean {
+    let v = args[0];
+    if (v === null) return true;
+    if (typeof v === 'string' || v instanceof Uint8Array) v = toNumeric(v)!;
+    this.count--;
+    if (this.isInt) {
+      const s = this.intSum;
+      if (typeof s === 'number' && typeof v === 'number') {
+        const r = s - v;
+        if (Number.isSafeInteger(r)) {
+          this.intSum = r;
+          return true;
+        }
+      }
+      const big = BigInt(s) - BigInt(v as number | bigint);
+      if (big > 2n ** 63n - 1n || big < -(2n ** 63n)) return false;
+      this.intSum = normalizeInt(big);
+      return true;
+    }
+    const x = Number(v);
+    this.addReal(-x);
+    this.removed++;
+    const ax = Math.abs(x);
+    if (ax > this.removedMax) this.removedMax = ax;
+    return Math.abs(this.real + this.comp) >= 1e9 * this.removed * Number.EPSILON * Number.EPSILON * this.removedMax;
+  }
+
   private switchToReal(): void {
     this.isInt = false;
     this.real = 0;
@@ -648,6 +685,10 @@ class CountState implements AggregateState {
   constructor(private readonly star: boolean) {}
   step(args: SqlValue[]): void {
     if (this.star || args[0] !== null) this.n++;
+  }
+  inverse(args: SqlValue[]): boolean {
+    if (this.star || args[0] !== null) this.n--;
+    return true;
   }
   final(): SqlValue {
     return this.n;
