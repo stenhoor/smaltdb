@@ -54,6 +54,15 @@ What M1 adds:
 - **Record format:** property tests for round trips and for rowid key ordering.
 - **SQL smoke tests:** constraints, transactions, persistence, `EXPLAIN QUERY PLAN`.
 
+## Generated code
+
+`test/codegen-source.test.ts` records the JavaScript that code generation emits (expressions, fused pipelines over
+row and columnar tables, row loaders) for a corpus of queries over typed tables, and compares it with
+`test/codegen-source/*.txt`. Generated code carries the performance of [ADR 0003](adr/0003-m1-executor-and-transactions.md),
+and the plan layer ([ADR 0014](adr/0014-shared-plan-layer.md)) moves code generation onto plan expressions, so a change
+to it must show in review: update the files with `npx vitest run test/codegen-source.test.ts -u`. It skips under
+`SMALT_NO_CODEGEN`.
+
 ## Plugins
 
 The plugins live in their own repositories ([ADR 0012](adr/0012-plugins.md)): `stenhoor/smaltdb-io`,

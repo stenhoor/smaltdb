@@ -355,6 +355,19 @@ class Emitter {
   }
 }
 
+/** Generated sources recorded for tests (test/codegen-source.test.ts), or null when not recording. */
+let traced: string[] | null = null;
+
+/**
+ * Start (`true`) or stop recording the source of every function generated from now on, and return what was recorded
+ * since the last start. For tests that pin generated code: a change to the plan layer must not change it unnoticed.
+ */
+export function traceGeneratedCode(on: boolean): string[] {
+  const out = traced ?? [];
+  traced = on ? [] : null;
+  return out;
+}
+
 /**
  * Generate a function for `e`. `fallback` compiles a node with the closure compiler; `groupReg`
  * maps GROUP BY expressions to registers in post-aggregation scopes.
@@ -368,6 +381,7 @@ export function generate(
   const em = new Emitter(fallback, groupReg);
   const g = em.gen(e);
   const body = `${em.lines.join('\n')}\nreturn ${em.value(g)};`;
+  traced?.push(`expression:\n${body}`);
   let factory = factories.get(body);
   if (factory === undefined) {
     factory = new Function('H', 'K', 'T', `"use strict"; return function smaltExpr(r) {\n${body}\n};`) as Factory;
@@ -498,6 +512,7 @@ export function generateLoader(spec: LoaderSpec, helpers: LoaderHelpers): Loader
   emitDecode(spec, L);
   L.push('return true;');
   const body = L.join('\n');
+  traced?.push(`loader:\n${body}`);
   let factory = loaderFactories.get(body);
   if (factory === undefined) {
     factory = new Function('H', `"use strict"; return function smaltLoad(c, r) {\n${body}\n};`) as (H: LoaderHelpers) => Loader;
@@ -740,6 +755,7 @@ const pipelineFactories = new Map<string, (...args: unknown[]) => unknown>();
  */
 function compileFn<T>(params: string[], src: string, args: unknown[]): T {
   const key = params.join(',') + '\n' + src;
+  traced?.push(`pipeline(${params.join(', ')}):\n${src}`);
   let factory = pipelineFactories.get(key);
   if (factory === undefined) {
     factory = new Function(...params, `"use strict"; ${src}`) as (...args: unknown[]) => unknown;
