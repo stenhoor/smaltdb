@@ -137,12 +137,12 @@ Each step runs `npm run check`, `npm run slt`, the differential tests (also with
   - SQL's output column names;
   - code-generation performance ([ADR 0003](0003-m1-executor-and-transactions.md));
   - one more pass when planning small queries.
-- **smaltdf can run queries from step 9.** Until then it is specified, and its plan builder is written against the
-  plan types from steps 3–5.
+- **smaltdf builds on the layer once all nine steps have landed** (owner's decision below). Until then its language
+  is specified, and its plan builder can be written against the plan types from steps 3–5.
 - **The plan format is a new public surface,** with its own versioning (section 4).
 
-## Questions for the owner
+## Owner's decisions (2026-11-03)
 
-1. **Scope:** reading queries first and writing operations later, or both before smaltdf builds on the layer?
-2. **Timing against 0.9.0** (issue #36): start now on branches, or after 0.9.0 is published?
-3. **Who:** one session working through the steps in order, or several sessions split by step?
+1. **Scope:** reading and writing. All nine steps of section 5 land before smaltdf builds on the layer.
+2. **Timing:** the plan layer comes before any npm publish of smaltdb.
+3. **Who:** one session works through the steps in order.
