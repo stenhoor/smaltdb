@@ -188,6 +188,7 @@ export default defineConfig({
           { text: 'Columnar vs. MVs', link: '/research/columnar-mv-assessment' },
           { text: 'Vectorization review', link: '/research/vectorization-review' },
           { text: 'sqllogictest', link: '/research/sqllogictest' },
+          { text: 'Plan layer implementation', link: '/research/plan-layer-implementation' },
         ],
       },
     ],
