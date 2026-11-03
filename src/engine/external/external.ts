@@ -549,7 +549,9 @@ export class ExternalRegistry {
           // A remote server whose ranges do not match the file it serves (a size or encoding it
           // misreports) can make a ranged read fail: read the whole file once instead. Local and
           // registered files have an exact size, and SmaltErrors (HTTP errors, interrupts) are final.
-          if (e instanceof SmaltError || place.kind === 'file' || place.kind === 'node') throw e;
+          // Only when the reader says the bytes look inconsistent (`wholeFileMayHelp`, e.g. no Parquet
+          // footer where the size says it is): a missing codec or a corrupt chunk would fail again.
+          if (e instanceof SmaltError || place.kind === 'file' || place.kind === 'node' || !(e as { wholeFileMayHelp?: boolean })?.wholeFileMayHelp) throw e;
           const f = await this.fetchFile(source, place, signal, false);
           validator = f.validator;
           result = await reader.read({ byteLength: f.bytes.byteLength, slice: (s, end) => f.bytes.slice(s, end).buffer as ArrayBuffer }, request);

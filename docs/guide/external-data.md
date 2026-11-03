@@ -572,7 +572,9 @@ Ranged reads from a browser need the server's CORS configuration to:
 - expose the `Content-Range` response header, so the page can read the size from the probe;
 - expose `ETag`, if you use `IF CHANGED`.
 
-If the server ignores `Range` and answers the probe with `200`, that body is the whole file and is used as it is. If the probe's `206` has no readable total size (`Content-Range` is not exposed, or its total is `*`), the file is downloaded in one request without `Range`. If a ranged read still fails, for example because the server reports a wrong size, the file is downloaded once in one request and read again. Registered files and Node files have an exact size and are not read again.
+If the server ignores `Range` and answers the probe with `200`, that body is the whole file and is used as it is. If the probe's `206` has no readable total size (`Content-Range` is not exposed, or its total is `*`), the file is downloaded whole, without `Range`. If the reader then finds no Parquet footer where the size puts it, for example because the server reports the compressed size as the total, the file is downloaded whole and read again; other errors, such as a missing codec or a corrupt column chunk, are reported at once. Registered files and Node files have an exact size and are not read again.
+
+How often such a file is downloaded depends on how it is read. A `read_parquet()` call reads the file twice per statement, once for its schema (the footer) and once for its rows, so it downloads it twice. An external table stores its columns when it is created, so a statement over it reads the file once. To download it once in all, [cache it in a materialized view](#caching-in-a-materialized-view).
 
 For S3 and Azure, configure CORS on the bucket or storage account. Signed requests also send their own headers (for S3 with keys, `authorization`, `x-amz-date` and `x-amz-content-sha256`, plus `x-amz-security-token` with a session token), which must be allowed too.
 

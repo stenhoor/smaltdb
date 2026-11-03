@@ -81,6 +81,11 @@ export interface FormatResult {
  * A file format. `access: 'random'` readers get a {@link RandomAccessFile}, so they can read only
  * the parts they need; `'bytes'` readers get the whole file. Errors thrown are reported as
  * SMALT_EXTERNAL with the source's label in front.
+ *
+ * A random-access reader that finds the bytes inconsistent with the file's size (a Parquet footer
+ * missing where the size puts it: some hosts report a compressed size) throws an error with
+ * `wholeFileMayHelp: true`. The engine then reads a remote file once more in full and retries;
+ * other errors are reported at once.
  */
 export type FormatReader = {
   /** Format name, as in `format = 'parquet'` (lower case). */

@@ -167,7 +167,7 @@ DROP CONNECTION [IF EXISTS] api;          -- fails while an external table uses 
   - The size comes from a range probe (`Range: bytes=0-0`, the total in `Content-Range`), not HEAD's `Content-Length`,
     which hosts that compress responses report compressed. Browsers need CORS on the server that allows the `Range`
     header and exposes `Content-Range` (and `ETag` for `IF CHANGED`); without a readable size the file is read in one
-    request, and a ranged read that fails is retried once with the whole file.
+    request, and a ranged read that finds no footer where the size puts it is retried once with the whole file.
 - **Reader options:** `header` (default true), `delimiter`, `quote`, `null` (text read as NULL; unquoted empty fields are
   NULL anyway), `skip` (leading records), `encoding` (default utf-8). Unknown options are errors.
 - **Types:** declared columns convert values by affinity (text that does not convert stays text). Inferred columns are

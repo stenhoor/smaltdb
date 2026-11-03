@@ -80,13 +80,19 @@ type Request = { file: string; bytes: number; range: string | null; method: stri
  */
 function parquetServer(opts: { gzip?: boolean } = {}) {
   const ranges: Request[] = [];
-  const state = { ignoreRanges: false, version: 1, wrongTotal: false };
+  const state = { ignoreRanges: false, version: 1, gzipRanges: false };
   const server = createServer((req, res) => {
     const path = decodeURIComponent(new URL(req.url!, 'http://x').pathname);
     const file = join(F, path);
     let body: Buffer;
     try {
-      body = path === '/not.parquet' ? Buffer.from('not parquet at all') : path === '/empty.parquet' ? Buffer.alloc(0) : readFileSync(file);
+      if (path === '/not.parquet') body = Buffer.from('not parquet at all');
+      else if (path === '/empty.parquet') body = Buffer.alloc(0);
+      else if (path === '/corrupt.parquet') {
+        // A valid footer, but the column data scrambled: decoding fails after the footer was read.
+        body = Buffer.from(readFileSync(join(F, 'sales-snappy.parquet')));
+        for (let i = 4; i < 4000; i++) body[i] = (body[i] * 31 + 7) & 0xff;
+      } else body = readFileSync(file);
     } catch {
       res.writeHead(404);
       res.end();
@@ -105,7 +111,17 @@ function parquetServer(opts: { gzip?: boolean } = {}) {
     if (m && !state.ignoreRanges) {
       const [s, e] = [Number(m[1]), Math.min(Number(m[2]), size - 1)];
       ranges.push({ file, bytes: e - s + 1, range: req.headers.range!, method: req.method! });
-      res.writeHead(206, { ...headers, 'content-range': `bytes ${s}-${e}/${state.wrongTotal ? gzipSync(body).length : size}`, 'content-length': e - s + 1 });
+      if (state.gzipRanges) {
+        // Like GitHub Pages for a client that accepts gzip on range requests: the range's bytes are
+        // gzipped, and Content-Range reports the compressed size of the whole file as the total.
+        // (Fetch sends `identity` with Range, as Node's does, so this ignores Accept-Encoding to
+        // stand in for a client that does not.)
+        const sent = gzipSync(body.subarray(s, e + 1));
+        res.writeHead(206, { ...headers, 'content-range': `bytes ${s}-${e}/${gzipSync(body).length}`, 'content-length': sent.length, 'content-encoding': 'gzip' });
+        res.end(req.method === 'HEAD' ? undefined : sent);
+        return;
+      }
+      res.writeHead(206, { ...headers, 'content-range': `bytes ${s}-${e}/${size}`, 'content-length': e - s + 1 });
       res.end(req.method === 'HEAD' ? undefined : body.subarray(s, e + 1));
       return;
     }
@@ -259,27 +275,43 @@ describe('hosts that compress responses (GitHub Pages, issue #32)', () => {
     expect(d.query('SELECT n FROM m').rows).toEqual([[4000]]);
   });
 
-  it('a ranged read that fails is retried once with the whole file', async () => {
+  it('a ranged read that finds no footer is retried once with the whole file', async () => {
     const d = await db();
-    const url = `${srv.base}/sales-zstd.parquet`;
-    // A server whose Content-Range reports the compressed size: the ranged read finds no footer.
-    srv.state.wrongTotal = true;
+    // An uncompressed file, so gzip shrinks it a lot (as with the demo file on Pages).
+    const url = `${srv.base}/sales-none.parquet`;
+    // Ranges gzipped with the compressed size as the total (GitHub Pages, for clients that accept
+    // gzip on range requests): the size is wrong, so the footer is not where it says.
+    srv.state.gzipRanges = true;
     srv.ranges.length = 0;
     try {
       expect((await d.queryAsync(`SELECT count(*), max(id) FROM read_parquet('${url}')`)).rows).toEqual([[4000, 3999]]);
     } finally {
-      srv.state.wrongTotal = false;
+      srv.state.gzipRanges = false;
     }
     // One whole (gzipped) download for each read: the schema, then the rows.
     expect(srv.ranges.filter((r) => r.range === null).map((r) => [r.method, r.gzip])).toEqual([
       ['GET', true],
       ['GET', true],
     ]);
+    // An external table stores its columns, so a statement over it downloads the file once.
+    await d.execAsync(`CREATE EXTERNAL TABLE gz WITH (location = '${url}')`);
+    srv.state.gzipRanges = true;
+    srv.ranges.length = 0;
+    try {
+      expect((await d.queryAsync('SELECT count(*) FROM gz')).rows).toEqual([[4000]]);
+    } finally {
+      srv.state.gzipRanges = false;
+    }
+    expect(srv.ranges.filter((r) => r.range === null).map((r) => r.method)).toEqual(['GET']);
     // When the retry fails too, its error is reported.
     srv.ranges.length = 0;
     expect(await d.queryAsync(`SELECT * FROM read_parquet('${srv.base}/not.parquet')`).catch((e: Error) => e.message)).toMatch(/not\.parquet'\): not a readable Parquet file/);
     expect(srv.ranges.filter((r) => r.range === null).map((r) => r.method)).toEqual(['GET']);
     // An empty file: the probe gets 416, the file is read whole, and the format reports it (not "HTTP 416").
     expect(await d.queryAsync(`SELECT * FROM read_parquet('${srv.base}/empty.parquet')`).catch((e: Error) => e.message)).toMatch(/empty\.parquet'\): not a readable Parquet file/);
+    // Other reader errors (a corrupt column chunk, a missing codec) are not retried: no whole-file download.
+    srv.ranges.length = 0;
+    expect(await d.queryAsync(`SELECT sum(amount) FROM read_parquet('${srv.base}/corrupt.parquet')`).catch((e: Error) => e.message)).toMatch(/corrupt\.parquet'\): Parquet: /);
+    expect(srv.ranges.filter((r) => r.range === null)).toEqual([]);
   });
 });
