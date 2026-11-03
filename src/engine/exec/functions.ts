@@ -224,6 +224,9 @@ function quote(v: SqlValue, isReal: boolean): string {
   if (v === null) return 'NULL';
   if (typeof v === 'string') return "'" + v.replace(/'/g, "''") + "'";
   if (v instanceof Uint8Array) return "X'" + hex(v) + "'";
+  // SQLite quotes an infinite REAL as a literal that parses back to it.
+  if (v === Infinity) return '9.0e+999';
+  if (v === -Infinity) return '-9.0e+999';
   return toText(v, isReal)!;
 }
 
@@ -602,11 +605,24 @@ class SumState implements AggregateState {
     this.real = t;
   }
 
+  /**
+   * The REAL sum. An infinite term makes the compensation NaN or infinite, and SQLite then leaves it out; a NaN sum
+   * (Inf + -Inf) is NULL, as SQLite stores every NaN result.
+   */
+  private realSum(): number | null {
+    const r = Number.isFinite(this.comp) ? this.real + this.comp : this.real;
+    return Number.isNaN(r) ? null : r;
+  }
+
   final(): SqlValue {
-    if (this.mode === 'total') return this.isInt ? Number(this.intSum) : this.real + this.comp;
+    if (this.mode === 'total') return this.isInt ? Number(this.intSum) : this.realSum();
     if (this.count === 0) return null;
-    if (this.mode === 'avg') return (this.isInt ? Number(this.intSum) : this.real + this.comp) / this.count;
-    return this.isInt ? this.intSum : this.real + this.comp;
+    if (this.mode === 'avg') {
+      if (this.isInt) return Number(this.intSum) / this.count;
+      const r = this.realSum();
+      return r === null ? null : r / this.count;
+    }
+    return this.isInt ? this.intSum : this.realSum();
   }
 }
 
