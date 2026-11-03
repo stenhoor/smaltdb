@@ -11,6 +11,14 @@ An aggregate function computes one value from many rows: from each group of a `G
 | [`min(X)`](#min), [`max(X)`](#max) | Smallest or largest value |
 | [`group_concat(X [, SEP])`](#group_concat) | Values joined into text |
 | [`string_agg(X, SEP)`](#string_agg) | Same as `group_concat(X, SEP)` |
+| [`var_samp(X)`, `variance(X)`, `var_pop(X)`](#variance) | Sample or population variance |
+| [`stddev_samp(X)`, `stddev(X)`, `stddev_pop(X)`](#variance) | Sample or population standard deviation |
+| [`covar_samp(Y, X)`, `covar_pop(Y, X)`](#covariance) | Sample or population covariance |
+| [`corr(Y, X)`](#covariance) | Correlation coefficient |
+| [`skewness(X)`, `skewness_pop(X)`](#skewness) | Skewness |
+| [`kurtosis(X)`, `kurtosis_pop(X)`](#skewness) | Excess kurtosis |
+| [`median(X)`](#median) | Median |
+| [`percentile(X, P)`, `percentile_cont(X, F)`, `percentile_disc(X, F)`](#median) | Percentile, interpolated or an actual value |
 
 The examples on this page use this table:
 
@@ -252,14 +260,136 @@ SELECT string_agg(region, '; ') AS regions FROM (SELECT DISTINCT region FROM sal
 | --- |
 | north; south |
 
-## Not available
+## Statistics {#statistics}
 
-`median`, `percentile`, `percentile_cont`, `percentile_disc`, `stddev`, `variance`, `json_group_array` and `json_group_object` are not implemented and fail with `no such function`. A variance can be computed from `avg`:
+The statistical aggregates skip NULLs, convert text and blobs to numbers like [`sum`](#sum) and [`avg`](#avg) do, and return a REAL, or NULL when the statistic is undefined (too few values, or no spread for `corr`, `skewness` and `kurtosis`). They are computed in one pass with numerically stable updates, so data with a large common offset, such as timestamps or prices in cents, keeps its precision. They work with `DISTINCT`, `FILTER` and as [window functions](./window#aggregate-functions-as-window-functions); over a sliding frame (`ROWS 20 PRECEDING`), the variance, standard deviation, median and percentiles update as rows enter and leave the frame instead of recomputing it.
 
-```sql
-SELECT avg(qty * qty) - avg(qty) * avg(qty) AS variance FROM sale;
+The names are PostgreSQL's (`var_samp`, `stddev_samp`, `covar_samp`, `corr`), with `variance` and `stddev` for the sample statistics. `skewness` and `kurtosis` are DuckDB's. `median` and the `percentile` functions are SQLite's.
+
+### var_samp, variance, var_pop, stddev_samp, stddev, stddev_pop {#variance}
+
+```
+var_samp(X)       variance(X)
+var_pop(X)
+stddev_samp(X)    stddev(X)
+stddev_pop(X)
 ```
 
-| variance |
+The sample variance (divided by n − 1; NULL for fewer than two values) and the population variance (divided by n), and their square roots.
+
+```sql
+SELECT var_samp(qty) AS var_samp, var_pop(qty) AS var_pop, stddev_samp(qty) AS stddev_samp, stddev_pop(qty) AS stddev_pop FROM sale;
+```
+
+| var_samp | var_pop | stddev_samp | stddev_pop |
+| --- | --- | --- | --- |
+| 1.6666666666666667 | 1.25 | 1.2909944487358056 | 1.118033988749895 |
+
+```sql
+SELECT var_samp(qty) AS one_row FROM sale WHERE region = 'south';
+```
+
+| one_row |
 | --- |
-| 1.25 |
+| NULL |
+
+### covar_samp, covar_pop, corr {#covariance}
+
+```
+covar_samp(Y, X)
+covar_pop(Y, X)
+corr(Y, X)
+```
+
+The sample and population covariance of the pairs, and Pearson's correlation coefficient, from -1 to 1. Rows where `Y` or `X` is NULL are skipped. `corr` is NULL when either has no spread.
+
+```sql
+SELECT round(covar_samp(qty, price), 6) AS covar_samp, round(covar_pop(qty, price), 6) AS covar_pop, round(corr(qty, price), 6) AS corr FROM sale;
+```
+
+| covar_samp | covar_pop | corr |
+| --- | --- | --- |
+| -0.041667 | -0.03125 | -0.258199 |
+
+### skewness, skewness_pop, kurtosis, kurtosis_pop {#skewness}
+
+```
+skewness(X)
+skewness_pop(X)
+kurtosis(X)
+kurtosis_pop(X)
+```
+
+The asymmetry (skewness) and tailedness (excess kurtosis: 0 for a normal distribution) of the values. `skewness` and `kurtosis` are the sample statistics with bias correction, as in DuckDB and Excel (`SKEW`, `KURT`); they need three and four values. `skewness_pop` and `kurtosis_pop` are the population statistics, as pandas and Polars compute with `bias=True`. All are NULL when the values have no spread.
+
+```sql
+WITH v(x) AS (VALUES (2), (4), (4), (4), (5), (5), (7), (9))
+SELECT round(skewness(x), 6) AS skewness, round(skewness_pop(x), 6) AS skewness_pop, round(kurtosis(x), 6) AS kurtosis, round(kurtosis_pop(x), 6) AS kurtosis_pop FROM v;
+```
+
+| skewness | skewness_pop | kurtosis | kurtosis_pop |
+| --- | --- | --- | --- |
+| 0.818488 | 0.65625 | 0.940625 | -0.21875 |
+
+### median, percentile, percentile_cont, percentile_disc {#median}
+
+```
+median(X)
+percentile(X, P)
+percentile_cont(X, F)
+percentile_disc(X, F)
+```
+
+As in SQLite: `median(X)` is `percentile_cont(X, 0.5)`. `percentile` takes `P` from 0 to 100 and `percentile_cont` takes `F` from 0 to 1; both interpolate between the two nearest values. `percentile_disc` returns one of the values: the one at position `F` × (n − 1), rounded down, in sorted order. The result is a REAL.
+
+```sql
+SELECT median(qty) AS median, percentile(qty, 25) AS p25, percentile_cont(qty, 0.25) AS cont, percentile_disc(qty, 0.25) AS disc FROM sale;
+```
+
+| median | p25 | cont | disc |
+| --- | --- | --- | --- |
+| 2.5 | 1.75 | 1.75 | 1 |
+
+```sql
+SELECT region, median(qty) AS median FROM sale GROUP BY region ORDER BY region;
+```
+
+| region | median |
+| --- | --- |
+| north | 2 |
+| south | 4 |
+
+They are stricter than the other aggregates, as in SQLite:
+- a value that is not a number (text, a blob) is an error, not converted; so is an infinite value;
+- `P` (or `F`) must be in range and the same on every row.
+
+<!-- docs:error SMALT_ERROR -->
+```sql
+SELECT median(product) FROM sale;
+```
+
+<!-- docs:error SMALT_ERROR -->
+```sql
+SELECT percentile(qty, 150) FROM sale;
+```
+
+### Moving statistics {#moving-statistics}
+
+With a window frame, the statistics move along the rows, as rolling functions do in dataframe libraries:
+
+```sql
+WITH w(x) AS (VALUES (1), (2), (4), (7), (11))
+SELECT x, round(var_samp(x) OVER (ORDER BY x ROWS 2 PRECEDING), 4) AS moving_var, median(x) OVER (ORDER BY x ROWS 2 PRECEDING) AS moving_median FROM w ORDER BY x;
+```
+
+| x | moving_var | moving_median |
+| --- | --- | --- |
+| 1 | NULL | 1 |
+| 2 | 0.5 | 1.5 |
+| 4 | 2.3333 | 2 |
+| 7 | 6.3333 | 4 |
+| 11 | 12.3333 | 7 |
+
+## Not available
+
+`json_group_array` and `json_group_object` are not implemented and fail with `no such function`.
