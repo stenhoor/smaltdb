@@ -309,6 +309,15 @@ describe('hosts that compress responses (GitHub Pages, issue #32)', () => {
     expect(srv.ranges.filter((r) => r.range === null).map((r) => r.method)).toEqual(['GET']);
     // An empty file: the probe gets 416, the file is read whole, and the format reports it (not "HTTP 416").
     expect(await d.queryAsync(`SELECT * FROM read_parquet('${srv.base}/empty.parquet')`).catch((e: Error) => e.message)).toMatch(/empty\.parquet'\): not a readable Parquet file/);
+    // A file that was already read whole (the server ignored ranges) is not downloaded again.
+    srv.state.ignoreRanges = true;
+    srv.ranges.length = 0;
+    try {
+      expect(await d.queryAsync(`SELECT * FROM read_parquet('${srv.base}/not.parquet')`).catch((e: Error) => e.message)).toMatch(/not a readable Parquet file/);
+    } finally {
+      srv.state.ignoreRanges = false;
+    }
+    expect(srv.ranges.map((r) => r.method)).toEqual(['GET']);
     // Other reader errors (a corrupt column chunk, a missing codec) are not retried: no whole-file download.
     srv.ranges.length = 0;
     expect(await d.queryAsync(`SELECT sum(amount) FROM read_parquet('${srv.base}/corrupt.parquet')`).catch((e: Error) => e.message)).toMatch(/corrupt\.parquet'\): Parquet: /);

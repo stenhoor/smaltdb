@@ -537,8 +537,9 @@ export class ExternalRegistry {
     let validator: string | null;
     try {
       if (reader.access === 'random') {
+        let opened: Awaited<ReturnType<ExternalRegistry['openRandom']>> | null = null;
         try {
-          const file = await this.openRandom(source, place, signal);
+          const file = (opened = await this.openRandom(source, place, signal));
           validator = file.validator;
           try {
             result = await reader.read(file.file, request);
@@ -551,7 +552,8 @@ export class ExternalRegistry {
           // registered files have an exact size, and SmaltErrors (HTTP errors, interrupts) are final.
           // Only when the reader says the bytes look inconsistent (`wholeFileMayHelp`, e.g. no Parquet
           // footer where the size says it is): a missing codec or a corrupt chunk would fail again.
-          if (e instanceof SmaltError || place.kind === 'file' || place.kind === 'node' || !(e as { wholeFileMayHelp?: boolean })?.wholeFileMayHelp) throw e;
+          // Nor when the reader already had the whole file (the server ignored ranges, or CORS hid the size).
+          if (e instanceof SmaltError || place.kind === 'file' || place.kind === 'node' || !(e as { wholeFileMayHelp?: boolean })?.wholeFileMayHelp || opened?.whole?.()) throw e;
           const f = await this.fetchFile(source, place, signal, false);
           validator = f.validator;
           result = await reader.read({ byteLength: f.bytes.byteLength, slice: (s, end) => f.bytes.slice(s, end).buffer as ArrayBuffer }, request);
@@ -569,7 +571,7 @@ export class ExternalRegistry {
   }
 
   /** Random access to a file: its size and byte ranges (HTTP Range requests for remote ones). */
-  private async openRandom(source: ExternalSource, place: Place, signal?: AbortSignal): Promise<{ file: RandomAccessFile; validator: string | null; close(): Promise<void> }> {
+  private async openRandom(source: ExternalSource, place: Place, signal?: AbortSignal): Promise<{ file: RandomAccessFile; validator: string | null; close(): Promise<void>; whole?: () => boolean }> {
     const none = async (): Promise<void> => undefined;
     const fromBytes = (b: Uint8Array): RandomAccessFile => ({ byteLength: b.byteLength, slice: (s, e) => b.slice(s, e).buffer as ArrayBuffer });
     if (place.kind === 'file') {
@@ -609,11 +611,11 @@ export class ExternalRegistry {
     let validator = probe.headers.get('etag') ?? probe.headers.get('last-modified');
     const body = new Uint8Array(await probe.arrayBuffer());
     // 200: the server ignored the range and sent the whole file.
-    if (probe.status === 200) return { file: fromBytes(body), validator, close: none };
+    if (probe.status === 200) return { file: fromBytes(body), validator, close: none, whole: () => true };
     // 416: no byte 0, an empty file; read it as one (the format then reports what is wrong with it).
     if (probe.status === 416) {
       const f = await this.fetchFile(source, place, signal, false);
-      return { file: fromBytes(f.bytes), validator: validator ?? f.validator, close: none };
+      return { file: fromBytes(f.bytes), validator: validator ?? f.validator, close: none, whole: () => true };
     }
     const total = /^bytes\s+\d+-\d+\/(\d+)\s*$/i.exec(probe.headers.get('content-range') ?? '');
     const size = total ? Number(total[1]) : NaN;
@@ -621,7 +623,7 @@ export class ExternalRegistry {
       // No total size (`*`, or Content-Range not exposed to the page by CORS): read the whole file once.
       const f = await this.fetchFile(source, place, signal, false);
       validator ??= f.validator;
-      return { file: fromBytes(f.bytes), validator, close: none };
+      return { file: fromBytes(f.bytes), validator, close: none, whole: () => true };
     }
     let whole: Promise<Uint8Array> | null = null;
     return {
@@ -638,6 +640,8 @@ export class ExternalRegistry {
       },
       validator,
       close: none,
+      // A slice that got the whole body (the server ignored a later range) holds the whole file.
+      whole: () => whole !== null,
     };
   }
 
