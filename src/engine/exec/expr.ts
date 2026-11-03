@@ -119,6 +119,11 @@ function isNumericType(t: StaticType): boolean {
  * JavaScript when allowed (see codegen.ts); everything else uses the closure compiler.
  */
 export function compileExpr(e: Expr, scope: CompileScope): Compiled {
+  if (e.kind === 'call' && codegenEnabled() && isCodegenRoot(e)) {
+    // A math call: keep the closure compiler's result when it is constant (folded) or a register read.
+    const c = compileNode(e, scope);
+    if (c.constant || c.reg !== undefined) return c;
+  }
   if (codegenEnabled() && isCodegenRoot(e) && hasRuntimeInputs(e) && !scope.groupRef?.(e)) {
     const g = generate(
       e,
