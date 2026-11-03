@@ -3,7 +3,7 @@ layout: home
 
 hero:
   name: 'sm<span class="alt">alt</span>db'
-  text: Small. Alternate. Fast.
+  text: Small. Alternative. Fast.
   tagline: A fast alternative database for the browser, written in TypeScript.
   image:
     light: /grain-mark.svg

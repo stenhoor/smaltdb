@@ -5,7 +5,7 @@
   </picture>
 </h1>
 
-**Small. Alternate. Fast.**
+**Small. Alternative. Fast.**
 
 **smaltdb** is an embedded SQL database engine for web browsers, written in JavaScript/TypeScript.
 It stores data in the [Origin Private File System (OPFS)](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system),

@@ -1,6 +1,6 @@
 # smaltdb brand assets
 
-**Small. Alternate. Fast.** The name reads as *sm* (small) + *alt* (alternate) + *db* (database), and smalt is the cobalt-glass pigment `#003399`.
+**Small. Alternative. Fast.** The name reads as *sm* (small) + *alt* (alternative) + *db* (database), and smalt is the cobalt-glass pigment `#003399`.
 
 | File | Use |
 | --- | --- |
