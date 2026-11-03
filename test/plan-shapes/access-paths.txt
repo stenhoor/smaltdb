@@ -1,0 +1,86 @@
+> SELECT * FROM customers WHERE id = 42
+columns: id int, name text, region text, tier int
+  Project
+    Filter [est 1]
+      RowidLookup: SEARCH customers USING INTEGER PRIMARY KEY (rowid=?)
+
+> SELECT name FROM customers WHERE id BETWEEN 10 AND 20
+columns: name text
+  Project
+    Filter [est 218]
+      Filter
+        TableScan: SEARCH customers USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)
+
+> SELECT name FROM customers WHERE region = 'EU'
+columns: name text
+  Project
+    FusedScanFilter: SCAN customers (fused scan + filter)
+
+> SELECT count(*) FROM customers WHERE region = 'EU'
+columns: count(*) int
+  Project
+    FusedScanAggregate: SCAN customers (fused scan + filter + aggregate)
+
+> SELECT id FROM customers WHERE region IN ('EU', 'US')
+columns: id int
+  Project
+    FusedScanFilter: SCAN customers (fused scan + filter)
+
+> SELECT id FROM customers WHERE lower(name) = 'name14'
+columns: id int
+  Project
+    IndexScan: SEARCH customers USING COVERING INDEX customers_lower_name (=?) [est 660]
+
+> SELECT id FROM orders WHERE day = 10
+columns: id int
+  Project
+    IndexScan: SEARCH orders USING COVERING INDEX orders_day_status (=?) [est 54.5]
+
+> SELECT id FROM orders WHERE day = 10 AND status = 'paid'
+columns: id int
+  Project
+    IndexScan: SEARCH orders USING COVERING INDEX orders_day_status (=?,=?) [est 13.6]
+
+> SELECT id FROM orders WHERE day BETWEEN 10 AND 12
+columns: id int
+  Project
+    IndexScan: SEARCH orders USING COVERING INDEX orders_day_status (range) [est 2180]
+
+> SELECT id FROM orders WHERE status = 'paid'
+columns: id int
+  Project
+    FusedScanFilter: SCAN orders (fused scan + filter)
+
+> SELECT id FROM orders WHERE customer_id = 5 OR day = 3
+columns: id int
+  Project
+    FusedScanFilter: SCAN orders (fused scan + filter)
+
+> SELECT price FROM products WHERE category = 'cat3' AND price > 20
+columns: price real
+  Project
+    FusedScanFilter: SCAN products (fused scan + filter)
+
+> SELECT * FROM products WHERE sku = 'sku10'
+columns: sku text, category text, price real
+  Project
+    IndexScan: SEARCH products USING INDEX smalt_autoindex_products_1 (=?) [est 1]
+
+> SELECT * FROM orders WHERE amount > 100
+columns: id int, customer_id int, day int, status text, amount real
+  Project
+    FusedScanFilter: SCAN orders (fused scan + filter)
+
+> SELECT * FROM empty_t WHERE a = 1
+columns: a int, b text
+  Project
+    FusedScanFilter: SCAN empty_t (fused scan + filter)
+
+> SELECT min(day), max(day) FROM orders
+columns: min(day) int, max(day) int
+  Project
+    FusedScanAggregate: SCAN orders (fused scan + filter + aggregate)
+
+> SELECT count(*) FROM orders
+columns: count(*) int
+  CountRows: SCAN orders (count)

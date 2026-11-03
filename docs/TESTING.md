@@ -54,6 +54,19 @@ What M1 adds:
 - **Record format:** property tests for round trips and for rowid key ordering.
 - **SQL smoke tests:** constraints, transactions, persistence, `EXPLAIN QUERY PLAN`.
 
+## Plan shapes
+
+`test/plan-shapes.test.ts` is a golden corpus of physical plans ([ADR 0014](adr/0014-shared-plan-layer.md), step 2).
+Over a fixed database (row tables with indexes, a columnar table, views, materialized views, statistics), it renders
+each query's operator tree with every operator's class, `EXPLAIN` detail and row estimate. It also records the plans of
+subqueries inside expressions and the result columns, and compares all of it with `test/plan-shapes/*.txt`. The
+queries cover access paths, join orders and methods, aggregates, ordering and top-N, subqueries and decorrelation, views
+and materialized-view matching, columnar scans, windows and compound selects.
+
+A planner change that alters a plan fails the test. When the change is intended, update the files with
+`npx vitest run test/plan-shapes.test.ts -u` and review the diff with the PR. The corpus describes the default
+configuration, so it skips under `SMALT_NO_CODEGEN`, `SMALT_NO_FLATTEN` and `SMALT_NO_DECORRELATE`.
+
 ## Plugins
 
 The plugins live in their own repositories ([ADR 0012](adr/0012-plugins.md)): `stenhoor/smaltdb-io`,

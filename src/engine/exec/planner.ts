@@ -1927,6 +1927,16 @@ export class Planner {
   /** Planner row estimates per operator (per loop for inner sides), shown by EXPLAIN ANALYZE. */
   readonly estimates = new WeakMap<Operator, number>();
 
+  /**
+   * Plans run from inside expressions (subqueries), which operator trees don't reach, in planning order.
+   * For tests that compare plan shapes (test/plan-shapes.test.ts); trial compiles don't record.
+   */
+  readonly subplans: { label: string; root: Operator }[] = [];
+
+  private recordSubplan(label: string, root: Operator): void {
+    if (!this.dryCompile) this.subplans.push({ label, root });
+  }
+
   /** Root page -> row estimate (from the tree shape) each costed table had when this plan was made. */
   readonly rowAssumptions = new Map<number, number>();
   /** External sources the statement reads (M8): loaded before it runs. */
@@ -2507,6 +2517,7 @@ export class Planner {
     if (dec) return dec;
     const plan = this.planSelect(select, scope);
     if (plan.outRegs.length !== 1) throw new SmaltError('SMALT_ERROR', `sub-select returns ${plan.outRegs.length} columns - expected 1`);
+    this.recordSubplan(plan.correlated ? 'CORRELATED SCALAR SUBQUERY' : 'SCALAR SUBQUERY', plan.root);
     if (plan.correlated) scope.correlated = scope.correlated || this.isCorrelatedBeyond(scope);
     const out = plan.outRegs[0];
     const state = this.env.state;
@@ -2657,6 +2668,7 @@ export class Planner {
       const [cl, cr] = comparisonConverters(l, r);
       keyFns.push({ outer: outerC.fn, coll, convInner: pairs[i].innerLeft ? cl : cr, convOuter: pairs[i].innerLeft ? cr : cl });
     }
+    this.recordSubplan(kind === 'exists' ? 'EXISTS (decorrelated: hash semi-join)' : 'SCALAR SUBQUERY (decorrelated: grouped lookup)', plan.root);
     const guardFns = guards.map((g) => compileExpr(g, outerScope).fn);
     // Value over an empty inner set (count(*) -> 0, sum -> NULL, ...): the result expression over no rows.
     let emptyValue: SqlValue = kind === 'exists' ? 0 : null;
@@ -2727,6 +2739,7 @@ export class Planner {
     const dec = decorrelationDisabled() ? null : this.decorrelate(select, scope, 'exists');
     if (dec) return dec.fn;
     const plan = this.planSelect(select, scope);
+    this.recordSubplan(plan.correlated ? 'CORRELATED EXISTS' : 'EXISTS', plan.root);
     const state = this.env.state;
     let epoch = -1;
     let cached: SqlValue = 0;
@@ -2751,6 +2764,7 @@ export class Planner {
 
   private inSubquery(select: SelectStmt, probe: Compiled, scope: Scope): Fn {
     const plan = this.planSelect(select, scope);
+    this.recordSubplan(plan.correlated ? 'CORRELATED IN SUBQUERY' : 'IN SUBQUERY', plan.root);
     if (plan.outRegs.length !== 1) throw new SmaltError('SMALT_ERROR', `sub-select returns ${plan.outRegs.length} columns - expected 1`);
     const out = plan.outRegs[0];
     const col = plan.columns[0];

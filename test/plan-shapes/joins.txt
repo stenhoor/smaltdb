@@ -1,0 +1,117 @@
+> SELECT c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id WHERE c.id = 7
+columns: name text, amount real
+  Project
+    NestedLoopJoin [est 9.77]
+      Filter [est 1]
+        RowidLookup: SEARCH customers USING INTEGER PRIMARY KEY (rowid=?)
+      IndexScan: SEARCH orders USING INDEX orders_customer (=?) [est 9.77]
+
+> SELECT c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id WHERE c.region = 'EU'
+columns: name text, amount real
+  Project
+    HashJoin: HASH JOIN [est 3910]
+      FusedScanFilter: SCAN orders (fused scan + filter) [est 20000]
+      FusedScanFilter: SCAN customers (fused scan + filter) [est 400]
+
+> SELECT c.region, sum(o.amount) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.region
+columns: region text, sum(o.amount) real
+  Project
+    HashAggregate: USE TEMP B-TREE FOR GROUP BY
+      HashJoin: HASH JOIN [est 19500]
+        FusedScanFilter: SCAN orders (fused scan + filter) [est 20000]
+        FusedScanFilter: SCAN customers (fused scan + filter) [est 2000]
+
+> SELECT o.id, i.qty, p.price FROM orders o JOIN items i ON i.order_id = o.id JOIN products p ON p.sku = i.sku WHERE o.day = 3
+columns: id int, qty int, price real
+  Project
+    HashJoin: HASH JOIN [est 136]
+      NestedLoopJoin [est 136]
+        IndexScan: SEARCH orders USING COVERING INDEX orders_day_status (=?) [est 54.5]
+        IndexScan: SEARCH items USING INDEX items_order (=?) [est 2.5]
+      FusedScanFilter: SCAN products (fused scan + filter) [est 300]
+
+> SELECT c.region, p.category, sum(i.qty * p.price) FROM customers c JOIN orders o ON o.customer_id = c.id JOIN items i ON i.order_id = o.id JOIN products p ON p.sku = i.sku WHERE c.tier = 3 GROUP BY c.region, p.category
+columns: region text, category text, sum(i.qty * p.price) real
+  Project
+    HashAggregate: USE TEMP B-TREE FOR GROUP BY
+      HashJoin: HASH JOIN [est 12200]
+        HashJoin: HASH JOIN [est 12200]
+          HashJoin: HASH JOIN [est 4890]
+            FusedScanFilter: SCAN orders (fused scan + filter) [est 20000]
+            FusedScanFilter: SCAN customers (fused scan + filter) [est 500]
+          FusedScanFilter: SCAN items (fused scan + filter) [est 50000]
+        FusedScanFilter: SCAN products (fused scan + filter) [est 300]
+
+> SELECT c.name, t.label FROM customers c JOIN tiers t ON t.tier = c.tier WHERE c.id < 50
+columns: name text, label text
+  Project
+    HashJoin: HASH JOIN [est 660]
+      Filter [est 660]
+        TableScan: SEARCH customers USING INTEGER PRIMARY KEY (rowid<?)
+      FusedScanFilter: SCAN tiers (fused scan + filter) [est 4]
+
+> SELECT c.id, o.id FROM customers c LEFT JOIN orders o ON o.customer_id = c.id WHERE c.id < 10
+columns: id int, id int
+  Project
+    HashJoin: LEFT HASH JOIN [est 6450]
+      Filter [est 660]
+        TableScan: SEARCH customers USING INTEGER PRIMARY KEY (rowid<?)
+      FusedScanFilter: SCAN orders (fused scan + filter) [est 20000]
+
+> SELECT c.id FROM customers c LEFT JOIN orders o ON o.customer_id = c.id WHERE o.id IS NULL
+columns: id int
+  Project
+    Filter
+      HashJoin: LEFT HASH JOIN [est 19500]
+        FusedScanFilter: SCAN customers (fused scan + filter) [est 2000]
+        FusedScanFilter: SCAN orders (fused scan + filter) [est 20000]
+
+> SELECT t.label, c.id FROM customers c RIGHT JOIN tiers t ON t.tier = c.tier AND c.id < 5
+columns: label text, id int
+  Project
+    OuterJoin: RIGHT OUTER HASH JOIN
+      FusedScanFilter: SCAN customers (fused scan + filter) [est 2000]
+      FusedScanFilter: SCAN tiers (fused scan + filter)
+
+> SELECT t.label, c.id FROM tiers t FULL JOIN customers c ON c.tier = t.tier AND c.id < 3
+columns: label text, id int
+  Project
+    OuterJoin: FULL OUTER HASH JOIN
+      FusedScanFilter: SCAN tiers (fused scan + filter) [est 4]
+      FusedScanFilter: SCAN customers (fused scan + filter)
+
+> SELECT count(*) FROM tiers, products
+columns: count(*) int
+  Project
+    HashAggregate
+      NestedLoopJoin [est 1200]
+        FusedScanFilter: SCAN products (fused scan + filter) [est 300]
+        Materialize: MATERIALIZE
+          FusedScanFilter: SCAN tiers (fused scan + filter) [est 4]
+
+> SELECT o.id FROM orders o JOIN customers c USING (id) WHERE c.tier = 1
+columns: id int
+  Project
+    Filter
+      NestedLoopJoin [est 500]
+        FusedScanFilter: SCAN customers (fused scan + filter) [est 500]
+        RowidLookup: SEARCH orders USING INTEGER PRIMARY KEY (rowid=?) [est 1]
+
+> SELECT a.id, b.id FROM orders a JOIN orders b ON b.customer_id = a.customer_id WHERE a.id = 100
+columns: id int, id int
+  Project
+    NestedLoopJoin [est 9.77]
+      Filter [est 1]
+        RowidLookup: SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
+      IndexScan: SEARCH orders USING COVERING INDEX orders_customer (=?) [est 9.77]
+
+> SELECT o.id FROM orders o JOIN customers c ON c.id = o.customer_id JOIN tiers t ON t.tier = c.tier WHERE t.label = ?
+columns: id int
+  Project
+    HashJoin: HASH JOIN [est 4890]
+      Filter
+        NestedLoopJoin [est 500]
+          FusedScanFilter: SCAN customers (fused scan + filter) [est 2000]
+          Materialize: MATERIALIZE
+            FusedScanFilter: SCAN tiers (fused scan + filter) [est 1]
+      FusedScanFilter: SCAN orders (fused scan + filter) [est 20000]

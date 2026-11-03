@@ -1,0 +1,51 @@
+> SELECT status, count(*), sum(amount), avg(amount) FROM orders GROUP BY status
+columns: status text, count(*) int, sum(amount) real, avg(amount) real
+  Project
+    FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
+
+> SELECT day, count(*) FROM orders GROUP BY day ORDER BY day
+columns: day int, count(*) int
+  Sort: USE TEMP B-TREE FOR ORDER BY
+    Project
+      FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
+
+> SELECT customer_id, sum(amount) FROM orders GROUP BY customer_id HAVING sum(amount) > 100
+columns: customer_id int, sum(amount) real
+  Project
+    Filter
+      FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
+
+> SELECT count(DISTINCT customer_id) FROM orders
+columns: count(DISTINCT customer_id) int
+  Project
+    HashAggregate
+      TableScan: SCAN orders [est 20000]
+
+> SELECT DISTINCT region FROM customers
+columns: region text
+  Distinct: USE TEMP B-TREE FOR DISTINCT
+    Project
+      FusedScanFilter: SCAN customers (fused scan + filter)
+
+> SELECT DISTINCT status, day FROM orders WHERE day < 3
+columns: status text, day int
+  Distinct: USE TEMP B-TREE FOR DISTINCT
+    Project
+      IndexScan: SEARCH orders USING COVERING INDEX orders_day_status (range) [est 6600]
+
+> SELECT sum(amount) FROM orders WHERE day < 30
+columns: sum(amount) real
+  Project
+    FusedScanAggregate: SCAN orders (fused scan + filter + aggregate)
+
+> SELECT tier, group_concat(name) FROM customers WHERE id < 20 GROUP BY tier
+columns: tier int, group_concat(name) text
+  Project
+    HashAggregate: USE TEMP B-TREE FOR GROUP BY
+      Filter [est 660]
+        TableScan: SEARCH customers USING INTEGER PRIMARY KEY (rowid<?)
+
+> SELECT median(amount), stddev(amount) FROM orders
+columns: median(amount) real, stddev(amount) real
+  Project
+    FusedScanAggregate: SCAN orders (fused scan + filter + aggregate)

@@ -992,6 +992,20 @@ export class Database implements FunctionContext {
 
   // ---------------------------------------------------------------- compilation
 
+  /**
+   * @internal The physical plan of a SELECT, as `compile` makes it, with the plans of subqueries run from
+   * inside expressions and the planner's row estimates. For test/plan-shapes.test.ts.
+   */
+  planOf(sql: string): { root: Operator; columns: { name: string; type: StaticType }[]; subplans: readonly { label: string; root: Operator }[]; estimates: WeakMap<Operator, number> } {
+    this.checkOpen();
+    const ps = parseOne(sql);
+    if (ps.stmt.kind !== 'select') throw new MisuseError('planOf takes a SELECT statement');
+    const planner = new Planner(this.plannerDeps(this.rewritePolicy(ps.stmt)), new Registers(ps.paramCount));
+    planner.sqlText = ps.text;
+    const plan = planner.planSelect(ps.stmt, null);
+    return { root: plan.root, columns: plan.columns.map((c) => ({ name: c.name, type: c.type })), subplans: planner.subplans, estimates: planner.estimates };
+  }
+
   /** @internal Compile a statement AST into a program for the current schema. */
   compile(ps: ParsedStatement): Program {
     const stmt = ps.stmt;

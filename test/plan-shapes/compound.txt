@@ -1,0 +1,42 @@
+> SELECT id FROM customers WHERE region = 'EU' UNION SELECT customer_id FROM orders WHERE day = 1
+columns: id int
+  Compound: COMPOUND QUERY (UNION)
+    Project
+      FusedScanFilter: SCAN customers (fused scan + filter)
+    Project
+      IndexScan: SEARCH orders USING INDEX orders_day_status (=?) [est 54.5]
+
+> SELECT id FROM customers UNION ALL SELECT id FROM orders ORDER BY 1 LIMIT 3
+columns: id int
+  Limit
+    Sort: USE TEMP B-TREE FOR ORDER BY
+      Compound: COMPOUND QUERY (UNION ALL)
+        Project
+          FusedScanFilter: SCAN customers (fused scan + filter)
+        Project
+          FusedScanFilter: SCAN orders (fused scan + filter)
+
+> SELECT customer_id FROM orders WHERE day = 1 INTERSECT SELECT id FROM customers WHERE tier = 1
+columns: customer_id int
+  Compound: COMPOUND QUERY (INTERSECT)
+    Project
+      IndexScan: SEARCH orders USING INDEX orders_day_status (=?) [est 54.5]
+    Project
+      FusedScanFilter: SCAN customers (fused scan + filter)
+
+> SELECT id FROM customers EXCEPT SELECT customer_id FROM orders
+columns: id int
+  Compound: COMPOUND QUERY (EXCEPT)
+    Project
+      FusedScanFilter: SCAN customers (fused scan + filter)
+    Project
+      FusedScanFilter: SCAN orders (fused scan + filter)
+
+> VALUES (1, 2), (3, 4)
+columns: column1 int, column2 int
+  Values: SCAN CONSTANT ROW
+
+> SELECT 1 + 2, ? AS p
+columns: 1 + 2 int, p any
+  Project
+    SingleRow

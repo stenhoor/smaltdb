@@ -1,0 +1,106 @@
+> SELECT name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > 240)
+columns: name text
+  Project
+    Filter
+      TableScan: SCAN customers [est 2000]
+  EXISTS (decorrelated: hash semi-join):
+    Distinct: USE TEMP B-TREE FOR DISTINCT
+      Project
+        FusedScanFilter: SCAN orders (fused scan + filter)
+
+> SELECT name FROM customers c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id)
+columns: name text
+  Project
+    Filter
+      TableScan: SCAN customers [est 2000]
+  EXISTS (decorrelated: hash semi-join):
+    Distinct: USE TEMP B-TREE FOR DISTINCT
+      Project
+        FusedScanFilter: SCAN orders (fused scan + filter)
+
+> SELECT name FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE status = 'void' AND day = 1)
+columns: name text
+  Project
+    Filter
+      TableScan: SCAN customers [est 2000]
+  IN SUBQUERY:
+    Project
+      IndexScan: SEARCH orders USING INDEX orders_day_status (=?,=?) [est 13.6]
+
+> SELECT name FROM customers WHERE id NOT IN (SELECT customer_id FROM orders WHERE day < 100)
+columns: name text
+  Project
+    Filter
+      TableScan: SCAN customers [est 2000]
+  IN SUBQUERY:
+    Project
+      FusedScanFilter: SCAN orders (fused scan + filter)
+
+> SELECT name, (SELECT count(*) FROM orders o WHERE o.customer_id = c.id) FROM customers c WHERE c.tier = 2
+columns: name text, (SELECT count(*) FROM orders o WHERE o.customer_id = c.id) int
+  Project
+    FusedScanFilter: SCAN customers (fused scan + filter)
+  SCALAR SUBQUERY (decorrelated: grouped lookup):
+    Project
+      FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
+
+> SELECT name, (SELECT max(day) FROM orders o WHERE o.customer_id = c.id AND o.status = c.region) FROM customers c WHERE c.id < 5
+columns: name text, (SELECT max(day) FROM orders o WHERE o.customer_id = c.id AND o.status = c.region) int
+  Project
+    Filter [est 660]
+      TableScan: SEARCH customers USING INTEGER PRIMARY KEY (rowid<?)
+  SCALAR SUBQUERY (decorrelated: grouped lookup):
+    Project
+      FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
+
+> SELECT * FROM orders WHERE amount > (SELECT avg(amount) FROM orders)
+columns: id int, customer_id int, day int, status text, amount real
+  Project
+    Filter
+      TableScan: SCAN orders [est 20000]
+  SCALAR SUBQUERY:
+    Project
+      FusedScanAggregate: SCAN orders (fused scan + filter + aggregate)
+
+> SELECT x.customer_id, x.total FROM (SELECT customer_id, sum(amount) AS total FROM orders GROUP BY customer_id) x WHERE x.total > 200
+columns: customer_id int, total real
+  Project
+    Filter [est 330]
+      Project
+        FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
+
+> SELECT * FROM (SELECT id, amount * 2 AS a2 FROM orders WHERE day = 1) WHERE a2 > 10
+columns: id int, a2 real
+  Project
+    Filter [est 330]
+      Project
+        IndexScan: SEARCH orders USING INDEX orders_day_status (=?) [est 54.5]
+
+> WITH big AS (SELECT * FROM orders WHERE amount > 200) SELECT c.name, big.amount FROM big JOIN customers c ON c.id = big.customer_id
+columns: name text, amount real
+  Project
+    HashJoin: HASH JOIN [est 1000]
+      FusedScanFilter: SCAN customers (fused scan + filter) [est 2000]
+      Project [est 1000]
+        FusedScanFilter: SCAN orders (fused scan + filter)
+
+> WITH s AS (SELECT day, sum(amount) AS t FROM orders GROUP BY day) SELECT a.day FROM s a JOIN s b ON b.day = a.day + 1 WHERE b.t > a.t
+columns: day int
+  Project
+    Filter
+      HashJoin: HASH JOIN [est 109000]
+        Project [est 1000]
+          FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
+        Project [est 1000]
+          FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
+
+> WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10) SELECT sum(i) FROM n
+columns: sum(i) int
+  Project
+    HashAggregate
+      RecursiveCte: RECURSIVE CTE n [est 1000]
+        Project
+          SingleRow
+        Project
+          Filter [est 330]
+            WorkingScan: SCAN n (recursive step)
