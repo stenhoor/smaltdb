@@ -1,0 +1,31 @@
+> SELECT id, row_number() OVER (ORDER BY id) FROM orders WHERE day = 1
+columns: id int, row_number() OVER (ORDER BY id) int
+  Project
+    Window
+      IndexScan: SEARCH orders USING COVERING INDEX orders_day_status (=?) [est 54.5]
+
+> SELECT id, rank() OVER (PARTITION BY status ORDER BY amount DESC) FROM orders WHERE day < 3
+columns: id int, rank() OVER (PARTITION BY status ORDER BY amount DESC) int
+  Project
+    Window
+      IndexScan: SEARCH orders USING INDEX orders_day_status (range) [est 6600]
+
+> SELECT id, sum(amount) OVER (PARTITION BY customer_id ORDER BY day ROWS 2 PRECEDING) FROM orders WHERE customer_id < 5
+columns: id int, sum(amount) OVER (PARTITION BY customer_id ORDER BY day ROWS 2 PRECEDING) real
+  Project
+    Window
+      IndexScan: SEARCH orders USING INDEX orders_customer (range) [est 6600]
+
+> SELECT day, sum(amount) OVER w, avg(amount) OVER w FROM orders WHERE day < 5 WINDOW w AS (ORDER BY day RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)
+columns: day int, sum(amount) OVER w real, avg(amount) OVER w real
+  Project
+    Window
+      IndexScan: SEARCH orders USING INDEX orders_day_status (range) [est 6600]
+
+> SELECT * FROM (SELECT id, lag(amount) OVER (ORDER BY id) AS prev FROM orders) WHERE prev > 200
+columns: id int, prev real
+  Project
+    Filter [est 330]
+      Project
+        Window
+          FusedScanFilter: SCAN orders (fused scan + filter)

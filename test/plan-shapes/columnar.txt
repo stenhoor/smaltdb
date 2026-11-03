@@ -1,0 +1,42 @@
+> SELECT count(*) FROM events
+columns: count(*) int
+  Project
+    FusedScanAggregate: SCAN events_by_kind (columnar, fused scan + filter + aggregate)
+
+> SELECT sum(v) FROM events WHERE ts BETWEEN 1000 AND 2000
+columns: sum(v) real
+  Project
+    FusedScanAggregate: SCAN events (columnar table: delta + segments, fused scan + filter + aggregate, zone maps: ts >= ? AND ts <= ?)
+
+> SELECT kind, avg(v), max(ts) FROM events WHERE v > 50 GROUP BY kind
+columns: kind int, avg(v) real, max(ts) int
+  Project
+    FusedGroupAggregate: SCAN events (columnar table: delta + segments, fused scan + filter + group aggregate, zone maps: v > ?)
+
+> SELECT id, v FROM events WHERE kind = 3 AND ts > 29000
+columns: id int, v real
+  Project
+    Filter [est 3.3]
+      Filter
+        ColumnarTableScan: SCAN events (columnar table: delta + segments, zone maps: kind = ? AND ts > ?)
+
+> SELECT * FROM events WHERE id = 77
+columns: id int, kind int, ts int, v real
+  Project
+    Filter [est 1]
+      ColumnarTableScan: SCAN events (columnar table: delta + segments, zone maps: rowid = ?)
+
+> SELECT e.kind, count(*) FROM events e JOIN tiers t ON t.tier = e.kind GROUP BY e.kind
+columns: kind int, count(*) int
+  Project
+    HashAggregate: USE TEMP B-TREE FOR GROUP BY
+      HashJoin: HASH JOIN [est 40]
+        ColumnarTableScan: SCAN events (columnar table: delta + segments) [est 30200]
+        FusedScanFilter: SCAN tiers (fused scan + filter) [est 4]
+
+> SELECT * FROM events ORDER BY v DESC LIMIT 5
+columns: id int, kind int, ts int, v real
+  Limit
+    Sort: USE TEMP B-TREE FOR ORDER BY
+      Project
+        ColumnarTableScan: SCAN events (columnar table: delta + segments) [est 30200]

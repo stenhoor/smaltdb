@@ -1,0 +1,44 @@
+> SELECT * FROM orders ORDER BY id DESC LIMIT 5
+columns: id int, customer_id int, day int, status text, amount real
+  Limit
+    Project
+      TableScan: SCAN orders [est 20000]
+
+> SELECT * FROM orders ORDER BY amount DESC LIMIT 10
+columns: id int, customer_id int, day int, status text, amount real
+  Limit
+    Sort: USE TEMP B-TREE FOR ORDER BY
+      Project
+        FusedScanFilter: SCAN orders (fused scan + filter)
+
+> SELECT * FROM orders ORDER BY amount DESC LIMIT 10 OFFSET 20
+columns: id int, customer_id int, day int, status text, amount real
+  Limit
+    Sort: USE TEMP B-TREE FOR ORDER BY
+      Project
+        FusedScanFilter: SCAN orders (fused scan + filter)
+
+> SELECT id FROM orders WHERE day = 4 ORDER BY status
+columns: id int
+  Sort: USE TEMP B-TREE FOR ORDER BY
+    Project
+      IndexScan: SEARCH orders USING COVERING INDEX orders_day_status (=?) [est 54.5]
+
+> SELECT name FROM customers ORDER BY region, name
+columns: name text
+  Sort: USE TEMP B-TREE FOR ORDER BY
+    Project
+      FusedScanFilter: SCAN customers (fused scan + filter)
+
+> SELECT name FROM customers ORDER BY lower(name) LIMIT 3
+columns: name text
+  Limit
+    Sort: USE TEMP B-TREE FOR ORDER BY
+      Project
+        FusedScanFilter: SCAN customers (fused scan + filter)
+
+> SELECT * FROM customers LIMIT 3
+columns: id int, name text, region text, tier int
+  Limit
+    Project
+      FusedScanFilter: SCAN customers (fused scan + filter)

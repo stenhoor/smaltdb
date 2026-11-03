@@ -1,0 +1,54 @@
+> SELECT * FROM paid_orders WHERE customer_id = 9
+columns: id int, customer_id int, day int, amount real
+  Project
+    Filter [est 2.44]
+      IndexScan: SEARCH orders USING INDEX orders_customer (=?)
+
+> SELECT p.amount, c.name FROM paid_orders p JOIN customers c ON c.id = p.customer_id WHERE p.day = 2
+columns: amount real, name text
+  Project
+    Filter
+      NestedLoopJoin [est 13.3]
+        IndexScan: SEARCH orders USING INDEX orders_day_status (=?,=?) [est 13.6]
+        RowidLookup: SEARCH customers USING INTEGER PRIMARY KEY (rowid=?) [est 0.977]
+
+> SELECT * FROM customer_totals WHERE customer_id = 9
+columns: customer_id int, n int, total real
+  Project
+    Filter [est 330]
+      Project
+        FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
+
+> SELECT c.name, t.total FROM customers c JOIN customer_totals t ON t.customer_id = c.id WHERE c.region = ?
+columns: name text, total real
+  Project
+    HashJoin: HASH JOIN [est 200]
+      Project [est 1000]
+        FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
+      FusedScanFilter: SCAN customers (fused scan + filter) [est 400]
+
+> SELECT region, sum(total) FROM region_day GROUP BY region
+columns: region text, sum(total) real
+  Project
+    FusedGroupAggregate: SCAN region_day (fused scan + filter + GROUP BY)
+
+> SELECT c.region, sum(o.amount) FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.region
+columns: region text, sum(o.amount) real
+  Project
+    HashAggregate: USE TEMP B-TREE FOR GROUP BY
+      HashJoin: HASH JOIN [est 19500]
+        FusedScanFilter: SCAN orders (fused scan + filter) [est 20000]
+        FusedScanFilter: SCAN customers (fused scan + filter) [est 2000]
+
+> SELECT c.region, o.day, count(*) FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.day < 10 GROUP BY c.region, o.day
+columns: region text, day int, count(*) int
+  Project
+    HashAggregate: USE TEMP B-TREE FOR GROUP BY
+      HashJoin: HASH JOIN [est 6450]
+        FusedScanFilter: SCAN orders (fused scan + filter) [est 6600]
+        FusedScanFilter: SCAN customers (fused scan + filter) [est 2000]
+
+> SELECT kind, sum(v) FROM events GROUP BY kind
+columns: kind int, sum(v) real
+  Project
+    FusedGroupAggregate: SCAN events_by_kind (columnar, fused scan + filter + group aggregate)
