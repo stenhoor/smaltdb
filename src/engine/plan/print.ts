@@ -54,6 +54,12 @@ export function printPlan(op: PlanOp, depth = 0): string {
   switch (op.op) {
     case 'scan':
       return `${pad}scan ${op.db ? `${op.db}.` : ''}${op.table} [${op.columns.join(', ')}]`;
+    case 'source':
+      return `${pad}${op.kind} ${op.schema ? `${op.schema}.` : ''}${op.name}(${list(op.args)})`;
+    case 'iterate':
+      return [`${pad}iterate #${op.id}${op.distinct ? ' distinct' : ''}${op.limit ? ` limit ${printExpr(op.limit)}` : ''}`, sub(op.init), ...op.steps.map(sub)].join('\n');
+    case 'working':
+      return `${pad}working #${op.id}`;
     case 'values':
       return `${pad}values ${op.rows.map((r) => `(${list(r)})`).join(', ')}`;
     case 'filter':
@@ -74,5 +80,11 @@ export function printPlan(op: PlanOp, depth = 0): string {
     }
     case 'distinct':
       return `${pad}distinct\n${sub(op.input)}`;
+    case 'window': {
+      const calls = op.calls.map((c) => `${c.fn}(${c.star ? '*' : list(c.args)})`).join(', ');
+      const part = op.partition.length ? ` partition [${list(op.partition.map((p) => p.expr))}]` : '';
+      const order = op.order.length ? ` order [${op.order.map((k) => `${printExpr(k.expr)}${k.desc ? ' desc' : ''}`).join(', ')}]` : '';
+      return `${pad}window [${calls}]${part}${order} ${op.frame.unit} ${op.frame.start.kind}..${op.frame.end.kind}\n${sub(op.input)}`;
+    }
   }
 }

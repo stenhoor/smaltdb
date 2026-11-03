@@ -20,13 +20,20 @@ export function planShadowEnabled(): boolean {
   return mode === 'shadow';
 }
 
-/** Statements checked and skipped (unsupported shapes, rewritten to a materialized view) so far. */
-export const shadowStats = { checked: 0, skipped: 0 };
+/** Statements checked and skipped so far, with the reasons for skipping. */
+export const shadowStats = { checked: 0, skipped: 0, reasons: {} as Record<string, number> };
 
-{
-  // SMALT_PLAN_STATS=1: print the counts when the process exits (how much of a corpus the front end covers).
-  const g = globalThis as { process?: { env?: Record<string, string | undefined>; on?(event: string, f: () => void): void } };
-  if (g.process?.env?.SMALT_PLAN_STATS) g.process.on?.('exit', () => console.log(`SMALT_PLAN shadow: ${shadowStats.checked} checked, ${shadowStats.skipped} skipped`));
+// SMALT_PLAN_STATS=<file>: append each skipped statement as a JSON line (reason, text), so a corpus run shows what the
+// front end does not handle yet. Node only, through its built-in fs (test runners use several workers).
+type Proc = { env?: Record<string, string | undefined>; getBuiltinModule?(name: string): unknown };
+const proc = (globalThis as { process?: Proc }).process;
+const statsFile = proc?.env?.SMALT_PLAN_STATS;
+const statsFs = statsFile ? (proc?.getBuiltinModule?.('fs') as { appendFileSync(f: string, s: string): void } | undefined) : undefined;
+
+function skip(reason: string, text: string): void {
+  shadowStats.skipped++;
+  shadowStats.reasons[reason] = (shadowStats.reasons[reason] ?? 0) + 1;
+  if (statsFile && statsFs) statsFs.appendFileSync(statsFile, JSON.stringify({ reason, text }) + '\n');
 }
 
 function mismatch(text: string, what: string): SmaltError {
@@ -39,8 +46,9 @@ const describe = (e: unknown): string => (e instanceof Error ? `${(e as { code?:
 export function shadowCheck(stmt: SelectStmt, text: string, catalog: FrontEndCatalog, legacy: () => QueryPlan, rewritten: () => boolean): QueryPlan {
   let fe: FrontEndResult | null = null;
   let feError: unknown;
+  let unsupported = '';
   try {
-    fe = toPlan(stmt, text, catalog);
+    fe = toPlan(stmt, text, catalog, (reason) => (unsupported = reason));
   } catch (e) {
     feError = e ?? new Error('undefined');
   }
@@ -55,13 +63,13 @@ export function shadowCheck(stmt: SelectStmt, text: string, catalog: FrontEndCat
       if (describe(feError) !== describe(e)) throw mismatch(text, `the error: front end ${describe(feError)}; planner ${describe(e)}`);
       shadowStats.checked++;
     } else if (fe !== null) throw mismatch(text, `whether it is valid: the planner raised ${describe(e)}`);
-    else shadowStats.skipped++;
+    else skip(unsupported, text);
     throw e;
   }
   if (feError !== undefined) throw mismatch(text, `whether it is valid: the front end raised ${describe(feError)}`);
   // Materialized-view matching rewrites the statement (it moves onto plans in step 7); compare unrewritten plans only.
   if (fe === null || rewritten()) {
-    shadowStats.skipped++;
+    skip(fe === null ? unsupported : 'rewritten to a materialized view', text);
     return plan;
   }
   shadowStats.checked++;

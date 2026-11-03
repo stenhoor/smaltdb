@@ -82,8 +82,8 @@ to it must show in review: update the files with `npx vitest run test/codegen-so
 column's name, type, collation, declared type and affinity, and on planning errors; a disagreement fails the statement
 with `SMALT_INTERNAL`. Shapes the front end does not handle yet are skipped, and so are statements the planner rewrote
 to read a materialized view. CI runs the whole suite this way (`SMALT_PLAN=shadow npx vitest run`); run it with
-`npm run slt` or the differential tests the same way. `SMALT_PLAN_STATS=1` prints how many statements were checked
-and skipped when the process exits.
+`npm run slt` or the differential tests the same way. `SMALT_PLAN_STATS=<file>` appends each skipped statement to
+`<file>` as a JSON line with the reason, to see what the front end does not cover yet.
 
 ## Plugins
 
