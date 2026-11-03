@@ -1,10 +1,12 @@
 // Runs the OPFS integration test in a real browser via Playwright: `npm run test:browser`.
 // Uses the pre-installed Chromium; set BROWSERS=chromium,firefox,webkit when those are installed.
 import { build } from 'esbuild';
+import { createServer } from 'node:http';
 import { copyFileSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadPlaywright } from './playwright.mjs';
+import { compressingHandler } from './compressing.mjs';
 import { serve } from './serve.mjs';
 
 const playwright = loadPlaywright();
@@ -35,7 +37,17 @@ writeFileSync(
   </script>`,
 );
 
-const server = await serve({ '/': out });
+// Hosts that compress responses (issue #32): one under /gz/ on the page's origin, and one on another
+// origin whose CORS headers expose only Content-Length and ETag.
+const gzLog = [];
+const server = await serve({ '/': out }, { handle: compressingHandler('/gz/', out, { log: gzLog }) });
+const xoLog = [];
+const xoHandle = compressingHandler('/gz/', out, { log: xoLog, cors: server.url });
+const xoServer = createServer(async (req, res) => {
+  if (!(await xoHandle(req, res))) res.writeHead(404).end();
+});
+await new Promise((r) => xoServer.listen(0, '127.0.0.1', r));
+const xoUrl = `http://127.0.0.1:${xoServer.address().port}`;
 const names = (process.env.BROWSERS ?? 'chromium').split(',');
 let failed = false;
 for (const name of names) {
@@ -66,13 +78,29 @@ for (const name of names) {
     return page.evaluate(() => window.__result);
   })) ?? { ok: false, error: 'empty result' };
   // Client API test (main thread -> engine worker -> OPFS).
-  await page.goto(server.url + '/client.html');
+  gzLog.length = 0;
+  xoLog.length = 0;
+  await page.goto(server.url + '/client.html?xo=' + encodeURIComponent(xoUrl));
   const client = (await waitFor(() => window.__clientResult !== undefined, 'client result'))
     ? await page.evaluate(() => window.__clientResult)
     : { ok: false, error: 'no result from the client test' };
   if (client.ok) {
     result.checks?.push(...client.checks.map((c) => ({ ...c, name: 'client: ' + c.name })));
     Object.assign(result.timings ?? {}, Object.fromEntries(Object.entries(client.timings).map(([k, v]) => ['client.' + k, v])));
+    // What the compressing hosts saw: same-origin, a range probe and ranged reads only (nothing
+    // gzipped); cross-origin, where Content-Range is hidden, the probe and then whole-file GETs.
+    const same = gzLog.filter((r) => r.path === '/gz/sales.parquet');
+    const cross = xoLog.filter((r) => r.path === '/gz/sales.parquet');
+    result.checks?.push({
+      name: 'client: compressing hosts: same-origin reads by ranges after a range probe',
+      ok: same.length > 0 && same[0].range === 'bytes=0-0' && same.every((r) => r.method === 'GET' && r.range !== null),
+      detail: JSON.stringify(same),
+    });
+    result.checks?.push({
+      name: 'client: compressing hosts: cross-origin falls back to whole-file reads',
+      ok: cross.length > 0 && cross[0].range === 'bytes=0-0' && cross.some((r) => r.method === 'GET' && r.range === null),
+      detail: JSON.stringify(cross),
+    });
   } else if (result.ok) {
     result.checks.push({ name: 'client test ran', ok: false, detail: client.error });
   }
@@ -102,6 +130,7 @@ for (const name of names) {
   console.log('capabilities', JSON.stringify(result.capabilities));
 }
 server.close();
+xoServer.close();
 process.exit(failed ? 1 : 0);
 
 async function multiTab(context, url) {

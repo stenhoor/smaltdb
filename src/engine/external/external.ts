@@ -537,12 +537,26 @@ export class ExternalRegistry {
     let validator: string | null;
     try {
       if (reader.access === 'random') {
-        const file = await this.openRandom(source, place, signal);
-        validator = file.validator;
+        let opened: Awaited<ReturnType<ExternalRegistry['openRandom']>> | null = null;
         try {
-          result = await reader.read(file.file, request);
-        } finally {
-          await file.close();
+          const file = (opened = await this.openRandom(source, place, signal));
+          validator = file.validator;
+          try {
+            result = await reader.read(file.file, request);
+          } finally {
+            await file.close();
+          }
+        } catch (e) {
+          // A remote server whose ranges do not match the file it serves (a size or encoding it
+          // misreports) can make a ranged read fail: read the whole file once instead. Local and
+          // registered files have an exact size, and SmaltErrors (HTTP errors, interrupts) are final.
+          // Only when the reader says the bytes look inconsistent (`wholeFileMayHelp`, e.g. no Parquet
+          // footer where the size says it is): a missing codec or a corrupt chunk would fail again.
+          // Nor when the reader already had the whole file (the server ignored ranges, or CORS hid the size).
+          if (e instanceof SmaltError || place.kind === 'file' || place.kind === 'node' || !(e as { wholeFileMayHelp?: boolean })?.wholeFileMayHelp || opened?.whole?.()) throw e;
+          const f = await this.fetchFile(source, place, signal, false);
+          validator = f.validator;
+          result = await reader.read({ byteLength: f.bytes.byteLength, slice: (s, end) => f.bytes.slice(s, end).buffer as ArrayBuffer }, request);
         }
       } else {
         const f = await this.fetchFile(source, place, signal, false);
@@ -557,7 +571,7 @@ export class ExternalRegistry {
   }
 
   /** Random access to a file: its size and byte ranges (HTTP Range requests for remote ones). */
-  private async openRandom(source: ExternalSource, place: Place, signal?: AbortSignal): Promise<{ file: RandomAccessFile; validator: string | null; close(): Promise<void> }> {
+  private async openRandom(source: ExternalSource, place: Place, signal?: AbortSignal): Promise<{ file: RandomAccessFile; validator: string | null; close(): Promise<void>; whole?: () => boolean }> {
     const none = async (): Promise<void> => undefined;
     const fromBytes = (b: Uint8Array): RandomAccessFile => ({ byteLength: b.byteLength, slice: (s, e) => b.slice(s, e).buffer as ArrayBuffer });
     if (place.kind === 'file') {
@@ -590,13 +604,26 @@ export class ExternalRegistry {
       }
     }
     const url = place.kind === 'http' ? place.url : this.objectUrl(place, place.key);
-    const head = await this.request(source, place, url, 'HEAD', signal);
-    const validator = head.headers.get('etag') ?? head.headers.get('last-modified');
-    const size = Number(head.headers.get('content-length'));
-    if (!Number.isFinite(size) || head.headers.get('content-length') === null) {
-      // No size (or not exposed to the page by CORS): read the whole file once.
-      const res = await this.request(source, place, url, 'GET', signal);
-      return { file: fromBytes(new Uint8Array(await res.arrayBuffer())), validator, close: none };
+    // The size comes from a 1-byte range probe, not HEAD: on hosts that compress responses (GitHub
+    // Pages, CDNs), HEAD's Content-Length is the compressed size while ranges address the
+    // uncompressed bytes. Browsers request range responses with `identity` encoding.
+    const probe = await this.request(source, place, url, 'GET', signal, { range: 'bytes=0-0' }, [416]);
+    let validator = probe.headers.get('etag') ?? probe.headers.get('last-modified');
+    const body = new Uint8Array(await probe.arrayBuffer());
+    // 200: the server ignored the range and sent the whole file.
+    if (probe.status === 200) return { file: fromBytes(body), validator, close: none, whole: () => true };
+    // 416: no byte 0, an empty file; read it as one (the format then reports what is wrong with it).
+    if (probe.status === 416) {
+      const f = await this.fetchFile(source, place, signal, false);
+      return { file: fromBytes(f.bytes), validator: validator ?? f.validator, close: none, whole: () => true };
+    }
+    const total = /^bytes\s+\d+-\d+\/(\d+)\s*$/i.exec(probe.headers.get('content-range') ?? '');
+    const size = total ? Number(total[1]) : NaN;
+    if (!Number.isSafeInteger(size)) {
+      // No total size (`*`, or Content-Range not exposed to the page by CORS): read the whole file once.
+      const f = await this.fetchFile(source, place, signal, false);
+      validator ??= f.validator;
+      return { file: fromBytes(f.bytes), validator, close: none, whole: () => true };
     }
     let whole: Promise<Uint8Array> | null = null;
     return {
@@ -613,6 +640,8 @@ export class ExternalRegistry {
       },
       validator,
       close: none,
+      // A slice that got the whole body (the server ignored a later range) holds the whole file.
+      whole: () => whole !== null,
     };
   }
 
@@ -849,7 +878,7 @@ export class ExternalRegistry {
    * One HTTP request: with the connection's credentials (only for URLs under the provider's
    * endpoint), signed for S3 (SigV4) or Azure (SAS, Shared Key, bearer), or to a presigned URL.
    */
-  private async request(source: ExternalSource, place: Place, url: string, method: 'GET' | 'HEAD', signal?: AbortSignal, extra: Record<string, string> = {}): Promise<Awaited<ReturnType<FetchFn>>> {
+  private async request(source: ExternalSource, place: Place, url: string, method: 'GET' | 'HEAD', signal?: AbortSignal, extra: Record<string, string> = {}, accept: number[] = []): Promise<Awaited<ReturnType<FetchFn>>> {
     let headers: Record<string, string> = { ...extra };
     let target = url;
     const credName = source.connection?.options.credentials;
@@ -882,7 +911,7 @@ export class ExternalRegistry {
       if ((e as Error).name === 'AbortError') throw new SmaltError('SMALT_INTERRUPT', 'interrupted');
       throw externalError(source, `fetching ${url} failed: ${(e as Error).message} (a network error, or a CORS error: the server must allow this origin)`);
     }
-    if (!res.ok) {
+    if (!res.ok && !accept.includes(res.status)) {
       let detail = '';
       if (method !== 'HEAD') {
         // S3 and Azure explain errors in an XML body (<Code>AccessDenied</Code>, <Message>…</Message>).

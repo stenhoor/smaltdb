@@ -5,9 +5,13 @@ import { extname, join, normalize } from 'node:path';
 
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json', '.data': 'application/octet-stream' };
 
-/** Serve `roots` (url prefix -> directory). Returns { url, close }. */
-export async function serve(roots, { isolated = true } = {}) {
+/**
+ * Serve `roots` (url prefix -> directory). `handle(req, res)`, when given, is asked first and returns
+ * true for requests it answered. Returns { url, close }.
+ */
+export async function serve(roots, { isolated = true, handle } = {}) {
   const server = createServer(async (req, res) => {
+    if (handle && (await handle(req, res))) return;
     const path = decodeURIComponent(new URL(req.url, 'http://x').pathname);
     for (const [prefix, dir] of Object.entries(roots)) {
       if (!path.startsWith(prefix)) continue;

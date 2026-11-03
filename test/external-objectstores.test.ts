@@ -5,7 +5,7 @@
  */
 import { createHash, createHmac } from 'node:crypto';
 import { type IncomingMessage, type ServerResponse, createServer } from 'node:http';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -15,6 +15,9 @@ import type { Request, Response } from '../src/shared/protocol.js';
 import { until } from './helpers/wait.js';
 import { signV4 } from '../src/engine/external/sign.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
+import parquet from '@smaltdb/parquet';
+
+const SALES_PARQUET = readFileSync('test/fixtures/parquet/sales-none.parquet');
 
 const errorOf = async (p: Promise<unknown>): Promise<{ code: string; message: string }> => {
   try {
@@ -43,8 +46,22 @@ const KEYS = { accessKeyId: 'AKIDTEST', secretAccessKey: 'secret/key+TEST' };
 const AZURE_KEY = Buffer.from('azure-account-key-for-tests').toString('base64');
 
 interface Obj {
-  body: string;
+  body: string | Uint8Array;
   etag: string;
+}
+
+/** An object's body, or the byte range a `Range: bytes=s-e` header asks for (206, Content-Range). */
+function sendObject(req: IncomingMessage, res: ServerResponse, body: string | Uint8Array, headers: Record<string, string>): void {
+  const bytes = typeof body === 'string' ? Buffer.from(body) : Buffer.from(body);
+  const m = /^bytes=(\d+)-(\d+)$/.exec(String(req.headers.range ?? ''));
+  if (m) {
+    const [s, e] = [Number(m[1]), Math.min(Number(m[2]), bytes.length - 1)];
+    res.writeHead(206, { ...headers, 'content-range': `bytes ${s}-${e}/${bytes.length}` });
+    res.end(req.method === 'HEAD' ? undefined : bytes.subarray(s, e + 1));
+    return;
+  }
+  res.writeHead(200, headers);
+  res.end(req.method === 'HEAD' ? undefined : bytes);
 }
 
 /** Independent SigV4 check of an incoming request. */
@@ -103,7 +120,7 @@ function fakeS3(objects: Map<string, Obj>, log: string[]) {
   return startServer((req, res, url) => {
     const signed = verifyV4(req, url);
     const presigned = url.searchParams.get('X-Test-Presigned') === 'ok';
-    log.push(`${req.method} ${url.pathname}${url.search}${signed ? ' signed' : presigned ? ' presigned' : ''}${req.headers['x-amz-security-token'] ? ' token' : ''}`);
+    log.push(`${req.method} ${url.pathname}${url.search}${req.headers.range ? ` [${req.headers.range}]` : ''}${signed ? ' signed' : presigned ? ' presigned' : ''}${req.headers['x-amz-security-token'] ? ' token' : ''}`);
     if (!signed && !presigned) {
       res.writeHead(403, { 'content-type': 'application/xml' });
       res.end('<Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match</Message></Error>');
@@ -132,8 +149,7 @@ function fakeS3(objects: Map<string, Obj>, log: string[]) {
       res.end('<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>');
       return;
     }
-    res.writeHead(200, { etag: `"${o.etag}"` });
-    res.end(req.method === 'HEAD' ? undefined : o.body);
+    sendObject(req, res, o.body, { etag: `"${o.etag}"` });
   });
 }
 
@@ -141,7 +157,7 @@ function fakeS3(objects: Map<string, Obj>, log: string[]) {
 function fakeAzure(account: string, blobs: Map<string, Obj>, log: string[]) {
   return startServer((req, res, url) => {
     const auth = url.searchParams.get('sig') === 'testsig' ? 'sas' : verifySharedKey(req, url, account) ? 'sharedkey' : req.headers.authorization === 'Bearer entra-token' ? 'bearer' : null;
-    log.push(`${req.method} ${url.pathname}${url.search.replace(/[?&]sig=testsig/, '')} ${auth}`);
+    log.push(`${req.method} ${url.pathname}${url.search.replace(/[?&]sig=testsig/, '')}${req.headers.range ? ` [${req.headers.range}]` : ''} ${auth}`);
     if (!auth || !req.headers['x-ms-version'] && auth !== 'sas') {
       res.writeHead(403, { 'content-type': 'application/xml' });
       res.end('<?xml version="1.0"?><Error><Code>AuthenticationFailed</Code><Message>Server failed to authenticate the request.</Message></Error>');
@@ -166,8 +182,7 @@ function fakeAzure(account: string, blobs: Map<string, Obj>, log: string[]) {
       res.end();
       return;
     }
-    res.writeHead(200, { etag: `0x${b.etag}` });
-    res.end(req.method === 'HEAD' ? undefined : b.body);
+    sendObject(req, res, b.body, { etag: `0x${b.etag}` });
   });
 }
 
@@ -251,6 +266,20 @@ describe('S3 sources', () => {
     await d.execAsync('REFRESH MATERIALIZED VIEW total IF CHANGED');
     expect(d.query('SELECT s FROM total').rows).toEqual([[370]]);
     put('analytics/sales/year=2024/month=01/a.csv', 'id,amount\n3,30\n');
+  });
+
+  it('Parquet by signed and presigned Range requests (the size from a range probe)', async () => {
+    objects.set('analytics/sales.parquet', { body: SALES_PARQUET, etag: 'pq1' });
+    for (const auth of [{ aws: KEYS }, { presign: (url: string) => `${url}?X-Test-Presigned=ok` }]) {
+      const d = await Database.open(new MemoryVfs(), 'db', { plugins: [parquet] });
+      d.registerCredentials('aws', { endpoint: endpoint + '/', ...auth });
+      d.exec(`CREATE CONNECTION lake WITH (type = 's3', endpoint = '${endpoint}', region = 'eu-west-1', bucket = 'analytics', credentials = 'aws')`);
+      log.length = 0;
+      expect((await d.queryAsync("SELECT sum(id) FROM read_parquet('sales.parquet', connection => 'lake')")).rows).toEqual([[(3999 * 4000) / 2]]);
+      const kind = 'aws' in auth ? 'signed' : 'presigned';
+      expect(log[0]).toMatch(new RegExp(`^GET /analytics/sales\\.parquet\\S* \\[bytes=0-0\\] ${kind}$`));
+      expect(log.every((l) => l.startsWith('GET ') && / \[bytes=\d+-\d+\] /.test(l) && l.endsWith(` ${kind}`)), kind).toBe(true);
+    }
   });
 
   it('session tokens, presigned URLs, refusals and errors', async () => {
@@ -353,6 +382,23 @@ describe('Azure Blob Storage sources', () => {
       ]);
       expect(log.length).toBeGreaterThan(0);
       expect(log.every((l) => l.endsWith(` ${kind}`)), kind).toBe(true);
+    }
+  });
+
+  it('Parquet by signed Range requests (the size from a range probe)', async () => {
+    blobs.set('data/sales.parquet', { body: SALES_PARQUET, etag: 'pq1' });
+    for (const [azure, kind] of [
+      [{ accountKey: AZURE_KEY }, 'sharedkey'],
+      [{ sasToken: '?sv=2021-08-06&sig=testsig' }, 'sas'],
+      [{ bearerToken: 'entra-token' }, 'bearer'],
+    ] as const) {
+      const d = await Database.open(new MemoryVfs(), 'db', { plugins: [parquet] });
+      d.registerCredentials('az', { endpoint: base + '/', azure });
+      d.exec(`CREATE CONNECTION store WITH (type = 'azure', account = 'devstoreaccount1', endpoint = '${base}/devstoreaccount1', container = 'data', credentials = 'az')`);
+      log.length = 0;
+      expect((await d.queryAsync("SELECT sum(id) FROM read_parquet('sales.parquet', connection => 'store')")).rows, kind).toEqual([[(3999 * 4000) / 2]]);
+      expect(log[0], kind).toMatch(/^GET \/devstoreaccount1\/data\/sales\.parquet\S* \[bytes=0-0\] /);
+      expect(log.every((l) => / \[bytes=\d+-\d+\] /.test(l) && l.endsWith(` ${kind}`)), kind).toBe(true);
     }
   });
 
