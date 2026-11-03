@@ -42,9 +42,10 @@ export type PlanExpr =
   /**
    * Internal, while the plan layer is built next to the current planner (ADR 0014, steps 3–5): a value the planner
    * keeps in a register (a column of a source, a GROUP BY key, an aggregate or window result). Never serialized,
-   * rejected by the validator, and replaced by `col` when the SQL front end produces plans.
+   * rejected by the validator, and replaced by `col` when the SQL front end produces plans. `use` marks a source
+   * column as read (projection pushdown) and runs when the slot is compiled.
    */
-  | { readonly k: 'slot'; readonly reg: number; readonly type: PlanType }
+  | { readonly k: 'slot'; readonly reg: number; readonly type: PlanType; readonly use?: () => void }
   /**
    * Internal, as `slot`: a subexpression the current planner compiled itself (a subquery, or a select-list alias
    * that a name resolved to). `compiled` is an `exec/expr.ts` `Compiled`.

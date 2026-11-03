@@ -163,6 +163,7 @@ class Emitter {
     if (isOpaque(e)) return this.viaFallback(e);
     switch (e.k) {
       case 'slot':
+        e.use?.();
         return this.reg(e.reg, e.type);
       case 'param':
         return this.reg(e.index, 'any');
