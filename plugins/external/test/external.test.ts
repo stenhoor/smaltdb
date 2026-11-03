@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Database } from '../../../src/engine/database.js';
+import type { SmaltPlugin } from '../../../src/engine/plugin.js';
 import { EngineServer } from '../../../src/engine/server.js';
 import { MemoryVfs } from '../../../src/engine/vfs/memory.js';
 import io from '@smaltdb/io';
@@ -287,6 +288,73 @@ describe('sources', () => {
     await registerFile(db, 'bytes', new TextEncoder().encode('a\n5\n'));
     await registerFile(db, 'blob', new Blob(['a\n7\n']));
     expect((await db.queryAsync("SELECT (SELECT a FROM read_csv('file:bytes')) + (SELECT a FROM read_csv('file:blob'))")).rows).toEqual([[12]]);
+  });
+
+  it('random access says when a failed read would fail again with the whole file (no retry)', async () => {
+    // A random-access format whose error asks for a whole-file retry (wholeFileMayHelp), counting reads.
+    let reads = 0;
+    const tail: SmaltPlugin = {
+      name: 'tail-format',
+      version: '1.0.0',
+      apiVersion: 1,
+      setup(host) {
+        host.addFormat({
+          name: 'tail',
+          extensions: ['tail'],
+          access: 'random',
+          async read(file) {
+            reads++;
+            const last = new Uint8Array(await file.slice(file.byteLength - 1, file.byteLength))[0];
+            if (last !== 0x23) throw Object.assign(new Error('no # at the end'), { wholeFileMayHelp: true });
+            return { columns: [{ name: 'n', declType: 'INTEGER' }], rows: [[file.byteLength]] };
+          },
+        });
+        host.addTableFunction('read_tail', { format: 'tail' });
+      },
+    };
+    const db = await Database.open(new MemoryVfs(), 'db', { plugins: [external, tail] });
+    const path = join(dir, 'x.tail');
+    writeFileSync(path, 'abc');
+    await registerFile(db, 'a.tail', 'abc');
+    await registerFile(db, 'b.tail', new Blob(['abc']));
+    // Registered files and Node paths have an exact size: one read, the error at once.
+    for (const loc of ['file:a.tail', 'file:b.tail', path]) {
+      reads = 0;
+      expect(await errorOf(db.queryAsync(`SELECT * FROM read_tail('${loc}')`)), loc).toMatchObject({ code: 'SMALT_EXTERNAL', message: expect.stringMatching(/no # at the end$/) });
+      expect(reads, loc).toBe(1);
+    }
+    // HTTP: a probe whose total is wrong (here one byte short) is retried once with the whole file;
+    // a server that ignored the range sent the whole file already, so its error is final.
+    const body = new TextEncoder().encode('abc#');
+    const requests: string[] = [];
+    await setFetch(db, async (url, init) => {
+      const range = /^bytes=(\d+)-(\d+)$/.exec(init.headers.range ?? '');
+      requests.push(`${url} ${init.headers.range ?? 'whole'}`);
+      // later.tail: a 206 for the probe, then 200s with the whole body (the server ignores later ranges).
+      const ranged = range && (url.endsWith('/short.tail') || (url.endsWith('/later.tail') && init.headers.range === 'bytes=0-0'));
+      const [s, e] = ranged ? [Number(range[1]), Math.min(Number(range[2]), 2)] : [0, body.length - 1];
+      const sent = url.endsWith('/bad.tail') || url.endsWith('/later.tail') ? new TextEncoder().encode('abc').slice(s, e + 1) : body.slice(s, e + 1);
+      return {
+        ok: true,
+        status: ranged ? 206 : 200,
+        statusText: '',
+        headers: { get: (h: string) => (h === 'content-range' && ranged ? `bytes ${s}-${e}/3` : null) },
+        arrayBuffer: async () => sent.buffer as ArrayBuffer,
+      };
+    });
+    reads = 0;
+    expect((await db.queryAsync("SELECT n FROM read_tail('https://example.test/short.tail')")).rows).toEqual([[4]]);
+    expect(reads).toBe(2);
+    expect(requests).toEqual(['https://example.test/short.tail bytes=0-0', 'https://example.test/short.tail bytes=2-2', 'https://example.test/short.tail whole']);
+    reads = 0;
+    requests.length = 0;
+    expect(await errorOf(db.queryAsync("SELECT n FROM read_tail('https://example.test/bad.tail')"))).toMatchObject({ code: 'SMALT_EXTERNAL' });
+    expect([reads, requests]).toEqual([1, ['https://example.test/bad.tail bytes=0-0']]);
+    // A later range answered with 200: that body is kept for the other slices and is the whole file.
+    reads = 0;
+    requests.length = 0;
+    expect(await errorOf(db.queryAsync("SELECT n FROM read_tail('https://example.test/later.tail')"))).toMatchObject({ code: 'SMALT_EXTERNAL' });
+    expect([reads, requests]).toEqual([1, ['https://example.test/later.tail bytes=0-0', 'https://example.test/later.tail bytes=2-2']]);
   });
 });
 

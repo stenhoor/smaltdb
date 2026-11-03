@@ -653,13 +653,17 @@ SELECT sold, typeof(sold), strftime('%m', sold) AS month FROM sales LIMIT 2;
 
 ### CORS for remote Parquet
 
+For HTTP, S3 and Azure locations, `@smaltdb/external` first learns the file's size with a range probe: a `GET` with `Range: bytes=0-0`. The total size comes from the `Content-Range` header of the `206` response (`bytes 0-0/<size>`). It does not use `Content-Length` from a `HEAD` request: hosts that compress responses, such as GitHub Pages, report the compressed size there, while ranges address the uncompressed bytes. Browsers send range requests with `Accept-Encoding: identity`, so range responses are not compressed.
+
 Ranged reads from a browser need the server's CORS configuration to:
 
 - allow the `Range` request header;
-- expose the `Content-Length` response header (smaltdb sends a `HEAD` request first to learn the file size);
+- expose the `Content-Range` response header, so the page can read the size from the probe;
 - expose `ETag`, if you use `IF CHANGED`.
 
-Without a usable `Content-Length`, the file is downloaded in one request. A server that ignores `Range` and returns the whole file also works; the body is then reused for the other column chunks.
+If the server ignores `Range` and answers the probe with `200`, that body is the whole file and is used as it is. If the probe's `206` has no readable total size (`Content-Range` is not exposed, or its total is `*`), the file is downloaded whole, without `Range`. If the reader then finds no Parquet footer where the size puts it, for example because the server reports the compressed size as the total, the file is downloaded whole and read again; other errors, such as a missing codec or a corrupt column chunk, are reported at once. Registered files and Node files have an exact size and are not read again.
+
+How often such a file is downloaded depends on how it is read. A `read_parquet()` call reads the file twice per statement, once for its schema (the footer) and once for its rows, so it downloads it twice. An external table stores its columns when it is created, so a statement over it reads the file once. To download it once in all, [cache it in a materialized view](#caching-in-a-materialized-view).
 
 For S3 and Azure, configure CORS on the bucket or storage account. Signed requests also send their own headers (for S3 with keys, `authorization`, `x-amz-date` and `x-amz-content-sha256`, plus `x-amz-security-token` with a session token), which must be allowed too.
 

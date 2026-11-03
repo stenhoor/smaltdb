@@ -146,6 +146,12 @@ export interface FormatResult {
  * A file format. `access: 'random'` readers get a {@link RandomAccessFile}, so they can read only
  * the parts they need; `'bytes'` readers get the whole file. Errors thrown are reported as
  * SMALT_EXTERNAL with the source's label in front.
+ *
+ * A random-access reader that finds the bytes inconsistent with the file's size (a Parquet footer
+ * missing where the size puts it: some hosts report a compressed size) throws an error with
+ * `wholeFileMayHelp: true`. The engine then reads the file once more in full ({@link OpenedFile.bytes})
+ * and retries, unless the source says the bytes it gave were already the whole file or the size was
+ * exact ({@link RandomFile.complete}); other errors are reported at once.
  */
 export type FormatReader = {
   /** Format name, as in `format = 'parquet'` (lower case). */
@@ -185,8 +191,22 @@ export interface OpenedFile {
   /** The whole file. */
   bytes(): Promise<{ bytes: Uint8Array; validator: string | null }>;
   /** Random access, for formats that read parts (absent: the whole file is read). */
-  random?(): Promise<{ file: RandomAccessFile; validator: string | null }>;
+  random?(): Promise<RandomFile>;
   close?(): Promise<void>;
+}
+
+/** What {@link OpenedFile.random} returns. */
+export interface RandomFile {
+  file: RandomAccessFile;
+  validator: string | null;
+  /**
+   * True when a read that failed would fail the same way with the whole file: the bytes in hand
+   * are the whole file (a server that ignored ranges), or `byteLength` is exact (a local or
+   * registered file). Asked after a reader error with `wholeFileMayHelp`; false or absent, the
+   * engine reads the whole file with {@link OpenedFile.bytes} and retries once (a remote size can
+   * be wrong: a host that reports a compressed size).
+   */
+  complete?: () => boolean;
 }
 
 /** A file a pattern matched. */

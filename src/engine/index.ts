@@ -22,6 +22,7 @@ export {
   type FormatResult,
   type FormatColumn,
   type RandomAccessFile,
+  type RandomFile,
   type SourceHandler,
   type SourceTarget,
   type SourceContext,

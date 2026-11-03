@@ -48,7 +48,9 @@ async function readParquet(file: RandomAccessFile, req: FormatRequest): Promise<
     // the metadata is longer), not its default 512 KB, which is all of a small file.
     meta = await pq.parquetMetadataAsync(buffer, { parsers: PARQUET_PARSERS, initialFetchSize: 1 << 14 } as Hyparquet.MetadataOptions);
   } catch (e) {
-    throw new Error(`not a readable Parquet file: ${(e as Error).message}`);
+    // No footer where the size puts it: maybe the size is wrong (a host that reported a compressed
+    // size), so the engine may retry with the whole file.
+    throw Object.assign(new Error(`not a readable Parquet file: ${(e as Error).message}`), { wholeFileMayHelp: true });
   }
   const schema = pq.parquetSchema(meta).children;
   const fileCols: FormatColumn[] = schema.map((c) => ({ name: c.element.name, declType: parquetDeclType(c) }));

@@ -212,6 +212,12 @@ A `RandomAccessFile` is `{ byteLength: number; slice(start: number, end?: number
 When the source has no random access, the engine reads the whole file and gives the format a `RandomAccessFile` over
 the bytes.
 
+A random-access format that finds the bytes inconsistent with the file's size throws an error with
+`wholeFileMayHelp: true`. `@smaltdb/parquet` does this when there is no footer where the size puts it, as when a host
+reports a compressed size. The engine then reads the whole file with the source's `bytes()` and calls `read` once more
+over it, unless the source's `complete()` says the read was already over the whole file or an exact size (see
+[OpenedFile](#openedfile)). Other errors, and errors with a `SMALT_` code, are reported at once.
+
 ### FormatRequest
 
 What the engine asks the format for:
@@ -273,11 +279,17 @@ source with no validator makes a view over it count as changed at every `IF CHAN
 | Member | Description |
 |---|---|
 | `bytes(): Promise<{ bytes: Uint8Array; validator: string \| null }>` | The whole file. |
-| `random?(): Promise<{ file: RandomAccessFile; validator: string \| null }>` | Random access, for formats with `access: 'random'`. Absent: those formats get the whole file. |
+| `random?(): Promise<{ file: RandomAccessFile; validator: string \| null; complete?: () => boolean }>` | Random access, for formats with `access: 'random'`. Absent: those formats get the whole file. |
 | `close?(): Promise<void>` | Called when the read is done, also after an error. |
 
 The engine calls `open`, then `random()` if the format has `access: 'random'` and the source has it, else `bytes()`,
 then `close()`.
+
+`complete()` returns `true` when reading the whole file could not change the result: the bytes in hand are already the
+whole file (a server that ignored `Range`), or `byteLength` is exact (a local or registered file). The engine asks it
+only after a format error with `wholeFileMayHelp`. When it returns `false`, or is absent, the engine calls `bytes()`
+and reads once more. `@smaltdb/external` returns `true` for `file:` locations and local paths. For HTTP, S3 and Azure,
+it returns `true` once it holds the whole body, because the server ignored a range or the size was unknown.
 
 ### Patterns
 

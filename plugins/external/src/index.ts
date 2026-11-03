@@ -221,7 +221,7 @@ class Sources {
     return this.host.glob.isGlob(target.location);
   }
 
-  /** A file to read: its bytes (one GET) or random access (a HEAD, then ranges). */
+  /** A file to read: its bytes (one GET) or random access (a range probe for the size, then ranges). */
   async open(target: SourceTarget, ctx: SourceContext): Promise<OpenedFile> {
     const place = placeOf(target);
     let close: (() => Promise<void>) | undefined;
@@ -302,16 +302,18 @@ class Sources {
   // ---------------------------------------------------------------- fetching
 
   /** Random access to a file: its size and byte ranges (HTTP Range requests for remote ones). */
-  private async openRandom(target: SourceTarget, place: Place, signal?: AbortSignal): Promise<{ file: RandomAccessFile; validator: string | null; close(): Promise<void> }> {
+  private async openRandom(target: SourceTarget, place: Place, signal?: AbortSignal): Promise<{ file: RandomAccessFile; validator: string | null; close(): Promise<void>; complete: () => boolean }> {
     const none = async (): Promise<void> => undefined;
+    const yes = (): boolean => true;
     const fromBytes = (b: Uint8Array): RandomAccessFile => ({ byteLength: b.byteLength, slice: (s, e) => b.slice(s, e).buffer as ArrayBuffer });
     if (place.kind === 'file') {
       const f = this.files.get(place.name);
       if (f === undefined) throw new Error(`no file is registered as '${place.name}' (registerFile)`);
-      if (typeof f === 'string' || f instanceof Uint8Array || f instanceof ArrayBuffer) return { file: fromBytes((await fileBytes(f)).bytes), validator: null, close: none };
+      // Registered files have an exact size: a read that fails would fail again.
+      if (typeof f === 'string' || f instanceof Uint8Array || f instanceof ArrayBuffer) return { file: fromBytes((await fileBytes(f)).bytes), validator: null, close: none, complete: yes };
       const blob = 'getFile' in f ? await f.getFile() : f;
       const lm = (blob as { lastModified?: number }).lastModified;
-      return { file: { byteLength: blob.size, slice: (s, e) => blob.slice(s, e).arrayBuffer() }, validator: typeof lm === 'number' ? `${lm}:${blob.size}` : null, close: none };
+      return { file: { byteLength: blob.size, slice: (s, e) => blob.slice(s, e).arrayBuffer() }, validator: typeof lm === 'number' ? `${lm}:${blob.size}` : null, close: none, complete: yes };
     }
     if (place.kind === 'node') {
       const fs = await nodeFs();
@@ -328,16 +330,30 @@ class Sources {
         },
         validator: `${st.mtimeMs}:${st.size}`,
         close: () => h.close(),
+        complete: yes, // a local file's size is exact
       };
     }
     const url = place.kind === 'http' ? place.url : objectUrl(place, place.key);
-    const head = await this.request(target, place, url, 'HEAD', signal);
-    const validator = head.headers.get('etag') ?? head.headers.get('last-modified');
-    const size = Number(head.headers.get('content-length'));
-    if (!Number.isFinite(size) || head.headers.get('content-length') === null) {
-      // No size (or not exposed to the page by CORS): read the whole file once.
-      const res = await this.request(target, place, url, 'GET', signal);
-      return { file: fromBytes(new Uint8Array(await res.arrayBuffer())), validator, close: none };
+    // The size comes from a 1-byte range probe, not HEAD: on hosts that compress responses (GitHub
+    // Pages, CDNs), HEAD's Content-Length is the compressed size while ranges address the
+    // uncompressed bytes. Browsers request range responses with `identity` encoding.
+    const probe = await this.request(target, place, url, 'GET', signal, { range: 'bytes=0-0' }, [416]);
+    let validator = probe.headers.get('etag') ?? probe.headers.get('last-modified');
+    const body = new Uint8Array(await probe.arrayBuffer());
+    // 200: the server ignored the range and sent the whole file.
+    if (probe.status === 200) return { file: fromBytes(body), validator, close: none, complete: yes };
+    // 416: no byte 0, an empty file; read it as one (the format then reports what is wrong with it).
+    if (probe.status === 416) {
+      const f = await this.fetchFile(target, place, signal, false);
+      return { file: fromBytes(f.bytes), validator: validator ?? f.validator, close: none, complete: yes };
+    }
+    const total = /^bytes\s+\d+-\d+\/(\d+)\s*$/i.exec(probe.headers.get('content-range') ?? '');
+    const size = total ? Number(total[1]) : NaN;
+    if (!Number.isSafeInteger(size)) {
+      // No total size (`*`, or Content-Range not exposed to the page by CORS): read the whole file once.
+      const f = await this.fetchFile(target, place, signal, false);
+      validator ??= f.validator;
+      return { file: fromBytes(f.bytes), validator, close: none, complete: yes };
     }
     let whole: Promise<Uint8Array> | null = null;
     return {
@@ -354,6 +370,8 @@ class Sources {
       },
       validator,
       close: none,
+      // A slice that got the whole body (the server ignored a later range) holds the whole file.
+      complete: () => whole !== null,
     };
   }
 
@@ -402,7 +420,7 @@ class Sources {
    * One HTTP request: with the connection's credentials (only for URLs under the provider's
    * endpoint), signed for S3 (SigV4) or Azure (SAS, Shared Key, bearer), or to a presigned URL.
    */
-  private async request(target: SourceTarget, place: Place, url: string, method: 'GET' | 'HEAD', signal?: AbortSignal, extra: Record<string, string> = {}): Promise<Response> {
+  private async request(target: SourceTarget, place: Place, url: string, method: 'GET' | 'HEAD', signal?: AbortSignal, extra: Record<string, string> = {}, accept: number[] = []): Promise<Response> {
     let headers: Record<string, string> = { ...extra };
     let to = url;
     const credName = target.connection?.options.credentials;
@@ -436,7 +454,7 @@ class Sources {
       if ((e as Error)?.name === 'AbortError') throw e; // the engine reports SMALT_INTERRUPT
       throw new Error(`fetching ${url} failed: ${(e as Error)?.message} (a network error, or a CORS error: the server must allow this origin)`);
     }
-    if (!res.ok) {
+    if (!res.ok && !accept.includes(res.status)) {
       let detail = '';
       if (method !== 'HEAD') {
         // S3 and Azure explain errors in an XML body (<Code>AccessDenied</Code>, <Message>…</Message>).

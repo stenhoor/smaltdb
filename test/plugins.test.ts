@@ -245,4 +245,72 @@ describe('plugins', () => {
     // Its pending call fails (the reply goes nowhere: the tab is gone).
     expect(reply('tab-b', r4)).toMatchObject({ kind: 'error', code: 'SMALT_EXTERNAL', message: 'test-plugin: the tab that would answer closed' });
   });
+
+  it('a random-access read whose error says wholeFileMayHelp is retried once with bytes(), unless the file was complete', async () => {
+    // `tail:<complete>/<error>`: random() gives the file without its last byte (a size the source
+    // got wrong), bytes() the whole file. The `tail` format needs a file that ends in '#'.
+    const log: string[] = [];
+    const plugin: SmaltPlugin = {
+      name: 'retry-plugin',
+      version: '1.0.0',
+      apiVersion: 1,
+      setup(host) {
+        const whole = new TextEncoder().encode('abc#');
+        host.addSource({
+          name: 'tail',
+          prefixes: ['tail:'],
+          async open(target) {
+            const [complete] = target.location.slice(5).split('/');
+            return {
+              bytes: async () => (log.push('bytes'), { bytes: whole, validator: 'w' }),
+              random: async () => ({
+                file: { byteLength: 3, slice: (s, e) => whole.slice(s, Math.min(e ?? 3, 3)).buffer as ArrayBuffer },
+                validator: 'r',
+                ...(complete === 'absent' ? {} : { complete: () => complete === 'yes' }),
+              }),
+            };
+          },
+          async validator() {
+            return null;
+          },
+        });
+        host.addFormat({
+          name: 'tail',
+          extensions: ['tail'],
+          access: 'random',
+          async read(file, req) {
+            log.push('read');
+            const last = new Uint8Array(await file.slice(file.byteLength - 1, file.byteLength))[0];
+            if (last !== 0x23) {
+              const kind = req.label.match(/\/(\w+)/)?.[1];
+              const e = new Error('no # at the end');
+              if (kind === 'may') throw Object.assign(e, { wholeFileMayHelp: true });
+              if (kind === 'code') throw Object.assign(e, { wholeFileMayHelp: true, code: 'SMALT_EXTERNAL' });
+              throw e;
+            }
+            return { columns: [{ name: 'n', declType: 'INTEGER' }], rows: req.schemaOnly ? [] : [[file.byteLength]] };
+          },
+        });
+        host.addTableFunction('read_tail', { format: 'tail' });
+      },
+    };
+    const db = Database.openMemory({ plugins: [plugin] });
+    const run = async (loc: string): Promise<{ result: unknown; log: string[] }> => {
+      log.length = 0;
+      const result = await db.queryAsync(`SELECT n FROM read_tail('${loc}')`).then(
+        (r) => r.rows,
+        (e: { code: string; message: string }) => `${e.code}: ${e.message}`,
+      );
+      return { result, log: [...log] };
+    };
+    // Not complete (false or absent): one whole-file read, then the reader again on it.
+    for (const c of ['no', 'absent']) {
+      expect(await run(`tail:${c}/may`), c).toEqual({ result: [[4]], log: ['read', 'bytes', 'read'] });
+    }
+    // Complete (an exact size, or the whole file in hand): reported at once.
+    expect(await run('tail:yes/may')).toEqual({ result: "SMALT_EXTERNAL: read_tail('tail:yes/may'): no # at the end", log: ['read'] });
+    // Errors without the flag, and errors with a SMALT_ code, are final.
+    expect(await run('tail:no/plain')).toEqual({ result: "SMALT_EXTERNAL: read_tail('tail:no/plain'): no # at the end", log: ['read'] });
+    expect(await run('tail:no/code')).toEqual({ result: 'SMALT_EXTERNAL: no # at the end', log: ['read'] });
+  });
 });

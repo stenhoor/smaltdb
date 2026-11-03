@@ -10,7 +10,7 @@
  */
 import { SmaltError, errorCode } from '../errors.js';
 import type { StaticType } from '../exec/convert.js';
-import { type FormatReader, PluginRegistry, type RandomAccessFile, type SourceHandler, type SourceTarget } from '../plugin.js';
+import { type FormatReader, PluginRegistry, type RandomAccessFile, type RandomFile, type SourceHandler, type SourceTarget } from '../plugin.js';
 import type { Zone } from '../storage/columnar.js';
 import type { SqlValue } from '../values.js';
 import { hivePartitions, isGlob, partitionValue } from './glob.js';
@@ -356,9 +356,22 @@ export class ExternalRegistry {
         let validator: string | null;
         let result: { columns: ExternalColumn[]; rows: SqlValue[][] };
         if (reader.access === 'random') {
-          const r = file.random ? await file.random() : await file.bytes().then((b) => ({ file: fromBytes(b.bytes), validator: b.validator }));
+          const r: RandomFile = file.random ? await file.random() : await file.bytes().then((b) => ({ file: fromBytes(b.bytes), validator: b.validator, complete: () => true }));
           validator = r.validator;
-          result = await reader.read(r.file, request);
+          try {
+            result = await reader.read(r.file, request);
+          } catch (e) {
+            // A remote server whose ranges do not match the file it serves (a size or encoding it
+            // misreports) can make a ranged read fail: read the whole file once instead. Only when
+            // the reader says the bytes look inconsistent (`wholeFileMayHelp`, e.g. no Parquet footer
+            // where the size says it is): a missing codec or a corrupt chunk would fail again. Errors
+            // with a SMALT_ code are final, and so is a read of bytes the source says were already
+            // complete (a local or registered file's exact size, a server that ignored ranges).
+            if (e instanceof SmaltError || errorCode(e) !== 'SMALT_INTERNAL' || !(e as { wholeFileMayHelp?: boolean })?.wholeFileMayHelp || r.complete?.()) throw e;
+            const b = await file.bytes();
+            validator = b.validator;
+            result = await reader.read(fromBytes(b.bytes), request);
+          }
         } else {
           const b = await file.bytes();
           validator = b.validator;

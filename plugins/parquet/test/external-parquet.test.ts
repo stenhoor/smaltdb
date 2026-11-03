@@ -6,6 +6,7 @@
 import { readFileSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Database } from '../../../src/engine/database.js';
 import { MemoryVfs } from '../../../src/engine/vfs/memory.js';
@@ -71,47 +72,92 @@ describe('Parquet values and types', () => {
   });
 });
 
-describe('ranged reads: projection and row-group pruning', () => {
-  const ranges: { file: string; bytes: number; range: string | null; method: string }[] = [];
-  let ignoreRanges = false;
+type Request = { file: string; bytes: number; range: string | null; method: string; gzip?: boolean };
+
+/**
+ * A static file server for Parquet fixtures that logs every request and the body bytes it sent.
+ * With `gzip` it behaves like GitHub Pages: responses to requests without `Range` whose
+ * Accept-Encoding includes gzip are gzipped, HEAD included (its content-length is then the
+ * compressed size); Range requests get the uncompressed bytes with `Content-Range`.
+ */
+function parquetServer(opts: { gzip?: boolean } = {}) {
+  const ranges: Request[] = [];
+  const state = { ignoreRanges: false, version: 1, gzipRanges: false };
   const server = createServer((req, res) => {
-    const file = join(F, decodeURIComponent(new URL(req.url!, 'http://x').pathname));
-    let size: number;
+    const path = decodeURIComponent(new URL(req.url!, 'http://x').pathname);
+    const file = join(F, path);
+    let body: Buffer;
     try {
-      size = statSync(file).size;
+      if (path === '/not.parquet') body = Buffer.from('not parquet at all');
+      else if (path === '/empty.parquet') body = Buffer.alloc(0);
+      else if (path === '/corrupt.parquet') {
+        // A valid footer, but the column data scrambled: decoding fails after the footer was read.
+        body = Buffer.from(readFileSync(join(F, 'sales-snappy.parquet')));
+        for (let i = 4; i < 4000; i++) body[i] = (body[i] * 31 + 7) & 0xff;
+      } else body = readFileSync(file);
     } catch {
       res.writeHead(404);
       res.end();
       return;
     }
+    const size = body.length;
     const m = /^bytes=(\d+)-(\d+)$/.exec(String(req.headers.range ?? ''));
-    const headers = { etag: `"${statSync(file).mtimeMs}"`, 'accept-ranges': 'bytes' };
-    if (req.method === 'HEAD') {
-      ranges.push({ file, bytes: 0, range: null, method: 'HEAD' });
-      res.writeHead(200, { ...headers, 'content-length': size });
+    const headers = { etag: `"${size}-${state.version}"`, 'accept-ranges': 'bytes' };
+    if (m && !state.ignoreRanges && Number(m[1]) >= size) {
+      // Like real servers: a range that starts past the end (any range of an empty file) is 416.
+      ranges.push({ file, bytes: 0, range: req.headers.range!, method: req.method! });
+      res.writeHead(416, { ...headers, 'content-range': `bytes */${size}` });
       res.end();
       return;
     }
-    const body = readFileSync(file);
-    if (m && !ignoreRanges) {
-      const [s, e] = [Number(m[1]), Number(m[2])];
-      ranges.push({ file, bytes: e - s + 1, range: req.headers.range!, method: 'GET' });
+    if (m && !state.ignoreRanges) {
+      const [s, e] = [Number(m[1]), Math.min(Number(m[2]), size - 1)];
+      ranges.push({ file, bytes: e - s + 1, range: req.headers.range!, method: req.method! });
+      if (state.gzipRanges) {
+        // Like GitHub Pages for a client that accepts gzip on range requests: the range's bytes are
+        // gzipped, and Content-Range reports the compressed size of the whole file as the total.
+        // (Fetch sends `identity` with Range, as Node's does, so this ignores Accept-Encoding to
+        // stand in for a client that does not.)
+        const sent = gzipSync(body.subarray(s, e + 1));
+        res.writeHead(206, { ...headers, 'content-range': `bytes ${s}-${e}/${gzipSync(body).length}`, 'content-length': sent.length, 'content-encoding': 'gzip' });
+        res.end(req.method === 'HEAD' ? undefined : sent);
+        return;
+      }
       res.writeHead(206, { ...headers, 'content-range': `bytes ${s}-${e}/${size}`, 'content-length': e - s + 1 });
-      res.end(body.subarray(s, e + 1));
+      res.end(req.method === 'HEAD' ? undefined : body.subarray(s, e + 1));
       return;
     }
-    ranges.push({ file, bytes: size, range: null, method: 'GET' });
-    res.writeHead(200, { ...headers, 'content-length': size });
-    res.end(body);
+    const gzip = !!opts.gzip && /\bgzip\b/.test(String(req.headers['accept-encoding'] ?? ''));
+    const sent = gzip ? gzipSync(body) : body;
+    ranges.push({ file, bytes: req.method === 'HEAD' ? 0 : sent.length, range: null, method: req.method!, gzip });
+    res.writeHead(200, { ...headers, 'content-length': sent.length, ...(gzip ? { 'content-encoding': 'gzip', vary: 'Accept-Encoding' } : {}) });
+    res.end(req.method === 'HEAD' ? undefined : sent);
   });
+  const srv = {
+    ranges,
+    state,
+    base: '',
+    fetched: () => ranges.reduce((n, r) => n + r.bytes, 0),
+    listen: async () => {
+      await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+      srv.base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    },
+    close: () => server.close(),
+  };
+  return srv;
+}
+
+describe('ranged reads: projection and row-group pruning', () => {
+  const srv = parquetServer();
+  const ranges = srv.ranges;
   let base = '';
   beforeAll(async () => {
-    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
-    base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    await srv.listen();
+    base = srv.base;
   });
-  afterAll(() => server.close());
+  afterAll(() => srv.close());
 
-  const fetched = () => ranges.reduce((n, r) => n + r.bytes, 0);
+  const fetched = srv.fetched;
 
   it('fetches the footer and only the column chunks the statement uses', async () => {
     const d = await db();
@@ -174,17 +220,109 @@ describe('ranged reads: projection and row-group pruning', () => {
   it('servers that ignore Range get one whole download; IF CHANGED uses HEAD', async () => {
     const d = await db();
     const url = `${base}/sales-snappy.parquet`;
-    ignoreRanges = true;
+    srv.state.ignoreRanges = true;
     ranges.length = 0;
     try {
       expect((await d.queryAsync(`SELECT count(*) FROM read_parquet('${url}') WHERE id < 5`)).rows).toEqual([[5]]);
     } finally {
-      ignoreRanges = false;
+      srv.state.ignoreRanges = false;
     }
     expect(ranges.filter((r) => r.method === 'GET').length).toBeLessThanOrEqual(2); // schema read + data read
     await d.execAsync(`CREATE MATERIALIZED VIEW m AS SELECT count(*) AS n FROM read_parquet('${url}')`);
     ranges.length = 0;
     await d.execAsync('REFRESH MATERIALIZED VIEW m IF CHANGED');
     expect(ranges.map((r) => r.method)).toEqual(['HEAD']);
+  });
+});
+
+describe('hosts that compress responses (GitHub Pages, issue #32)', () => {
+  // HEAD's content-length is the gzipped size there, while ranges address the uncompressed bytes.
+  const srv = parquetServer({ gzip: true });
+  beforeAll(() => srv.listen());
+  afterAll(() => srv.close());
+
+  it('reads Parquet with read_parquet and external tables', async () => {
+    const d = await db();
+    for (const name of ['sales-zstd', 'sales-none']) {
+      const url = `${srv.base}/${name}.parquet`;
+      expect((await d.queryAsync(`SELECT count(*), sum(amount), min(day), max(id) FROM read_parquet('${url}') WHERE id >= 1000`)).rows, name).toEqual([[3000, 144154, '2024-01-21', 3999]]);
+    }
+    await d.execAsync(`CREATE EXTERNAL TABLE s WITH (location = '${srv.base}/sales-zstd.parquet')`);
+    expect((await d.queryAsync('SELECT count(*), count(DISTINCT region) FROM s')).rows).toEqual([[4000, 3]]);
+  });
+
+  it('still reads only the footer and the column chunks the statement uses', async () => {
+    const d = await db();
+    const url = `${srv.base}/sales-none.parquet`;
+    const size = statSync(join(F, 'sales-none.parquet')).size;
+    srv.ranges.length = 0;
+    expect((await d.queryAsync(`SELECT sum(id) FROM read_parquet('${url}')`)).rows).toEqual([[(3999 * 4000) / 2]]);
+    // Every request is ranged (the size comes from a 1-byte range probe, not HEAD): nothing is gzipped.
+    expect(srv.ranges.every((r) => r.range !== null && r.method === 'GET')).toBe(true);
+    expect(srv.fetched()).toBeLessThan(size / 3);
+  });
+
+  it('REFRESH … IF CHANGED revalidates with HEAD (the ETag survives gzip)', async () => {
+    const d = await db();
+    const url = `${srv.base}/sales-zstd.parquet`;
+    await d.execAsync(`CREATE MATERIALIZED VIEW m AS SELECT count(*) AS n FROM read_parquet('${url}')`);
+    srv.ranges.length = 0;
+    await d.execAsync('REFRESH MATERIALIZED VIEW m IF CHANGED');
+    expect(srv.ranges.map((r) => [r.method, r.gzip])).toEqual([['HEAD', true]]);
+    srv.state.version++;
+    srv.ranges.length = 0;
+    await d.execAsync('REFRESH MATERIALIZED VIEW m IF CHANGED');
+    expect(srv.ranges[0].method).toBe('HEAD');
+    expect(srv.ranges.filter((r) => r.method === 'GET').length).toBeGreaterThan(0);
+    expect(d.query('SELECT n FROM m').rows).toEqual([[4000]]);
+  });
+
+  it('a ranged read that finds no footer is retried once with the whole file', async () => {
+    const d = await db();
+    // An uncompressed file, so gzip shrinks it a lot (as with the demo file on Pages).
+    const url = `${srv.base}/sales-none.parquet`;
+    // Ranges gzipped with the compressed size as the total (GitHub Pages, for clients that accept
+    // gzip on range requests): the size is wrong, so the footer is not where it says.
+    srv.state.gzipRanges = true;
+    srv.ranges.length = 0;
+    try {
+      expect((await d.queryAsync(`SELECT count(*), max(id) FROM read_parquet('${url}')`)).rows).toEqual([[4000, 3999]]);
+    } finally {
+      srv.state.gzipRanges = false;
+    }
+    // One whole (gzipped) download for each read: the schema, then the rows.
+    expect(srv.ranges.filter((r) => r.range === null).map((r) => [r.method, r.gzip])).toEqual([
+      ['GET', true],
+      ['GET', true],
+    ]);
+    // An external table stores its columns, so a statement over it downloads the file once.
+    await d.execAsync(`CREATE EXTERNAL TABLE gz WITH (location = '${url}')`);
+    srv.state.gzipRanges = true;
+    srv.ranges.length = 0;
+    try {
+      expect((await d.queryAsync('SELECT count(*) FROM gz')).rows).toEqual([[4000]]);
+    } finally {
+      srv.state.gzipRanges = false;
+    }
+    expect(srv.ranges.filter((r) => r.range === null).map((r) => r.method)).toEqual(['GET']);
+    // When the retry fails too, its error is reported.
+    srv.ranges.length = 0;
+    expect(await d.queryAsync(`SELECT * FROM read_parquet('${srv.base}/not.parquet')`).catch((e: Error) => e.message)).toMatch(/not\.parquet'\): not a readable Parquet file/);
+    expect(srv.ranges.filter((r) => r.range === null).map((r) => r.method)).toEqual(['GET']);
+    // An empty file: the probe gets 416, the file is read whole, and the format reports it (not "HTTP 416").
+    expect(await d.queryAsync(`SELECT * FROM read_parquet('${srv.base}/empty.parquet')`).catch((e: Error) => e.message)).toMatch(/empty\.parquet'\): not a readable Parquet file/);
+    // A file that was already read whole (the server ignored ranges) is not downloaded again.
+    srv.state.ignoreRanges = true;
+    srv.ranges.length = 0;
+    try {
+      expect(await d.queryAsync(`SELECT * FROM read_parquet('${srv.base}/not.parquet')`).catch((e: Error) => e.message)).toMatch(/not a readable Parquet file/);
+    } finally {
+      srv.state.ignoreRanges = false;
+    }
+    expect(srv.ranges.map((r) => r.method)).toEqual(['GET']);
+    // Other reader errors (a corrupt column chunk, a missing codec) are not retried: no whole-file download.
+    srv.ranges.length = 0;
+    expect(await d.queryAsync(`SELECT sum(amount) FROM read_parquet('${srv.base}/corrupt.parquet')`).catch((e: Error) => e.message)).toMatch(/corrupt\.parquet'\): Parquet: /);
+    expect(srv.ranges.filter((r) => r.range === null)).toEqual([]);
   });
 });
