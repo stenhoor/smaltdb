@@ -55,10 +55,24 @@ const HANDLED = [
   'SELECT t.id, p.name FROM t, pragma_table_info(\'t\') p WHERE t.id < 3',
   'SELECT u.y, max(t.r) FROM t JOIN u ON u.x = t.a GROUP BY u.y ORDER BY 2 DESC',
   'SELECT table_name FROM information_schema.tables ORDER BY 1',
+  // Subqueries (6c-ii): uncorrelated, correlated, decorrelated, over aggregate rows, nested, in ON and arguments.
+  'SELECT a FROM t WHERE id IN (SELECT x FROM u)',
+  'SELECT a FROM t WHERE a NOT IN (SELECT x FROM u WHERE x > 3) ORDER BY 1',
+  'SELECT id, (SELECT max(y) FROM u WHERE u.x = t.a) FROM t WHERE id < 30',
+  'SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a AND u.y = \'y2\')',
+  'SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.x = t.a)',
+  'SELECT id FROM t WHERE EXISTS (SELECT count(*) FROM u WHERE u.x = t.a)',
+  'SELECT id, (SELECT y FROM u WHERE u.x = t.a ORDER BY y LIMIT 1) FROM t WHERE id < 10',
+  'SELECT id FROM t WHERE r > (SELECT avg(r) FROM t)',
+  'SELECT a, count(*), (SELECT count(*) FROM u WHERE u.x = t.a) FROM t GROUP BY a',
+  'SELECT a FROM t GROUP BY a HAVING count(*) > (SELECT count(*) FROM u WHERE u.x = t.a)',
+  'SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a AND EXISTS (SELECT 1 FROM c WHERE c.g = u.x AND c.v = t.id))',
+  'SELECT t.id, u.y FROM t LEFT JOIN u ON u.x = t.a AND u.y IN (SELECT y FROM u WHERE x = 1) WHERE t.id < 8',
+  'SELECT (SELECT count(*) FROM u), (SELECT 1 WHERE EXISTS (SELECT 1 FROM t))',
 ];
 
-// Shapes the physical planner leaves to the planner (6c-ii, 6c-iii).
-const JOINS = ['SELECT a FROM t WHERE id IN (SELECT x FROM u)', 'SELECT u.x, w.r FROM u CROSS JOIN (SELECT 1 AS r) w LIMIT 2'];
+// Shapes the physical planner leaves to the planner (6c-iii).
+const JOINS = ['SELECT u.x, w.r FROM u CROSS JOIN (SELECT 1 AS r) w LIMIT 2', 'SELECT a, rank() OVER (ORDER BY id) FROM t LIMIT 3'];
 
 const params = (sql: string) => (sql.includes('?') ? [7] : undefined);
 const run = (db: Database, sql: string) => db.prepare(sql).all(params(sql));
@@ -81,7 +95,7 @@ describe('physical planner', () => {
     expect(shadowStats.physical - before).toBe(HANDLED.length);
   });
 
-  it('leaves subqueries and derived tables to the planner', async () => {
+  it('leaves derived tables and windows to the planner', async () => {
     const db = await setup();
     setPlanMode('legacy');
     const want = JOINS.map((q) => run(db, q));
