@@ -333,6 +333,42 @@ export class Window implements Operator {
               }
               return;
             }
+            // Sliding frames (no exclusion) of an aggregate that can undo a step: one running state that adds the rows
+            // entering the frame and removes the rows leaving it. Frame bounds only move forward as i grows; a frame that
+            // moves back (it cannot with the frame types SQL has) gets a fresh state.
+            const probe = a.def.create(a.argTypes, a.collation);
+            if (probe.inverse && frame.exclude === 'NO OTHERS') {
+              let st = probe;
+              let lo = ps;
+              let hi = ps;
+              /** Remove row j; false when the state asked to be rebuilt. */
+              const unstep = (j: number): boolean => {
+                const row = rows[idx[j]];
+                return !row.filter[ci] || st.inverse!(a.star ? [] : row.args[ci]);
+              };
+              for (let i = ps; i < pe; i++) {
+                const [fs, fe] = frameOf(i);
+                if (fs < lo || fe < hi) {
+                  st = a.def.create(a.argTypes, a.collation);
+                  lo = hi = fs;
+                }
+                if (fs >= hi) {
+                  // No overlap with the previous frame: start again rather than removing every row.
+                  st = a.def.create(a.argTypes, a.collation);
+                  lo = hi = fs;
+                }
+                while (hi < fe) step(hi++, st);
+                let exact = true;
+                while (lo < fs) if (!unstep(lo++)) exact = false;
+                if (!exact) {
+                  // Rounding left by removed rows: rebuild from the rows of this frame.
+                  st = a.def.create(a.argTypes, a.collation);
+                  for (let j = fs; j < fe; j++) step(j, st);
+                }
+                res[idx[i]] = st.final();
+              }
+              return;
+            }
             for (let i = ps; i < pe; i++) {
               const [fs, fe] = frameOf(i);
               const st = a.def.create(a.argTypes, a.collation);

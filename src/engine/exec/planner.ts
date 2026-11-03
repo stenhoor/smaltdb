@@ -60,7 +60,14 @@ import { CODEGEN_HELPERS_FOR_FUSION } from './expr.js';
 import type { Frame } from '../storage/pager.js';
 import { PH_RIGHT } from '../storage/format.js';
 
-const FUSABLE_AGGS = new Set(['count', 'sum', 'total', 'avg', 'min', 'max']);
+/** Aggregates generated pipelines can step (one argument, with step1). */
+const FUSABLE_AGGS = new Set([
+  'count', 'sum', 'total', 'avg', 'min', 'max',
+  // statistics (stat-aggregates.ts)
+  'var_samp', 'variance', 'var_pop', 'stddev_samp', 'stddev', 'stddev_pop', 'skewness', 'skewness_pop', 'kurtosis', 'kurtosis_pop', 'median',
+]);
+/** Two-argument aggregates generated pipelines can step (with step2). */
+const FUSABLE_AGGS2 = new Set(['covar_samp', 'covar_pop', 'corr', 'percentile', 'percentile_cont', 'percentile_disc']);
 import {
   type AggSpec,
   Compound,
@@ -642,7 +649,11 @@ export class Planner {
         },
         aggregateRef: (call) => {
           const existing = aggAsts.findIndex((a) => exprEquals(a, call));
-          if (existing >= 0) return { reg: aggs[existing].outReg, type: 'any', collation: aggs[existing].collation, affinity: 'NONE' };
+          if (existing >= 0) {
+            // The same aggregate again (sum(x) and typeof(sum(x))): one state, and the same result type.
+            const a = aggs[existing];
+            return { reg: a.outReg, type: a.def.resultType(a.argTypes), collation: a.collation, affinity: 'NONE' };
+          }
           const def = aggregateFunctions.get(call.name)!;
           if (call.star && call.name !== 'count') throw new SmaltError('SMALT_ERROR', `wrong number of arguments to function ${call.name}()`);
           const n = call.args.length;
@@ -923,9 +934,11 @@ export class Planner {
   private fusedAggSpecs(aggs: AggSpec[]): FusedAggSpec[] | null {
     const specs: FusedAggSpec[] = [];
     for (const a of aggs) {
-      if (a.distinct || !FUSABLE_AGGS.has(a.name) || a.argAsts.length > 1) return null;
+      const two = FUSABLE_AGGS2.has(a.name) && a.argAsts.length === 2;
+      if (a.distinct || (!two && (!FUSABLE_AGGS.has(a.name) || a.argAsts.length > 1))) return null;
       if ([a.filterAst, ...a.argAsts].some((x) => x !== undefined && hasSubquery(x))) return null;
       if (a.name === 'count') specs.push(a.star ? { kind: 'countStar', filter: a.filterAst } : { kind: 'count', arg: a.argAsts[0], filter: a.filterAst });
+      else if (two) specs.push({ kind: 'step2', arg: a.argAsts[0], arg2: a.argAsts[1], filter: a.filterAst });
       else specs.push({ kind: 'step', arg: a.argAsts[0], filter: a.filterAst });
     }
     return specs;
@@ -2876,7 +2889,13 @@ function containsWindow(e: Expr | undefined): boolean {
 
 /** Shape of an expression for matching against index definitions: no positions, no table qualifiers. */
 /** Aggregates whose result does not depend on input order (sum/avg of REAL up to rounding). */
-const ORDER_INSENSITIVE_AGGS = new Set(['count', 'sum', 'total', 'avg', 'min', 'max']);
+const ORDER_INSENSITIVE_AGGS = new Set([
+  'count', 'sum', 'total', 'avg', 'min', 'max',
+  // statistics (stat-aggregates.ts): the percentiles exactly, the moments up to rounding like sum/avg
+  'median', 'percentile', 'percentile_cont', 'percentile_disc',
+  'var_samp', 'variance', 'var_pop', 'stddev_samp', 'stddev', 'stddev_pop',
+  'skewness', 'skewness_pop', 'kurtosis', 'kurtosis_pop', 'covar_samp', 'covar_pop', 'corr',
+]);
 
 /**
  * Let index scans under `op` fetch rows in rowid order: the caller guarantees the row order is not

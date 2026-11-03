@@ -1,10 +1,11 @@
 import type { Expr } from '../sql/ast.js';
 import type { SqlValue } from '../values.js';
 import { type StaticType, truthy } from './convert.js';
+import { type InlineMath, type MathFunction, inlineMath, roundingType } from './math.js';
 
 /**
- * Expression code generation (ADR 0001 decision 5). Arithmetic, numeric comparisons and boolean
- * logic are emitted as straight-line JavaScript with fast paths chosen from static types, so each
+ * Expression code generation (ADR 0001 decision 5). Arithmetic, numeric comparisons, boolean
+ * logic and the math functions on numeric arguments (math.ts) are emitted as straight-line JavaScript with fast paths chosen from static types, so each
  * expression gets its own V8 type feedback and inlined register reads and constants. Closures
  * share feedback across all instances of a closure literal, so they cannot be specialized this way.
  * Any other node is delegated to the closure compiler (`fallback`), which defines the semantics;
@@ -83,11 +84,18 @@ export function codegenEnabled(): boolean {
   return enabled;
 }
 
-/** Worth generating code for: arithmetic, numeric comparison or boolean logic at the root. */
+/** Worth generating code for: arithmetic, numeric comparison, boolean logic or a math function at the root. */
 export function isCodegenRoot(e: Expr): boolean {
   if (e.kind === 'binary') return ARITH.has(e.op) || CMP.has(e.op) || e.op === 'AND' || e.op === 'OR';
   if (e.kind === 'unary') return e.op === 'NOT' || e.op === '-';
+  if (e.kind === 'call') return mathCall(e) !== undefined;
   return false;
+}
+
+/** A plain call of a math function that generated code can emit inline. */
+function mathCall(e: Expr): InlineMath | undefined {
+  if (e.kind !== 'call' || e.over !== undefined || e.distinct || e.star || e.filter) return undefined;
+  return inlineMath(e.name, e.args.length);
 }
 
 type Factory = (H: CodegenHelpers, K: unknown[], T: typeof truthy) => (r: SqlValue[]) => SqlValue;
@@ -191,9 +199,52 @@ class Emitter {
           return { v, nul: `${v}n`, type: isNum(a.type) ? a.type : 'num' };
         }
         return this.viaFallback(e);
+      case 'call': {
+        const m = mathCall(e);
+        if (m === undefined) return this.viaFallback(e);
+        // A constant call (sqrt(4)) is folded by the closure compiler.
+        const fb = this.fallback(e);
+        if (fb.constant || fb.reg !== undefined) return this.viaFallback(e);
+        const saved = this.lines;
+        this.lines = [];
+        const args = e.args.map((a) => this.gen(a));
+        const inner = this.lines;
+        this.lines = saved;
+        // Non-numeric arguments (text affinity, blobs) take the closure compiler's general path.
+        if (!args.every((a) => isNum(a.type) || a.type === 'null')) return this.viaFallback(e);
+        this.lines.push(...inner);
+        return m.kind === 'real' ? this.mathReal(m.m, args) : this.mathRounding(m.js, args[0]);
+      }
       default:
         return this.viaFallback(e);
     }
+  }
+
+  /** A double from a numeric value (an INTEGER may be a bigint). */
+  private double(a: Gen): string {
+    return a.type === 'real' ? a.v : `(typeof ${a.v} === 'number' ? ${a.v} : Number(${a.v}))`;
+  }
+
+  /** A REAL-valued math function: NULL in, NULL out; a NaN result is NULL. */
+  private mathReal(m: MathFunction, args: Gen[]): Gen {
+    const v = this.tmp();
+    const nul = args.reduce((acc, a) => orNull(acc, nullOf(a)), 'false');
+    const xs = args.map((a) => this.double(a));
+    const call = m.js !== undefined ? m.js.replace(/\$(\d)/g, (_s, i: string) => `x${i}`) : `${this.konst(m.f)}(${xs.map((_x, i) => `x${i}`).join(', ')})`;
+    const bind = xs.map((x, i) => `const x${i} = ${x};`).join(' ');
+    this.lines.push(`let ${v}n = ${nul}; let ${v} = 0; if (!${v}n) { ${bind} const z = ${call}; if (z === z) ${v} = z; else ${v}n = true; }`);
+    return { v, nul: `${v}n`, type: 'real' };
+  }
+
+  /** ceil, floor, trunc: an INTEGER is unchanged (a bigint too), a REAL is rounded. */
+  private mathRounding(js: string, a: Gen): Gen {
+    const type = roundingType(a.type);
+    if (type === 'null') return { v: '0', nul: 'true', type: 'null' };
+    if (type === 'int') return a;
+    const v = this.tmp();
+    const value = type === 'real' ? `${js}(${a.v})` : `(typeof ${a.v} === 'number' ? ${js}(${a.v}) : ${a.v})`;
+    this.lines.push(`const ${v}n = ${nullOf(a)}; const ${v} = ${v}n ? 0 : ${value};`);
+    return { v, nul: `${v}n`, type };
   }
 
   /** JS boolean expression: the value is a true SQL condition (NULL and 0 are false). */
@@ -459,9 +510,11 @@ export function generateLoader(spec: LoaderSpec, helpers: LoaderHelpers): Loader
 // ------------------------------------------------------------------ fused scan + filter + aggregate
 
 export interface FusedAggSpec {
-  kind: 'countStar' | 'count' | 'step';
-  /** Argument expression (count/step). */
+  kind: 'countStar' | 'count' | 'step' | 'step2';
+  /** Argument expression (count/step/step2). */
   arg?: Expr;
+  /** Second argument expression (step2: two-argument aggregates such as corr and percentile). */
+  arg2?: Expr;
   filter?: Expr;
 }
 
@@ -660,8 +713,14 @@ class Pipeline {
       if (a.kind === 'countStar') body.push(`${state(i)}.n++;`);
       else {
         const g = em.gen(a.arg!);
-        body.push(...this.take());
-        body.push(a.kind === 'count' ? `if (!${em.isNull(g)}) ${state(i)}.n++;` : `${state(i)}.step1(${em.value(g)});`);
+        if (a.kind === 'step2') {
+          const g2 = em.gen(a.arg2!);
+          body.push(...this.take());
+          body.push(`${state(i)}.step2(${em.value(g)}, ${em.value(g2)});`);
+        } else {
+          body.push(...this.take());
+          body.push(a.kind === 'count' ? `if (!${em.isNull(g)}) ${state(i)}.n++;` : `${state(i)}.step1(${em.value(g)});`);
+        }
       }
       if (a.filter) {
         const f = em.gen(a.filter);

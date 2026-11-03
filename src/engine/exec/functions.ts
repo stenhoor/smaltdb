@@ -13,7 +13,9 @@ import {
   truthy,
 } from './convert.js';
 import { sqlPrintf, valueInt64 } from './printf.js';
+import { STAT_AGGREGATES } from './stat-aggregates.js';
 import { dateFn, datetimeFn, juliandayFn, strftimeFn, timeFn, timediffFn, unixepochFn } from './datetime.js';
+import { MATH_FUNCTIONS, ROUNDING, logScalar, mathScalar, roundingScalar } from './math.js';
 
 /**
  * The package version, replaced at build time from package.json (esbuild `define` in
@@ -72,6 +74,16 @@ export interface AggregateState {
   step(args: SqlValue[]): void;
   /** Single-argument step (used by generated code; same semantics as step([v])). */
   step1?(v: SqlValue): void;
+  /** Two-argument step (used by generated code; same semantics as step([a, b])). */
+  step2?(a: SqlValue, b: SqlValue): void;
+  /**
+   * Undo a step with these arguments (SQLite's xInverse): window frames that slide add the rows entering the frame
+   * and remove the rows leaving it, instead of recomputing every frame. Absent: frames are recomputed. Returns false
+   * when the state can no longer be trusted to full precision (rounding left by values that have left); the caller
+   * then rebuilds it from the rows of the current frame.
+   */
+  inverse?(args: SqlValue[]): boolean;
+  /** May be called more than once (window frames read the running result after each step). */
   final(): SqlValue;
 }
 
@@ -545,6 +557,11 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
   ['timediff', dateFunction(2, 2, 'text', (v, _a, ctx) => timediffFn(v, ctx))],
 ]);
 
+// The math functions (math.ts): acos … trunc, as SQLite builds them with SQLITE_ENABLE_MATH_FUNCTIONS.
+for (const [name, m] of MATH_FUNCTIONS) scalarFunctions.set(name, mathScalar(m));
+scalarFunctions.set('log', logScalar);
+for (const [name, g] of ROUNDING) scalarFunctions.set(name, roundingScalar(g));
+
 // ------------------------------------------------------------------ aggregates
 
 /** Neumaier-compensated sum with exact integer accumulation (SQLite 3.43+ semantics). */
@@ -705,6 +722,9 @@ export const aggregateFunctions = new Map<string, AggregateFunction>([
   ['group_concat', { minArgs: 1, maxArgs: 2, resultType: () => 'text', create: (t) => new GroupConcatState(t[0] === 'real', t.length > 1, t[1] === 'real') }],
   ['string_agg', { minArgs: 2, maxArgs: 2, resultType: () => 'text', create: (t) => new GroupConcatState(t[0] === 'real', true, t[1] === 'real') }],
 ]);
+// Statistics (stat-aggregates.ts): variance, standard deviation, covariance, correlation, skewness, kurtosis, and
+// SQLite's median and percentile functions.
+for (const [name, agg] of STAT_AGGREGATES) aggregateFunctions.set(name, agg);
 
 /** Format helper re-exported for EXPLAIN and tests. */
 export { formatReal };

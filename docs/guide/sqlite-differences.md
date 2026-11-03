@@ -188,6 +188,18 @@ SELECT id FROM seq
 
 The supported `PRAGMA`s are listed in [PRAGMA](../reference/sql/pragmas).
 
+## Math functions
+
+The math functions (`sqrt`, `pow`, `ln`, `sin`, …) follow SQLite, with these differences:
+- **The last bit.** smaltdb computes them with JavaScript's `Math`, and SQLite with the C library it was built with.
+  In V8 (Chrome, Edge, Node) every function is within one unit in the last place of SQLite's official WASM build, and
+  `sqrt`, `ceil`, `floor`, `trunc`, `mod`, `log2`, `log10`, `tanh` and the inverse trigonometric functions match it to
+  the bit. JavaScript leaves the last bit to the engine, so Firefox and Safari can differ there too.
+- **`acosh` below -1.** smaltdb returns NULL for any `X` below 1, where acosh is not defined. SQLite's WASM build
+  returns a wrong number for some arguments of -2 or less; builds on other C libraries return NULL.
+- **`ceil`, `floor` and `trunc` of text or an `ANY` value** can give an INTEGER where SQLite gives the same value as a
+  REAL (`ceil('2.5')` is 3 rather than 3.0); see [Integral REALs can become INTEGERs](#integral-reals-can-become-integers).
+
 ## Queries
 
 - `RIGHT JOIN` and `FULL JOIN` work (SQLite has them since 3.39), except with `USING` or `NATURAL`.
@@ -205,4 +217,5 @@ smaltdb also has things SQLite does not:
 - [materialized views](../reference/sql/views) (`CREATE / REFRESH / DROP MATERIALIZED VIEW`);
 - [external tables and connections](../reference/sql/external), and the `read_csv`, `read_json`, `read_parquet` table functions, through [plugins](./plugins);
 - [columnar tables](../reference/sql/create-table#columnar-tables) (`WITH (storage = 'columnar')`);
+- the [statistical aggregates](../reference/functions/aggregate#statistics) `var_samp`, `variance`, `var_pop`, `stddev_samp`, `stddev`, `stddev_pop`, `covar_samp`, `covar_pop`, `corr`, `skewness`, `skewness_pop`, `kurtosis` and `kurtosis_pop` (SQLite has `median` and the `percentile` functions, which smaltdb has too, with the same results);
 - `EXPLAIN ANALYZE`, and the pragmas `work_mem`, `matview_rewrite`, `parallel_aggregates`, `spill_bytes` and `compact`.
