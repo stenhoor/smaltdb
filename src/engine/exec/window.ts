@@ -61,28 +61,31 @@ export const WINDOW_ARITY: Record<string, [number, number]> = {
   nth_value: [2, 2],
 };
 
-/** Per-row data for one window definition. */
-interface RowData {
+/**
+ * The rows of one window definition, buffered columnwise: flat arrays indexed by input row, rather than an object
+ * and several small arrays per row (which made garbage collection most of the cost of a window).
+ */
+interface Buffered {
+  n: number;
+  /** Partition key k of row r at part[r * np + k]. */
   part: SqlValue[];
+  /** ORDER BY key k of row r at order[r * no + k]. */
   order: SqlValue[];
-  /** Argument values per call (navigation/aggregate), evaluated in the row's context. */
+  /** Per call: argument a of row r at args[c][r * arity + a]. */
   args: SqlValue[][];
-  filter: boolean[];
+  /** Per call: FILTER result per row (1 = the row counts), or null without a FILTER clause. */
+  filter: (Uint8Array | null)[];
 }
 
-function cmpKeys(a: SqlValue[], b: SqlValue[], colls: readonly Collation[], dirs?: readonly { desc: boolean; nullsFirst: boolean }[]): number {
-  for (let i = 0; i < a.length; i++) {
-    const x = a[i];
-    const y = b[i];
-    if (x === null || y === null) {
-      if (x === y) continue;
-      const nullsFirst = dirs ? dirs[i].nullsFirst : true;
-      return (x === null) === nullsFirst ? -1 : 1;
-    }
-    const c = compareValues(x, y, colls[i]);
-    if (c !== 0) return dirs?.[i].desc ? -c : c;
+/** Compare two values as window keys: NULLs first unless the direction says otherwise, then by collation. */
+function cmpKey(x: SqlValue, y: SqlValue, coll: Collation, dir?: { desc: boolean; nullsFirst: boolean }): number {
+  if (x === null || y === null) {
+    if (x === y) return 0;
+    const nullsFirst = dir ? dir.nullsFirst : true;
+    return (x === null) === nullsFirst ? -1 : 1;
   }
-  return 0;
+  const c = compareValues(x, y, coll);
+  return dir?.desc ? -c : c;
 }
 
 function offsetValue(fn: Fn | undefined, r: SqlValue[], which: 'starting' | 'ending', unit: FrameUnit): number {
@@ -100,7 +103,9 @@ function offsetValue(fn: Fn | undefined, r: SqlValue[], which: 'starting' | 'end
 export class Window implements Operator {
   readonly children: Operator[];
   private r!: SqlValue[];
-  private snaps: SqlValue[][] = [];
+  /** Snapshot register j of input row i at snaps[i * snapRegs.length + j]. */
+  private snaps: SqlValue[] = [];
+  private rowCount = 0;
   /** results[c][row] for every call of every window, in definition order. */
   private results: SqlValue[][] = [];
   private outRegs: number[];
@@ -122,38 +127,60 @@ export class Window implements Operator {
   open(r: SqlValue[]): void {
     this.r = r;
     this.i = 0;
-    const snaps: SqlValue[][] = [];
-    const data: RowData[][] = this.defs.map(() => []);
+    const snaps: SqlValue[] = [];
+    const snapRegs = this.snapRegs;
+    const bufs: Buffered[] = this.defs.map((d) => ({
+      n: 0,
+      part: [],
+      order: [],
+      args: d.calls.map(() => []),
+      filter: d.calls.map(() => null),
+    }));
+    // FILTER flags grow with the input; collected in plain arrays, then packed.
+    const filterFlags: number[][][] = this.defs.map((d) => d.calls.map(() => []));
+    let n = 0;
     const c = this.child;
     c.open(r);
     try {
       while (c.next()) {
-        snaps.push(this.snapRegs.map((g) => r[g]));
-        this.defs.forEach((d, k) => {
-          data[k].push({
-            part: d.partition.map((f) => f(r)),
-            order: d.order.map((o) => o.fn(r)),
-            args: d.calls.map((call) => call.args.map((f) => f(r))),
-            filter: d.calls.map((call) => (call.filter ? truthy(call.filter(r)) === true : true)),
-          });
-        });
+        for (let j = 0; j < snapRegs.length; j++) snaps.push(r[snapRegs[j]]);
+        for (let k = 0; k < this.defs.length; k++) {
+          const d = this.defs[k];
+          const b = bufs[k];
+          for (let j = 0; j < d.partition.length; j++) b.part.push(d.partition[j](r));
+          for (let j = 0; j < d.order.length; j++) b.order.push(d.order[j].fn(r));
+          for (let ci = 0; ci < d.calls.length; ci++) {
+            const call = d.calls[ci];
+            const out = b.args[ci];
+            for (let a = 0; a < call.args.length; a++) out.push(call.args[a](r));
+            if (call.filter) filterFlags[k][ci].push(truthy(call.filter(r)) === true ? 1 : 0);
+          }
+        }
+        n++;
       }
     } finally {
       c.close();
     }
     this.snaps = snaps;
+    this.rowCount = n;
     this.results = [];
     this.defs.forEach((d, k) => {
-      for (const res of this.evaluate(d, data[k])) this.results.push(res);
+      const b = bufs[k];
+      b.n = n;
+      d.calls.forEach((call, ci) => {
+        if (call.filter) b.filter[ci] = Uint8Array.from(filterFlags[k][ci]);
+      });
+      for (const res of this.evaluate(d, b)) this.results.push(res);
     });
   }
 
   next(): boolean {
-    if (this.i >= this.snaps.length) return false;
+    if (this.i >= this.rowCount) return false;
     const i = this.i++;
     const r = this.r;
-    const snap = this.snaps[i];
-    for (let j = 0; j < this.snapRegs.length; j++) r[this.snapRegs[j]] = snap[j];
+    const ns = this.snapRegs.length;
+    const base = i * ns;
+    for (let j = 0; j < ns; j++) r[this.snapRegs[j]] = this.snaps[base + j];
     for (let j = 0; j < this.outRegs.length; j++) r[this.outRegs[j]] = this.results[j][i];
     return true;
   }
@@ -163,34 +190,111 @@ export class Window implements Operator {
     this.child.close();
     this.snaps = [];
     this.results = [];
+    this.rowCount = 0;
+  }
+
+  /**
+   * The input rows in window order: by partition keys, then ORDER BY keys, then input order. No sort when the input
+   * already arrives in that order (a scan in rowid order under ORDER BY id); a numeric sort over a typed key array for
+   * one numeric key; otherwise a comparison sort.
+   */
+  private sortedOrder(d: WindowDef, b: Buffered): Int32Array {
+    const n = b.n;
+    const np = d.partition.length;
+    const no = d.order.length;
+    const idx = new Int32Array(n);
+    for (let i = 0; i < n; i++) idx[i] = i;
+    if (np + no === 0 || n < 2) return idx;
+    const P = b.part;
+    const O = b.order;
+    const pColl = d.partitionColls;
+    const keyCmp = (a: number, c: number): number => {
+      for (let k = 0; k < np; k++) {
+        const x = cmpKey(P[a * np + k], P[c * np + k], pColl[k]);
+        if (x !== 0) return x;
+      }
+      for (let k = 0; k < no; k++) {
+        const o = d.order[k];
+        const x = cmpKey(O[a * no + k], O[c * no + k], o.collation, o);
+        if (x !== 0) return x;
+      }
+      return 0;
+    };
+    let sorted = true;
+    for (let i = 1; i < n && sorted; i++) if (keyCmp(i - 1, i) > 0) sorted = false;
+    if (sorted) return idx;
+    // One key, all numbers (no NULLs, text or bigints): sort by a typed array of keys.
+    if (np + no === 1) {
+      const src = np === 1 ? P : O;
+      const desc = np === 0 && d.order[0].desc;
+      const keys = new Float64Array(n);
+      let numeric = true;
+      for (let i = 0; i < n; i++) {
+        const v = src[i];
+        if (typeof v !== 'number') {
+          numeric = false;
+          break;
+        }
+        keys[i] = desc ? -v : v;
+      }
+      if (numeric) return idx.sort((a, c) => keys[a] - keys[c] || a - c);
+    }
+    return idx.sort((a, c) => keyCmp(a, c) || a - c);
   }
 
   /** Compute every call of one window; returns results[call][inputRow]. */
-  private evaluate(d: WindowDef, rows: RowData[]): SqlValue[][] {
-    const n = rows.length;
+  private evaluate(d: WindowDef, b: Buffered): SqlValue[][] {
+    const n = b.n;
     const out = d.calls.map(() => new Array<SqlValue>(n).fill(null));
     if (n === 0) return out;
-    const orderColls = d.order.map((o) => o.collation);
-    const idx = Array.from({ length: n }, (_, i) => i);
-    idx.sort((a, b) => cmpKeys(rows[a].part, rows[b].part, d.partitionColls) || cmpKeys(rows[a].order, rows[b].order, orderColls, d.order) || a - b);
+    const np = d.partition.length;
+    const no = d.order.length;
+    const P = b.part;
+    const O = b.order;
+    const idx = this.sortedOrder(d, b);
+    const samePartition = (x: number, y: number): boolean => {
+      for (let k = 0; k < np; k++) if (cmpKey(P[x * np + k], P[y * np + k], d.partitionColls[k]) !== 0) return false;
+      return true;
+    };
+    const sameOrder = (x: number, y: number): boolean => {
+      for (let k = 0; k < no; k++) if (cmpKey(O[x * no + k], O[y * no + k], d.order[k].collation) !== 0) return false;
+      return true;
+    };
     const frame = d.frame;
     const startOff = frame.start.offset ? offsetValue(frame.start.offset, this.r, 'starting', frame.unit) : 0;
     const endOff = frame.end.offset ? offsetValue(frame.end.offset, this.r, 'ending', frame.unit) : 0;
     const rangeOffset = frame.unit === 'RANGE' && (frame.start.offset || frame.end.offset);
+    const noExclusion = frame.exclude === 'NO OTHERS';
+    // The first ORDER BY key of sorted position j, as a number (RANGE offsets); null when not a number.
+    const keyNum = (j: number): number | null => {
+      const x = O[idx[j] * no];
+      return typeof x === 'number' ? x : typeof x === 'bigint' ? Number(x) : null;
+    };
     let ps = 0;
     while (ps < n) {
       let pe = ps + 1;
-      while (pe < n && cmpKeys(rows[idx[pe]].part, rows[idx[ps]].part, d.partitionColls) === 0) pe++;
+      if (np > 0) while (pe < n && samePartition(idx[pe], idx[ps])) pe++;
+      else pe = n;
       // Peer groups: [gStart[g], gStart[g+1]); groupOf[i] for sorted position i.
       const gStart: number[] = [];
       const groupOf = new Int32Array(pe - ps);
       for (let i = ps; i < pe; i++) {
-        if (i === ps || cmpKeys(rows[idx[i]].order, rows[idx[i - 1]].order, orderColls) !== 0) gStart.push(i);
+        if (i === ps || !sameOrder(idx[i], idx[i - 1])) gStart.push(i);
         groupOf[i - ps] = gStart.length - 1;
       }
       gStart.push(pe);
       const size = pe - ps;
-      const frameOf = (i: number): [number, number] => {
+      // RANGE with offsets: the rows with numeric keys are [nnS, nnE) (NULL and other keys sort at the ends).
+      let nnS = ps;
+      let nnE = pe;
+      if (rangeOffset) {
+        while (nnS < nnE && keyNum(nnS) === null) nnS++;
+        while (nnE > nnS && keyNum(nnE - 1) === null) nnE--;
+      }
+      // frameAt(i) sets FS and FE: the frame of sorted position i is [FS, FE).
+      let FS = 0;
+      let FE = 0;
+      const frameAt = (i: number): void => {
         const g = groupOf[i - ps];
         let fs: number;
         let fe: number;
@@ -199,33 +303,22 @@ export class Window implements Operator {
           fe = bound(frame.end.kind, false, i, endOff, ps, pe);
         } else if (frame.unit === 'GROUPS' || !rangeOffset) {
           // GROUPS, or RANGE with only UNBOUNDED / CURRENT ROW bounds (peer groups).
-          const ng = gStart.length - 1;
-          const gb = (kind: BoundKind, off: number, isStart: boolean): number => {
-            switch (kind) {
-              case 'unboundedPreceding':
-                return ps;
-              case 'unboundedFollowing':
-                return pe;
-              case 'currentRow':
-                return isStart ? gStart[g] : gStart[g + 1];
-              case 'preceding': {
-                const t = g - off;
-                if (isStart) return gStart[Math.max(0, t)];
-                return t < 0 ? ps : gStart[t + 1];
-              }
-              case 'following': {
-                const t = g + off;
-                if (isStart) return t >= ng ? pe : gStart[t];
-                return gStart[Math.min(ng, t + 1)];
-              }
-            }
-          };
-          fs = gb(frame.start.kind, startOff, true);
-          fe = gb(frame.end.kind, endOff, false);
+          fs = groupBound(frame.start.kind, startOff, true, g, gStart, ps, pe);
+          fe = groupBound(frame.end.kind, endOff, false, g, gStart, ps, pe);
         } else {
-          [fs, fe] = rangeFrame(frame, rows, idx, i, ps, pe, startOff, endOff, d.order[0], gStart[g], gStart[g + 1]);
+          const cv = keyNum(i);
+          if (cv === null) {
+            // NULL (or non-numeric) keys: the frame is the peer group for offset bounds.
+            fs = frame.start.kind === 'unboundedPreceding' ? ps : frame.start.kind === 'unboundedFollowing' ? pe : gStart[g];
+            fe = frame.end.kind === 'unboundedFollowing' ? pe : frame.end.kind === 'unboundedPreceding' ? ps : gStart[g + 1];
+          } else {
+            const dir = d.order[0].desc ? -1 : 1;
+            fs = rangeBound(frame.start.kind, startOff, true, cv, dir, keyNum, nnS, nnE, ps, pe, gStart[g], gStart[g + 1]);
+            fe = rangeBound(frame.end.kind, endOff, false, cv, dir, keyNum, nnS, nnE, ps, pe, gStart[g], gStart[g + 1]);
+          }
         }
-        return [Math.max(ps, fs), Math.min(pe, fe)];
+        FS = Math.max(ps, fs);
+        FE = Math.min(pe, fe);
       };
       const inFrame = (i: number, j: number): boolean => {
         switch (frame.exclude) {
@@ -241,6 +334,11 @@ export class Window implements Operator {
       };
       d.calls.forEach((call, ci) => {
         const res = out[ci];
+        const A = b.args[ci];
+        const arity = call.args.length;
+        const F = b.filter[ci];
+        /** Argument a of the row at sorted position j. */
+        const arg = (j: number, a: number): SqlValue => A[idx[j] * arity + a];
         switch (call.kind) {
           case 'row_number':
             for (let i = ps; i < pe; i++) res[idx[i]] = i - ps + 1;
@@ -258,7 +356,7 @@ export class Window implements Operator {
             for (let i = ps; i < pe; i++) res[idx[i]] = (gStart[groupOf[i - ps] + 1] - ps) / size;
             return;
           case 'ntile': {
-            const v = rows[idx[ps]].args[ci][0];
+            const v = arg(ps, 0);
             // As sqlite3_value_int64(): REALs truncate, text and blobs use their leading integer, NULL is 0.
             const buckets = Number(valueInt64(v));
             if (!(buckets > 0)) throw new SmaltError('SMALT_ERROR', 'argument of ntile must be a positive integer');
@@ -273,41 +371,45 @@ export class Window implements Operator {
           case 'lag':
           case 'lead':
             for (let i = ps; i < pe; i++) {
-              const a = rows[idx[i]].args[ci];
-              const off = a.length > 1 ? toInt(a[1]) : 1;
+              const off = arity > 1 ? toInt(arg(i, 1)) : 1;
               if (off === null) {
                 res[idx[i]] = null;
                 continue;
               }
               const j = call.kind === 'lag' ? i - off : i + off;
-              res[idx[i]] = j >= ps && j < pe ? rows[idx[j]].args[ci][0] : a.length > 2 ? a[2] : null;
+              res[idx[i]] = j >= ps && j < pe ? arg(j, 0) : arity > 2 ? arg(i, 2) : null;
             }
             return;
           case 'first_value':
           case 'last_value':
           case 'nth_value':
             for (let i = ps; i < pe; i++) {
-              const [fs, fe] = frameOf(i);
+              frameAt(i);
+              const fs = FS;
+              const fe = FE;
               let want = 1;
               if (call.kind === 'nth_value') {
-                const nv = rows[idx[i]].args[ci][1];
-                const k = toInt(nv);
+                const k = toInt(arg(i, 1));
                 if (k === null || k <= 0) throw new SmaltError('SMALT_ERROR', 'second argument to nth_value must be a positive integer');
                 want = k;
               }
-              let seen = 0;
               let val: SqlValue = null;
-              if (call.kind === 'last_value') {
+              if (noExclusion) {
+                // Every row of [fs, fe) is in the frame: the value is at a known position.
+                if (call.kind === 'last_value') val = fe > fs ? arg(fe - 1, 0) : null;
+                else val = fs + want - 1 < fe ? arg(fs + want - 1, 0) : null;
+              } else if (call.kind === 'last_value') {
                 for (let j = fe - 1; j >= fs; j--) {
                   if (!inFrame(i, j)) continue;
-                  val = rows[idx[j]].args[ci][0];
+                  val = arg(j, 0);
                   break;
                 }
               } else {
+                let seen = 0;
                 for (let j = fs; j < fe; j++) {
                   if (!inFrame(i, j)) continue;
                   if (++seen === want) {
-                    val = rows[idx[j]].args[ci][0];
+                    val = arg(j, 0);
                     break;
                   }
                 }
@@ -317,49 +419,81 @@ export class Window implements Operator {
             return;
           case 'aggregate': {
             const a = call.agg!;
-            const step = (j: number, st: { step(args: SqlValue[]): void }): void => {
-              const row = rows[idx[j]];
-              if (!row.filter[ci]) return;
-              st.step(a.star ? [] : row.args[ci]);
+            const counts = (j: number): boolean => F === null || F[idx[j]] === 1;
+            // Arguments of sorted position j as an array for step/inverse; one buffer, refilled per row (states do not
+            // keep it).
+            const buf: SqlValue[] = new Array(arity).fill(null);
+            const argsOf = (j: number): SqlValue[] => {
+              if (a.star) return EMPTY;
+              const base = idx[j] * arity;
+              for (let k = 0; k < arity; k++) buf[k] = A[base + k];
+              return buf;
+            };
+            const step = (j: number, st: { step(args: SqlValue[]): void; step1?(v: SqlValue): void }): void => {
+              if (!counts(j)) return;
+              if (arity === 1 && st.step1) st.step1(A[idx[j]]);
+              else st.step(argsOf(j));
             };
             // Frames that only grow (UNBOUNDED PRECEDING start, no exclusion): one running state.
-            if (frame.start.kind === 'unboundedPreceding' && frame.exclude === 'NO OTHERS') {
+            if (frame.start.kind === 'unboundedPreceding' && noExclusion) {
               const st = a.def.create(a.argTypes, a.collation);
               let added = ps;
               for (let i = ps; i < pe; i++) {
-                const [, fe] = frameOf(i);
-                while (added < fe) step(added++, st);
+                frameAt(i);
+                while (added < FE) step(added++, st);
                 res[idx[i]] = st.final();
               }
               return;
             }
-            // Sliding frames (no exclusion) of an aggregate that can undo a step: one running state that adds the rows
-            // entering the frame and removes the rows leaving it. Frame bounds only move forward as i grows; a frame that
-            // moves back (it cannot with the frame types SQL has) gets a fresh state.
+            // Sliding min and max: a monotonic deque of candidates, O(1) per row on average.
+            if ((call.name === 'min' || call.name === 'max') && arity === 1 && noExclusion) {
+              const sign = call.name === 'max' ? 1 : -1;
+              const dq = new Int32Array(size);
+              let head = 0;
+              let tail = 0;
+              let hi = ps;
+              for (let i = ps; i < pe; i++) {
+                frameAt(i);
+                if (FS >= hi || FE < hi) {
+                  head = tail = 0;
+                  hi = FS;
+                }
+                while (hi < FE) {
+                  const j = hi++;
+                  const v = arg(j, 0);
+                  if (v === null || !counts(j)) continue;
+                  // Drop candidates the new value beats; an equal earlier value stays first, as in min()/max().
+                  while (tail > head && sign * compareValues(arg(dq[tail - 1], 0), v, a.collation) < 0) tail--;
+                  dq[tail++] = j;
+                }
+                while (head < tail && dq[head] < FS) head++;
+                res[idx[i]] = head < tail ? arg(dq[head], 0) : null;
+              }
+              return;
+            }
+            // Sliding frames (no exclusion) of an aggregate that can undo a step: one running state that removes the rows
+            // leaving the frame and adds the rows entering it. Frame bounds only move forward as i grows; a frame that
+            // moves back (it cannot with the frame types SQL has), or does not overlap the last one, gets a fresh state.
             const probe = a.def.create(a.argTypes, a.collation);
-            if (probe.inverse && frame.exclude === 'NO OTHERS') {
+            if (probe.inverse && noExclusion) {
               let st = probe;
               let lo = ps;
               let hi = ps;
-              /** Remove row j; false when the state asked to be rebuilt. */
-              const unstep = (j: number): boolean => {
-                const row = rows[idx[j]];
-                return !row.filter[ci] || st.inverse!(a.star ? [] : row.args[ci]);
-              };
               for (let i = ps; i < pe; i++) {
-                const [fs, fe] = frameOf(i);
-                if (fs < lo || fe < hi) {
+                frameAt(i);
+                const fs = FS;
+                const fe = FE;
+                if (fs < lo || fe < hi || fs >= hi) {
                   st = a.def.create(a.argTypes, a.collation);
                   lo = hi = fs;
                 }
-                if (fs >= hi) {
-                  // No overlap with the previous frame: start again rather than removing every row.
-                  st = a.def.create(a.argTypes, a.collation);
-                  lo = hi = fs;
+                // Remove first, so the running state never holds more than the overlap of two frames.
+                let exact = true;
+                while (lo < fs) {
+                  const j = lo++;
+                  if (counts(j) && !st.inverse!(argsOf(j))) exact = false;
                 }
                 while (hi < fe) step(hi++, st);
-                let exact = true;
-                while (lo < fs) if (!unstep(lo++)) exact = false;
                 if (!exact) {
                   // Rounding left by removed rows: rebuild from the rows of this frame.
                   st = a.def.create(a.argTypes, a.collation);
@@ -370,7 +504,9 @@ export class Window implements Operator {
               return;
             }
             for (let i = ps; i < pe; i++) {
-              const [fs, fe] = frameOf(i);
+              frameAt(i);
+              const fs = FS;
+              const fe = FE;
               const st = a.def.create(a.argTypes, a.collation);
               for (let j = fs; j < fe; j++) if (inFrame(i, j)) step(j, st);
               res[idx[i]] = st.final();
@@ -383,6 +519,71 @@ export class Window implements Operator {
     }
     return out;
   }
+}
+
+const EMPTY: SqlValue[] = [];
+
+/** GROUPS bound (and RANGE with only UNBOUNDED / CURRENT ROW bounds): peer group g of [gStart[g], gStart[g+1]). */
+function groupBound(kind: BoundKind, off: number, isStart: boolean, g: number, gStart: number[], ps: number, pe: number): number {
+  const ng = gStart.length - 1;
+  switch (kind) {
+    case 'unboundedPreceding':
+      return ps;
+    case 'unboundedFollowing':
+      return pe;
+    case 'currentRow':
+      return isStart ? gStart[g] : gStart[g + 1];
+    case 'preceding': {
+      const t = g - off;
+      if (isStart) return gStart[Math.max(0, t)];
+      return t < 0 ? ps : gStart[t + 1];
+    }
+    case 'following': {
+      const t = g + off;
+      if (isStart) return t >= ng ? pe : gStart[t];
+      return gStart[Math.min(ng, t + 1)];
+    }
+  }
+}
+
+/**
+ * RANGE bound with a numeric offset: the first sorted position (within the numeric keys [nnS, nnE), which are sorted
+ * in direction `dir`) whose key is at or past (start) or past (end) the current key cv shifted by the offset. A binary
+ * search: the frame of every row is found in O(log n).
+ */
+function rangeBound(
+  kind: BoundKind,
+  off: number,
+  isStart: boolean,
+  cv: number,
+  dir: number,
+  keyNum: (j: number) => number | null,
+  nnS: number,
+  nnE: number,
+  ps: number,
+  pe: number,
+  peerStart: number,
+  peerEnd: number,
+): number {
+  switch (kind) {
+    case 'unboundedPreceding':
+      return ps;
+    case 'unboundedFollowing':
+      return pe;
+    case 'currentRow':
+      return isStart ? peerStart : peerEnd;
+  }
+  const target = kind === 'preceding' ? cv - dir * off : cv + dir * off;
+  // First position whose key is >= target (start) or > target (end), in sort direction.
+  let lo = nnS;
+  let hi = nnE;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    const t = dir * (keyNum(mid)! - target);
+    if (isStart ? t >= 0 : t > 0) hi = mid;
+    else lo = mid + 1;
+  }
+  return lo;
 }
 
 /** ROWS bound for sorted position i: start bounds are inclusive, end bounds exclusive. */
@@ -399,69 +600,6 @@ function bound(kind: BoundKind, isStart: boolean, i: number, off: number, ps: nu
     case 'following':
       return isStart ? i + off : i + off + 1;
   }
-}
-
-/** RANGE frame with numeric offsets: rows whose single ORDER BY key lies within the offsets. */
-function rangeFrame(
-  frame: FrameSpec,
-  rows: RowData[],
-  idx: number[],
-  i: number,
-  ps: number,
-  pe: number,
-  startOff: number,
-  endOff: number,
-  key: { desc: boolean },
-  peerStart: number,
-  peerEnd: number,
-): [number, number] {
-  const v = rows[idx[i]].order[0];
-  const num = (x: SqlValue): number | null => (typeof x === 'number' ? x : typeof x === 'bigint' ? Number(x) : null);
-  const cv = num(v);
-  // NULL (or non-numeric) keys: the frame is the peer group for offset bounds.
-  if (cv === null) {
-    const fs = frame.start.kind === 'unboundedPreceding' ? ps : frame.start.kind === 'unboundedFollowing' ? pe : peerStart;
-    const fe = frame.end.kind === 'unboundedFollowing' ? pe : frame.end.kind === 'unboundedPreceding' ? ps : peerEnd;
-    return [fs, fe];
-  }
-  const dir = key.desc ? -1 : 1;
-  // Rows with NULL keys sit at one end of the partition and are never within an offset of a value.
-  let nnS = ps;
-  let nnE = pe;
-  while (nnS < nnE && num(rows[idx[nnS]].order[0]) === null) nnS++;
-  while (nnE > nnS && num(rows[idx[nnE - 1]].order[0]) === null) nnE--;
-  // Position of a row's key relative to (cv + delta) in sort direction.
-  const lo = (target: number): number => {
-    // First position whose key is >= target in sort order (NULLs sort before/after per nulls ordering; treat as out of range).
-    for (let j = nnS; j < nnE; j++) {
-      const x = num(rows[idx[j]].order[0])!;
-      if (dir * (x - target) >= 0) return j;
-    }
-    return nnE;
-  };
-  const hi = (target: number): number => {
-    // First position whose key is > target in sort order.
-    for (let j = nnS; j < nnE; j++) {
-      const x = num(rows[idx[j]].order[0])!;
-      if (dir * (x - target) > 0) return j;
-    }
-    return nnE;
-  };
-  const at = (kind: BoundKind, off: number, isStart: boolean): number => {
-    switch (kind) {
-      case 'unboundedPreceding':
-        return ps;
-      case 'unboundedFollowing':
-        return pe;
-      case 'currentRow':
-        return isStart ? peerStart : peerEnd;
-      case 'preceding':
-        return isStart ? lo(cv - dir * off) : hi(cv - dir * off);
-      case 'following':
-        return isStart ? lo(cv + dir * off) : hi(cv + dir * off);
-    }
-  };
-  return [at(frame.start.kind, startOff, true), at(frame.end.kind, endOff, false)];
 }
 
 function toInt(v: SqlValue): number | null {
