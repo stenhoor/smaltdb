@@ -49,7 +49,7 @@ export type PlanExpr =
    * Internal, as `slot`: a subexpression the current planner compiled itself (a subquery, or a select-list alias
    * that a name resolved to). `compiled` is an `exec/expr.ts` `Compiled`.
    */
-  | { readonly k: 'native'; readonly compiled: object; readonly type: PlanType };
+  | { readonly k: 'native'; readonly compiled: object; readonly type: PlanType; readonly subquery?: true };
 
 /** The static type of an expression. */
 export function typeOf(e: PlanExpr): PlanType {

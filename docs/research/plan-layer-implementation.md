@@ -102,12 +102,13 @@ generated-code snapshot from 3a and, from step 3, a budget for prepare time on s
 - **Risks.** Error order between binding and `def.compile`; one more allocation per node while planning; the fold
   rule of `isCodegenRoot`.
 
-### Step 4: operators and fusion carry plan expressions (about 400 lines)
+### Step 4: operators and fusion carry plan expressions (done)
 
-`Filter.ast` becomes a plan expression, and `AggSpec.argAsts` / `filterAst` become plan expressions set where
-`aggregateRef` binds them. `FusedAggSpec`, `Pipeline.addPredicates`, `textEqualityConjunct` and the
-`generate*Aggregate` / `generateScanFilter` entry points take plan expressions. Fusion compiles the stored expressions
-instead of recompiling AST, and declines on `native` nodes where it declined on subqueries.
+`Filter.expr` and `AggSpec.argExprs` / `filterExpr` hold the bound plan expressions, and GROUP BY terms keep theirs
+(`compileWithPlan` returns the compiled and the bound form). Fused pipelines compile those instead of binding the
+parser's expressions again, so names are resolved once; columns were already marked as read when the operators were
+compiled, so decode lists and generated code are unchanged. Fusion declines on `native` nodes from subqueries, where
+it declined on subquery AST (a compiled alias is a `native` node too, and fuses as before).
 
 ### Step 4b (added): FROM/WHERE machinery on bound conjuncts (about 600 lines)
 
