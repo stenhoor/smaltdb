@@ -13,6 +13,7 @@ async function setup(): Promise<{ db: Database; catalog: FrontEndCatalog }> {
     CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, s TEXT COLLATE NOCASE);
     CREATE TABLE u(x INT, y REAL);
     CREATE VIEW v AS SELECT a AS va, s FROM t WHERE a > 0;
+    CREATE TABLE w(a INT, z TEXT);
   `);
   const catalog = (db as unknown as { frontEndCatalog(): FrontEndCatalog }).frontEndCatalog();
   return { db, catalog };
@@ -47,6 +48,17 @@ describe('SQL front end', () => {
     );
   });
 
+  it('plans USING, NATURAL, RIGHT and FULL joins', async () => {
+    const { catalog } = await setup();
+    // USING hides the right side's copy of the column from * and from unqualified names.
+    const p = plan(catalog, 'SELECT * FROM t JOIN w USING (a)');
+    expect(p!.columns).toEqual(['id int INTEGER', 'a int INT', 's text TEXT nocase', 'z text TEXT']);
+    expect(p!.text).toBe(['project #0.0, #0.1, #0.2, #0.4', '  join inner on sql.eq(#0.1, #1.0)', '    scan t [0, 1, 2]', '    scan w [0, 1, -1]'].join('\n'));
+    expect(plan(catalog, 'SELECT z FROM t NATURAL JOIN w')!.text.split('\n')[1]).toBe('  join inner on sql.eq(#0.1, #1.0)');
+    expect(plan(catalog, 'SELECT t.a, w.z FROM t FULL JOIN w ON w.a = t.a')!.text.split('\n')[1]).toBe('  join full on sql.eq(#1.0, #0.1)');
+    expect(() => plan(catalog, 'SELECT * FROM t JOIN u USING (a)')).toThrow('cannot join using column a - column not present in both tables');
+  });
+
   it('carries bare columns through the aggregate', async () => {
     const { catalog } = await setup();
     expect(plan(catalog, 'SELECT a, s, max(id) FROM t GROUP BY a HAVING count(*) > 1')!.text).toBe(
@@ -69,16 +81,19 @@ describe('SQL front end', () => {
     expect(() => plan(catalog, 'SELECT a FROM t UNION SELECT a, s FROM t')).toThrow('do not have the same number of result columns');
   });
 
-  it('returns null for shapes it does not handle yet', async () => {
+  it('plans windows, recursive CTEs, table functions and virtual tables', async () => {
     const { catalog } = await setup();
-    for (const sql of [
-      'SELECT a, row_number() OVER (ORDER BY a) FROM t',
-      'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3) SELECT i FROM n',
-      "SELECT * FROM pragma_table_info('t')",
-      'SELECT * FROM t JOIN u USING (id)',
-      'SELECT * FROM t RIGHT JOIN u ON u.x = t.a',
-    ]) {
-      expect(plan(catalog, sql), sql).toBeNull();
-    }
+    // A window outputs its input's columns, then its calls.
+    expect(plan(catalog, 'SELECT a, sum(a) OVER (PARTITION BY s ORDER BY id) FROM t')!.text).toBe(
+      ['project #0.1, #0.3', '  window [sum(#0.1)] partition [#0.2] order [#0.0] RANGE unboundedPreceding..currentRow', '    scan t [0, 1, 2]'].join('\n'),
+    );
+    expect(plan(catalog, 'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3) SELECT i FROM n')!.text).toBe(
+      ['project #0.0', '  iterate #0', '    project 1', '      values ()', '    project sql.add(#0.0, 1)', '      filter sql.lt(#0.0, 3)', '        working #0'].join('\n'),
+    );
+    // A table function's arguments may read the join's left input (a lateral source).
+    expect(plan(catalog, 'SELECT t.id, p.name FROM t, pragma_table_info(t.s) p')!.text).toBe(
+      ['project #0.0, #0.4', '  join cross', '    scan t [0, 1, 2]', '    function pragma_table_info(#0.2)'].join('\n'),
+    );
+    expect(plan(catalog, 'SELECT table_name FROM information_schema.tables')!.columns).toEqual(['table_name text']);
   });
 });

@@ -1011,7 +1011,15 @@ export class Database implements FunctionContext {
   /** What the SQL front end (ADR 0014, step 5) reads of the catalog. */
   private frontEndCatalog(): FrontEndCatalog {
     const deps = this.plannerDeps();
-    return { getTable: deps.getTable, getView: deps.getView, isExternal: (n) => this.externals.has(n.toLowerCase()), funcCtx: this };
+    return {
+      getTable: deps.getTable,
+      getView: deps.getView,
+      isExternal: (n) => this.externals.has(n.toLowerCase()),
+      externalColumns: (n) => deps.externalTable?.(n)?.columns,
+      isExternalFunction: deps.isExternalFunction,
+      virtualTable: deps.virtualTable,
+      funcCtx: this,
+    };
   }
 
   /** @internal Compile a statement AST into a program for the current schema. */

@@ -5,21 +5,21 @@
  *
  * Until step 6 the plans are not executed: `SMALT_PLAN=shadow` (exec/plan-shadow.ts) builds one beside every
  * compiled SELECT and checks its result columns (names, types, collations, declared types, affinities) and its
- * errors against the current planner's. Shapes the front end does not handle yet make `toPlan` return null:
- * window functions, recursive CTEs, table-valued functions and virtual tables, external tables, USING / NATURAL,
- * RIGHT / FULL JOIN.
+ * errors against the current planner's. The one shape the front end does not handle is a table function that reads
+ * external data (`read_csv()` and the like: its columns come from the data); `toPlan` returns null for it.
  */
-import type { TableSchema } from '../../catalog/schema.js';
+import { type TableSchema, storageTypeFor } from '../../catalog/schema.js';
 import { SmaltError } from '../../errors.js';
 import { type Affinity, type StaticType, affinityOfStorage, staticTypeOfStorage } from '../../exec/convert.js';
 import { CollSrc, type ColumnBinding, type CompileScope, bindExpr, boundMetadata, conjuncts, withCompiledMeta } from '../../exec/expr.js';
-import { type FunctionContext, aggregateFunctions } from '../../exec/functions.js';
-import { containsAggregate, containsWindow, exprEquals, firstAggregateCall, sameName, selectReferences } from '../../exec/planner.js';
+import { type FunctionContext, aggregateFunctions, scalarFunctions } from '../../exec/functions.js';
+import { NAVIGATION, RANKING, WINDOW_ARITY } from '../../exec/window.js';
+import { containsAggregate, containsWindow, coreReferences, exprEquals, firstAggregateCall, firstWindowCall, sameName, selectReferences } from '../../exec/planner.js';
 import type { PlanExpr } from '../../plan/expr.js';
-import type { AggCall, JoinKind, PlanOp, SortKey } from '../../plan/ops.js';
+import type { AggCall, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../plan/ops.js';
 import type { CollationName } from '../../plan/types.js';
 import { Collation } from '../../values.js';
-import type { CallExpr, ColumnExpr, Expr, FromItem, JoinType, OrderingTerm, ResultColumn, SelectCore, SelectStmt, WithClause } from '../ast.js';
+import type { CallExpr, ColumnExpr, Expr, FrameBound, FromItem, JoinType, OrderingTerm, ResultColumn, SelectCore, SelectCoreSelect, SelectStmt, WindowSpec, WithClause } from '../ast.js';
 
 /** What the front end needs of the catalog. */
 export interface FrontEndCatalog {
@@ -27,6 +27,12 @@ export interface FrontEndCatalog {
   getView?(name: string, schema?: string): { name: string; sql: string; columns?: string[]; select: SelectStmt } | undefined;
   /** True for an external table (not handled by the front end yet). */
   isExternal?(name: string): boolean;
+  /** The columns of an external table. */
+  externalColumns?(name: string): { name: string; type: StaticType; declType?: string }[] | undefined;
+  /** A table function that reads external data (`read_csv`): its columns come from the data. */
+  isExternalFunction?(name: string): boolean;
+  /** Virtual tables: `information_schema.<name>`, the TEMP catalog, table-valued functions (schema undefined). */
+  virtualTable?(schema: string | undefined, name: string): { columns: { name: string; type: StaticType }[] } | undefined;
   funcCtx: FunctionContext;
 }
 
@@ -51,13 +57,16 @@ class Unsupported extends Error {}
  * Plan a SELECT. `text` is the statement's SQL text (result columns are named from it). Returns null for shapes the
  * front end does not handle yet; throws the error the current planner would raise.
  */
-export function toPlan(stmt: SelectStmt, text: string, catalog: FrontEndCatalog): FrontEndResult | null {
+export function toPlan(stmt: SelectStmt, text: string, catalog: FrontEndCatalog, onUnsupported?: (reason: string) => void): FrontEndResult | null {
   try {
     const fe = new FrontEnd(catalog, text);
     const r = fe.select(stmt, null);
     return { plan: fe.resolveRefs(r.plan), columns: r.columns };
   } catch (e) {
-    if (e instanceof Unsupported) return null;
+    if (e instanceof Unsupported) {
+      onUnsupported?.(e.message);
+      return null;
+    }
     throw e;
   }
 }
@@ -84,6 +93,8 @@ interface FeSource {
   rowid: number | null;
   /** FROM position (join input order). */
   position: number;
+  /** Lower-cased column names merged by USING / NATURAL (hidden from unqualified lookup and `*`). */
+  hidden: Set<string>;
   /** Width in the FROM row (columns, and the rowid of a table). */
   width: number;
 }
@@ -93,14 +104,14 @@ class FeScope {
   width = 0;
   aliases: Map<string, Expr> | null = null;
   aliasScope: CompileScope | null = null;
-  ctes = new Map<string, { select: SelectStmt; columns?: string[] }>();
+  ctes = new Map<string, FeCte>();
   /** After aggregation: FROM-row position of a bare column -> its aggregate output position. */
   carry: ((rowIndex: number, type: StaticType, collation: Collation) => () => number) | null = null;
   /** While binding the ON condition of the join that adds source `onSource`. */
   onSource = -1;
   constructor(readonly parent: FeScope | null) {}
 
-  findCte(name: string): { select: SelectStmt; columns?: string[] } | undefined {
+  findCte(name: string): FeCte | undefined {
     const lower = name.toLowerCase();
     for (let s: FeScope | null = this; s; s = s.parent) {
       const c = s.ctes.get(lower);
@@ -119,6 +130,22 @@ interface Ref {
   collation: Collation;
 }
 
+interface FeCte {
+  select: SelectStmt;
+  columns?: string[];
+  recursive?: boolean;
+  /** Inside a recursive step: the CTE's name means the previous step's rows. */
+  working?: { id: number; columns: FrontEndColumn[] };
+}
+
+interface FeWindow {
+  key: string;
+  partition: { expr: PlanExpr; collation: CollationName }[];
+  order: SortKey[];
+  frame: WindowFrame;
+  calls: WindowCall[];
+}
+
 interface CoreResult {
   plan: PlanOp;
   columns: FrontEndColumn[];
@@ -126,6 +153,7 @@ interface CoreResult {
 
 class FrontEnd {
   readonly refs: Ref[] = [];
+  private nextIterate = 0;
   private readonly expandingViews = new Set<string>();
   private readonly expandingAliases = new Set<string>();
 
@@ -167,9 +195,60 @@ class FrontEnd {
 
   private registerCtes(w: WithClause, scope: FeScope): void {
     for (const c of w.ctes) {
-      if (w.recursive && selectReferences(c.select, c.name)) throw new Unsupported('recursive CTE');
-      scope.ctes.set(c.name.toLowerCase(), { select: c.select, columns: c.columns });
+      const recursive = w.recursive && selectReferences(c.select, c.name);
+      scope.ctes.set(c.name.toLowerCase(), { select: c.select, columns: c.columns, recursive });
     }
+  }
+
+  /** A WITH RECURSIVE CTE: the initial part, then steps reading the previous step's rows, as the planner. */
+  private recursive(name: string, cte: FeCte, parent: FeScope | null): CoreResult {
+    const select = cte.select;
+    const cores = [select.core, ...select.compound.map((c) => c.core)];
+    const refs = cores.map((c) => coreReferences(c, name));
+    const k = refs.indexOf(true);
+    if (k <= 0) throw new SmaltError('SMALT_ERROR', `recursive reference in a subquery: ${name}`);
+    for (let i = k; i < cores.length; i++) {
+      if (!refs[i]) throw new SmaltError('SMALT_ERROR', `circular reference: ${name}`);
+    }
+    const ops = select.compound.slice(k - 1).map((c) => c.op);
+    if (ops.some((op) => op !== 'UNION' && op !== 'UNION ALL')) throw new SmaltError('SMALT_ERROR', `recursive reference in a subquery: ${name}`);
+    const distinct = ops.includes('UNION');
+    const init: SelectStmt = { ...select, with: undefined, core: select.core, compound: select.compound.slice(0, k - 1), orderBy: [], limit: undefined, offset: undefined };
+    const first = this.select(init, parent);
+    if (cte.columns && cte.columns.length !== first.columns.length) {
+      throw new SmaltError('SMALT_ERROR', `table ${name} has ${first.columns.length} values for ${cte.columns.length} columns`);
+    }
+    const columns = first.columns.map((c, i) => ({ ...c, name: cte.columns?.[i] ?? c.name }));
+    const id = this.nextIterate++;
+    const steps = cores.slice(k).map((core) => {
+      const s = new FeScope(parent);
+      s.ctes.set(name.toLowerCase(), { select, columns: cte.columns, working: { id, columns } });
+      const r = this.core(core, s, null, columns.length);
+      if (r.columns.length !== columns.length) {
+        throw new SmaltError('SMALT_ERROR', `SELECTs to the left and right of ${ops[0]} do not have the same number of result columns`);
+      }
+      return r.plan;
+    });
+    const order: SortKey[] = select.orderBy.map((t) => {
+      const idx = this.compoundOrderIndex(t, columns, select.core);
+      const c = columns[idx];
+      return { expr: { k: 'col', input: 0, index: idx, depth: 0, type: c.type, collation: collationName(c.collation) }, desc: t.desc, nullsFirst: t.nulls ? t.nulls === 'FIRST' : !t.desc, collation: collationName(c.collation) };
+    });
+    const cs = this.compileScope(new FeScope(parent));
+    const limit = select.limit ? bindExpr(select.limit, cs) : undefined;
+    const offset = select.offset ? bindExpr(select.offset, cs) : undefined;
+    const plan: PlanOp = {
+      op: 'iterate',
+      id,
+      init: first.plan,
+      steps,
+      distinct,
+      collations: columns.map((c) => collationName(c.collation)),
+      ...(order.length ? { order } : {}),
+      ...(limit ? { limit } : {}),
+      ...(offset ? { offset } : {}),
+    };
+    return { plan, columns };
   }
 
   private limit(plan: PlanOp, stmt: SelectStmt, scope: FeScope | null): PlanOp {
@@ -204,9 +283,6 @@ class FrontEnd {
 
   private core(core: SelectCore, parent: FeScope | null, stmt: SelectStmt | null, width: number | undefined): CoreResult {
     if (core.kind === 'values') return this.values(core.rows, parent, stmt);
-    if (core.columns.some((c) => c.kind === 'expr' && containsWindow(c.expr)) || stmt?.orderBy.some((t) => containsWindow(t.expr)) || core.windows?.length) {
-      throw new Unsupported('window functions');
-    }
     const scope = new FeScope(parent);
     let root = this.from(core.from, core.where, scope);
     const resultCols = this.expandResultColumns(core.columns, scope);
@@ -300,6 +376,18 @@ class FrontEnd {
       scope.carry = carryOf;
     }
 
+    // Window functions: result columns and ORDER BY terms may call f(...) OVER (...).
+    const noWindowScope = exprScope;
+    const windows: FeWindow[] = [];
+    const hasWindows = resultCols.some((c) => containsWindow(c.expr)) || (stmt?.orderBy.some((t) => containsWindow(t.expr)) ?? false);
+    if (hasWindows) {
+      const seen: { ast: CallExpr; binding: ColumnBinding }[] = [];
+      const a = agg;
+      // Window calls follow the window's input: the aggregate's output, or the FROM row.
+      const inputWidth = (): number => (a ? a.keys.length + a.aggs.length + a.carry.length : scope.width);
+      exprScope = { ...exprScope, windowRef: (call) => this.windowRef(call, core, noWindowScope, windows, seen, inputWidth) };
+    }
+
     // Result expressions.
     const bound = resultCols.map((c) => bindExpr(c.expr, exprScope));
     const compiled = bound.map((b) => boundMetadata(b, this.catalog.funcCtx));
@@ -347,11 +435,112 @@ class FrontEnd {
 
     if (agg) root = { op: 'aggregate', input: root, keys: agg.keys, aggs: agg.aggs, carry: agg.carry };
     if (having) root = { op: 'filter', input: root, pred: having };
+    for (const w of windows) root = { op: 'window', input: root, partition: w.partition, order: w.order, frame: w.frame, calls: w.calls };
     root = { op: 'project', input: root, exprs: [...bound, ...extras] };
     if (core.distinct) root = { op: 'distinct', input: root, collations: columns.map((c) => collationName(c.collation)) };
     if (keys.length) root = { op: 'sort', input: root, keys };
     if (extras.length) root = { op: 'project', input: root, exprs: columns.map((c, i) => ({ k: 'col', input: 0, index: i, depth: 0, type: c.type, collation: collationName(c.collation) })) };
     return { plan: root, columns };
+  }
+
+  private resolveWindowSpec(over: WindowSpec | string, core: SelectCoreSelect): WindowSpec {
+    const named = (name: string): WindowSpec => {
+      const w = core.windows.find((x) => sameName(x.name, name));
+      if (!w) throw new SmaltError('SMALT_ERROR', `no such window: ${name}`);
+      return w.spec.base ? this.resolveWindowSpec(w.spec, core) : w.spec;
+    };
+    if (typeof over === 'string') return named(over);
+    if (!over.base) return over;
+    const base = named(over.base);
+    if (over.partitionBy.length) throw new SmaltError('SMALT_ERROR', `cannot override PARTITION clause of window: ${over.base}`);
+    if (over.orderBy.length && base.orderBy.length) throw new SmaltError('SMALT_ERROR', `cannot override ORDER BY clause of window: ${over.base}`);
+    if (base.frame) throw new SmaltError('SMALT_ERROR', `cannot override frame specification of window: ${over.base}`);
+    return { ...over, base: undefined, partitionBy: base.partitionBy, orderBy: over.orderBy.length ? over.orderBy : base.orderBy };
+  }
+
+  /** A window function call: one `window` operation per distinct (PARTITION BY, ORDER BY, frame), as the planner. */
+  private windowRef(call: CallExpr, core: SelectCoreSelect, scope: CompileScope, defs: FeWindow[], seen: { ast: CallExpr; binding: ColumnBinding }[], inputWidth: () => number): ColumnBinding {
+    const hit = seen.find((x) => exprEquals(x.ast, call));
+    if (hit) return hit.binding;
+    const name = call.name;
+    const aggDef = aggregateFunctions.get(name);
+    const builtin = WINDOW_ARITY[name];
+    if (!builtin && !aggDef) {
+      if (scalarFunctions.has(name)) throw new SmaltError('SMALT_ERROR', `${name}() may not be used as a window function`);
+      throw new SmaltError('SMALT_ERROR', `no such function: ${name}`);
+    }
+    const n = call.args.length;
+    const [minA, maxA] = builtin ?? [aggDef!.minArgs, aggDef!.maxArgs];
+    if (call.star ? name !== 'count' : n < minA || n > maxA || (name === 'count' && n === 0)) {
+      throw new SmaltError('SMALT_ERROR', `wrong number of arguments to function ${name}()`);
+    }
+    if (call.distinct) throw new SmaltError('SMALT_ERROR', 'DISTINCT is not supported for window functions');
+    if (builtin && call.filter) throw new SmaltError('SMALT_ERROR', `FILTER clause may only be used with aggregate window functions`);
+    for (const a of call.args) {
+      const inner = firstWindowCall(a);
+      if (inner) throw new SmaltError('SMALT_ERROR', `misuse of window function ${inner.name}()`);
+    }
+    const spec = this.resolveWindowSpec(call.over!, core);
+    const args = call.args.map((a) => bindExpr(a, scope));
+    const meta = args.map((a) => boundMetadata(a, this.catalog.funcCtx));
+    const strip = (x: unknown): string => JSON.stringify(x, (k, v) => (k === 'pos' || k === 'end' ? undefined : typeof v === 'bigint' ? `${v}n` : v instanceof Uint8Array ? [...v] : v));
+    const key = strip({ p: spec.partitionBy, o: spec.orderBy, f: spec.frame });
+    let defIndex = defs.findIndex((d) => d.key === key);
+    if (defIndex < 0) {
+      const partition = spec.partitionBy.map((e) => {
+        const b = bindExpr(e, scope);
+        const m = boundMetadata(b, this.catalog.funcCtx);
+        return { expr: b, collation: collationName(m.collSrc !== CollSrc.None ? m.collation : Collation.Binary) };
+      });
+      const order: SortKey[] = spec.orderBy.map((t) => {
+        const b = bindExpr(t.expr, scope);
+        const m = boundMetadata(b, this.catalog.funcCtx);
+        return { expr: b, desc: t.desc, nullsFirst: t.nulls ? t.nulls === 'FIRST' : !t.desc, collation: collationName(m.collSrc !== CollSrc.None ? m.collation : Collation.Binary) };
+      });
+      const f = spec.frame;
+      const bound = (b: FrameBound): { kind: string; offset?: PlanExpr } => ('offset' in b ? { kind: b.kind, offset: bindExpr(b.offset, scope) } : { kind: b.kind });
+      const frame: WindowFrame = f
+        ? { unit: f.unit, start: bound(f.start), end: f.end ? bound(f.end) : { kind: 'currentRow' }, exclude: f.exclude ?? 'NO OTHERS' }
+        : order.length
+          ? { unit: 'RANGE', start: { kind: 'unboundedPreceding' }, end: { kind: 'currentRow' }, exclude: 'NO OTHERS' }
+          : { unit: 'ROWS', start: { kind: 'unboundedPreceding' }, end: { kind: 'unboundedFollowing' }, exclude: 'NO OTHERS' };
+      const rank = (k: string): number => ['unboundedPreceding', 'preceding', 'currentRow', 'following', 'unboundedFollowing'].indexOf(k);
+      if (frame.start.kind === 'unboundedFollowing' || frame.end.kind === 'unboundedPreceding' || rank(frame.start.kind) > rank(frame.end.kind)) {
+        throw new SmaltError('SMALT_ERROR', 'unsupported frame specification');
+      }
+      if (frame.unit === 'RANGE' && (frame.start.offset || frame.end.offset) && order.length !== 1) {
+        throw new SmaltError('SMALT_ERROR', 'RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression');
+      }
+      defs.push({ key, partition, order, frame, calls: [] });
+      defIndex = defs.length - 1;
+    }
+    const filter = call.filter ? bindExpr(call.filter, scope) : undefined;
+    const kind = builtin ? name : 'aggregate';
+    const t0 = meta[0]?.type ?? 'any';
+    const type: StaticType =
+      kind === 'aggregate'
+        ? aggDef!.resultType(meta.map((m) => m.type))
+        : kind === 'percent_rank' || kind === 'cume_dist'
+          ? 'real'
+          : RANKING.has(kind)
+            ? 'int'
+            : t0 === 'null'
+              ? 'any'
+              : kind === 'lag' || kind === 'lead'
+                ? meta.length > 2 && meta[2].type !== t0
+                  ? 'any'
+                  : t0
+                : t0;
+    const callCollation = kind === 'aggregate' && meta[0]?.collSrc ? meta[0].collation : Collation.Binary;
+    const collation = meta[0]?.collSrc && NAVIGATION.has(kind) ? meta[0].collation : Collation.Binary;
+    const def = defs[defIndex];
+    const at = def.calls.length;
+    def.calls.push({ fn: name, args, star: call.star, ...(filter ? { filter } : {}), type, collation: collationName(callCollation) });
+    const di = defIndex;
+    const index = (): number => inputWidth() + defs.slice(0, di).reduce((n, d) => n + d.calls.length, 0) + at;
+    const binding: ColumnBinding = { reg: this.ref({ depth: 0, input: 0, index, type, collation }), type, collation, affinity: 'NONE' };
+    seen.push({ ast: call, binding });
+    return binding;
   }
 
   private values(rows: Expr[][], parent: FeScope | null, stmt: SelectStmt | null): CoreResult {
@@ -404,7 +593,10 @@ class FrontEnd {
         for (const src of scope.sources) {
           if (rc.kind === 'tableStar' && !sameName(src.name, rc.table)) continue;
           found = true;
-          for (const c of src.cols) out.push({ expr: { kind: 'column', table: src.name, name: c.name, pos: rc.pos, end: rc.end }, name: c.name, declType: c.declType || undefined });
+          for (const c of src.cols) {
+            if (rc.kind === 'star' && src.hidden.has(c.name.toLowerCase())) continue;
+            out.push({ expr: { kind: 'column', table: src.name, name: c.name, pos: rc.pos, end: rc.end }, name: c.name, declType: c.declType || undefined });
+          }
         }
         if (!found) throw new SmaltError('SMALT_ERROR', `no such table: ${(rc as { table: string }).table}`);
       } else {
@@ -443,20 +635,39 @@ class FrontEnd {
     const items: { item: FromItem; joinType: JoinType; on?: Expr; using?: string[]; natural: boolean }[] = [];
     this.flattenFrom(from, 'INNER', undefined, undefined, false, items);
     const inputs = items.map((it) => this.addSource(it.item, scope));
-    for (const it of items) {
-      if (it.using || it.natural) throw new Unsupported('USING / NATURAL');
-      if (it.joinType === 'RIGHT' || it.joinType === 'FULL') throw new Unsupported('RIGHT / FULL JOIN');
+    // USING / NATURAL become equality conjuncts in the ON clause, and hide the right side's copy of the column.
+    const ons: Expr[][] = items.map(() => []);
+    items.forEach((it, p) => {
+      const src = scope.sources[p];
+      if (it.on) ons[p].push(...conjuncts(it.on));
+      let using = it.using;
+      if (it.natural) {
+        using = src.cols
+          .filter((c) => scope.sources.slice(0, p).some((s) => s.cols.some((x) => sameName(x.name, c.name) && !s.hidden.has(x.name.toLowerCase()))))
+          .map((c) => c.name);
+      }
+      for (const name of using ?? []) {
+        const left = scope.sources.slice(0, p).find((s) => s.cols.some((c) => sameName(c.name, name)) && !s.hidden.has(name.toLowerCase()));
+        if (!left || !src.cols.some((c) => sameName(c.name, name))) {
+          throw new SmaltError('SMALT_ERROR', `cannot join using column ${name} - column not present in both tables`);
+        }
+        src.hidden.add(name.toLowerCase());
+        ons[p].push({ kind: 'binary', op: '=', left: { kind: 'column', table: left.name, name, pos: 0, end: 0 }, right: { kind: 'column', table: src.name, name, pos: 0, end: 0 }, pos: 0, end: 0 });
+      }
+    });
+    if (items.some((it) => (it.using || it.natural) && (it.joinType === 'RIGHT' || it.joinType === 'FULL')) && items.some((it) => it.joinType === 'RIGHT' || it.joinType === 'FULL')) {
+      throw new SmaltError('SMALT_UNSUPPORTED', 'USING / NATURAL with RIGHT or FULL JOIN is not supported yet');
     }
     let root = inputs[0];
     for (let p = 1; p < items.length; p++) {
       const it = items[p];
-      const kind: JoinKind = it.joinType === 'LEFT' ? 'left' : it.on ? 'inner' : 'cross';
+      const kind: JoinKind = it.joinType === 'LEFT' ? 'left' : it.joinType === 'RIGHT' ? 'right' : it.joinType === 'FULL' ? 'full' : ons[p].length ? 'inner' : 'cross';
       let on: PlanExpr | undefined;
-      if (it.on) {
+      if (ons[p].length) {
         scope.onSource = p;
         try {
           const cs = this.compileScope(scope);
-          const parts = conjuncts(it.on).map((c) => bindExpr(c, cs));
+          const parts = ons[p].map((c) => bindExpr(c, cs));
           on = parts.reduce((x, y) => ({ k: 'and', args: [x, y] }));
         } finally {
           scope.onSource = -1;
@@ -493,16 +704,53 @@ class FrontEnd {
   /** Add a FROM item's columns to the scope; returns the plan that produces its rows. */
   private addSource(item: FromItem, scope: FeScope): PlanOp {
     const position = scope.sources.length;
-    if (item.kind === 'function') throw new Unsupported('table-valued function');
     if (item.kind === 'join') throw new SmaltError('SMALT_ERROR', 'unexpected join');
-    if (item.kind === 'table') {
-      const schema = item.schema?.toLowerCase();
-      const lower = item.name.toLowerCase();
-      if (schema === 'information_schema') throw new Unsupported('information_schema');
-      if (schema === undefined ? !scope.findCte(item.name) && TEMP_CATALOG.has(lower) : schema === 'temp' && (TEMP_CATALOG.has(lower) || lower === 'sqlite_schema' || lower === 'sqlite_master')) {
-        throw new Unsupported('TEMP catalog');
+    // External data: external tables and read_csv()-style functions (their columns come from the data).
+    if (item.kind === 'function' && this.catalog.isExternalFunction?.(item.name)) throw new Unsupported('external table function');
+    if (item.kind === 'table' && (!item.schema || item.schema.toLowerCase() === 'main') && !(!item.schema && scope.findCte(item.name))) {
+      const ext = this.catalog.externalColumns?.(item.name);
+      if (ext) {
+        const cols: FeColumn[] = ext.map((c) => ({ name: c.name, type: c.type, collation: Collation.Binary, affinity: affinityOfStorage(storageTypeFor(c.declType)), declType: c.declType ?? '' }));
+        this.push(scope, { name: item.alias ?? item.name, cols, offset: 0, rowid: null, position, width: cols.length, hidden: new Set() });
+        return { op: 'source', kind: 'external', name: item.name, args: [], types: cols.map((c) => c.type) };
       }
-      if ((schema === undefined || schema === 'main') && !(schema === undefined && scope.findCte(item.name)) && this.catalog.isExternal?.(item.name)) throw new Unsupported('external table');
+    }
+    const isInfoSchema = item.kind === 'table' && item.schema?.toLowerCase() === 'information_schema';
+    const tempCatalog =
+      item.kind === 'table' &&
+      (item.schema === undefined
+        ? !scope.findCte(item.name) && TEMP_CATALOG.has(item.name.toLowerCase())
+        : item.schema.toLowerCase() === 'temp' && (TEMP_CATALOG.has(item.name.toLowerCase()) || ['sqlite_schema', 'sqlite_master'].includes(item.name.toLowerCase())));
+    if (tempCatalog) {
+      const vt = this.catalog.virtualTable?.('temp', 'sqlite_schema');
+      if (vt) {
+        const cols: FeColumn[] = vt.columns.map((c) => ({ name: c.name, type: c.type, collation: Collation.Binary, affinity: 'NONE', declType: '' }));
+        this.push(scope, { name: (item as { alias?: string }).alias ?? item.name, cols, offset: 0, rowid: null, position, width: cols.length, hidden: new Set() });
+        return { op: 'source', kind: 'virtual', schema: 'temp', name: 'sqlite_schema', args: [], types: cols.map((c) => c.type) };
+      }
+    }
+    if (item.kind === 'function' || isInfoSchema) {
+      const vt = this.catalog.virtualTable?.(isInfoSchema ? 'information_schema' : undefined, item.name);
+      if (!vt) {
+        if (isInfoSchema) throw new SmaltError('SMALT_ERROR', `no such table: information_schema.${item.name}`);
+        throw new SmaltError('SMALT_ERROR', `no such table-valued function: ${item.name}`);
+      }
+      // Arguments may read earlier sources of this FROM (a lateral source: input 0 of the join that adds it).
+      let args: PlanExpr[] = [];
+      if (item.kind === 'function') {
+        scope.onSource = position;
+        try {
+          const cs = this.compileScope(scope);
+          args = item.args.map((a) => bindExpr(a, cs));
+        } finally {
+          scope.onSource = -1;
+        }
+      }
+      const cols: FeColumn[] = vt.columns.map((c) => ({ name: c.name, type: c.type, collation: Collation.Binary, affinity: 'NONE', declType: '' }));
+      this.push(scope, { name: item.alias ?? item.name, cols, offset: 0, rowid: null, position, width: cols.length, hidden: new Set() });
+      return isInfoSchema
+        ? { op: 'source', kind: 'virtual', schema: 'information_schema', name: item.name, args, types: cols.map((c) => c.type) }
+        : { op: 'source', kind: 'function', name: item.name, args, types: cols.map((c) => c.type) };
     }
     const view =
       item.kind === 'table' && (!item.schema || ['main', 'temp'].includes(item.schema.toLowerCase())) && !(!item.schema && scope.findCte(item.name)) && !this.catalog.getTable(item.name, item.schema)
@@ -538,13 +786,21 @@ class FrontEnd {
         const cte = scope.findCte(cteName)!;
         names = cte.columns;
         alias = (item as { alias?: string }).alias ?? cteName;
-        sub = this.select(cte.select, scope.parent);
+        if (cte.working) {
+          // The recursive step's working table: the previous step's rows.
+          const w = cte.working;
+          const cols: FeColumn[] = w.columns.map((c) => ({ name: c.name, type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '' }));
+          this.push(scope, { name: alias, cols, offset: 0, rowid: null, position, width: cols.length, hidden: new Set() });
+          return { op: 'working', id: w.id, types: cols.map((c) => c.type) };
+        }
+        sub = cte.recursive ? this.recursive(cteName, cte, scope.parent) : this.select(cte.select, scope.parent);
+        if (cte.recursive) names = undefined; // already applied to the plan's columns
       }
       if (names && names.length !== sub.columns.length) {
         throw new SmaltError('SMALT_ERROR', `table ${alias} has ${sub.columns.length} values for ${names.length} columns`);
       }
       const cols: FeColumn[] = sub.columns.map((c, i) => ({ name: names ? names[i] : c.name, type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '' }));
-      this.push(scope, { name: alias ?? `(subquery-${position + 1})`, cols, offset: 0, rowid: null, position, width: cols.length });
+      this.push(scope, { name: alias ?? `(subquery-${position + 1})`, cols, offset: 0, rowid: null, position, width: cols.length, hidden: new Set() });
       return sub.plan;
     }
     if (item.schema && !['main', 'temp'].includes(item.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${item.schema}`);
@@ -562,7 +818,7 @@ class FrontEnd {
     }));
     const n = table.columns.length;
     const hasAlias = table.rowidAlias >= 0;
-    this.push(scope, { name, cols, offset: 0, rowid: hasAlias ? table.rowidAlias : n, position, width: hasAlias ? n : n + 1 });
+    this.push(scope, { name, cols, offset: 0, rowid: hasAlias ? table.rowidAlias : n, position, width: hasAlias ? n : n + 1, hidden: new Set() });
     const columns = table.columns.map((_c, i) => i);
     const db = table.temp ? 'temp' : undefined;
     return { op: 'scan', table: table.name, ...(db ? { db } : {}), columns: hasAlias ? columns : [...columns, -1] };
@@ -639,6 +895,7 @@ class FrontEnd {
     }
     let found: { src: FeSource; col: number } | undefined;
     for (const src of scope.sources) {
+      if (src.hidden.has(e.name.toLowerCase())) continue;
       const c = src.cols.findIndex((c) => sameName(c.name, e.name));
       if (c < 0) continue;
       if (found) throw new SmaltError('SMALT_ERROR', `ambiguous column name: ${e.name}`);
@@ -681,7 +938,19 @@ class FrontEnd {
     const list = (xs: readonly PlanExpr[]): PlanExpr[] => xs.map(ex);
     switch (op.op) {
       case 'scan':
+      case 'working':
         return op;
+      case 'source':
+        return { ...op, args: list(op.args) };
+      case 'iterate':
+        return {
+          ...op,
+          init: this.resolveRefs(op.init),
+          steps: op.steps.map((x) => this.resolveRefs(x)),
+          ...(op.order ? { order: op.order.map((k) => ({ ...k, expr: ex(k.expr) })) } : {}),
+          ...(op.limit ? { limit: ex(op.limit) } : {}),
+          ...(op.offset ? { offset: ex(op.offset) } : {}),
+        };
       case 'values':
         return { ...op, rows: op.rows.map(list) };
       case 'filter':
@@ -706,6 +975,17 @@ class FrontEnd {
         };
       case 'distinct':
         return { ...op, input: this.resolveRefs(op.input) };
+      case 'window': {
+        const bound = (b: { kind: string; offset?: PlanExpr }) => (b.offset ? { kind: b.kind, offset: ex(b.offset) } : b);
+        return {
+          ...op,
+          input: this.resolveRefs(op.input),
+          partition: op.partition.map((p) => ({ ...p, expr: ex(p.expr) })),
+          order: op.order.map((k) => ({ ...k, expr: ex(k.expr) })),
+          frame: { ...op.frame, start: bound(op.frame.start), end: bound(op.frame.end) },
+          calls: op.calls.map((c) => ({ ...c, args: list(c.args), ...(c.filter ? { filter: ex(c.filter) } : {}) })),
+        };
+      }
     }
   }
 

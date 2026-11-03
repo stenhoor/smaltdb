@@ -2882,7 +2882,7 @@ function fromReferences(f: FromItem | undefined, name: string): boolean {
   }
 }
 
-function coreReferences(core: SelectCore, name: string): boolean {
+export function coreReferences(core: SelectCore, name: string): boolean {
   return core.kind === 'select' && fromReferences(core.from, name);
 }
 
@@ -2893,7 +2893,7 @@ export function selectReferences(s: SelectStmt, name: string): boolean {
 }
 
 /** The first window function call (`f(...) OVER ...`) in `e`, if any. */
-function firstWindowCall(e: Expr): CallExpr | undefined {
+export function firstWindowCall(e: Expr): CallExpr | undefined {
   let found: CallExpr | undefined;
   walk(e, (x) => {
     if (found) return false;

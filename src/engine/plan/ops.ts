@@ -8,7 +8,8 @@
  * - `join` outputs its inputs' columns concatenated (`semi` / `anti`: the left input's only); its condition reads
  *   input 0 (the left side) and input 1 (the right side);
  * - `aggregate` outputs its keys, then its aggregate calls, then its carried columns;
- * - `setop` outputs the first input's columns.
+ * - `setop` outputs the first input's columns;
+ * - `window` outputs its input's columns, then one column per window call.
  *
  * Writing operations (`append`, `update`, `delete`), windows, recursion and external sources arrive with the later
  * steps of the ADR's order of work.
@@ -34,11 +35,53 @@ export interface AggCall {
   readonly type: PlanType;
 }
 
+/** A window frame: `offset` bounds are expressions over constants and parameters. */
+export interface WindowFrame {
+  readonly unit: 'ROWS' | 'RANGE' | 'GROUPS';
+  readonly start: { readonly kind: string; readonly offset?: PlanExpr };
+  readonly end: { readonly kind: string; readonly offset?: PlanExpr };
+  readonly exclude: 'NO OTHERS' | 'CURRENT ROW' | 'GROUP' | 'TIES';
+}
+
+/** A window function call: a ranking or navigation function, or an aggregate over the frame. */
+export interface WindowCall {
+  readonly fn: string;
+  readonly args: readonly PlanExpr[];
+  readonly star: boolean;
+  readonly filter?: PlanExpr;
+  readonly type: PlanType;
+  readonly collation: CollationName;
+}
+
 export type JoinKind = 'inner' | 'left' | 'right' | 'full' | 'semi' | 'anti' | 'cross';
 
 export type PlanOp =
   /** Rows of a table: `columns` lists table column indexes, -1 for the rowid. */
   | { readonly op: 'scan'; readonly table: string; readonly db?: 'main' | 'temp'; readonly columns: readonly number[] }
+  /**
+   * Rows that are not a table's: a table-valued function (`pragma_table_info(t)`), a virtual table
+   * (`information_schema.*`, the TEMP catalog) or an external table. A function's arguments may read the columns of
+   * the join's left input (a lateral source).
+   */
+  | { readonly op: 'source'; readonly kind: 'function' | 'virtual' | 'external'; readonly name: string; readonly schema?: string; readonly args: readonly PlanExpr[]; readonly types: readonly PlanType[] }
+  /**
+   * A recursive query: `init` gives the first rows; each step reads the rows of the previous one through `working`
+   * (same `id`) until a step gives none. `distinct`: UNION (rows seen before are dropped); `order` / `limit` /
+   * `offset` are the recursive CTE's own.
+   */
+  | {
+      readonly op: 'iterate';
+      readonly id: number;
+      readonly init: PlanOp;
+      readonly steps: readonly PlanOp[];
+      readonly distinct: boolean;
+      readonly collations: readonly CollationName[];
+      readonly order?: readonly SortKey[];
+      readonly limit?: PlanExpr;
+      readonly offset?: PlanExpr;
+    }
+  /** The previous step's rows inside an `iterate` with the same `id`. */
+  | { readonly op: 'working'; readonly id: number; readonly types: readonly PlanType[] }
   /** Constant rows (VALUES, and the single empty row of a SELECT without FROM). */
   | { readonly op: 'values'; readonly rows: readonly (readonly PlanExpr[])[]; readonly types: readonly PlanType[] }
   | { readonly op: 'filter'; readonly input: PlanOp; readonly pred: PlanExpr }
@@ -55,4 +98,13 @@ export type PlanOp =
       /** SQL's bare columns: input columns carried to the output, from the row SQLite picks (#46, decision 4). */
       readonly carry: readonly PlanExpr[];
     }
-  | { readonly op: 'distinct'; readonly input: PlanOp; readonly collations: readonly CollationName[] };
+  | { readonly op: 'distinct'; readonly input: PlanOp; readonly collations: readonly CollationName[] }
+  /** One window (PARTITION BY, ORDER BY, frame): outputs its input's columns, then one column per call. */
+  | {
+      readonly op: 'window';
+      readonly input: PlanOp;
+      readonly partition: readonly { readonly expr: PlanExpr; readonly collation: CollationName }[];
+      readonly order: readonly SortKey[];
+      readonly frame: WindowFrame;
+      readonly calls: readonly WindowCall[];
+    };

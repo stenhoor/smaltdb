@@ -139,7 +139,11 @@ pre-passes until step 7.
   `SMALT_PLAN=shadow` mode checks every SELECT's result columns (name, type, collation, declared type, affinity) and
   planning errors against the planner; CI runs the suite that way, and the differential tests and slt (112,981
   SELECTs, none skipped) pass in it. Statements rewritten to a materialized view are skipped until step 7.
-- **5b:** the remaining shapes (CTEs, windows, external sources).
+- **5b (done):** USING / NATURAL (hidden merged columns), RIGHT / FULL JOIN, window functions (one `window`
+  operation per distinct window, outputting its input then its calls), recursive CTEs (`iterate` / `working`), and
+  `source` operations for table-valued functions (lateral arguments read the join's left input), `information_schema`,
+  the TEMP catalog and external tables. Only `read_csv()`-style functions, whose columns come from the data, are
+  skipped. `SMALT_PLAN_STATS=<file>` lists skipped statements with their reasons.
 
 ### Step 6: the physical planner reads plans (`SMALT_PLAN=legacy|plan|shadow`)
 
