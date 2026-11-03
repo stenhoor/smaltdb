@@ -537,12 +537,22 @@ export class ExternalRegistry {
     let validator: string | null;
     try {
       if (reader.access === 'random') {
-        const file = await this.openRandom(source, place, signal);
-        validator = file.validator;
         try {
-          result = await reader.read(file.file, request);
-        } finally {
-          await file.close();
+          const file = await this.openRandom(source, place, signal);
+          validator = file.validator;
+          try {
+            result = await reader.read(file.file, request);
+          } finally {
+            await file.close();
+          }
+        } catch (e) {
+          // A remote server whose ranges do not match the file it serves (a size or encoding it
+          // misreports) can make a ranged read fail: read the whole file once instead. Local and
+          // registered files have an exact size, and SmaltErrors (HTTP errors, interrupts) are final.
+          if (e instanceof SmaltError || place.kind === 'file' || place.kind === 'node') throw e;
+          const f = await this.fetchFile(source, place, signal, false);
+          validator = f.validator;
+          result = await reader.read({ byteLength: f.bytes.byteLength, slice: (s, end) => f.bytes.slice(s, end).buffer as ArrayBuffer }, request);
         }
       } else {
         const f = await this.fetchFile(source, place, signal, false);
@@ -590,13 +600,21 @@ export class ExternalRegistry {
       }
     }
     const url = place.kind === 'http' ? place.url : this.objectUrl(place, place.key);
-    const head = await this.request(source, place, url, 'HEAD', signal);
-    const validator = head.headers.get('etag') ?? head.headers.get('last-modified');
-    const size = Number(head.headers.get('content-length'));
-    if (!Number.isFinite(size) || head.headers.get('content-length') === null) {
-      // No size (or not exposed to the page by CORS): read the whole file once.
-      const res = await this.request(source, place, url, 'GET', signal);
-      return { file: fromBytes(new Uint8Array(await res.arrayBuffer())), validator, close: none };
+    // The size comes from a 1-byte range probe, not HEAD: on hosts that compress responses (GitHub
+    // Pages, CDNs), HEAD's Content-Length is the compressed size while ranges address the
+    // uncompressed bytes. Browsers request range responses with `identity` encoding.
+    const probe = await this.request(source, place, url, 'GET', signal, { range: 'bytes=0-0' });
+    let validator = probe.headers.get('etag') ?? probe.headers.get('last-modified');
+    const body = new Uint8Array(await probe.arrayBuffer());
+    // 200: the server ignored the range and sent the whole file.
+    if (probe.status !== 206) return { file: fromBytes(body), validator, close: none };
+    const total = /^bytes\s+\d+-\d+\/(\d+)\s*$/i.exec(probe.headers.get('content-range') ?? '');
+    const size = total ? Number(total[1]) : NaN;
+    if (!Number.isSafeInteger(size)) {
+      // No total size (`*`, or Content-Range not exposed to the page by CORS): read the whole file once.
+      const f = await this.fetchFile(source, place, signal, false);
+      validator ??= f.validator;
+      return { file: fromBytes(f.bytes), validator, close: none };
     }
     let whole: Promise<Uint8Array> | null = null;
     return {
