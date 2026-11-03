@@ -167,6 +167,8 @@ export default defineConfig({
           { text: '0010 Analytics & mixed storage', link: '/adr/0010-analytics-and-mixed-storage' },
           { text: '0011 External tables', link: '/adr/0011-external-tables' },
           { text: '0012 Plugins', link: '/adr/0012-plugins' },
+          { text: '0013 Plugin API v1', link: '/adr/0013-plugin-api-v1' },
+          { text: '0014 Shared plan layer (proposed)', link: '/adr/0014-shared-plan-layer' },
         ],
       },
       {
