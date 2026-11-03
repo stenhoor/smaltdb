@@ -1,4 +1,3 @@
-import type { Expr } from '../sql/ast.js';
 import type { PlanExpr } from '../plan/expr.js';
 import type { SqlValue } from '../values.js';
 import { isOpaque } from './sql-meta.js';
@@ -545,10 +544,10 @@ export function generateLoader(spec: LoaderSpec, helpers: LoaderHelpers): Loader
 export interface FusedAggSpec {
   kind: 'countStar' | 'count' | 'step' | 'step2';
   /** Argument expression (count/step/step2). */
-  arg?: Expr;
+  arg?: PlanExpr;
   /** Second argument expression (step2: two-argument aggregates such as corr and percentile). */
-  arg2?: Expr;
-  filter?: Expr;
+  arg2?: PlanExpr;
+  filter?: PlanExpr;
 }
 
 export interface FusedHelpers extends LoaderHelpers, CodegenHelpers {
@@ -567,23 +566,13 @@ export interface FusedHelpers extends LoaderHelpers, CodegenHelpers {
  * block. Expressions must be emitted before `finish()`, because column references are resolved
  * (and added to the scan's decode list) while emitting.
  */
-/**
- * How a fused pipeline compiles the planner's expressions: `bind` turns an expression of the parser into a plan
- * expression (resolving its columns, which adds them to the scan's decode list), `fallback` compiles a bound node
- * with the closure compiler.
- */
-export interface PipelineCompiler {
-  bind(e: Expr): PlanExpr;
-  fallback(e: PlanExpr): FallbackNode;
-}
-
 class Pipeline {
   readonly em: Emitter;
   private readonly localRegs = new Map<number, boolean>(); // reg -> flagged
   readonly rowLines: string[] = [];
 
-  constructor(readonly compiler: PipelineCompiler) {
-    this.em = new Emitter(compiler.fallback);
+  constructor(fallback: (e: PlanExpr) => FallbackNode) {
+    this.em = new Emitter(fallback);
     this.em.regRef = (reg, type) => {
       const flagged = type === 'int' || type === 'real';
       if (!this.localRegs.has(reg)) this.localRegs.set(reg, flagged);
@@ -601,9 +590,8 @@ class Pipeline {
   private readonly textEq: { reg: number; bytes: Uint8Array }[] = [];
 
   /** WHERE: every conjunct must be true (NULL counts as false). */
-  addPredicates(preds: Expr[]): void {
-    for (const ast of preds) {
-      const p = this.compiler.bind(ast);
+  addPredicates(preds: PlanExpr[]): void {
+    for (const p of preds) {
       const eq = this.textEqualityConjunct(p);
       if (eq) this.textEq.push(eq);
       const g = this.em.gen(p);
@@ -758,9 +746,9 @@ class Pipeline {
       const body: string[] = [];
       if (a.kind === 'countStar') body.push(`${state(i)}.n++;`);
       else {
-        const g = em.gen(this.compiler.bind(a.arg!));
+        const g = em.gen(a.arg!);
         if (a.kind === 'step2') {
-          const g2 = em.gen(this.compiler.bind(a.arg2!));
+          const g2 = em.gen(a.arg2!);
           body.push(...this.take());
           body.push(`${state(i)}.step2(${em.value(g)}, ${em.value(g2)});`);
         } else {
@@ -769,7 +757,7 @@ class Pipeline {
         }
       }
       if (a.filter) {
-        const f = em.gen(this.compiler.bind(a.filter));
+        const f = em.gen(a.filter);
         this.rowLines.push(`{ ${this.take().join(' ')} if (${em.isTrue(f)}) { ${body.join(' ')} } }`);
       } else this.rowLines.push(`{ ${body.join(' ')} }`);
     });
@@ -801,13 +789,13 @@ function compileFn<T>(params: string[], src: string, args: unknown[]): T {
  * the WHERE conjuncts and steps the aggregates — no per-row operator calls.
  */
 export function generateFusedAggregate(
-  preds: Expr[],
+  preds: PlanExpr[],
   aggs: FusedAggSpec[],
   source: PipelineSource,
   helpers: FusedHelpers | ColumnarHelpers,
-  compiler: PipelineCompiler,
+  fallback: (e: PlanExpr) => FallbackNode,
 ): (r: SqlValue[], states: unknown[]) => void {
-  const pl = new Pipeline(compiler);
+  const pl = new Pipeline(fallback);
   pl.addPredicates(preds);
   pl.addAggregates(aggs, (i) => `S${i}`);
   const src = [...aggs.map((_, i) => `const S${i} = S[${i}];`), ...scanLoop(pl, source)].join('\n');
@@ -887,14 +875,14 @@ export interface ScanState {
  * number of rows written (0 = scan finished). The current leaf stays pinned in `st.f` between calls.
  */
 export function generateScanFilter(
-  preds: Expr[],
+  preds: PlanExpr[],
   outRegs: { reg: number; type: StaticType }[],
   cap: number,
   loaderSpec: () => LoaderSpec,
   helpers: FusedHelpers,
-  compiler: PipelineCompiler,
+  fallback: (e: PlanExpr) => FallbackNode,
 ): (st: ScanState, r: SqlValue[], out: SqlValue[]) => number {
-  const pl = new Pipeline(compiler);
+  const pl = new Pipeline(fallback);
   pl.addPredicates(preds);
   const w = outRegs.length;
   const writes = outRegs.map((o, j) => `out[k * ${w} + ${j}] = ${pl.regValue(o.reg, o.type)};`);
@@ -930,20 +918,20 @@ export interface GroupHelpers {
  * its aggregates.
  */
 export function generateGroupAggregate(
-  preds: Expr[],
-  groupExprs: { expr: Expr; collation: number }[],
+  preds: PlanExpr[],
+  groupExprs: { expr: PlanExpr; collation: number }[],
   aggs: FusedAggSpec[],
   source: PipelineSource,
   helpers: (FusedHelpers | ColumnarHelpers) & GroupHelpers & { newGroup: (keys: SqlValue[]) => { keys: SqlValue[]; st: unknown[] } },
-  compiler: PipelineCompiler,
+  fallback: (e: PlanExpr) => FallbackNode,
 ): (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => void {
-  const pl = new Pipeline(compiler);
+  const pl = new Pipeline(fallback);
   pl.addPredicates(preds);
   const em = pl.em;
   const keyLines: string[] = [];
   const keyVals: string[] = [];
   let keyExpr: string;
-  const gens = groupExprs.map((g) => em.gen(pl.compiler.bind(g.expr)));
+  const gens = groupExprs.map((g) => em.gen(g.expr));
   keyLines.push(...pl.take());
   gens.forEach((g, j) => keyLines.push(`const kv${j} = ${em.value(g)};`) && keyVals.push(`kv${j}`));
   if (gens.length === 1) {

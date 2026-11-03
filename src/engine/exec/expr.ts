@@ -14,7 +14,7 @@ import {
 import { currentTimeText } from './datetime.js';
 import { ARITHMETIC_FUNCTIONS, BITWISE_FUNCTIONS, COMPARISON_FUNCTIONS, arithImpl, negate, sqlFunction } from './sql-functions.js';
 import { type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
-import { type CodegenHelpers, type PipelineCompiler, codegenEnabled, generate, isCodegenRoot } from './codegen.js';
+import { type CodegenHelpers, type FallbackNode, codegenEnabled, generate, isCodegenRoot } from './codegen.js';
 import { WINDOW_ARITY } from './window.js';
 import { type SqlMeta, getMeta, setMeta } from './sql-meta.js';
 import { type PlanExpr, call, lit, param, typeOf } from '../plan/expr.js';
@@ -112,20 +112,56 @@ function isNumericType(t: StaticType): boolean {
  * to generated JavaScript when allowed (see codegen.ts), everything else with the closure compiler.
  */
 export function compileExpr(e: Expr, scope: CompileScope): Compiled {
-  const b = bindExpr(e, scope);
-  if (!codegenEnabled() || !isCodegenRoot(b)) return compilePlanExpr(b, scope.funcCtx);
+  return compileWithPlan(e, scope).compiled;
+}
+
+/**
+ * `compileExpr`, also returning the bound plan expression: operators keep it, so that pipeline fusion compiles it
+ * again without binding names a second time.
+ */
+export function compileWithPlan(e: Expr, scope: CompileScope): { compiled: Compiled; bound: PlanExpr } {
+  const bound = bindExpr(e, scope);
+  return { compiled: compileBoundExpr(bound, scope.funcCtx), bound };
+}
+
+/** Compile a bound expression: generated code for arithmetic / comparison / logic roots, otherwise closures. */
+export function compileBoundExpr(b: PlanExpr, ctx: FunctionContext): Compiled {
+  if (!codegenEnabled() || !isCodegenRoot(b)) return compilePlanExpr(b, ctx);
   if (b.k === 'call' && !b.fn.startsWith('sql.')) {
     // A math call: keep the closure compiler's result when it is constant (folded) or a register read.
-    const c = compilePlanExpr(b, scope.funcCtx);
+    const c = compilePlanExpr(b, ctx);
     if (c.constant || c.reg !== undefined) return c;
   }
-  const g = generate(b, CODEGEN_HELPERS, (x) => compilePlanExpr(x, scope.funcCtx));
+  const g = generate(b, CODEGEN_HELPERS, (x) => compilePlanExpr(x, ctx));
   return { fn: g.fn, type: g.type, collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
 }
 
-/** How fused pipelines compile the planner's expressions (see `PipelineCompiler` in codegen.ts). */
-export function pipelineCompiler(scope: CompileScope): PipelineCompiler {
-  return { bind: (e) => bindExpr(e, scope), fallback: (e) => compilePlanExpr(e, scope.funcCtx) };
+/** How fused pipelines compile a node of a bound expression with the closure compiler. */
+export function pipelineCompiler(scope: CompileScope): (e: PlanExpr) => FallbackNode {
+  return (e) => compilePlanExpr(e, scope.funcCtx);
+}
+
+/** True if a bound expression runs a subquery (fused pipelines leave those to the operators). */
+export function planHasSubquery(e: PlanExpr): boolean {
+  switch (e.k) {
+    case 'native':
+      return e.subquery === true;
+    case 'call':
+    case 'and':
+    case 'or':
+      return e.args.some(planHasSubquery);
+    case 'cast':
+    case 'not':
+    case 'isNull':
+      return planHasSubquery(e.arg);
+    case 'case':
+      return e.whens.some((w) => planHasSubquery(w.when) || planHasSubquery(w.then)) || planHasSubquery(e.else);
+    case 'subquery':
+    case 'inSubquery':
+      return true;
+    default:
+      return false;
+  }
 }
 
 const CODEGEN_HELPERS: CodegenHelpers = {
@@ -249,15 +285,15 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
             return v === null ? null : v === 1 ? 0 : 1;
           }
         : test;
-      return native({ fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false });
+      return native({ fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false }, true);
     }
     case 'exists': {
       const f = scope.existsSubquery(e.select);
       const fn: Fn = e.not ? (r) => (f(r) === 1 ? 0 : 1) : f;
-      return native({ fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false });
+      return native({ fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false }, true);
     }
     case 'subquery':
-      return native(scope.scalarSubquery(e.select));
+      return native(scope.scalarSubquery(e.select), true);
     case 'like': {
       const x = bindExpr(e.expr, scope);
       const pat = bindExpr(e.pattern, scope);
@@ -297,8 +333,8 @@ function stripped(e: PlanExpr): PlanExpr {
   return e;
 }
 
-function native(c: Compiled): PlanExpr {
-  return { k: 'native', compiled: c, type: c.type };
+function native(c: Compiled, subquery = false): PlanExpr {
+  return subquery ? { k: 'native', compiled: c, type: c.type, subquery: true } : { k: 'native', compiled: c, type: c.type };
 }
 
 function bindBinary(op: string, a: PlanExpr, b: PlanExpr): PlanExpr {

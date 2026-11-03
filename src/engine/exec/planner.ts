@@ -50,8 +50,10 @@ import {
   type Fn,
   compileExpr,
   compileNode,
+  compileWithPlan,
   comparisonCollation,
   pipelineCompiler,
+  planHasSubquery,
   comparisonConverters,
   conjuncts,
 } from './expr.js';
@@ -107,6 +109,7 @@ import { type ColumnStore, ROW_GROUP_ROWS, type Zone, zoneMayMatch } from '../st
 import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
 import { deletedBitmap, rowidsOf, zoneOf } from './columnar-table.js';
 import { anyNode, exprKey } from '../sql/ast-util.js';
+import type { PlanExpr } from '../plan/expr.js';
 import type { ExternalSource } from '../external/external.js';
 
 export interface PlannerEnv {
@@ -336,6 +339,12 @@ function walk(e: Expr, visit: (e: Expr) => boolean | void): void {
     default:
       break;
   }
+}
+
+/** A Filter on `e`, keeping the bound predicate for pipeline fusion. */
+function filterOn(child: Operator, e: Expr, cs: CompileScope): Filter {
+  const { compiled, bound } = compileWithPlan(e, cs);
+  return new Filter(child, compiled.fn, bound);
 }
 
 function hasSubquery(e: Expr): boolean {
@@ -623,7 +632,7 @@ export class Planner {
 
     let exprScope: CompileScope;
     let agg: { groupFns: Fn[]; groupColls: Collation[]; groupRegs: number[]; aggs: AggSpec[]; bare: Set<number> } | null = null;
-    let groupAstsForFusion: Expr[] = [];
+    let groupExprsForFusion: PlanExpr[] = [];
     if (isAgg) {
       const baseCompile = this.compileScope(scope);
       const groupCompiled = core.groupBy.map((g) => this.compileGroupTerm(g, scope, resultCols, baseCompile));
@@ -633,7 +642,7 @@ export class Planner {
       const bare = new Set<number>();
       agg = { groupFns: groupCompiled.map((g) => g.fn), groupColls: groupCompiled.map((g) => g.collation), groupRegs, aggs, bare };
       const groupAsts = core.groupBy.map((g) => this.resolveGroupAst(g, resultCols));
-      groupAstsForFusion = groupAsts;
+      groupExprsForFusion = groupCompiled.map((g) => g.bound);
       exprScope = {
         ...baseCompile,
         resolveColumn: (e) => {
@@ -666,21 +675,23 @@ export class Planner {
           if (inner) throw new SmaltError('SMALT_ERROR', `misuse of aggregate function ${inner.name}()`);
           if (call.orderBy?.length) throw new SmaltError('SMALT_UNSUPPORTED', 'ORDER BY inside aggregate functions is not supported yet');
           if (call.distinct && n !== 1) throw new SmaltError('SMALT_ERROR', 'DISTINCT aggregates must have exactly one argument');
-          const args = call.args.map((a) => compileExpr(a, baseCompile));
+          const bound = call.args.map((a) => compileWithPlan(a, baseCompile));
+          const args = bound.map((b) => b.compiled);
           const argTypes = args.map((a) => a.type);
+          const filter = call.filter ? compileWithPlan(call.filter, baseCompile) : undefined;
           const spec: AggSpec = {
             def,
             args: args.map((a) => a.fn),
             argTypes,
             distinct: call.distinct,
-            filter: call.filter ? compileExpr(call.filter, baseCompile).fn : undefined,
+            filter: filter?.compiled.fn,
             outReg: this.regs.alloc(),
             collation: args[0]?.collSrc ? args[0].collation : Collation.Binary,
             star: call.star,
             isMinMax: call.name === 'min' || call.name === 'max',
             name: call.name,
-            argAsts: call.args,
-            filterAst: call.filter,
+            argExprs: bound.map((b) => b.bound),
+            filterExpr: filter?.bound,
           };
           aggs.push(spec);
           aggAsts.push(call);
@@ -754,7 +765,7 @@ export class Planner {
           ? null
           : agg.groupFns.length === 0
             ? this.tryFuseAggregate(root, agg.aggs, scope)
-            : this.tryFuseGroupAggregate(root, groupAstsForFusion, agg.groupColls, agg.groupRegs, agg.aggs, scope);
+            : this.tryFuseGroupAggregate(root, groupExprsForFusion, agg.groupColls, agg.groupRegs, agg.aggs, scope);
       const hashAgg = new HashAggregate(root, agg.groupFns, agg.groupColls, agg.groupRegs, agg.aggs, [...agg.bare], this.env.spill ?? null);
       // A fused GROUP BY that outgrows work_mem starts over as the (spilling) hash aggregate.
       if (fused instanceof FusedGroupAggregate) fused.fallback = hashAgg;
@@ -918,13 +929,13 @@ export class Planner {
    * (FusedScanAggregate). Returns null when the shape or the aggregates do not qualify.
    */
   /** Match `Filter* -> forward full TableScan`; returns the scan and the predicate ASTs (outermost last). */
-  private scanChain(src: Operator): { scan: TableScan | ColumnScan | ColumnarTableScan; preds: Expr[] } | null {
+  private scanChain(src: Operator): { scan: TableScan | ColumnScan | ColumnarTableScan; preds: PlanExpr[] } | null {
     if (!codegenEnabled()) return null;
-    const preds: Expr[] = [];
+    const preds: PlanExpr[] = [];
     let node: Operator = src;
     while (node instanceof Filter) {
-      if (!node.ast || hasSubquery(node.ast)) return null;
-      preds.push(node.ast);
+      if (!node.expr || planHasSubquery(node.expr)) return null;
+      preds.push(node.expr);
       node = node.child;
     }
     if (node instanceof ColumnScan || node instanceof ColumnarTableScan) return { scan: node, preds: preds.reverse() };
@@ -935,12 +946,12 @@ export class Planner {
   private fusedAggSpecs(aggs: AggSpec[]): FusedAggSpec[] | null {
     const specs: FusedAggSpec[] = [];
     for (const a of aggs) {
-      const two = FUSABLE_AGGS2.has(a.name) && a.argAsts.length === 2;
-      if (a.distinct || (!two && (!FUSABLE_AGGS.has(a.name) || a.argAsts.length > 1))) return null;
-      if ([a.filterAst, ...a.argAsts].some((x) => x !== undefined && hasSubquery(x))) return null;
-      if (a.name === 'count') specs.push(a.star ? { kind: 'countStar', filter: a.filterAst } : { kind: 'count', arg: a.argAsts[0], filter: a.filterAst });
-      else if (two) specs.push({ kind: 'step2', arg: a.argAsts[0], arg2: a.argAsts[1], filter: a.filterAst });
-      else specs.push({ kind: 'step', arg: a.argAsts[0], filter: a.filterAst });
+      const two = FUSABLE_AGGS2.has(a.name) && a.argExprs.length === 2;
+      if (a.distinct || (!two && (!FUSABLE_AGGS.has(a.name) || a.argExprs.length > 1))) return null;
+      if ([a.filterExpr, ...a.argExprs].some((x) => x !== undefined && planHasSubquery(x))) return null;
+      if (a.name === 'count') specs.push(a.star ? { kind: 'countStar', filter: a.filterExpr } : { kind: 'count', arg: a.argExprs[0], filter: a.filterExpr });
+      else if (two) specs.push({ kind: 'step2', arg: a.argExprs[0], arg2: a.argExprs[1], filter: a.filterExpr });
+      else specs.push({ kind: 'step', arg: a.argExprs[0], filter: a.filterExpr });
     }
     return specs;
   }
@@ -990,10 +1001,10 @@ export class Planner {
   }
 
   /** Scan + filter + GROUP BY + aggregates in one generated loop. */
-  private tryFuseGroupAggregate(src: Operator, groupAsts: Expr[], groupColls: Collation[], groupRegs: number[], aggs: AggSpec[], scope: Scope): Operator | null {
+  private tryFuseGroupAggregate(src: Operator, groupExprs: PlanExpr[], groupColls: Collation[], groupRegs: number[], aggs: AggSpec[], scope: Scope): Operator | null {
     const chain = this.scanChain(src);
     const specs = this.fusedAggSpecs(aggs);
-    if (!chain || !specs || groupAsts.some(hasSubquery)) return null;
+    if (!chain || !specs || groupExprs.some(planHasSubquery)) return null;
     const access = chain.scan.access;
     const cs = this.compileScope(scope);
     const node = chain.scan;
@@ -1008,7 +1019,7 @@ export class Planner {
         return { keys, st: aggs.map((a) => a.def.create(a.star ? [] : a.argTypes, a.collation)) };
       },
     };
-    const groupSpecs = groupAsts.map((expr, i) => ({ expr, collation: groupColls[i] }));
+    const groupSpecs = groupExprs.map((expr, i) => ({ expr, collation: groupColls[i] }));
     const gen = (scan: TableScan | ColumnScan) =>
       generateGroupAggregate(chain.preds, groupSpecs, specs, this.pipelineSource(scan), { ...helpers, ...(scan instanceof ColumnScan ? this.columnarHelpers(scan) : this.fusedHelpers(access)) }, pipelineCompiler(cs));
     // A columnar table: one loop over the delta store's leaves, one over the segments, same groups.
@@ -1146,12 +1157,12 @@ export class Planner {
     return g;
   }
 
-  private compileGroupTerm(g: Expr, scope: Scope, cols: { alias?: string; expr: Expr }[], cs: CompileScope): Compiled {
+  private compileGroupTerm(g: Expr, scope: Scope, cols: { alias?: string; expr: Expr }[], cs: CompileScope): Compiled & { bound: PlanExpr } {
     const ast = this.resolveGroupAst(g, cols);
     if (containsAggregate(ast)) throw new SmaltError('SMALT_ERROR', 'aggregate functions are not allowed in the GROUP BY clause');
     void scope;
-    const c = compileExpr(ast, cs);
-    return { ...c, collation: c.collSrc !== CollSrc.None ? c.collation : Collation.Binary };
+    const { compiled: c, bound } = compileWithPlan(ast, cs);
+    return { ...c, collation: c.collSrc !== CollSrc.None ? c.collation : Collation.Binary, bound };
   }
 
   private planValues(rows: Expr[][], parent: Scope | null, outRegs: number[] | undefined, stmt: SelectStmt | null): QueryPlan {
@@ -1317,7 +1328,7 @@ export class Planner {
         outerRows = Math.max(outerRows, this.tableRows(src));
         for (const c of pool) {
           if (c.placed || c.deps === null || c.deps.size === 0 || (c.minStep ?? -1) > p || ![...c.deps].every((d) => placed.has(d))) continue;
-          root = new Filter(root, compileExpr(c.expr, cs).fn, c.expr);
+          root = filterOn(root, c.expr, cs);
           c.placed = true;
         }
         continue;
@@ -1336,7 +1347,7 @@ export class Planner {
       let leaf = access.leaf;
       const local = candidates.filter((c) => c.deps!.size === 1 && !c.placed);
       for (const c of local) {
-        leaf = new Filter(leaf, compileExpr(c.expr, cs).fn, c.expr);
+        leaf = filterOn(leaf, c.expr, cs);
         c.placed = true;
       }
       // In joins, standalone full scans of this source run as generated scan + filter pipelines.
@@ -1376,14 +1387,14 @@ export class Planner {
       // Remaining WHERE / inner-ON conjuncts whose dependencies are now all available.
       for (const c of pool) {
         if (c.placed || c.deps === null || c.deps.size === 0 || (c.minStep ?? -1) > p || ![...c.deps].every((d) => placed.has(d))) continue;
-        root = new Filter(root, compileExpr(c.expr, cs).fn, c.expr);
+        root = filterOn(root, c.expr, cs);
         c.placed = true;
       }
     }
     // Constant / correlated-only / subquery conjuncts.
     for (const c of pool) {
       if (c.placed) continue;
-      root = new Filter(root!, compileExpr(c.expr, cs).fn, c.expr);
+      root = filterOn(root!, c.expr, cs);
       c.placed = true;
     }
     return root!;
