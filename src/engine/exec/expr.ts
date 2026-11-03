@@ -14,11 +14,12 @@ import {
 import { currentTimeText } from './datetime.js';
 import { ARITHMETIC_FUNCTIONS, BITWISE_FUNCTIONS, COMPARISON_FUNCTIONS, arithImpl, negate, sqlFunction } from './sql-functions.js';
 import { type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
-import { type CodegenHelpers, type FallbackNode, codegenEnabled, generate, isCodegenRoot } from './codegen.js';
+import { type CodegenHelpers, type FallbackNode, codegenEnabled, generate, generatedType, isCodegenRoot } from './codegen.js';
 import { WINDOW_ARITY } from './window.js';
 import { type SqlMeta, getMeta, setMeta } from './sql-meta.js';
 import { type PlanExpr, call, lit, param, typeOf } from '../plan/expr.js';
 import type { CollationName } from '../plan/types.js';
+import type { PlanOp } from '../plan/ops.js';
 import { decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
 import { readRowidKey } from '../storage/key-codec.js';
 
@@ -55,6 +56,8 @@ export interface ColumnBinding {
    * Without `defer`, resolving marks it at once.
    */
   use?: () => void;
+  /** The name resolved to a select-list alias, bound by the SQL front end: use this plan expression. */
+  bound?: PlanExpr;
 }
 
 /** Name resolution and planner callbacks used while compiling expressions. */
@@ -73,6 +76,11 @@ export interface CompileScope {
   existsSubquery(select: SelectStmt): Fn;
   /** Returns membership test: 1, 0, or NULL (SQL IN semantics) for a probe value. */
   inSubquery(select: SelectStmt, probe: Compiled): Fn;
+  /**
+   * The SQL front end (ADR 0014, step 5): plan a subquery as a nested plan instead of compiling it. Given, the binder
+   * produces `subquery` / `inSubquery` plan nodes; `column` is the scalar subquery's first result column.
+   */
+  planSubquery?(select: SelectStmt, mode: 'scalar' | 'exists' | 'in'): { plan: PlanOp; column: { type: StaticType; collation: Collation } };
   funcCtx: FunctionContext;
 }
 
@@ -145,6 +153,20 @@ export function compileBoundExpr(b: PlanExpr, ctx: FunctionContext): Compiled {
   return { fn: g.fn, type: g.type, collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
 }
 
+/**
+ * The static metadata `compileBoundExpr` gives a bound expression (type, collation, affinity), without generating
+ * code: the SQL front end (ADR 0014, step 5) derives its result columns' metadata exactly as the planner does.
+ */
+export function boundMetadata(b: PlanExpr, ctx: FunctionContext): Pick<Compiled, 'type' | 'collation' | 'collSrc' | 'affinity'> {
+  if (!codegenEnabled() || !isCodegenRoot(b)) return compilePlanExpr(b, ctx);
+  if (b.k === 'call' && !b.fn.startsWith('sql.')) {
+    const c = compilePlanExpr(b, ctx);
+    if (c.constant || c.reg !== undefined) return c;
+  }
+  // Generated code carries no collation or affinity.
+  return { type: generatedType(b, (x) => compilePlanExpr(x, ctx)), collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE' };
+}
+
 /** How fused pipelines compile a node of a bound expression with the closure compiler. */
 export function pipelineCompiler(scope: CompileScope): (e: PlanExpr) => FallbackNode {
   return (e) => compilePlanExpr(e, scope.funcCtx);
@@ -203,6 +225,13 @@ function withMeta<T extends PlanExpr>(e: T, m: SqlMeta): T {
 
 const metaOf = (e: PlanExpr): SqlMeta => getMeta(e) ?? NO_META;
 
+/** A copy of `e` carrying the SQL metadata of `c` (the SQL front end: a select-list alias, as the planner compiled it). */
+export function withCompiledMeta(e: PlanExpr, c: Pick<Compiled, 'collation' | 'collSrc' | 'affinity'>): PlanExpr {
+  const copy = { ...e };
+  setMeta(copy, { ...metaOf(e), collation: c.collation, collSrc: c.collSrc, affinity: c.affinity });
+  return copy;
+}
+
 /** Mark `e` as an SQL form that code generation leaves to the closure compiler (see SqlMeta.opaque). */
 function opaque<T extends PlanExpr>(e: T): T {
   setMeta(e, { ...metaOf(e), opaque: true });
@@ -243,6 +272,7 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
       return param(e.index - 1);
     case 'column': {
       const b = scope.resolveColumn(e, true);
+      if (b.bound) return b.bound;
       if (b.compiled) return native(b.compiled);
       const slot: PlanExpr = b.use ? { k: 'slot', reg: b.reg, type: b.type, use: b.use } : { k: 'slot', reg: b.reg, type: b.type };
       return withMeta(slot, { collation: b.collation, collSrc: CollSrc.Column, affinity: b.affinity });
@@ -287,6 +317,12 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
       return e.not ? opaque({ k: 'not', arg: inList }) : inList;
     }
     case 'inSelect': {
+      if (scope.planSubquery) {
+        const probe = bindExpr(e.expr, scope);
+        const sub = scope.planSubquery(e.select, 'in');
+        const node: PlanExpr = { k: 'inSubquery', probe, plan: sub.plan, collation: 'binary' };
+        return e.not ? { k: 'not', arg: node } : node;
+      }
       const probe = compilePlanExpr(bindExpr(e.expr, scope), scope.funcCtx);
       const test = scope.inSubquery(e.select, probe);
       const fn: Fn = e.not
@@ -298,12 +334,23 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
       return native({ fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false }, true);
     }
     case 'exists': {
+      if (scope.planSubquery) {
+        const node: PlanExpr = { k: 'subquery', mode: 'exists', plan: scope.planSubquery(e.select, 'exists').plan, type: 'int', collation: 'binary' };
+        return e.not ? { k: 'not', arg: node } : node;
+      }
       const f = scope.existsSubquery(e.select);
       const fn: Fn = e.not ? (r) => (f(r) === 1 ? 0 : 1) : f;
       return native({ fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false }, true);
     }
-    case 'subquery':
+    case 'subquery': {
+      if (scope.planSubquery) {
+        const { plan, column } = scope.planSubquery(e.select, 'scalar');
+        const node: PlanExpr = { k: 'subquery', mode: 'scalar', plan, type: column.type, collation: collationName(column.collation) };
+        // As the compiled scalar subquery: its column's collation, from a column.
+        return withMeta(node, { collation: column.collation, collSrc: column.collation ? CollSrc.Column : CollSrc.None, affinity: 'NONE' });
+      }
       return native(scope.scalarSubquery(e.select), true);
+    }
     case 'like': {
       const x = bindExpr(e.expr, scope);
       const pat = bindExpr(e.pattern, scope);
@@ -484,9 +531,16 @@ function compileBound(e: PlanExpr, ctx: FunctionContext): Compiled {
     }
     case 'call':
       return e.fn.startsWith('sql.') ? compileSqlCall(e, ctx, false) : compileScalarCall(e, ctx);
-    case 'col':
     case 'subquery':
-    case 'inSubquery':
+    case 'inSubquery': {
+      // Plans from the SQL front end are not executed yet (ADR 0014, step 6): compiling one gives its static
+      // metadata, which the front end compares with the current planner's, and a closure that refuses to run.
+      const fn: Fn = () => {
+        throw new SmaltError('SMALT_INTERNAL', 'a plan from the SQL front end cannot run yet');
+      };
+      return { fn, type: typeOf(e), collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
+    }
+    case 'col':
       throw new SmaltError('SMALT_INTERNAL', `plan expression ${e.k} cannot be compiled yet`);
   }
 }

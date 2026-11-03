@@ -24,6 +24,8 @@ import { type ExternalScan, Planner, type QueryPlan, Registers, markUnordered } 
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
+import { planShadowEnabled, shadowCheck } from './exec/plan-shadow.js';
+import type { FrontEndCatalog } from './sql/frontend/select.js';
 import { type MatviewCandidate, matchMatview } from './exec/mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import type { ReaderSettings } from '../shared/protocol.js';
@@ -1006,6 +1008,12 @@ export class Database implements FunctionContext {
     return { root: plan.root, columns: plan.columns.map((c) => ({ name: c.name, type: c.type })), subplans: planner.subplans, estimates: planner.estimates };
   }
 
+  /** What the SQL front end (ADR 0014, step 5) reads of the catalog. */
+  private frontEndCatalog(): FrontEndCatalog {
+    const deps = this.plannerDeps();
+    return { getTable: deps.getTable, getView: deps.getView, isExternal: (n) => this.externals.has(n.toLowerCase()), funcCtx: this };
+  }
+
   /** @internal Compile a statement AST into a program for the current schema. */
   compile(ps: ParsedStatement): Program {
     const stmt = ps.stmt;
@@ -1015,7 +1023,7 @@ export class Database implements FunctionContext {
     const done = (p: Omit<Program, 'regCount'>): Program => ({ ...p, regCount: regs.count, rowAssumptions: planner.rowAssumptions, externals: planner.finishExternals() });
     switch (stmt.kind) {
       case 'select': {
-        const plan = planner.planSelect(stmt, null);
+        const plan = planShadowEnabled() ? shadowCheck(stmt, ps.text, this.frontEndCatalog(), () => planner.planSelect(stmt, null), () => planner.usedMatview) : planner.planSelect(stmt, null);
         return done({ plan, readonly: true, columns: plan.columns.map((c) => c.name), columnTypes: plan.columns.map((c) => c.type) });
       }
       case 'insert': {

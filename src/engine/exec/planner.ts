@@ -262,7 +262,7 @@ class Scope {
   }
 }
 
-function sameName(a: string, b: string): boolean {
+export function sameName(a: string, b: string): boolean {
   return a.length === b.length && a.toLowerCase() === b.toLowerCase();
 }
 
@@ -292,7 +292,7 @@ export function exprEquals(a: unknown, b: unknown): boolean {
 }
 
 /** Visit an expression tree; `visit` returns false to skip children. Does not enter subqueries. */
-function walk(e: Expr, visit: (e: Expr) => boolean | void): void {
+export function walk(e: Expr, visit: (e: Expr) => boolean | void): void {
   if (visit(e) === false) return;
   switch (e.kind) {
     case 'unary':
@@ -360,7 +360,7 @@ export function isAggregateCall(e: Expr): e is CallExpr {
   return e.kind === 'call' && aggregateFunctions.has(e.name) && !((e.name === 'min' || e.name === 'max') && e.args.length > 1) && e.over === undefined;
 }
 
-function containsAggregate(e: Expr | undefined): boolean {
+export function containsAggregate(e: Expr | undefined): boolean {
   if (!e) return false;
   let found = false;
   walk(e, (x) => {
@@ -444,8 +444,13 @@ export class Planner {
     const from = core.from;
     if (!from.schema && parent?.findCte(from.name)) return null;
     if (parent !== null && !this.readsOnlyItsTable(stmt, from)) return null;
-    return rewrite(stmt, this.sqlText);
+    const r = rewrite(stmt, this.sqlText);
+    if (r) this.usedMatview = true;
+    return r;
   }
+
+  /** Some SELECT was rewritten to read a materialized view (SMALT_PLAN=shadow compares only unrewritten plans). */
+  usedMatview = false;
 
   /** One SELECT of a compound (UNION / INTERSECT / EXCEPT) answered from a materialized view. */
   private matviewCore(core: SelectCore, parent: Scope | null): SelectCore {
@@ -2882,7 +2887,7 @@ function coreReferences(core: SelectCore, name: string): boolean {
 }
 
 /** Whether a SELECT reads table `name` in one of its FROM clauses (the recursion of a CTE). */
-function selectReferences(s: SelectStmt, name: string): boolean {
+export function selectReferences(s: SelectStmt, name: string): boolean {
   if (s.with?.ctes.some((c) => sameName(c.name, name))) return false; // shadowed
   return coreReferences(s.core, name) || s.compound.some((c) => coreReferences(c.core, name));
 }
@@ -2901,7 +2906,7 @@ function firstWindowCall(e: Expr): CallExpr | undefined {
 }
 
 /** The first aggregate call in `e`, if any. */
-function firstAggregateCall(e: Expr): CallExpr | undefined {
+export function firstAggregateCall(e: Expr): CallExpr | undefined {
   let found: CallExpr | undefined;
   walk(e, (x) => {
     if (found) return false;
@@ -2913,7 +2918,7 @@ function firstAggregateCall(e: Expr): CallExpr | undefined {
   return found;
 }
 
-function containsWindow(e: Expr | undefined): boolean {
+export function containsWindow(e: Expr | undefined): boolean {
   if (!e) return false;
   let found = false;
   walk(e, (x) => {

@@ -3,17 +3,13 @@
  * no implicit conversions. Every conversion a language makes is an explicit `cast` or function call, and behaviour
  * that differs between languages lives in named functions the front end chooses (SQL's are `sql.*`, in
  * exec/sql-functions.ts).
- *
- * Nested plans (`subquery`, `inSubquery`) arrive with the plan operations in step 5 of the ADR's order of work;
- * until then they are typed by an opaque placeholder.
  */
 import type { SqlValue } from '../values.js';
+import type { PlanOp } from './ops.js';
 import type { CollationName, PlanType } from './types.js';
 
-/** A nested plan. Placeholder until the plan operations exist (ADR 0014, step 5). */
-export interface NestedPlan {
-  readonly op: string;
-}
+/** A nested plan (the operation tree of a subquery). */
+export type NestedPlan = PlanOp;
 
 export type PlanExpr =
   /**

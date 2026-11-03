@@ -374,6 +374,14 @@ class Emitter {
   }
 }
 
+/**
+ * The static type `generate` gives `e`, without generating a function (the SQL front end compares result types with
+ * the planner's; a constant folded to NULL makes generated arithmetic `num`, for example).
+ */
+export function generatedType(e: PlanExpr, fallback: (e: PlanExpr) => FallbackNode): StaticType {
+  return new Emitter(fallback).gen(e).type;
+}
+
 /** Generated sources recorded for tests (test/codegen-source.test.ts), or null when not recording. */
 let traced: string[] | null = null;
 
