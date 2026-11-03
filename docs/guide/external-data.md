@@ -145,6 +145,7 @@ Because one `opened` value is a fraction, the whole column is REAL.
 
 ### Parquet
 
+<!-- docs:plugin @smaltdb/parquet -->
 ```sql
 SELECT * FROM read_parquet('file:ext-sales.parquet');
 ```
@@ -586,6 +587,7 @@ npm install @smaltdb/parquet
 
 Add it to the plugins of your engine worker entry, next to `@smaltdb/external` for the source (see [Plugins](#plugins)):
 
+<!-- docs:plugin @smaltdb/parquet -->
 ```ts
 // db-worker.ts
 import { serve } from 'smaltdb/worker-runtime';
@@ -617,6 +619,7 @@ Remote files are read with HTTP `Range` requests, registered `File`s and `Blob`s
 
 Row groups are skipped using each column's minimum, maximum and NULL count, for `WHERE` conditions of the form `column op constant` (`=`, `<`, `<=`, `>`, `>=`), `BETWEEN` and `IN (…)` with constants. This works for `read_parquet()` calls and external tables alike, but not for a source on the right of a `LEFT JOIN` or with `RIGHT` or `FULL` joins. The answer is always the same as a full read.
 
+<!-- docs:plugin @smaltdb/parquet -->
 ```sql
 CREATE EXTERNAL TABLE sales WITH (location = 'file:ext-sales.parquet');
 SELECT region, sum(units) AS units FROM sales WHERE sold >= '2026-02-01' GROUP BY region ORDER BY region;
@@ -642,6 +645,7 @@ SELECT region, sum(units) AS units FROM sales WHERE sold >= '2026-02-01' GROUP B
 
 Dates and timestamps come out in the format SQLite's date functions use, so they compare and sort correctly as text and work with `date()`, `strftime()` and the rest:
 
+<!-- docs:plugin @smaltdb/parquet -->
 ```sql
 SELECT sold, typeof(sold), strftime('%m', sold) AS month FROM sales LIMIT 2;
 ```

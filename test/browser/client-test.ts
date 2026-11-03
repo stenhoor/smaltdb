@@ -2,7 +2,6 @@
 import { open } from '../../src/client/index.js';
 import { registerCredentials, registerFile } from '@smaltdb/external/client';
 import { exportCSV, exportJSON, importCSV, importJSON } from '@smaltdb/io/client';
-import { signV4 } from '../../plugins/external/src/sign.js';
 
 type Check = { name: string; ok: boolean; detail?: string };
 
@@ -53,31 +52,6 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   await registerCredentials(db, 'site-token', null);
   await db.exec('DROP MATERIALIZED VIEW prices_cache; DROP EXTERNAL TABLE prices; DROP CONNECTION site');
   await registerFile(db, 'stock', null);
-
-  // Parquet (M8.3) over HTTP: footer, column chunks and row groups by ranges; zstd via the optional compressors.
-  const pq = await db.query(`SELECT count(*), sum(amount), min(day), max(id) FROM read_parquet('${location.origin}/sales.parquet') WHERE id >= 1000`, undefined, { rowMode: 'array' });
-  const pqTypes = await db.query(`SELECT i64, d, ts, dec, lst FROM read_parquet('${location.origin}/types.parquet') WHERE i32 = 1`, undefined, { rowMode: 'array' });
-  check('Parquet over HTTP (zstd, row-group pruning, types)', JSON.stringify(pq) === JSON.stringify([[3000, 144154, '2024-01-21', 3999]]) && JSON.stringify(pqTypes) === JSON.stringify([[2 ** 40, '2024-02-29', '2024-01-02 03:04:05.678', 12.34, '[1,2]']]), [pq, pqTypes]);
-
-  // Hosts that compress responses (GitHub Pages; issue #32): HEAD's Content-Length is the gzipped
-  // size there. Same-origin, and cross-origin with only Content-Length and ETag exposed by CORS.
-  const xo = new URLSearchParams(location.search).get('xo');
-  for (const [name, base] of [
-    ['same-origin', `${location.origin}/gz`],
-    ['cross-origin, Content-Range not exposed', `${xo}/gz`],
-  ]) {
-    const got = await db
-      .query(`SELECT count(*), sum(amount), min(day), max(id) FROM read_parquet('${base}/sales.parquet') WHERE id >= 1000`, undefined, { rowMode: 'array' })
-      .then((r) => JSON.stringify(r), (e: Error) => e.message);
-    await db.exec(`DROP EXTERNAL TABLE IF EXISTS gz; CREATE EXTERNAL TABLE gz WITH (location = '${base}/sales.parquet')`).catch(() => undefined);
-    const ext = await db.query('SELECT count(*), count(DISTINCT region) FROM gz', undefined, { rowMode: 'array' }).then((r) => JSON.stringify(r), (e: Error) => e.message);
-    await db.exec('DROP EXTERNAL TABLE IF EXISTS gz');
-    check(`Parquet from a host that compresses responses (${name})`, got === JSON.stringify([[3000, 144154, '2024-01-21', 3999]]) && ext === JSON.stringify([[4000, 3]]), [got, ext]);
-  }
-
-  // Object-store signing (M8.2) runs on this browser's WebCrypto: AWS's published SigV4 test vector.
-  const v4 = await signV4({ method: 'GET', url: 'https://examplebucket.s3.amazonaws.com/test.txt', headers: { Range: 'bytes=0-9' } }, { accessKeyId: 'AKIAIOSFODNN7EXAMPLE', secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' }, 'us-east-1', 's3', new Date('2013-05-24T00:00:00Z'));
-  check('S3 request signing (SigV4 test vector) with WebCrypto', v4.authorization.endsWith('Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41'), v4.authorization);
 
   // Spill to OPFS: a tiny work_mem makes the sort and the GROUP BY go through the scratch file.
   const plain = await db.query('SELECT price % 37 AS k, count(*) AS n, sum(id) AS s FROM items GROUP BY k ORDER BY k, n', undefined, { rowMode: 'array' });

@@ -226,6 +226,7 @@ Reads a Parquet file. Only the columns the query uses are fetched, and row group
 | other binary | BLOB |
 | lists, structs, maps | TEXT holding JSON |
 
+<!-- docs:plugin @smaltdb/parquet -->
 ```sql
 SELECT * FROM read_parquet('file:fn-cities.parquet');
 ```
@@ -238,6 +239,7 @@ SELECT * FROM read_parquet('file:fn-cities.parquet');
 
 The read functions combine with each other and with tables:
 
+<!-- docs:plugin @smaltdb/parquet -->
 ```sql
 SELECT c.name, c.population, p.founded
 FROM read_csv('file:fn-cities.csv') AS c

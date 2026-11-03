@@ -54,11 +54,17 @@ What M1 adds:
 - **Record format:** property tests for round trips and for rowid key ordering.
 - **SQL smoke tests:** constraints, transactions, persistence, `EXPLAIN QUERY PLAN`.
 
-## Fixtures
+## Plugins
 
-`test/fixtures/parquet` holds Parquet files written by pyarrow, an independent writer, so the reader is tested against
-what other tools produce: every common type, four codecs, row groups with statistics, and a Hive-partitioned dataset.
-Regenerate them with `pip install pyarrow && python3 scripts/gen-parquet-fixtures.py`.
+The plugins live in their own repositories ([ADR 0012](adr/0012-plugins.md)): `stenhoor/smaltdb-io`,
+`stenhoor/smaltdb-external` and `stenhoor/smaltdb-parquet`, each with its own tests (the Parquet fixtures written by
+pyarrow are in `smaltdb-parquet`). This repository tests the plugin interface with plugins defined in
+`test/plugins.test.ts`. The docs examples and the browser tests also use `@smaltdb/io` and `@smaltdb/external`:
+- `packed.json` pins them to commits of their repositories.
+- `npm run deps` (`scripts/fetch-packed.mjs`) builds those commits and installs them with `npm install --no-save`.
+  Run it after every `npm ci` or `npm install`; `npm test` and `npm run typecheck` stop with a message when they are
+  missing.
+- To test against an unmerged plugin change, run `node scripts/fetch-packed.mjs --local @smaltdb/io=../smaltdb-io`.
 
 ## Documentation examples
 
@@ -67,13 +73,16 @@ Regenerate them with `pip install pyarrow && python3 scripts/gen-parquet-fixture
   are registered as `file:<name>`.
 - A Markdown table directly after a `sql` block is the expected result of the block's last statement. The header row
   is the column names, `NULL` is NULL, blobs are `x'hex'`, and numbers print as JavaScript does (REAL 2.0 is `2`).
-- Every `ts` block is type-checked against the public API: `smaltdb` and `smaltdb/engine` resolve to `src/`. `db` is
-  predeclared as a client `Database` unless the block declares its own.
+- Every `ts` block is type-checked against the public API: `smaltdb` and `smaltdb/engine` resolve to `src/`, and the
+  plugins to their installed packages. `db` is predeclared as a client `Database` unless the block declares its own.
 - Markers go in an HTML comment on the line before a block:
   - `<!-- docs:skip -->`: the block is not run, e.g. a URL or S3 example.
   - `<!-- docs:error SMALT_CODE -->`: the block's last statement must fail with this code.
   - `<!-- docs:unordered -->`: compare the rows in any order.
   - `<!-- docs:setup SQL -->`: hidden SQL that runs before the block.
+  - `<!-- docs:plugin @smaltdb/parquet -->`: the block needs Parquet, which this repository doesn't install. It is
+    skipped here; `smaltdb-parquet` runs every page with such a block, top to bottom with all plugins, against the
+    docs at the smaltdb commit it pins. Mark later blocks that use what a marked block created, too.
 
 ## Timing in tests
 
