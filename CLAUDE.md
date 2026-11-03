@@ -24,7 +24,7 @@ Playwright is resolved globally in local containers (see `test/browser/playwrigh
 - `src/client/`: the `smaltdb` client (`open()`, `Database`). `src/engine/`: the engine (SQL in `sql/`, planner and
   execution in `exec/`, B-trees, pager and WAL in `storage/`, catalog, VFS, worker server and runtime). `src/shared/`:
   the worker protocol.
-- `plugins/*`: optional packages (`@smaltdb/parquet`, …) as npm workspaces. ADR 0012 moves each to its own repository.
+- `plugins/*`: optional packages (`@smaltdb/parquet`) as npm workspaces ([ADR 0012](docs/adr/0012-plugins.md)).
 - Read before changing things: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/TESTING.md](docs/TESTING.md),
   [docs/ROADMAP.md](docs/ROADMAP.md), and the decisions in [docs/adr/](docs/adr/README.md). A significant decision
   gets a new ADR.
