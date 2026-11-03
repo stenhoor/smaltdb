@@ -39,7 +39,7 @@ smaltdf ───────────────→ plan builder ─┐
 SQL → parser → SQL front end ──────────┘
 ```
 
-The ADR's section 5 gives the order of work. Until those steps land, the description above is the code.
+The ADR's section 5 gives the order of work, and [research/plan-layer-implementation.md](research/plan-layer-implementation.md) works it out against the code. Until those steps land, the description above is the code.
 
 **Plan caching:** the database caches prepared statements by SQL text. A cached statement compiles again when the
 schema version changes (any DDL, or a setting that changes planning).
