@@ -50,11 +50,20 @@ export interface ColumnBinding {
   affinity: Affinity;
   /** The name resolved to a select-list alias: use this compiled expression instead of a register. */
   compiled?: Compiled;
+  /**
+   * Resolved with `defer`: marks the column as read (projection pushdown), for when the expression is compiled.
+   * Without `defer`, resolving marks it at once.
+   */
+  use?: () => void;
 }
 
 /** Name resolution and planner callbacks used while compiling expressions. */
 export interface CompileScope {
-  resolveColumn(e: ColumnExpr): ColumnBinding;
+  /**
+   * Resolve a column name. With `defer`, the column is marked as read only when the binding's `use` runs (the binder
+   * calls it from compiling); scopes that don't support deferring may ignore it and mark at once.
+   */
+  resolveColumn(e: ColumnExpr, defer?: boolean): ColumnBinding;
   /** Post-aggregation context: maps an aggregate call (or GROUP BY expression) to its register. */
   aggregateRef?(call: CallExpr): ColumnBinding;
   groupRef?(e: Expr): ColumnBinding | undefined;
@@ -233,9 +242,10 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
     case 'param':
       return param(e.index - 1);
     case 'column': {
-      const b = scope.resolveColumn(e);
+      const b = scope.resolveColumn(e, true);
       if (b.compiled) return native(b.compiled);
-      return withMeta({ k: 'slot', reg: b.reg, type: b.type }, { collation: b.collation, collSrc: CollSrc.Column, affinity: b.affinity });
+      const slot: PlanExpr = b.use ? { k: 'slot', reg: b.reg, type: b.type, use: b.use } : { k: 'slot', reg: b.reg, type: b.type };
+      return withMeta(slot, { collation: b.collation, collSrc: CollSrc.Column, affinity: b.affinity });
     }
     case 'collate': {
       const inner = bindExpr(e.expr, scope);
@@ -445,6 +455,7 @@ function compileBound(e: PlanExpr, ctx: FunctionContext): Compiled {
       return { fn: (r) => r[reg], type: 'any', collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false, reg };
     }
     case 'slot':
+      e.use?.();
       return { fn: regReader(e.reg), type: e.type, collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false, reg: e.reg };
     case 'native':
       return e.compiled as Compiled;

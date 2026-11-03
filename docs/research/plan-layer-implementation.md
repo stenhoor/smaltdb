@@ -110,9 +110,14 @@ parser's expressions again, so names are resolved once; columns were already mar
 compiled, so decode lists and generated code are unchanged. Fusion declines on `native` nodes from subqueries, where
 it declined on subquery AST (a compiled alias is a `native` node too, and fuses as before).
 
-### Step 4b (added): FROM/WHERE machinery on bound conjuncts (about 600 lines)
+### Step 4b (added): FROM/WHERE machinery on bound conjuncts
 
-The conjunct pool keeps a bound form next to the AST (null while a conjunct holds a subquery, which keeps subquery
+- **4b-i (done): columns are marked as read when compiled.** Resolving a name used to mark the column for decoding
+  (projection pushdown). The binder now resolves with `defer`: the bound `slot` carries the marking (`use`), and
+  compiling the slot (or generating code that reads it) runs it, except in trial compiles while costing. Direct
+  callers of `resolveColumn` still mark at once. Pushdown is unchanged, and conjuncts can now be bound before the
+  planner knows which of them an index will consume.
+- **4b-ii:** the conjunct pool keeps a bound form next to the AST (null while a conjunct holds a subquery, which keeps subquery
 planning lazy). Access options, `columnOf`, `colRef`, `selectivity`, `hashKeys`, partition pruning, row-group checks,
 columnar options and expression-index keys read the bound form. Index probes see through `sql.affinity_*`. The
 step-6 planner then reuses the access-path, cost and join-order code unchanged. Gate: no change in the plan-shape

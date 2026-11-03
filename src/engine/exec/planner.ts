@@ -645,8 +645,8 @@ export class Planner {
       groupExprsForFusion = groupCompiled.map((g) => g.bound);
       exprScope = {
         ...baseCompile,
-        resolveColumn: (e) => {
-          const b = baseCompile.resolveColumn(e);
+        resolveColumn: (e, defer) => {
+          const b = baseCompile.resolveColumn(e, defer);
           // reg -1: an expanded select-list alias (its own columns were recorded while compiling it).
           if (b.reg >= 0) bare.add(b.reg);
           return b;
@@ -2431,7 +2431,7 @@ export class Planner {
 
   compileScope(scope: Scope): CompileScope {
     return {
-      resolveColumn: (e) => this.resolveColumn(e, scope),
+      resolveColumn: (e, defer) => this.resolveColumn(e, scope, defer),
       scalarSubquery: (select) => this.scalarSubquery(select, scope),
       existsSubquery: (select) => this.existsSubquery(select, scope),
       inSubquery: (select, probe) => this.inSubquery(select, probe, scope),
@@ -2451,10 +2451,10 @@ export class Planner {
     return s;
   }
 
-  private resolveColumn(e: ColumnExpr, scope: Scope): ColumnBinding {
+  private resolveColumn(e: ColumnExpr, scope: Scope, defer = false): ColumnBinding {
     let depth = 0;
     for (let s: Scope | null = scope; s; s = s.parent, depth++) {
-      const b = this.resolveIn(e, s);
+      const b = this.resolveIn(e, s, defer);
       if (b) {
         if (depth > 0) {
           for (let t: Scope | null = scope; t && t !== s; t = t.parent) t.correlated = true;
@@ -2487,15 +2487,27 @@ export class Planner {
 
   private readonly expandingAliases = new Set<string>();
 
-  private resolveIn(e: ColumnExpr, scope: Scope): ColumnBinding | undefined {
+  /**
+   * Resolve `e` among the sources of `scope`. The column is marked as read (projection pushdown: the scan decodes
+   * it) at once, or with `defer` when the binding's `use` runs (from compiling). Trial compiles while costing
+   * (`dryCompile`) mark nothing.
+   */
+  private resolveIn(e: ColumnExpr, scope: Scope, defer = false): ColumnBinding | undefined {
     const bind = (src: Source, c: SourceColumn): ColumnBinding => {
-      if (src.access && !this.dryCompile) src.access.use(c.index, c.reg);
-      if (src.external?.projection && !this.dryCompile) src.external.projection.add(c.name.toLowerCase());
-      return { reg: c.reg, type: c.type, collation: c.collation, affinity: c.affinity };
+      const use = (): void => {
+        if (this.dryCompile) return;
+        src.access?.use(c.index, c.reg);
+        src.external?.projection?.add(c.name.toLowerCase());
+      };
+      if (!defer) use();
+      return { reg: c.reg, type: c.type, collation: c.collation, affinity: c.affinity, ...(defer ? { use } : {}) };
     };
     const rowidOf = (src: Source): ColumnBinding => {
-      if (!this.dryCompile) src.access!.useRowid(src.rowidReg);
-      return { reg: src.rowidReg, type: 'int', collation: Collation.Binary, affinity: 'INTEGER' };
+      const use = (): void => {
+        if (!this.dryCompile) src.access!.useRowid(src.rowidReg);
+      };
+      if (!defer) use();
+      return { reg: src.rowidReg, type: 'int', collation: Collation.Binary, affinity: 'INTEGER', ...(defer ? { use } : {}) };
     };
     if (e.table) {
       const src = scope.sources.find((s) => sameName(s.name, e.table!));
@@ -2658,8 +2670,8 @@ export class Planner {
     const outerScope: CompileScope = scope.onOuterRef
       ? {
           ...cs,
-          resolveColumn: (e) => {
-            const b = cs.resolveColumn(e);
+          resolveColumn: (e, defer) => {
+            const b = cs.resolveColumn(e, defer);
             if (b.reg >= 0) scope.onOuterRef!(b.reg);
             return b;
           },

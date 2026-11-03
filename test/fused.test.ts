@@ -143,7 +143,7 @@ describe('fused pipelines over bound expressions', () => {
     d.exec("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500) INSERT INTO t SELECT i, i % 17, 'k' || (i % 5) FROM n");
     const plan = (q: string) => d.query('EXPLAIN QUERY PLAN ' + q).rows.map((r) => r[3]).join(' ');
     const grouped = "SELECT b * 2, count(*) FROM t WHERE b > 3 AND s <> 'k1' GROUP BY b * 2";
-    expect(plan(grouped)).toMatch(/fused scan \+ filter \+ GROUP BY/);
+    if (!process.env.SMALT_NO_CODEGEN) expect(plan(grouped)).toMatch(/fused scan \+ filter \+ GROUP BY/);
     expect(d.query(grouped).rows.length).toBe(13);
     const sub = 'SELECT id FROM t WHERE b = (SELECT max(b) FROM t)';
     expect(plan(sub)).not.toMatch(/SCAN t \(fused/);
