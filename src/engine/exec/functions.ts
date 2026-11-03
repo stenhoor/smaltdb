@@ -14,6 +14,7 @@ import {
 } from './convert.js';
 import { sqlPrintf, valueInt64 } from './printf.js';
 import { dateFn, datetimeFn, juliandayFn, strftimeFn, timeFn, timediffFn, unixepochFn } from './datetime.js';
+import { MATH_FUNCTIONS, ROUNDING, logScalar, mathScalar, roundingScalar } from './math.js';
 
 /**
  * The package version, replaced at build time from package.json (esbuild `define` in
@@ -541,6 +542,11 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
   ['strftime', dateFunction(0, -1, 'text', (v, _a, ctx) => strftimeFn(v, ctx))],
   ['timediff', dateFunction(2, 2, 'text', (v, _a, ctx) => timediffFn(v, ctx))],
 ]);
+
+// The math functions (math.ts): acos … trunc, as SQLite builds them with SQLITE_ENABLE_MATH_FUNCTIONS.
+for (const [name, m] of MATH_FUNCTIONS) scalarFunctions.set(name, mathScalar(m));
+scalarFunctions.set('log', logScalar);
+for (const [name, g] of ROUNDING) scalarFunctions.set(name, roundingScalar(g));
 
 // ------------------------------------------------------------------ aggregates
 
