@@ -1,23 +1,38 @@
 # Query Engine
 
-> Status: M1 implemented. Sections 1–2 describe the pipeline as built. The cost-based optimizer (§3) and vectorized
-> execution (§4) are M3/M7 targets; what M1 actually does is described in §6.
+> Status: §1 describes the pipeline as built today, and the shared plan layer being added by
+> [ADR 0014](adr/0014-shared-plan-layer.md). §2–§4 describe target designs; what is implemented is described in §6–§8.
 
 ## 1. Pipeline
+
+As built, there is no logical plan: the planner goes from the parser's output straight to physical operators.
 
 ```
 SQL text
   → Lexer (single-pass scanner over the string, no regex)
-  → Parser (recursive descent + Pratt for expressions) → AST
-  → Binder (name resolution, type inference, view expansion) → Bound logical plan
-  → Rewriter (rule-based, to a fixed point)
-  → Cost-based optimizer (join ordering, access paths, physical operators)
-  → Physical plan (immutable, cacheable)
-  → Executor (vectorized)
+  → Parser (recursive descent + Pratt for expressions) → AST (sql/ast.ts)
+  → Planner (exec/planner.ts), in one pass: AST rewrites as it goes (materialized-view matching, exec/mv-match.ts;
+    view and subquery flattening, exec/flatten.ts), name resolution and typing, register allocation, projection
+    pushdown, decorrelation, cost-based join ordering and access paths, operator construction
+  → Pipeline fusion (exec/codegen.ts), which recompiles AST pieces kept in the operators
+  → Physical operators (exec/operators.ts), executed over a register file
 ```
 
-**Plan caching:** prepared statements cache the physical plan. Cached plans are invalidated when the schema cookie changes,
-or when statistics drift by more than a threshold.
+The morsel split for parallel readers (`exec/morsel.ts`) also works on the AST, and sends its parts to readers as SQL
+text.
+
+[ADR 0014](adr/0014-shared-plan-layer.md) adds a shared plan layer in neutral engine terms between the front ends and
+the physical planner. SQL becomes one front end, producing plans; other languages, such as smaltdf, build plans
+directly. The optimizations move onto the plan, and the physical planner and fusion read plans instead of the AST:
+
+```
+SQL text → parser → SQL front end ─┐
+                                   ├→ plan → optimizer → physical planner → operators
+other languages → plan builder ────┘
+```
+
+**Plan caching:** prepared statements cache the physical plan, keyed today by SQL text (with ADR 0014, by a hash of the
+plan). Cached plans are invalidated when the schema cookie changes, or when statistics drift by more than a threshold.
 
 ## 2. Logical rewrites (rule-based)
 
