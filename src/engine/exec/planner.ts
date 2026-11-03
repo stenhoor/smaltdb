@@ -48,6 +48,8 @@ import {
   type CompileScope,
   type Compiled,
   type Fn,
+  bindExpr,
+  compileBoundExpr,
   compileExpr,
   compileNode,
   compileWithPlan,
@@ -60,6 +62,7 @@ import {
 import { type AggregateState, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type ColumnarHelpers, type FusedAggSpec, type FusedHelpers, type PipelineSource, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter } from './codegen.js';
 import { CODEGEN_HELPERS_FOR_FUSION } from './expr.js';
+import { getMeta, isOpaque } from './sql-meta.js';
 import type { Frame } from '../storage/pager.js';
 import { PH_RIGHT } from '../storage/format.js';
 
@@ -347,6 +350,46 @@ function filterOn(child: Operator, e: Expr, cs: CompileScope): Filter {
   return new Filter(child, compiled.fn, bound);
 }
 
+/** A Filter on a pool conjunct: compiled from its bound form (bound once, when the pool was built). */
+function filterOnConjunct(child: Operator, c: ConjunctInfo, cs: CompileScope): Filter {
+  if (!c.compilable) return filterOn(child, c.expr, cs);
+  return new Filter(child, compileBoundExpr(c.bound, cs.funcCtx).fn, c.bound);
+}
+
+/** The operand of a bound comparison, without the affinity conversion SQL applies to it. */
+const unconvertedOperand = (x: PlanExpr): PlanExpr => (x.k === 'call' && (x.fn === 'sql.affinity_numeric' || x.fn === 'sql.affinity_text') ? x.args[0] : x);
+
+/** Visit the register slots of a bound expression (not inside compiled nodes or nested plans). */
+function forEachSlot(e: PlanExpr, f: (reg: number) => void): void {
+  switch (e.k) {
+    case 'slot':
+      f(e.reg);
+      return;
+    case 'call':
+    case 'and':
+    case 'or':
+      for (const a of e.args) forEachSlot(a, f);
+      return;
+    case 'cast':
+    case 'not':
+    case 'isNull':
+      forEachSlot(e.arg, f);
+      return;
+    case 'case':
+      for (const w of e.whens) {
+        forEachSlot(w.when, f);
+        forEachSlot(w.then, f);
+      }
+      forEachSlot(e.else, f);
+      return;
+    case 'inSubquery':
+      forEachSlot(e.probe, f);
+      return;
+    default:
+      return;
+  }
+}
+
 function hasSubquery(e: Expr): boolean {
   let found = false;
   walk(e, (x) => {
@@ -374,6 +417,13 @@ export function containsAggregate(e: Expr | undefined): boolean {
 
 interface ConjunctInfo {
   expr: Expr;
+  /**
+   * The conjunct bound to a plan expression, which the access-path and cost analysis read (ADR 0014, step 6a). A
+   * conjunct with a subquery is bound for analysis only: its subqueries are placeholders, and it compiles from
+   * `expr`.
+   */
+  bound: PlanExpr;
+  compilable: boolean;
   /** Positions of current-scope sources referenced; null = depends on everything (subqueries). */
   deps: Set<number> | null;
   placed: boolean;
@@ -1280,19 +1330,19 @@ export class Planner {
       }
     });
 
-    const pool: ConjunctInfo[] = [];
-    const addPool = (e: Expr): void => {
-      for (const c of splitBetween(e)) pool.push({ expr: c, deps: this.deps(c, scope), placed: false });
-    };
-    for (const c of conjuncts(where)) addPool(c);
     // RIGHT / FULL JOIN make every earlier source NULL-extendable: WHERE conjuncts reading those
     // sources must not be pushed below the join (FROM order is kept; see OuterJoin).
     const outerAt = scope.sources.flatMap((s, i) => (s.joinType === 'RIGHT' || s.joinType === 'FULL' ? [i] : []));
     const hasOuter = outerAt.length > 0;
+    if (hasOuter && items.some((it, i) => (it.using || it.natural) && (scope.sources[i].joinType === 'RIGHT' || scope.sources[i].joinType === 'FULL'))) {
+      throw new SmaltError('SMALT_UNSUPPORTED', 'USING / NATURAL with RIGHT or FULL JOIN is not supported yet');
+    }
+    const pool: ConjunctInfo[] = [];
+    const addPool = (e: Expr): void => {
+      for (const c of splitBetween(e)) pool.push(this.conjunct(c, scope));
+    };
+    for (const c of conjuncts(where)) addPool(c);
     if (hasOuter) {
-      if (items.some((it, i) => (it.using || it.natural) && (scope.sources[i].joinType === 'RIGHT' || scope.sources[i].joinType === 'FULL'))) {
-        throw new SmaltError('SMALT_UNSUPPORTED', 'USING / NATURAL with RIGHT or FULL JOIN is not supported yet');
-      }
       for (const c of pool) {
         let m = -1;
         for (const d of c.deps ?? scope.sources.map((s) => s.position)) for (const k of outerAt) if (d < k || (d === k && scope.sources[k].joinType === 'FULL')) m = Math.max(m, k);
@@ -1333,7 +1383,7 @@ export class Planner {
         outerRows = Math.max(outerRows, this.tableRows(src));
         for (const c of pool) {
           if (c.placed || c.deps === null || c.deps.size === 0 || (c.minStep ?? -1) > p || ![...c.deps].every((d) => placed.has(d))) continue;
-          root = filterOn(root, c.expr, cs);
+          root = filterOnConjunct(root, c, cs);
           c.placed = true;
         }
         continue;
@@ -1352,7 +1402,7 @@ export class Planner {
       let leaf = access.leaf;
       const local = candidates.filter((c) => c.deps!.size === 1 && !c.placed);
       for (const c of local) {
-        leaf = filterOn(leaf, c.expr, cs);
+        leaf = filterOnConjunct(leaf, c, cs);
         c.placed = true;
       }
       // In joins, standalone full scans of this source run as generated scan + filter pipelines.
@@ -1392,14 +1442,14 @@ export class Planner {
       // Remaining WHERE / inner-ON conjuncts whose dependencies are now all available.
       for (const c of pool) {
         if (c.placed || c.deps === null || c.deps.size === 0 || (c.minStep ?? -1) > p || ![...c.deps].every((d) => placed.has(d))) continue;
-        root = filterOn(root, c.expr, cs);
+        root = filterOnConjunct(root, c, cs);
         c.placed = true;
       }
     }
     // Constant / correlated-only / subquery conjuncts.
     for (const c of pool) {
       if (c.placed) continue;
-      root = filterOn(root!, c.expr, cs);
+      root = filterOnConjunct(root!, c, cs);
       c.placed = true;
     }
     return root!;
@@ -1612,6 +1662,112 @@ export class Planner {
   }
 
   /** Current-scope sources referenced by an expression (null when it contains a subquery). */
+  /**
+   * Bound conjuncts by scope and AST node: ON conjuncts are listed again for every join step that costs them. Per
+   * scope, because the same AST is planned again with other registers (a CTE or view referenced twice).
+   */
+  private readonly boundConjuncts = new WeakMap<Scope, WeakMap<Expr, { bound: PlanExpr; compilable: boolean; deps: Set<number> | null }>>();
+
+  /** A WHERE / ON conjunct for the pool: bound once (columns are marked as read only when it is compiled). */
+  private conjunct(e: Expr, scope: Scope): ConjunctInfo {
+    let byExpr = this.boundConjuncts.get(scope);
+    if (byExpr === undefined) this.boundConjuncts.set(scope, (byExpr = new WeakMap()));
+    let b = byExpr.get(e);
+    if (b === undefined) {
+      const compilable = !hasSubquery(e);
+      const cs = this.compileScope(scope);
+      // A conjunct with a subquery: bound for analysis, with placeholders for the subqueries (not planned here).
+      const analysis: CompileScope = compilable ? cs : { ...cs, planSubquery: () => ({ plan: { op: 'values', rows: [], types: [] }, column: { type: 'any', collation: Collation.Binary } }) };
+      const bound = bindExpr(e, analysis);
+      b = { bound, compilable, deps: compilable ? this.depsOf(bound, scope) : null };
+      byExpr.set(e, b);
+    }
+    return { expr: e, bound: b.bound, compilable: b.compilable, deps: b.deps, placed: false };
+  }
+
+  /** The source and column a bound slot reads, among `scope`'s sources. */
+  private slotSource(reg: number, scope: Scope): { src: Source; col: number | 'rowid' | null } | null {
+    for (const src of scope.sources) {
+      if (src.table && src.rowidReg === reg) return { src, col: 'rowid' };
+      const i = src.cols.findIndex((c) => c.reg === reg);
+      if (i >= 0) return { src, col: src.table ? i : null };
+    }
+    return null;
+  }
+
+  /** Positions of the current-scope sources a bound expression reads. */
+  private depsOf(b: PlanExpr, scope: Scope): Set<number> {
+    const out = new Set<number>();
+    forEachSlot(b, (reg) => {
+      const s = this.slotSource(reg, scope);
+      if (s) out.add(s.src.position);
+    });
+    return out;
+  }
+
+  /** `colRef` on a bound operand: a column of a table source (also under COLLATE, not under unary +). */
+  private colRefOf(e: PlanExpr, scope: Scope): { src: Source; col: number | 'rowid' } | null {
+    const x = unconvertedOperand(e);
+    if (x.k !== 'slot') return null;
+    if (isOpaque(x) && getMeta(x)?.collSrc !== CollSrc.Explicit) return null;
+    const s = this.slotSource(x.reg, scope);
+    return s && s.col !== null ? { src: s.src, col: s.col } : null;
+  }
+
+  /** `selectivity` on a bound conjunct: the same estimates, read from SQL's operators as `sql.*` calls. */
+  private selectivityOf(e: PlanExpr, scope: Scope): number {
+    // BETWEEN, NOT BETWEEN, COLLATE and unary + keep their own estimates (they were not comparisons in the AST).
+    if (isOpaque(e)) {
+      if (e.k === 'and') return 0.25;
+      if (e.k === 'not') return e.arg.k === 'and' && isOpaque(e.arg) ? 0.75 : 1 - this.selectivityOf(e.arg, scope);
+      return 0.33;
+    }
+    switch (e.k) {
+      case 'and':
+        return this.selectivityOf(e.args[0], scope) * this.selectivityOf(e.args[1], scope);
+      case 'or': {
+        const a = this.selectivityOf(e.args[0], scope);
+        const b = this.selectivityOf(e.args[1], scope);
+        return a + b - a * b;
+      }
+      case 'not':
+        return 1 - this.selectivityOf(e.arg, scope);
+      case 'isNull': {
+        const c = this.colRefOf(e.arg, scope);
+        let s = 0.05;
+        const st = c && c.col !== 'rowid' ? this.statsOf(c.src) : undefined;
+        if (c && c.col !== 'rowid' && st) s = st.nulls[c.col] / Math.max(1, st.rows);
+        else if (c?.col === 'rowid') s = 0;
+        return e.not ? 1 - s : s;
+      }
+      case 'call':
+        switch (e.fn) {
+          case 'sql.eq':
+          case 'sql.is': {
+            const l = this.colRefOf(e.args[0], scope);
+            const r = this.colRefOf(e.args[1], scope);
+            if (l && r && l.src !== r.src) return 1 / Math.max(this.ndv(l.src, l.col), this.ndv(r.src, r.col));
+            const c = l ?? r;
+            return c ? 1 / this.ndv(c.src, c.col) : 0.33;
+          }
+          case 'sql.ne':
+          case 'sql.is_not':
+            return 0.9;
+          case 'sql.in_list': {
+            const c = this.colRefOf(e.args[0], scope);
+            return c ? Math.min(1, (e.args.length - 1) / this.ndv(c.src, c.col)) : 0.33;
+          }
+          case 'sql.like':
+          case 'sql.glob':
+            return 0.25;
+          default:
+            return 0.33;
+        }
+      default:
+        return 0.33;
+    }
+  }
+
   private deps(e: Expr, scope: Scope): Set<number> | null {
     if (hasSubquery(e)) return null;
     const out = new Set<number>();
@@ -2265,9 +2421,9 @@ export class Planner {
     const local = candidates.filter((c) => c.deps!.size === 1);
     const joins = candidates.filter((c) => c.deps!.size > 1);
     let filtered = this.tableRows(t);
-    for (const c of local) filtered *= this.selectivity(c.expr, scope);
+    for (const c of local) filtered *= this.selectivityOf(c.bound, scope);
     let joinSel = 1;
-    for (const c of joins) joinSel *= this.selectivity(c.expr, scope);
+    for (const c of joins) joinSel *= this.selectivityOf(c.bound, scope);
     const opts = this.accessOptions(t, p, candidates, scope, cs);
     const standalone = this.bestStandalone(opts);
     if (placed.size === 0) {
@@ -2330,7 +2486,7 @@ export class Planner {
   }
 
   private leftOnInfos(src: Source, scope: Scope): ConjunctInfo[] {
-    return src.on.flatMap((e) => splitBetween(e)).map((e) => ({ expr: e, deps: this.deps(e, scope), placed: false }));
+    return src.on.flatMap((e) => splitBetween(e)).map((e) => this.conjunct(e, scope));
   }
 
   private orderSegmentDP(segment: number[], prefix: Set<number>, prefixRows: number, pool: ConjunctInfo[], scope: Scope, cs: CompileScope): { order: number[]; rows: number } {
