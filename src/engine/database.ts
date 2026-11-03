@@ -1028,13 +1028,13 @@ export class Database implements FunctionContext {
       case 'legacy':
         return planner.planSelect(stmt, null);
       case 'shadow': {
-        // The physical plan replaces the planner's, with the registers it would have had alone.
-        const start = planner.regs.count;
+        // The physical plan replaces the planner's, as if planned alone (registers, external sources).
+        const start = planner.mark();
         const physical = (fe: FrontEndResult): QueryPlan | null => {
-          const end = planner.regs.count;
-          planner.regs.count = start;
+          const end = planner.mark();
+          start();
           const p = planner.planPlan(fe.plan, fe.columns);
-          if (!p) planner.regs.count = end;
+          if (!p) end();
           return p;
         };
         return shadowCheck(stmt, text, this.frontEndCatalog(), () => planner.planSelect(stmt, null), () => planner.usedMatview, physical);

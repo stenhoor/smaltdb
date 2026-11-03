@@ -82,9 +82,9 @@ planned (`src/engine/exec/plan-shadow.ts`):
 
 - unset (or `legacy`): the current planner, from the AST.
 - `plan`: the SQL front end (`src/engine/sql/frontend/`, step 5) makes a plan, and the physical planner
-  (`Planner.planPlan`, step 6) builds its operators. Shapes it does not handle yet (joins, subqueries, windows,
-  compounds, views; see the implementation plan) go through the current planner, and so do statements answered from a
-  materialized view.
+  (`Planner.planPlan`, step 6) builds its operators. Shapes it does not handle yet (subqueries, windows, compounds,
+  derived tables and views; see the implementation plan) go through the current planner, and so do statements
+  answered from a materialized view.
 - `shadow` (tests): both. The front end must agree with the planner on every result column's name, type, collation,
   declared type and affinity, and on planning errors; the physical planner's operators must give the planner's
   `EXPLAIN` rows, and then they run. A disagreement fails the statement with `SMALT_INTERNAL`.
