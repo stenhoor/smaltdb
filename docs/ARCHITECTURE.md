@@ -15,11 +15,11 @@
  ┌──────────────────── Engine (Dedicated Worker) ─────────────────┐
  │  Session manager ─ Transaction manager ─ Lock manager          │
  │        │                                                       │
- │  SQL front-end:  Lexer → Parser → Binder/Analyzer              │
- │        │                                                       │
- │  Optimizer: logical rewrites → cost-based physical planning    │
+ │  SQL front-end:  Lexer → Parser → AST rewrites                 │
+ │        │         (views, subqueries, materialized views)       │
+ │  Planner: names, types, costing, joins, access paths → ops     │
  │        │            ▲ statistics, catalog                      │
- │  Executor: vectorized push/pull operators                      │
+ │  Executor: pull operators over a register file, fused codegen  │
  │        │                                                       │
  │  Access methods: table B+tree, index B+tree, (columnar segs)   │
  │        │                                                       │
@@ -38,8 +38,8 @@
 | **Client API** | Thin library on the main thread or another worker. Serializes requests and streams results back as columnar batches using transferable `ArrayBuffer`s. |
 | **Session manager** | One session per connection. Holds the prepared-statement cache, transaction state, and settings. |
 | **Lexer / Parser** | Hand-written recursive-descent parser with Pratt parsing for expressions. Produces an AST. No parser generator, which keeps the bundle small and the parser fast. |
-| **Binder / Analyzer** | Resolves names against the catalog, infers types, expands `*`, and checks semantics. |
-| **Optimizer** | Rule-based rewrites first, then cost-based join ordering and access-path selection. See [QUERY_ENGINE.md](QUERY_ENGINE.md). |
+| **AST rewrites** | Materialized-view matching and view/subquery flattening rewrite the parser's output (`exec/mv-match.ts`, `exec/flatten.ts`). |
+| **Planner** | One pass from the AST to operators (`exec/planner.ts`): resolves names against the catalog, infers types, expands `*`, decorrelates subqueries, and chooses join order and access paths by cost. There is no separate binder or logical plan yet; [ADR 0014](adr/0014-shared-plan-layer.md) adds one. See [QUERY_ENGINE.md](QUERY_ENGINE.md). |
 | **Executor** | Vectorized operators that process batches of about 1024 rows held in typed arrays. Expressions compile to specialized JS closures, or to generated code if CSP allows it **[Q-9]**. |
 | **Catalog** | System tables stored in the database itself. `information_schema` and `sqlite_schema` are views over the catalog. |
 | **Statistics** | Row counts, NDV sketches (HyperLogLog), histograms, and min/max per column. Updated by `ANALYZE` and incrementally on write. |
@@ -70,27 +70,29 @@ See [WORKER_MODEL.md](WORKER_MODEL.md) for details.
   - Single writer and multiple readers under MVCC snapshot isolation, using the WAL.
   - Optional **reader worker pool** for parallel query execution. This requires `SharedArrayBuffer` and therefore cross-origin isolation **[Q-4]**.
 
-## 5. Module layout (proposed)
+## 5. Module layout
 
-One npm package for now. It may split into client and engine packages once the client API exists (M1).
+One npm package. Plugins are separate packages ([ADR 0012](adr/0012-plugins.md)).
 
 ```
 src/
-  client/             public client API, main thread (M1)
+  client/             public client API (open(), Database)
+  shared/             worker protocol
   engine/
-    vfs/              Vfs interface, MemoryVfs, OpfsVfs, capability detection     [M0]
-    storage/          pager + buffer pool, B+tree, key codec, CRC-32C, format     [M0]
-                      WAL, record format                                          (M1/M2)
-    sql/              lexer, parser, AST                                          (M1)
-    analyze/          binder, type checker                                        (M1)
-    plan/             logical plan, rules, cost model, physical plan              (M1/M3)
-    exec/             operators, expression compiler, vectors                     (M1)
-    catalog/          system tables, information_schema                           (M1/M4)
-    txn/              MVCC, locks                                                 (M2)
-    util/             byte helpers
-test/                 unit and property tests (Vitest, Node + MemoryVfs)
+    vfs/              Vfs interface, MemoryVfs, OpfsVfs, capability detection
+    storage/          pager, WAL, B-trees, key codec, record format, columnar segments, CRC-32C
+    sql/              lexer, parser, AST
+    exec/             planner, AST rewrites (flatten, mv-match, morsel), operators, expression
+                      compiler, code generation, functions, window, spill, statistics, writes
+    catalog/          schema, ALTER, information_schema
+    external/         external tables (the plugin host side)
+    plan/             the shared plan layer (planned: ADR 0014)
+    database.ts       the engine's Database: statements, transactions, catalog loading
+    server.ts         the worker server; worker.ts and worker-runtime.ts start it
+test/                 unit, differential and property tests (Vitest, Node + MemoryVfs)
 test/browser/         real-browser tests via Playwright (OPFS, workers)
-bench/micro/          storage micro-benchmarks (Node)
+test/slt/             the sqllogictest runner
+bench/micro/          micro-benchmarks (Node)
 bench/browser/        engine comparison harness: smaltdb vs SQLite WASM, PGlite, DuckDB-WASM
 bench/results/        saved benchmark runs (JSON)
 ```

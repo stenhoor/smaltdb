@@ -66,6 +66,14 @@ and materialized-view matching, columnar scans, windows and compound selects.
 A planner change that alters a plan fails the test. When the change is intended, update the files with
 `npx vitest run test/plan-shapes.test.ts -u` and review the diff with the PR. The corpus describes the default
 configuration, so it skips under `SMALT_NO_CODEGEN`, `SMALT_NO_FLATTEN` and `SMALT_NO_DECORRELATE`.
+## Generated code
+
+`test/codegen-source.test.ts` records the JavaScript that code generation emits (expressions, fused pipelines over
+row and columnar tables, row loaders) for a corpus of queries over typed tables, and compares it with
+`test/codegen-source/*.txt`. Generated code carries the performance of [ADR 0003](adr/0003-m1-executor-and-transactions.md),
+and the plan layer ([ADR 0014](adr/0014-shared-plan-layer.md)) moves code generation onto plan expressions, so a change
+to it must show in review: update the files with `npx vitest run test/codegen-source.test.ts -u`. It skips under
+`SMALT_NO_CODEGEN`.
 
 ## Plugins
 

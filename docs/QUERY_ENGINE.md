@@ -1,23 +1,48 @@
 # Query Engine
 
-> Status: M1 implemented. Sections 1–2 describe the pipeline as built. The cost-based optimizer (§3) and vectorized
-> execution (§4) are M3/M7 targets; what M1 actually does is described in §6.
+> Status: section 1 describes the pipeline as built, and the plan layer that [ADR 0014](adr/0014-shared-plan-layer.md)
+> adds. Sections 2–4 began as design targets: §6–§8 say what each milestone built. Vectorized execution (§4) is not
+> built as described: operators return one row per `next()`, and only fused and columnar pipelines loop over chunks.
 
 ## 1. Pipeline
 
+**As built.** There is no bound logical plan yet: the planner goes from the parser's output straight to operators.
+
 ```
 SQL text
-  → Lexer (single-pass scanner over the string, no regex)
-  → Parser (recursive descent + Pratt for expressions) → AST
-  → Binder (name resolution, type inference, view expansion) → Bound logical plan
-  → Rewriter (rule-based, to a fixed point)
-  → Cost-based optimizer (join ordering, access paths, physical operators)
-  → Physical plan (immutable, cacheable)
-  → Executor (vectorized)
+  → Lexer (single-pass scanner over the string, no regex)            sql/lexer.ts
+  → Parser (recursive descent + Pratt for expressions) → AST          sql/parser.ts
+  → AST rewrites: materialized-view matching, view and subquery       exec/mv-match.ts, exec/flatten.ts
+    flattening
+  → Planner, in one pass: name resolution, typing, register           exec/planner.ts
+    allocation, projection pushdown, decorrelation, costing,
+    join ordering, access paths, operator construction
+  → Pipeline fusion: scan → filter → aggregate chains compiled        exec/codegen.ts
+    to generated code (recompiled from the AST kept on operators)
+  → Operators: a pull model over a shared register file, one row      exec/operators.ts
+    per next() call
 ```
 
-**Plan caching:** prepared statements cache the physical plan. Cached plans are invalidated when the schema cookie changes,
-or when statistics drift by more than a threshold.
+The steps after the parser depend on SQL text or AST in several places:
+- operators keep parts of the AST (`Filter.ast`, `AggSpec.argAsts`) for fusion;
+- morsel parallelism (`exec/morsel.ts`) sends SQL text to reader workers, which parse it again;
+- output column names come from the query text;
+- compiled statements are cached by their SQL text.
+
+**Planned.** [ADR 0014](adr/0014-shared-plan-layer.md) adds a typed, positional plan layer
+(`src/engine/plan/`) between the front ends and the physical planner. SQL and smaltdf both produce plans, and the
+optimizations and physical planning move onto the plan:
+
+```
+smaltdf ───────────────→ plan builder ─┐
+                                       ├→ plan → optimizer → physical planner → operators
+SQL → parser → SQL front end ──────────┘
+```
+
+The ADR's section 5 gives the order of work, and [research/plan-layer-implementation.md](research/plan-layer-implementation.md) works it out against the code. Until those steps land, the description above is the code.
+
+**Plan caching:** the database caches prepared statements by SQL text. A cached statement compiles again when the
+schema version changes (any DDL, or a setting that changes planning).
 
 ## 2. Logical rewrites (rule-based)
 
