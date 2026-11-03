@@ -75,15 +75,26 @@ and the plan layer ([ADR 0014](adr/0014-shared-plan-layer.md)) moves code genera
 to it must show in review: update the files with `npx vitest run test/codegen-source.test.ts -u`. It skips under
 `SMALT_NO_CODEGEN`.
 
-## The SQL front end (shadow mode)
+## The SQL front end and the physical planner (`SMALT_PLAN`)
 
-`SMALT_PLAN=shadow` plans every SELECT twice: with the current planner, and with the SQL front end
-(`src/engine/sql/frontend/`, [ADR 0014](adr/0014-shared-plan-layer.md) step 5). The two must agree on every result
-column's name, type, collation, declared type and affinity, and on planning errors; a disagreement fails the statement
-with `SMALT_INTERNAL`. Shapes the front end does not handle yet are skipped, and so are statements the planner rewrote
-to read a materialized view. CI runs the whole suite this way (`SMALT_PLAN=shadow npx vitest run`); run it with
-`npm run slt` or the differential tests the same way. `SMALT_PLAN_STATS=<file>` appends each skipped statement to
-`<file>` as a JSON line with the reason, to see what the front end does not cover yet.
+While the plan layer ([ADR 0014](adr/0014-shared-plan-layer.md)) is built, `SMALT_PLAN` selects how SELECTs are
+planned (`src/engine/exec/plan-shadow.ts`):
+
+- unset (or `legacy`): the current planner, from the AST.
+- `plan`: the SQL front end (`src/engine/sql/frontend/`, step 5) makes a plan, and the physical planner
+  (`Planner.planPlan`, step 6) builds its operators. Shapes it does not handle yet (joins, subqueries, windows,
+  compounds, views; see the implementation plan) go through the current planner, and so do statements answered from a
+  materialized view.
+- `shadow` (tests): both. The front end must agree with the planner on every result column's name, type, collation,
+  declared type and affinity, and on planning errors; the physical planner's operators must give the planner's
+  `EXPLAIN` rows, and then they run. A disagreement fails the statement with `SMALT_INTERNAL`.
+
+CI runs the whole suite with `SMALT_PLAN=shadow`, and `test/plan-shapes.test.ts` and `test/codegen-source.test.ts`
+with `SMALT_PLAN=plan` (the same plan shapes and generated code; shadow mode generates code for both planners, so
+the generated-code snapshot skips there). Run `npm run slt` or the differential tests the same way.
+`SMALT_PLAN_STATS=<file>` appends each skipped statement to `<file>` as a JSON line with the reason, and each
+statement the physical planner does not handle yet (reason `physical planner: not handled yet`).
+`test/plan-physical.test.ts` checks single-table plans in each mode.
 
 ## Plugins
 

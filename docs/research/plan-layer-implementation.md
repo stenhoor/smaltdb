@@ -148,15 +148,23 @@ pre-passes until step 7.
 
 ### Step 6: the physical planner reads plans (`SMALT_PLAN=legacy|plan|shadow`)
 
-`exec/physical.ts` assigns registers to each operation's output and compiles plan expressions against them, calling
+The physical planner assigns registers to each operation's output and compiles plan expressions against them, calling
 the column marking as today. Shapes it does not handle yet return null and go through the current planner, so each
-part can be on by default. Shadow mode also compares `EXPLAIN` rows from both paths.
-- **6a, one source** (about 1.2k lines): scan, filter, project, limit, sort, distinct, values, aggregate; the count
-  fast path, rowid ORDER BY elimination, top-N, fusion.
-- **6b, join regions** (about 1.5k lines): the inner-join region becomes sources and a conjunct pool; outer joins,
-  table functions, derived tables, external projection, expression indexes.
-- **6c, the rest** (about 1.2k lines): subqueries and decorrelation on `subquery` plans, windows, `setop`, `iterate`,
-  EXPLAIN estimates. The default becomes `plan`.
+part can be on by default. Shadow mode also compares `EXPLAIN` rows from both paths, and runs the physical planner's
+operators.
+- **6a (done):** access-path and cost analysis read bound conjuncts (step 4b-ii above).
+- **6b (done), one source:** `Planner.planPlan` (in `exec/planner.ts` while it shares the planner's access-path code;
+  it moves to `exec/physical.ts` with 6d) builds operators for plans over one table or no FROM: scan (access paths
+  through `planFrom`, with the WHERE conjuncts bound from the plan), filter, project, aggregate (fused or hashed, with
+  carried bare columns), HAVING, distinct, sort (top-N), limit; the count fast path, ORDER BY rowid elimination and
+  fusion. Registers are allocated in the planner's order, so plan shapes and generated code are byte-identical under
+  `SMALT_PLAN=plan`. The front end keeps each column's SQL metadata on its `col`, and the scan op carries INDEXED BY
+  and an explicit `main`. One planner change came with it: ORDER BY an ordinal or alias of the rowid also reads in
+  rowid order (it sorted before), as the plan cannot tell those from naming the rowid. In slt, about 99k of 112,981
+  SELECTs go through it.
+- **6c, the rest** (about 2.7k lines): join regions (the inner-join region becomes sources and a conjunct pool; outer
+  joins, table functions, derived tables, external projection, expression indexes), subqueries and decorrelation on
+  `subquery` plans, windows, `setop`, `iterate`, VALUES, EXPLAIN estimates. The default becomes `plan`.
 - **6d, deletion** (about 2k lines removed): the AST paths of the planner and the internal `slot` / `native` nodes.
 - **Hardest parts:** projection-pushdown parity, register order (window snapshots), outer references from subqueries
   over aggregate rows, correlation of derived tables, estimates keyed by the same operators.
