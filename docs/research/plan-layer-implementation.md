@@ -93,8 +93,12 @@ generated-code snapshot from 3a and, from step 3, a budget for prepare time on s
   source) is a symbol-keyed property beside the plan. Functions gain an optional `resultType`, so binding types a
   call without compiling it. `compileExpr` and `compileNode` keep their signatures; code generation still reads
   the AST. Planning cost of small statements is unchanged within noise (`bench/micro/prepare.ts`).
-- **3c, code generation on plan expressions** (about 500 lines). The emitter switches on function ids instead of AST
-  operators; `isCodegenRoot`, `mathCall` and `hasRuntimeInputs` read plan expressions.
+- **3c, code generation on plan expressions** (done). The emitter reads plan expressions: it recognises `sql.add`
+  and the other operators and the math functions by name, and compares the operands of a comparison without their
+  affinity calls (it only emits comparisons where those change nothing). `compileExpr` binds once and generates code
+  or compiles closures from the same tree. The SQL forms code generation always left to the closure compiler (BETWEEN,
+  NOT LIKE, NOT IN, COLLATE, unary +) are marked by the binder, so generated code stays byte-identical (the snapshot
+  covers them). Fused pipelines still receive the parser's expressions until step 4 and bind them first.
 - **Risks.** Error order between binding and `def.compile`; one more allocation per node while planning; the fold
   rule of `isCodegenRoot`.
 
