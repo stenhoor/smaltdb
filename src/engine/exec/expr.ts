@@ -1,26 +1,18 @@
 import { SmaltError } from '../errors.js';
 import { storageTypeFor } from '../catalog/schema.js';
 import type { CallExpr, ColumnExpr, Expr, SelectStmt } from '../sql/ast.js';
-import { Collation, type SqlValue, collationByName, compareValues, normalizeInt } from '../values.js';
+import { Collation, type SqlValue, collationByName } from '../values.js';
 import {
   type Affinity,
   type StaticType,
   affinityOfStorage,
   applyNumericAffinity,
   applyTextAffinity,
-  castToInteger,
-  castToNumeric,
-  castToReal,
-  hashKey,
-  isIntValue,
-  realToInt,
   staticTypeOfStorage,
-  toBlob,
-  toNumeric,
-  toText,
   truthy,
 } from './convert.js';
 import { currentTimeText } from './datetime.js';
+import { ARITHMETIC_FUNCTIONS, BITWISE_FUNCTIONS, COMPARISON_FUNCTIONS, arithImpl, negate, sqlFunction } from './sql-functions.js';
 import { type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type CodegenHelpers, codegenEnabled, generate, isCodegenRoot } from './codegen.js';
 import { WINDOW_ARITY } from './window.js';
@@ -73,8 +65,6 @@ export interface CompileScope {
 }
 
 const NO_REGS: SqlValue[] = [];
-const I64_MIN = -(2n ** 63n);
-const I64_MAX = 2n ** 63n - 1n;
 
 function konst(v: SqlValue, type: StaticType, affinity: Affinity = 'NONE'): Compiled {
   return { fn: () => v, type, collation: Collation.Binary, collSrc: CollSrc.None, affinity, constant: true };
@@ -262,55 +252,14 @@ function regReader(reg: number): Fn {
 // ------------------------------------------------------------------ unary / logic
 
 function compileUnary(op: string, x: Compiled): Compiled {
-  const f = x.fn;
-  let out: Compiled;
-  switch (op) {
-    case 'NOT':
-      out = {
-        fn: (r) => {
-          const t = truthy(f(r));
-          return t === null ? null : t ? 0 : 1;
-        },
-        type: 'int',
-        collation: 0,
-        collSrc: CollSrc.None,
-        affinity: 'NONE',
-        constant: x.constant,
-      };
-      break;
-    case '-':
-      out = { fn: (r) => negate(f(r)), type: isNumericType(x.type) ? x.type : 'num', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: x.constant };
-      break;
-    case '+':
-      // Unary plus is a no-op that strips affinity and collation (SQLite).
-      out = { ...x, affinity: 'NONE', collSrc: CollSrc.None, collation: Collation.Binary };
-      break;
-    case '~':
-      out = {
-        fn: (r) => {
-          const v = f(r);
-          if (v === null) return null;
-          const n = castToInteger(v)!;
-          return normalizeInt(BigInt.asIntN(64, ~BigInt(n)));
-        },
-        type: 'int',
-        collation: 0,
-        collSrc: CollSrc.None,
-        affinity: 'NONE',
-        constant: x.constant,
-      };
-      break;
-    default:
-      throw new SmaltError('SMALT_ERROR', `unknown unary operator ${op}`);
+  const name = op === 'NOT' ? 'sql.not' : op === '-' ? 'sql.neg' : op === '~' ? 'sql.bitnot' : null;
+  if (op === '+') {
+    // Unary plus is a no-op that strips affinity and collation (SQLite).
+    return fold({ ...x, affinity: 'NONE', collSrc: CollSrc.None, collation: Collation.Binary });
   }
-  return fold(out);
-}
-
-function negate(v: SqlValue): SqlValue {
-  if (v === null) return null;
-  if (typeof v === 'number') return v === 0 ? 0 : -v;
-  if (typeof v === 'bigint') return v === I64_MIN ? -Number(v) : normalizeInt(-v);
-  return negate(toNumeric(v));
+  if (name === null) throw new SmaltError('SMALT_ERROR', `unknown unary operator ${op}`);
+  const { fn, type } = sqlFunction(name).compile([x], {});
+  return fold({ fn, type, collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: x.constant });
 }
 
 function and(a: Compiled, b: Compiled): Compiled {
@@ -376,31 +325,13 @@ function compileBinary(op: string, le: Expr, re: Expr, scope: CompileScope): Com
     case '/':
     case '%':
       return arithmetic(op, a, b);
-    case '||': {
-      const fa = a.fn;
-      const fb = b.fn;
-      const ra = a.type === 'real';
-      const rb = b.type === 'real';
-      return fold({
-        fn: (r) => {
-          const x = fa(r);
-          if (x === null) return null;
-          const y = fb(r);
-          if (y === null) return null;
-          return toText(x, ra)! + toText(y, rb)!;
-        },
-        type: 'text',
-        collation: 0,
-        collSrc: CollSrc.None,
-        affinity: 'NONE',
-        constant: a.constant && b.constant,
-      });
-    }
+    case '||':
+      return call2('sql.concat', a, b);
     case '&':
     case '|':
     case '<<':
     case '>>':
-      return bitwise(op, a, b);
+      return call2(BITWISE_FUNCTIONS[op], a, b);
     default:
       throw new SmaltError('SMALT_UNSUPPORTED', `operator ${op} is not supported yet`);
   }
@@ -438,463 +369,48 @@ export function comparisonConverters(a: Compiled, b: Compiled): [((v: SqlValue) 
   return [ca, cb];
 }
 
-function comparison(op: string, a: Compiled, b: Compiled): Compiled {
-  const fa = a.fn;
-  const fb = b.fn;
-  const coll = comparisonCollation(a, b);
-  const [ca, cb] = comparisonConverters(a, b);
-  const constant = a.constant && b.constant;
-  const base = { type: 'int' as StaticType, collation: 0 as Collation, collSrc: CollSrc.None, affinity: 'NONE' as Affinity, constant };
-
-  if (op === 'IS' || op === 'IS NOT') {
-    const want = op === 'IS' ? 1 : 0;
-    return fold({
-      ...base,
-      fn: (r) => {
-        let x = fa(r);
-        let y = fb(r);
-        if (x === null || y === null) return (x === null && y === null) === (want === 1) ? 1 : 0;
-        if (ca) x = ca(x);
-        if (cb) y = cb(y);
-        return (compareValues(x, y, coll) === 0) === (want === 1) ? 1 : 0;
-      },
-    });
-  }
-
-  // Fast path: both operands statically numeric (no conversions or collation needed).
-  if (isNumericType(a.type) && isNumericType(b.type)) {
-    let fn: Fn;
-    switch (op) {
-      case '=':
-        fn = (r) => {
-          const x = fa(r);
-          if (x === null) return null;
-          const y = fb(r);
-          if (y === null) return null;
-          // eslint-disable-next-line eqeqeq
-          return (x as number) == (y as number) ? 1 : 0;
-        };
-        break;
-      case '!=':
-        fn = (r) => {
-          const x = fa(r);
-          if (x === null) return null;
-          const y = fb(r);
-          if (y === null) return null;
-          // eslint-disable-next-line eqeqeq
-          return (x as number) != (y as number) ? 1 : 0;
-        };
-        break;
-      case '<':
-        fn = (r) => {
-          const x = fa(r);
-          if (x === null) return null;
-          const y = fb(r);
-          if (y === null) return null;
-          return (x as number) < (y as number) ? 1 : 0;
-        };
-        break;
-      case '<=':
-        fn = (r) => {
-          const x = fa(r);
-          if (x === null) return null;
-          const y = fb(r);
-          if (y === null) return null;
-          return (x as number) <= (y as number) ? 1 : 0;
-        };
-        break;
-      case '>':
-        fn = (r) => {
-          const x = fa(r);
-          if (x === null) return null;
-          const y = fb(r);
-          if (y === null) return null;
-          return (x as number) > (y as number) ? 1 : 0;
-        };
-        break;
-      default:
-        fn = (r) => {
-          const x = fa(r);
-          if (x === null) return null;
-          const y = fb(r);
-          if (y === null) return null;
-          return (x as number) >= (y as number) ? 1 : 0;
-        };
-    }
-    return fold({ ...base, fn });
-  }
-
-  const test = cmpTest(op);
-  return fold({
-    ...base,
-    fn: (r) => {
-      let x = fa(r);
-      if (x === null) return null;
-      let y = fb(r);
-      if (y === null) return null;
-      if (ca) x = ca(x);
-      if (cb) y = cb(y);
-      return test(compareValues(x, y, coll)) ? 1 : 0;
-    },
-  });
+/** A two-argument `sql.*` function with no front-end options; the result has no affinity or collation. */
+function call2(name: string, a: Compiled, b: Compiled): Compiled {
+  const { fn, type } = sqlFunction(name).compile([a, b], {});
+  return fold({ fn, type, collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: a.constant && b.constant });
 }
 
-function cmpTest(op: string): (c: number) => boolean {
-  switch (op) {
-    case '=':
-      return (c) => c === 0;
-    case '!=':
-      return (c) => c !== 0;
-    case '<':
-      return (c) => c < 0;
-    case '<=':
-      return (c) => c <= 0;
-    case '>':
-      return (c) => c > 0;
-    default:
-      return (c) => c >= 0;
-  }
+/** A comparison: SQLite's collation and affinity rules pick the options of `sql.eq` and the others. */
+function comparison(op: string, a: Compiled, b: Compiled): Compiled {
+  const coll = comparisonCollation(a, b);
+  const [ca, cb] = comparisonConverters(a, b);
+  const { fn } = sqlFunction(COMPARISON_FUNCTIONS[op]).compile([{ fn: a.fn, type: a.type, convert: ca }, { fn: b.fn, type: b.type, convert: cb }], { collation: coll });
+  return fold({ fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: a.constant && b.constant });
 }
 
 function arithmetic(op: string, a: Compiled, b: Compiled): Compiled {
-  const fa = a.fn;
-  const fb = b.fn;
-  const real = a.type === 'real' || b.type === 'real';
-  const type: StaticType = real ? 'real' : a.type === 'int' && b.type === 'int' ? 'int' : 'num';
-  const impl = arithImpl(op, real);
-  return fold({
-    fn: (r) => {
-      const x = fa(r);
-      if (x === null) return null;
-      const y = fb(r);
-      if (y === null) return null;
-      return impl(x, y);
-    },
-    type,
-    collation: 0,
-    collSrc: CollSrc.None,
-    affinity: 'NONE',
-    constant: a.constant && b.constant,
-  });
-}
-
-function num(v: SqlValue): number | bigint {
-  return typeof v === 'number' || typeof v === 'bigint' ? v : (toNumeric(v) as number | bigint);
-}
-
-function inI64(b: bigint): boolean {
-  return b >= I64_MIN && b <= I64_MAX;
-}
-
-function realResult(x: number): SqlValue {
-  return Number.isNaN(x) ? null : x;
-}
-
-export function arithImpl(op: string, forceReal: boolean): (x: SqlValue, y: SqlValue) => SqlValue {
-  const realOp = (x: number, y: number): SqlValue => {
-    switch (op) {
-      case '+':
-        return realResult(x + y);
-      case '-':
-        return realResult(x - y);
-      case '*':
-        return realResult(x * y);
-      case '/':
-        return y === 0 ? null : realResult(x / y);
-      default:
-        return realMod(x, y);
-    }
-  };
-  const intOp = (x: number | bigint, y: number | bigint): SqlValue => {
-    if (typeof x === 'number' && typeof y === 'number') {
-      switch (op) {
-        case '+': {
-          const s = x + y;
-          if (Number.isSafeInteger(s)) return s;
-          break;
-        }
-        case '-': {
-          const s = x - y;
-          if (Number.isSafeInteger(s)) return s;
-          break;
-        }
-        case '*': {
-          const s = x * y;
-          if (Number.isSafeInteger(s)) return s === 0 ? 0 : s;
-          break;
-        }
-        case '/':
-          if (y === 0) return null;
-          if (Math.abs(x) < 2147483648 && Math.abs(y) < 2147483648) {
-            const q = Math.trunc(x / y);
-            return q === 0 ? 0 : q;
-          }
-          break;
-        default:
-          if (y === 0) return null;
-          if (y === -1) return 0;
-          {
-            const m = x % y;
-            return m === 0 ? 0 : m;
-          }
-      }
-    }
-    const bx = BigInt(x);
-    const by = BigInt(y);
-    let res: bigint;
-    switch (op) {
-      case '+':
-        res = bx + by;
-        break;
-      case '-':
-        res = bx - by;
-        break;
-      case '*':
-        res = bx * by;
-        break;
-      case '/':
-        if (by === 0n) return null;
-        if (bx === I64_MIN && by === -1n) return realResult(Number(bx) / -1);
-        res = bx / by;
-        break;
-      default:
-        if (by === 0n) return null;
-        if (by === -1n) return 0;
-        res = bx % by;
-    }
-    if (!inI64(res)) return realOp(Number(x), Number(y));
-    return normalizeInt(res);
-  };
-  return (x, y) => {
-    const nx = num(x);
-    const ny = num(y);
-    if (!forceReal && isIntValue(nx) && isIntValue(ny)) return intOp(nx, ny);
-    // REAL %: convert the *original* operands to int64 (converting a bigint through a double would lose precision).
-    if (op === '%') return realMod(nx, ny);
-    return realOp(Number(nx), Number(ny));
-  };
-}
-
-/** SQLite REAL `%`: both operands cast to INTEGER, remainder returned as REAL. */
-function realMod(x: number | bigint, y: number | bigint): SqlValue {
-  const ix = typeof x === 'bigint' ? x : realToInt(x);
-  let iy = typeof y === 'bigint' ? y : realToInt(y);
-  if (iy === 0 || iy === 0n) return null;
-  if (iy === -1 || iy === -1n) iy = 1;
-  return Number(BigInt(ix) % BigInt(iy));
-}
-
-function bitwise(op: string, a: Compiled, b: Compiled): Compiled {
-  const fa = a.fn;
-  const fb = b.fn;
-  return fold({
-    fn: (r) => {
-      const x = fa(r);
-      if (x === null) return null;
-      const y = fb(r);
-      if (y === null) return null;
-      const bx = BigInt(castToInteger(x)!);
-      let by = BigInt(castToInteger(y)!);
-      let res: bigint;
-      switch (op) {
-        case '&':
-          res = bx & by;
-          break;
-        case '|':
-          res = bx | by;
-          break;
-        default: {
-          let left = op === '<<';
-          if (by < 0n) {
-            left = !left;
-            by = -by;
-          }
-          if (by >= 64n) res = left || bx >= 0n ? 0n : -1n;
-          else res = left ? BigInt.asIntN(64, bx << by) : bx >> by;
-        }
-      }
-      return normalizeInt(BigInt.asIntN(64, res));
-    },
-    type: 'int',
-    collation: 0,
-    collSrc: CollSrc.None,
-    affinity: 'NONE',
-    constant: a.constant && b.constant,
-  });
+  return call2(ARITHMETIC_FUNCTIONS[op], a, b);
 }
 
 // ------------------------------------------------------------------ IN, LIKE, CASE, CAST
 
 function compileInList(not: boolean, x: Compiled, list: Compiled[]): Compiled {
-  const fx = x.fn;
   const base = { type: 'int' as StaticType, collation: 0 as Collation, collSrc: CollSrc.None, affinity: 'NONE' as Affinity };
-  const finish = (v: SqlValue): SqlValue => (v === null ? null : not ? (v === 1 ? 0 : 1) : v);
   if (list.length === 0) return konst(not ? 1 : 0, 'int');
+  const f = sqlFunction('sql.in_list');
   // All-constant list: hash lookup with the probe's affinity and collation applied up front.
   if (list.every((c) => c.constant)) {
-    const coll = x.collSrc !== CollSrc.None ? x.collation : Collation.Binary;
-    const set = new Set<unknown>();
-    let hasNull = false;
-    const numAff = isNumAff(x.affinity);
-    const textAff = x.affinity === 'TEXT';
-    for (const c of list) {
-      let v = c.fn(NO_REGS);
-      if (v === null) {
-        hasNull = true;
-        continue;
-      }
-      if (numAff) v = applyNumericAffinity(v);
-      else if (textAff) v = applyTextAffinity(v, c.type === 'real');
-      set.add(hashKey(v, coll));
-    }
-    const listAllNumeric = list.every((c) => c.type === 'int' || c.type === 'real' || c.type === 'null');
-    return fold({
-      ...base,
-      constant: x.constant,
-      fn: (r) => {
-        let v = fx(r);
-        if (v === null) return null;
-        // A probe without affinity compared to numeric list values: no conversion (SQLite).
-        if (!numAff && !textAff && typeof v === 'string' && listAllNumeric) return finish(hasNull ? null : 0);
-        if (set.has(hashKey(v, coll))) return finish(1);
-        return finish(hasNull ? null : 0);
-      },
-    });
+    const collation = x.collSrc !== CollSrc.None ? x.collation : Collation.Binary;
+    const probeAffinity = isNumAff(x.affinity) ? 'NUMERIC' : x.affinity === 'TEXT' ? 'TEXT' : 'NONE';
+    const { fn } = f.compile([x, ...list], { collation, probeAffinity, negated: not });
+    return fold({ ...base, constant: x.constant, fn });
   }
-  const tests = list.map((c) => comparison('=', x, c).fn);
-  return {
-    ...base,
-    constant: false,
-    fn: (r) => {
-      let sawNull = false;
-      for (const t of tests) {
-        const v = t(r);
-        if (v === 1) return finish(1);
-        if (v === null) sawNull = true;
-      }
-      return finish(sawNull ? null : 0);
-    },
-  };
-}
-
-/** SQL LIKE (ASCII case-insensitive) / GLOB (case-sensitive, with [...] classes). */
-export function likeMatch(pattern: string, s: string, escape: number, glob: boolean): boolean {
-  const p = Array.from(pattern);
-  const t = Array.from(s);
-  const ANY = glob ? '*' : '%';
-  const ONE = glob ? '?' : '_';
-  const fold = (c: string): string => (glob ? c : c.length === 1 && c >= 'A' && c <= 'Z' ? c.toLowerCase() : c);
-  const esc = escape >= 0 ? String.fromCodePoint(escape) : null;
-  // Iterative matcher with single backtrack point for the last wildcard (standard approach).
-  let pi = 0;
-  let ti = 0;
-  let starP = -1;
-  let starT = -1;
-  while (ti < t.length) {
-    if (pi < p.length) {
-      const c = p[pi];
-      if (esc !== null && c === esc && pi + 1 < p.length) {
-        if (fold(p[pi + 1]) === fold(t[ti])) {
-          pi += 2;
-          ti++;
-          continue;
-        }
-      } else if (c === ANY) {
-        starP = pi++;
-        starT = ti;
-        continue;
-      } else if (c === ONE) {
-        pi++;
-        ti++;
-        continue;
-      } else if (glob && c === '[') {
-        const end = classEnd(p, pi);
-        if (end > 0) {
-          if (classMatch(p, pi, end, t[ti])) {
-            pi = end + 1;
-            ti++;
-            continue;
-          }
-        } else if (c === t[ti]) {
-          pi++;
-          ti++;
-          continue;
-        }
-      } else if (fold(c) === fold(t[ti])) {
-        pi++;
-        ti++;
-        continue;
-      }
-    }
-    if (starP >= 0) {
-      pi = starP + 1;
-      ti = ++starT;
-      continue;
-    }
-    return false;
-  }
-  while (pi < p.length && p[pi] === ANY) pi++;
-  return pi === p.length;
-}
-
-function classEnd(p: string[], start: number): number {
-  let i = start + 1;
-  if (p[i] === '^') i++;
-  if (p[i] === ']') i++;
-  while (i < p.length && p[i] !== ']') i++;
-  return i < p.length ? i : -1;
-}
-
-function classMatch(p: string[], start: number, end: number, c: string): boolean {
-  let i = start + 1;
-  let negate = false;
-  if (p[i] === '^') {
-    negate = true;
-    i++;
-  }
-  let found = false;
-  let first = true;
-  while (i < end) {
-    if (p[i] === '-' && !first && i + 1 < end) {
-      const lo = p[i - 1].codePointAt(0)!;
-      const hi = p[i + 1].codePointAt(0)!;
-      const x = c.codePointAt(0)!;
-      if (x >= lo && x <= hi) found = true;
-      i += 2;
-    } else {
-      if (p[i] === c) found = true;
-      i++;
-    }
-    first = false;
-  }
-  return found !== negate;
+  // Otherwise the probe is compared with each element by `=`.
+  const tests = list.map((c) => ({ fn: comparison('=', x, c).fn, type: 'int' as StaticType, constant: false }));
+  const { fn } = f.compile([x, ...tests], { negated: not });
+  return { ...base, constant: false, fn };
 }
 
 function compileLike(op: string, not: boolean, x: Compiled, pat: Compiled, escape?: Compiled): Compiled {
   if (op !== 'LIKE' && op !== 'GLOB') throw new SmaltError('SMALT_ERROR', `no such function: ${op.toLowerCase()}`);
-  const glob = op === 'GLOB';
-  const fx = x.fn;
-  const fp = pat.fn;
-  const fe = escape?.fn;
-  const xr = x.type === 'real';
-  const pr = pat.type === 'real';
-  const er = escape?.type === 'real';
+  const { fn } = sqlFunction(op === 'GLOB' ? 'sql.glob' : 'sql.like').compile(escape ? [x, pat, escape] : [x, pat], { negated: not });
   return fold({
-    fn: (r) => {
-      const v = fx(r);
-      const p = fp(r);
-      if (v === null || p === null) return null;
-      let esc = -1;
-      if (fe) {
-        const e = fe(r);
-        if (e === null) return null;
-        const es = toText(e, er)!;
-        if (Array.from(es).length !== 1) throw new SmaltError('SMALT_ERROR', 'ESCAPE expression must be a single character');
-        esc = es.codePointAt(0)!;
-      }
-      const m = likeMatch(toText(p, pr)!, toText(v, xr)!, esc, glob);
-      return m !== not ? 1 : 0;
-    },
+    fn,
     type: 'int',
     collation: 0,
     collSrc: CollSrc.None,
@@ -934,27 +450,11 @@ function compileCase(e: Extract<Expr, { kind: 'case' }>, scope: CompileScope): C
   });
 }
 
+const CAST_FUNCTIONS: Record<string, string> = { INTEGER: 'sql.cast_integer', REAL: 'sql.cast_real', TEXT: 'sql.cast_text', BLOB: 'sql.cast_blob' };
+
 function compileCast(x: Compiled, typeName: string): Compiled {
   const st = storageTypeFor(typeName);
-  const f = x.fn;
-  const xr = x.type === 'real';
-  let fn: Fn;
-  switch (st) {
-    case 'INTEGER':
-      fn = (r) => castToInteger(f(r));
-      break;
-    case 'REAL':
-      fn = (r) => castToReal(f(r));
-      break;
-    case 'TEXT':
-      fn = (r) => toText(f(r), xr);
-      break;
-    case 'BLOB':
-      fn = (r) => toBlob(f(r), xr);
-      break;
-    default:
-      fn = (r) => castToNumeric(f(r));
-  }
+  const { fn } = sqlFunction(CAST_FUNCTIONS[st] ?? 'sql.cast_numeric').compile([x], {});
   const affinity = st === 'ANY' ? 'NUMERIC' : affinityOfStorage(st);
   const type = st === 'ANY' || st === 'NUMERIC' ? 'num' : staticTypeOfStorage(st);
   return fold({ fn, type, collation: x.collation, collSrc: x.collSrc, affinity, constant: x.constant });
