@@ -86,7 +86,7 @@ function parquetServer(opts: { gzip?: boolean } = {}) {
     const file = join(F, path);
     let body: Buffer;
     try {
-      body = path === '/not.parquet' ? Buffer.from('not parquet at all') : readFileSync(file);
+      body = path === '/not.parquet' ? Buffer.from('not parquet at all') : path === '/empty.parquet' ? Buffer.alloc(0) : readFileSync(file);
     } catch {
       res.writeHead(404);
       res.end();
@@ -95,6 +95,13 @@ function parquetServer(opts: { gzip?: boolean } = {}) {
     const size = body.length;
     const m = /^bytes=(\d+)-(\d+)$/.exec(String(req.headers.range ?? ''));
     const headers = { etag: `"${size}-${state.version}"`, 'accept-ranges': 'bytes' };
+    if (m && !state.ignoreRanges && Number(m[1]) >= size) {
+      // Like real servers: a range that starts past the end (any range of an empty file) is 416.
+      ranges.push({ file, bytes: 0, range: req.headers.range!, method: req.method! });
+      res.writeHead(416, { ...headers, 'content-range': `bytes */${size}` });
+      res.end();
+      return;
+    }
     if (m && !state.ignoreRanges) {
       const [s, e] = [Number(m[1]), Math.min(Number(m[2]), size - 1)];
       ranges.push({ file, bytes: e - s + 1, range: req.headers.range!, method: req.method! });
@@ -272,5 +279,7 @@ describe('hosts that compress responses (GitHub Pages, issue #32)', () => {
     srv.ranges.length = 0;
     expect(await d.queryAsync(`SELECT * FROM read_parquet('${srv.base}/not.parquet')`).catch((e: Error) => e.message)).toMatch(/not\.parquet'\): not a readable Parquet file/);
     expect(srv.ranges.filter((r) => r.range === null).map((r) => r.method)).toEqual(['GET']);
+    // An empty file: the probe gets 416, the file is read whole, and the format reports it (not "HTTP 416").
+    expect(await d.queryAsync(`SELECT * FROM read_parquet('${srv.base}/empty.parquet')`).catch((e: Error) => e.message)).toMatch(/empty\.parquet'\): not a readable Parquet file/);
   });
 });
