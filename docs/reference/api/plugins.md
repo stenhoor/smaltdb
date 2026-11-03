@@ -6,8 +6,7 @@ read from, connection types, and methods that the application calls. smaltdb's o
 [plugins guide](../../guide/plugins) shows how to install them.
 
 This page describes the plugin interface, **API version 1**. It is not stable yet: it will be declared stable before
-the 0.9.0 release. Until then it may change, and plugins written outside this repository may need changes when you
-upgrade.
+the 0.9.0 release. Until then it may change, and a plugin may need changes when you upgrade smaltdb.
 
 ```ts
 import type { SmaltPlugin, PluginHost, FormatReader, SourceHandler } from 'smaltdb/engine';

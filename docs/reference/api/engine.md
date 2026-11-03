@@ -228,6 +228,7 @@ export type { Vfs, VfsFile, OpenOptions };
 `DatabaseOptions.plugins` installs [plugins](../../guide/plugins) into this engine instance. In the browser, plugins
 are installed in the engine worker with `serve({ plugins })` from `smaltdb/worker-runtime`.
 
+<!-- docs:plugin @smaltdb/parquet -->
 ```ts
 // db-worker.ts
 import { serve } from 'smaltdb/worker-runtime';

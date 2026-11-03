@@ -67,6 +67,12 @@ only the pieces it uses.
   plugins and no third-party runtime dependencies, so a licence scan of it, its lockfile included, finds none. Each
   plugin repository has its own licence, lockfile, tests, CI and releases, and a scan of one shows only that plugin's
   dependencies. The core tests the plugin interface with test plugins defined in its own test suite.
+- **Before the first publish** (amended, step 5): smaltdb 0.9.0 and the plugins are not on npm yet, and nothing uses
+  git dependencies. Each repository has a `packed.json` that pins the packages it needs to commits, and the same
+  `scripts/fetch-packed.mjs`, which checks out those commits, builds them, runs `npm pack` and installs the tarballs
+  with `npm install --no-save`. CI and developers run it after `npm ci`. Nothing reaches a `package.json` or lockfile,
+  so there is no core-to-plugin cycle to clean up: at release, the script and the pin files are deleted, and pins that
+  are still wanted become `^0.9.0` development dependencies.
 - **Notices travel with each package.** Every package has its own `LICENSE`. A package that depends on third-party
   code declares it as a normal `dependency`, so npm installs it with its own licence file next to it, where scanners
   expect it.
@@ -225,7 +231,10 @@ The catalog records, for each external table and connection, the format, source 
   - The external data and import/export guides gain installation steps.
   - Getting started gains the worker-entry pattern.
   - The reference pages say which plugin provides each function and statement.
-  - The `docs:examples` harness loads all plugins.
+  - The docs examples (amended, owner's decision 2026-11-03) are split by plugin. The core's harness installs
+    `@smaltdb/io` and `@smaltdb/external`, which contain no third-party code, from their pins. Blocks that need
+    `@smaltdb/parquet` are marked `<!-- docs:plugin @smaltdb/parquet -->`: the core skips them, and
+    `smaltdb-parquet` runs every page that has one, with all three plugins, against the docs at its pinned core commit.
 - **Process.** A release publishes the core from this repository and each plugin from its own.
 
 ## Implementation plan
@@ -238,6 +247,8 @@ The catalog records, for each external table and connection, the format, source 
    framework: SQL, catalog, fetch phase, patterns, partitions, pruning, validators.
 4. **External sources and CSV/JSON out.** `@smaltdb/external` (sources, signing, credentials, registered files) and
    `@smaltdb/io` (CSV/JSON formats, import and export).
-5. **Separate repositories.** Each plugin moves to its own repository with its tests; the core keeps test plugins.
+5. **Separate repositories.** ✅ Each plugin moves to its own repository with its tests; the core keeps test plugins.
+   The plugins' tests that use the engine's internals (its server and worker protocol) import them from the source in
+   the packed core build.
 6. **Declare API version 1 stable**, with a public reference for writing plugins.
 7. **Release** 0.9.0: `smaltdb` and the three `@smaltdb/*` packages, together.

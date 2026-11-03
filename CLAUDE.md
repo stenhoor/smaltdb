@@ -9,12 +9,13 @@ file; keep the working rules the same.
 
 | Command | What it does | When |
 |---|---|---|
+| `npm ci && npm run deps` | Installs dependencies, then the pinned `@smaltdb/io` and `@smaltdb/external` builds from `packed.json` (see below) | First, and again after every `npm ci` or `npm install` |
 | `npm run check` | `npm run typecheck` then `npm test` (vitest): what CI's `test` job runs | Before every commit |
 | `npm run test:browser` | Builds `dist/`, then runs the browser integration tests (Playwright). CI runs them on Chromium, Firefox and WebKit | Changes to the client, worker, server, OPFS or multi-tab code |
 | `npm run slt` | The sqllogictest subset (122k records) | Changes to the parser, planner, expressions or functions |
 | `npm run bench` | Storage micro-benchmarks in Node (`bench:browser` compares engines in a browser) | Performance work; compare with `bench/results/` |
 | `npm run docs:dev` | The docs site (VitePress) with live reload; `npm run docs:build` fails on dead links | Docs changes |
-| `npm run build` | `dist/` (client, worker, engine), type declarations, and every `plugins/*` workspace | Packaging and release checks |
+| `npm run build` | `dist/` (client, worker, engine) and type declarations | Packaging and release checks |
 
 Playwright is resolved globally in local containers (see `test/browser/playwright.mjs`); do not run
 `playwright install` locally.
@@ -24,19 +25,23 @@ Playwright is resolved globally in local containers (see `test/browser/playwrigh
 - `src/client/`: the `smaltdb` client (`open()`, `Database`). `src/engine/`: the engine (SQL in `sql/`, planner and
   execution in `exec/`, B-trees, pager and WAL in `storage/`, catalog, VFS, worker server and runtime). `src/shared/`:
   the worker protocol.
-- `plugins/*`: optional packages (`@smaltdb/parquet`, `@smaltdb/external`, `@smaltdb/io`) as npm workspaces, until
-  each moves to its own repository ([ADR 0012](docs/adr/0012-plugins.md)). Core tests the plugin interface with test
-  plugins in `test/plugins.test.ts`; never import a plugin from `src/`.
+- Plugins live in their own repositories ([ADR 0012](docs/adr/0012-plugins.md)): `stenhoor/smaltdb-io`,
+  `stenhoor/smaltdb-external`, `stenhoor/smaltdb-parquet`. Core tests the plugin interface with test plugins in
+  `test/plugins.test.ts`; never import a plugin from `src/`. Until 0.9.0 is on npm, `packed.json` pins `@smaltdb/io`
+  and `@smaltdb/external` to commits for the docs examples and browser tests, and `scripts/fetch-packed.mjs` (the same
+  file in all four repositories) installs them without touching `package.json` or the lockfile. A change to the plugin
+  interface lands here first; then the plugin repositories update their `smaltdb` pin.
 - Read before changing things: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/TESTING.md](docs/TESTING.md),
   [docs/ROADMAP.md](docs/ROADMAP.md), and the decisions in [docs/adr/](docs/adr/README.md). A significant decision
   gets a new ADR.
 
 ## Lessons from CI failures
 
-- **Lockfile.** Adding or changing a `plugins/*` workspace or any dependency means running `npm install` and
-  committing `package-lock.json`. Otherwise `npm ci` fails and no tests run.
+- **Lockfile.** Adding or changing any dependency means running `npm install` and committing `package-lock.json`.
+  Otherwise `npm ci` fails and no tests run.
 - **Docs examples are tests.** `test/docs-examples.test.ts` runs every SQL example in `docs/guide` and
-  `docs/reference` and type-checks the TypeScript ones, so a docs or engine change can fail it.
+  `docs/reference` and type-checks the TypeScript ones, so a docs or engine change can fail it. Parquet examples are
+  marked `<!-- docs:plugin @smaltdb/parquet -->` and run in `smaltdb-parquet` instead (see TESTING.md).
 - **No fixed sleeps in tests.** Wait with `until()` / `pause()` from `test/helpers/wait.ts` (see TESTING.md).
 - **Probe tests** (`test/zz-*.test.ts`) are scratch files: delete them, never commit them. Don't reformat files with
   Prettier.

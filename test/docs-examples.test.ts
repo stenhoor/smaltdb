@@ -1,7 +1,8 @@
 /**
  * Every SQL example in the user documentation (docs/guide, docs/reference) runs here, and every
  * result table printed under one must match what the engine returns. TypeScript examples are
- * type-checked against the public API (and the plugins in plugins/). See docs/TESTING.md ("Documentation examples").
+ * type-checked against the public API and the plugins this repository installs (@smaltdb/io and @smaltdb/external,
+ * pinned in packed.json). See docs/TESTING.md ("Documentation examples").
  *
  * A page runs top to bottom on one fresh in-memory database, so an earlier block's tables are
  * visible to later ones. Files in docs/examples/ are registered as `file:<name>`.
@@ -11,6 +12,9 @@
  *   <!-- docs:error CODE -->      the block's last statement must fail with this error code
  *   <!-- docs:unordered -->       compare the result rows in any order
  *   <!-- docs:setup ... -->       hidden SQL run before the next block (e.g. data the reader need not see)
+ *   <!-- docs:plugin NAME -->     the block needs a plugin this repository doesn't install (@smaltdb/parquet): it is
+ *                                 not run or type-checked here, but in that plugin's repository, which runs the whole
+ *                                 page with every plugin installed
  * A Markdown table directly after a sql fence is the expected result of the block's last statement:
  * the header row is the column names, `NULL` is NULL, blobs are x'hex', and a cell in backticks
  * is taken literally (so `' a '` keeps its spaces and quotes are dropped: write `'…'` for text with
@@ -23,7 +27,6 @@ import { describe, expect, it } from 'vitest';
 import external from '@smaltdb/external';
 import { registerFile } from '@smaltdb/external/client';
 import io from '@smaltdb/io';
-import parquet from '@smaltdb/parquet';
 import { Database } from '../src/engine/database.js';
 import { parse } from '../src/engine/sql/parser.js';
 import type { SqlValue } from '../src/engine/values.js';
@@ -31,6 +34,13 @@ import type { SqlValue } from '../src/engine/values.js';
 const DOCS = 'docs';
 const PAGE_DIRS = ['guide', 'reference'];
 const EXAMPLES = join(DOCS, 'examples');
+/** The plugins installed here; blocks marked `docs:plugin` with another are tested in that plugin's repository. */
+const INSTALLED = ['@smaltdb/io', '@smaltdb/external'];
+const needsOther = (b: Block): boolean =>
+  b.markers.some((m) => {
+    const name = /^docs:plugin\s+(\S+)/.exec(m)?.[1];
+    return name !== undefined && !INSTALLED.includes(name);
+  });
 
 function pages(): string[] {
   const out: string[] = [];
@@ -152,8 +162,8 @@ describe('documentation SQL examples', () => {
   });
   for (const page of all) {
     it(page, async () => {
-      // Every plugin is installed (ADR 0012), as an application that uses them would.
-      const db = Database.openMemory({ plugins: [external, io, parquet] });
+      // The plugins this repository installs (ADR 0012), as an application that uses them would.
+      const db = Database.openMemory({ plugins: [external, io] });
       await registerExamples(db);
       try {
         for (const b of blocks(readFileSync(page, 'utf8'))) {
@@ -162,7 +172,7 @@ describe('documentation SQL examples', () => {
             const setup = /^docs:setup\s+([\s\S]*)$/.exec(m);
             if (setup) await db.execAsync(setup[1]);
           }
-          if (b.lang !== 'sql' || b.markers.includes('docs:skip')) continue;
+          if (b.lang !== 'sql' || b.markers.includes('docs:skip') || needsOther(b)) continue;
           const err = b.markers.map((m) => /^docs:error\s+(\S+)/.exec(m)?.[1]).find(Boolean);
           if (err) {
             // A syntax error anywhere in the block fails parse(): run the block as one script then.
@@ -211,7 +221,7 @@ describe('documentation TypeScript examples', () => {
     const origin = new Map<string, string>();
     for (const page of all) {
       blocks(readFileSync(page, 'utf8')).forEach((b, n) => {
-        if (!['ts', 'typescript'].includes(b.lang) || b.markers.includes('docs:skip')) return;
+        if (!['ts', 'typescript'].includes(b.lang) || b.markers.includes('docs:skip') || needsOther(b)) return;
         // `db` (an open client database) is predeclared unless the block makes its own.
         const declaresDb = /\b(const|let|var)\s+db\b|\(\s*db\s*(:[^)]*)?\)\s*=>|\bfunction\s*\w*\s*\(\s*db\b/.test(b.code);
         const prelude = declaresDb ? '' : "declare const db: import('smaltdb').Database;\n";
@@ -241,11 +251,6 @@ describe('documentation TypeScript examples', () => {
             smaltdb: [join(root, 'src/client/index.ts')],
             'smaltdb/engine': [join(root, 'src/engine/index.ts')],
             'smaltdb/worker-runtime': [join(root, 'src/engine/worker-runtime.ts')],
-            '@smaltdb/parquet': [join(root, 'plugins/parquet/src/index.ts')],
-            '@smaltdb/io': [join(root, 'plugins/io/src/index.ts')],
-            '@smaltdb/io/client': [join(root, 'plugins/io/src/client.ts')],
-            '@smaltdb/external': [join(root, 'plugins/external/src/index.ts')],
-            '@smaltdb/external/client': [join(root, 'plugins/external/src/client.ts')],
           },
         },
         files,

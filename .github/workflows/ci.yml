@@ -14,6 +14,15 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # The plugins (@smaltdb/io, @smaltdb/external) are not on npm yet: build the commits pinned in packed.json and
+      # install them, for the docs examples and the browser tests (scripts/fetch-packed.mjs).
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cache/packed/*.tgz
+            .cache/packed/*-files
+          key: packed-${{ hashFiles('packed.json') }}
+      - run: node scripts/fetch-packed.mjs
       - run: npm run typecheck
       - run: npm test
 
@@ -30,6 +39,15 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # The plugins (@smaltdb/io, @smaltdb/external) are not on npm yet: build the commits pinned in packed.json and
+      # install them, for the docs examples and the browser tests (scripts/fetch-packed.mjs).
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cache/packed/*.tgz
+            .cache/packed/*-files
+          key: packed-${{ hashFiles('packed.json') }}
+      - run: node scripts/fetch-packed.mjs
       # Playwright is resolved globally (see test/browser/playwright.mjs) so local dev containers can use a preinstalled copy.
       - run: npm install -g playwright && npx playwright install --with-deps ${{ matrix.browser }}
       - run: NODE_PATH=$(npm root -g) BROWSERS=${{ matrix.browser }} npm run test:browser

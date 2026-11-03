@@ -29,6 +29,7 @@ worker an entry script that lists your plugins.
 
 2. Write an engine worker entry that serves the engine with your plugins:
 
+   <!-- docs:plugin @smaltdb/parquet -->
    ```ts
    // db-worker.ts
    import { serve } from 'smaltdb/worker-runtime';
@@ -72,6 +73,7 @@ Use the same `worker` option in every tab, so each tab that may own the database
 
 With the in-process engine, pass the plugins to `Database.open()` or `Database.openMemory()`:
 
+<!-- docs:plugin @smaltdb/parquet -->
 ```ts
 import { Database } from 'smaltdb/engine';
 import external from '@smaltdb/external';
@@ -145,5 +147,5 @@ Every other table works as usual.
 ## Writing plugins
 
 The plugin interface is `SmaltPlugin` in `smaltdb/engine`, API version 1. See [Writing plugins](../reference/api/plugins).
-It is not stable yet: it will be declared stable before the 0.9.0 release. Until then, plugins written outside this
-repository may need changes when you upgrade.
+It is not stable yet: it will be declared stable before the 0.9.0 release. Until then, a plugin may need changes when
+you upgrade smaltdb.
