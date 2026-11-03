@@ -110,6 +110,8 @@ class FeScope {
   carry: ((rowIndex: number, type: StaticType, collation: Collation) => () => number) | null = null;
   /** While binding the ON condition of the join that adds source `onSource`. */
   onSource = -1;
+  /** A WITH clause's scope: it holds CTEs, and no rows. */
+  ctesOnly = false;
   constructor(readonly parent: FeScope | null) {}
 
   findCte(name: string): FeCte | undefined {
@@ -167,6 +169,7 @@ class FrontEnd {
 
   select(stmt: SelectStmt, parent: FeScope | null): CoreResult {
     const withScope = new FeScope(parent);
+    withScope.ctesOnly = true;
     if (stmt.with) this.registerCtes(stmt.with, withScope);
     const base = stmt.with ? withScope : parent;
     if (stmt.compound.length === 0) {
@@ -859,7 +862,8 @@ class FrontEnd {
 
   private resolveColumn(e: ColumnExpr, scope: FeScope): ColumnBinding {
     let depth = 0;
-    for (let s: FeScope | null = scope; s; s = s.parent, depth++) {
+    // A column's depth counts the operations it is evaluated out from, not the scopes that only hold CTEs.
+    for (let s: FeScope | null = scope; s; depth += s.ctesOnly ? 0 : 1, s = s.parent) {
       const hit = this.resolveIn(e, s);
       if (hit) return this.binding(hit, s, depth);
     }

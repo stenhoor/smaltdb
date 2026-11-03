@@ -1028,13 +1028,26 @@ export class Database implements FunctionContext {
       case 'legacy':
         return planner.planSelect(stmt, null);
       case 'shadow': {
-        // The physical plan replaces the planner's, as if planned alone (registers, external sources).
+        // The physical plan replaces the planner's, as if planned alone (registers, external sources, subplans),
+        // and must record the same subplans (subqueries) as the planner.
         const start = planner.mark();
+        const first = planner.subplans.length;
+        const subplans = (): string =>
+          planner.subplans
+            .slice(first)
+            .map((x) => `${x.label}\n${explainRows(x.root).map((r) => `  ${r.id} ${r.parent} ${r.detail}`).join('\n')}`)
+            .join('\n');
         const physical = (fe: FrontEndResult): QueryPlan | null => {
+          const want = subplans();
           const end = planner.mark();
           start();
           const p = planner.planPlan(fe.plan, fe.columns);
-          if (!p) end();
+          if (!p) {
+            end();
+            return null;
+          }
+          const got = subplans();
+          if (got !== want) throw new SmaltError('SMALT_INTERNAL', `SMALT_PLAN=shadow: the physical planner disagrees with the planner on subqueries\n  in: ${text}\nphysical:\n${got}\nplanner:\n${want}`);
           return p;
         };
         return shadowCheck(stmt, text, this.frontEndCatalog(), () => planner.planSelect(stmt, null), () => planner.usedMatview, physical);

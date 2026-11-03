@@ -37,6 +37,9 @@ describe('subquery decorrelation', () => {
       'SELECT id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE o.n = i.n)',
       'SELECT id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k AND i.v > 9 AND o.id < 5)',
       'SELECT id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k AND i.s = o.s LIMIT 1)',
+      // EXISTS over an aggregate always has its row (not a semi-join).
+      'SELECT id FROM o WHERE EXISTS (SELECT count(*) FROM i WHERE i.k = o.k)',
+      'SELECT id FROM o WHERE NOT EXISTS (SELECT max(v) FROM i WHERE i.k = o.k)',
       'SELECT id, (SELECT count(*) FROM i WHERE i.k = o.k) FROM o',
       'SELECT id, (SELECT sum(v) FROM i WHERE i.k = o.k) FROM o',
       'SELECT id, (SELECT max(v) * 2 + count(*) FROM i WHERE i.k = o.k AND v IS NOT NULL) FROM o',

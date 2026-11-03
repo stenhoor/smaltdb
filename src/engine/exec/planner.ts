@@ -52,6 +52,7 @@ import {
   boundMetadata,
   compileBoundExpr,
   compileExpr,
+  compilePlanExpr,
   compileWithPlan,
   comparisonCollation,
   pipelineCompiler,
@@ -113,7 +114,7 @@ import { type ColumnStore, ROW_GROUP_ROWS, type Zone, zoneMayMatch } from '../st
 import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
 import { deletedBitmap, rowidsOf, zoneOf } from './columnar-table.js';
 import { anyNode } from '../sql/ast-util.js';
-import type { PlanExpr } from '../plan/expr.js';
+import { type PlanExpr, lit } from '../plan/expr.js';
 import type { AggCall, JoinKind, PlanOp, SortKey as PlanSortKey } from '../plan/ops.js';
 import type { CollationName } from '../plan/types.js';
 import type { ExternalSource } from '../external/external.js';
@@ -219,7 +220,7 @@ interface Source {
   joinType: JoinType;
   on: Expr[];
   /** The join condition's conjuncts bound from a plan (the physical planner), in place of `on`. */
-  onBound?: PlanExpr[];
+  onBound?: BoundConjunct[];
   /** Lower-cased column names merged by USING/NATURAL (hidden from unqualified lookup and *). */
   hidden: Set<string>;
   position: number;
@@ -357,7 +358,11 @@ function filterOn(child: Operator, e: Expr, cs: CompileScope): Filter {
 
 /** A Filter on a pool conjunct: compiled from its bound form (bound once, when the pool was built). */
 function filterOnConjunct(child: Operator, c: ConjunctInfo, cs: CompileScope): Filter {
-  if (!c.compilable) return filterOn(child, c.expr!, cs);
+  if (!c.compilable) {
+    if (!c.lazy) return filterOn(child, c.expr!, cs);
+    const b = c.lazy();
+    return new Filter(child, compileBoundExpr(b, cs.funcCtx).fn, b);
+  }
   return new Filter(child, compileBoundExpr(c.bound, cs.funcCtx).fn, c.bound);
 }
 
@@ -438,6 +443,8 @@ interface ConjunctInfo {
   placed: boolean;
   /** RIGHT/FULL JOIN: earliest step (FROM position) at which this WHERE conjunct may be applied. */
   minStep?: number;
+  /** Not compilable and bound from a plan: binds it with its subqueries planned (the physical planner). */
+  lazy?: () => PlanExpr;
 }
 
 /** FROM items, join conditions and WHERE conjuncts the physical planner bound from a plan (see planFrom). */
@@ -448,8 +455,17 @@ interface BoundFrom {
   /** Item `p` was registered: its registers are known. */
   added(p: number): void;
   /** Item `p`'s join condition, split into conjuncts. */
-  on(p: number): PlanExpr[];
-  where(): PlanExpr[];
+  on(p: number): BoundConjunct[];
+  where(): BoundConjunct[];
+}
+
+/**
+ * A conjunct bound from a plan. With a subquery, `bound` is for analysis only (its subqueries are placeholders) and
+ * `compile` binds it with its subqueries planned, when it is placed.
+ */
+interface BoundConjunct {
+  bound: PlanExpr;
+  compile?: () => PlanExpr;
 }
 
 interface AccessChoice {
@@ -1238,28 +1254,50 @@ export class Planner {
    * Plans are checked before anything is allocated, so a null leaves the planner as it was.
    */
   planPlan(op: PlanOp, columns: ResultColumnInfo[]): QueryPlan | null {
-    const s = flatShape(op);
-    if (!s) return null;
+    if (!supportedPlan(op, 0)) return null;
+    return this.physical(op, columns, null);
+  }
+
+  /**
+   * Operators for a plan `supportedPlan` accepts. `outer` maps the columns of the enclosing operation's row for a
+   * subquery's plan (its columns with depth > 0), null at the top; `given` are the result columns (computed when
+   * null).
+   */
+  private physical(op: PlanOp, given: ResultColumnInfo[] | null, outer: ColMap | null): QueryPlan {
+    const s = flatShape(op)!;
     const ctx = this.env.funcCtx;
     const compile = (e: PlanExpr): Compiled => compileBoundExpr(e, ctx);
-    const limit = (root: Operator): Operator => (s.limit ? new Limit(root, compile(s.limit.count).fn, s.limit.offset ? compile(s.limit.offset).fn : undefined) : root);
+    const scope = new Scope(null);
+    // Columns of enclosing operations: the subquery is correlated, and depends on what the enclosing mapping marks.
+    const up =
+      (m: ColMap): ColMap =>
+      (c) => {
+        if (c.depth === 0) return m(c);
+        scope.correlated = true;
+        return outer!(shallower(c));
+      };
+    const sub = (n: PlanExpr, f: ColMap): PlanExpr => this.subqueryExpr(n, f);
+    const bind = (e: PlanExpr, m: ColMap): PlanExpr => rebind(e, up(m), sub);
+    // A WHERE / ON conjunct with a subquery is bound for analysis with placeholders, and planned where it is placed.
+    const conjunct = (e: PlanExpr, m: ColMap): BoundConjunct => (hasNested(e) ? { bound: rebind(e, up(m)), compile: () => bind(e, m) } : { bound: bind(e, m) });
+    const limitFns = (): [Fn, Fn | undefined] => [compile(bind(s.limit!.count, NO_COLUMNS)).fn, s.limit!.offset ? compile(bind(s.limit!.offset, NO_COLUMNS)).fn : undefined];
+    const limit = (root: Operator): Operator => (s.limit ? new Limit(root, ...limitFns()) : root);
 
-    const fast = this.countRowsOf(s, columns);
+    const fast = this.countRowsOf(s, given);
     if (fast) return { ...fast, root: limit(fast.root) };
 
     // The FROM row: the registers of each source's columns, in FROM order, marked as read when an expression reading
     // them is compiled. Join conditions read input 0 (the sources before) and input 1 (the source being joined).
-    const scope = new Scope(null);
     const fromRow: { reg: number; use: () => void }[] = [];
-    const fromSlot = (c: ColRef): PlanExpr => slotFor(c, fromRow[c.index].reg, fromRow[c.index].use);
+    const fromSlot: ColMap = (c) => slotFor(c, fromRow[c.index].reg, fromRow[c.index].use);
     let root: Operator;
     if (s.from) {
       const leaves = s.from;
       const offsets: number[] = [];
       leaves.reduce((at, l) => (offsets.push(at), at + leafWidth(l.op)), 0);
       const onSlot =
-        (p: number) =>
-        (c: ColRef): PlanExpr => {
+        (p: number): ColMap =>
+        (c) => {
           const f = fromRow[c.input === 1 ? offsets[p] + c.index : c.index];
           return slotFor(c, f.reg, f.use);
         };
@@ -1267,7 +1305,7 @@ export class Planner {
         items: leaves.map((l, p) => ({ item: leafItem(l.op, p), joinType: JOIN_TYPES[l.join ?? 'inner'] })),
         args: (p) => {
           const l = leaves[p].op;
-          return l.op === 'source' && l.kind === 'function' ? l.args.map((a) => rebind(a, fromSlot)) : undefined;
+          return l.op === 'source' && l.kind === 'function' ? l.args.map((a) => bind(a, fromSlot)) : undefined;
         },
         added: (p) => {
           const src = scope.sources[p];
@@ -1282,13 +1320,13 @@ export class Planner {
             for (const c of src.cols) fromRow.push({ reg: c.reg, use: () => this.dryCompile || src.external?.projection?.add(c.name.toLowerCase()) });
           }
         },
-        on: (p) => (leaves[p].on ? splitBoundConjuncts(rebind(leaves[p].on!, onSlot(p))) : []),
-        where: () => (s.where ? splitBoundConjuncts(rebind(s.where, fromSlot)) : []),
+        on: (p) => (leaves[p].on ? splitBoundConjuncts(leaves[p].on!).map((c) => conjunct(c, onSlot(p))) : []),
+        where: () => (s.where ? splitBoundConjuncts(s.where).map((c) => conjunct(c, fromSlot)) : []),
       });
     } else {
       this.lastScan = null;
       root = new SingleRow();
-      if (s.where) root = new Filter(root, compile(rebind(s.where, fromSlot)).fn);
+      if (s.where) root = new Filter(root, compile(bind(s.where, fromSlot)).fn);
     }
 
     // The aggregate's output row: keys, then aggregate calls (registers allocated where first read, as planCore
@@ -1297,7 +1335,7 @@ export class Planner {
     let outSlot = fromSlot;
     if (s.aggregate) {
       const a = s.aggregate;
-      const keys = a.keys.map((k) => rebind(k.expr, fromSlot));
+      const keys = a.keys.map((k) => bind(k.expr, fromSlot));
       const groupFns = keys.map((k) => compile(k).fn);
       const groupRegs = keys.map(() => this.regs.alloc());
       const specs: AggSpec[] = [];
@@ -1308,7 +1346,7 @@ export class Planner {
       const spec = (i: number): AggSpec => {
         let sp = byCall.get(i);
         if (sp === undefined) {
-          sp = this.aggSpec(a.aggs[i], (e) => rebind(e, fromSlot));
+          sp = this.aggSpec(a.aggs[i], (e) => bind(e, fromSlot));
           byCall.set(i, sp);
           specs.push(sp);
         }
@@ -1318,7 +1356,7 @@ export class Planner {
         const i = c.index;
         if (i < a.keys.length) return slotFor(c, groupRegs[i]);
         if (i < a.keys.length + a.aggs.length) return slotFor(c, spec(i - a.keys.length).outReg);
-        const from = a.carry[i - a.keys.length - a.aggs.length] as PlanExpr & { k: 'col' };
+        const from = a.carry[i - a.keys.length - a.aggs.length] as ColRef;
         const f = fromRow[from.index];
         bare.add(f.reg);
         return slotFor(c, f.reg, f.use);
@@ -1326,23 +1364,25 @@ export class Planner {
     }
 
     // Result expressions, then ORDER BY expressions that are not results, then HAVING (planCore's order).
-    const n = columns.length;
-    const compiled = s.project.slice(0, n).map((e) => compile(rebind(e, outSlot)));
+    const n = s.width;
+    const compiled = s.project.slice(0, n).map((e) => compile(bind(e, outSlot)));
     const regs = compiled.map(() => this.regs.alloc());
+    const columns: ResultColumnInfo[] =
+      given ?? compiled.map((c) => ({ name: '', type: c.type, collation: c.collSrc !== CollSrc.None ? c.collation : Collation.Binary, affinity: c.affinity }));
     const sortKeys: SortKey[] = [];
     const extraFns: Fn[] = [];
     const extraRegs: number[] = [];
     for (const k of s.sort ?? []) {
-      const at = (k.expr as PlanExpr & { k: 'col' }).index;
+      const at = (k.expr as ColRef).index;
       let reg: number;
       if (at < n) reg = regs[at];
       else {
-        extraFns.push(compile(rebind(s.project[at], outSlot)).fn);
+        extraFns.push(compile(bind(s.project[at], outSlot)).fn);
         extraRegs.push((reg = this.regs.alloc()));
       }
       sortKeys.push({ reg, desc: k.desc, nullsFirst: k.nullsFirst, collation: collationId(k.collation) });
     }
-    const having = s.having ? compile(rebind(s.having, outSlot)).fn : undefined;
+    const having = s.having ? compile(bind(s.having, outSlot)).fn : undefined;
 
     if (agg) {
       if (agg.groupFns.length === 0 && agg.bare.size === 0 && agg.aggs.every((x) => ORDER_INSENSITIVE_AGGS.has(x.name))) markUnordered(root);
@@ -1363,12 +1403,12 @@ export class Planner {
     const single = s.from?.length === 1 && s.from[0].op.op === 'scan' ? s.from[0].op : null;
     if (sortNeeded && !agg && !s.distinct && single && sortKeys.length === 1) {
       const k = s.sort![0];
-      const e = s.project[(k.expr as PlanExpr & { k: 'col' }).index];
+      const e = s.project[(k.expr as ColRef).index];
       const src = scope.sources[0];
       const scan = this.lastScan;
       const t = src.table!;
       const rowidAt = (i: number): boolean => single.columns[i] === -1 || single.columns[i] === t.rowidAlias;
-      if (scan && scan.access === src.access && e.k === 'col' && !isOpaque(e) && rowidAt(e.index) && k.nullsFirst === !k.desc) {
+      if (scan && scan.access === src.access && e.k === 'col' && e.depth === 0 && !isOpaque(e) && rowidAt(e.index) && k.nullsFirst === !k.desc) {
         scan.reverse = k.desc;
         sortNeeded = false;
       }
@@ -1378,10 +1418,137 @@ export class Planner {
     root = new Project(root, [...compiled.map((c) => c.fn), ...extraFns], [...regs, ...extraRegs]);
     if (s.distinct) root = new Distinct(root, regs, s.distinct.map(collationId));
     if (sortNeeded) {
-      const hint = s.limit ? topN(compile(s.limit.count).fn, s.limit.offset ? compile(s.limit.offset).fn : undefined) : undefined;
+      const hint = s.limit ? topN(...limitFns()) : undefined;
       root = new Sort(root, sortKeys, [...regs, ...extraRegs], hint, this.env.spill ?? null);
     }
-    return { root: limit(root), outRegs: regs, columns, correlated: false };
+    return { root: limit(root), outRegs: regs, columns, correlated: scope.correlated };
+  }
+
+  /**
+   * A subquery of a plan (`subquery`, `inSubquery`, and NOT IN as one test), compiled as the planner compiles it:
+   * decorrelated when it qualifies, else its plan re-run per outer row (or once, when uncorrelated). `f` maps the
+   * columns of the operation it is evaluated in.
+   */
+  private subqueryExpr(n: PlanExpr, f: ColMap): PlanExpr {
+    const ctx = this.env.funcCtx;
+    const test = (c: Fn): PlanExpr => subqueryNative({ fn: c, type: 'int', collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false });
+    const inTest = (x: PlanExpr & { k: 'inSubquery' }): Fn => {
+      const probe = compilePlanExpr(rebind(x.probe, f, (m, g) => this.subqueryExpr(m, g)), ctx);
+      return this.inFromPlan(this.physical(x.plan, null, f), probe);
+    };
+    if (n.k === 'not') {
+      const t = inTest(n.arg as PlanExpr & { k: 'inSubquery' });
+      return test((r) => {
+        const v = t(r);
+        return v === null ? null : v === 1 ? 0 : 1;
+      });
+    }
+    if (n.k === 'inSubquery') return test(inTest(n));
+    const q = n as PlanExpr & { k: 'subquery' };
+    const dec = decorrelationDisabled() ? null : this.decorrelatePlan(q.plan, q.mode, f);
+    if (q.mode === 'exists') return test(dec ? dec.fn : this.existsFromPlan(this.physical(q.plan, null, f)));
+    return subqueryNative(dec ?? this.scalarFromPlan(this.physical(q.plan, null, f)));
+  }
+
+  /**
+   * `decorrelate` for a subquery's plan, with the same rules: EXISTS or a scalar aggregate over base tables joined by
+   * inner joins, whose correlated WHERE conjuncts are equalities between the subquery's columns and the enclosing
+   * row's (conjuncts over the enclosing row alone are guards). Null when it does not qualify.
+   */
+  private decorrelatePlan(op: PlanOp, kind: 'exists' | 'scalar', f: ColMap): Compiled | null {
+    const s = flatShape(op)!;
+    const a = s.aggregate;
+    if (s.limit?.offset || !s.from || !s.where || (a && a.keys.length) || s.having) return null;
+    if (kind === 'scalar' && (s.limit || s.sort)) return null;
+    if (kind === 'exists' && s.limit && !(s.limit.count.k === 'lit' && typeof s.limit.count.value === 'number' && s.limit.count.value >= 1)) return null;
+    if (kind === 'exists' && a) return null;
+    for (const l of s.from) {
+      if (l.op.op !== 'scan' || (l.join !== null && l.join !== 'inner' && l.join !== 'cross')) return null;
+      if (l.on && !['inner', 'none'].includes(sideOf(l.on))) return null;
+    }
+    const pairs: { inner: PlanExpr; outer: PlanExpr; innerLeft: boolean }[] = [];
+    const guards: PlanExpr[] = [];
+    const rest: PlanExpr[] = [];
+    for (const c of andParts(s.where)) {
+      const sd = sideOf(c);
+      if (sd === 'inner' || sd === 'none') rest.push(c);
+      else if (sd === 'outer') guards.push(c);
+      else if (sd === 'mixed' && c.k === 'call' && c.fn === 'sql.eq' && !isOpaque(c)) {
+        const [x, y] = c.args.map(unconvertedOperand);
+        const l = sideOf(x);
+        const r = sideOf(y);
+        if (l === 'inner' && r === 'outer') pairs.push({ inner: x, outer: y, innerLeft: true });
+        else if (l === 'outer' && r === 'inner') pairs.push({ inner: y, outer: x, innerLeft: false });
+        else return null;
+      } else return null;
+    }
+    if (pairs.length === 0) return null;
+    // The scalar form's result: aggregates of the inner rows (no bare columns, nothing from the enclosing row).
+    let value: PlanExpr | undefined;
+    if (kind === 'scalar') {
+      if (!a || s.width !== 1 || s.distinct) return null;
+      value = s.project[0];
+      const reads: number[] = [];
+      let outerRef = false;
+      rebind(value, (c) => (c.depth === 0 ? reads.push(c.index) : (outerRef = true), c));
+      if (outerRef || hasNested(value) || reads.some((i) => i >= a.aggs.length) || !reads.length) return null;
+      const used = [...new Set(reads)].map((i) => a.aggs[i]);
+      if (used.some((c) => [...c.args, c.filter].some((x) => x !== undefined && sideOf(x) !== 'inner' && sideOf(x) !== 'none'))) return null;
+    }
+    // The inner side: its key expressions (grouped for a scalar, DISTINCT for EXISTS) over the uncorrelated WHERE.
+    const from = s.from.slice(1).reduce<PlanOp>((left, l) => ({ op: 'join', kind: l.join!, inputs: [left, l.op], ...(l.on ? { on: l.on } : {}) }), s.from[0].op);
+    const where = rest.length ? rest.reduce((x, y) => ({ k: 'and', args: [x, y] }) as PlanExpr) : undefined;
+    const filtered: PlanOp = where ? { op: 'filter', input: from, pred: where } : from;
+    const meta = pairs.map((p) => {
+      const m = boundMetadata(rebind(p.inner, (c) => slotFor(c, 0)), this.env.funcCtx);
+      return { type: m.type, collation: m.collSrc !== CollSrc.None ? m.collation : Collation.Binary, affinity: m.affinity };
+    });
+    let inner: PlanOp;
+    if (kind === 'exists') {
+      inner = { op: 'distinct', input: { op: 'project', input: filtered, exprs: pairs.map((p) => p.inner) }, collations: meta.map((m) => COLLATION_NAMES[m.collation]) };
+    } else {
+      const keyCol = (i: number): PlanExpr => {
+        const c: PlanExpr = { k: 'col', input: 0, index: i, depth: 0, type: meta[i].type, collation: COLLATION_NAMES[meta[i].collation] };
+        setMeta(c, { collation: meta[i].collation, collSrc: meta[i].collation ? CollSrc.Column : CollSrc.None, affinity: meta[i].affinity });
+        return c;
+      };
+      const shifted = rebind(value!, (c) => ({ ...c, index: c.index + pairs.length }));
+      inner = {
+        op: 'project',
+        input: { op: 'aggregate', input: filtered, keys: pairs.map((p, i) => ({ expr: p.inner, collation: COLLATION_NAMES[meta[i].collation] })), aggs: a!.aggs, carry: [] },
+        exprs: [...pairs.map((_p, i) => keyCol(i)), shifted],
+      };
+    }
+    let plan: QueryPlan;
+    try {
+      plan = this.physical(inner, null, null);
+    } catch {
+      return null;
+    }
+    if (plan.correlated) return null;
+    const outerOf = (e: PlanExpr): Compiled => compileBoundExpr(rebind(e, (c) => f(shallower(c)), (m, g) => this.subqueryExpr(m, g)), this.env.funcCtx);
+    const keyFns: { outer: Fn; convOuter: ((v: SqlValue) => SqlValue) | null; convInner: ((v: SqlValue) => SqlValue) | null; coll: Collation }[] = [];
+    for (let i = 0; i < pairs.length; i++) {
+      const col = plan.columns[i];
+      const p = pairs[i];
+      const innerIsColumn = p.inner.k === 'col' && !isOpaque(p.inner);
+      const innerC: Compiled = { fn: () => null, type: col.type, collation: col.collation, collSrc: innerIsColumn || col.collation ? CollSrc.Column : CollSrc.None, affinity: col.affinity, constant: false };
+      const outerC = outerOf(p.outer);
+      const [l, r] = p.innerLeft ? [innerC, outerC] : [outerC, innerC];
+      const coll = comparisonCollation(l, r);
+      if (kind === 'scalar' && coll !== col.collation) return null;
+      if (isOpaque(p.inner) && getMeta(p.inner)?.collSrc === CollSrc.Explicit) return null;
+      const [cl, cr] = comparisonConverters(l, r);
+      keyFns.push({ outer: outerC.fn, coll, convInner: p.innerLeft ? cl : cr, convOuter: p.innerLeft ? cr : cl });
+    }
+    this.recordSubplan(kind === 'exists' ? 'EXISTS (decorrelated: hash semi-join)' : 'SCALAR SUBQUERY (decorrelated: grouped lookup)', plan.root);
+    const guardFns = guards.map((g) => outerOf(g).fn);
+    let emptyPlan: QueryPlan | null = null;
+    if (kind === 'scalar') {
+      const empty: PlanOp = { op: 'project', input: { op: 'aggregate', input: { op: 'filter', input: from, pred: lit(0, 'int') }, keys: [], aggs: a!.aggs, carry: [] }, exprs: [value!] };
+      emptyPlan = this.physical(empty, null, null);
+    }
+    return this.decorrelatedFn(kind, plan, keyFns, guardFns, emptyPlan);
   }
 
   /** An aggregate call of a plan, with its arguments bound to the FROM row's registers by `bind`. */
@@ -1407,10 +1574,10 @@ export class Planner {
   }
 
   /** `SELECT count(*) FROM table` with nothing else: count leaf cells (planCountStar for plans). */
-  private countRowsOf(s: FlatShape, columns: ResultColumnInfo[]): QueryPlan | null {
+  private countRowsOf(s: FlatShape, given: ResultColumnInfo[] | null): QueryPlan | null {
     const a = s.aggregate;
     const scan = s.from?.length === 1 && s.from[0].op.op === 'scan' ? s.from[0].op : null;
-    if (!scan || !a || s.where || s.having || s.distinct || scan.indexedBy !== undefined || columns.length !== 1) return null;
+    if (!scan || !a || s.where || s.having || s.distinct || scan.indexedBy !== undefined || s.width !== 1) return null;
     if (a.keys.length !== 0 || a.aggs.length !== 1) return null;
     const c = a.aggs[0];
     const e = s.project[0];
@@ -1418,6 +1585,7 @@ export class Planner {
     const table = this.env.getTable(scan.table, scan.db);
     if (!table || isColumnar(table)) return null;
     const reg = this.regs.alloc();
+    const columns = given ?? [{ name: '', type: 'int' as StaticType, collation: Collation.Binary, affinity: 'NONE' as Affinity }];
     return { root: new CountRows(this.env.openTree(table.rootPage), table.name, reg), outRegs: [reg], columns, correlated: false };
   }
 
@@ -1705,7 +1873,7 @@ export class Planner {
 
   private andAll(cs: ConjunctInfo[], scope: CompileScope): Fn | undefined {
     if (cs.length === 0) return undefined;
-    const fns = cs.map((c) => (c.expr ? compileExpr(c.expr, scope) : compileBoundExpr(c.bound, scope.funcCtx)).fn);
+    const fns = cs.map((c) => (c.expr ? compileExpr(c.expr, scope) : compileBoundExpr(c.lazy ? c.lazy() : c.bound, scope.funcCtx)).fn);
     if (fns.length === 1) return fns[0];
     return (r) => {
       let sawNull = false;
@@ -1784,7 +1952,11 @@ export class Planner {
       // Arguments that read earlier sources of this FROM make the source lateral.
       let lateral = false;
       let correlated = false;
-      for (const a of planArgs ?? []) forEachSlot(a, () => (lateral = true));
+      for (const a of planArgs ?? []) {
+        // As for the AST below: a subquery makes the source correlated; columns of this FROM make it lateral.
+        if (planHasSubquery(a)) correlated = true;
+        else forEachSlot(a, (reg) => (this.slotSource(reg, scope) ? (lateral = true) : (correlated = true)));
+      }
       for (const a of planArgs ? [] : args) {
         const d = this.deps(a, scope);
         if (d === null) correlated = true;
@@ -2745,9 +2917,10 @@ export class Planner {
     return src.on.flatMap((e) => splitBetween(e)).map((e) => this.conjunct(e, scope));
   }
 
-  /** A conjunct the physical planner bound from a plan (no subqueries: always compilable). */
-  private boundConjunct(b: PlanExpr, scope: Scope): ConjunctInfo {
-    return { bound: b, compilable: true, deps: this.depsOf(b, scope), placed: false };
+  /** A conjunct the physical planner bound from a plan. */
+  private boundConjunct(b: BoundConjunct, scope: Scope): ConjunctInfo {
+    if (b.compile) return { bound: b.bound, compilable: false, deps: null, placed: false, lazy: b.compile };
+    return { bound: b.bound, compilable: true, deps: this.depsOf(b.bound, scope), placed: false };
   }
 
   private orderSegmentDP(segment: number[], prefix: Set<number>, prefixRows: number, pool: ConjunctInfo[], scope: Scope, cs: CompileScope): { order: number[]; rows: number } {
@@ -2956,8 +3129,12 @@ export class Planner {
     if (dec) return dec;
     const plan = this.planSelect(select, scope);
     if (plan.outRegs.length !== 1) throw new SmaltError('SMALT_ERROR', `sub-select returns ${plan.outRegs.length} columns - expected 1`);
+    return this.scalarFromPlan(plan);
+  }
+
+  /** A scalar subquery's value from its plan: the first column of its first row (cached unless correlated). */
+  private scalarFromPlan(plan: QueryPlan): Compiled {
     this.recordSubplan(plan.correlated ? 'CORRELATED SCALAR SUBQUERY' : 'SCALAR SUBQUERY', plan.root);
-    if (plan.correlated) scope.correlated = scope.correlated || this.isCorrelatedBeyond(scope);
     const out = plan.outRegs[0];
     const state = this.env.state;
     let epoch = -1;
@@ -2997,6 +3174,8 @@ export class Planner {
     if (core.kind !== 'select' || !core.where || !core.from || core.groupBy.length || core.having || core.windows.length) return null;
     if (kind === 'scalar' && (select.limit || select.orderBy.length)) return null;
     if (kind === 'exists' && select.limit && !(select.limit.kind === 'literal' && typeof select.limit.value === 'number' && select.limit.value >= 1)) return null;
+    // EXISTS over an aggregate always has its one row: the semi-join's keys would lose that.
+    if (kind === 'exists' && core.columns.some((c) => c.kind === 'expr' && containsAggregate(c.expr))) return null;
     // Inner sources: base tables only (known columns).
     const inner = new Map<string, Set<string>>();
     const addFrom = (f: FromItem): boolean => {
@@ -3110,16 +3289,30 @@ export class Planner {
     this.recordSubplan(kind === 'exists' ? 'EXISTS (decorrelated: hash semi-join)' : 'SCALAR SUBQUERY (decorrelated: grouped lookup)', plan.root);
     const guardFns = guards.map((g) => compileExpr(g, outerScope).fn);
     // Value over an empty inner set (count(*) -> 0, sum -> NULL, ...): the result expression over no rows.
-    let emptyValue: SqlValue = kind === 'exists' ? 0 : null;
     let emptyPlan: QueryPlan | null = null;
     if (kind === 'scalar') {
       const emptyCore: SelectCoreSelect = { ...core, columns: [{ kind: 'expr', expr: resultExpr!, pos: 0, end: 0 }], where: { kind: 'literal', value: 0, pos: 0, end: 0 } };
       emptyPlan = this.planSelect({ kind: 'select', core: emptyCore, compound: [], orderBy: [], pos: 0, end: 0 }, null);
     }
+    return this.decorrelatedFn(kind, plan, keyFns, guardFns, emptyPlan);
+  }
+
+  /**
+   * The value of a decorrelated subquery: `plan` (the inner side: its key columns, then for a scalar the value) is
+   * read once per statement into a hash table, probed per outer row with `keyFns`; `guardFns` read the outer row only.
+   */
+  private decorrelatedFn(
+    kind: 'exists' | 'scalar',
+    plan: QueryPlan,
+    keyFns: { outer: Fn; convOuter: ((v: SqlValue) => SqlValue) | null; convInner: ((v: SqlValue) => SqlValue) | null; coll: Collation }[],
+    guardFns: Fn[],
+    emptyPlan: QueryPlan | null,
+  ): Compiled {
+    let emptyValue: SqlValue = kind === 'exists' ? 0 : null;
     const state = this.env.state;
     let epoch = -1;
     let table = new Map<unknown, SqlValue>();
-    const n = pairs.length;
+    const n = keyFns.length;
     const keyOf = (vals: SqlValue[]): unknown => (n === 1 ? hashKey(vals[0], keyFns[0].coll) : hashKeyMulti(vals, keyFns.map((k) => k.coll)));
     const build = (r: SqlValue[]): void => {
       table = new Map();
@@ -3177,7 +3370,11 @@ export class Planner {
   private existsSubquery(select: SelectStmt, scope: Scope): Fn {
     const dec = decorrelationDisabled() ? null : this.decorrelate(select, scope, 'exists');
     if (dec) return dec.fn;
-    const plan = this.planSelect(select, scope);
+    return this.existsFromPlan(this.planSelect(select, scope));
+  }
+
+  /** EXISTS from its plan: whether it has a row (cached unless correlated). */
+  private existsFromPlan(plan: QueryPlan): Fn {
     this.recordSubplan(plan.correlated ? 'CORRELATED EXISTS' : 'EXISTS', plan.root);
     const state = this.env.state;
     let epoch = -1;
@@ -3202,7 +3399,11 @@ export class Planner {
   }
 
   private inSubquery(select: SelectStmt, probe: Compiled, scope: Scope): Fn {
-    const plan = this.planSelect(select, scope);
+    return this.inFromPlan(this.planSelect(select, scope), probe);
+  }
+
+  /** `probe IN (subquery)` from the subquery's plan: 1, 0 or NULL (its rows are read once unless correlated). */
+  private inFromPlan(plan: QueryPlan, probe: Compiled): Fn {
     this.recordSubplan(plan.correlated ? 'CORRELATED IN SUBQUERY' : 'IN SUBQUERY', plan.root);
     if (plan.outRegs.length !== 1) throw new SmaltError('SMALT_ERROR', `sub-select returns ${plan.outRegs.length} columns - expected 1`);
     const out = plan.outRegs[0];
@@ -3303,6 +3504,8 @@ interface FlatShape {
   distinct?: readonly CollationName[];
   /** The result expressions, then the ORDER BY expressions computed beside them. */
   project: readonly PlanExpr[];
+  /** The number of result expressions. */
+  width: number;
   having?: PlanExpr;
   aggregate?: AggregateOp;
   where?: PlanExpr;
@@ -3344,7 +3547,10 @@ function flatShape(op: PlanOp): FlatShape | null {
     n = n.input;
   }
   // The projection that drops ORDER BY expressions which are not results.
-  if (n.op === 'project' && n.input.op === 'sort' && n.exprs.every((e, i) => e.k === 'col' && e.depth === 0 && e.index === i)) n = n.input;
+  if (n.op === 'project' && n.input.op === 'sort' && n.exprs.every((e, i) => e.k === 'col' && e.depth === 0 && e.index === i)) {
+    s.width = n.exprs.length;
+    n = n.input;
+  }
   if (n.op === 'sort') {
     s.sort = n.keys;
     n = n.input;
@@ -3355,6 +3561,7 @@ function flatShape(op: PlanOp): FlatShape | null {
   }
   if (n.op !== 'project') return null;
   s.project = n.exprs;
+  s.width ??= n.exprs.length;
   n = n.input;
   if (n.op === 'filter' && n.input.op === 'aggregate') {
     s.having = n.pred;
@@ -3370,25 +3577,42 @@ function flatShape(op: PlanOp): FlatShape | null {
   }
   if (n.op === 'values' && n.rows.length === 1 && n.rows[0].length === 0) s.from = null;
   else if (!(s.from = fromLeaves(n))) return null;
-  const a = s.aggregate;
-  const exprs: (PlanExpr | undefined)[] = [
-    ...s.project,
-    ...(s.sort ?? []).map((k) => k.expr),
-    s.having,
-    s.where,
-    s.limit?.count,
-    s.limit?.offset,
-    ...(a ? [...a.keys.map((k) => k.expr), ...a.aggs.flatMap((c) => [...c.args, c.filter]), ...a.carry] : []),
-    ...(s.from ?? []).flatMap((l) => [l.on, ...(l.op.op === 'source' ? l.op.args : [])]),
-  ];
-  return exprs.every((e) => e === undefined || readsOwnRow(e)) ? (s as FlatShape) : null;
+  return s as FlatShape;
 }
 
-/** True when `e` reads only its operation's own input: no nested plans, no correlated columns, no planner nodes. */
-function readsOwnRow(e: PlanExpr): boolean {
+/** Every expression of a flat shape (results, keys, conditions, arguments), for checking. */
+function shapeExprs(s: FlatShape): { all: (PlanExpr | undefined)[]; limit: (PlanExpr | undefined)[] } {
+  const a = s.aggregate;
+  return {
+    all: [
+      ...s.project,
+      ...(s.sort ?? []).map((k) => k.expr),
+      s.having,
+      s.where,
+      ...(a ? [...a.keys.map((k) => k.expr), ...a.aggs.flatMap((c) => [...c.args, c.filter]), ...a.carry] : []),
+      ...(s.from ?? []).flatMap((l) => [l.on, ...(l.op.op === 'source' ? l.op.args : [])]),
+    ],
+    limit: [s.limit?.count, s.limit?.offset],
+  };
+}
+
+/**
+ * Whether the physical planner handles `op` (step 6c): a flat shape whose expressions read its own row or, inside a
+ * subquery `level` deep, the rows of the operations it is evaluated in, and whose subqueries it handles too. LIMIT
+ * and OFFSET read no rows.
+ */
+function supportedPlan(op: PlanOp, level: number): boolean {
+  const s = flatShape(op);
+  if (!s) return false;
+  const { all, limit } = shapeExprs(s);
+  return all.every((e) => e === undefined || readsRows(e, level)) && limit.every((e) => e === undefined || readsRows(e, -1));
+}
+
+/** True when `e`'s columns are at most `level` evaluations out (-1: none), and its subqueries are supported. */
+function readsRows(e: PlanExpr, level: number): boolean {
   switch (e.k) {
     case 'col':
-      return e.depth === 0;
+      return e.depth <= level;
     case 'lit':
     case 'param':
       return true;
@@ -3397,21 +3621,87 @@ function readsOwnRow(e: PlanExpr): boolean {
     case 'call':
     case 'and':
     case 'or':
-      return e.args.every(readsOwnRow);
+      return e.args.every((x) => readsRows(x, level));
     case 'cast':
     case 'not':
     case 'isNull':
-      return readsOwnRow(e.arg);
+      return readsRows(e.arg, level);
     case 'case':
-      return e.whens.every((w) => readsOwnRow(w.when) && readsOwnRow(w.then)) && readsOwnRow(e.else);
+      return e.whens.every((w) => readsRows(w.when, level) && readsRows(w.then, level)) && readsRows(e.else, level);
+    case 'subquery':
+      return level >= 0 && supportedPlan(e.plan, level + 1);
+    case 'inSubquery':
+      return level >= 0 && readsRows(e.probe, level) && supportedPlan(e.plan, level + 1);
     default:
       return false;
   }
 }
 
-/** A copy of `e` with each column replaced by `f(column)`, keeping every node's SQL metadata. */
-function rebind(e: PlanExpr, f: (c: ColRef) => PlanExpr): PlanExpr {
-  const r = (x: PlanExpr): PlanExpr => rebind(x, f);
+/** Column `c` read from the operation one evaluation out. */
+function shallower(c: ColRef): ColRef {
+  const d: PlanExpr = { ...c, depth: c.depth - 1 };
+  return d as ColRef;
+}
+
+/** Maps a column of an operation's row to the register slot that holds it. */
+type ColMap = (c: ColRef) => PlanExpr;
+
+/** For LIMIT / OFFSET, which read no row. */
+const NO_COLUMNS: ColMap = () => {
+  throw new SmaltError('SMALT_INTERNAL', 'LIMIT reads no columns');
+};
+
+/** True when `e` has a subquery (not counting compiled nodes). */
+function hasNested(e: PlanExpr): boolean {
+  switch (e.k) {
+    case 'subquery':
+    case 'inSubquery':
+      return true;
+    case 'call':
+    case 'and':
+    case 'or':
+      return e.args.some(hasNested);
+    case 'cast':
+    case 'not':
+    case 'isNull':
+      return hasNested(e.arg);
+    case 'case':
+      return e.whens.some((w) => hasNested(w.when) || hasNested(w.then)) || hasNested(e.else);
+    default:
+      return false;
+  }
+}
+
+/** Which rows a subquery's expression reads: its own (`inner`), the enclosing ones (`outer`), both, or neither. */
+function sideOf(e: PlanExpr): 'inner' | 'outer' | 'mixed' | 'none' | 'bad' {
+  if (hasNested(e)) return 'bad';
+  let i = false;
+  let o = false;
+  rebind(e, (c) => ((c.depth === 0 ? (i = true) : (o = true)), c));
+  return i && o ? 'mixed' : i ? 'inner' : o ? 'outer' : 'none';
+}
+
+/** The AND-ed parts of a predicate, as `conjuncts` splits its AST (BETWEEN stays whole). */
+function andParts(e: PlanExpr, out: PlanExpr[] = []): PlanExpr[] {
+  if (e.k === 'and' && !getMeta(e)?.opaque) for (const x of e.args) andParts(x, out);
+  else out.push(e);
+  return out;
+}
+
+const COLLATION_NAMES: readonly CollationName[] = ['binary', 'nocase', 'rtrim'];
+
+/** A compiled subquery, as the binder makes one. */
+const subqueryNative = (c: Compiled): PlanExpr => ({ k: 'native', compiled: c, type: c.type, subquery: true });
+
+/** An empty plan in place of a subquery's, in a conjunct bound for analysis (as `conjunct` does). */
+const PLACEHOLDER: PlanOp = { op: 'values', rows: [], types: [] };
+
+/**
+ * A copy of `e` with each column replaced by `f(column)`, keeping every node's SQL metadata. `sub` compiles its
+ * subqueries (and NOT IN as one test); without it they become placeholders, as for analysis.
+ */
+function rebind(e: PlanExpr, f: (c: ColRef) => PlanExpr, sub?: (n: PlanExpr, f: (c: ColRef) => PlanExpr) => PlanExpr): PlanExpr {
+  const r = (x: PlanExpr): PlanExpr => rebind(x, f, sub);
   switch (e.k) {
     case 'col':
       return f(e);
@@ -3419,12 +3709,20 @@ function rebind(e: PlanExpr, f: (c: ColRef) => PlanExpr): PlanExpr {
     case 'and':
     case 'or':
       return { ...e, args: e.args.map(r) };
-    case 'cast':
     case 'not':
+      if (sub && e.arg.k === 'inSubquery') return sub(e, f);
+      return { ...e, arg: r(e.arg) };
+    case 'cast':
     case 'isNull':
       return { ...e, arg: r(e.arg) } as PlanExpr;
     case 'case':
       return { ...e, whens: e.whens.map((w) => ({ when: r(w.when), then: r(w.then) })), else: r(e.else) };
+    case 'subquery':
+      if (sub) return sub(e, f);
+      return { k: 'subquery', mode: e.mode, plan: PLACEHOLDER, type: e.mode === 'exists' ? 'int' : 'any', collation: 'binary' };
+    case 'inSubquery':
+      if (sub) return sub(e, f);
+      return { k: 'inSubquery', probe: r(e.probe), plan: PLACEHOLDER, collation: 'binary' };
     default:
       return e;
   }

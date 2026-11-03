@@ -168,7 +168,13 @@ operators.
     and external tables (projection and partition pruning). `planFrom` takes the items, join conditions and WHERE
     conjuncts bound from the plan; sources are registered under positional names. In slt, 8,172 SELECTs (subqueries)
     are left.
-  - **6c-ii, subqueries:** `subquery` / `inSubquery` plans, decorrelation, outer references over aggregate rows.
+  - **6c-ii (done), subqueries:** `subquery` / `inSubquery` plans are planned where the planner plans them (a WHERE
+    or ON conjunct with a subquery is bound for analysis with placeholders and planned when placed); columns with
+    depth > 0 resolve through the enclosing operation's registers, which marks the scope correlated and carries bare
+    columns over aggregate rows. Decorrelation decides on the plan with `decorrelate`'s rules and builds its inner
+    sides as plans. Shadow mode also compares the subplans. The front end no longer counts WITH scopes in a column's
+    depth. A planner fix came with it: EXISTS over an aggregate is no longer decorrelated (it always has its row).
+    In slt, 1,002 SELECTs (compounds, views) are left.
   - **6c-iii:** windows, `setop`, `iterate`, VALUES, derived tables and views (FROM nested plans), EXPLAIN estimates.
   - **6c-iv:** the default becomes `plan`.
 - **6d, deletion** (about 2k lines removed): the AST paths of the planner and the internal `slot` / `native` nodes.
