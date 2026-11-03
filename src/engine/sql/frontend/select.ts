@@ -16,6 +16,7 @@ import { type FunctionContext, aggregateFunctions, scalarFunctions } from '../..
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../../exec/window.js';
 import { containsAggregate, containsWindow, coreReferences, exprEquals, firstAggregateCall, firstWindowCall, sameName, selectReferences } from '../../exec/planner.js';
 import type { PlanExpr } from '../../plan/expr.js';
+import { getMeta, setMeta } from '../../exec/sql-meta.js';
 import type { AggCall, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../plan/ops.js';
 import type { CollationName } from '../../plan/types.js';
 import { Collation } from '../../values.js';
@@ -820,8 +821,8 @@ class FrontEnd {
     const hasAlias = table.rowidAlias >= 0;
     this.push(scope, { name, cols, offset: 0, rowid: hasAlias ? table.rowidAlias : n, position, width: hasAlias ? n : n + 1, hidden: new Set() });
     const columns = table.columns.map((_c, i) => i);
-    const db = table.temp ? 'temp' : undefined;
-    return { op: 'scan', table: table.name, ...(db ? { db } : {}), columns: hasAlias ? columns : [...columns, -1] };
+    const db = table.temp ? 'temp' : item.schema?.toLowerCase() === 'main' ? 'main' : undefined;
+    return { op: 'scan', table: table.name, ...(db ? { db } : {}), columns: hasAlias ? columns : [...columns, -1], ...(item.indexedBy !== undefined ? { indexedBy: item.indexedBy } : {}) };
   }
 
   private push(scope: FeScope, src: FeSource): void {
@@ -995,7 +996,11 @@ class FrontEnd {
       case 'slot': {
         const r = this.refs[e.reg];
         if (!r) return e;
-        return { k: 'col', input: r.input, index: r.index(), depth: r.depth, type: r.type, collation: collationName(r.collation) };
+        // The slot's SQL metadata (collation source, affinity) stays with the column, for the physical planner.
+        const c: PlanExpr = { k: 'col', input: r.input, index: r.index(), depth: r.depth, type: r.type, collation: collationName(r.collation) };
+        const m = getMeta(e);
+        if (m) setMeta(c, m);
+        return c;
       }
       case 'call':
         return { ...e, args: e.args.map(ex) };

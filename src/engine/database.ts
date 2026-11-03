@@ -24,8 +24,8 @@ import { type ExternalScan, Planner, type QueryPlan, Registers, markUnordered } 
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
-import { planShadowEnabled, shadowCheck } from './exec/plan-shadow.js';
-import type { FrontEndCatalog } from './sql/frontend/select.js';
+import { planMode, shadowCheck } from './exec/plan-shadow.js';
+import { type FrontEndCatalog, type FrontEndResult, toPlan } from './sql/frontend/select.js';
 import { type MatviewCandidate, matchMatview } from './exec/mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import type { ReaderSettings } from '../shared/protocol.js';
@@ -1004,7 +1004,7 @@ export class Database implements FunctionContext {
     if (ps.stmt.kind !== 'select') throw new MisuseError('planOf takes a SELECT statement');
     const planner = new Planner(this.plannerDeps(this.rewritePolicy(ps.stmt)), new Registers(ps.paramCount));
     planner.sqlText = ps.text;
-    const plan = planner.planSelect(ps.stmt, null);
+    const plan = this.planSelectStmt(ps.stmt, ps.text, planner);
     return { root: plan.root, columns: plan.columns.map((c) => ({ name: c.name, type: c.type })), subplans: planner.subplans, estimates: planner.estimates };
   }
 
@@ -1022,6 +1022,35 @@ export class Database implements FunctionContext {
     };
   }
 
+  /** A top-level SELECT, planned as `SMALT_PLAN` says (exec/plan-shadow.ts). */
+  private planSelectStmt(stmt: SelectStmt, text: string, planner: Planner): QueryPlan {
+    switch (planMode()) {
+      case 'legacy':
+        return planner.planSelect(stmt, null);
+      case 'shadow': {
+        // The physical plan replaces the planner's, with the registers it would have had alone.
+        const start = planner.regs.count;
+        const physical = (fe: FrontEndResult): QueryPlan | null => {
+          const end = planner.regs.count;
+          planner.regs.count = start;
+          const p = planner.planPlan(fe.plan, fe.columns);
+          if (!p) planner.regs.count = end;
+          return p;
+        };
+        return shadowCheck(stmt, text, this.frontEndCatalog(), () => planner.planSelect(stmt, null), () => planner.usedMatview, physical);
+      }
+      case 'plan': {
+        // Materialized-view matching still rewrites the AST (step 7).
+        if (!planner.rewritesToMatview(stmt)) {
+          const fe = toPlan(stmt, text, this.frontEndCatalog());
+          const p = fe && planner.planPlan(fe.plan, fe.columns);
+          if (p) return p;
+        }
+        return planner.planSelect(stmt, null);
+      }
+    }
+  }
+
   /** @internal Compile a statement AST into a program for the current schema. */
   compile(ps: ParsedStatement): Program {
     const stmt = ps.stmt;
@@ -1031,7 +1060,7 @@ export class Database implements FunctionContext {
     const done = (p: Omit<Program, 'regCount'>): Program => ({ ...p, regCount: regs.count, rowAssumptions: planner.rowAssumptions, externals: planner.finishExternals() });
     switch (stmt.kind) {
       case 'select': {
-        const plan = planShadowEnabled() ? shadowCheck(stmt, ps.text, this.frontEndCatalog(), () => planner.planSelect(stmt, null), () => planner.usedMatview) : planner.planSelect(stmt, null);
+        const plan = this.planSelectStmt(stmt, ps.text, planner);
         return done({ plan, readonly: true, columns: plan.columns.map((c) => c.name), columnTypes: plan.columns.map((c) => c.type) });
       }
       case 'insert': {
@@ -1067,7 +1096,7 @@ export class Database implements FunctionContext {
         return done({ exec: () => this.transactionControl(stmt), readonly: true, columns: [], columnTypes: [] });
       case 'explain': {
         if (stmt.stmt.kind !== 'select') throw new SmaltError('SMALT_UNSUPPORTED', 'EXPLAIN is only supported for SELECT statements');
-        const plan = planner.planSelect(stmt.stmt as SelectStmt, null);
+        const plan = this.planSelectStmt(stmt.stmt as SelectStmt, ps.text, planner);
         if (stmt.analyze) {
           const round = (x: number): number => Math.round(x * 1000) / 1000;
           return done({

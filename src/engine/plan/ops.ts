@@ -56,8 +56,11 @@ export interface WindowCall {
 export type JoinKind = 'inner' | 'left' | 'right' | 'full' | 'semi' | 'anti' | 'cross';
 
 export type PlanOp =
-  /** Rows of a table: `columns` lists table column indexes, -1 for the rowid. */
-  | { readonly op: 'scan'; readonly table: string; readonly db?: 'main' | 'temp'; readonly columns: readonly number[] }
+  /**
+   * Rows of a table: `columns` lists table column indexes, -1 for the rowid. `db` names the schema when the query
+   * did or the table is TEMP; `indexedBy` is SQL's INDEXED BY name, or null for NOT INDEXED.
+   */
+  | { readonly op: 'scan'; readonly table: string; readonly db?: 'main' | 'temp'; readonly columns: readonly number[]; readonly indexedBy?: string | null }
   /**
    * Rows that are not a table's: a table-valued function (`pragma_table_info(t)`), a virtual table
    * (`information_schema.*`, the TEMP catalog) or an external table. A function's arguments may read the columns of

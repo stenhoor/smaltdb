@@ -62,7 +62,7 @@ import {
 import { type AggregateState, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type ColumnarHelpers, type FusedAggSpec, type FusedHelpers, type PipelineSource, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter } from './codegen.js';
 import { CODEGEN_HELPERS_FOR_FUSION } from './expr.js';
-import { getMeta, isOpaque } from './sql-meta.js';
+import { getMeta, isOpaque, setMeta } from './sql-meta.js';
 import { printExpr } from '../plan/print.js';
 import type { Frame } from '../storage/pager.js';
 import { PH_RIGHT } from '../storage/format.js';
@@ -114,6 +114,8 @@ import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
 import { deletedBitmap, rowidsOf, zoneOf } from './columnar-table.js';
 import { anyNode } from '../sql/ast-util.js';
 import type { PlanExpr } from '../plan/expr.js';
+import type { AggCall, PlanOp, SortKey as PlanSortKey } from '../plan/ops.js';
+import type { CollationName } from '../plan/types.js';
 import type { ExternalSource } from '../external/external.js';
 
 export interface PlannerEnv {
@@ -353,7 +355,7 @@ function filterOn(child: Operator, e: Expr, cs: CompileScope): Filter {
 
 /** A Filter on a pool conjunct: compiled from its bound form (bound once, when the pool was built). */
 function filterOnConjunct(child: Operator, c: ConjunctInfo, cs: CompileScope): Filter {
-  if (!c.compilable) return filterOn(child, c.expr, cs);
+  if (!c.compilable) return filterOn(child, c.expr!, cs);
   return new Filter(child, compileBoundExpr(c.bound, cs.funcCtx).fn, c.bound);
 }
 
@@ -420,7 +422,8 @@ export function containsAggregate(e: Expr | undefined): boolean {
 }
 
 interface ConjunctInfo {
-  expr: Expr;
+  /** The conjunct's AST; absent when the physical planner bound it from a plan (always compilable). */
+  expr?: Expr;
   /**
    * The conjunct bound to a plan expression, which the access-path and cost analysis read (ADR 0014, step 6a). A
    * conjunct with a subquery is bound for analysis only: its subqueries are placeholders, and it compiles from
@@ -505,6 +508,13 @@ export class Planner {
 
   /** Some SELECT was rewritten to read a materialized view (SMALT_PLAN=shadow compares only unrewritten plans). */
   usedMatview = false;
+
+  /** Whether `stmt` (a top-level SELECT) would be answered from a materialized view: SMALT_PLAN=plan then plans its AST. */
+  rewritesToMatview(stmt: SelectStmt): boolean {
+    const r = this.matviewRewrite(stmt, null) !== null;
+    this.usedMatview = false;
+    return r;
+  }
 
   /** One SELECT of a compound (UNION / INTERSECT / EXCEPT) answered from a materialized view. */
   private matviewCore(core: SelectCore, parent: Scope | null): SelectCore {
@@ -832,14 +842,17 @@ export class Planner {
       if (having) root = new Filter(root, having);
     }
 
-    // ORDER BY rowid elimination for simple scans.
+    // ORDER BY the rowid (named, or a result column that is the rowid) of a simple scan: read in rowid order. The
+    // rowid is an integer, so its collation does not matter; NULLS FIRST / LAST only when it is the default.
     let sortNeeded = sortKeys.length > 0;
     if (sortNeeded && !agg && !core.distinct && scope.sources.length === 1 && stmt?.orderBy.length === 1) {
       const src = scope.sources[0];
       const term = stmt.orderBy[0];
       const scan = this.lastScan;
-      if (scan && src.table && scan.access === src.access && this.rowidRegOf(term.expr, scope) >= 0) {
-        if (!term.nulls) {
+      const idx = this.orderByResultIndex(term.expr, resultCols);
+      const key = idx >= 0 ? resultCols[idx].expr : term.expr.kind === 'collate' ? term.expr.expr : term.expr;
+      if (scan && src.table && scan.access === src.access && this.rowidRegOf(key, scope) >= 0) {
+        if (term.nulls === undefined || (term.nulls === 'FIRST') === !term.desc) {
           scan.reverse = term.desc;
           sortNeeded = false;
         }
@@ -1184,13 +1197,177 @@ export class Planner {
 
   private topNHint(stmt: SelectStmt, parent: Scope | null): ((r: SqlValue[]) => number) | undefined {
     const s = this.compileScope(new Scope(parent));
-    const lim = compileExpr(stmt.limit!, s).fn;
-    const off = stmt.offset ? compileExpr(stmt.offset, s).fn : undefined;
-    return (r) => {
-      const l = Limit.evalCount(lim, r, -1);
-      if (l < 0) return -1;
-      return l + Math.max(0, Limit.evalCount(off, r, 0));
+    return topN(compileExpr(stmt.limit!, s).fn, stmt.offset ? compileExpr(stmt.offset, s).fn : undefined);
+  }
+
+  // ================================================================ physical planner (ADR 0014, step 6b)
+
+  /**
+   * Operators for a plan of the SQL front end (sql/frontend/select.ts) that reads one table or no FROM: the same
+   * operators, registers and fusion as `planCore` builds for the statement. Null for shapes it does not handle yet
+   * (joins, nested plans, windows, compounds, VALUES, other sources); the caller then plans the statement's AST.
+   * Plans are checked before anything is allocated, so a null leaves the planner as it was.
+   */
+  planPlan(op: PlanOp, columns: ResultColumnInfo[]): QueryPlan | null {
+    const s = singleTableShape(op);
+    if (!s) return null;
+    const ctx = this.env.funcCtx;
+    const compile = (e: PlanExpr): Compiled => compileBoundExpr(e, ctx);
+    const limit = (root: Operator): Operator => (s.limit ? new Limit(root, compile(s.limit.count).fn, s.limit.offset ? compile(s.limit.offset).fn : undefined) : root);
+
+    const fast = this.countRowsOf(s, columns);
+    if (fast) return { ...fast, root: limit(fast.root) };
+
+    // The FROM row: a register per scan column, marked as read when an expression reading it is compiled.
+    const scope = new Scope(null);
+    const fromRow: { reg: number; use: () => void }[] = [];
+    const fromSlot = (c: PlanExpr & { k: 'col' }): PlanExpr => slotFor(c, fromRow[c.index].reg, fromRow[c.index].use);
+    let root: Operator;
+    if (s.scan) {
+      const scan = s.scan;
+      const item: FromItem = { kind: 'table', name: scan.table, ...(scan.db ? { schema: scan.db } : {}), ...(scan.indexedBy !== undefined ? { indexedBy: scan.indexedBy } : {}), pos: 0, end: 0 };
+      root = this.planFrom(item, undefined, scope, () => {
+        const src = scope.sources[0];
+        const access = src.access!;
+        for (const c of scan.columns) {
+          const reg = c < 0 ? src.rowidReg : src.cols[c].reg;
+          const use = c < 0 ? () => this.dryCompile || access.useRowid(reg) : () => this.dryCompile || access.use(c, reg);
+          fromRow.push({ reg, use });
+        }
+        return s.where ? splitBoundConjuncts(rebind(s.where, fromSlot)) : [];
+      });
+    } else {
+      this.lastScan = null;
+      root = new SingleRow();
+      if (s.where) root = new Filter(root, compile(rebind(s.where, fromSlot)).fn);
+    }
+
+    // The aggregate's output row: keys, then aggregate calls (registers allocated where first read, as planCore
+    // does while binding), then carried bare columns (the FROM row's registers).
+    let agg: { groupFns: Fn[]; groupColls: Collation[]; groupRegs: number[]; groupExprs: PlanExpr[]; aggs: AggSpec[]; bare: Set<number> } | null = null;
+    let outSlot = fromSlot;
+    if (s.aggregate) {
+      const a = s.aggregate;
+      const keys = a.keys.map((k) => rebind(k.expr, fromSlot));
+      const groupFns = keys.map((k) => compile(k).fn);
+      const groupRegs = keys.map(() => this.regs.alloc());
+      const specs: AggSpec[] = [];
+      const byCall = new Map<number, AggSpec>();
+      const bare = new Set<number>();
+      const g = { groupFns, groupColls: a.keys.map((k) => collationId(k.collation)), groupRegs, groupExprs: keys, aggs: specs, bare };
+      agg = g;
+      const spec = (i: number): AggSpec => {
+        let sp = byCall.get(i);
+        if (sp === undefined) {
+          sp = this.aggSpec(a.aggs[i], (e) => rebind(e, fromSlot));
+          byCall.set(i, sp);
+          specs.push(sp);
+        }
+        return sp;
+      };
+      outSlot = (c) => {
+        const i = c.index;
+        if (i < a.keys.length) return slotFor(c, groupRegs[i]);
+        if (i < a.keys.length + a.aggs.length) return slotFor(c, spec(i - a.keys.length).outReg);
+        const from = a.carry[i - a.keys.length - a.aggs.length] as PlanExpr & { k: 'col' };
+        const f = fromRow[from.index];
+        bare.add(f.reg);
+        return slotFor(c, f.reg, f.use);
+      };
+    }
+
+    // Result expressions, then ORDER BY expressions that are not results, then HAVING (planCore's order).
+    const n = columns.length;
+    const compiled = s.project.slice(0, n).map((e) => compile(rebind(e, outSlot)));
+    const regs = compiled.map(() => this.regs.alloc());
+    const sortKeys: SortKey[] = [];
+    const extraFns: Fn[] = [];
+    const extraRegs: number[] = [];
+    for (const k of s.sort ?? []) {
+      const at = (k.expr as PlanExpr & { k: 'col' }).index;
+      let reg: number;
+      if (at < n) reg = regs[at];
+      else {
+        extraFns.push(compile(rebind(s.project[at], outSlot)).fn);
+        extraRegs.push((reg = this.regs.alloc()));
+      }
+      sortKeys.push({ reg, desc: k.desc, nullsFirst: k.nullsFirst, collation: collationId(k.collation) });
+    }
+    const having = s.having ? compile(rebind(s.having, outSlot)).fn : undefined;
+
+    if (agg) {
+      if (agg.groupFns.length === 0 && agg.bare.size === 0 && agg.aggs.every((x) => ORDER_INSENSITIVE_AGGS.has(x.name))) markUnordered(root);
+      const fused =
+        agg.bare.size > 0
+          ? null
+          : agg.groupFns.length === 0
+            ? this.tryFuseAggregate(root, agg.aggs, scope)
+            : this.tryFuseGroupAggregate(root, agg.groupExprs, agg.groupColls, agg.groupRegs, agg.aggs, scope);
+      const hashAgg = new HashAggregate(root, agg.groupFns, agg.groupColls, agg.groupRegs, agg.aggs, [...agg.bare], this.env.spill ?? null);
+      if (fused instanceof FusedGroupAggregate) fused.fallback = hashAgg;
+      root = fused ?? hashAgg;
+      if (having) root = new Filter(root, having);
+    }
+
+    // ORDER BY the rowid of a table scan: read the table in rowid order (backwards for DESC), as planCore.
+    let sortNeeded = sortKeys.length > 0;
+    if (sortNeeded && !agg && !s.distinct && s.scan && sortKeys.length === 1) {
+      const k = s.sort![0];
+      const e = s.project[(k.expr as PlanExpr & { k: 'col' }).index];
+      const src = scope.sources[0];
+      const scan = this.lastScan;
+      const t = src.table!;
+      const rowidAt = (i: number): boolean => s.scan!.columns[i] === -1 || s.scan!.columns[i] === t.rowidAlias;
+      if (scan && scan.access === src.access && e.k === 'col' && !isOpaque(e) && rowidAt(e.index) && k.nullsFirst === !k.desc) {
+        scan.reverse = k.desc;
+        sortNeeded = false;
+      }
+    }
+
+    if (!agg) root = this.tryFuseScanFilter(root, scope);
+    root = new Project(root, [...compiled.map((c) => c.fn), ...extraFns], [...regs, ...extraRegs]);
+    if (s.distinct) root = new Distinct(root, regs, s.distinct.map(collationId));
+    if (sortNeeded) {
+      const hint = s.limit ? topN(compile(s.limit.count).fn, s.limit.offset ? compile(s.limit.offset).fn : undefined) : undefined;
+      root = new Sort(root, sortKeys, [...regs, ...extraRegs], hint, this.env.spill ?? null);
+    }
+    return { root: limit(root), outRegs: regs, columns, correlated: false };
+  }
+
+  /** An aggregate call of a plan, with its arguments bound to the FROM row's registers by `bind`. */
+  private aggSpec(a: AggCall, bind: (e: PlanExpr) => PlanExpr): AggSpec {
+    const def = aggregateFunctions.get(a.fn)!;
+    const argExprs = a.args.map(bind);
+    const args = argExprs.map((x) => compileBoundExpr(x, this.env.funcCtx));
+    const filterExpr = a.filter ? bind(a.filter) : undefined;
+    return {
+      def,
+      args: args.map((x) => x.fn),
+      argTypes: args.map((x) => x.type),
+      distinct: a.distinct,
+      filter: filterExpr ? compileBoundExpr(filterExpr, this.env.funcCtx).fn : undefined,
+      outReg: this.regs.alloc(),
+      collation: args[0]?.collSrc ? args[0].collation : Collation.Binary,
+      star: a.star,
+      isMinMax: a.fn === 'min' || a.fn === 'max',
+      name: a.fn,
+      argExprs,
+      filterExpr,
     };
+  }
+
+  /** `SELECT count(*) FROM table` with nothing else: count leaf cells (planCountStar for plans). */
+  private countRowsOf(s: SingleTableShape, columns: ResultColumnInfo[]): QueryPlan | null {
+    const a = s.aggregate;
+    if (!s.scan || !a || s.where || s.having || s.distinct || s.scan.indexedBy !== undefined || columns.length !== 1) return null;
+    if (a.keys.length !== 0 || a.aggs.length !== 1) return null;
+    const c = a.aggs[0];
+    const e = s.project[0];
+    if (c.fn !== 'count' || !c.star || c.filter || e.k !== 'col' || e.index !== 0 || isOpaque(e)) return null;
+    const table = this.env.getTable(s.scan.table, s.scan.db);
+    if (!table || isColumnar(table)) return null;
+    const reg = this.regs.alloc();
+    return { root: new CountRows(this.env.openTree(table.rootPage), table.name, reg), outRegs: [reg], columns, correlated: false };
   }
 
   private orderByResultIndex(e: Expr, cols: { alias?: string; expr: Expr; name: string }[]): number {
@@ -1295,8 +1472,11 @@ export class Planner {
   /** The full scan chosen for the first source (for ORDER BY elimination); reset per FROM. */
   private lastScan: TableScan | null = null;
 
-  /** Plan FROM + WHERE into an operator tree; registers sources in `scope`. */
-  planFrom(from: FromItem | undefined, where: Expr | undefined, scope: Scope): Operator {
+  /**
+   * Plan FROM + WHERE into an operator tree; registers sources in `scope`. `bound` (the physical planner) gives the
+   * WHERE conjuncts already bound, once the sources are registered, in place of `where`.
+   */
+  planFrom(from: FromItem | undefined, where: Expr | undefined, scope: Scope, bound?: () => PlanExpr[]): Operator {
     this.lastScan = null;
     if (!from) {
       let root: Operator = new SingleRow();
@@ -1346,6 +1526,7 @@ export class Planner {
       for (const c of splitBetween(e)) pool.push(this.conjunct(c, scope));
     };
     for (const c of conjuncts(where)) addPool(c);
+    if (bound) for (const b of bound()) pool.push({ bound: b, compilable: true, deps: this.depsOf(b, scope), placed: false });
     if (hasOuter) {
       for (const c of pool) {
         let m = -1;
@@ -1461,7 +1642,7 @@ export class Planner {
 
   private andAll(cs: ConjunctInfo[], scope: CompileScope): Fn | undefined {
     if (cs.length === 0) return undefined;
-    const fns = cs.map((c) => compileExpr(c.expr, scope).fn);
+    const fns = cs.map((c) => (c.expr ? compileExpr(c.expr, scope) : compileBoundExpr(c.bound, scope.funcCtx)).fn);
     if (fns.length === 1) return fns[0];
     return (r) => {
       let sawNull = false;
@@ -3022,6 +3203,161 @@ function splitBetween(e: Expr): Expr[] {
   }
   return [e];
 }
+
+/** The LIMIT (plus OFFSET) a Sort may stop at, or -1 for all rows. */
+function topN(lim: Fn, off: Fn | undefined): (r: SqlValue[]) => number {
+  return (r) => {
+    const l = Limit.evalCount(lim, r, -1);
+    if (l < 0) return -1;
+    return l + Math.max(0, Limit.evalCount(off, r, 0));
+  };
+}
+
+// ------------------------------------------------------------------ physical planner helpers (ADR 0014, step 6b)
+
+type ColRef = PlanExpr & { k: 'col' };
+type ScanOp = Extract<PlanOp, { op: 'scan' }>;
+type AggregateOp = Extract<PlanOp, { op: 'aggregate' }>;
+
+/** A plan over one table (or no FROM): limit? / sort? / distinct? / project / having? / aggregate? / where? / leaf. */
+interface SingleTableShape {
+  limit?: { count: PlanExpr; offset?: PlanExpr };
+  sort?: readonly PlanSortKey[];
+  distinct?: readonly CollationName[];
+  /** The result expressions, then the ORDER BY expressions computed beside them. */
+  project: readonly PlanExpr[];
+  having?: PlanExpr;
+  aggregate?: AggregateOp;
+  where?: PlanExpr;
+  /** Null: no FROM (one empty row). */
+  scan: ScanOp | null;
+}
+
+/** Match a plan the physical planner handles (step 6b), or null. */
+function singleTableShape(op: PlanOp): SingleTableShape | null {
+  let n = op;
+  const s: Partial<SingleTableShape> = {};
+  if (n.op === 'limit') {
+    s.limit = { count: n.count, ...(n.offset ? { offset: n.offset } : {}) };
+    n = n.input;
+  }
+  // The projection that drops ORDER BY expressions which are not results.
+  if (n.op === 'project' && n.input.op === 'sort' && n.exprs.every((e, i) => e.k === 'col' && e.depth === 0 && e.index === i)) n = n.input;
+  if (n.op === 'sort') {
+    s.sort = n.keys;
+    n = n.input;
+  }
+  if (n.op === 'distinct') {
+    s.distinct = n.collations;
+    n = n.input;
+  }
+  if (n.op !== 'project') return null;
+  s.project = n.exprs;
+  n = n.input;
+  if (n.op === 'filter' && n.input.op === 'aggregate') {
+    s.having = n.pred;
+    n = n.input;
+  }
+  if (n.op === 'aggregate') {
+    s.aggregate = n;
+    n = n.input;
+  }
+  if (n.op === 'filter') {
+    s.where = n.pred;
+    n = n.input;
+  }
+  if (n.op === 'scan') s.scan = n;
+  else if (n.op === 'values' && n.rows.length === 1 && n.rows[0].length === 0) s.scan = null;
+  else return null;
+  const a = s.aggregate;
+  const exprs: (PlanExpr | undefined)[] = [
+    ...s.project,
+    ...(s.sort ?? []).map((k) => k.expr),
+    s.having,
+    s.where,
+    s.limit?.count,
+    s.limit?.offset,
+    ...(a ? [...a.keys.map((k) => k.expr), ...a.aggs.flatMap((c) => [...c.args, c.filter]), ...a.carry] : []),
+  ];
+  return exprs.every((e) => e === undefined || readsOwnRow(e)) ? (s as SingleTableShape) : null;
+}
+
+/** True when `e` reads only its operation's own input: no nested plans, no correlated columns, no planner nodes. */
+function readsOwnRow(e: PlanExpr): boolean {
+  switch (e.k) {
+    case 'col':
+      return e.depth === 0;
+    case 'lit':
+    case 'param':
+      return true;
+    case 'native':
+      return e.subquery !== true;
+    case 'call':
+    case 'and':
+    case 'or':
+      return e.args.every(readsOwnRow);
+    case 'cast':
+    case 'not':
+    case 'isNull':
+      return readsOwnRow(e.arg);
+    case 'case':
+      return e.whens.every((w) => readsOwnRow(w.when) && readsOwnRow(w.then)) && readsOwnRow(e.else);
+    default:
+      return false;
+  }
+}
+
+/** A copy of `e` with each column replaced by `f(column)`, keeping every node's SQL metadata. */
+function rebind(e: PlanExpr, f: (c: ColRef) => PlanExpr): PlanExpr {
+  const r = (x: PlanExpr): PlanExpr => rebind(x, f);
+  switch (e.k) {
+    case 'col':
+      return f(e);
+    case 'call':
+    case 'and':
+    case 'or':
+      return { ...e, args: e.args.map(r) };
+    case 'cast':
+    case 'not':
+    case 'isNull':
+      return { ...e, arg: r(e.arg) } as PlanExpr;
+    case 'case':
+      return { ...e, whens: e.whens.map((w) => ({ when: r(w.when), then: r(w.then) })), else: r(e.else) };
+    default:
+      return e;
+  }
+}
+
+/** The register slot for column `c`, with its SQL metadata; `use` marks the column as read when compiled. */
+function slotFor(c: ColRef, reg: number, use?: () => void): PlanExpr {
+  const slot: PlanExpr = use ? { k: 'slot', reg, type: c.type, use } : { k: 'slot', reg, type: c.type };
+  const m = getMeta(c);
+  if (m) setMeta(slot, m);
+  return slot;
+}
+
+/**
+ * The conjuncts of a bound WHERE predicate, as `conjuncts` and `splitBetween` split its AST: AND (not one a COLLATE
+ * copied), and the two comparisons of a BETWEEN.
+ */
+function splitBoundConjuncts(e: PlanExpr, out: PlanExpr[] = []): PlanExpr[] {
+  if (e.k === 'and') {
+    const m = getMeta(e);
+    if (!m?.opaque) {
+      for (const x of e.args) splitBoundConjuncts(x, out);
+      return out;
+    }
+    if (m.collSrc !== CollSrc.Explicit) {
+      out.push(...e.args);
+      return out;
+    }
+  }
+  out.push(e);
+  return out;
+}
+
+const COLLATION_IDS: Readonly<Record<CollationName, Collation>> = { binary: Collation.Binary, nocase: Collation.NoCase, rtrim: Collation.RTrim };
+const collationId = (n: CollationName): Collation => COLLATION_IDS[n];
 
 export type { Scope };
 

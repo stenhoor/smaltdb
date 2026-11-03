@@ -1,27 +1,43 @@
 /**
- * `SMALT_PLAN=shadow` (tests only; ADR 0014, step 5): every SELECT the engine compiles is also planned by the SQL
- * front end (sql/frontend/select.ts), and the two must agree on the result columns (name, type, collation, declared
- * type, affinity) and on errors. A disagreement raises SMALT_INTERNAL, so the whole test suite, the differential
- * tests and sqllogictest can run against the front end. Shapes the front end does not handle yet are skipped.
+ * `SMALT_PLAN` selects how SELECTs are planned while the plan layer (ADR 0014) is built:
+ *
+ * - unset or `legacy`: the current planner, from the AST;
+ * - `plan`: the SQL front end (sql/frontend/select.ts) makes a plan and the physical planner (`Planner.planPlan`)
+ *   builds its operators; shapes either does not handle yet go through the current planner;
+ * - `shadow` (tests): both. The front end must agree with the planner on the result columns (name, type, collation,
+ *   declared type, affinity) and on errors, and the physical planner's operators on the planner's `EXPLAIN` rows; the
+ *   physical planner's operators then run. A disagreement raises SMALT_INTERNAL, so the test suite, the differential
+ *   tests and sqllogictest check the new path. Shapes not handled yet are skipped.
  */
 import { SmaltError } from '../errors.js';
 import type { SelectStmt } from '../sql/ast.js';
 import { type FrontEndCatalog, type FrontEndResult, toPlan } from '../sql/frontend/select.js';
+import { explainRows } from './operators.js';
 import type { QueryPlan } from './planner.js';
 
 let mode: string | undefined | null = null;
 
-/** True when SELECTs are checked against the SQL front end. */
-export function planShadowEnabled(): boolean {
+/** The planning mode (`SMALT_PLAN`). */
+export function planMode(): 'legacy' | 'plan' | 'shadow' {
   if (mode === null) {
     const g = globalThis as { process?: { env?: Record<string, string | undefined> } };
     mode = g.process?.env?.SMALT_PLAN;
   }
-  return mode === 'shadow';
+  return mode === 'plan' || mode === 'shadow' ? mode : 'legacy';
+}
+
+/** @internal Tests: set the planning mode (null: read `SMALT_PLAN` again). */
+export function setPlanMode(m: 'legacy' | 'plan' | 'shadow' | null): void {
+  mode = m;
+}
+
+/** True when SELECTs are checked against the SQL front end. */
+export function planShadowEnabled(): boolean {
+  return planMode() === 'shadow';
 }
 
 /** Statements checked and skipped so far, with the reasons for skipping. */
-export const shadowStats = { checked: 0, skipped: 0, reasons: {} as Record<string, number> };
+export const shadowStats = { checked: 0, skipped: 0, physical: 0, reasons: {} as Record<string, number> };
 
 // SMALT_PLAN_STATS=<file>: append each skipped statement as a JSON line (reason, text), so a corpus run shows what the
 // front end does not handle yet. Node only, through its built-in fs (test runners use several workers).
@@ -42,8 +58,18 @@ function mismatch(text: string, what: string): SmaltError {
 
 const describe = (e: unknown): string => (e instanceof Error ? `${(e as { code?: string }).code ?? e.name}: ${e.message}` : String(e));
 
-/** Plan `stmt` with `legacy` (the current planner) and check the SQL front end against it. */
-export function shadowCheck(stmt: SelectStmt, text: string, catalog: FrontEndCatalog, legacy: () => QueryPlan, rewritten: () => boolean): QueryPlan {
+/**
+ * Plan `stmt` with `legacy` (the current planner) and check the SQL front end against it; then, when `physical`
+ * builds operators for the front end's plan, check their `EXPLAIN` rows against the planner's and return them.
+ */
+export function shadowCheck(
+  stmt: SelectStmt,
+  text: string,
+  catalog: FrontEndCatalog,
+  legacy: () => QueryPlan,
+  rewritten: () => boolean,
+  physical?: (fe: FrontEndResult) => QueryPlan | null,
+): QueryPlan {
   let fe: FrontEndResult | null = null;
   let feError: unknown;
   let unsupported = '';
@@ -80,5 +106,17 @@ export function shadowCheck(stmt: SelectStmt, text: string, catalog: FrontEndCat
       if ((got[k] ?? undefined) !== (want[k] ?? undefined)) throw mismatch(text, `result column ${i + 1} ${k}: front end ${String(got[k])}, planner ${String(want[k])}`);
     }
   });
-  return plan;
+  if (!physical) return plan;
+  const p = physical(fe);
+  if (!p) {
+    // Listed for SMALT_PLAN_STATS, not counted as skipped: the front end's plan was checked.
+    if (statsFile && statsFs) statsFs.appendFileSync(statsFile, JSON.stringify({ reason: 'physical planner: not handled yet', text }) + '\n');
+    return plan;
+  }
+  shadowStats.physical++;
+  const rows = (q: QueryPlan): string => explainRows(q.root).map((x) => `${x.id} ${x.parent} ${x.detail}`).join('\n');
+  const want = rows(plan);
+  const got = rows(p);
+  if (got !== want) throw new SmaltError('SMALT_INTERNAL', `SMALT_PLAN=shadow: the physical planner disagrees with the planner on EXPLAIN\n  in: ${text}\nphysical:\n${got}\nplanner:\n${want}`);
+  return p;
 }
