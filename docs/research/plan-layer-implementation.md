@@ -162,9 +162,15 @@ operators.
   and an explicit `main`. One planner change came with it: ORDER BY an ordinal or alias of the rowid also reads in
   rowid order (it sorted before), as the plan cannot tell those from naming the rowid. In slt, about 99k of 112,981
   SELECTs go through it.
-- **6c, the rest** (about 2.7k lines): join regions (the inner-join region becomes sources and a conjunct pool; outer
-  joins, table functions, derived tables, external projection, expression indexes), subqueries and decorrelation on
-  `subquery` plans, windows, `setop`, `iterate`, VALUES, EXPLAIN estimates. The default becomes `plan`.
+- **6c, the rest**, in parts:
+  - **6c-i (done), join regions:** left-deep joins over tables and sources (inner, cross, left, right, full; USING /
+    NATURAL arrive as ON conjuncts), table functions with lateral arguments, `information_schema`, the TEMP catalog
+    and external tables (projection and partition pruning). `planFrom` takes the items, join conditions and WHERE
+    conjuncts bound from the plan; sources are registered under positional names. In slt, 8,172 SELECTs (subqueries)
+    are left.
+  - **6c-ii, subqueries:** `subquery` / `inSubquery` plans, decorrelation, outer references over aggregate rows.
+  - **6c-iii:** windows, `setop`, `iterate`, VALUES, derived tables and views (FROM nested plans), EXPLAIN estimates.
+  - **6c-iv:** the default becomes `plan`.
 - **6d, deletion** (about 2k lines removed): the AST paths of the planner and the internal `slot` / `native` nodes.
 - **Hardest parts:** projection-pushdown parity, register order (window snapshots), outer references from subqueries
   over aggregate rows, correlation of derived tables, estimates keyed by the same operators.

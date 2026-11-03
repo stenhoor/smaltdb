@@ -114,7 +114,7 @@ import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
 import { deletedBitmap, rowidsOf, zoneOf } from './columnar-table.js';
 import { anyNode } from '../sql/ast-util.js';
 import type { PlanExpr } from '../plan/expr.js';
-import type { AggCall, PlanOp, SortKey as PlanSortKey } from '../plan/ops.js';
+import type { AggCall, JoinKind, PlanOp, SortKey as PlanSortKey } from '../plan/ops.js';
 import type { CollationName } from '../plan/types.js';
 import type { ExternalSource } from '../external/external.js';
 
@@ -218,6 +218,8 @@ interface Source {
   indexedBy?: string | null;
   joinType: JoinType;
   on: Expr[];
+  /** The join condition's conjuncts bound from a plan (the physical planner), in place of `on`. */
+  onBound?: PlanExpr[];
   /** Lower-cased column names merged by USING/NATURAL (hidden from unqualified lookup and *). */
   hidden: Set<string>;
   position: number;
@@ -438,6 +440,18 @@ interface ConjunctInfo {
   minStep?: number;
 }
 
+/** FROM items, join conditions and WHERE conjuncts the physical planner bound from a plan (see planFrom). */
+interface BoundFrom {
+  items: { item: FromItem; joinType: JoinType }[];
+  /** A table function's arguments (item `p`), bound to the earlier items' registers. */
+  args(p: number): PlanExpr[] | undefined;
+  /** Item `p` was registered: its registers are known. */
+  added(p: number): void;
+  /** Item `p`'s join condition, split into conjuncts. */
+  on(p: number): PlanExpr[];
+  where(): PlanExpr[];
+}
+
 interface AccessChoice {
   leaf: Operator;
   /** Leaf probes depend on earlier sources (must be re-opened per outer row). */
@@ -504,6 +518,21 @@ export class Planner {
     const r = rewrite(stmt, this.sqlText);
     if (r) this.usedMatview = true;
     return r;
+  }
+
+  /**
+   * SMALT_PLAN=shadow: returns a function that forgets what planning registered since (registers, external sources,
+   * recorded subplans), so the physical planner's plan replaces the planner's as if planned alone.
+   */
+  mark(): () => void {
+    const regs = this.regs.count;
+    const externals = [...this.externals];
+    const subplans = [...this.subplans];
+    return () => {
+      this.regs.count = regs;
+      this.externals.splice(0, this.externals.length, ...externals);
+      this.subplans.splice(0, this.subplans.length, ...subplans);
+    };
   }
 
   /** Some SELECT was rewritten to read a materialized view (SMALT_PLAN=shadow compares only unrewritten plans). */
@@ -1209,7 +1238,7 @@ export class Planner {
    * Plans are checked before anything is allocated, so a null leaves the planner as it was.
    */
   planPlan(op: PlanOp, columns: ResultColumnInfo[]): QueryPlan | null {
-    const s = singleTableShape(op);
+    const s = flatShape(op);
     if (!s) return null;
     const ctx = this.env.funcCtx;
     const compile = (e: PlanExpr): Compiled => compileBoundExpr(e, ctx);
@@ -1218,23 +1247,43 @@ export class Planner {
     const fast = this.countRowsOf(s, columns);
     if (fast) return { ...fast, root: limit(fast.root) };
 
-    // The FROM row: a register per scan column, marked as read when an expression reading it is compiled.
+    // The FROM row: the registers of each source's columns, in FROM order, marked as read when an expression reading
+    // them is compiled. Join conditions read input 0 (the sources before) and input 1 (the source being joined).
     const scope = new Scope(null);
     const fromRow: { reg: number; use: () => void }[] = [];
-    const fromSlot = (c: PlanExpr & { k: 'col' }): PlanExpr => slotFor(c, fromRow[c.index].reg, fromRow[c.index].use);
+    const fromSlot = (c: ColRef): PlanExpr => slotFor(c, fromRow[c.index].reg, fromRow[c.index].use);
     let root: Operator;
-    if (s.scan) {
-      const scan = s.scan;
-      const item: FromItem = { kind: 'table', name: scan.table, ...(scan.db ? { schema: scan.db } : {}), ...(scan.indexedBy !== undefined ? { indexedBy: scan.indexedBy } : {}), pos: 0, end: 0 };
-      root = this.planFrom(item, undefined, scope, () => {
-        const src = scope.sources[0];
-        const access = src.access!;
-        for (const c of scan.columns) {
-          const reg = c < 0 ? src.rowidReg : src.cols[c].reg;
-          const use = c < 0 ? () => this.dryCompile || access.useRowid(reg) : () => this.dryCompile || access.use(c, reg);
-          fromRow.push({ reg, use });
-        }
-        return s.where ? splitBoundConjuncts(rebind(s.where, fromSlot)) : [];
+    if (s.from) {
+      const leaves = s.from;
+      const offsets: number[] = [];
+      leaves.reduce((at, l) => (offsets.push(at), at + leafWidth(l.op)), 0);
+      const onSlot =
+        (p: number) =>
+        (c: ColRef): PlanExpr => {
+          const f = fromRow[c.input === 1 ? offsets[p] + c.index : c.index];
+          return slotFor(c, f.reg, f.use);
+        };
+      root = this.planFrom(undefined, undefined, scope, {
+        items: leaves.map((l, p) => ({ item: leafItem(l.op, p), joinType: JOIN_TYPES[l.join ?? 'inner'] })),
+        args: (p) => {
+          const l = leaves[p].op;
+          return l.op === 'source' && l.kind === 'function' ? l.args.map((a) => rebind(a, fromSlot)) : undefined;
+        },
+        added: (p) => {
+          const src = scope.sources[p];
+          const l = leaves[p].op;
+          if (l.op === 'scan') {
+            const access = src.access!;
+            for (const c of l.columns) {
+              const reg = c < 0 ? src.rowidReg : src.cols[c].reg;
+              fromRow.push({ reg, use: c < 0 ? () => this.dryCompile || access.useRowid(reg) : () => this.dryCompile || access.use(c, reg) });
+            }
+          } else {
+            for (const c of src.cols) fromRow.push({ reg: c.reg, use: () => this.dryCompile || src.external?.projection?.add(c.name.toLowerCase()) });
+          }
+        },
+        on: (p) => (leaves[p].on ? splitBoundConjuncts(rebind(leaves[p].on!, onSlot(p))) : []),
+        where: () => (s.where ? splitBoundConjuncts(rebind(s.where, fromSlot)) : []),
       });
     } else {
       this.lastScan = null;
@@ -1311,13 +1360,14 @@ export class Planner {
 
     // ORDER BY the rowid of a table scan: read the table in rowid order (backwards for DESC), as planCore.
     let sortNeeded = sortKeys.length > 0;
-    if (sortNeeded && !agg && !s.distinct && s.scan && sortKeys.length === 1) {
+    const single = s.from?.length === 1 && s.from[0].op.op === 'scan' ? s.from[0].op : null;
+    if (sortNeeded && !agg && !s.distinct && single && sortKeys.length === 1) {
       const k = s.sort![0];
       const e = s.project[(k.expr as PlanExpr & { k: 'col' }).index];
       const src = scope.sources[0];
       const scan = this.lastScan;
       const t = src.table!;
-      const rowidAt = (i: number): boolean => s.scan!.columns[i] === -1 || s.scan!.columns[i] === t.rowidAlias;
+      const rowidAt = (i: number): boolean => single.columns[i] === -1 || single.columns[i] === t.rowidAlias;
       if (scan && scan.access === src.access && e.k === 'col' && !isOpaque(e) && rowidAt(e.index) && k.nullsFirst === !k.desc) {
         scan.reverse = k.desc;
         sortNeeded = false;
@@ -1357,14 +1407,15 @@ export class Planner {
   }
 
   /** `SELECT count(*) FROM table` with nothing else: count leaf cells (planCountStar for plans). */
-  private countRowsOf(s: SingleTableShape, columns: ResultColumnInfo[]): QueryPlan | null {
+  private countRowsOf(s: FlatShape, columns: ResultColumnInfo[]): QueryPlan | null {
     const a = s.aggregate;
-    if (!s.scan || !a || s.where || s.having || s.distinct || s.scan.indexedBy !== undefined || columns.length !== 1) return null;
+    const scan = s.from?.length === 1 && s.from[0].op.op === 'scan' ? s.from[0].op : null;
+    if (!scan || !a || s.where || s.having || s.distinct || scan.indexedBy !== undefined || columns.length !== 1) return null;
     if (a.keys.length !== 0 || a.aggs.length !== 1) return null;
     const c = a.aggs[0];
     const e = s.project[0];
     if (c.fn !== 'count' || !c.star || c.filter || e.k !== 'col' || e.index !== 0 || isOpaque(e)) return null;
-    const table = this.env.getTable(s.scan.table, s.scan.db);
+    const table = this.env.getTable(scan.table, scan.db);
     if (!table || isColumnar(table)) return null;
     const reg = this.regs.alloc();
     return { root: new CountRows(this.env.openTree(table.rootPage), table.name, reg), outRegs: [reg], columns, correlated: false };
@@ -1474,22 +1525,30 @@ export class Planner {
 
   /**
    * Plan FROM + WHERE into an operator tree; registers sources in `scope`. `bound` (the physical planner) gives the
-   * WHERE conjuncts already bound, once the sources are registered, in place of `where`.
+   * FROM items and their join conditions and the WHERE conjuncts already bound, in place of `from` and `where`.
    */
-  planFrom(from: FromItem | undefined, where: Expr | undefined, scope: Scope, bound?: () => PlanExpr[]): Operator {
+  planFrom(from: FromItem | undefined, where: Expr | undefined, scope: Scope, bound?: BoundFrom): Operator {
     this.lastScan = null;
-    if (!from) {
+    if (!from && !bound) {
       let root: Operator = new SingleRow();
       if (where) root = new Filter(root, compileExpr(where, this.compileScope(scope)).fn);
       return root;
     }
     const items: { item: FromItem; joinType: JoinType; on?: Expr; using?: string[]; natural: boolean }[] = [];
-    this.flattenFrom(from, 'INNER', undefined, undefined, false, items);
-    for (const it of items) this.addSource(it.item, it.joinType, scope);
+    if (bound) items.push(...bound.items.map((it) => ({ ...it, natural: false })));
+    else this.flattenFrom(from!, 'INNER', undefined, undefined, false, items);
+    items.forEach((it, p) => {
+      this.addSource(it.item, it.joinType, scope, bound?.args(p));
+      bound?.added(p);
+    });
 
     // USING / NATURAL become equality conjuncts in the ON clause.
     items.forEach((it, p) => {
       const src = scope.sources[p];
+      if (bound) {
+        src.onBound = bound.on(p);
+        return;
+      }
       if (it.on) src.on.push(...conjuncts(it.on));
       let using = it.using;
       if (it.natural) {
@@ -1526,7 +1585,7 @@ export class Planner {
       for (const c of splitBetween(e)) pool.push(this.conjunct(c, scope));
     };
     for (const c of conjuncts(where)) addPool(c);
-    if (bound) for (const b of bound()) pool.push({ bound: b, compilable: true, deps: this.depsOf(b, scope), placed: false });
+    if (bound) for (const b of bound.where()) pool.push(this.boundConjunct(b, scope));
     if (hasOuter) {
       for (const c of pool) {
         let m = -1;
@@ -1534,7 +1593,11 @@ export class Planner {
         c.minStep = m;
       }
     }
-    for (const src of scope.sources) if (src.joinType === 'INNER' || src.joinType === 'CROSS') for (const c of src.on) addPool(c);
+    for (const src of scope.sources) {
+      if (src.joinType !== 'INNER' && src.joinType !== 'CROSS') continue;
+      for (const c of src.on) addPool(c);
+      for (const b of src.onBound ?? []) pool.push(this.boundConjunct(b, scope));
+    }
     if (!hasOuter) this.prunePartitions(scope, pool);
 
     const cs = this.compileScope(scope);
@@ -1677,7 +1740,8 @@ export class Planner {
     out.push({ item, joinType, on, using, natural });
   }
 
-  private addSource(item: FromItem, joinType: JoinType, scope: Scope): void {
+  /** `planArgs`: a table function's arguments bound from a plan (the physical planner), in place of the AST's. */
+  private addSource(item: FromItem, joinType: JoinType, scope: Scope, planArgs?: PlanExpr[]): void {
     const position = scope.sources.length;
     const ext = this.externalScan(item, scope);
     if (ext) {
@@ -1716,11 +1780,12 @@ export class Planner {
       }
       const args = item.kind === 'function' ? item.args : [];
       const cs = this.compileScope(scope);
-      const argFns = args.map((a) => compileExpr(a, cs).fn);
+      const argFns = planArgs ? planArgs.map((a) => compileBoundExpr(a, cs.funcCtx).fn) : args.map((a) => compileExpr(a, cs).fn);
       // Arguments that read earlier sources of this FROM make the source lateral.
       let lateral = false;
       let correlated = false;
-      for (const a of args) {
+      for (const a of planArgs ?? []) forEachSlot(a, () => (lateral = true));
+      for (const a of planArgs ? [] : args) {
         const d = this.deps(a, scope);
         if (d === null) correlated = true;
         else if (d.size > 0) lateral = true;
@@ -2676,7 +2741,13 @@ export class Planner {
   }
 
   private leftOnInfos(src: Source, scope: Scope): ConjunctInfo[] {
+    if (src.onBound) return src.onBound.map((b) => this.boundConjunct(b, scope));
     return src.on.flatMap((e) => splitBetween(e)).map((e) => this.conjunct(e, scope));
+  }
+
+  /** A conjunct the physical planner bound from a plan (no subqueries: always compilable). */
+  private boundConjunct(b: PlanExpr, scope: Scope): ConjunctInfo {
+    return { bound: b, compilable: true, deps: this.depsOf(b, scope), placed: false };
   }
 
   private orderSegmentDP(segment: number[], prefix: Set<number>, prefixRows: number, pool: ConjunctInfo[], scope: Scope, cs: CompileScope): { order: number[]; rows: number } {
@@ -3219,8 +3290,14 @@ type ColRef = PlanExpr & { k: 'col' };
 type ScanOp = Extract<PlanOp, { op: 'scan' }>;
 type AggregateOp = Extract<PlanOp, { op: 'aggregate' }>;
 
-/** A plan over one table (or no FROM): limit? / sort? / distinct? / project / having? / aggregate? / where? / leaf. */
-interface SingleTableShape {
+type SourceOp = Extract<PlanOp, { op: 'source' }>;
+type FromLeaf = { op: ScanOp | SourceOp; join: JoinKind | null; on?: PlanExpr };
+
+/**
+ * A plan the physical planner handles: limit? / sort? / distinct? / project / having? / aggregate? / where? / FROM,
+ * where FROM is a left-deep tree of joins over tables and sources, or no FROM (one empty row).
+ */
+interface FlatShape {
   limit?: { count: PlanExpr; offset?: PlanExpr };
   sort?: readonly PlanSortKey[];
   distinct?: readonly CollationName[];
@@ -3229,14 +3306,39 @@ interface SingleTableShape {
   having?: PlanExpr;
   aggregate?: AggregateOp;
   where?: PlanExpr;
-  /** Null: no FROM (one empty row). */
-  scan: ScanOp | null;
+  /** The FROM items in order (the first has no join), or null: no FROM. */
+  from: FromLeaf[] | null;
 }
 
-/** Match a plan the physical planner handles (step 6b), or null. */
-function singleTableShape(op: PlanOp): SingleTableShape | null {
+/** The FROM items of a left-deep join tree over tables and sources, or null. */
+function fromLeaves(op: PlanOp, out: FromLeaf[] = []): FromLeaf[] | null {
+  if (op.op === 'scan' || op.op === 'source') {
+    out.push({ op, join: null });
+    return out;
+  }
+  if (op.op !== 'join' || op.kind === 'semi' || op.kind === 'anti') return null;
+  const right = op.inputs[1];
+  if ((right.op !== 'scan' && right.op !== 'source') || !fromLeaves(op.inputs[0], out)) return null;
+  out.push({ op: right, join: op.kind, ...(op.on ? { on: op.on } : {}) });
+  return out;
+}
+
+const leafWidth = (op: ScanOp | SourceOp): number => (op.op === 'scan' ? op.columns.length : op.types.length);
+
+const JOIN_TYPES: Readonly<Record<JoinKind, JoinType>> = { inner: 'INNER', cross: 'INNER', left: 'LEFT', right: 'RIGHT', full: 'FULL', semi: 'INNER', anti: 'INNER' };
+
+/** The FROM item the planner registers for a plan's table or source (named by position: names are resolved). */
+function leafItem(op: ScanOp | SourceOp, p: number): FromItem {
+  const alias = `#${p}`;
+  if (op.op === 'scan') return { kind: 'table', name: op.table, alias, ...(op.db ? { schema: op.db } : {}), ...(op.indexedBy !== undefined ? { indexedBy: op.indexedBy } : {}), pos: 0, end: 0 };
+  if (op.kind === 'function') return { kind: 'function', name: op.name, args: [], alias, pos: 0, end: 0 };
+  return { kind: 'table', name: op.name, alias, ...(op.schema ? { schema: op.schema } : {}), pos: 0, end: 0 };
+}
+
+/** Match a plan the physical planner handles, or null. */
+function flatShape(op: PlanOp): FlatShape | null {
   let n = op;
-  const s: Partial<SingleTableShape> = {};
+  const s: Partial<FlatShape> = {};
   if (n.op === 'limit') {
     s.limit = { count: n.count, ...(n.offset ? { offset: n.offset } : {}) };
     n = n.input;
@@ -3266,9 +3368,8 @@ function singleTableShape(op: PlanOp): SingleTableShape | null {
     s.where = n.pred;
     n = n.input;
   }
-  if (n.op === 'scan') s.scan = n;
-  else if (n.op === 'values' && n.rows.length === 1 && n.rows[0].length === 0) s.scan = null;
-  else return null;
+  if (n.op === 'values' && n.rows.length === 1 && n.rows[0].length === 0) s.from = null;
+  else if (!(s.from = fromLeaves(n))) return null;
   const a = s.aggregate;
   const exprs: (PlanExpr | undefined)[] = [
     ...s.project,
@@ -3278,8 +3379,9 @@ function singleTableShape(op: PlanOp): SingleTableShape | null {
     s.limit?.count,
     s.limit?.offset,
     ...(a ? [...a.keys.map((k) => k.expr), ...a.aggs.flatMap((c) => [...c.args, c.filter]), ...a.carry] : []),
+    ...(s.from ?? []).flatMap((l) => [l.on, ...(l.op.op === 'source' ? l.op.args : [])]),
   ];
-  return exprs.every((e) => e === undefined || readsOwnRow(e)) ? (s as SingleTableShape) : null;
+  return exprs.every((e) => e === undefined || readsOwnRow(e)) ? (s as FlatShape) : null;
 }
 
 /** True when `e` reads only its operation's own input: no nested plans, no correlated columns, no planner nodes. */

@@ -44,9 +44,21 @@ const HANDLED = [
   'SELECT 1 + 2, \'x\' WHERE 1',
   'SELECT count(*)',
   'SELECT a FROM t WHERE id = ?',
+  // Joins (6c-i): index nested loop, hash, outer joins, USING / NATURAL, table functions, virtual tables.
+  'SELECT t.a, u.y FROM t JOIN u ON u.x = t.a WHERE t.id < 5',
+  'SELECT t.id, u.y FROM u JOIN t ON t.id = u.x AND t.s BETWEEN \'a\' AND \'c\'',
+  'SELECT count(*) FROM t, u WHERE t.a = u.x',
+  'SELECT t.id, u2.y FROM t LEFT JOIN u AS u2 ON u2.x = t.id AND u2.y = \'y1\' WHERE t.id < 20 ORDER BY 1, 2',
+  'SELECT t.id, u.x FROM t RIGHT JOIN u ON u.x = t.id WHERE u.x > 8',
+  'SELECT t.id, u.x FROM t FULL JOIN u ON u.x = t.a + 20',
+  'SELECT a.id, b.id FROM t a JOIN t b USING (a) WHERE a.id < 4 AND b.id < 4',
+  'SELECT t.id, p.name FROM t, pragma_table_info(\'t\') p WHERE t.id < 3',
+  'SELECT u.y, max(t.r) FROM t JOIN u ON u.x = t.a GROUP BY u.y ORDER BY 2 DESC',
+  'SELECT table_name FROM information_schema.tables ORDER BY 1',
 ];
 
-const JOINS = ['SELECT t.a, u.y FROM t JOIN u ON u.x = t.a WHERE t.id < 5', 'SELECT a FROM t WHERE id IN (SELECT x FROM u)'];
+// Shapes the physical planner leaves to the planner (6c-ii, 6c-iii).
+const JOINS = ['SELECT a FROM t WHERE id IN (SELECT x FROM u)', 'SELECT u.x, w.r FROM u CROSS JOIN (SELECT 1 AS r) w LIMIT 2'];
 
 const params = (sql: string) => (sql.includes('?') ? [7] : undefined);
 const run = (db: Database, sql: string) => db.prepare(sql).all(params(sql));
@@ -69,7 +81,7 @@ describe('physical planner', () => {
     expect(shadowStats.physical - before).toBe(HANDLED.length);
   });
 
-  it('leaves joins and subqueries to the planner', async () => {
+  it('leaves subqueries and derived tables to the planner', async () => {
     const db = await setup();
     setPlanMode('legacy');
     const want = JOINS.map((q) => run(db, q));
