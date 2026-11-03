@@ -1,6 +1,7 @@
 /** Text form of plan expressions, for tests, debugging and (later) EXPLAIN. */
 import type { SqlValue } from '../values.js';
 import type { PlanExpr } from './expr.js';
+import type { PlanOp } from './ops.js';
 
 function literal(v: SqlValue): string {
   if (v === null) return 'NULL';
@@ -42,5 +43,36 @@ export function printExpr(e: PlanExpr): string {
       return `r${e.reg}`;
     case 'native':
       return '<compiled>';
+  }
+}
+
+/** Indented text form of a plan, one operation per line, for tests and debugging. */
+export function printPlan(op: PlanOp, depth = 0): string {
+  const pad = '  '.repeat(depth);
+  const list = (xs: readonly PlanExpr[]): string => xs.map(printExpr).join(', ');
+  const sub = (o: PlanOp): string => printPlan(o, depth + 1);
+  switch (op.op) {
+    case 'scan':
+      return `${pad}scan ${op.db ? `${op.db}.` : ''}${op.table} [${op.columns.join(', ')}]`;
+    case 'values':
+      return `${pad}values ${op.rows.map((r) => `(${list(r)})`).join(', ')}`;
+    case 'filter':
+      return `${pad}filter ${printExpr(op.pred)}\n${sub(op.input)}`;
+    case 'project':
+      return `${pad}project ${list(op.exprs)}\n${sub(op.input)}`;
+    case 'limit':
+      return `${pad}limit ${printExpr(op.count)}${op.offset ? ` offset ${printExpr(op.offset)}` : ''}\n${sub(op.input)}`;
+    case 'join':
+      return `${pad}join ${op.kind}${op.on ? ` on ${printExpr(op.on)}` : ''}\n${sub(op.inputs[0])}\n${sub(op.inputs[1])}`;
+    case 'setop':
+      return `${pad}${op.kind}\n${sub(op.inputs[0])}\n${sub(op.inputs[1])}`;
+    case 'sort':
+      return `${pad}sort ${op.keys.map((k) => `${printExpr(k.expr)}${k.desc ? ' desc' : ''}${k.collation !== 'binary' ? ` [${k.collation}]` : ''}`).join(', ')}\n${sub(op.input)}`;
+    case 'aggregate': {
+      const aggs = op.aggs.map((a) => `${a.fn}(${a.distinct ? 'distinct ' : ''}${a.star ? '*' : list(a.args)})${a.filter ? ` filter ${printExpr(a.filter)}` : ''}`);
+      return `${pad}aggregate keys [${op.keys.map((k) => printExpr(k.expr)).join(', ')}] aggs [${aggs.join(', ')}]${op.carry.length ? ` carry [${list(op.carry)}]` : ''}\n${sub(op.input)}`;
+    }
+    case 'distinct':
+      return `${pad}distinct\n${sub(op.input)}`;
   }
 }

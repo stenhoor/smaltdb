@@ -25,6 +25,8 @@ jobs:
       - run: node scripts/fetch-packed.mjs
       - run: npm run typecheck
       - run: npm test
+      # The SQL front end must agree with the planner on every SELECT (ADR 0014, step 5).
+      - run: SMALT_PLAN=shadow npx vitest run
 
   browser:
     runs-on: ubuntu-latest
