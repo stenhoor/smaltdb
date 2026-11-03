@@ -7,7 +7,6 @@ import { afterEach, describe, expect, it } from 'vitest';
 import * as client from '../src/client/index.js';
 import { Database } from '../src/engine/database.js';
 import { SmaltError } from '../src/engine/errors.js';
-import { importCSV, importJSON } from '../src/engine/io/import-export.js';
 import { EngineServer } from '../src/engine/server.js';
 import { OpfsVfs } from '../src/engine/vfs/opfs.js';
 import type { Request, Response } from '../src/shared/protocol.js';
@@ -276,80 +275,6 @@ describe('8. exec with parameters and several statements', () => {
     await expect(db.exec('SELECT ?; SELECT 1', [1])).rejects.toMatchObject({ code: 'SMALT_MISUSE', message: msg });
     // A real syntax error stays one.
     expect(await codeOf(db.exec('SELEC ?; SELECT 1', [1]))).toBe('SMALT_SYNTAX');
-  });
-});
-
-describe('9-11. JSON and CSV import', () => {
-  const d = (): Database => Database.openMemory();
-  const tables = (db: Database): unknown[][] => db.query("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").rows;
-
-  it('9. says which item is wrong', () => {
-    expect(() => importJSON(d(), 'v', '[1, 2]', { create: true })).toThrow('JSON item 1: expected an object or an array, found a number (JSON import expects an array of objects or of arrays, or NDJSON lines of either)');
-    expect(() => importJSON(d(), 'v', '[{"a": 1}, "x"]', { create: true })).toThrow('JSON item 2: expected an object or an array, found a string');
-    expect(() => importJSON(d(), 'v', '[{"a": 1}, {"a": 2}, [3]]', { create: true })).toThrow('JSON item 3: expected an object like JSON item 1, found an array (all items must be objects or all arrays)');
-    expect(() => importJSON(d(), 'v', '{"a": 1}\n[1]\n')).toThrow('NDJSON line 2: expected an object like NDJSON line 1, found an array');
-  });
-
-  // An integer column (inferred from 1) cannot store text beyond 64 bits: the second row fails after
-  // the table was created.
-  const BAD_JSON = '[{"x": 1}, {"x": "12345678901234567890"}]';
-  const BAD_CSV = 'x\n1\n12345678901234567890\n';
-
-  it('10. a failed import with create: true leaves no table behind (engine)', () => {
-    const e = d();
-    e.exec('CREATE TABLE keep(a)');
-    expect(() => importJSON(e, 'j', BAD_JSON, { create: true })).toThrow('JSON item 2: cannot store TEXT value in INTEGER column j.x');
-    expect(() => importCSV(e, 'c', BAD_CSV, { create: true })).toThrow('CSV line 3: cannot store TEXT value in INTEGER column c.x');
-    expect(tables(e)).toEqual([['keep']]);
-    // Inside an open transaction: the import's table and rows go; the transaction stays open with its work.
-    e.exec('BEGIN; INSERT INTO keep VALUES (1)');
-    expect(() => importJSON(e, 'j', BAD_JSON, { create: true })).toThrow(/^JSON item 2/);
-    expect(() => importCSV(e, 'c', BAD_CSV, { create: true })).toThrow(/^CSV line 3/);
-    expect(() => importJSON(e, 'keep', '[{"a": 2}, {"a": 3}, {"b": 4}]')).toThrow(/no column named b/);
-    expect(() => importCSV(e, 'keep', 'a\n5\n6\n"7\n')).toThrow(/unterminated/);
-    expect(e.inTransaction).toBe(true);
-    e.exec('COMMIT');
-    expect(tables(e)).toEqual([['keep']]);
-    expect(e.query('SELECT a FROM keep').rows).toEqual([[1]]);
-  });
-
-  it('10. a failed import inside an open transaction keeps none of its rows', () => {
-    const e = d();
-    e.exec('CREATE TABLE t(a INTEGER NOT NULL)');
-    e.exec('BEGIN');
-    expect(() => importJSON(e, 't', '[[1], [2], [null]]')).toThrow(/^JSON item 3: /);
-    e.exec('COMMIT');
-    expect(e.query('SELECT count(*) FROM t').rows).toEqual([[0]]);
-  });
-
-  it('10. a failed import with create: true leaves no table behind (client)', async () => {
-    const db = await openDb();
-    await expect(db.importJSON('j', BAD_JSON, { create: true })).rejects.toMatchObject({ code: 'SMALT_CONSTRAINT_DATATYPE' });
-    await expect(db.importCSV('c', BAD_CSV, { create: true })).rejects.toMatchObject({ code: 'SMALT_CONSTRAINT_DATATYPE' });
-    expect(await db.query("SELECT count(*) AS n FROM sqlite_schema WHERE type = 'table'")).toEqual([{ n: 0 }]);
-  });
-  it('11. JSON integers beyond 2^53 keep their exact value; beyond 64 bits they are REAL, as in SQLite', async () => {
-    const e = d();
-    importJSON(e, 'w', '[{"x": 1234567890123456789, "y": "12345678901234567890", "z": 9007199254740993}, {"x": -9223372036854775808, "y": "a", "z": 1}]', { create: true });
-    expect(e.query('SELECT x, typeof(x), y, z FROM w ORDER BY rowid').rows).toEqual([
-      [1234567890123456789n, 'integer', '12345678901234567890', 9007199254740993n],
-      [-9223372036854775808n, 'integer', 'a', 1],
-    ]);
-    importJSON(e, 'r', '[[12345678901234567890, 1.5e300], [1, 2]]', { create: true, columns: ['a', 'b'] });
-    expect(e.query('SELECT typeof(a), a, typeof(b) FROM r ORDER BY rowid').rows).toEqual([
-      ['real', 12345678901234567890, 'real'],
-      ['real', 1, 'real'],
-    ]);
-    importJSON(e, 'n', '{"id": 18014398509481985, "doc": {"big": 18014398509481985, "s": "\\u00e9\\"", "__proto__": 1}}\n{"id": 2, "doc": [true, null]}\n', { create: true });
-    expect(e.query('SELECT id, doc FROM n ORDER BY rowid').rows).toEqual([
-      [18014398509481985n, '{"big":18014398509481985,"s":"é\\"","__proto__":1}'],
-      [2, '[true,null]'],
-    ]);
-    // Invalid JSON is still reported by JSON.parse.
-    expect(() => importJSON(e, 'n', '[{"id": 12345678901234567890,}]')).toThrow(/^invalid JSON: /);
-    const db = await openDb();
-    await db.importJSON('w', '[{"x": 1234567890123456789}]', { create: true });
-    expect(await db.query('SELECT x FROM w')).toEqual([{ x: 1234567890123456789n }]);
   });
 });
 

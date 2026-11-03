@@ -24,7 +24,16 @@ smaltdb has two kinds:
 
 ## Reading files: read_csv, read_json, read_parquet {#reading-files}
 
-These functions read external data straight into a query, without creating a table. This section lists their arguments; [External data](../../guide/external-data) explains locations, connections, credentials, caching and partitioned datasets in full, and [CREATE EXTERNAL TABLE](../sql/external) gives the same data a permanent name.
+These functions read external data straight into a query, without creating a table. They come from [plugins](../../guide/plugins):
+
+| Function | Plugin |
+| --- | --- |
+| `read_csv`, `read_json` | `@smaltdb/io` |
+| `read_parquet` | `@smaltdb/parquet` |
+
+The location also needs a source plugin: `@smaltdb/external` reads registered files (`file:`), URLs, S3, Azure and local paths in Node. Install the plugins in the engine worker entry (`serve({ plugins: [io, external, parquet] })`, started with `worker: () => new Worker(new URL('./db-worker.ts', import.meta.url), { type: 'module' })`), or in Node with `Database.openMemory({ plugins: [io, external, parquet] })`. Without the plugin a call needs, it fails with `SMALT_PLUGIN_MISSING`, and the message names the plugin.
+
+This section lists their arguments; [External data](../../guide/external-data) explains locations, connections, credentials, caching and partitioned datasets in full, and [CREATE EXTERNAL TABLE](../sql/external) gives the same data a permanent name.
 
 ```
 read_csv(LOCATION [, option => value, …])
@@ -41,7 +50,7 @@ read_parquet(LOCATION [, option => value, …])
 
 | Location | Reads |
 | --- | --- |
-| `file:NAME` | A file registered with `registerFile(NAME, …)` (a `Uint8Array`, `ArrayBuffer`, string, `Blob`/`File`, or a file handle). |
+| `file:NAME` | A file registered with `registerFile(db, NAME, …)` from `@smaltdb/external/client` (a `Uint8Array`, `ArrayBuffer`, string, `Blob`/`File`, or a file handle). |
 | `https://…`, `http://…` | A URL, fetched with `fetch` (the server must allow CORS in a browser). |
 | `s3://bucket/key` | An object in S3 or an S3-compatible store, through an `s3` connection or the default endpoint. |
 | `az://container/path` | A blob in Azure Blob Storage, through an `azure` connection. |
@@ -64,7 +73,7 @@ Option names are case-insensitive. An unknown option fails with `unknown option 
 
 | Option | Applies to | Default | Meaning |
 | --- | --- | --- | --- |
-| `format` | all | from the function | `'csv'`, `'tsv'`, `'json'`, `'ndjson'` or `'parquet'`. Overrides the function's own format, so `read_csv(…, format => 'json')` reads JSON. |
+| `format` | all | from the function | `'csv'`, `'tsv'`, `'json'` (also `'ndjson'`, `'jsonl'`) or `'parquet'`. Overrides the function's own format, so `read_csv(…, format => 'json')` reads JSON. |
 | `header` | CSV | true | Whether the first record holds the column names. False names the columns `column1`, `column2`, …. `1`/`0`, `true`/`false`, `'yes'`/`'no'`, `'on'`/`'off'` are accepted. |
 | `delimiter` | CSV | `','` (`'\t'` for `.tsv` files and `format => 'tsv'`) | The field separator. One character. |
 | `quote` | CSV | `'"'` | The quote character. One character. A quote inside a quoted field is written twice. |
@@ -74,7 +83,7 @@ Option names are case-insensitive. An unknown option fails with `unknown option 
 | `hive_partitioning` | all | true when the location has wildcards | Read `key=value` directory names in the path as extra columns. |
 | `connection` | all | none | Name of a connection created with [CREATE CONNECTION](../sql/external); the location is resolved against it. |
 
-CSV options given to `read_json` or `read_parquet` are accepted and ignored.
+The options accepted are those of every installed format. So with `@smaltdb/io` installed, CSV options given to `read_json` or `read_parquet` are accepted and ignored.
 
 ### read_csv {#read_csv}
 
@@ -204,7 +213,7 @@ smaltdb has no JSON functions (`json_extract`, `->>`, …), so nested values can
 read_parquet(LOCATION [, hive_partitioning => …] [, connection => …])
 ```
 
-Reads a Parquet file. Only the columns the query uses are fetched, and row groups whose statistics rule them out are skipped; for remote files this uses HTTP range requests. `read_parquet` is provided by the [`@smaltdb/parquet` plugin](../../guide/plugins) (plus `hyparquet-compressors` for codecs other than Snappy and uncompressed); without the plugin the call fails with `SMALT_PLUGIN_MISSING`: `reading Parquet needs the @smaltdb/parquet plugin`.
+Reads a Parquet file. Only the columns the query uses are fetched, and row groups whose statistics rule them out are skipped; for remote files this uses HTTP range requests. `read_parquet` is provided by the [`@smaltdb/parquet` plugin](../../guide/plugins) (plus `hyparquet-compressors` for codecs other than Snappy and uncompressed); without the plugin the call fails with `SMALT_PLUGIN_MISSING`: `the parquet format needs the @smaltdb/parquet plugin`.
 
 | Parquet type | SQL value |
 | --- | --- |

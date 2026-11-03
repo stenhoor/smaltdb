@@ -17,13 +17,13 @@ it behaves differently, [Differences from SQLite](./sqlite-differences) lists th
 ### Can I open an existing SQLite database file?
 
 No. smaltdb has its own file format, and opening a file that isn't a smaltdb database fails with `SMALT_NOTADB`. To
-move data across, export it from SQLite as CSV or JSON and [import it](./import-export).
+move data across, export it from SQLite as CSV or JSON and [import it](./import-export) with the `@smaltdb/io` plugin.
 
 ### Is it ready for production?
 
 The current version is 0.9.0. The on-disk format may still change before 1.0, so a later version might not open a
 database written by this one. Keep a way to rebuild or re-import your data, for example
-[exportJSON](./import-export) or a server copy.
+[exportJSON](./import-export) from the `@smaltdb/io` plugin, or a server copy.
 
 ### How big is it?
 
@@ -34,8 +34,9 @@ These are the minified sizes, with the gzipped size in brackets:
 | `smaltdb.js` | the client you import | 12 KB (4 KB) |
 | `smaltdb-worker.js` | the engine, in its worker | 471 KB (150 KB) |
 
-Optional features that depend on other packages are [plugins](./plugins) and are not included. For example, the
-Parquet plugin adds hyparquet and, if you install it, hyparquet-compressors to your worker bundle.
+Optional features are [plugins](./plugins) and are not included: `@smaltdb/io` (CSV and JSON), `@smaltdb/external`
+(files, URLs, S3 and Azure) and `@smaltdb/parquet`. The plugins you install are bundled into your engine worker. The
+Parquet plugin also adds hyparquet and, if you install it, hyparquet-compressors.
 
 ## Storage
 
@@ -113,8 +114,8 @@ statements. See [External data](./external-data).
 
 ### How do I back up a database?
 
-Export the tables you need with `exportJSON` or `exportCSV`, and load them back with `importJSON` or `importCSV`. See
-[Import and export](./import-export).
+Export the tables you need with `exportJSON` or `exportCSV`, and load them back with `importJSON` or `importCSV`. These
+helpers come from the `@smaltdb/io` plugin. See [Import and export](./import-export).
 
 ### How do I see why a query is slow?
 

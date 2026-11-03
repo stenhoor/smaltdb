@@ -10,7 +10,7 @@ Every function smaltdb accepts, in alphabetical order. Names are case-insensitiv
 | [Date and time functions](./datetime) | `date`, `time`, `datetime`, `julianday`, `unixepoch`, `strftime`, `timediff`, `CURRENT_*`; time values, modifiers and format codes |
 | [Aggregate functions](./aggregate) | `count`, `sum`, `total`, `avg`, `min`, `max`, `group_concat`, `string_agg`; `DISTINCT` and `FILTER` |
 | [Window functions](./window) | Ranking and navigation functions, aggregates over windows, `OVER` syntax |
-| [Table-valued functions](./table-valued) | `read_csv`, `read_json`, `read_parquet`, `pragma_*` |
+| [Table-valued functions](./table-valued) | `read_csv`, `read_json`, `read_parquet` (from [plugins](../../guide/plugins)), `pragma_*` |
 
 Operators (`||`, `LIKE`, `GLOB`, arithmetic, comparisons), `CASE` and `CAST` are not functions; see [Expressions](../sql/expressions).
 
@@ -73,9 +73,9 @@ Operators (`||`, `LIKE`, `GLOB`, arithmetic, comparisons), `CASE` and `CAST` are
 | [`random()`](./math#random) | scalar | Random 64-bit integer |
 | [`randomblob(N)`](./scalar#randomblob) | scalar | `N` random bytes |
 | [`rank()`](./window#rank) | window | Rank with gaps |
-| [`read_csv(LOCATION, …)`](./table-valued#read_csv) | table-valued | Rows of a CSV or TSV file |
-| [`read_json(LOCATION, …)`](./table-valued#read_json) | table-valued | Rows of a JSON or NDJSON file |
-| [`read_parquet(LOCATION, …)`](./table-valued#read_parquet) | table-valued | Rows of a Parquet file |
+| [`read_csv(LOCATION, …)`](./table-valued#read_csv) | table-valued | Rows of a CSV or TSV file (`@smaltdb/io` plugin) |
+| [`read_json(LOCATION, …)`](./table-valued#read_json) | table-valued | Rows of a JSON or NDJSON file (`@smaltdb/io` plugin) |
+| [`read_parquet(LOCATION, …)`](./table-valued#read_parquet) | table-valued | Rows of a Parquet file (`@smaltdb/parquet` plugin) |
 | [`replace(X, Y, Z)`](./string#replace) | scalar | Replace every `Y` in `X` with `Z` |
 | [`round(X [, DIGITS])`](./math#round) | scalar | Round to `DIGITS` decimal places |
 | [`row_number()`](./window#row_number) | window | Row number within the partition |

@@ -30,7 +30,7 @@ features:
   - title: Analytics built in
     details: Columnar tables and materialized views with zone maps, spilling sorts and parallel readers.
   - title: External data
-    details: Query CSV, JSON and Parquet files, URLs, S3 and Azure Blob storage with plain SQL.
+    details: Query CSV, JSON and Parquet files, URLs, S3 and Azure Blob storage with plain SQL, through optional plugins.
   - title: Introspection
     details: An information_schema, plus sqlite_schema and PRAGMA compatibility.
 ---

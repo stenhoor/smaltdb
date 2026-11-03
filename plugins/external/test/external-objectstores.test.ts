@@ -9,13 +9,18 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Database } from '../src/engine/database.js';
-import { EngineServer } from '../src/engine/server.js';
-import type { Request, Response } from '../src/shared/protocol.js';
-import { until } from './helpers/wait.js';
-import { signV4 } from '../src/engine/external/sign.js';
-import { MemoryVfs } from '../src/engine/vfs/memory.js';
+import { Database } from '../../../src/engine/database.js';
+import { EngineServer } from '../../../src/engine/server.js';
+import type { Request, Response } from '../../../src/shared/protocol.js';
+import { until } from '../../../test/helpers/wait.js';
+import io from '@smaltdb/io';
 import parquet from '@smaltdb/parquet';
+import external from '../src/index.js';
+import { type CredentialsProvider, registerCredentials, registerFile, setFetch } from '../src/client.js';
+import { signV4 } from '../src/sign.js';
+import { MemoryVfs } from '../../../src/engine/vfs/memory.js';
+
+const plugins = [external, io];
 
 const SALES_PARQUET = readFileSync('test/fixtures/parquet/sales-none.parquet');
 
@@ -201,8 +206,8 @@ describe('S3 sources', () => {
   const put = (key: string, body: string) => objects.set(key, { body, etag: createHash('md5').update(body).digest('hex') });
 
   async function db() {
-    const d = await Database.open(new MemoryVfs(), 'db');
-    d.registerCredentials('aws', { endpoint: endpoint + '/', aws: KEYS });
+    const d = await Database.open(new MemoryVfs(), 'db', { plugins });
+    await registerCredentials(d, 'aws', { endpoint: endpoint + '/', aws: KEYS });
     d.exec(`CREATE CONNECTION lake WITH (type = 's3', endpoint = '${endpoint}', region = 'eu-west-1', bucket = 'analytics', credentials = 'aws')`);
     return d;
   }
@@ -271,8 +276,8 @@ describe('S3 sources', () => {
   it('Parquet by signed and presigned Range requests (the size from a range probe)', async () => {
     objects.set('analytics/sales.parquet', { body: SALES_PARQUET, etag: 'pq1' });
     for (const auth of [{ aws: KEYS }, { presign: (url: string) => `${url}?X-Test-Presigned=ok` }]) {
-      const d = await Database.open(new MemoryVfs(), 'db', { plugins: [parquet] });
-      d.registerCredentials('aws', { endpoint: endpoint + '/', ...auth });
+      const d = await Database.open(new MemoryVfs(), 'db', { plugins: [external, parquet] });
+      await registerCredentials(d, 'aws', { endpoint: endpoint + '/', ...auth });
       d.exec(`CREATE CONNECTION lake WITH (type = 's3', endpoint = '${endpoint}', region = 'eu-west-1', bucket = 'analytics', credentials = 'aws')`);
       log.length = 0;
       expect((await d.queryAsync("SELECT sum(id) FROM read_parquet('sales.parquet', connection => 'lake')")).rows).toEqual([[(3999 * 4000) / 2]]);
@@ -284,26 +289,26 @@ describe('S3 sources', () => {
 
   it('session tokens, presigned URLs, refusals and errors', async () => {
     const d = await db();
-    d.registerCredentials('aws', { endpoint: endpoint + '/', aws: async () => ({ ...KEYS, sessionToken: 'sts-token' }) });
+    await registerCredentials(d, 'aws', { endpoint: endpoint + '/', aws: async () => ({ ...KEYS, sessionToken: 'sts-token' }) });
     log.length = 0;
     await d.queryAsync("SELECT * FROM read_json('one.json', connection => 'lake')");
     expect(log).toEqual(['GET /analytics/one.json signed token']);
-    d.registerCredentials('aws', { endpoint: endpoint + '/', presign: (url) => `${url}?X-Test-Presigned=ok` });
+    await registerCredentials(d, 'aws', { endpoint: endpoint + '/', presign: (url) => `${url}?X-Test-Presigned=ok` });
     log.length = 0;
     expect((await d.queryAsync("SELECT v FROM read_json('one.json', connection => 'lake')")).rows).toEqual([[1]]);
     expect(log).toEqual(['GET /analytics/one.json?X-Test-Presigned=ok presigned']);
-    d.registerCredentials('aws', { endpoint: endpoint + '/', aws: { ...KEYS, secretAccessKey: 'wrong' } });
+    await registerCredentials(d, 'aws', { endpoint: endpoint + '/', aws: { ...KEYS, secretAccessKey: 'wrong' } });
     expect((await errorOf(d.queryAsync("SELECT * FROM read_json('one.json', connection => 'lake')"))).message).toBe(
       `read_json('one.json'): HTTP 403 Forbidden for ${endpoint}/analytics/one.json (SignatureDoesNotMatch: The request signature we calculated does not match)`,
     );
-    d.registerCredentials('aws', { endpoint: endpoint + '/', aws: KEYS });
+    await registerCredentials(d, 'aws', { endpoint: endpoint + '/', aws: KEYS });
     expect((await errorOf(d.queryAsync("SELECT * FROM read_csv('s3://analytics/nothing/*.csv', connection => 'lake')"))).message).toMatch(/no files match/);
     expect((await errorOf(d.queryAsync("SELECT * FROM read_csv('https://example.com/*.csv')"))).message).toMatch(/wildcards need a source that can be listed/);
     expect((await errorOf(d.queryAsync("SELECT * FROM read_csv('az://c/x.csv')"))).message).toMatch(/need an azure connection/);
   });
 
   it('AWS keys from a credentials callback across the worker boundary', async () => {
-    const d = await Database.open(new MemoryVfs(), 'db');
+    const d = await Database.open(new MemoryVfs(), 'db', { plugins });
     const msgs: { session: string; msg: Response }[] = [];
     const server = new EngineServer((session, msg) => msgs.push({ session, msg }), { open: () => d, refreshTimer: false });
     let id = 1;
@@ -315,7 +320,7 @@ describe('S3 sources', () => {
     const ended = (rid: number) => msgs.some((m) => m.msg.id === rid && ['ok', 'error', 'done'].includes(m.msg.kind));
     for (const body of [
       { op: 'open', name: 'db', storage: 'memory' },
-      { op: 'registerCredentials', name: 'aws', provider: { endpoint: endpoint + '/', callback: true } },
+      { op: 'pluginCall', plugin: '@smaltdb/external', method: 'registerCredentials', args: ['aws', { endpoint: endpoint + '/', callback: true }] },
       { op: 'exec', sql: `CREATE CONNECTION lake WITH (type = 's3', endpoint = '${endpoint}', bucket = 'analytics', credentials = 'aws')` },
     ]) {
       const rid = send(body);
@@ -323,18 +328,18 @@ describe('S3 sources', () => {
     }
     log.length = 0;
     const q = send({ op: 'query', sql: "SELECT v FROM read_json('one.json', connection => 'lake')" });
-    await until('the question', () => msgs.some((m) => m.msg.kind === 'credentials'));
-    const ask = msgs.find((m) => m.msg.kind === 'credentials')!.msg as Extract<Response, { kind: 'credentials' }>;
-    server.receive(EngineServer.LOCAL, { id: 0, op: 'credentialsReply', target: ask.request, material: { aws: KEYS } } as Request);
+    await until('the question', () => msgs.some((m) => m.msg.kind === 'pluginAsk'));
+    const ask = msgs.find((m) => m.msg.kind === 'pluginAsk')!.msg as Extract<Response, { kind: 'pluginAsk' }>;
+    server.receive(EngineServer.LOCAL, { id: 0, op: 'pluginReply', target: ask.request, value: { aws: KEYS } } as Request);
     await until('the query', () => ended(q));
     expect(msgs.find((m) => m.msg.id === q && m.msg.kind === 'error')).toBeUndefined();
     expect(log).toEqual(['GET /analytics/one.json signed']);
   });
 
   it('virtual-hosted URLs on AWS', async () => {
-    const d = await Database.open(new MemoryVfs(), 'db');
+    const d = await Database.open(new MemoryVfs(), 'db', { plugins });
     const urls: string[] = [];
-    d.setFetch(async (url) => {
+    await setFetch(d, async (url) => {
       urls.push(url);
       return { ok: true, status: 200, statusText: 'OK', headers: { get: () => null }, arrayBuffer: async () => new TextEncoder().encode('a\n1\n').buffer as ArrayBuffer };
     });
@@ -361,9 +366,9 @@ describe('Azure Blob Storage sources', () => {
   });
   afterAll(() => az.server.close());
 
-  async function db(auth: Parameters<Database['registerCredentials']>[1]) {
-    const d = await Database.open(new MemoryVfs(), 'db');
-    d.registerCredentials('az', auth);
+  async function db(auth: CredentialsProvider) {
+    const d = await Database.open(new MemoryVfs(), 'db', { plugins });
+    await registerCredentials(d, 'az', auth);
     d.exec(`CREATE CONNECTION store WITH (type = 'azure', account = 'devstoreaccount1', endpoint = '${base}/devstoreaccount1', container = 'data', credentials = 'az')`);
     return d;
   }
@@ -392,8 +397,8 @@ describe('Azure Blob Storage sources', () => {
       [{ sasToken: '?sv=2021-08-06&sig=testsig' }, 'sas'],
       [{ bearerToken: 'entra-token' }, 'bearer'],
     ] as const) {
-      const d = await Database.open(new MemoryVfs(), 'db', { plugins: [parquet] });
-      d.registerCredentials('az', { endpoint: base + '/', azure });
+      const d = await Database.open(new MemoryVfs(), 'db', { plugins: [external, parquet] });
+      await registerCredentials(d, 'az', { endpoint: base + '/', azure });
       d.exec(`CREATE CONNECTION store WITH (type = 'azure', account = 'devstoreaccount1', endpoint = '${base}/devstoreaccount1', container = 'data', credentials = 'az')`);
       log.length = 0;
       expect((await d.queryAsync("SELECT sum(id) FROM read_parquet('sales.parquet', connection => 'store')")).rows, kind).toEqual([[(3999 * 4000) / 2]]);
@@ -408,7 +413,7 @@ describe('Azure Blob Storage sources', () => {
     log.length = 0;
     expect((await d.queryAsync('SELECT n FROM events WHERE day = 2')).rows).toEqual([[3]]);
     expect(log.filter((l) => l.startsWith('GET /devstoreaccount1/data/events/day'))).toEqual(['GET /devstoreaccount1/data/events/day%3D2/e.ndjson sharedkey']);
-    d.registerCredentials('az', { endpoint: base + '/', azure: { accountKey: Buffer.from('wrong').toString('base64') } });
+    await registerCredentials(d, 'az', { endpoint: base + '/', azure: { accountKey: Buffer.from('wrong').toString('base64') } });
     expect((await errorOf(d.queryAsync('SELECT * FROM events'))).message).toMatch(/HTTP 403 .*\(AuthenticationFailed: Server failed to authenticate the request\.\)/);
   });
 });
@@ -427,15 +432,15 @@ describe('patterns over local files and registered files', () => {
       mkdirSync(join(dir, p, '..'), { recursive: true });
       writeFileSync(join(dir, p), body);
     }
-    const d = await Database.open(new MemoryVfs(), 'db');
+    const d = await Database.open(new MemoryVfs(), 'db', { plugins });
     expect((await d.queryAsync(`SELECT region, sum(x) FROM read_csv('${dir}/**/*.csv') GROUP BY region ORDER BY 1`)).rows).toEqual([
       ['eu', 1],
       ['us', 5],
     ]);
     expect((await d.queryAsync(`SELECT x FROM read_csv('${dir}/region=us/{2024,2025}/?.csv', hive_partitioning => false)`)).columns).toEqual(['x']);
-    d.registerFile('jan.csv', 'v\n1\n');
-    d.registerFile('feb.csv', 'v\n2\n');
-    d.registerFile('notes.txt', 'nope');
+    await registerFile(d, 'jan.csv', 'v\n1\n');
+    await registerFile(d, 'feb.csv', 'v\n2\n');
+    await registerFile(d, 'notes.txt', 'nope');
     expect((await d.queryAsync("SELECT sum(v) FROM read_csv('file:*.csv')")).rows).toEqual([[3]]);
   });
 });

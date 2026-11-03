@@ -1,6 +1,8 @@
 // Runs on the page main thread: exercises the public client API against the real engine worker + OPFS.
 import { open } from '../../src/client/index.js';
-import { signV4 } from '../../src/engine/external/sign.js';
+import { registerCredentials, registerFile } from '@smaltdb/external/client';
+import { exportCSV, exportJSON, importCSV, importJSON } from '@smaltdb/io/client';
+import { signV4 } from '../../plugins/external/src/sign.js';
 
 type Check = { name: string; ok: boolean; detail?: string };
 
@@ -29,7 +31,7 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   // External data (M8): a CSV over HTTP from this page's server and a registered Blob, joined with
   // a local table, plus a materialized view caching the HTTP one.
   await db.exec('DROP MATERIALIZED VIEW IF EXISTS prices_cache; DROP EXTERNAL TABLE IF EXISTS prices; DROP CONNECTION IF EXISTS site');
-  await db.registerFile('stock', new Blob(['id,qty\n1,10\n2,0\n3,7\n']));
+  await registerFile(db, 'stock', new Blob(['id,qty\n1,10\n2,0\n3,7\n']));
   await db.exec(`CREATE CONNECTION site WITH (url = '${location.origin}')`);
   await db.exec("CREATE EXTERNAL TABLE prices WITH (connection = 'site', location = 'prices.csv')");
   const ext = await db.query("SELECT p.name, p.price, s.qty, i.name AS item FROM prices p JOIN read_csv('file:stock') s ON s.id = p.id JOIN items i ON i.id = p.id ORDER BY p.id", undefined, { rowMode: 'array' });
@@ -41,16 +43,16 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   check('external: cached in a materialized view', JSON.stringify(cached) === JSON.stringify([[3, 3.5]]), cached);
   // Credentials computed per request by a callback in this tab (the engine worker asks for them).
   const asked: string[] = [];
-  await db.registerCredentials('site-token', { endpoint: location.origin + '/', headers: async (url) => (asked.push(url), { 'x-token': 'abc' }) });
+  await registerCredentials(db, 'site-token', { endpoint: location.origin + '/', headers: async (url) => (asked.push(url), { 'x-token': 'abc' }) });
   await db.exec(`CREATE CONNECTION site_auth WITH (url = '${location.origin}', credentials = 'site-token')`);
   await db.exec("CREATE EXTERNAL TABLE prices_auth WITH (connection = 'site_auth', location = 'prices.csv')");
-  const csv = await db.exportCSV('SELECT name FROM prices_auth ORDER BY id');
+  const csv = await exportCSV(db, 'SELECT name FROM prices_auth ORDER BY id');
   check('external: credentials callback asked per request; export over external data', csv === 'name\napple\n"pear, green"\nplum\n' && asked.length === 2 && asked[1] === location.origin + '/prices.csv', [csv, asked]);
   await db.exec('REFRESH MATERIALIZED VIEW prices_cache IF CHANGED');
   await db.exec('DROP EXTERNAL TABLE prices_auth; DROP CONNECTION site_auth');
-  await db.registerCredentials('site-token', null);
+  await registerCredentials(db, 'site-token', null);
   await db.exec('DROP MATERIALIZED VIEW prices_cache; DROP EXTERNAL TABLE prices; DROP CONNECTION site');
-  await db.registerFile('stock', null);
+  await registerFile(db, 'stock', null);
 
   // Parquet (M8.3) over HTTP: footer, column chunks and row groups by ranges; zstd via the optional compressors.
   const pq = await db.query(`SELECT count(*), sum(amount), min(day), max(id) FROM read_parquet('${location.origin}/sales.parquet') WHERE id >= 1000`, undefined, { rowMode: 'array' });
@@ -114,11 +116,11 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
     check('constraint error surfaces', (e as { code: string }).code === 'SMALT_CONSTRAINT_NOTNULL', String(e));
   }
   // CSV / JSON import and export through the worker (bytes transferred, Blob source).
-  const imported = await db.importCSV('people', new Blob(['id,name,age\n1,"Lee, A",31\n2,Kim,\n']), { create: true });
-  const asJson = await db.exportJSON('SELECT id, name, age FROM people ORDER BY id');
+  const imported = await importCSV(db, 'people', new Blob(['id,name,age\n1,"Lee, A",31\n2,Kim,\n']), { create: true });
+  const asJson = await exportJSON(db, 'SELECT id, name, age FROM people ORDER BY id');
   check('import CSV / export JSON', imported.rows === 2 && asJson === '[{"id":1,"name":"Lee, A","age":31},{"id":2,"name":"Kim","age":null}]', [imported, asJson]);
-  await db.importJSON('people', '{"id":3,"name":"Ng"}\n');
-  const asCsv = await db.exportCSV('SELECT id, name FROM people WHERE id > ?', [1]);
+  await importJSON(db, 'people', '{"id":3,"name":"Ng"}\n');
+  const asCsv = await exportCSV(db, 'SELECT id, name FROM people WHERE id > ?', [1]);
   check('import NDJSON / export CSV', asCsv === 'id,name\n2,Kim\n3,Ng\n', asCsv);
 
   // Streaming with backpressure: batches arrive as they are consumed; leaving early closes the stream.

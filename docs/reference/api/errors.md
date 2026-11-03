@@ -23,6 +23,7 @@ The [errors guide](../../guide/errors) shows how to handle them. This page lists
 | [`SMALT_INTERRUPT`](#smalt-interrupt) | The request was cancelled | Your choice |
 | [`SMALT_RETRY`](#smalt-retry) | The tab that owned the database changed | Yes |
 | [`SMALT_MISUSE`](#smalt-misuse) | The API was used incorrectly (closed database, finalized statement) | No |
+| [`SMALT_PLUGIN_MISSING`](#smalt-plugin-missing) | A feature needs a plugin the engine does not have | After installing it |
 | [`SMALT_EXTERNAL`](#smalt-external) | Reading external data failed | Often |
 | [`SMALT_ASYNC_REQUIRED`](#smalt-async-required) | A synchronous engine call needs external data | Use the async method |
 | [`SMALT_CANTOPEN`](#smalt-cantopen) | A database file cannot be opened | No |
@@ -239,6 +240,11 @@ The API was used in a way that cannot work:
 | `the transaction has ended: use tx only while the transaction callback runs` | A method of a `db.transaction()` handle (`tx`) called after its callback finished. |
 | `the statement was prepared on another Database` | `tx.statement(stmt)` with a statement of another `Database`. |
 | `invalid page size …` | A `pageSize` that is not a power of two from 512 to 65536. |
+| `plugin … needs plugin API version …; this engine implements version 1` | A plugin written for another version of the [plugin interface](./plugins). |
+| `plugin … is installed twice` | The same plugin listed twice in `plugins`. |
+| `plugin …: format 'csv' is already defined` (or table function, source prefix, connection type, method) | Two plugins register the same name. |
+| `plugin … has no method …` | `callPlugin` with a method the plugin does not have. |
+| `serve() was already called in this worker` | A second `serve()` call in an engine worker entry. |
 
 Low-level engine classes (pager, b-tree, VFS) raise it for invalid calls as well.
 
@@ -246,13 +252,21 @@ Low-level engine classes (pager, b-tree, VFS) raise it for invalid calls as well
 
 ## SMALT_PLUGIN_MISSING
 
-A statement needs a [plugin](../../guide/plugins) the engine does not have, e.g. `read_parquet('file:x.parquet'): reading Parquet needs the @smaltdb/parquet plugin (install it and add it to the engine's plugins)`. It is raised when the statement is planned or run, never when a database is opened.
+A statement or a plugin call needs a [plugin](../../guide/plugins) the engine does not have. The message names smaltdb's plugin for the feature when there is one:
 
-**Remedy:** install the plugin and add it to the engine: `serve({ plugins: [...] })` in the engine worker entry, or `Database.open(…, { plugins })` with `smaltdb/engine`.
+- a format: `read_parquet('file:x.parquet'): the parquet format needs the @smaltdb/parquet plugin (install it and add it to the engine's plugins)`;
+- a source: `read_csv('file:x.csv'): reading file:x.csv needs the @smaltdb/external plugin (…)`, or `reading the path 'data/x.csv'` for a local path;
+- a connection type, in `CREATE CONNECTION` or when a statement reads through the connection: `connection c: an s3 connection needs the @smaltdb/external plugin (…)`;
+- a plugin helper: `importCSV(): import and export needs the @smaltdb/io plugin (…)`, `registerFile(): registering files and credentials needs the @smaltdb/external plugin (…)`;
+- a format no plugin is known for: `read_csv('file:x.dat'): no installed plugin provides the 'xml' format (installed: csv, json, jsonl, ndjson, tsv)`.
+
+It is raised when a statement is planned or run, or when a plugin method is called, never when a database is opened. External tables and connections created with a plugin stay in the catalog without it.
+
+**Remedy:** install the plugin and add it to the engine: `serve({ plugins: [...] })` in the engine worker entry, with `worker: () => new Worker(new URL('./db-worker.ts', import.meta.url), { type: 'module' })` in `open()`, or `Database.openMemory({ plugins })` / `Database.open(…, { plugins })` with `smaltdb/engine`. See [plugins](../../guide/plugins).
 
 ## SMALT_EXTERNAL
 
-Reading [external data](../../guide/external-data) failed. The message starts with the source (`read_csv('file:x.csv'): …`, a URL, an external table) and says why: no file registered under that name, an HTTP error, a network failure, a file that does not parse, a missing optional package (`this file uses a codec that needs the hyparquet-compressors package`), or credentials that could not be obtained (a credentials callback that failed, did not answer within 30 seconds, or whose tab closed).
+Reading [external data](../../guide/external-data) failed. Plugins raise it: a format or source plugin that throws a plain `Error` is reported as `SMALT_EXTERNAL` (see [Writing plugins](./plugins#errors)). The message starts with the source (`read_csv('file:x.csv'): …`, a URL, an external table) and says why: no file registered under that name, an HTTP error, a network failure, a file that does not parse, a missing optional package (`this file uses a codec that needs the hyparquet-compressors package`), or credentials that could not be obtained (a credentials callback that failed, did not answer within 30 seconds, or whose tab closed).
 
 **Remedy:** depends on the cause. Network and HTTP errors are often temporary and can be retried.
 
@@ -303,6 +317,6 @@ Client only. The engine worker raised an error event: it failed to load (a wrong
 
 ## SMALT_INTERNAL
 
-The engine worker caught an error that is not a smaltdb error, such as a `TypeError` from a bug or a browser API failure. The message is the original error's message (or its name when the message is empty).
+The engine worker caught an error that is not a smaltdb error, such as a `TypeError` from a bug or a browser API failure, or a plain `Error` thrown by a plugin method. The message is the original error's message (or its name when the message is empty).
 
 **Remedy:** report it, with the message and the SQL, at the project's issue tracker.

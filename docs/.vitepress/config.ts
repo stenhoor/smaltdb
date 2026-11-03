@@ -130,6 +130,7 @@ export default defineConfig({
         items: [
           { text: 'Client (smaltdb)', link: '/reference/api/client' },
           { text: 'Engine (smaltdb/engine)', link: '/reference/api/engine' },
+          { text: 'Writing plugins', link: '/reference/api/plugins' },
           { text: 'Error codes', link: '/reference/api/errors' },
         ],
       },

@@ -150,7 +150,7 @@ A smaltdb extension.
 | --- | --- |
 | `table_catalog`, `table_schema`, `table_name` | the table |
 | `location` | the `location` option |
-| `format` | `csv`, `tsv`, `json`, `ndjson`, `parquet` as given, or from the extension (`csv`, `json`, `parquet`) |
+| `format` | the `format` option as given (lower case), or else the format the file extension selects (`csv`, `tsv`, `json`, `parquet`); NULL when no installed [plugin](../../guide/plugins) reads that extension |
 | `connection_name` | the connection, or NULL |
 | `options` | the other options as a JSON object |
 

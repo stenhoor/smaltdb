@@ -203,6 +203,6 @@ smaltdb also has things SQLite does not:
 
 - [`information_schema`](../reference/sql/information-schema) views;
 - [materialized views](../reference/sql/views) (`CREATE / REFRESH / DROP MATERIALIZED VIEW`);
-- [external tables and connections](../reference/sql/external), and the `read_csv`, `read_json`, `read_parquet` table functions;
+- [external tables and connections](../reference/sql/external), and the `read_csv`, `read_json`, `read_parquet` table functions, through [plugins](./plugins);
 - [columnar tables](../reference/sql/create-table#columnar-tables) (`WITH (storage = 'columnar')`);
 - `EXPLAIN ANALYZE`, and the pragmas `work_mem`, `matview_rewrite`, `parallel_aggregates`, `spill_bytes` and `compact`.

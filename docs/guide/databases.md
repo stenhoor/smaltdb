@@ -136,7 +136,7 @@ From your code's point of view, every tab has a normal `Database`. Some things t
 - **Transactions belong to a tab.** While one tab's transaction is open, the other tabs' requests wait until it ends. If a tab closes with a transaction open, the transaction is rolled back. See [transactions](./transactions#multiple-tabs).
 - **A change of owner fails requests in flight** with `SMALT_RETRY`. Requests sent to the old owner are lost with it. Retry them; see [errors](./errors#retrying).
 - **Prepared statements belong to the owner** they were prepared on. After a change of owner, using one rejects with `SMALT_RETRY`; prepare it again.
-- **Registered files and credentials** (`registerFile`, `registerCredentials`) live in the owning worker. Each tab registers its own again with a new owner automatically.
+- **Registered files and credentials** (`registerFile`, `registerCredentials` from the [`@smaltdb/external`](./plugins) plugin) live in the owning worker. Each tab registers its own again with a new owner automatically. Credentials whose provider has functions are answered by the tab that registered them, and are dropped when that tab closes.
 - **Cancellation** of a statement that is already running works only in the owning tab (see [cancellation](./queries#cancellation)).
 
 Turn sharing off with `multiTab: false`. Each `open()` then opens the files itself, and a second tab that opens the same database fails with `SMALT_BUSY` while the first has it open.

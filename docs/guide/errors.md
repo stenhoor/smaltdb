@@ -40,6 +40,7 @@ Most errors point at the SQL or the data, and running the same call again gives 
 | `SMALT_CONSTRAINT_*` | The data breaks a constraint | Show the user, change the data, or use an upsert |
 | `SMALT_MISMATCH`, `SMALT_RANGE` | Wrong parameter types, counts or ranges | Fix the calling code |
 | `SMALT_MISUSE` | A closed database, a finalized statement, a `tx` handle used after its callback | Fix the calling code |
+| `SMALT_PLUGIN_MISSING` | The call needs a [plugin](./plugins) the engine does not have, such as `@smaltdb/io` for `read_csv` | Install the plugin and add it to the engine |
 
 Some errors depend on timing and can succeed later:
 
@@ -47,7 +48,7 @@ Some errors depend on timing and can succeed later:
 |---|---|---|
 | `SMALT_RETRY` | With multi-tab access, the tab that owned the database closed during the call | Retry (see [below](#retrying)) |
 | `SMALT_BUSY` | Your own open stream blocks a write, or another tab holds the file | End the stream; or close the other database, or turn on multi-tab access |
-| `SMALT_EXTERNAL` | A fetch of external data failed | Often a network problem: retry later |
+| `SMALT_EXTERNAL` | Reading [external data](./external-data) failed | Often a network problem: retry later |
 | `SMALT_INTERRUPT` | You cancelled the call | Nothing |
 
 And some mean the environment or the file is broken: `SMALT_WORKER`, `SMALT_CANTOPEN`, `SMALT_NOTADB`, `SMALT_FORMAT`, `SMALT_CORRUPT`, `SMALT_INTERNAL`. See the [reference](../reference/api/errors) for each.

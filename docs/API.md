@@ -1,6 +1,8 @@
 # Public API
 
-> Status: the M1 API is implemented in `src/client/index.ts`. Planned extensions are marked *(planned)*.
+> Status: design notes, partly historical. The current API is in the [client](reference/api/client.md) and
+> [engine](reference/api/engine.md) references. Since ADR 0012, import/export and registered files and credentials are
+> plugin helpers (`@smaltdb/io`, `@smaltdb/external`), not `db` methods.
 
 **Implemented in M1:**
 - `open(name, { storage, pageSize, cacheMB, durable, worker })`

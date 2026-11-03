@@ -1,5 +1,5 @@
 /**
- * Request signing for object stores (M8.2), on WebCrypto (browsers, workers and Node 20+), so the core
+ * Request signing for object stores (M8.2), on WebCrypto (browsers, workers and Node 20+), so the plugin
  * needs no dependency:
  * - AWS Signature Version 4 (S3 and S3-compatible stores: MinIO, Cloudflare R2, …);
  * - Azure Storage Shared Key (blob service).
