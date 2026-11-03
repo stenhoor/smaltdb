@@ -117,11 +117,12 @@ it declined on subquery AST (a compiled alias is a `native` node too, and fuses 
   compiling the slot (or generating code that reads it) runs it, except in trial compiles while costing. Direct
   callers of `resolveColumn` still mark at once. Pushdown is unchanged, and conjuncts can now be bound before the
   planner knows which of them an index will consume.
-- **4b-ii:** the conjunct pool keeps a bound form next to the AST (null while a conjunct holds a subquery, which keeps subquery
-planning lazy). Access options, `columnOf`, `colRef`, `selectivity`, `hashKeys`, partition pruning, row-group checks,
-columnar options and expression-index keys read the bound form. Index probes see through `sql.affinity_*`. The
-step-6 planner then reuses the access-path, cost and join-order code unchanged. Gate: no change in the plan-shape
-corpus.
+- **4b-ii (done as step 6a):** every WHERE / ON conjunct of the join pool is bound once (per scope), and the
+  access-path, cost and join-order code reads the bound form: dependencies, selectivity, rowid and index probes
+  (collation and conversions in the index's operand order), partial-index predicates and expression-index columns
+  (bound against their table alone and compared by a positional shape key), range fractions, hash-join keys, columnar
+  zone maps, and partition and row-group pruning. Conjuncts with subqueries are bound for analysis with placeholder
+  subqueries and still compile from the AST. The plan-shape corpus is unchanged.
 
 ### Step 5: the SQL front end produces plans for reading queries (about 2.5k lines, two PRs)
 
