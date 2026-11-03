@@ -218,6 +218,6 @@ The data stays in OPFS. The next `open('tasks')` in this origin finds it again.
 ## Where next
 
 - [Queries](./queries): result shapes, prepared statements, streaming, how values map between JavaScript and SQL.
-- [Import and export](./import-export): load CSV or JSON, export query results.
+- [Import and export](./import-export): load CSV or JSON, export query results, with the `@smaltdb/io` plugin.
 - [Errors](./errors): error codes and what to retry.
 - [SQL reference](../reference/sql/).

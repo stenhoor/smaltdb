@@ -24,9 +24,8 @@ The guide explains the concepts: [databases](../../guide/databases), [queries](.
 | [`RunResult`](#runresult) | type | Result of `exec` and `run` |
 | [`ArrayResult`](#arrayresult), [`ColumnarResult`](#columnarresult) | type | Results in `'array'` and `'columnar'` row mode |
 | [`SqlValue`](#sqlvalue), [`Params`](#params) | type | Values and parameters |
-| [`ImportSource`](#importsource) | type | Input of `importCSV` / `importJSON` |
-| [`CsvImportOptions`](#csvimportoptions), [`JsonImportOptions`](#jsonimportoptions), [`CsvExportOptions`](#csvexportoptions), [`JsonExportOptions`](#jsonexportoptions) | type | Import and export options |
-| [`CredentialsProvider`](#credentialsprovider) | type | Credentials for `registerCredentials` |
+
+Import and export, registered files and credentials come from [plugins](../../guide/plugins), not from `smaltdb`. Their helpers are listed under [Plugin helpers](#plugin-helpers).
 
 ## open
 
@@ -134,73 +133,60 @@ const id = await db.transaction(async (tx) => {
 });
 ```
 
-Run statements through `tx` (a [`Transaction`](#transaction-1)). While `fn` runs, every other call on the same `Database` and its prepared statements (`query`, `exec`, `stream`, `prepare`, `transaction`, the import and export methods, `close`, and `query`, `stream` and `run` of a `PreparedStatement`) waits for the transaction to end, so awaiting one inside `fn` never finishes. Rejects with `SMALT_ERROR` if a transaction opened with SQL `BEGIN` is already open.
+Run statements through `tx` (a [`Transaction`](#transaction-1)). While `fn` runs, every other call on the same `Database` and its prepared statements (`query`, `exec`, `stream`, `prepare`, `transaction`, `callPlugin` with `lock` (such as the `@smaltdb/io` helpers), `close`, and `query`, `stream` and `run` of a `PreparedStatement`) waits for the transaction to end, so awaiting one inside `fn` never finishes. Rejects with `SMALT_ERROR` if a transaction opened with SQL `BEGIN` is already open.
 
 If `fn` ends the transaction itself through `tx`: after a `COMMIT`, the promise resolves to `fn`'s result; after a `ROLLBACK`, it rejects with `SMALT_ERROR` ("the transaction was rolled back inside the transaction callback"). See [transactions](../../guide/transactions).
 
-### importCSV
+### callPlugin
 
-`db.importCSV(table: string, source: ImportSource, options?: CsvImportOptions): Promise<{ rows: number }>`
+`db.callPlugin(plugin: string, method: string, args: unknown[], options?: { lock?: boolean; replay?: string; dropReplay?: boolean; signal?: AbortSignal }): Promise<unknown>`
 
-Inserts the CSV records of `source` into `table`, in one transaction (or in a savepoint of the open SQL transaction). Resolves to the number of rows inserted. Rejects, with nothing inserted and no table created, if any row fails. See [CsvImportOptions](#csvimportoptions) and [importCSV](../../guide/import-export#importcsv).
+Calls method `method` of plugin `plugin` in the engine worker, and resolves to its result. `args` and the result are sent with `postMessage`, so they must be values the browser can clone. Plugins export typed [helpers](#plugin-helpers) that call this, so applications rarely call it directly.
+
+| Option | Description |
+|---|---|
+| `lock` | Wait for earlier `exec` calls and transactions of this `Database`, and hold off later ones while the call runs, as `exec` does. |
+| `replay` | A key under which the call is sent again to a new engine worker when this tab takes over a shared database (for state that lives in the worker, such as registered files). A later call with the same key replaces it. |
+| `dropReplay` | With `replay`: forget the call stored under that key. The call itself is still sent. |
+| `signal` | Cancels the call; it then rejects with `SMALT_INTERRUPT`. |
+
+Rejects with `SMALT_PLUGIN_MISSING` when the engine does not have the plugin, and with `SMALT_MISUSE` when the plugin has no such method. See [Writing plugins](./plugins#calling-plugin-methods).
 
 ```ts
-const { rows } = await db.importCSV('people', 'name,age\nAnn,31\nBob,27\n');
+const result = await db.callPlugin('@smaltdb/io', 'exportCSV', ['SELECT 1 AS x', null, {}], { lock: true });
+console.log(result); // 'x\n1\n'
 ```
 
-### importJSON
+### onPluginMessage
 
-`db.importJSON(table: string, source: ImportSource, options?: JsonImportOptions): Promise<{ rows: number }>`
+`db.onPluginMessage(plugin: string, handler: ((message: unknown) => unknown) | null): void`
 
-Inserts a JSON array of objects or arrays, or NDJSON, into `table`, like `importCSV`. See [JsonImportOptions](#jsonimportoptions) and [importJSON](../../guide/import-export#importjson).
+Answers questions that plugin `plugin` asks this tab from the engine (for example, `@smaltdb/external` asks for fresh credentials for one request). The handler's return value, or the value its promise resolves to, is the answer. If it throws, the plugin's question fails with the error's message. One handler per plugin; `null` removes it. `registerCredentials` from `@smaltdb/external/client` sets its own handler, so applications rarely call this. See [Writing plugins](./plugins#asking-the-client).
 
-```ts
-await db.importJSON('people', '[{"name": "Cy", "age": 40}]');
-```
+### Plugin helpers
 
-### exportCSV
+These functions come from the plugins' client modules. Each takes the `Database` first, and calls [`callPlugin`](#callplugin). The engine worker must have the plugin installed; see [plugins](../../guide/plugins).
 
-`db.exportCSV(sql: string, params?: Params, options?: CsvExportOptions): Promise<string>`
+| Helper | Module | Description |
+|---|---|---|
+| `importCSV(db, table: string, source: ImportSource, options?: CsvImportOptions): Promise<{ rows: number }>` | `@smaltdb/io/client` | Insert CSV records into `table`. See [importCSV](../../guide/import-export#importcsv). |
+| `importJSON(db, table: string, source: ImportSource, options?: JsonImportOptions): Promise<{ rows: number }>` | `@smaltdb/io/client` | Insert a JSON array or NDJSON. See [importJSON](../../guide/import-export#importjson). |
+| `exportCSV(db, sql: string, params?: ExportParams, options?: CsvExportOptions): Promise<string>` | `@smaltdb/io/client` | A query's result as CSV. See [exportCSV](../../guide/import-export#exportcsv). |
+| `exportJSON(db, sql: string, params?: ExportParams, options?: JsonExportOptions): Promise<string>` | `@smaltdb/io/client` | A query's result as JSON or NDJSON. See [exportJSON](../../guide/import-export#exportjson). |
+| `registerFile(db, name: string, file: FileSource \| null): Promise<void>` | `@smaltdb/external/client` | Make `file` readable as `file:<name>`; `null` removes it. See [registering files](../../guide/external-data#registering-files). |
+| `registerCredentials(db, name: string, provider: CredentialsProvider \| null): Promise<void>` | `@smaltdb/external/client` | Credentials a connection names; `null` removes them. See [credentials](../../guide/external-data#credentials). |
+| `setFetch(db, fetchFn: FetchFn \| null): Promise<void>` | `@smaltdb/external/client` | Replace the transport for HTTP(S), S3 and Azure requests. A function cannot be sent to a worker, so this works with the in-process engine only. |
 
-Runs a query and resolves to its result as CSV text. See [CsvExportOptions](#csvexportoptions) and [exportCSV](../../guide/import-export#exportcsv).
-
-```ts
-const csv = await db.exportCSV('SELECT name, age FROM people ORDER BY name');
-```
-
-### exportJSON
-
-`db.exportJSON(sql: string, params?: Params, options?: JsonExportOptions): Promise<string>`
-
-Runs a query and resolves to its result as a JSON array of objects, or NDJSON with `{ format: 'ndjson' }`. See [exportJSON](../../guide/import-export#exportjson).
+The import and export helpers pass `lock: true`. `registerFile` and `registerCredentials` pass a `replay` key (`file:<name>`, `cred:<name>`), so a new owner tab gets them again, and `dropReplay` when you pass `null`.
 
 ```ts
-const ndjson = await db.exportJSON('SELECT * FROM people', undefined, { format: 'ndjson' });
-```
+import { importCSV, exportCSV } from '@smaltdb/io/client';
+import { registerFile } from '@smaltdb/external/client';
 
-### registerFile
-
-`db.registerFile(name: string, file: Blob | Uint8Array | ArrayBuffer | string | { getFile(): Promise<Blob> } | null): Promise<void>`
-
-Makes `file` readable from SQL as `file:<name>`, in `read_csv('file:<name>')`, `read_json`, `read_parquet` and external tables. `file` may be a `File` or `Blob`, a File System Access file handle, bytes, or text. `null` removes the registration. Nothing is copied into the database; the registration lives in the engine worker's memory until the database is closed. With multi-tab access, the client registers its files again with a new owner tab. See [external data](../../guide/external-data).
-
-```ts
-await db.registerFile('prices.csv', new Blob(['id,price\n1,9.5\n']));
+await registerFile(db, 'prices.csv', new Blob(['id,price\n1,9.5\n']));
 const rows = await db.query("SELECT * FROM read_csv('file:prices.csv')");
-```
-
-### registerCredentials
-
-`db.registerCredentials(name: string, provider: CredentialsProvider | null): Promise<void>`
-
-Registers credentials that connections refer to by name (`CREATE CONNECTION c WITH (…, credentials = '<name>')`). They are used only for requests to URLs that start with `provider.endpoint`, live in the engine worker's memory, and are never stored in SQL or the database file. `null` removes them. Parts given as functions stay in this tab: the engine asks this tab for each request. See [CredentialsProvider](#credentialsprovider) and [external data](../../guide/external-data).
-
-```ts
-await db.registerCredentials('api', {
-  endpoint: 'https://data.example.com/',
-  headers: async () => ({ authorization: `Bearer ${await getToken()}` }),
-});
-declare function getToken(): Promise<string>;
+await importCSV(db, 'people', 'name,age\nAnn,31\nBob,27\n', { create: true });
+const csv = await exportCSV(db, 'SELECT name, age FROM people ORDER BY name');
 ```
 
 ### close
@@ -356,11 +342,19 @@ A SQL value in JavaScript: NULL, INTEGER (`number`, or `bigint` outside ±(2^53 
 
 Positional values for `?` / `?NNN`, or an object for `:name`, `@name` and `$name`. `true` and `false` bind as `1` and `0`, `undefined` in an array as NULL, and `NaN` as NULL. A `bigint` outside the 64-bit INTEGER range, and an object for a statement with `?` or `?NNN` placeholders, reject with `SMALT_RANGE`. See [parameters](../../guide/queries#parameters).
 
+## Plugin helper types
+
+These types are exported by the plugins' client modules, not by `smaltdb`: `ImportSource`, `ExportParams`, `CsvImportOptions`, `JsonImportOptions`, `CsvExportOptions` and `JsonExportOptions` by `@smaltdb/io/client`, and `FileSource`, `CredentialsProvider`, `AwsKeys`, `AzureAuth` and `FetchFn` by `@smaltdb/external/client`.
+
 ### ImportSource
 
 `type ImportSource = string | Uint8Array | ArrayBuffer | Blob`
 
 Text, UTF-8 bytes, or a `Blob` / `File`.
+
+### ExportParams
+
+`type ExportParams = readonly ParamValue[] | Readonly<Record<string, ParamValue>>`, where `ParamValue` is `null | number | bigint | string | Uint8Array | boolean | undefined`. Positional values, or named ones for `:name`, `$name` and `@name`, as for [`Params`](#params).
 
 ### CsvImportOptions
 
@@ -395,6 +389,12 @@ Text, UTF-8 bytes, or a `Blob` / `File`.
 |---|---|---|---|
 | `format` | `'array'` \| `'ndjson'` | `'array'` | One JSON array of objects, or one object per line. |
 
+### FileSource
+
+`type FileSource = Blob | Uint8Array | ArrayBuffer | string | { getFile(): Promise<Blob> }`
+
+A `File` or `Blob`, bytes, text, or a file handle such as a `FileSystemFileHandle` (`getFile()` is called on each read).
+
 ### CredentialsProvider
 
 | Field | Type | Description |
@@ -405,4 +405,10 @@ Text, UTF-8 bytes, or a `Blob` / `File`.
 | `azure` | `{ sasToken }` \| `{ accountKey }` \| `{ bearerToken }`, or a function returning one | Authentication for `azure` connections. |
 | `presign` | `(url: string, method: 'GET' \| 'HEAD') => string \| Promise<string>` | Returns a presigned URL to fetch instead of `url`. |
 
-When any part is a function, the parts stay in this tab and the engine worker asks for the credentials of each request; a request fails with `SMALT_EXTERNAL` if no answer comes within 30 seconds, or when the tab closes. See [external data](../../guide/external-data).
+When any part is a function (`presign` always is), the whole provider stays in this tab: the engine worker gets only the `endpoint`, and asks this tab for the credentials of each request. A request then fails with `SMALT_EXTERNAL` if no answer comes within 30 seconds, or when the tab has closed; the engine drops the credentials when the tab closes. See [external data](../../guide/external-data#credentials).
+
+### FetchFn
+
+`type FetchFn = (url: string, init: { method?: 'GET' | 'HEAD'; headers: Record<string, string>; signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; statusText: string; headers: { get(name: string): string | null }; arrayBuffer(): Promise<ArrayBuffer> }>`
+
+The subset of `fetch` that `@smaltdb/external` uses. The global `fetch` fits it.

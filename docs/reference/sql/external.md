@@ -2,6 +2,8 @@
 
 An external table is a catalog entry for data that lives outside the database: a CSV, JSON or Parquet file in the browser, on a web server, in S3 or Azure Blob Storage, or on disk in Node. Queries read it like a table; the database never writes to it. A connection names an endpoint and the credentials for it.
 
+External data comes from [plugins](../../guide/plugins). `@smaltdb/external` provides the sources (registered files, URLs, S3, Azure, local paths in Node) and the connection types `http`, `s3` and `azure`. `@smaltdb/io` provides the CSV, TSV and JSON formats, and `@smaltdb/parquet` the Parquet format. Install them in the engine worker entry (`serve({ plugins: [io, external, parquet] })`, started with `worker: () => new Worker(new URL('./db-worker.ts', import.meta.url), { type: 'module' })`), or in Node with `Database.openMemory({ plugins: [io, external, parquet] })`. A statement that needs a missing plugin fails with `SMALT_PLUGIN_MISSING`. Tables and connections created with a plugin stay in the catalog without it.
+
 This page is the syntax reference. For a walk-through, registering files and credentials, patterns, partitions and caching, see [External data](../../guide/external-data). To read a file once without a catalog entry, use [`read_csv`, `read_json` and `read_parquet`](../functions/table-valued).
 
 ## CREATE CONNECTION
@@ -10,9 +12,9 @@ This page is the syntax reference. For a walk-through, registering files and cre
 CREATE CONNECTION [IF NOT EXISTS] name WITH (option = value [, ...])
 ```
 
-A connection is stored in the database file. It holds no secrets: `credentials` names a provider that the application registers at runtime with `registerCredentials` (see the [client API](../api/client)), and that provider's material is only sent to URLs that start with its `endpoint`.
+A connection is stored in the database file. It holds no secrets: `credentials` names a provider that the application registers at runtime with `registerCredentials(db, name, provider)` from `@smaltdb/external/client` (see [credentials](../../guide/external-data#credentials)), and that provider's material is only sent to URLs that start with its `endpoint`.
 
-Options by `type`:
+The connection types come from the `@smaltdb/external` plugin. Without it, `CREATE CONNECTION` fails with `SMALT_PLUGIN_MISSING` (`connection c: an s3 connection needs the @smaltdb/external plugin (…)`); an omitted `type` is `http`. Options by `type`:
 
 | Option | `http` (default) | `s3` | `azure` | Meaning |
 | --- | --- | --- | --- | --- |
@@ -80,7 +82,7 @@ CREATE EXTERNAL TABLE [IF NOT EXISTS] [main.]name [(column [type] [, ...])]
 | --- | --- |
 | `location` | required: where the data is; see [Locations](#locations) |
 | `connection` | name of a connection; relative locations resolve against it, and its credentials are used |
-| `format` | `'csv'`, `'tsv'`, `'json'`, `'ndjson'` or `'parquet'` (`'jsonl'` and `'pq'` also work); default: from the file extension |
+| `format` | `'csv'`, `'tsv'`, `'json'` (also `'ndjson'`, `'jsonl'`) or `'parquet'`; default: from the file extension |
 | [reader options](#reader-options) | `header`, `delimiter`, `quote`, `null`, `skip`, `encoding`, `hive_partitioning` |
 
 Unknown options fail with `SMALT_EXTERNAL` (`x: unknown option 'foo'`), so typos are caught.
@@ -133,14 +135,14 @@ Option names may be keywords, so `null = 'NA'` and `"null" = 'NA'` are the same 
 
 | Location | Source |
 | --- | --- |
-| `file:<name>` | a file the application registered with `registerFile(name, …)`: a `File`, `Blob`, file handle, bytes or text |
+| `file:<name>` | a file the application registered with `registerFile(db, name, …)` from `@smaltdb/external/client`: a `File`, `Blob`, file handle, bytes or text |
 | `https://…`, `http://…` | a URL (in browsers, the server must allow CORS) |
 | a relative path or key | resolved against the connection: its `url` (http), its `bucket` (s3) or its `container` (azure) |
 | `s3://bucket/key` | an S3 object; needs no connection, or an `s3` connection |
 | `az://container/path` (also `azure://`) | an Azure blob; needs an `azure` connection (it names the account) |
 | a local path | a file on disk, in Node only; in a browser it fails (`register the file (registerFile) and use file:<name>`) |
 
-Other schemes fail when the table is read: `unsupported location 'ftp://…' (http(s), s3://, az://, file:<name>, or a path in Node)`.
+Other schemes fail with `SMALT_EXTERNAL` when the table is read: `unsupported location 'ftp://…' (file:, http:, https:, s3://, az://, azure://)`. The list names the prefixes of the installed sources.
 
 **Patterns.** In S3 and Azure keys, local paths and registered file names, `*` (within a directory), `**` (any depth), `?`, `[a-z]` and `{a,b}` select several files, which are read concurrently and merged by column name. HTTP URLs cannot be listed, so they take no patterns.
 
@@ -154,15 +156,16 @@ SELECT year, sum(amount) FROM sales WHERE year >= 2024 GROUP BY year;
 
 ### Formats
 
-| Format | Extensions | Notes |
-| --- | --- | --- |
-| `csv` | `.csv`, `.txt` | RFC 4180 quoting; `delimiter`, `quote`, `header`, `null`, `skip` apply |
-| `tsv` | `.tsv` | CSV with a tab delimiter |
-| `json` | `.json` | an array of objects (keys become columns, matched without regard to case), or of arrays (`column1`, …) |
-| `ndjson` | `.ndjson`, `.jsonl` | one JSON value per line |
-| `parquet` | `.parquet`, `.pq` | needs the [`@smaltdb/parquet` plugin](../../guide/plugins); reads only the columns and row groups a statement needs |
+| Format | Other names | Extensions | Plugin | Notes |
+| --- | --- | --- | --- | --- |
+| `csv` | | `.csv`, `.txt` | `@smaltdb/io` | RFC 4180 quoting; `delimiter`, `quote`, `header`, `null`, `skip` apply |
+| `tsv` | | `.tsv` | `@smaltdb/io` | CSV with a tab delimiter |
+| `json` | `ndjson`, `jsonl` | `.json`, `.ndjson`, `.jsonl` | `@smaltdb/io` | an array of objects (keys become columns, matched without regard to case) or of arrays (`column1`, …), or one JSON value per line |
+| `parquet` | `pq` | `.parquet`, `.pq` | [`@smaltdb/parquet`](../../guide/plugins) | reads only the columns and row groups a statement needs |
 
-A location without a known extension needs `format` (`cannot tell the format of 'x': add format = 'csv', 'json' or 'parquet'`). JSON and NDJSON are told apart by the content, so either `format` reads both. In JSON, `true`/`false` become 1/0, and nested arrays and objects become JSON text.
+`txt` is an extension only: `format = 'txt'` fails with `unsupported format 'txt'`. `information_schema.external_tables` shows the `format` option as given, or else the name of the format the extension selects (`json` for an `.ndjson` file), or NULL when no installed plugin reads that extension.
+
+A location without a known extension needs `format` (`cannot tell the format of 'x': add format = '…'`). JSON and NDJSON are told apart by the content, so either `format` reads both. In JSON, `true`/`false` become 1/0, and nested arrays and objects become JSON text.
 
 ```sql
 CREATE EXTERNAL TABLE events WITH (location = 'file:sql-events.json');

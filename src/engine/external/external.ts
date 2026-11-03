@@ -267,7 +267,15 @@ export class ExternalRegistry {
   private isPattern(source: ExternalSource, handler: SourceHandler): boolean {
     const target = this.targetOf(source);
     const path = /^[a-z][a-z0-9+.-]*:\/\//i.test(source.location) ? source.location.replace(/[?#].*$/, '') : source.location;
-    if (!(handler.isPattern ? handler.isPattern(target) : isGlob(path))) return false;
+    let pattern: boolean;
+    try {
+      pattern = handler.isPattern ? handler.isPattern(target) : isGlob(path);
+    } catch (e) {
+      // Errors from a plugin's isPattern: like its other errors, labelled SMALT_EXTERNAL (or its own SMALT_ code).
+      if (e instanceof SmaltError || errorCode(e) !== 'SMALT_INTERNAL') throw e;
+      throw externalError(source, (e as Error)?.message ?? String(e));
+    }
+    if (!pattern) return false;
     if (!handler.list) throw externalError(source, `wildcards need a source that can be listed, not ${handler.name}`);
     return true;
   }

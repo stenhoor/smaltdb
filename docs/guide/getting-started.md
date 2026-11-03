@@ -17,7 +17,7 @@ The package has three entry points:
 | `smaltdb/worker` | `dist/smaltdb-worker.js` | The default engine worker script (no plugins), for setups that need its path (see [below](#loading-the-engine-worker)). |
 | `smaltdb/worker-runtime` | `dist/worker-runtime.js` | `serve()`, to write your own engine worker entry with [plugins](./plugins). |
 
-The package has no runtime dependencies. Optional features that depend on other projects, such as Parquet, are separate [plugin](./plugins) packages.
+The package has no runtime dependencies. Optional features are separate [plugin](./plugins) packages: `@smaltdb/io` (CSV and JSON formats, import and export), `@smaltdb/external` (files, URLs, S3 and Azure as data sources) and `@smaltdb/parquet` (Parquet).
 
 Type declarations ship with the package. The engine needs Node 20 or later when you run it in Node.
 
@@ -127,7 +127,7 @@ Storage in Node:
 - `OpfsVfs` needs OPFS, which Node does not have: opening a file with it rejects with `SMALT_CANTOPEN`.
 - smaltdb ships no VFS for the Node file system. To persist to disk, implement the `Vfs` interface (see [the engine API](../reference/api/engine#vfs)).
 
-Reading Parquet files needs the `@smaltdb/parquet` plugin, in Node as in the browser: `Database.openMemory({ plugins: [parquet] })`. See [plugins](./plugins).
+[External data](./external-data) and [import and export](./import-export) need plugins, in Node as in the browser. In Node, pass them when you open the database: `Database.openMemory({ plugins: [io, external, parquet] })`. See [plugins](./plugins).
 
 ## Next steps
 

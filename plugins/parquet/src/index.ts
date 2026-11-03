@@ -19,7 +19,7 @@ const parquet: SmaltPlugin = {
   version: VERSION,
   apiVersion: 1,
   setup(host) {
-    host.addFormat({ name: 'parquet', extensions: ['parquet', 'pq'], access: 'random', pushdown: true, read: readParquet });
+    host.addFormat({ name: 'parquet', aliases: ['pq'], extensions: ['parquet', 'pq'], access: 'random', pushdown: true, read: readParquet });
     host.addTableFunction('read_parquet', { format: 'parquet' });
   },
 };

@@ -20,13 +20,12 @@ The SQL, the values, the parameters and the errors are the same as in the client
 |---|---|
 | [`Database`](#database) | A database connection |
 | [`Statement`](#statement), [`RowCursor`](#rowcursor) | Prepared statements and their result cursors |
-| [`importCSV`, `importJSON`, `exportCSV`, `exportJSON`, `exportCSVAsync`, `exportJSONAsync`](#import-and-export) | Import and export functions |
 | [`MemoryVfs`, `OpfsVfs`, `Vfs`, `VfsFile`, `OpenOptions`](#vfs) | Storage back ends |
 | [`SmaltError`, `CorruptionError`, `MisuseError`, `SqlSyntaxError`](#errors) | Error classes |
 | [`parse`, `parseOne`](#parsing) | The SQL parser |
 | [`detectCapabilities`, `Capabilities`](#detectcapabilities) | Browser feature detection |
-| [`PLUGIN_API_VERSION`, `SmaltPlugin`, `PluginHost`, `FormatReader`, …](#plugins) | The plugin interface (experimental) |
-| Types: `RunResult`, `QueryResult`, `BindParams`, `DatabaseOptions`, `SqlValue`, `CsvImportOptions`, `JsonImportOptions`, `CsvExportOptions`, `JsonExportOptions`, `CredentialProvider`, `FetchFn`, `FileSource` | Described below |
+| [`PLUGIN_API_VERSION`, `SmaltPlugin`, `PluginHost`, `FormatReader`, …](#plugins) | The plugin interface, version 1. See [Writing plugins](./plugins). |
+| Types: `RunResult`, `QueryResult`, `BindParams`, `DatabaseOptions`, `SqlValue` | Described below |
 | `Pager`, `Frame`, `BTree`, `BTreeCursor`, `KeyEncoder`, `encodeKey`, `decodeKey`, `Collation`, `crc32c`, and their types | [Low-level storage](#low-level-storage) |
 
 ## Database
@@ -65,7 +64,7 @@ console.log(again.query('SELECT a FROM t').rows); // [['kept']]
 | `verifyChecksums` | `boolean` | `true` | Check page checksums on every read from storage. |
 | `walAutoCheckpointBytes` | `number` | 4 MiB | Copy the write-ahead log into the database file once it reaches this size. |
 | `readAheadBytes` | `number` | 64 KiB | On a cache miss, read this aligned extent around the page in one call (`0` disables). |
-| `plugins` | `SmaltPlugin[]` | none | [Plugins](../../guide/plugins) to install, e.g. `[parquet]` from `@smaltdb/parquet`. |
+| `plugins` | `readonly SmaltPlugin[]` | none | [Plugins](../../guide/plugins) to install, e.g. `[io, external]` from `@smaltdb/io` and `@smaltdb/external`. |
 | `sharedHandles` | `boolean` | `false` | Open OPFS files with `readwrite-unsafe` handles so other workers can open them too. You must then make sure only one connection writes. |
 
 ### Running SQL
@@ -100,22 +99,24 @@ Statements that read [external data](../../guide/external-data) (`read_csv`, `re
 | `execAsync(sql, params?, options?): Promise<void>` | `exec` that fetches external sources first, statement by statement. |
 
 The three async methods also run `REFRESH MATERIALIZED VIEW … IF CHANGED`, which checks the view's sources before it refreshes; the synchronous ones fail with `SMALT_ASYNC_REQUIRED` for it.
-| `registerFile(name: string, file: FileSource \| null): void` | Make `file` readable as `file:<name>`. `FileSource` is `Blob \| Uint8Array \| ArrayBuffer \| string \| { getFile(): Promise<Blob> }`; a string is the file's text. `null` removes it. |
-| `registerCredentials(name: string, provider: CredentialProvider \| null): void` | Credentials a connection names. `CredentialProvider` has the fields of the client's [`CredentialsProvider`](./client#credentialsprovider); functions are called in this thread. |
-| `setFetch(fetchFn: FetchFn \| null): void` | Replace the transport for HTTP(S) and object store requests (default: the global `fetch`). |
 
 `signal` aborts the fetches; the call then rejects with `SMALT_INTERRUPT`.
 
+Formats and sources come from [plugins](../../guide/plugins): `@smaltdb/io` (CSV, TSV, JSON), `@smaltdb/parquet` (Parquet) and `@smaltdb/external` (registered files, URLs, S3, Azure and local paths). Without them, these statements fail with `SMALT_PLUGIN_MISSING`. Files are registered with `registerFile(db, name, file)` from `@smaltdb/external/client`, which takes the engine `Database` as it takes the client's:
+
 ```ts
 import { Database } from 'smaltdb/engine';
+import io from '@smaltdb/io';
+import external from '@smaltdb/external';
+import { registerFile } from '@smaltdb/external/client';
 
-const db = Database.openMemory();
-db.registerFile('prices.csv', 'id,price\n1,9.5\n2,12\n');
+const db = Database.openMemory({ plugins: [io, external] });
+await registerFile(db, 'prices.csv', 'id,price\n1,9.5\n2,12\n');
 const { rows } = await db.queryAsync("SELECT id, price FROM read_csv('file:prices.csv') WHERE price > ?", [10]);
 console.log(rows); // [[2, 12]]
 ```
 
-`FetchFn` is `(url, { method?, headers, signal? }) => Promise<{ ok, status, statusText, headers: { get(name) }, arrayBuffer() }>`, a subset of `fetch`. Replace it to route requests through your own transport or to serve them in tests.
+`registerCredentials(db, name, provider)` and `setFetch(db, fn)` from `@smaltdb/external/client` work the same way; with the in-process engine, functions in a credentials provider are called in this thread. See the [client's plugin helpers](./client#plugin-helpers).
 
 ## Statement
 
@@ -178,26 +179,19 @@ db.exec('DELETE FROM t'); // fine: the cursor is closed
 
 ## Import and export
 
-The same operations as the client's [import and export methods](./client#importcsv), as functions. They take text (decode bytes yourself) and run synchronously.
-
-| Function | Description |
-|---|---|
-| `importCSV(db, table, text, options?: CsvImportOptions): { rows: number }` | Insert CSV records. |
-| `importJSON(db, table, text, options?: JsonImportOptions): { rows: number }` | Insert a JSON array or NDJSON. |
-| `exportCSV(db, sql, params?, options?: CsvExportOptions): string` | Query result as CSV. |
-| `exportJSON(db, sql, params?, options?: JsonExportOptions): string` | Query result as JSON or NDJSON. |
-| `exportCSVAsync(db, sql, params?, options?, signal?): Promise<string>` | `exportCSV` for queries over external data. |
-| `exportJSONAsync(db, sql, params?, options?, signal?): Promise<string>` | `exportJSON` for queries over external data. |
-
-The options and output rules are in [import and export](../../guide/import-export).
+Import and export come from the `@smaltdb/io` plugin. Its helpers in `@smaltdb/io/client` take an engine `Database` as they take the client's, and return promises:
 
 ```ts
-import { Database, importCSV, exportCSV } from 'smaltdb/engine';
+import { Database } from 'smaltdb/engine';
+import io from '@smaltdb/io';
+import { importCSV, exportCSV } from '@smaltdb/io/client';
 
-const db = Database.openMemory();
-importCSV(db, 'people', 'name,age\nAnn,31\n', { create: true });
-console.log(exportCSV(db, 'SELECT name, age FROM people')); // 'name,age\nAnn,31\n'
+const db = Database.openMemory({ plugins: [io] });
+await importCSV(db, 'people', 'name,age\nAnn,31\n', { create: true });
+console.log(await exportCSV(db, 'SELECT name, age FROM people')); // 'name,age\nAnn,31\n'
 ```
+
+Exports over external data fetch their sources first. The options and output rules are in [import and export](../../guide/import-export).
 
 ## VFS
 
@@ -235,22 +229,28 @@ export type { Vfs, VfsFile, OpenOptions };
 are installed in the engine worker with `serve({ plugins })` from `smaltdb/worker-runtime`.
 
 ```ts
+// db-worker.ts
 import { serve } from 'smaltdb/worker-runtime';
+import io from '@smaltdb/io';
+import external from '@smaltdb/external';
 import parquet from '@smaltdb/parquet';
 
-serve({ plugins: [parquet] });
+serve({ plugins: [io, external, parquet] });
 ```
 
-| Export | Description |
+| Member or export | Description |
 |---|---|
-| `serve(options?: { plugins?: SmaltPlugin[] })` (`smaltdb/worker-runtime`) | Makes the current dedicated worker an engine worker, with these plugins in it and in its parallel readers. Call it once, at the top level of the worker script; a second call fails with `SMALT_MISUSE`. |
+| `serve(options?: { plugins?: readonly SmaltPlugin[] })` (`smaltdb/worker-runtime`) | Makes the current dedicated worker an engine worker, with these plugins in it and in its parallel readers. Call it once, at the top level of the worker script; a second call fails with `SMALT_MISUSE`. |
+| `db.plugins: readonly { name: string; version: string }[]` | The plugins installed in this engine (getter). |
+| `db.callPlugin(plugin: string, method: string, args: unknown[], options?: { session?: string; signal?: AbortSignal }): Promise<unknown>` | Call a plugin method. Plugin helpers such as `importCSV(db, …)` call it. `session` names the calling client session (default `'local'`); the worker server sets it. See [Writing plugins](./plugins#calling-plugin-methods). |
 | `PLUGIN_API_VERSION` | The plugin interface version this engine implements (`1`). |
-| `SmaltPlugin`, `PluginHost`, `FormatReader`, `FormatRequest`, `FormatResult`, `FormatColumn`, `RandomAccessFile`, `Zone` | Types for writing plugins. |
+| `SmaltPlugin`, `PluginHost`, `PluginMethod`, `MethodContext`, `ConnectionTypeSpec`, `FormatReader`, `FormatRequest`, `FormatResult`, `FormatColumn`, `RandomAccessFile`, `SourceHandler`, `SourceTarget`, `SourceContext`, `OpenedFile`, `ListedFile`, `AskError`, `Zone` | Types for writing plugins. See [Writing plugins](./plugins). |
 
 Opening fails with `SMALT_MISUSE` when a plugin was written for another `apiVersion`, when the same plugin is listed
-twice, or when two plugins define the same format or table function.
+twice, or when two plugins register the same format name or alias, table function, source prefix, source for plain
+paths, or connection type or alias.
 
-The plugin interface is experimental: it may change between minor versions until it is declared stable.
+The plugin interface is API version 1. It is not stable yet: it will be declared stable before the 0.9.0 release.
 
 ## Errors
 

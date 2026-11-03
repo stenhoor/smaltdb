@@ -7,7 +7,7 @@
  * A plugin imports nothing from the engine at run time (only these types), so it works with any
  * copy of the engine an application bundles. Everything it needs comes through `PluginHost`.
  */
-import { SmaltError } from './errors.js';
+import { SmaltError, errorCode } from './errors.js';
 import type { Database } from './database.js';
 import { formatReal } from './catalog/schema.js';
 import { globPrefix, globRegExp, isGlob } from './external/glob.js';
@@ -242,7 +242,10 @@ const KNOWN_FUNCTIONS: Record<string, { plugin: string; format: (location: strin
 };
 const KNOWN_SOURCES: [RegExp, string][] = [[/^(https?:|s3:\/\/|az:\/\/|azure:\/\/|file:)/i, '@smaltdb/external']];
 const KNOWN_CONNECTIONS: Record<string, string> = { http: '@smaltdb/external', https: '@smaltdb/external', s3: '@smaltdb/external', azure: '@smaltdb/external' };
-const KNOWN_METHODS: Record<string, string> = { '@smaltdb/io': 'import and export', '@smaltdb/external': 'registered files and credentials' };
+const KNOWN_METHODS: Record<string, string> = { '@smaltdb/io': 'import and export', '@smaltdb/external': 'registering files and credentials' };
+
+/** 'a' or 'an' before a word (`an s3 connection`, `an http connection`). */
+const article = (word: string): string => (/^([aeiou]|s3|https?\b)/i.test(word) ? 'an' : 'a');
 
 /** A feature that needs a plugin the engine does not have. */
 export function pluginMissing(label: string, what: string, plugin?: string): SmaltError {
@@ -390,7 +393,7 @@ export class PluginRegistry {
       const type = this.connectionType(String(target.connection.options.type ?? 'http'));
       const s = this.sources.find((x) => x.connectionTypes?.some((t) => t.toLowerCase() === type));
       if (s) return s;
-      return this.throwMissing(pluginMissing(label, `a ${type} connection`, KNOWN_CONNECTIONS[type]));
+      return this.throwMissing(pluginMissing(label, `${article(type)} ${type} connection`, KNOWN_CONNECTIONS[type]));
     }
     const s = this.sources.find((x) => x.paths);
     if (s) return s;
@@ -412,7 +415,7 @@ export class PluginRegistry {
     const t = type.toLowerCase();
     const spec = this.connectionTypes.get(t);
     if (!spec) {
-      if (KNOWN_CONNECTIONS[t]) throw pluginMissing(`connection ${name}`, `a ${t} connection`, KNOWN_CONNECTIONS[t]);
+      if (KNOWN_CONNECTIONS[t]) throw pluginMissing(`connection ${name}`, `${article(t)} ${t} connection`, KNOWN_CONNECTIONS[t]);
       const known = [...new Set([...this.connectionTypes.values()].map((x) => x.type))]; // registration order
       throw new SmaltError('SMALT_ERROR', `connection ${name}: type '${type}' is not supported${known.length ? ` (${known.join(', ')})` : ''}`);
     }
@@ -422,7 +425,8 @@ export class PluginRegistry {
     try {
       spec.validate?.(options);
     } catch (e) {
-      if (e instanceof SmaltError) throw e;
+      // SmaltErrors, and plugin errors that carry a SMALT_ code, keep their code.
+      if (e instanceof SmaltError || errorCode(e) !== 'SMALT_INTERNAL') throw e;
       throw new SmaltError('SMALT_ERROR', `connection ${name}: ${(e as Error).message}`);
     }
   }

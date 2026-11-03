@@ -10,9 +10,61 @@ There are three ways to use it:
 | `CREATE EXTERNAL TABLE` | A source you query regularly: its location, format and columns are stored under a name. |
 | A materialized view over either | A local copy: fast repeat reads and offline use, refreshed when the source changes. |
 
-Reference pages: [CREATE CONNECTION and CREATE EXTERNAL TABLE](../reference/sql/external), [table-valued functions](../reference/functions/table-valued), [registerFile and registerCredentials](../reference/api/client), [error codes](../reference/api/errors).
+Reference pages: [CREATE CONNECTION and CREATE EXTERNAL TABLE](../reference/sql/external), [table-valued functions](../reference/functions/table-valued), [plugins](./plugins), [error codes](../reference/api/errors).
 
 The runnable examples on this page read small files from the documentation's `docs/examples/` folder, registered under their file names (`file:ext-products.csv` and so on).
+
+## Plugins
+
+External data is not built into the core engine. Three [plugins](./plugins) provide it:
+
+| Plugin | Provides | Depends on |
+| --- | --- | --- |
+| `@smaltdb/io` | The CSV, TSV, JSON and NDJSON formats; `read_csv()` and `read_json()` | Nothing |
+| `@smaltdb/external` | Where data is read from: registered files (`file:`), `http://` and `https://` URLs, S3 (`s3://`), Azure Blob Storage (`az://`, `azure://`) and local paths in Node. The connection types `http`, `s3` and `azure`. The helpers `registerFile`, `registerCredentials` and `setFetch` | Nothing |
+| `@smaltdb/parquet` | The Parquet format; `read_parquet()` | `hyparquet`; optionally `hyparquet-compressors` |
+
+A read needs a plugin for the format and a plugin for the source. `read_csv('file:prices.csv')` needs both `@smaltdb/io` and `@smaltdb/external`.
+
+Install the ones you use:
+
+```sh
+npm install smaltdb @smaltdb/io @smaltdb/external
+```
+
+In the browser, the plugins run in the engine worker. Write a worker entry that serves the engine with them:
+
+```ts
+// db-worker.ts
+import { serve } from 'smaltdb/worker-runtime';
+import io from '@smaltdb/io';
+import external from '@smaltdb/external';
+
+serve({ plugins: [io, external] });
+```
+
+Open the database with that worker:
+
+```ts
+import { open } from 'smaltdb';
+
+const db = await open('app', {
+  worker: () => new Worker(new URL('./db-worker.ts', import.meta.url), { type: 'module' }),
+});
+```
+
+In Node, pass the plugins to the in-process engine: `Database.openMemory({ plugins: [io, external] })`. See [Running statements over external data](#running-statements-over-external-data).
+
+A statement that needs a missing plugin fails with `SMALT_PLUGIN_MISSING`, and the message names the plugin:
+
+<!-- docs:skip -->
+```sql
+SELECT * FROM read_csv('file:prices.csv');
+-- without @smaltdb/io:
+--   read_csv('file:prices.csv'): the csv format needs the @smaltdb/io plugin (install it and add it to the engine's plugins)
+-- with @smaltdb/io but without @smaltdb/external:
+--   read_csv('file:prices.csv'): reading file:prices.csv needs the @smaltdb/external plugin (install it and add it to the engine's plugins)
+```
 
 ## Reading files
 
@@ -154,9 +206,12 @@ The engine is synchronous, but fetching files is not. smaltdb therefore fetches 
 
 ```ts
 import { Database } from 'smaltdb/engine';
+import io from '@smaltdb/io';
+import external from '@smaltdb/external';
+import { registerFile } from '@smaltdb/external/client';
 
-const db = Database.openMemory();
-db.registerFile('prices.csv', 'id,price\n1,9.5\n2,12\n');
+const db = Database.openMemory({ plugins: [io, external] });
+await registerFile(db, 'prices.csv', 'id,price\n1,9.5\n2,12\n');
 
 const { rows } = await db.queryAsync("SELECT sum(price) AS total FROM read_csv('file:prices.csv')");
 console.log(rows); // [[21.5]]
@@ -166,21 +221,23 @@ Statements that read external data always run on the engine worker that owns the
 
 ## Registering files
 
-In a browser, the engine cannot open the user's files by path. Register a file under a name, then read it as `file:<name>`:
+In a browser, the engine cannot open the user's files by path. Register a file under a name with `registerFile(db, name, source)` from `@smaltdb/external/client`, then read it as `file:<name>`:
 
 ```ts
+import { registerFile } from '@smaltdb/external/client';
+
 const input = document.querySelector<HTMLInputElement>('#upload')!;
 
 input.addEventListener('change', async () => {
   const file = input.files?.[0];
   if (!file) return;
-  await db.registerFile('upload.csv', file);
+  await registerFile(db, 'upload.csv', file);
   const preview = await db.query("SELECT * FROM read_csv('file:upload.csv') LIMIT 20");
   console.table(preview);
 });
 ```
 
-`registerFile(name, source)` accepts:
+`source` can be:
 
 | Source | Notes |
 | --- | --- |
@@ -194,7 +251,7 @@ Registered files live in the engine worker's memory for as long as the database 
 
 A registered name can contain slashes, and can be matched by [wildcards](#wildcards-and-partitions): `file:exports/*.csv`.
 
-The in-process engine has the same method (`db.registerFile(name, source)`, synchronous), and also reads local paths in Node, relative to the current directory:
+`registerFile` works the same with the in-process engine. In Node, `@smaltdb/external` also reads local paths, relative to the current directory:
 
 <!-- docs:skip -->
 ```sql
@@ -214,7 +271,7 @@ The format comes from the `format` option, or else from the file extension. `rea
 | `.json`, `.ndjson`, `.jsonl` | JSON (an array or NDJSON, detected from the first character) |
 | `.parquet`, `.pq` | Parquet |
 
-Other extensions need `format = 'csv' | 'tsv' | 'json' | 'ndjson' | 'parquet'`.
+Other extensions need the `format` option: `'csv'`, `'tsv'`, `'json'` (also `'ndjson'` or `'jsonl'`) or `'parquet'` (also `'pq'`). `txt` is an extension only, not a format name.
 
 Reader options (named arguments of the functions, or `WITH (…)` options of an external table):
 
@@ -347,6 +404,21 @@ SELECT * FROM read_csv('https://data.example.com/v1/fx/rates.csv');
 
 In a browser, the server must allow your origin with CORS headers. A network failure, including a CORS refusal, fails with `SMALT_EXTERNAL`, and the message mentions CORS. Check the browser's network panel for the cause. For `IF CHANGED` (below), the server should also expose the `ETag` or `Last-Modified` header. Parquet has further requirements; see [Parquet](#parquet).
 
+Requests go through the global `fetch`. With the in-process engine, `setFetch(db, fn)` from `@smaltdb/external/client` replaces it for HTTP(S), S3 and Azure requests, for example to serve requests in tests; `null` restores `fetch`. A function cannot be sent to an engine worker, so this is for the in-process engine only.
+
+```ts
+import { Database } from 'smaltdb/engine';
+import io from '@smaltdb/io';
+import external from '@smaltdb/external';
+import { setFetch } from '@smaltdb/external/client';
+
+const db = Database.openMemory({ plugins: [io, external] });
+await setFetch(db, async (url, init) => {
+  console.log(init.method ?? 'GET', url);
+  return fetch(url, init);
+});
+```
+
 ## Connections
 
 A connection names an endpoint and, optionally, the credentials to use with it. Locations relative to a connection resolve against it:
@@ -397,14 +469,16 @@ SELECT connection_name, connection_type, url, credentials, options FROM informat
 
 ## Credentials
 
-Secrets never go into SQL or the database file. The application registers them at runtime with `registerCredentials(name, provider)`, under the name that a connection's `credentials` option refers to. They live in the engine worker's memory until the database is closed.
+Secrets never go into SQL or the database file. The application registers them at runtime with `registerCredentials(db, name, provider)` from `@smaltdb/external/client`, under the name that a connection's `credentials` option refers to. They live in the engine's memory until the database is closed. Pass `null` as the provider to remove them.
 
 Every provider has an `endpoint`: credentials are only ever sent with requests to URLs that start with it. A connection that points elsewhere fails instead of leaking them, which protects you when a database file comes from someone else.
 
 ```ts
+import { registerCredentials } from '@smaltdb/external/client';
+
 declare const apiToken: string;
 
-await db.registerCredentials('rates-token', {
+await registerCredentials(db, 'rates-token', {
   endpoint: 'https://data.example.com/',
   headers: { authorization: `Bearer ${apiToken}` },
 });
@@ -419,10 +493,12 @@ A provider holds one of these:
 | `azure` | `azure` connections | `{ sasToken }`, `{ accountKey }` (requests are signed with Shared Key) or `{ bearerToken }` (Microsoft Entra ID). |
 | `presign` | Any | A function `(url, method) => presigned URL`, called for each request. The returned URL is fetched instead, with no other authentication. |
 
-`headers`, `aws` and `azure` can also be functions, called for each request. Use them for short-lived tokens or keys fetched from your backend. In the worker client, functions stay in the tab that registered them; the engine asks that tab for each request.
+`headers`, `aws` and `azure` can also be functions, called for each request. Use them for short-lived tokens or keys fetched from your backend. In the worker client, a provider with any function in it (including `presign`) stays in the tab that registered it, and the engine asks that tab for each request. The engine drops such credentials when that tab closes. A request fails with `SMALT_EXTERNAL` if the tab does not answer within 30 seconds. With the in-process engine, the functions are called directly.
 
 ```ts
-await db.registerCredentials('lake-keys', {
+import { registerCredentials } from '@smaltdb/external/client';
+
+await registerCredentials(db, 'lake-keys', {
   endpoint: 'https://analytics.s3.eu-west-1.amazonaws.com/',
   aws: async () => {
     const res = await fetch('/api/s3-session');
@@ -430,12 +506,12 @@ await db.registerCredentials('lake-keys', {
   },
 });
 
-await db.registerCredentials('contoso-sas', {
+await registerCredentials(db, 'contoso-sas', {
   endpoint: 'https://contoso.blob.core.windows.net/',
   azure: { sasToken: 'sv=2024-11-04&ss=b&sig=…' },
 });
 
-await db.registerCredentials('reports', {
+await registerCredentials(db, 'reports', {
   endpoint: 'https://reports.s3.amazonaws.com/',
   presign: async (url, method) => {
     const res = await fetch(`/api/presign?method=${method}&url=${encodeURIComponent(url)}`);
@@ -444,7 +520,7 @@ await db.registerCredentials('reports', {
 });
 ```
 
-The endpoint is compared with the full request URL, so for S3 use the URL the bucket is reached at: `https://<bucket>.s3.<region>.amazonaws.com/` for virtual-hosted style, or the `endpoint` you configured for path style. Pass `null` as the provider to remove credentials.
+The endpoint is compared with the full request URL, so for S3 use the URL the bucket is reached at: `https://<bucket>.s3.<region>.amazonaws.com/` for virtual-hosted style, or the `endpoint` you configured for path style.
 
 ::: warning Anything in a browser is visible to its user
 Keys registered in a page can be read by whoever uses that page. Give browsers short-lived, narrowly scoped credentials (STS session tokens, SAS tokens, presigned URLs) issued by your backend, never long-term keys.
@@ -502,11 +578,24 @@ Pruning applies to external tables, not to `read_csv()` and `read_json()` calls.
 
 ## Parquet
 
-Parquet is provided by the `@smaltdb/parquet` [plugin](./plugins), which reads files with [hyparquet](https://github.com/hyparam/hyparquet). Install it and add it to your engine worker:
+Parquet is provided by the `@smaltdb/parquet` [plugin](./plugins), which reads files with [hyparquet](https://github.com/hyparam/hyparquet). Install it:
 
 ```sh
 npm install @smaltdb/parquet
 ```
+
+Add it to the plugins of your engine worker entry, next to `@smaltdb/external` for the source (see [Plugins](#plugins)):
+
+```ts
+// db-worker.ts
+import { serve } from 'smaltdb/worker-runtime';
+import external from '@smaltdb/external';
+import parquet from '@smaltdb/parquet';
+
+serve({ plugins: [external, parquet] });
+```
+
+In Node: `Database.openMemory({ plugins: [external, parquet] })`.
 
 Snappy compression is built in. For gzip, zstd, brotli or LZ4-compressed files, also install the decompressors:
 
@@ -639,6 +728,7 @@ Views over external data are never used by `PRAGMA matview_rewrite` to answer qu
 
 | Code | Raised when |
 | --- | --- |
+| `SMALT_PLUGIN_MISSING` | The statement needs a [plugin](#plugins) the engine does not have. The message names it. |
 | `SMALT_EXTERNAL` | A source cannot be fetched or parsed. The message names the source and the cause: the HTTP status, the CSV line, the JSON item, a missing registered file, an unknown option, or a network or CORS failure. |
 | `SMALT_ASYNC_REQUIRED` | The in-process engine's synchronous API ran a statement that reads external data, or `REFRESH … IF CHANGED`. Use the `…Async` methods. |
 | `SMALT_INTERRUPT` | The request was cancelled while fetching. |
