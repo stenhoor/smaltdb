@@ -1,7 +1,9 @@
-# smaltdb
+# CLAUDE.md
 
-An embedded SQL database for browsers, written in TypeScript: the engine runs in a Web Worker, data lives in OPFS,
-and the SQL dialect follows SQLite. Published on npm as `smaltdb`.
+smaltdb is an embedded SQL database for browsers, written in TypeScript: the engine runs in a Web Worker, data lives
+in OPFS, and the SQL dialect follows SQLite. Published on npm as `smaltdb`. Several Claude Code sessions work on the
+smalt repos in parallel and cannot see each other: this file is the shared starting point. smaltui has the matching
+file; keep the working rules the same.
 
 ## Commands
 
@@ -34,15 +36,15 @@ Playwright is resolved globally in local containers (see `test/browser/playwrigh
 - **Docs examples are tests.** `test/docs-examples.test.ts` runs every SQL example in `docs/guide` and
   `docs/reference` and type-checks the TypeScript ones, so a docs or engine change can fail it.
 - **No fixed sleeps in tests.** Wait with `until()` / `pause()` from `test/helpers/wait.ts` (see TESTING.md).
+- **Probe tests** (`test/zz-*.test.ts`) are scratch files: delete them, never commit them. Don't reformat files with
+  Prettier.
 
-## Working rules
+## Working rules for sessions
 
-- One task per branch and PR. Don't add unrelated work to an open PR: it holds up everything else in it.
+- One task per branch and PR. Do not add unrelated work to an open PR: it holds up everything else in it.
 - Mark unfinished work clearly, and open a PR only when CI passes.
 - Read review comments on your PR and answer them with commits that say what they address.
-- When a PR depends on another repo's PR, say so in its description: `Depends on: stenhoor/smalt-brand#2`.
-- Probe tests (`test/zz-*.test.ts`) are scratch files: delete them, never commit them. Don't reformat files with
-  Prettier.
+- When a PR depends on another repo's PR, add a line such as `Depends on: stenhoor/smalt-brand#2`.
 
 ## Cross-repo impact
 
