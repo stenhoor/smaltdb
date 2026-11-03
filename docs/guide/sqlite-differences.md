@@ -205,4 +205,5 @@ smaltdb also has things SQLite does not:
 - [materialized views](../reference/sql/views) (`CREATE / REFRESH / DROP MATERIALIZED VIEW`);
 - [external tables and connections](../reference/sql/external), and the `read_csv`, `read_json`, `read_parquet` table functions, through [plugins](./plugins);
 - [columnar tables](../reference/sql/create-table#columnar-tables) (`WITH (storage = 'columnar')`);
+- the [statistical aggregates](../reference/functions/aggregate#statistics) `var_samp`, `variance`, `var_pop`, `stddev_samp`, `stddev`, `stddev_pop`, `covar_samp`, `covar_pop`, `corr`, `skewness`, `skewness_pop`, `kurtosis` and `kurtosis_pop` (SQLite has `median` and the `percentile` functions, which smaltdb has too, with the same results);
 - `EXPLAIN ANALYZE`, and the pragmas `work_mem`, `matview_rewrite`, `parallel_aggregates`, `spill_bytes` and `compact`.

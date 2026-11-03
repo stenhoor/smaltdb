@@ -459,9 +459,11 @@ export function generateLoader(spec: LoaderSpec, helpers: LoaderHelpers): Loader
 // ------------------------------------------------------------------ fused scan + filter + aggregate
 
 export interface FusedAggSpec {
-  kind: 'countStar' | 'count' | 'step';
-  /** Argument expression (count/step). */
+  kind: 'countStar' | 'count' | 'step' | 'step2';
+  /** Argument expression (count/step/step2). */
   arg?: Expr;
+  /** Second argument expression (step2: two-argument aggregates such as corr and percentile). */
+  arg2?: Expr;
   filter?: Expr;
 }
 
@@ -660,8 +662,14 @@ class Pipeline {
       if (a.kind === 'countStar') body.push(`${state(i)}.n++;`);
       else {
         const g = em.gen(a.arg!);
-        body.push(...this.take());
-        body.push(a.kind === 'count' ? `if (!${em.isNull(g)}) ${state(i)}.n++;` : `${state(i)}.step1(${em.value(g)});`);
+        if (a.kind === 'step2') {
+          const g2 = em.gen(a.arg2!);
+          body.push(...this.take());
+          body.push(`${state(i)}.step2(${em.value(g)}, ${em.value(g2)});`);
+        } else {
+          body.push(...this.take());
+          body.push(a.kind === 'count' ? `if (!${em.isNull(g)}) ${state(i)}.n++;` : `${state(i)}.step1(${em.value(g)});`);
+        }
       }
       if (a.filter) {
         const f = em.gen(a.filter);
