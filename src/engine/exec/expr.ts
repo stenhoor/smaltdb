@@ -14,8 +14,9 @@ import {
 import { currentTimeText } from './datetime.js';
 import { ARITHMETIC_FUNCTIONS, BITWISE_FUNCTIONS, COMPARISON_FUNCTIONS, arithImpl, negate, sqlFunction } from './sql-functions.js';
 import { type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
-import { type CodegenHelpers, codegenEnabled, generate, isCodegenRoot } from './codegen.js';
+import { type CodegenHelpers, type PipelineCompiler, codegenEnabled, generate, isCodegenRoot } from './codegen.js';
 import { WINDOW_ARITY } from './window.js';
+import { type SqlMeta, getMeta, setMeta } from './sql-meta.js';
 import { type PlanExpr, call, lit, param, typeOf } from '../plan/expr.js';
 import type { CollationName } from '../plan/types.js';
 import { decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
@@ -107,57 +108,24 @@ function isNumericType(t: StaticType): boolean {
 }
 
 /**
- * Compile an expression. Arithmetic / comparison / logic roots are compiled to generated
- * JavaScript when allowed (see codegen.ts); everything else uses the closure compiler.
+ * Compile an expression. It is bound to a plan expression once; arithmetic / comparison / logic roots are compiled
+ * to generated JavaScript when allowed (see codegen.ts), everything else with the closure compiler.
  */
 export function compileExpr(e: Expr, scope: CompileScope): Compiled {
-  if (e.kind === 'call' && codegenEnabled() && isCodegenRoot(e)) {
+  const b = bindExpr(e, scope);
+  if (!codegenEnabled() || !isCodegenRoot(b)) return compilePlanExpr(b, scope.funcCtx);
+  if (b.k === 'call' && !b.fn.startsWith('sql.')) {
     // A math call: keep the closure compiler's result when it is constant (folded) or a register read.
-    const c = compileNode(e, scope);
+    const c = compilePlanExpr(b, scope.funcCtx);
     if (c.constant || c.reg !== undefined) return c;
   }
-  if (codegenEnabled() && isCodegenRoot(e) && hasRuntimeInputs(e) && !scope.groupRef?.(e)) {
-    const g = generate(
-      e,
-      CODEGEN_HELPERS,
-      (x) => compileNode(x, scope),
-      (x) => {
-        const b = scope.groupRef?.(x);
-        return b ? { reg: b.reg, type: b.type } : undefined;
-      },
-    );
-    return { fn: g.fn, type: g.type, collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
-  }
-  return compileNode(e, scope);
+  const g = generate(b, CODEGEN_HELPERS, (x) => compilePlanExpr(x, scope.funcCtx));
+  return { fn: g.fn, type: g.type, collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
 }
 
-/** True if the expression reads registers (columns, parameters, aggregates, subqueries). */
-function hasRuntimeInputs(e: Expr): boolean {
-  let found = false;
-  const visit = (x: Expr): void => {
-    if (found) return;
-    switch (x.kind) {
-      case 'column':
-      case 'param':
-      case 'call':
-      case 'subquery':
-      case 'exists':
-      case 'inSelect':
-        found = true;
-        return;
-      case 'binary':
-        visit(x.left);
-        visit(x.right);
-        return;
-      case 'unary':
-        visit(x.operand);
-        return;
-      default:
-        found = true; // anything else: let the generator decide via fallback
-    }
-  };
-  visit(e);
-  return found;
+/** How fused pipelines compile the planner's expressions (see `PipelineCompiler` in codegen.ts). */
+export function pipelineCompiler(scope: CompileScope): PipelineCompiler {
+  return { bind: (e) => bindExpr(e, scope), fallback: (e) => compilePlanExpr(e, scope.funcCtx) };
 }
 
 const CODEGEN_HELPERS: CodegenHelpers = {
@@ -175,37 +143,26 @@ export function compileNode(e: Expr, scope: CompileScope): Compiled {
   return compilePlanExpr(bindExpr(e, scope), scope.funcCtx);
 }
 
-/** What SQL knows about a bound expression besides its type: its collation, where that came from, its affinity. */
-interface SqlMeta {
-  collation: Collation;
-  collSrc: CollSrc;
-  affinity: Affinity;
-}
 
 const NO_META: SqlMeta = { collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE' };
 
-/**
- * SQL metadata of bound expressions, kept beside the plan rather than in it (ADR 0014: affinity and collation
- * sources are SQL's, not the plan's): a symbol-keyed property, which serializing a plan leaves out. Nodes without
- * it have none (BINARY, no source, no affinity).
- */
-const SQL_META: unique symbol = Symbol('sql');
-type WithMeta = { [SQL_META]?: SqlMeta };
-const getMeta = (e: PlanExpr): SqlMeta | undefined => (e as WithMeta)[SQL_META];
-const setMeta = (e: PlanExpr, m: SqlMeta): void => {
-  (e as WithMeta)[SQL_META] = m;
-};
 
 const COLLATION_NAMES: readonly CollationName[] = ['binary', 'nocase', 'rtrim'];
 const collationName = (c: Collation): CollationName => COLLATION_NAMES[c];
 const collationId = (n: CollationName | undefined): Collation => (n === 'nocase' ? Collation.NoCase : n === 'rtrim' ? Collation.RTrim : Collation.Binary);
 
 function withMeta<T extends PlanExpr>(e: T, m: SqlMeta): T {
-  if (m.collation !== Collation.Binary || m.collSrc !== CollSrc.None || m.affinity !== 'NONE') setMeta(e, m);
+  if (m.collation !== Collation.Binary || m.collSrc !== CollSrc.None || m.affinity !== 'NONE' || m.opaque) setMeta(e, m);
   return e;
 }
 
 const metaOf = (e: PlanExpr): SqlMeta => getMeta(e) ?? NO_META;
+
+/** Mark `e` as an SQL form that code generation leaves to the closure compiler (see SqlMeta.opaque). */
+function opaque<T extends PlanExpr>(e: T): T {
+  setMeta(e, { ...metaOf(e), opaque: true });
+  return e;
+}
 
 /** The parts of a bound expression the SQL rules for comparisons read. */
 const operand = (e: PlanExpr): SqlOperand => ({ type: typeOf(e), ...metaOf(e) });
@@ -248,7 +205,7 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
       const inner = bindExpr(e.expr, scope);
       const c = collationByName(e.collation);
       if (c === undefined) throw new SmaltError('SMALT_ERROR', `no such collation sequence: ${e.collation}`);
-      return withMeta({ ...inner }, { ...metaOf(inner), collation: c, collSrc: CollSrc.Explicit });
+      return withMeta({ ...inner }, { ...metaOf(inner), collation: c, collSrc: CollSrc.Explicit, opaque: true });
     }
     case 'unary': {
       const x = bindExpr(e.operand, scope);
@@ -261,7 +218,7 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
           return call('sql.bitnot', [x], 'int');
         case '+':
           // Unary plus is a no-op that strips affinity and collation (SQLite): the same value, without the metadata.
-          return stripped({ ...x });
+          return opaque(stripped({ ...x }));
         default:
           throw new SmaltError('SMALT_ERROR', `unknown unary operator ${(e as { op: string }).op}`);
       }
@@ -272,8 +229,8 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
       const x = bindExpr(e.expr, scope);
       const lo = bindExpr(e.low, scope);
       const hi = bindExpr(e.high, scope);
-      const both: PlanExpr = { k: 'and', args: [bindComparison('>=', x, lo), bindComparison('<=', x, hi)] };
-      return e.not ? { k: 'not', arg: both } : both;
+      const both: PlanExpr = opaque({ k: 'and', args: [bindComparison('>=', x, lo), bindComparison('<=', x, hi)] });
+      return e.not ? opaque({ k: 'not', arg: both }) : both;
     }
     case 'isNull':
       return { k: 'isNull', arg: bindExpr(e.expr, scope), not: e.not };
@@ -281,7 +238,7 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
       const x = bindExpr(e.expr, scope);
       const list = e.list.map((v) => bindExpr(v, scope));
       const inList = call('sql.in_list', [x, ...list], 'int');
-      return e.not ? { k: 'not', arg: inList } : inList;
+      return e.not ? opaque({ k: 'not', arg: inList }) : inList;
     }
     case 'inSelect': {
       const probe = compilePlanExpr(bindExpr(e.expr, scope), scope.funcCtx);
@@ -307,7 +264,7 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
       const esc = e.escape ? bindExpr(e.escape, scope) : undefined;
       if (e.op !== 'LIKE' && e.op !== 'GLOB') throw new SmaltError('SMALT_ERROR', `no such function: ${e.op.toLowerCase()}`);
       const like = call(e.op === 'GLOB' ? 'sql.glob' : 'sql.like', esc ? [x, pat, esc] : [x, pat], 'int');
-      return e.not ? { k: 'not', arg: like } : like;
+      return e.not ? opaque({ k: 'not', arg: like }) : like;
     }
     case 'case': {
       const base = e.base ? bindExpr(e.base, scope) : undefined;

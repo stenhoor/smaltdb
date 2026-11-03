@@ -202,3 +202,65 @@ try {
   }
 } finally { if (f !== null) H.release(f); }
 };
+
+> SELECT count(*) FROM t WHERE i NOT BETWEEN 2 AND 9 AND s NOT LIKE ? AND i NOT IN (3, 4)
+pipeline(H, K, T):
+return function smaltFusedAggregate(r, S) {
+const S0 = S[0];
+let f = H.first();
+try {
+  while (f !== null) {
+    const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
+    for (let i = 0; i < n; i++) {
+      const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);
+      
+      if ((b[off] < 128 && (b[off + 1] & 1) === 0 && (b[off + 1] < 128 || b[off + 2] < 128)) && (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 1] | (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 2] << 8)) === 8) { const ko = off + (b[off + 1] < 128 ? 2 : 3); const vo = ko + b[off]; const bm = vo + 3; const fx = bm + 1; const vt = fx + 24; const wide = (b[vo] & 1) === 1; const vd = vt + 5 * (wide ? 4 : 2); if ((b[bm + 0] & 2) !== 0) { r[2] = null; } else { { const o = fx + 8; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24); r[2] = (hi === 0 && lo >= 0) || (hi === -1 && lo < 0) ? lo : (hi >= -2097152 && hi <= 2097151) ? hi * 4294967296 + (lo >>> 0) : H.readInt64(dv, o); } } if ((b[bm + 0] & 8) !== 0) { r[4] = null; } else { r[4] = H.utf8(b, vd, vd + (wide ? dv.getUint32(vt + 0, true) : (b[vt + 0] | (b[vt + 1] << 8)))); } } else { H.slow(f, off, r);  }
+      const v0 = K[0](r);
+      if (!(v0 !== null && v0 != 0)) continue;
+      const v1 = K[1](r);
+      if (!(v1 !== null && v1 != 0)) continue;
+      const v2 = K[2](r);
+      if (!(v2 !== null && v2 != 0)) continue;
+      { S0.n++; }
+    }
+    f = H.next(f);
+  }
+} finally { if (f !== null) H.release(f); }
+};
+
+> SELECT count(*) FROM t WHERE c = 'abc' AND s COLLATE NOCASE = 'V1' AND +i > 2
+expression:
+const v0 = K[1](r);
+return v0;
+--
+expression:
+const v0 = K[1](r);
+return v0;
+--
+expression:
+const v0n = (r[1] === null); const v0 = v0n ? 0 : (r[1] > (2) ? 1 : 0);
+return (v0n ? null : v0);
+--
+pipeline(H, K, T):
+return function smaltFusedAggregate(r, S) {
+const S0 = S[0];
+let f = H.first();
+try {
+  while (f !== null) {
+    const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
+    for (let i = 0; i < n; i++) {
+      const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);
+      let c6 = null, c3 = null, c1 = 0, c1n = true;
+      if ((b[off] < 128 && (b[off + 1] & 1) === 0 && (b[off + 1] < 128 || b[off + 2] < 128)) && (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 1] | (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 2] << 8)) === 8) { const ko = off + (b[off + 1] < 128 ? 2 : 3); const vo = ko + b[off]; const bm = vo + 3; const fx = bm + 1; const vt = fx + 24; const wide = (b[vo] & 1) === 1; const vd = vt + 5 * (wide ? 4 : 2); if ((b[bm + 0] & 64) !== 0) { c6 = null; r[6] = null; } else { c6 = H.utf8(b, vd + (wide ? dv.getUint32(vt + 8, true) : (b[vt + 4] | (b[vt + 5] << 8))), vd + (wide ? dv.getUint32(vt + 12, true) : (b[vt + 6] | (b[vt + 7] << 8)))); r[6] = c6; } if ((b[bm + 0] & 8) !== 0) { c3 = null; r[3] = null; } else { c3 = H.utf8(b, vd, vd + (wide ? dv.getUint32(vt + 0, true) : (b[vt + 0] | (b[vt + 1] << 8)))); r[3] = c3; } if ((b[bm + 0] & 2) !== 0) { c1n = true; c1 = 0; r[1] = null; } else { { const o = fx + 8; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24); c1n = false; c1 = (hi === 0 && lo >= 0) || (hi === -1 && lo < 0) ? lo : (hi >= -2097152 && hi <= 2097151) ? hi * 4294967296 + (lo >>> 0) : H.readInt64(dv, o); r[1] = c1; } } } else { H.slow(f, off, r); c6 = r[6]; c3 = r[3]; { const t = r[1]; c1n = t === null; c1 = c1n ? 0 : t; } }
+      const v0 = K[1](r);
+      if (!(v0 !== null && v0 != 0)) continue;
+      const v1 = K[3](r);
+      if (!(v1 !== null && v1 != 0)) continue;
+      const v2n = c1n; const v2 = v2n ? 0 : (c1 > (2) ? 1 : 0);
+      if (!(!v2n && v2 != 0)) continue;
+      { S0.n++; }
+    }
+    f = H.next(f);
+  }
+} finally { if (f !== null) H.release(f); }
+};

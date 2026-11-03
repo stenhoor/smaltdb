@@ -44,6 +44,8 @@ const CORPUS: Record<string, string[]> = {
     'SELECT CAST(r AS INTEGER), CAST(i AS TEXT), CAST(s AS REAL) FROM t',
     'SELECT sqrt(r), pow(i, 2) + ln(r + 1), abs(i), coalesce(u, i) FROM t',
     'SELECT i + ? * 2, ? - r FROM t',
+    'SELECT s NOT LIKE ?, i NOT IN (1, 2), i NOT BETWEEN 1 AND 3, NOT (s LIKE ?), NOT (i IN (1, 2)) FROM t',
+    'SELECT +i + 1, (i + 1) COLLATE NOCASE, -(+r), (i COLLATE NOCASE) + 1, s COLLATE NOCASE = ? FROM t',
   ],
   'fused-row': [
     'SELECT id FROM t WHERE i = 3 AND r > 10',
@@ -53,6 +55,8 @@ const CORPUS: Record<string, string[]> = {
     'SELECT s, total(i * r) FROM t WHERE c = ? GROUP BY s',
     'SELECT sum(sqrt(r)) FROM t WHERE i BETWEEN 2 AND 9',
     'SELECT var_samp(r), covar_pop(i, r) FROM t',
+    'SELECT count(*) FROM t WHERE i NOT BETWEEN 2 AND 9 AND s NOT LIKE ? AND i NOT IN (3, 4)',
+    "SELECT count(*) FROM t WHERE c = 'abc' AND s COLLATE NOCASE = 'V1' AND +i > 2",
   ],
   'fused-columnar': [
     'SELECT count(*) FROM k WHERE v > 10',

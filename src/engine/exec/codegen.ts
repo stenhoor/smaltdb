@@ -1,5 +1,7 @@
 import type { Expr } from '../sql/ast.js';
+import type { PlanExpr } from '../plan/expr.js';
 import type { SqlValue } from '../values.js';
+import { isOpaque } from './sql-meta.js';
 import { type StaticType, truthy } from './convert.js';
 import { type InlineMath, type MathFunction, inlineMath, roundingType } from './math.js';
 
@@ -61,9 +63,17 @@ function orNull(a: string, b: string): string {
   return `(${a} || ${b})`;
 }
 
-const ARITH = new Set(['+', '-', '*', '/', '%']);
+/** The arithmetic and comparison functions generated inline, with their JavaScript operators. */
+const ARITH: Readonly<Record<string, string>> = { 'sql.add': '+', 'sql.sub': '-', 'sql.mul': '*', 'sql.div': '/', 'sql.mod': '%' };
+const CMP: Readonly<Record<string, string>> = { 'sql.eq': '=', 'sql.ne': '!=', 'sql.lt': '<', 'sql.le': '<=', 'sql.gt': '>', 'sql.ge': '>=' };
 const utf8Encoder = new TextEncoder();
-const CMP = new Set(['=', '!=', '<', '<=', '>', '>=']);
+
+/**
+ * The operand of a comparison without its affinity conversion. Generated comparisons run only on statically numeric
+ * operands (where the conversions change nothing) or on text under BINARY with neither operand converting to a
+ * number (checked by `binaryTextOperands`), so they compare the operands themselves.
+ */
+const unconverted = (x: PlanExpr): PlanExpr => (x.k === 'call' && (x.fn === 'sql.affinity_numeric' || x.fn === 'sql.affinity_text') ? x.args[0] : x);
 const isNum = (t: StaticType): boolean => t === 'int' || t === 'real' || t === 'num';
 
 let enabled: boolean | undefined;
@@ -85,17 +95,24 @@ export function codegenEnabled(): boolean {
 }
 
 /** Worth generating code for: arithmetic, numeric comparison, boolean logic or a math function at the root. */
-export function isCodegenRoot(e: Expr): boolean {
-  if (e.kind === 'binary') return ARITH.has(e.op) || CMP.has(e.op) || e.op === 'AND' || e.op === 'OR';
-  if (e.kind === 'unary') return e.op === 'NOT' || e.op === '-';
-  if (e.kind === 'call') return mathCall(e) !== undefined;
-  return false;
+export function isCodegenRoot(e: PlanExpr): boolean {
+  if (isOpaque(e)) return false;
+  switch (e.k) {
+    case 'call':
+      return e.fn in ARITH || e.fn in CMP || e.fn === 'sql.neg' || mathCall(e) !== undefined;
+    case 'and':
+    case 'or':
+    case 'not':
+      return true;
+    default:
+      return false;
+  }
 }
 
-/** A plain call of a math function that generated code can emit inline. */
-function mathCall(e: Expr): InlineMath | undefined {
-  if (e.kind !== 'call' || e.over !== undefined || e.distinct || e.star || e.filter) return undefined;
-  return inlineMath(e.name, e.args.length);
+/** A call of a math function that generated code can emit inline. */
+function mathCall(e: PlanExpr): InlineMath | undefined {
+  if (e.k !== 'call' || e.fn.startsWith('sql.')) return undefined;
+  return inlineMath(e.fn, e.args.length);
 }
 
 type Factory = (H: CodegenHelpers, K: unknown[], T: typeof truthy) => (r: SqlValue[]) => SqlValue;
@@ -106,10 +123,7 @@ class Emitter {
   private n = 0;
   readonly consts: unknown[] = [];
 
-  constructor(
-    private readonly fallback: (e: Expr) => FallbackNode,
-    private readonly groupReg: (e: Expr) => { reg: number; type: StaticType } | undefined,
-  ) {}
+  constructor(private readonly fallback: (e: PlanExpr) => FallbackNode) {}
 
   private tmp(): string {
     return 'v' + this.n++;
@@ -129,7 +143,7 @@ class Emitter {
     return { ...this.regRef(reg, type), type };
   }
 
-  private viaFallback(e: Expr): Gen {
+  private viaFallback(e: PlanExpr): Gen {
     const c = this.fallback(e);
     if (c.reg !== undefined) return this.reg(c.reg, c.type);
     if (c.constant) return this.literal(c.fn([]), c.type);
@@ -146,60 +160,65 @@ class Emitter {
   }
 
   /** Emit `e` (unsupported node kinds go through the closure compiler). */
-  gen(e: Expr): Gen {
-    const g = this.groupReg(e);
-    if (g) return this.reg(g.reg, g.type);
-    switch (e.kind) {
-      case 'literal':
-        return this.literal(e.value, typeof e.value === 'number' ? (e.isReal || !Number.isSafeInteger(e.value) ? 'real' : 'int') : typeof e.value === 'bigint' ? 'int' : e.value === null ? 'null' : typeof e.value === 'string' ? 'text' : 'blob');
-      case 'binary':
-        if (ARITH.has(e.op)) return this.arith(e.op, this.gen(e.left), this.gen(e.right));
-        if (e.op === 'AND' || e.op === 'OR') return this.logic(e.op, e.left, e.right);
-        if (CMP.has(e.op)) {
+  gen(e: PlanExpr): Gen {
+    if (isOpaque(e)) return this.viaFallback(e);
+    switch (e.k) {
+      case 'slot':
+        return this.reg(e.reg, e.type);
+      case 'param':
+        return this.reg(e.index, 'any');
+      case 'lit':
+        return this.literal(e.value, e.type);
+      case 'and':
+      case 'or':
+        return this.logic(e.k === 'and' ? 'AND' : 'OR', e.args[0], e.args[1]);
+      case 'not': {
+        const a = this.gen(e.arg);
+        const v = this.tmp();
+        if (isNum(a.type) || a.type === 'null') {
+          const nul = nullOf(a);
+          this.lines.push(`const ${v}n = ${nul}; const ${v} = ${v}n ? 0 : (${a.v} != 0 ? 0 : 1);`);
+          return { v, nul: `${v}n`, type: 'int' };
+        }
+        this.lines.push(`const ${v} = T(${plain(a)}); const n${v} = ${v} === null ? null : ${v} ? 0 : 1;`);
+        return { v: 'n' + v, type: 'int' };
+      }
+      case 'call': {
+        const arith = ARITH[e.fn];
+        if (arith !== undefined) return this.arith(arith, this.gen(e.args[0]), this.gen(e.args[1]));
+        const cmp = CMP[e.fn];
+        if (cmp !== undefined) {
           // Numeric comparisons only; anything involving text/affinity/collation uses the closure compiler.
+          const left = unconverted(e.args[0]);
+          const right = unconverted(e.args[1]);
           const saved = this.lines;
           this.lines = [];
-          const a = this.gen(e.left);
-          const b = this.gen(e.right);
+          const a = this.gen(left);
+          const b = this.gen(right);
           const inner = this.lines;
           this.lines = saved;
           if (isNum(a.type) && isNum(b.type)) {
             this.lines.push(...inner);
-            return this.compare(e.op, a, b);
+            return this.compare(cmp, a, b);
           }
-          if ((e.op === '=' || e.op === '!=') && a.type === 'text' && b.type === 'text' && this.binaryTextOperands(e.left, e.right)) {
+          if ((cmp === '=' || cmp === '!=') && a.type === 'text' && b.type === 'text' && this.binaryTextOperands(left, right)) {
             // Text = text under BINARY: UTF-16 equality is UTF-8 byte equality, so compare JS strings.
             this.lines.push(...inner);
             const v = this.tmp();
             const nul = orNull(nullOf(a), nullOf(b));
-            this.lines.push(`const ${v}n = ${nul}; const ${v} = ${v}n ? 0 : (${a.v} ${e.op === '=' ? '===' : '!=='} ${b.v} ? 1 : 0);`);
+            this.lines.push(`const ${v}n = ${nul}; const ${v} = ${v}n ? 0 : (${a.v} ${cmp === '=' ? '===' : '!=='} ${b.v} ? 1 : 0);`);
             return { v, nul: `${v}n`, type: 'int' };
           }
           return this.viaFallback(e);
         }
-        return this.viaFallback(e);
-      case 'unary':
-        if (e.op === 'NOT') {
-          const a = this.gen(e.operand);
-          const v = this.tmp();
-          if (isNum(a.type) || a.type === 'null') {
-            const nul = nullOf(a);
-            this.lines.push(`const ${v}n = ${nul}; const ${v} = ${v}n ? 0 : (${a.v} != 0 ? 0 : 1);`);
-            return { v, nul: `${v}n`, type: 'int' };
-          }
-          this.lines.push(`const ${v} = T(${plain(a)}); const n${v} = ${v} === null ? null : ${v} ? 0 : 1;`);
-          return { v: 'n' + v, type: 'int' };
-        }
-        if (e.op === '-') {
-          const a = this.gen(e.operand);
+        if (e.fn === 'sql.neg') {
+          const a = this.gen(e.args[0]);
           const v = this.tmp();
           this.lines.push(
             `let ${v}n = ${nullOf(a)}; let ${v} = 0; if (!${v}n) { const x = ${a.v}; if (typeof x === 'number') ${v} = x === 0 ? 0 : -x; else { const s = H.negate(x); if (s === null) ${v}n = true; else ${v} = s; } }`,
           );
           return { v, nul: `${v}n`, type: isNum(a.type) ? a.type : 'num' };
         }
-        return this.viaFallback(e);
-      case 'call': {
         const m = mathCall(e);
         if (m === undefined) return this.viaFallback(e);
         // A constant call (sqrt(4)) is folded by the closure compiler.
@@ -268,7 +287,7 @@ class Emitter {
     return `T(${plain(a)})`;
   }
 
-  private logic(op: 'AND' | 'OR', le: Expr, re: Expr): Gen {
+  private logic(op: 'AND' | 'OR', le: PlanExpr, re: PlanExpr): Gen {
     const a = this.gen(le);
     const ta = this.tmp();
     const v = this.tmp();
@@ -290,7 +309,7 @@ class Emitter {
   }
 
   /** The closure compiler's view of `e` (type, register, collation, affinity). */
-  fallbackOf(e: Expr): FallbackNode {
+  fallbackOf(e: PlanExpr): FallbackNode {
     return this.fallback(e);
   }
 
@@ -300,7 +319,7 @@ class Emitter {
   }
 
   /** Both comparison operands use BINARY collation and neither applies numeric affinity. */
-  binaryTextOperands(l: Expr, r: Expr): boolean {
+  binaryTextOperands(l: PlanExpr, r: PlanExpr): boolean {
     const ok = (c: FallbackNode): boolean => (c.collation ?? 0) === 0 && (c.affinity === undefined || c.affinity === 'TEXT' || c.affinity === 'NONE' || c.affinity === 'BLOB');
     const cl = this.fallback(l);
     const cr = this.fallback(r);
@@ -369,16 +388,15 @@ export function traceGeneratedCode(on: boolean): string[] {
 }
 
 /**
- * Generate a function for `e`. `fallback` compiles a node with the closure compiler; `groupReg`
- * maps GROUP BY expressions to registers in post-aggregation scopes.
+ * Generate a function for the bound expression `e`. `fallback` compiles a node with the closure compiler. GROUP BY
+ * expressions in post-aggregation scopes are already register slots (the binder resolved them).
  */
 export function generate(
-  e: Expr,
+  e: PlanExpr,
   helpers: CodegenHelpers,
-  fallback: (e: Expr) => FallbackNode,
-  groupReg: (e: Expr) => { reg: number; type: StaticType } | undefined,
+  fallback: (e: PlanExpr) => FallbackNode,
 ): { fn: (r: SqlValue[]) => SqlValue; type: StaticType; source: string } {
-  const em = new Emitter(fallback, groupReg);
+  const em = new Emitter(fallback);
   const g = em.gen(e);
   const body = `${em.lines.join('\n')}\nreturn ${em.value(g)};`;
   traced?.push(`expression:\n${body}`);
@@ -549,13 +567,23 @@ export interface FusedHelpers extends LoaderHelpers, CodegenHelpers {
  * block. Expressions must be emitted before `finish()`, because column references are resolved
  * (and added to the scan's decode list) while emitting.
  */
+/**
+ * How a fused pipeline compiles the planner's expressions: `bind` turns an expression of the parser into a plan
+ * expression (resolving its columns, which adds them to the scan's decode list), `fallback` compiles a bound node
+ * with the closure compiler.
+ */
+export interface PipelineCompiler {
+  bind(e: Expr): PlanExpr;
+  fallback(e: PlanExpr): FallbackNode;
+}
+
 class Pipeline {
   readonly em: Emitter;
   private readonly localRegs = new Map<number, boolean>(); // reg -> flagged
   readonly rowLines: string[] = [];
 
-  constructor(fallback: (e: Expr) => FallbackNode) {
-    this.em = new Emitter(fallback, () => undefined);
+  constructor(readonly compiler: PipelineCompiler) {
+    this.em = new Emitter(compiler.fallback);
     this.em.regRef = (reg, type) => {
       const flagged = type === 'int' || type === 'real';
       if (!this.localRegs.has(reg)) this.localRegs.set(reg, flagged);
@@ -574,7 +602,8 @@ class Pipeline {
 
   /** WHERE: every conjunct must be true (NULL counts as false). */
   addPredicates(preds: Expr[]): void {
-    for (const p of preds) {
+    for (const ast of preds) {
+      const p = this.compiler.bind(ast);
       const eq = this.textEqualityConjunct(p);
       if (eq) this.textEq.push(eq);
       const g = this.em.gen(p);
@@ -582,13 +611,15 @@ class Pipeline {
     }
   }
 
-  private textEqualityConjunct(p: Expr): { reg: number; bytes: Uint8Array } | null {
-    if (p.kind !== 'binary' || p.op !== '=') return null;
+  private textEqualityConjunct(p: PlanExpr): { reg: number; bytes: Uint8Array } | null {
+    if (p.k !== 'call' || p.fn !== 'sql.eq' || isOpaque(p)) return null;
+    const left = unconverted(p.args[0]);
+    const right = unconverted(p.args[1]);
     for (const [col, lit] of [
-      [p.left, p.right],
-      [p.right, p.left],
+      [left, right],
+      [right, left],
     ] as const) {
-      if (lit.kind !== 'literal' || typeof lit.value !== 'string') continue;
+      if (lit.k !== 'lit' || typeof lit.value !== 'string') continue;
       const c = this.em.fallbackOf(col);
       if (c.reg === undefined || c.type !== 'text' || !this.em.binaryTextOperands(col, lit)) continue;
       return { reg: c.reg, bytes: utf8Encoder.encode(lit.value) };
@@ -727,9 +758,9 @@ class Pipeline {
       const body: string[] = [];
       if (a.kind === 'countStar') body.push(`${state(i)}.n++;`);
       else {
-        const g = em.gen(a.arg!);
+        const g = em.gen(this.compiler.bind(a.arg!));
         if (a.kind === 'step2') {
-          const g2 = em.gen(a.arg2!);
+          const g2 = em.gen(this.compiler.bind(a.arg2!));
           body.push(...this.take());
           body.push(`${state(i)}.step2(${em.value(g)}, ${em.value(g2)});`);
         } else {
@@ -738,7 +769,7 @@ class Pipeline {
         }
       }
       if (a.filter) {
-        const f = em.gen(a.filter);
+        const f = em.gen(this.compiler.bind(a.filter));
         this.rowLines.push(`{ ${this.take().join(' ')} if (${em.isTrue(f)}) { ${body.join(' ')} } }`);
       } else this.rowLines.push(`{ ${body.join(' ')} }`);
     });
@@ -774,9 +805,9 @@ export function generateFusedAggregate(
   aggs: FusedAggSpec[],
   source: PipelineSource,
   helpers: FusedHelpers | ColumnarHelpers,
-  fallback: (e: Expr) => FallbackNode,
+  compiler: PipelineCompiler,
 ): (r: SqlValue[], states: unknown[]) => void {
-  const pl = new Pipeline(fallback);
+  const pl = new Pipeline(compiler);
   pl.addPredicates(preds);
   pl.addAggregates(aggs, (i) => `S${i}`);
   const src = [...aggs.map((_, i) => `const S${i} = S[${i}];`), ...scanLoop(pl, source)].join('\n');
@@ -861,9 +892,9 @@ export function generateScanFilter(
   cap: number,
   loaderSpec: () => LoaderSpec,
   helpers: FusedHelpers,
-  fallback: (e: Expr) => FallbackNode,
+  compiler: PipelineCompiler,
 ): (st: ScanState, r: SqlValue[], out: SqlValue[]) => number {
-  const pl = new Pipeline(fallback);
+  const pl = new Pipeline(compiler);
   pl.addPredicates(preds);
   const w = outRegs.length;
   const writes = outRegs.map((o, j) => `out[k * ${w} + ${j}] = ${pl.regValue(o.reg, o.type)};`);
@@ -904,15 +935,15 @@ export function generateGroupAggregate(
   aggs: FusedAggSpec[],
   source: PipelineSource,
   helpers: (FusedHelpers | ColumnarHelpers) & GroupHelpers & { newGroup: (keys: SqlValue[]) => { keys: SqlValue[]; st: unknown[] } },
-  fallback: (e: Expr) => FallbackNode,
+  compiler: PipelineCompiler,
 ): (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => void {
-  const pl = new Pipeline(fallback);
+  const pl = new Pipeline(compiler);
   pl.addPredicates(preds);
   const em = pl.em;
   const keyLines: string[] = [];
   const keyVals: string[] = [];
   let keyExpr: string;
-  const gens = groupExprs.map((g) => em.gen(g.expr));
+  const gens = groupExprs.map((g) => em.gen(pl.compiler.bind(g.expr)));
   keyLines.push(...pl.take());
   gens.forEach((g, j) => keyLines.push(`const kv${j} = ${em.value(g)};`) && keyVals.push(`kv${j}`));
   if (gens.length === 1) {

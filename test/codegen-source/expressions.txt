@@ -350,3 +350,67 @@ while (f !== null) {
 }
 return k;
 };
+
+> SELECT s NOT LIKE ?, i NOT IN (1, 2), i NOT BETWEEN 1 AND 3, NOT (s LIKE ?), NOT (i IN (1, 2)) FROM t
+expression:
+const v0 = K[0](r);
+const v1n = (v0 === null); const v1 = v1n ? 0 : (v0 != 0 ? 0 : 1);
+return (v1n ? null : v1);
+--
+expression:
+const v0 = K[0](r);
+const v1n = (v0 === null); const v1 = v1n ? 0 : (v0 != 0 ? 0 : 1);
+return (v1n ? null : v1);
+--
+pipeline(H, K, T):
+return function smaltScanFilter(st, r, out) {
+let f = st.f; let i = st.i; let k = 0;
+while (f !== null) {
+  const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
+  for (; i < n; i++) {
+    const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);
+    let c5 = null, c3 = 0, c3n = true;
+    if ((b[off] < 128 && (b[off + 1] & 1) === 0 && (b[off + 1] < 128 || b[off + 2] < 128)) && (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 1] | (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 2] << 8)) === 8) { const ko = off + (b[off + 1] < 128 ? 2 : 3); const vo = ko + b[off]; const bm = vo + 3; const fx = bm + 1; const vt = fx + 24; const wide = (b[vo] & 1) === 1; const vd = vt + 5 * (wide ? 4 : 2); if ((b[bm + 0] & 8) !== 0) { c5 = null; } else { c5 = H.utf8(b, vd, vd + (wide ? dv.getUint32(vt + 0, true) : (b[vt + 0] | (b[vt + 1] << 8)))); } if ((b[bm + 0] & 2) !== 0) { c3n = true; c3 = 0; } else { { const o = fx + 8; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24); c3n = false; c3 = (hi === 0 && lo >= 0) || (hi === -1 && lo < 0) ? lo : (hi >= -2097152 && hi <= 2097151) ? hi * 4294967296 + (lo >>> 0) : H.readInt64(dv, o); } } } else { H.slow(f, off, r); c5 = r[5]; { const t = r[3]; c3n = t === null; c3 = c3n ? 0 : t; } }
+    out[k * 2 + 0] = c5; out[k * 2 + 1] = (c3n ? null : c3);
+    k++;
+    if (k === 256) { st.i = i + 1; return k; }
+  }
+  f = H.next(f); st.f = f; i = 0; st.i = 0;
+}
+return k;
+};
+
+> SELECT +i + 1, (i + 1) COLLATE NOCASE, -(+r), (i COLLATE NOCASE) + 1, s COLLATE NOCASE = ? FROM t
+expression:
+let v0n = (r[2] === null); let v0 = 0; if (!v0n) { const x = r[2]; const y = (1); if (typeof x === 'number' && typeof y === 'number') { { const z = x + y; if (Number.isSafeInteger(z)) v0 = z + 0; else { const s = H.arith["+"](x, y); if (s === null) v0n = true; else v0 = s; } } } else { const s = H.arith["+"](x, y); if (s === null) v0n = true; else v0 = s; } }
+return (v0n ? null : v0);
+--
+expression:
+let v0n = (r[3] === null); let v0 = 0; if (!v0n) { const x = r[3]; if (typeof x === 'number') v0 = x === 0 ? 0 : -x; else { const s = H.negate(x); if (s === null) v0n = true; else v0 = s; } }
+return (v0n ? null : v0);
+--
+expression:
+let v0n = (r[2] === null); let v0 = 0; if (!v0n) { const x = r[2]; const y = (1); if (typeof x === 'number' && typeof y === 'number') { { const z = x + y; if (Number.isSafeInteger(z)) v0 = z + 0; else { const s = H.arith["+"](x, y); if (s === null) v0n = true; else v0 = s; } } } else { const s = H.arith["+"](x, y); if (s === null) v0n = true; else v0 = s; } }
+return (v0n ? null : v0);
+--
+expression:
+const v0 = K[0](r);
+return v0;
+--
+pipeline(H, K, T):
+return function smaltScanFilter(st, r, out) {
+let f = st.f; let i = st.i; let k = 0;
+while (f !== null) {
+  const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
+  for (; i < n; i++) {
+    const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);
+    let c2 = 0, c2n = true, c3 = 0, c3n = true, c4 = null;
+    if ((b[off] < 128 && (b[off + 1] & 1) === 0 && (b[off + 1] < 128 || b[off + 2] < 128)) && (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 1] | (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 2] << 8)) === 8) { const ko = off + (b[off + 1] < 128 ? 2 : 3); const vo = ko + b[off]; const bm = vo + 3; const fx = bm + 1; const vt = fx + 24; const wide = (b[vo] & 1) === 1; const vd = vt + 5 * (wide ? 4 : 2); if ((b[bm + 0] & 2) !== 0) { c2n = true; c2 = 0; } else { { const o = fx + 8; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24); c2n = false; c2 = (hi === 0 && lo >= 0) || (hi === -1 && lo < 0) ? lo : (hi >= -2097152 && hi <= 2097151) ? hi * 4294967296 + (lo >>> 0) : H.readInt64(dv, o); } } if ((b[bm + 0] & 4) !== 0) { c3n = true; c3 = 0; } else { c3n = false; c3 = dv.getFloat64(fx + 16, true); } if ((b[bm + 0] & 8) !== 0) { c4 = null; } else { c4 = H.utf8(b, vd, vd + (wide ? dv.getUint32(vt + 0, true) : (b[vt + 0] | (b[vt + 1] << 8)))); } } else { H.slow(f, off, r); { const t = r[2]; c2n = t === null; c2 = c2n ? 0 : t; } { const t = r[3]; c3n = t === null; c3 = c3n ? 0 : t; } c4 = r[4]; }
+    out[k * 3 + 0] = (c2n ? null : c2); out[k * 3 + 1] = (c3n ? null : c3); out[k * 3 + 2] = c4;
+    k++;
+    if (k === 256) { st.i = i + 1; return k; }
+  }
+  f = H.next(f); st.f = f; i = 0; st.i = 0;
+}
+return k;
+};
