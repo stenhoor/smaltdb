@@ -21,7 +21,8 @@ import type { SmaltPlugin, PluginHost, FormatReader, SourceHandler } from 'smalt
 - **Keep state in `setup`.** `setup(host)` runs once per engine instance (each `Database`), so state kept in its
   closure belongs to that database. Do not keep it in module variables.
 - **Throw plain errors.** A plugin cannot create a `SmaltError`. Throw an `Error`; give it a `code` property that
-  starts with `SMALT_` to choose the error code. See [Errors](#errors).
+  starts with `SMALT_` to choose the error code. See [Errors](#errors). So in-process, an error from a plugin method
+  is not `instanceof SmaltError`: check `e.code`.
 
 ## A complete example
 
@@ -183,7 +184,7 @@ What `setup` receives. Every member is safe to keep and use after `setup` return
 | `addSource(source: SourceHandler): void` | Where external data is read from. See [Sources](#sources). |
 | `addConnectionType(type: string, spec: ConnectionTypeSpec): void` | A `CREATE CONNECTION … WITH (type = '…')` type. See [Connection types](#connection-types). |
 | `addMethod(name: string, method: PluginMethod): void` | A method the application calls with `callPlugin(pluginName, name, args)`. See [Methods](#methods). |
-| `onSessionClosed(listener: (session: string) => void): void` | Called when a client session (a tab) goes away. Drop what that session registered. |
+| `onSessionClosed(listener: (session: string) => void): void` | Called when a client session (a tab) that sent a request goes away, after the engine has rolled back its transaction. Drop what that session registered. A listener that throws is logged and does not stop the others. |
 | `ask(session: string, message: unknown, timeoutMs?: number): Promise<unknown>` | Ask a client session a question. See [Asking the client](#asking-the-client). |
 | `glob: { isGlob(pattern), regExp(pattern), prefix(pattern) }` | Glob helpers for sources that list files. See [Patterns](#patterns). |
 | `formatReal(value: number): string` | A REAL as SQLite prints it as text: `2.0`, `1.0e+20`, 17 significant digits. `@smaltdb/io` uses it to export REAL columns. |
@@ -321,7 +322,7 @@ is:
 |---|---|---|
 | `options` | `string[]` | The options the type accepts, besides `type` and `credentials`. Others fail with `unknown option`. |
 | `aliases` | `string[]` | Other names for the type. `@smaltdb/external` makes `https` an alias of `http`. |
-| `validate(options)` | optional function | Check the options; throw to reject them. The error becomes `SMALT_ERROR`: `connection c: <message>`. |
+| `validate(options)` | optional function | Check the options; throw to reject them. An error with a `code` that starts with `SMALT_` is passed through with its code and message. Any other error becomes `SMALT_ERROR`: `connection c: <message>`. |
 
 A connection without `type` has type `http`. The engine checks the options when the connection is created. Statements
 that read through the connection go to the source whose `connectionTypes` include its type.
@@ -338,11 +339,19 @@ of `callPlugin`.
 |---|---|
 | `db: Database` | The engine `Database` the call runs on, with its synchronous API: `exec`, `query`, `prepare`, `inTransaction`, `getTable`. |
 | `session: string` | The calling client session (a tab), or `'local'` in-process. |
-| `signal?: AbortSignal` | Aborted when the call is cancelled. |
+| `signal?: AbortSignal` | Aborted when the call is cancelled, and in the engine worker also when the calling tab closes (its transaction is then rolled back). Check it after each `await`: work that goes on after it is aborted runs outside the transaction it was meant for. |
 | `query(sql, params?): Promise<{ columns: string[]; rows: SqlValue[][]; columnTypes: StaticType[] }>` | Run one statement that may read external data (its sources are fetched first). Returns its rows, column names, and the static type of each column: `'int'`, `'real'`, `'num'`, `'text'`, `'blob'`, `'null'` or `'any'`. |
 
 Through the worker client, `args` and the result cross to the engine worker with `postMessage`, so they must be values
 the browser can clone: no functions. In-process, they are passed as they are.
+
+In the engine worker, **a method may run again from the start**. While another tab reads a query result in batches,
+it holds the database for reading, and a write fails with `SMALT_BUSY` (`query cursor is open`). When a method's
+write fails that way and the method passes the error on, the engine waits until the reads end and then runs the whole
+method again, with the same arguments. The first run has made no change to the database by then: its first write is
+the one that failed. But what it did before that write runs twice: questions with `ask`, requests to other services,
+state kept in the plugin. Keep such side effects idempotent, or make them after the database work. A write that fails
+with `SMALT_BUSY` because the calling tab's own result is open is not run again: the call fails with it.
 
 ### Calling plugin methods
 
@@ -355,7 +364,7 @@ Client `Database` (`smaltdb`):
 | `lock` | Wait for earlier `exec` calls and transactions of this `Database`, and hold off later ones, as `exec` does. Use it for methods that write or read the database. Such a call inside a `db.transaction()` callback waits for the transaction, so it never finishes. |
 | `replay` | A key under which this tab stores the call. When this tab takes over a shared database ([multi-tab access](../../guide/databases#multi-tab-access)), or the owning tab changes, it sends its stored calls again to the new engine worker. A later call with the same key replaces the stored one. Use it for state that lives in the worker, such as registered files. |
 | `dropReplay` | With `replay`: remove the stored call. The call itself is still sent. |
-| `signal` | Cancels the call; it rejects with `SMALT_INTERRUPT`. |
+| `signal` | Cancels the call. A call still waiting for its turn rejects with `SMALT_INTERRUPT`. A running call has `ctx.signal` aborted: a method that stops then, rejecting with the signal's `AbortError` (or an error with code `SMALT_INTERRUPT`), rejects with `SMALT_INTERRUPT`. A method that ignores the signal runs to completion, and the call settles with its result or error. |
 
 Engine `Database` (`smaltdb/engine`):
 
@@ -390,9 +399,15 @@ does with `ctx.session`.
 | `'timeout'` | `SMALT_EXTERNAL` | No answer within `timeoutMs`. |
 | `'closed'` | `SMALT_EXTERNAL` | The session closed before it answered. |
 | `'failed'` | `SMALT_EXTERNAL` | The handler threw, or the tab has no handler for this plugin. `detail` holds the handler's error message, or `this tab has no handler for <plugin> (onPluginMessage)`. |
-| `'no-session'` | `SMALT_MISUSE` | There is no client to ask: in-process, or for work the engine worker does by itself, such as a [refresh policy](../../guide/views-and-materialized-views#refresh-policies). |
+| `'no-session'` | `SMALT_MISUSE` | There is no client to ask: the engine runs in-process (`Database.open()`, `Database.openMemory()`), where `ask` always fails this way. |
 
 `AskError` extends `Error` with `code`, `reason` and `detail?`.
+
+In the engine worker, `ask` sends the question to the session it is given. Work the engine does by itself, such as a
+[refresh policy](../../guide/views-and-materialized-views#refresh-policies), has no calling session, but sources do
+not get one anyway: a source asks the session it remembered, so during a refresh the question goes to the tab that
+registered the state (`@smaltdb/external` asks the tab that registered the credentials). If that tab has closed,
+`ask` fails with `'closed'`; drop its state in `onSessionClosed` so it is not asked at all.
 
 ## Errors
 
@@ -402,13 +417,19 @@ How the engine reports an error a plugin throws:
 |---|---|---|
 | A format's `read`, a source's `open`, `bytes`, `random`, `close`, `validator` or `list` | Passed through with its code and message. | `SMALT_EXTERNAL`, with the label in front: `read_kv('mem:x.kv'): line 2: no '='`. An `AbortError` becomes `SMALT_INTERRUPT`. |
 | A method, in-process | Passed through as it is. | Passed through as it is. |
-| A method, through the engine worker | The client gets its code and message. | The client gets `SMALT_INTERNAL` with its message. |
-| A connection type's `validate` | `SMALT_ERROR`: `connection c: <message>`. | `SMALT_ERROR`: `connection c: <message>`. |
+| A method, through the engine worker | The client gets its code and message. | The client gets `SMALT_INTERNAL` with its message. An `AbortError` becomes `SMALT_INTERRUPT`. |
+| A connection type's `validate` | Passed through with its code and message. | `SMALT_ERROR`: `connection c: <message>`. |
+| An `onSessionClosed` listener | Logged with `console.error`, naming the plugin. | Logged with `console.error`, naming the plugin. |
 | `setup` | Opening the database fails with the error. | Opening the database fails with the error. |
 
 So a format or source throws a plain `Error` for problems with the data or the network. A method that can fail for
 reasons the application should handle gives its errors a code: `@smaltdb/io` throws errors with `code: 'SMALT_ERROR'`
 for bad import data, and passes on the engine's own errors, such as `SMALT_CONSTRAINT_NOTNULL`.
+
+**In-process, check `e.code`, not the class.** A plugin's own errors are plain `Error`s with a `code`, not
+`SmaltError`s, so `e instanceof SmaltError` is false for them. Errors of the engine that a method passes on keep their
+class: an import's constraint failure is the engine's `SmaltError` subclass, named `ConstraintError`. Through the worker
+client, every error arrives as a `SmaltdbError` built from the code and message, so nothing changes there.
 
 Do not put the label in your messages: the engine adds it. For a pattern, the label also names the file:
 `orders (sales/2024/a.csv): …`.

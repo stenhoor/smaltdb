@@ -49,7 +49,10 @@ export interface PluginHost {
   addConnectionType(type: string, spec: ConnectionTypeSpec): void;
   /** A method the application calls with `callPlugin(plugin, name, args)` (client or engine). */
   addMethod(name: string, method: PluginMethod): void;
-  /** Called when a client session (a tab) goes away: drop what it registered. */
+  /**
+   * Called when a client session (a tab) goes away, after its transaction is rolled back: drop what
+   * it registered. A listener that throws is logged and does not stop the others.
+   */
   onSessionClosed(listener: (session: string) => void): void;
   /**
    * Ask the client session `session` a question, answered by the handler the application set with
@@ -91,6 +94,11 @@ export interface MethodContext {
   db: Database;
   /** The calling session (a tab), or `'local'` in-process. */
   session: string;
+  /**
+   * Aborted when the call is cancelled, or (engine worker) when its session closes. In the engine
+   * worker a method whose write hits SMALT_BUSY (another tab's open result) is run again from the
+   * start once the reads end: keep side effects before its first write idempotent.
+   */
   signal?: AbortSignal;
   /**
    * Run one statement that may read external data (its sources are fetched first) and return its
@@ -288,7 +296,7 @@ export class PluginRegistry {
   readonly sources: SourceHandler[] = [];
   readonly connectionTypes = new Map<string, { type: string; options: Set<string>; validate?: (options: Record<string, SqlValue>) => void }>();
   private readonly methods = new Map<string, Map<string, PluginMethod>>();
-  private readonly sessionListeners: ((session: string) => void)[] = [];
+  private readonly sessionListeners: { plugin: string; listener: (session: string) => void }[] = [];
   /** How questions reach client sessions; set by the worker server (none in-process). */
   asker: ((session: string, plugin: string, message: unknown, timeoutMs: number) => Promise<unknown>) | null = null;
 
@@ -334,7 +342,7 @@ export class PluginRegistry {
         if (methods.has(name)) throw taken('method', name);
         methods.set(name, method);
       },
-      onSessionClosed: (listener) => void this.sessionListeners.push(listener),
+      onSessionClosed: (listener) => void this.sessionListeners.push({ plugin: p.name, listener }),
       ask: (session, message, timeoutMs = 30_000) => {
         if (!this.asker) return Promise.reject(askError('no-session', `plugin ${p.name}: there is no client session to ask (in-process)`));
         return this.asker(session, p.name, message, timeoutMs);
@@ -462,8 +470,17 @@ export class PluginRegistry {
     return m(ctx, args);
   }
 
-  /** A client session went away. */
+  /**
+   * A client session went away. Each listener runs on its own: one that throws is reported and
+   * does not keep the others (or the engine's own cleanup) from running.
+   */
   sessionClosed(session: string): void {
-    for (const l of this.sessionListeners) l(session);
+    for (const { plugin, listener } of this.sessionListeners) {
+      try {
+        listener(session);
+      } catch (e) {
+        console.error(`plugin ${plugin}: onSessionClosed listener failed`, e);
+      }
+    }
   }
 }

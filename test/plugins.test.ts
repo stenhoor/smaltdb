@@ -4,13 +4,14 @@
  * to client sessions, and an engine without a plugin a database or statement needs (it opens, and
  * reports SMALT_PLUGIN_MISSING where the plugin is needed).
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as client from '../src/client/index.js';
 import { Database } from '../src/engine/database.js';
 import type { SmaltPlugin } from '../src/engine/plugin.js';
 import { EngineServer } from '../src/engine/server.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
 import type { Request, Response } from '../src/shared/protocol.js';
-import { until } from './helpers/wait.js';
+import { pause, until } from './helpers/wait.js';
 
 const code = (p: Promise<unknown>): Promise<string> =>
   p.then(
@@ -78,7 +79,7 @@ function testPlugin(log: string[] = []): SmaltPlugin {
       });
       host.addMethod('put', (_ctx, [name, text]) => void files.set(String(name), String(text)));
       host.addMethod('remember', (ctx) => void sessions.add(ctx.session));
-      host.addMethod('ask', (ctx, [question]) => host.ask(ctx.session, question, 5000));
+      host.addMethod('ask', (ctx, [question, timeoutMs]) => host.ask(ctx.session, question, Number(timeoutMs ?? 5000)));
       host.addMethod('sessions', () => [...sessions]);
       host.addMethod('real', (_ctx, [x]) => host.formatReal(Number(x)));
       host.addMethod('sum', async (ctx, [sql]) => (await ctx.query(String(sql))).rows);
@@ -312,5 +313,221 @@ describe('plugins', () => {
     // Errors without the flag, and errors with a SMALT_ code, are final.
     expect(await run('tail:no/plain')).toEqual({ result: "SMALT_EXTERNAL: read_tail('tail:no/plain'): no # at the end", log: ['read'] });
     expect(await run('tail:no/code')).toEqual({ result: 'SMALT_EXTERNAL: no # at the end', log: ['read'] });
+  });
+});
+
+/** A server over an in-memory database with `plugins`, a recording transport and a `watchSession` stub. */
+async function pluginServer(plugins: SmaltPlugin[]) {
+  const log: { session: string; msg: Response }[] = [];
+  const watched: string[] = [];
+  const server = new EngineServer((session, msg) => log.push({ session, msg }), {
+    open: () => Database.openMemory({ plugins }),
+    watchSession: (s) => watched.push(s),
+    refreshTimer: false,
+  });
+  let id = 1;
+  const send = (session: string, body: Record<string, unknown>): number => {
+    const rid = id++;
+    server.receive(session, { ...body, id: rid } as Request);
+    return rid;
+  };
+  const reply = (session: string, rid: number): Response | undefined => log.find((m) => m.session === session && m.msg.id === rid && (m.msg.kind === 'ok' || m.msg.kind === 'error' || m.msg.kind === 'done'))?.msg;
+  /** Send a request and wait for its final reply. */
+  const call = async (session: string, body: Record<string, unknown>): Promise<Response> => {
+    const rid = send(session, body);
+    await until(`${String(body.op)} from ${session}`, () => !!reply(session, rid));
+    return reply(session, rid)!;
+  };
+  await call(EngineServer.LOCAL, { op: 'open', name: ':memory:', storage: 'memory' });
+  return { server, log, watched, send, reply, call };
+}
+
+/** A Worker stand-in: the engine server runs in this thread, messages are cloned (as postMessage does) and delivered on later ticks. */
+class FakeWorker {
+  onmessage: ((e: { data: Response }) => void) | null = null;
+  onerror: unknown = null;
+  private readonly server: EngineServer;
+  constructor(plugins: SmaltPlugin[]) {
+    this.server = new EngineServer((_session, msg) => setTimeout(() => this.onmessage?.({ data: structuredClone(msg) })), {
+      open: () => Database.openMemory({ plugins }),
+      refreshTimer: false,
+    });
+  }
+  postMessage(req: Request): void {
+    const r = structuredClone(req);
+    setTimeout(() => this.server.receive(EngineServer.LOCAL, r));
+  }
+  terminate(): void {}
+}
+
+// The client checks that workers exist before it uses the one it is given.
+(globalThis as { Worker?: unknown }).Worker ??= FakeWorker;
+
+const clients: client.Database[] = [];
+afterEach(async () => {
+  for (const c of clients.splice(0)) await c.close();
+  vi.restoreAllMocks();
+});
+
+describe('plugins: review of #38', () => {
+  it('1. a tab that has only called plugin methods is watched, and onSessionClosed runs when it goes', async () => {
+    const t = await pluginServer([testPlugin()]);
+    expect(await t.call('tab-b', { op: 'pluginCall', plugin: 'test-plugin', method: 'remember', args: [] })).toMatchObject({ kind: 'ok' });
+    // The server asked to be told when tab-b goes away (it holds no stream or transaction).
+    expect(t.watched).toEqual(['tab-b']);
+    // What the watch reports when the tab's lock is released.
+    t.server.sessionGone(t.watched[0]);
+    expect(await t.call('local', { op: 'pluginCall', plugin: 'test-plugin', method: 'sessions', args: [] })).toMatchObject({ kind: 'ok', value: [] });
+  });
+
+  it('2. a throwing onSessionClosed listener is reported; the closed tab\'s transaction still rolls back', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const thrower: SmaltPlugin = {
+      name: 'thrower',
+      version: '1.0.0',
+      apiVersion: 1,
+      setup(host) {
+        host.onSessionClosed(() => {
+          throw new Error('listener failed');
+        });
+      },
+    };
+    const t = await pluginServer([thrower, testPlugin()]);
+    await t.call('local', { op: 'exec', sql: 'CREATE TABLE t(a INT)' });
+    await t.call('tab-b', { op: 'pluginCall', plugin: 'test-plugin', method: 'remember', args: [] });
+    expect(await t.call('tab-b', { op: 'exec', sql: 'BEGIN; INSERT INTO t VALUES (1)' })).toMatchObject({ kind: 'ok' });
+    try {
+      t.server.sessionGone('tab-b');
+    } catch {
+      // before the fix: the listener's error escaped here, skipping the rollback
+    }
+    // Another session's write gets through: tab-b's transaction was rolled back.
+    expect(await t.call('local', { op: 'exec', sql: 'INSERT INTO t VALUES (2)' })).toMatchObject({ kind: 'ok' });
+    expect(t.server.db!.query('SELECT a FROM t').rows).toEqual([[2]]);
+    // The listeners after the failing one still ran, and the failure was reported with the plugin's name.
+    expect(await t.call('local', { op: 'pluginCall', plugin: 'test-plugin', method: 'sessions', args: [] })).toMatchObject({ kind: 'ok', value: [] });
+    expect(errors).toHaveBeenCalledWith(expect.stringContaining('thrower'), expect.objectContaining({ message: 'listener failed' }));
+  });
+
+  it('3. cancelling a plugin call: a method that stops on the signal gives SMALT_INTERRUPT; one that ignores it finishes', async () => {
+    let release!: () => void;
+    const started: string[] = [];
+    const waiter: SmaltPlugin = {
+      name: 'waiter',
+      version: '1.0.0',
+      apiVersion: 1,
+      setup(host) {
+        host.addMethod('stop', (ctx) => {
+          started.push('stop');
+          return new Promise((_resolve, reject) => ctx.signal!.addEventListener('abort', () => reject(ctx.signal!.reason)));
+        });
+        host.addMethod('ignore', async () => {
+          started.push('ignore');
+          await new Promise<void>((r) => (release = r));
+          return 'done';
+        });
+      },
+    };
+    const t = await pluginServer([waiter]);
+    const stop = t.send('tab-b', { op: 'pluginCall', plugin: 'waiter', method: 'stop', args: [] });
+    await until('stop to start', () => started.includes('stop'));
+    t.server.receive('tab-b', { id: 0, op: 'cancel', target: stop });
+    await until('stop', () => !!t.reply('tab-b', stop));
+    expect(t.reply('tab-b', stop)).toMatchObject({ kind: 'error', code: 'SMALT_INTERRUPT' });
+
+    const ignore = t.send('tab-b', { op: 'pluginCall', plugin: 'waiter', method: 'ignore', args: [] });
+    await until('ignore to start', () => started.includes('ignore'));
+    t.server.receive('tab-b', { id: 0, op: 'cancel', target: ignore });
+    await pause();
+    expect(t.reply('tab-b', ignore)).toBeUndefined();
+    release();
+    await until('ignore', () => !!t.reply('tab-b', ignore));
+    expect(t.reply('tab-b', ignore)).toMatchObject({ kind: 'ok', value: 'done' });
+  });
+
+  it('4. CREATE EXTERNAL TABLE without the format\'s plugin: SMALT_PLUGIN_MISSING before reader options are checked', async () => {
+    const db = Database.openMemory();
+    await expect(db.execAsync("CREATE EXTERNAL TABLE t(a INT) WITH (location = 'x.csv', delimiter = ';')")).rejects.toMatchObject({
+      code: 'SMALT_PLUGIN_MISSING',
+      message: expect.stringContaining('@smaltdb/io'),
+    });
+    await expect(db.execAsync("CREATE EXTERNAL TABLE t(a INT) WITH (location = 'x.bin', format = 'kv', separator = ':')")).rejects.toMatchObject({ code: 'SMALT_PLUGIN_MISSING' });
+  });
+
+  it('5. a handler answer that cannot be cloned fails the question at once (no timeout)', async () => {
+    const db = await client.open(':memory:', { storage: 'memory', worker: new FakeWorker([testPlugin()]) as unknown as Worker });
+    clients.push(db);
+    db.onPluginMessage('test-plugin', () => () => 'a function');
+    const started = Date.now();
+    // A 3-second timeout: the error must come well before it.
+    await expect(db.callPlugin('test-plugin', 'ask', ['q', 3000])).rejects.toMatchObject({ code: 'SMALT_EXTERNAL', message: expect.stringMatching(/^test-plugin: .*clon/) });
+    expect(Date.now() - started).toBeLessThan(2000);
+    // A cloneable answer still works.
+    db.onPluginMessage('test-plugin', (m) => `re: ${String(m)}`);
+    expect(await db.callPlugin('test-plugin', 'ask', ['q'])).toBe('re: q');
+  });
+
+  it("a statement whose tab closes while its external data is fetched does not run after the tab's rollback", async () => {
+    let release!: () => void;
+    let opened = false;
+    const gate: SmaltPlugin = {
+      name: 'gate',
+      version: '1.0.0',
+      apiVersion: 1,
+      setup(host) {
+        host.addFormat({ name: 'gated', extensions: ['gated'], access: 'bytes', read: async () => ({ columns: [{ name: 'a', declType: 'INTEGER' }], rows: [[1], [2]] }) });
+        host.addTableFunction('read_gated', { format: 'gated' });
+        // A source that ignores the signal: it answers when the test lets it.
+        host.addSource({
+          name: 'gate',
+          prefixes: ['gate:'],
+          async open() {
+            opened = true;
+            await new Promise<void>((r) => (release = r));
+            return { bytes: async () => ({ bytes: new Uint8Array(0), validator: null }) };
+          },
+          validator: async () => null,
+        });
+      },
+    };
+    const t = await pluginServer([gate]);
+    await t.call('local', { op: 'exec', sql: 'CREATE TABLE t(a INT)' });
+    await t.call('tab-b', { op: 'exec', sql: 'BEGIN; INSERT INTO t VALUES (0)' });
+    const ins = t.send('tab-b', { op: 'exec', sql: "INSERT INTO t SELECT a FROM read_gated('gate:x')" });
+    await until('the fetch', () => opened);
+    t.server.sessionGone('tab-b');
+    release();
+    await until('the insert', () => !!t.reply('tab-b', ins));
+    expect(t.reply('tab-b', ins)).toMatchObject({ kind: 'error', code: 'SMALT_INTERRUPT' });
+    expect(t.server.db!.inTransaction).toBe(false);
+    expect(t.server.db!.query('SELECT count(*) FROM t').rows).toEqual([[0]]);
+  });
+
+  it('a method that hits SMALT_BUSY (another tab\'s open stream) runs again from the start once the stream ends', async () => {
+    const runs: string[] = [];
+    const writer: SmaltPlugin = {
+      name: 'writer',
+      version: '1.0.0',
+      apiVersion: 1,
+      setup(host) {
+        host.addMethod('add', (ctx, [x]) => {
+          runs.push(`run ${String(x)}`);
+          ctx.db.exec(`INSERT INTO t VALUES (${Number(x)})`);
+          return 'added';
+        });
+      },
+    };
+    const t = await pluginServer([writer]);
+    await t.call('local', { op: 'exec', sql: 'CREATE TABLE t(a INT); INSERT INTO t VALUES (1), (2), (3)' });
+    const q = t.send('tab-a', { op: 'query', sql: 'SELECT a FROM t', batchSize: 1, credit: 1 });
+    await until('the first batch', () => t.log.some((m) => m.session === 'tab-a' && m.msg.id === q && m.msg.kind === 'batch'));
+    const add = t.send('tab-b', { op: 'pluginCall', plugin: 'writer', method: 'add', args: [9] });
+    await until('the first run', () => runs.length === 1);
+    await pause();
+    expect(t.reply('tab-b', add)).toBeUndefined(); // waits for the stream
+    t.server.receive('tab-a', { id: 0, op: 'cancel', target: q });
+    await until('add', () => !!t.reply('tab-b', add));
+    expect(t.reply('tab-b', add)).toMatchObject({ kind: 'ok', value: 'added' });
+    expect(runs).toEqual(['run 9', 'run 9']);
   });
 });

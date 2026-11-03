@@ -247,8 +247,9 @@ export class EngineServer {
       clearTimeout(ask.timer);
       ask.reject(askError('closed', `${ask.plugin}: the tab that would answer closed`));
     }
-    // What it registered with plugins (credentials callbacks, …) went with it.
-    this.db?.external.plugins.sessionClosed(session);
+    // Its request running now (waiting on a fetch, a plugin method waiting on a Blob) stops: its
+    // transaction is about to be rolled back, and the work must not continue outside it.
+    if (this.currentAbort?.session === session) this.currentAbort.controller.abort();
     for (let i = this.queue.length - 1; i >= 0; i--) if (this.queue[i].session === session) this.queue.splice(i, 1);
     for (const m of this.morselJobs) if (m.session === session) m.cancelled = true;
     for (let i = this.streams.length - 1; i >= 0; i--) {
@@ -266,8 +267,14 @@ export class EngineServer {
     }
     if (this.txOwner === session) this.txOwner = null;
     this.txEnded.delete(session);
-    this.unblock();
-    this.kick();
+    // What it registered with plugins (credentials callbacks, …) went with it. After the rollback, so
+    // a plugin can never keep the database blocked (the registry also isolates each listener).
+    try {
+      this.db?.external.plugins.sessionClosed(session);
+    } finally {
+      this.unblock();
+      this.kick();
+    }
   }
 
   private cancel(session: string, target: number): void {
@@ -463,7 +470,16 @@ export class EngineServer {
       }
       case 'pluginCall': {
         const d = this.requireDb();
-        const value = await this.withAbort(session, id, (signal) => d.callPlugin(req.plugin, req.method, req.args, { session, signal }));
+        // Plugins keep per-session state (registered files, credentials): learn when this tab goes away.
+        this.watch(session);
+        let value: unknown;
+        try {
+          value = await this.withAbort(session, id, (signal) => d.callPlugin(req.plugin, req.method, req.args, { session, signal }));
+        } catch (e) {
+          // A method that stopped on its cancelled signal (rejecting with the signal's AbortError).
+          if (errorCode(e) === 'SMALT_INTERNAL' && (e as { name?: unknown } | null)?.name === 'AbortError') throw new SmaltError('SMALT_INTERRUPT', 'interrupted');
+          throw e;
+        }
         this.send(session, { id, kind: 'ok', value });
         return;
       }

@@ -265,6 +265,8 @@ Engine methods throw `SmaltError` (or a subclass) with the same `code` and `mess
 
 Other codes are thrown as plain `SmaltError` objects (or an internal subclass): check `code`, not the class. `OpfsVfs` used where OPFS sync access handles do not exist (Node, a page's main thread) throws `SMALT_CANTOPEN`. Other errors from the host pass through unchanged.
 
+Errors from [plugins](./plugins#errors), such as `@smaltdb/io`'s import errors from `callPlugin` or the `@smaltdb/io/client` helpers, are not `SmaltError`s: a plugin cannot create one. They carry a `code` that starts with `SMALT_` all the same, so check `e.code`; `e instanceof SmaltError` is false for them.
+
 ```ts
 import { Database, SmaltError, SqlSyntaxError } from 'smaltdb/engine';
 

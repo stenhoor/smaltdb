@@ -545,7 +545,18 @@ export class Database implements Queryable {
     } catch (e) {
       reply = { error: e instanceof Error ? e.message : String(e) };
     }
-    this.link?.send({ id: 0, op: 'pluginReply', target: msg.request, ...reply });
+    const send = (r: { value?: unknown; error?: string }): void => this.link?.send({ id: 0, op: 'pluginReply', target: msg.request, ...r });
+    try {
+      send(reply);
+    } catch (e) {
+      // An answer the browser cannot clone (a function, …): fail the question now rather than let
+      // the engine wait out its timeout.
+      try {
+        send({ error: `the answer could not be sent to the engine: ${e instanceof Error ? e.message : String(e)}` });
+      } catch {
+        // the link is gone: the engine learns that the session closed
+      }
+    }
   }
 
   /** Prepare a statement for repeated execution. */

@@ -18,6 +18,19 @@ export async function sourceText(source: ImportSource): Promise<string> {
   throw new IoError('SMALT_MISUSE', 'the import source must be a string, Uint8Array, ArrayBuffer or Blob');
 }
 
+/**
+ * The import source as text, read before the import starts. Reading a Blob waits, and meanwhile the
+ * call may be cancelled, or its tab close and its transaction be rolled back: the import must then
+ * not go ahead (on its own, it would commit what was meant for the transaction).
+ */
+export async function importText(ctx: MethodContext, source: ImportSource): Promise<string> {
+  const inTransaction = ctx.db.inTransaction;
+  const text = await sourceText(source);
+  if (ctx.signal?.aborted) throw new IoError('SMALT_INTERRUPT', 'interrupted');
+  if (inTransaction && !ctx.db.inTransaction) throw new IoError('SMALT_INTERRUPT', 'the transaction ended while the import source was read');
+  return text;
+}
+
 /** `e` with `${where}: ` in front of its message, keeping its class and code (an engine error stays one). */
 function at(where: string, e: unknown): Error {
   if (e instanceof Error && typeof (e as { code?: unknown }).code === 'string') {

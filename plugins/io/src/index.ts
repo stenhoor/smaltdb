@@ -7,7 +7,7 @@
  */
 import type { SmaltPlugin } from 'smaltdb/engine';
 import { decode, readCsv, readJson } from './formats.js';
-import { exportCSV, exportJSON, importCSV, importJSON, sourceText } from './import-export.js';
+import { exportCSV, exportJSON, importCSV, importJSON, importText } from './import-export.js';
 import type { CsvExportOptions, CsvImportOptions, ExportParams, ImportSource, JsonExportOptions, JsonImportOptions } from './options.js';
 
 export type { CsvExportOptions, CsvImportOptions, ExportParams, ImportSource, JsonExportOptions, JsonImportOptions, ParamValue } from './options.js';
@@ -36,8 +36,8 @@ const io: SmaltPlugin = {
     host.addTableFunction('read_csv', { format: (location) => (/\.tsv([?#]|$)/i.test(location) ? 'tsv' : 'csv') });
     host.addTableFunction('read_json', { format: 'json' });
 
-    host.addMethod('importCSV', async (ctx, [table, source, options]) => importCSV(ctx.db, table as string, await sourceText(source as ImportSource), (options ?? {}) as CsvImportOptions));
-    host.addMethod('importJSON', async (ctx, [table, source, options]) => importJSON(ctx.db, table as string, await sourceText(source as ImportSource), (options ?? {}) as JsonImportOptions));
+    host.addMethod('importCSV', async (ctx, [table, source, options]) => importCSV(ctx.db, table as string, await importText(ctx, source as ImportSource), (options ?? {}) as CsvImportOptions));
+    host.addMethod('importJSON', async (ctx, [table, source, options]) => importJSON(ctx.db, table as string, await importText(ctx, source as ImportSource), (options ?? {}) as JsonImportOptions));
     host.addMethod('exportCSV', (ctx, [sql, params, options]) => exportCSV(ctx, host.formatReal, sql as string, (params ?? undefined) as ExportParams | undefined, (options ?? {}) as CsvExportOptions));
     host.addMethod('exportJSON', (ctx, [sql, params, options]) => exportJSON(ctx, host.formatReal, sql as string, (params ?? undefined) as ExportParams | undefined, (options ?? {}) as JsonExportOptions));
   },

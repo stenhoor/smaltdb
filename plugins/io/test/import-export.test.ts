@@ -9,6 +9,7 @@ import { Database } from '../../../src/engine/database.js';
 import { EngineServer } from '../../../src/engine/server.js';
 import { MemoryVfs } from '../../../src/engine/vfs/memory.js';
 import type { Request, Response } from '../../../src/shared/protocol.js';
+import { until } from '../../../test/helpers/wait.js';
 
 const db = (): Database => Database.openFile(new MemoryVfs().openSync('io.db'), { plugins: [io] });
 
@@ -239,4 +240,71 @@ async function openClient(): Promise<client.Database> {
 }
 afterEach(async () => {
   for (const c of opened.splice(0)) await c.close();
+});
+
+describe('review of #38', () => {
+  it('7. errors: through the client a SmaltdbError with the code; in-process, check e.code', async () => {
+    const c = await openClient();
+    await c.exec('CREATE TABLE p(id INTEGER PRIMARY KEY, v TEXT NOT NULL)');
+    const bad = await importCSV(c, 'p', 'id,v\n1\n').catch((e: unknown) => e);
+    expect(bad).toBeInstanceOf(client.SmaltdbError);
+    expect(bad).toMatchObject({ code: 'SMALT_ERROR', message: 'CSV line 2: expected 2 fields but found 1' });
+    const constraint = await importCSV(c, 'p', 'id,v\n1,\n').catch((e: unknown) => e);
+    expect(constraint).toBeInstanceOf(client.SmaltdbError);
+    expect(constraint).toMatchObject({ code: 'SMALT_CONSTRAINT_NOTNULL', message: 'CSV line 2: NOT NULL constraint failed: p.v' });
+    // In-process the plugin's own errors carry the code (they are not SmaltErrors: plugins cannot make one).
+    const d = db();
+    d.exec('CREATE TABLE p(id INTEGER PRIMARY KEY, v TEXT NOT NULL)');
+    await expect(importCSV(d, 'p', 'id,v\n1\n')).rejects.toMatchObject({ code: 'SMALT_ERROR' });
+    await expect(importCSV(d, 'p', 'id,v\n1,\n')).rejects.toMatchObject({ code: 'SMALT_CONSTRAINT_NOTNULL' });
+  });
+
+  it("an import whose tab closes while its source is read does not commit on its own after the tab's rollback", async () => {
+    const log: { session: string; msg: Response }[] = [];
+    const server = new EngineServer((session, msg) => log.push({ session, msg }), { open: () => Database.openMemory({ plugins: [io] }), refreshTimer: false });
+    let id = 1;
+    const reply = (session: string, rid: number): Response | undefined => log.find((m) => m.session === session && m.msg.id === rid && (m.msg.kind === 'ok' || m.msg.kind === 'error'))?.msg;
+    const call = async (session: string, body: Record<string, unknown>): Promise<number> => {
+      const rid = id++;
+      server.receive(session, { ...body, id: rid } as Request);
+      return rid;
+    };
+    const done = async (session: string, rid: number): Promise<Response> => {
+      await until(`request ${rid}`, () => !!reply(session, rid));
+      return reply(session, rid)!;
+    };
+    await done('local', await call('local', { op: 'open', name: ':memory:', storage: 'memory' }));
+    await done('local', await call('local', { op: 'exec', sql: 'CREATE TABLE t(a INT)' }));
+    expect(await done('tab-b', await call('tab-b', { op: 'exec', sql: 'BEGIN; INSERT INTO t VALUES (0)' }))).toMatchObject({ kind: 'ok' });
+    // A Blob whose read the test controls.
+    let deliver!: (b: ArrayBuffer) => void;
+    let reading = false;
+    const blob = {
+      arrayBuffer: () => {
+        reading = true;
+        return new Promise<ArrayBuffer>((r) => (deliver = r));
+      },
+    };
+    const imp = await call('tab-b', { op: 'pluginCall', plugin: '@smaltdb/io', method: 'importCSV', args: ['t', blob, {}] });
+    await until('the source read', () => reading);
+    server.sessionGone('tab-b'); // rolls back tab-b's transaction
+    deliver(new TextEncoder().encode('a\n1\n2\n').buffer as ArrayBuffer);
+    expect(await done('tab-b', imp)).toMatchObject({ kind: 'error', code: 'SMALT_INTERRUPT' });
+    expect(server.db!.inTransaction).toBe(false);
+    expect(server.db!.query('SELECT count(*) FROM t').rows).toEqual([[0]]);
+  });
+
+  it('in-process: an import into a transaction that ends while its source is read fails instead of committing on its own', async () => {
+    const d = db();
+    d.exec('CREATE TABLE t(a INT); BEGIN; INSERT INTO t VALUES (0)');
+    let deliver!: (b: ArrayBuffer) => void;
+    const blob = { arrayBuffer: () => new Promise<ArrayBuffer>((r) => (deliver = r)) };
+    const imp = d.callPlugin('@smaltdb/io', 'importCSV', ['t', blob, {}]);
+    await until('the source read', () => deliver !== undefined);
+    d.exec('ROLLBACK');
+    deliver(new TextEncoder().encode('a\n1\n2\n').buffer as ArrayBuffer);
+    await expect(imp).rejects.toMatchObject({ code: 'SMALT_INTERRUPT' });
+    expect(d.inTransaction).toBe(false);
+    expect(d.query('SELECT count(*) FROM t').rows).toEqual([[0]]);
+  });
 });

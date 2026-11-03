@@ -603,6 +603,9 @@ export class Database implements FunctionContext {
       for (;;) {
         try {
           await load(st.externalSources);
+          // Cancelled (or its tab closed, its transaction rolled back) while a source that ignores
+          // the signal was fetched: the statement must not run now.
+          if (signal?.aborted) throw new SmaltError('SMALT_INTERRUPT', 'interrupted');
           return run();
         } catch (e) {
           // Retry only when it is new data that is missing (never loop on the same sources).
@@ -2342,6 +2345,15 @@ export class Database implements FunctionContext {
     const lower = stmt.name.toLowerCase();
     if (stmt.ifNotExists && this.externals.has(lower)) return none;
     this.checkNewName(stmt.name, 'external');
+    // A format whose plugin is missing first: the error names the plugin rather than one of its
+    // options (other format errors, such as an unknown extension, come after the options check).
+    if (typeof stmt.with.location === 'string' && stmt.with.location !== '') {
+      try {
+        formatOf(stmt.with.location, stmt.with, stmt.name, this.external.plugins);
+      } catch (e) {
+        if (e instanceof SmaltError && e.code === 'SMALT_PLUGIN_MISSING') throw e;
+      }
+    }
     checkReaderOptions(stmt.with, new Set(['location', 'connection', ...this.external.plugins.readerOptions()]), stmt.name);
     const seen = new Set<string>();
     for (const c of stmt.columns) {
