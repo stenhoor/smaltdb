@@ -191,8 +191,13 @@ operators.
   plans in place instead of copying them (`resolveRefs`), result columns and shapes have one object layout, and the
   physical planner creates a column's read marking only for columns an expression reads.
 - **Deleting the AST path** (`Planner.planSelect`, `SMALT_PLAN=legacy`, the internal `slot` / `native` nodes; about 2k
-  lines) waits for step 8: writes and materialized-view validation and refresh still run on it (owner decision on
-  #46, replacing item 11 below).
+  lines) waited for step 8: writes and materialized-view validation and refresh still ran on it (owner decision on
+  #46, replacing item 11 below). Before the deletion, the plan layer covers what still fell back: external table
+  functions (`read_csv(…)`: the front end evaluates the constant arguments and asks the catalog for the columns),
+  correlated recursive CTEs (a recursive step's scope holds only the working rows' name, so it is not a query level),
+  inner-join conditions that read a later source (moved to the WHERE, as SQLite does; an outer join's is SQLite's
+  error), and the engine's own queries. With every fallback made an error, the suite, sqllogictest and the plugin
+  suites never reach the AST path.
 - **Hardest parts:** projection-pushdown parity, register order (window snapshots), outer references from subqueries
   over aggregate rows, correlation of derived tables, estimates keyed by the same operators.
 

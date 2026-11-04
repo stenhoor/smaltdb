@@ -20,7 +20,7 @@ import { type StaticType, truthy } from './exec/convert.js';
 import { type CompileScope, type Compiled, type Fn, compileExpr } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, SingleRow, explainAnalyze, explainRows } from './exec/operators.js';
-import { type ExternalScan, Planner, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
+import { type ExternalScan, Planner, type PlannerEnv, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
@@ -846,12 +846,10 @@ export class Database implements FunctionContext {
         const v = this.views.get(name.toLowerCase());
         if (!v) return null;
         try {
-          const planner = new Planner(
-            { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state },
-            new Registers(0),
-          );
+          const deps: PlannerEnv = { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state };
+          const planner = new Planner(deps, new Registers(0));
           planner.sqlText = v.sql;
-          const plan = planner.planSelect(v.select, null);
+          const plan = this.planSelectStmt(v.select, v.sql, planner, this.catalogFor(deps), true);
           return plan.columns.map((c, i) => ({ name: v.columns?.[i] ?? c.name, declType: c.declType ?? '' }));
         } catch {
           return null;
@@ -1033,24 +1031,33 @@ export class Database implements FunctionContext {
 
   /** What the SQL front end (ADR 0014, step 5) reads of the catalog (it reads the database's state when called). */
   private frontEndCatalog(): FrontEndCatalog {
-    if (this.feCatalog) return this.feCatalog;
-    const deps = this.plannerDeps();
-    return (this.feCatalog = {
+    return (this.feCatalog ??= this.catalogFor(this.plannerDeps()));
+  }
+
+  /** The SQL front end's view of the planner dependencies `deps` (the same tables, views and sources). */
+  private catalogFor(deps: PlannerEnv): FrontEndCatalog {
+    return {
       getTable: deps.getTable,
       getView: deps.getView,
       isExternal: (n) => this.externals.has(n.toLowerCase()),
       externalColumns: (n) => deps.externalTable?.(n)?.columns,
+      externalFunctionColumns: (n, args, named) => deps.externalFunction?.(n, args, named)?.columns,
       isExternalFunction: deps.isExternalFunction,
       virtualTable: deps.virtualTable,
       funcCtx: this,
-    });
+    };
   }
 
   private feCatalog: FrontEndCatalog | null = null;
 
-  /** A top-level SELECT, planned as `SMALT_PLAN` says (exec/plan-shadow.ts). */
-  private planSelectStmt(stmt: SelectStmt, text: string, planner: Planner): QueryPlan {
-    switch (planMode()) {
+  /**
+   * A top-level SELECT, planned as `SMALT_PLAN` says (exec/plan-shadow.ts), against `catalog` (the planner's tables).
+   * `internal`: a query the engine plans for itself (materialized views, view checks), which shadow mode plans
+   * through the plan layer without comparing (the AST path's answers to them were never compared).
+   */
+  private planSelectStmt(stmt: SelectStmt, text: string, planner: Planner, catalog: FrontEndCatalog = this.frontEndCatalog(), internal = false): QueryPlan {
+    const mode = planMode();
+    switch (internal && mode === 'shadow' ? 'plan' : mode) {
       case 'legacy':
         return planner.planSelect(stmt, null);
       case 'shadow': {
@@ -1076,11 +1083,11 @@ export class Database implements FunctionContext {
           if (got !== want) throw new SmaltError('SMALT_INTERNAL', `SMALT_PLAN=shadow: the physical planner disagrees with the planner on subqueries\n  in: ${text}\nphysical:\n${got}\nplanner:\n${want}`);
           return p;
         };
-        return shadowCheck(stmt, text, this.frontEndCatalog(), () => planner.planSelect(stmt, null), planner.env.rewriteSelect, physical);
+        return shadowCheck(stmt, text, catalog, () => planner.planSelect(stmt, null), planner.env.rewriteSelect, physical);
       }
       case 'plan': {
         // The front end applies materialized-view matching as the planner does (step 7c).
-        const fe = toPlan(stmt, text, this.frontEndCatalog(), undefined, planner.env.rewriteSelect);
+        const fe = toPlan(stmt, text, catalog, undefined, planner.env.rewriteSelect);
         return (fe && planner.planPlan(fe.plan, fe.columns)) ?? planner.planSelect(stmt, null);
       }
     }
@@ -1650,7 +1657,7 @@ export class Database implements FunctionContext {
   private matviewLayout(name: string, select: SelectStmt, sql: string, names?: string[]): string {
     const planner = new Planner(this.plannerDeps(), new Registers(0));
     planner.sqlText = sql;
-    const plan = planner.planSelect(select, null);
+    const plan = this.planSelectStmt(select, sql, planner, undefined, true);
     if (names && names.length !== plan.columns.length) {
       throw new SmaltError('SMALT_ERROR', `materialized view ${name} has ${names.length} column names but its query returns ${plan.columns.length} columns`);
     }
@@ -1674,7 +1681,7 @@ export class Database implements FunctionContext {
     const regs = new Registers(0);
     const planner = new Planner(this.plannerDeps(), regs);
     planner.sqlText = sql;
-    const plan = planner.planSelect(select, null);
+    const plan = this.planSelectStmt(select, sql, planner, undefined, true);
     const externals = planner.finishExternals();
     const r: SqlValue[] = new Array(regs.count).fill(null);
     const root = plan.root;
@@ -3088,12 +3095,10 @@ export class Database implements FunctionContext {
     this.loadSchema();
     for (const v of this.views.values()) {
       try {
-        const planner = new Planner(
-          { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state },
-          new Registers(0),
-        );
+        const deps: PlannerEnv = { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state };
+        const planner = new Planner(deps, new Registers(0));
         planner.sqlText = v.sql;
-        planner.planSelect(v.select, null);
+        this.planSelectStmt(v.select, v.sql, planner, this.catalogFor(deps), true);
       } catch (e) {
         // A view that was already broken (e.g. dangling) stays as it was, like SQLite.
         if (!this.viewWasValid.has(v.name.toLowerCase())) continue;
@@ -3108,12 +3113,10 @@ export class Database implements FunctionContext {
     this.viewWasValid = new Set();
     for (const v of this.views.values()) {
       try {
-        const planner = new Planner(
-          { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state },
-          new Registers(0),
-        );
+        const deps: PlannerEnv = { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state };
+        const planner = new Planner(deps, new Registers(0));
         planner.sqlText = v.sql;
-        planner.planSelect(v.select, null);
+        this.planSelectStmt(v.select, v.sql, planner, this.catalogFor(deps), true);
         this.viewWasValid.add(v.name.toLowerCase());
       } catch {
         /* already broken */

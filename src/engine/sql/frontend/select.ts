@@ -11,7 +11,7 @@
 import { type TableSchema, findColumn, storageTypeFor } from '../../catalog/schema.js';
 import { SmaltError } from '../../errors.js';
 import { type Affinity, type StaticType, affinityOfStorage, staticTypeOfStorage } from '../../exec/convert.js';
-import { CollSrc, type ColumnBinding, type CompileScope, bindExpr, boundMetadata, conjuncts, withCompiledMeta } from '../../exec/expr.js';
+import { CollSrc, type ColumnBinding, type CompileScope, bindExpr, boundMetadata, compileBoundExpr, conjuncts, withCompiledMeta } from '../../exec/expr.js';
 import { type FunctionContext, aggregateFunctions, scalarFunctions } from '../../exec/functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../../exec/window.js';
 import { flattenCore, flatteningDisabled } from '../../exec/flatten.js';
@@ -22,7 +22,7 @@ import { type PlanExpr, typeOf } from '../../plan/expr.js';
 import { getMeta, markFlattened, setMeta, setSubquerySql } from '../../exec/sql-meta.js';
 import type { AggCall, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../plan/ops.js';
 import type { CollationName } from '../../plan/types.js';
-import { Collation } from '../../values.js';
+import { Collation, type SqlValue } from '../../values.js';
 import type { CallExpr, ColumnExpr, DeleteStmt, Expr, InsertStmt, UpdateStmt, UpsertClause, FrameBound, FromItem, JoinType, OrderingTerm, ResultColumn, SelectCore, SelectCoreSelect, SelectStmt, WindowSpec, WithClause } from '../ast.js';
 
 /** What the front end needs of the catalog. */
@@ -33,6 +33,8 @@ export interface FrontEndCatalog {
   isExternal?(name: string): boolean;
   /** The columns of an external table. */
   externalColumns?(name: string): { name: string; type: StaticType; declType?: string }[] | undefined;
+  /** The columns of an external table function call (`read_csv('…')`) with these constant arguments. */
+  externalFunctionColumns?(name: string, args: SqlValue[], named: Record<string, SqlValue>): { name: string; type: StaticType; declType?: string }[] | undefined;
   /** A table function that reads external data (`read_csv`): its columns come from the data. */
   isExternalFunction?(name: string): boolean;
   /** Virtual tables: `information_schema.<name>`, the TEMP catalog, table-valued functions (schema undefined). */
@@ -84,6 +86,9 @@ function tableShape(table: TableSchema): { cols: FeColumn[]; columns: number[] }
 
 /** A shape the front end does not handle yet. */
 class Unsupported extends Error {}
+
+/** A join condition read a source after the one it joins (FrontEnd.from moves it to the WHERE, or rejects it). */
+class LaterSource extends Error {}
 
 /**
  * Plan a SELECT. `text` is the statement's SQL text (result columns are named from it). Returns null for shapes the
@@ -258,6 +263,8 @@ interface FeCte {
   select: SelectStmt;
   columns?: string[];
   recursive?: boolean;
+  /** Its body is being expanded: reaching it again is a circular reference. */
+  expanding?: boolean;
   /** Inside a recursive step: the CTE's name means the previous step's rows. */
   working?: { id: number; columns: FrontEndColumn[] };
 }
@@ -546,7 +553,9 @@ class FrontEnd {
     const columns = first.columns.map((c, i) => ({ ...c, name: cte.columns?.[i] ?? c.name }));
     const id = this.nextIterate++;
     const steps = cores.slice(k).map((core) => {
+      // Holds the working rows' name only: not a query level, so outer columns keep their depth.
       const s = new FeScope(parent);
+      s.ctesOnly = true;
       s.ctes.set(name.toLowerCase(), { select, columns: cte.columns, working: { id, columns } });
       const r = this.core(core, s, null, columns.length);
       if (r.columns.length !== columns.length) {
@@ -985,23 +994,38 @@ class FrontEnd {
       throw new SmaltError('SMALT_UNSUPPORTED', 'USING / NATURAL with RIGHT or FULL JOIN is not supported yet');
     }
     let root = inputs[0];
+    // Inner-join conditions that read a later source of this FROM apply once that source is joined: in the WHERE, as
+    // SQLite treats them. An outer join's condition cannot (SQLite: "ON clause references tables to its right").
+    const later: Expr[] = [];
     for (let p = 1; p < items.length; p++) {
       const it = items[p];
-      const kind: JoinKind = it.joinType === 'LEFT' ? 'left' : it.joinType === 'RIGHT' ? 'right' : it.joinType === 'FULL' ? 'full' : ons[p].length ? 'inner' : 'cross';
-      let on: PlanExpr | undefined;
-      if (ons[p].length) {
-        scope.onSource = p;
-        try {
-          const cs = this.compileScope(scope);
-          const parts = ons[p].map((c) => bindExpr(c, cs));
-          on = parts.reduce((x, y) => ({ k: 'and', args: [x, y] }));
-        } finally {
-          scope.onSource = -1;
+      const outer = it.joinType === 'LEFT' || it.joinType === 'RIGHT' || it.joinType === 'FULL';
+      const parts: PlanExpr[] = [];
+      scope.onSource = p;
+      try {
+        const cs = this.compileScope(scope);
+        for (const c of ons[p]) {
+          try {
+            parts.push(bindExpr(c, cs));
+          } catch (e) {
+            if (!(e instanceof LaterSource)) throw e;
+            if (outer) throw new SmaltError('SMALT_ERROR', 'ON clause references tables to its right');
+            later.push(c);
+          }
         }
+      } finally {
+        scope.onSource = -1;
       }
+      const kind: JoinKind = it.joinType === 'LEFT' ? 'left' : it.joinType === 'RIGHT' ? 'right' : it.joinType === 'FULL' ? 'full' : parts.length ? 'inner' : 'cross';
+      const on = parts.length ? parts.reduce((x, y) => ({ k: 'and', args: [x, y] })) : undefined;
       root = on ? { op: 'join', kind, inputs: [root, inputs[p]], on } : { op: 'join', kind, inputs: [root, inputs[p]] };
     }
-    if (where) root = { op: 'filter', input: root, pred: bindExpr(where, this.compileScope(scope)) };
+    const filters = [...later, ...(where ? [where] : [])];
+    if (filters.length) {
+      const cs = this.compileScope(scope);
+      const pred = filters.map((e) => bindExpr(e, cs)).reduce((x, y) => ({ k: 'and', args: [x, y] }));
+      root = { op: 'filter', input: root, pred };
+    }
     return root;
   }
 
@@ -1032,7 +1056,7 @@ class FrontEnd {
     const position = scope.sources.length;
     if (item.kind === 'join') throw new SmaltError('SMALT_ERROR', 'unexpected join');
     // External data: external tables and read_csv()-style functions (their columns come from the data).
-    if (item.kind === 'function' && this.catalog.isExternalFunction?.(item.name)) throw new Unsupported('external table function');
+    if (item.kind === 'function' && this.catalog.isExternalFunction?.(item.name)) return this.externalFunction(item, scope, position);
     if (item.kind === 'table' && (!item.schema || item.schema.toLowerCase() === 'main') && !(!item.schema && scope.findCte(item.name))) {
       const ext = this.catalog.externalColumns?.(item.name);
       if (ext) {
@@ -1119,7 +1143,17 @@ class FrontEnd {
           this.push(scope, { name: alias, cols, offset: 0, rowid: null, position, width: cols.length, hidden: NO_HIDDEN });
           return { op: 'working', id: w.id, types: cols.map((c) => c.type) };
         }
-        sub = cte.recursive ? this.recursive(cteName, cte, scope.parent) : this.select(cte.select, scope.parent);
+        if (cte.recursive) sub = this.recursive(cteName, cte, scope.parent);
+        else {
+          // As SQLite: a CTE's body sees every CTE of its WITH clause, and reaching itself again is an error.
+          if (cte.expanding) throw new SmaltError('SMALT_ERROR', `circular reference: ${cteName}`);
+          cte.expanding = true;
+          try {
+            sub = this.select(cte.select, scope.parent);
+          } finally {
+            cte.expanding = false;
+          }
+        }
         if (cte.recursive) names = undefined; // already applied to the plan's columns
       }
       if (names && names.length !== sub.columns.length) {
@@ -1143,6 +1177,29 @@ class FrontEnd {
     const scan: Mutable<Extract<PlanOp, { op: 'scan' }>> = db ? { op: 'scan', table: table.name, db, columns } : { op: 'scan', table: table.name, columns };
     if (item.indexedBy !== undefined) scan.indexedBy = item.indexedBy;
     return scan;
+  }
+
+  /**
+   * An external table function call (`read_csv('…')`): its constant arguments name the data, whose columns come from
+   * the catalog (the data is loaded before the statement is planned).
+   */
+  private externalFunction(item: Extract<FromItem, { kind: 'function' }>, scope: FeScope, position: number): PlanOp {
+    const cs = this.compileScope(scope);
+    const constant = (e: Expr): { b: PlanExpr; v: SqlValue } => {
+      const b = bindExpr(e, cs);
+      const c = compileBoundExpr(b, this.catalog.funcCtx);
+      if (!c.constant) throw new SmaltError('SMALT_ERROR', `${item.name}() arguments must be constants`);
+      return { b, v: c.fn([]) };
+    };
+    const args = item.args.map(constant);
+    const named = Object.entries(item.named ?? {}).map(([k, e]) => [k, constant(e)] as const);
+    const ext = this.catalog.externalFunctionColumns?.(item.name, args.map((a) => a.v), Object.fromEntries(named.map(([k, a]) => [k, a.v])));
+    if (!ext) throw new SmaltError('SMALT_ERROR', `no such table-valued function: ${item.name}`);
+    const cols: FeColumn[] = ext.map((c) => ({ name: c.name, type: c.type, collation: Collation.Binary, affinity: affinityOfStorage(storageTypeFor(c.declType)), declType: c.declType ?? '' }));
+    this.push(scope, { name: item.alias ?? item.name, cols, offset: 0, rowid: null, position, width: cols.length, hidden: NO_HIDDEN });
+    const op: Mutable<Extract<PlanOp, { op: 'source' }>> = { op: 'source', kind: 'function', name: item.name, args: args.map((a) => a.b), types: cols.map((c) => c.type) };
+    if (named.length > 0) op.named = Object.fromEntries(named.map(([k, a]) => [k, a.b]));
+    return op;
   }
 
   private push(scope: FeScope, src: FeSource): void {
@@ -1242,7 +1299,7 @@ class FrontEnd {
     let index: () => number = () => rowIndex;
     if (depth === 0 && scope.onSource >= 0) {
       // A join condition: input 0 is the left side (the sources before), input 1 the source being joined.
-      if (src.position > scope.onSource) throw new Unsupported('join condition reading a later source');
+      if (src.position > scope.onSource) throw new LaterSource();
       if (src.position === scope.onSource) {
         input = 1;
         const local = rowIndex - src.offset;

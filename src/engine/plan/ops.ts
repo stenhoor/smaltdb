@@ -66,7 +66,7 @@ export type PlanOp =
    * (`information_schema.*`, the TEMP catalog) or an external table. A function's arguments may read the columns of
    * the join's left input (a lateral source).
    */
-  | { readonly op: 'source'; readonly kind: 'function' | 'virtual' | 'external'; readonly name: string; readonly schema?: string; readonly args: readonly PlanExpr[]; readonly types: readonly PlanType[] }
+  | { readonly op: 'source'; readonly kind: 'function' | 'virtual' | 'external'; readonly name: string; readonly schema?: string; readonly args: readonly PlanExpr[]; readonly named?: Readonly<Record<string, PlanExpr>>; readonly types: readonly PlanType[] }
   /**
    * A recursive query: `init` gives the first rows; each step reads the rows of the previous one through `working`
    * (same `id`) until a step gives none. `distinct`: UNION (rows seen before are dropped); `order` / `limit` /
