@@ -260,9 +260,13 @@ export function decodeUtf8(b: Uint8Array, start: number, end: number): string {
  * Reads columns of one record in place (no copy). Call {@link reset} for each record; the
  * underlying bytes must stay unchanged while reading (e.g. the cursor must not move).
  */
+/** Placeholders until a reader's first reset (allocating a buffer and view per reader is slow). */
+const EMPTY_BYTES = new Uint8Array(0);
+const EMPTY_VIEW = new DataView(EMPTY_BYTES.buffer);
+
 export class RecordReader {
-  private b: Uint8Array = new Uint8Array(0);
-  private dv: DataView = new DataView(new ArrayBuffer(0));
+  private b: Uint8Array = EMPTY_BYTES;
+  private dv: DataView = EMPTY_VIEW;
   private dvBuffer: ArrayBufferLike | null = null;
   private n = 0;
   private wide = false;
