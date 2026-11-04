@@ -244,6 +244,7 @@ class FrontEnd {
     const plan: PlanOp = {
       op: 'iterate',
       id,
+      name,
       init: first.plan,
       steps,
       distinct,

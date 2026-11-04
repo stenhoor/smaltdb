@@ -175,7 +175,12 @@ operators.
     sides as plans. Shadow mode also compares the subplans. The front end no longer counts WITH scopes in a column's
     depth. A planner fix came with it: EXISTS over an aggregate is no longer decorrelated (it always has its row).
     In slt, 1,002 SELECTs (compounds, views) are left.
-  - **6c-iii:** windows, `setop`, `iterate`, VALUES, derived tables and views (FROM nested plans), EXPLAIN estimates.
+  - **6c-iii (done):** windows (one Window operator; definitions and calls created where first read), compounds
+    (the cores write the first core's registers), VALUES, recursive CTEs (`iterate` / `working`; `iterate` carries
+    the CTE's name for EXPLAIN), and nested plans as FROM items (derived tables, views, CTE references). A nested
+    plan the planner may flatten into the query (a plain projection, filter or join of tables) still goes through
+    the planner until flattening reads plans (step 7a), unless flattening is off. In slt, 2 SELECTs (plain views)
+    are left.
   - **6c-iv:** the default becomes `plan`.
 - **6d, deletion** (about 2k lines removed): the AST paths of the planner and the internal `slot` / `native` nodes.
 - **Hardest parts:** projection-pushdown parity, register order (window snapshots), outer references from subqueries

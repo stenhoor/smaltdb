@@ -75,6 +75,8 @@ export type PlanOp =
   | {
       readonly op: 'iterate';
       readonly id: number;
+      /** The recursive CTE's name, for EXPLAIN. */
+      readonly name: string;
       readonly init: PlanOp;
       readonly steps: readonly PlanOp[];
       readonly distinct: boolean;

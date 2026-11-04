@@ -452,6 +452,8 @@ interface BoundFrom {
   items: { item: FromItem; joinType: JoinType }[];
   /** A table function's arguments (item `p`), bound to the earlier items' registers. */
   args(p: number): PlanExpr[] | undefined;
+  /** Item `p` planned (a nested plan), or undefined: registered from its FROM item. `working`: a recursive step's rows. */
+  source(p: number): { plan: QueryPlan; working?: boolean } | undefined;
   /** Item `p` was registered: its registers are known. */
   added(p: number): void;
   /** Item `p`'s join condition, split into conjuncts. */
@@ -1255,7 +1257,100 @@ export class Planner {
    */
   planPlan(op: PlanOp, columns: ResultColumnInfo[]): QueryPlan | null {
     if (!supportedPlan(op, 0)) return null;
-    return this.physical(op, columns, null);
+    return this.physicalAny(op, columns, null);
+  }
+
+  /**
+   * A plan `supportedPlan` accepts: a SELECT core (`physical`), or VALUES or a compound with its ORDER BY and LIMIT,
+   * as `planSelect` plans them. `outRegs`: the registers to write the results to (the cores of a compound and the
+   * steps of a recursive CTE share them).
+   */
+  private physicalAny(op: PlanOp, given: ResultColumnInfo[] | null, outer: ColMap | null, outRegs?: number[]): QueryPlan {
+    if (flatShape(op)) return this.physical(op, given, outer, outRegs);
+    let n = op;
+    const lim = n.op === 'limit' ? n : null;
+    if (lim) n = lim.input;
+    const sort = n.op === 'sort' ? n.keys : null;
+    if (sort) n = (n as Extract<PlanOp, { op: 'sort' }>).input;
+    let plan: QueryPlan;
+    if (n.op === 'values') plan = this.physicalValues(n, given, outer, outRegs, sort);
+    else {
+      // A compound: every core writes the first core's registers.
+      const cores: PlanOp[] = [];
+      const ops: ('UNION' | 'UNION ALL' | 'INTERSECT' | 'EXCEPT')[] = [];
+      let c: PlanOp = n;
+      while (c.op === 'setop') {
+        cores.unshift(c.inputs[1]);
+        ops.unshift(SETOPS[c.kind]);
+        c = c.inputs[0];
+      }
+      const first = this.physicalAny(c, null, outer, outRegs);
+      const regs = first.outRegs;
+      let root = first.root;
+      let correlated = first.correlated;
+      cores.forEach((core, i) => {
+        const next = this.physicalAny(core, null, outer, regs);
+        correlated ||= next.correlated;
+        root = new Compound(root, next.root, ops[i], regs, first.columns.map((x) => x.collation));
+      });
+      const columns = given ?? first.columns;
+      if (sort) root = new Sort(root, sort.map((k) => this.resultKey(k, regs, columns)), regs, undefined, this.env.spill ?? null);
+      plan = { root, outRegs: regs, columns, correlated };
+    }
+    if (lim) {
+      const bind = (e: PlanExpr): Fn => compileBoundExpr(rebind(e, NO_COLUMNS, (m, f) => this.subqueryExpr(m, f)), this.env.funcCtx).fn;
+      plan.root = new Limit(plan.root, bind(lim.count), lim.offset ? bind(lim.offset) : undefined);
+    }
+    return plan;
+  }
+
+  /** A compound's (or VALUES') ORDER BY key: a result position, with the result column's collation. */
+  private resultKey(k: PlanSortKey, regs: number[], columns: ResultColumnInfo[]): SortKey {
+    const at = (k.expr as ColRef).index;
+    return { reg: regs[at], desc: k.desc, nullsFirst: k.nullsFirst, collation: columns[at].collation };
+  }
+
+  /** VALUES (`planValues`), with its ORDER BY when it is the statement's only core. */
+  private physicalValues(op: Extract<PlanOp, { op: 'values' }>, given: ResultColumnInfo[] | null, outer: ColMap | null, outRegs: number[] | undefined, sort: readonly PlanSortKey[] | null): QueryPlan {
+    const scope = new Scope(null);
+    const f: ColMap = (c) => {
+      scope.correlated = true;
+      return outer!(shallower(c));
+    };
+    const compiled = op.rows.map((r) => r.map((e) => compileBoundExpr(rebind(e, f, (m, g) => this.subqueryExpr(m, g)), this.env.funcCtx)));
+    const regs = outRegs ?? compiled[0].map(() => this.regs.alloc());
+    const columns = given ?? compiled[0].map((c, i) => ({ name: `column${i + 1}`, type: c.type, collation: Collation.Binary, affinity: 'NONE' as Affinity }));
+    let root: Operator = new Values(compiled.map((r) => r.map((c) => c.fn)), regs);
+    if (sort) root = new Sort(root, sort.map((k) => ({ ...this.resultKey(k, regs, columns), collation: Collation.Binary })), regs, undefined, this.env.spill ?? null);
+    return { root, outRegs: regs, columns, correlated: scope.correlated };
+  }
+
+  /** The working rows of the recursive CTEs being planned, by `iterate` id. */
+  private readonly workings = new Map<number, { scan: WorkingScan; regs: number[]; columns: ResultColumnInfo[] }>();
+
+  /** A recursive CTE (`planRecursiveCte`): its initial rows, then its steps until one gives no rows. */
+  private physicalIterate(op: Extract<PlanOp, { op: 'iterate' }>, outer: ColMap | null): QueryPlan {
+    const initPlan = this.physicalAny(op.init, null, outer);
+    const outRegs = initPlan.outRegs;
+    const columns = initPlan.columns;
+    const wregs = outRegs.map(() => this.regs.alloc());
+    const scan = new WorkingScan(op.name, wregs);
+    this.workings.set(op.id, { scan, regs: wregs, columns });
+    let correlated = initPlan.correlated;
+    const steps = op.steps.map((step) => {
+      const p = this.physicalAny(step, null, outer, outRegs);
+      correlated ||= p.correlated;
+      return p.root;
+    });
+    const order = op.order?.length
+      ? op.order.map((k) => {
+          const at = (k.expr as ColRef).index;
+          return { index: at, desc: k.desc, nullsFirst: k.nullsFirst, collation: columns[at].collation };
+        })
+      : null;
+    const bind = (e: PlanExpr): Fn => compileBoundExpr(rebind(e, NO_COLUMNS, (m, f) => this.subqueryExpr(m, f)), this.env.funcCtx).fn;
+    const root = new RecursiveCte(op.name, initPlan.root, steps, outRegs, scan, op.distinct, columns.map((c) => c.collation), order, op.limit ? bind(op.limit) : undefined, op.offset ? bind(op.offset) : undefined);
+    return { root, outRegs, columns, correlated };
   }
 
   /**
@@ -1263,7 +1358,7 @@ export class Planner {
    * subquery's plan (its columns with depth > 0), null at the top; `given` are the result columns (computed when
    * null).
    */
-  private physical(op: PlanOp, given: ResultColumnInfo[] | null, outer: ColMap | null): QueryPlan {
+  private physical(op: PlanOp, given: ResultColumnInfo[] | null, outer: ColMap | null, outRegs?: number[]): QueryPlan {
     const s = flatShape(op)!;
     const ctx = this.env.funcCtx;
     const compile = (e: PlanExpr): Compiled => compileBoundExpr(e, ctx);
@@ -1283,7 +1378,7 @@ export class Planner {
     const limitFns = (): [Fn, Fn | undefined] => [compile(bind(s.limit!.count, NO_COLUMNS)).fn, s.limit!.offset ? compile(bind(s.limit!.offset, NO_COLUMNS)).fn : undefined];
     const limit = (root: Operator): Operator => (s.limit ? new Limit(root, ...limitFns()) : root);
 
-    const fast = this.countRowsOf(s, given);
+    const fast = this.countRowsOf(s, given, outRegs);
     if (fast) return { ...fast, root: limit(fast.root) };
 
     // The FROM row: the registers of each source's columns, in FROM order, marked as read when an expression reading
@@ -1294,7 +1389,7 @@ export class Planner {
     if (s.from) {
       const leaves = s.from;
       const offsets: number[] = [];
-      leaves.reduce((at, l) => (offsets.push(at), at + leafWidth(l.op)), 0);
+      leaves.reduce((at, l) => (offsets.push(at), at + planWidth(l.op)), 0);
       const onSlot =
         (p: number): ColMap =>
         (c) => {
@@ -1302,7 +1397,17 @@ export class Planner {
           return slotFor(c, f.reg, f.use);
         };
       root = this.planFrom(undefined, undefined, scope, {
-        items: leaves.map((l, p) => ({ item: leafItem(l.op, p), joinType: JOIN_TYPES[l.join ?? 'inner'] })),
+        items: leaves.map((l, p) => ({ item: l.op.op === 'scan' || l.op.op === 'source' ? leafItem(l.op, p) : { kind: 'subquery', select: NO_SELECT, alias: `#${p}`, pos: 0, end: 0 }, joinType: JOIN_TYPES[l.join ?? 'inner'] })),
+        // Nested plans read the rows of the operation this one is evaluated in, as derived tables do.
+        source: (p) => {
+          const l = leaves[p].op;
+          if (l.op === 'scan' || l.op === 'source') return undefined;
+          if (l.op === 'working') {
+            const w = this.workings.get(l.id)!;
+            return { plan: { root: w.scan, outRegs: w.regs, columns: w.columns, correlated: true }, working: true };
+          }
+          return { plan: l.op === 'iterate' ? this.physicalIterate(l, outer) : this.physicalAny(l, null, outer) };
+        },
         args: (p) => {
           const l = leaves[p].op;
           return l.op === 'source' && l.kind === 'function' ? l.args.map((a) => bind(a, fromSlot)) : undefined;
@@ -1363,10 +1468,56 @@ export class Planner {
       };
     }
 
+    // Window calls: their window is defined, and their registers allocated, where first read (as `windowRef`).
+    const windowDefs: WindowDef[] = [];
+    let readSlot = outSlot;
+    if (s.windows.length) {
+      const base = s.aggregate ? s.aggregate.keys.length + s.aggregate.aggs.length + s.aggregate.carry.length : fromRow.length;
+      const defs = new Map<number, WindowDef>();
+      const calls = new Map<number, number>();
+      const at: { w: number; c: number }[] = s.windows.flatMap((w, wi) => w.calls.map((_c, ci) => ({ w: wi, c: ci })));
+      const windowReg = (j: number): number => {
+        let reg = calls.get(j);
+        if (reg !== undefined) return reg;
+        const w = s.windows[at[j].w];
+        const call = w.calls[at[j].c];
+        const args = call.args.map((x) => compile(bind(x, outSlot)));
+        let def = defs.get(at[j].w);
+        if (def === undefined) {
+          const partition = w.partition.map((x) => compile(bind(x.expr, outSlot)).fn);
+          const order = w.order.map((k) => ({ fn: compile(bind(k.expr, outSlot)).fn, desc: k.desc, nullsFirst: k.nullsFirst, collation: collationId(k.collation) }));
+          const offset = (b: { offset?: PlanExpr }): Fn | undefined => (b.offset ? compile(bind(b.offset, outSlot)).fn : undefined);
+          const frame: FrameSpec = {
+            unit: w.frame.unit,
+            start: { kind: w.frame.start.kind, offset: offset(w.frame.start) },
+            end: { kind: w.frame.end.kind, offset: offset(w.frame.end) },
+            exclude: w.frame.exclude,
+          } as FrameSpec;
+          def = { partition, partitionColls: w.partition.map((x) => collationId(x.collation)), order, frame, calls: [] };
+          defs.set(at[j].w, def);
+          windowDefs.push(def);
+        }
+        reg = this.regs.alloc();
+        calls.set(j, reg);
+        const aggDef = aggregateFunctions.get(call.fn);
+        const builtin = WINDOW_ARITY[call.fn];
+        def.calls.push({
+          kind: builtin ? (call.fn as WindowCallKind) : 'aggregate',
+          name: call.fn,
+          args: args.map((x) => x.fn),
+          filter: call.filter ? compile(bind(call.filter, outSlot)).fn : undefined,
+          outReg: reg,
+          agg: aggDef && !builtin ? { def: aggDef, argTypes: args.map((x) => x.type), collation: args[0]?.collSrc ? args[0].collation : Collation.Binary, star: call.star } : undefined,
+        });
+        return reg;
+      };
+      readSlot = (c) => (c.index < base ? outSlot(c) : slotFor(c, windowReg(c.index - base)));
+    }
+
     // Result expressions, then ORDER BY expressions that are not results, then HAVING (planCore's order).
     const n = s.width;
-    const compiled = s.project.slice(0, n).map((e) => compile(bind(e, outSlot)));
-    const regs = compiled.map(() => this.regs.alloc());
+    const compiled = s.project.slice(0, n).map((e) => compile(bind(e, readSlot)));
+    const regs = outRegs ?? compiled.map(() => this.regs.alloc());
     const columns: ResultColumnInfo[] =
       given ?? compiled.map((c) => ({ name: '', type: c.type, collation: c.collSrc !== CollSrc.None ? c.collation : Collation.Binary, affinity: c.affinity }));
     const sortKeys: SortKey[] = [];
@@ -1377,7 +1528,7 @@ export class Planner {
       let reg: number;
       if (at < n) reg = regs[at];
       else {
-        extraFns.push(compile(bind(s.project[at], outSlot)).fn);
+        extraFns.push(compile(bind(s.project[at], readSlot)).fn);
         extraRegs.push((reg = this.regs.alloc()));
       }
       sortKeys.push({ reg, desc: k.desc, nullsFirst: k.nullsFirst, collation: collationId(k.collation) });
@@ -1415,6 +1566,13 @@ export class Planner {
     }
 
     if (!agg) root = this.tryFuseScanFilter(root, scope);
+    if (windowDefs.length) {
+      // Registers the projection reads from each input row (restored by the Window operator).
+      const snap = agg
+        ? [...agg.groupRegs, ...agg.aggs.map((x) => x.outReg), ...agg.bare]
+        : scope.sources.flatMap((src) => [...src.cols.map((c) => c.reg), ...(src.rowidReg >= 0 ? [src.rowidReg] : [])]);
+      root = new Window(root, [...new Set(snap)], windowDefs);
+    }
     root = new Project(root, [...compiled.map((c) => c.fn), ...extraFns], [...regs, ...extraRegs]);
     if (s.distinct) root = new Distinct(root, regs, s.distinct.map(collationId));
     if (sortNeeded) {
@@ -1434,7 +1592,7 @@ export class Planner {
     const test = (c: Fn): PlanExpr => subqueryNative({ fn: c, type: 'int', collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false });
     const inTest = (x: PlanExpr & { k: 'inSubquery' }): Fn => {
       const probe = compilePlanExpr(rebind(x.probe, f, (m, g) => this.subqueryExpr(m, g)), ctx);
-      return this.inFromPlan(this.physical(x.plan, null, f), probe);
+      return this.inFromPlan(this.physicalAny(x.plan, null, f), probe);
     };
     if (n.k === 'not') {
       const t = inTest(n.arg as PlanExpr & { k: 'inSubquery' });
@@ -1446,8 +1604,8 @@ export class Planner {
     if (n.k === 'inSubquery') return test(inTest(n));
     const q = n as PlanExpr & { k: 'subquery' };
     const dec = decorrelationDisabled() ? null : this.decorrelatePlan(q.plan, q.mode, f);
-    if (q.mode === 'exists') return test(dec ? dec.fn : this.existsFromPlan(this.physical(q.plan, null, f)));
-    return subqueryNative(dec ?? this.scalarFromPlan(this.physical(q.plan, null, f)));
+    if (q.mode === 'exists') return test(dec ? dec.fn : this.existsFromPlan(this.physicalAny(q.plan, null, f)));
+    return subqueryNative(dec ?? this.scalarFromPlan(this.physicalAny(q.plan, null, f)));
   }
 
   /**
@@ -1456,9 +1614,10 @@ export class Planner {
    * row's (conjuncts over the enclosing row alone are guards). Null when it does not qualify.
    */
   private decorrelatePlan(op: PlanOp, kind: 'exists' | 'scalar', f: ColMap): Compiled | null {
-    const s = flatShape(op)!;
+    const s = flatShape(op);
+    if (!s) return null;
     const a = s.aggregate;
-    if (s.limit?.offset || !s.from || !s.where || (a && a.keys.length) || s.having) return null;
+    if (s.limit?.offset || !s.from || !s.where || (a && a.keys.length) || s.having || s.windows.length) return null;
     if (kind === 'scalar' && (s.limit || s.sort)) return null;
     if (kind === 'exists' && s.limit && !(s.limit.count.k === 'lit' && typeof s.limit.count.value === 'number' && s.limit.count.value >= 1)) return null;
     if (kind === 'exists' && a) return null;
@@ -1574,7 +1733,7 @@ export class Planner {
   }
 
   /** `SELECT count(*) FROM table` with nothing else: count leaf cells (planCountStar for plans). */
-  private countRowsOf(s: FlatShape, given: ResultColumnInfo[] | null): QueryPlan | null {
+  private countRowsOf(s: FlatShape, given: ResultColumnInfo[] | null, outRegs: number[] | undefined): QueryPlan | null {
     const a = s.aggregate;
     const scan = s.from?.length === 1 && s.from[0].op.op === 'scan' ? s.from[0].op : null;
     if (!scan || !a || s.where || s.having || s.distinct || scan.indexedBy !== undefined || s.width !== 1) return null;
@@ -1584,7 +1743,8 @@ export class Planner {
     if (c.fn !== 'count' || !c.star || c.filter || e.k !== 'col' || e.index !== 0 || isOpaque(e)) return null;
     const table = this.env.getTable(scan.table, scan.db);
     if (!table || isColumnar(table)) return null;
-    const reg = this.regs.alloc();
+    if (s.windows.length) return null;
+    const reg = outRegs ? outRegs[0] : this.regs.alloc();
     const columns = given ?? [{ name: '', type: 'int' as StaticType, collation: Collation.Binary, affinity: 'NONE' as Affinity }];
     return { root: new CountRows(this.env.openTree(table.rootPage), table.name, reg), outRegs: [reg], columns, correlated: false };
   }
@@ -1706,7 +1866,9 @@ export class Planner {
     if (bound) items.push(...bound.items.map((it) => ({ ...it, natural: false })));
     else this.flattenFrom(from!, 'INNER', undefined, undefined, false, items);
     items.forEach((it, p) => {
-      this.addSource(it.item, it.joinType, scope, bound?.args(p));
+      const planned = bound?.source(p);
+      if (planned) this.addPlannedSource(planned.plan, it.joinType, scope, (it.item as { alias: string }).alias, planned.working === true);
+      else this.addSource(it.item, it.joinType, scope, bound?.args(p));
       bound?.added(p);
     });
 
@@ -2076,6 +2238,13 @@ export class Planner {
       if (sameName(s.name, src.name)) throw new SmaltError('SMALT_ERROR', `ambiguous table name: ${src.name}`);
     }
     scope.sources.push(src);
+  }
+
+  /** A FROM item the physical planner planned: as `addSource` registers a derived table (or a recursive step's rows). */
+  private addPlannedSource(sub: QueryPlan, joinType: JoinType, scope: Scope, name: string, working: boolean): void {
+    if (sub.correlated && !working) scope.correlated = true;
+    const cols: SourceColumn[] = sub.columns.map((c, i) => ({ name: c.name, reg: sub.outRegs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '', index: i }));
+    scope.sources.push({ name, cols, rowidReg: -1, sub, joinType, on: [], hidden: new Set(), position: scope.sources.length });
   }
 
   private sourceRegs(src: Source): number[] {
@@ -3492,11 +3661,13 @@ type ScanOp = Extract<PlanOp, { op: 'scan' }>;
 type AggregateOp = Extract<PlanOp, { op: 'aggregate' }>;
 
 type SourceOp = Extract<PlanOp, { op: 'source' }>;
-type FromLeaf = { op: ScanOp | SourceOp; join: JoinKind | null; on?: PlanExpr };
+type WindowOp = Extract<PlanOp, { op: 'window' }>;
+/** A FROM item: a table, a source, or a nested plan (a derived table, view, CTE or the working rows of one). */
+type FromLeaf = { op: PlanOp; join: JoinKind | null; on?: PlanExpr };
 
 /**
- * A plan the physical planner handles: limit? / sort? / distinct? / project / having? / aggregate? / where? / FROM,
- * where FROM is a left-deep tree of joins over tables and sources, or no FROM (one empty row).
+ * One SELECT core of a plan: limit? / sort? / distinct? / project / window* / having? / aggregate? / where? / FROM,
+ * where FROM is a left-deep tree of joins over its items, or no FROM (one empty row).
  */
 interface FlatShape {
   limit?: { count: PlanExpr; offset?: PlanExpr };
@@ -3506,6 +3677,8 @@ interface FlatShape {
   project: readonly PlanExpr[];
   /** The number of result expressions. */
   width: number;
+  /** Window operations, innermost (first defined) first. */
+  windows: WindowOp[];
   having?: PlanExpr;
   aggregate?: AggregateOp;
   where?: PlanExpr;
@@ -3513,25 +3686,53 @@ interface FlatShape {
   from: FromLeaf[] | null;
 }
 
-/** The FROM items of a left-deep join tree over tables and sources, or null. */
+/** The FROM items of a left-deep join tree, or null. */
 function fromLeaves(op: PlanOp, out: FromLeaf[] = []): FromLeaf[] | null {
-  if (op.op === 'scan' || op.op === 'source') {
+  if (op.op !== 'join') {
     out.push({ op, join: null });
     return out;
   }
-  if (op.op !== 'join' || op.kind === 'semi' || op.kind === 'anti') return null;
+  if (op.kind === 'semi' || op.kind === 'anti') return null;
   const right = op.inputs[1];
-  if ((right.op !== 'scan' && right.op !== 'source') || !fromLeaves(op.inputs[0], out)) return null;
+  if (right.op === 'join' || !fromLeaves(op.inputs[0], out)) return null;
   out.push({ op: right, join: op.kind, ...(op.on ? { on: op.on } : {}) });
   return out;
 }
 
-const leafWidth = (op: ScanOp | SourceOp): number => (op.op === 'scan' ? op.columns.length : op.types.length);
+/** The number of columns a plan outputs. */
+function planWidth(op: PlanOp): number {
+  switch (op.op) {
+    case 'scan':
+      return op.columns.length;
+    case 'source':
+    case 'working':
+    case 'values':
+      return op.types.length;
+    case 'project':
+      return op.exprs.length;
+    case 'filter':
+    case 'sort':
+    case 'limit':
+    case 'distinct':
+      return planWidth(op.input);
+    case 'aggregate':
+      return op.keys.length + op.aggs.length + op.carry.length;
+    case 'window':
+      return planWidth(op.input) + op.calls.length;
+    case 'setop':
+      return planWidth(op.inputs[0]);
+    case 'iterate':
+      return planWidth(op.init);
+    case 'join':
+      return op.kind === 'semi' || op.kind === 'anti' ? planWidth(op.inputs[0]) : planWidth(op.inputs[0]) + planWidth(op.inputs[1]);
+  }
+}
 
 const JOIN_TYPES: Readonly<Record<JoinKind, JoinType>> = { inner: 'INNER', cross: 'INNER', left: 'LEFT', right: 'RIGHT', full: 'FULL', semi: 'INNER', anti: 'INNER' };
 
 /** The FROM item the planner registers for a plan's table or source (named by position: names are resolved). */
 function leafItem(op: ScanOp | SourceOp, p: number): FromItem {
+  // (Nested plans are registered as planned sources: see BoundFrom.source.)
   const alias = `#${p}`;
   if (op.op === 'scan') return { kind: 'table', name: op.table, alias, ...(op.db ? { schema: op.db } : {}), ...(op.indexedBy !== undefined ? { indexedBy: op.indexedBy } : {}), pos: 0, end: 0 };
   if (op.kind === 'function') return { kind: 'function', name: op.name, args: [], alias, pos: 0, end: 0 };
@@ -3563,6 +3764,11 @@ function flatShape(op: PlanOp): FlatShape | null {
   s.project = n.exprs;
   s.width ??= n.exprs.length;
   n = n.input;
+  s.windows = [];
+  while (n.op === 'window') {
+    s.windows.unshift(n);
+    n = n.input;
+  }
   if (n.op === 'filter' && n.input.op === 'aggregate') {
     s.having = n.pred;
     n = n.input;
@@ -3590,6 +3796,13 @@ function shapeExprs(s: FlatShape): { all: (PlanExpr | undefined)[]; limit: (Plan
       s.having,
       s.where,
       ...(a ? [...a.keys.map((k) => k.expr), ...a.aggs.flatMap((c) => [...c.args, c.filter]), ...a.carry] : []),
+      ...s.windows.flatMap((w) => [
+        ...w.partition.map((p) => p.expr),
+        ...w.order.map((k) => k.expr),
+        w.frame.start.offset,
+        w.frame.end.offset,
+        ...w.calls.flatMap((c) => [...c.args, c.filter]),
+      ]),
       ...(s.from ?? []).flatMap((l) => [l.on, ...(l.op.op === 'source' ? l.op.args : [])]),
     ],
     limit: [s.limit?.count, s.limit?.offset],
@@ -3597,15 +3810,51 @@ function shapeExprs(s: FlatShape): { all: (PlanExpr | undefined)[]; limit: (Plan
 }
 
 /**
- * Whether the physical planner handles `op` (step 6c): a flat shape whose expressions read its own row or, inside a
- * subquery `level` deep, the rows of the operations it is evaluated in, and whose subqueries it handles too. LIMIT
- * and OFFSET read no rows.
+ * Whether the physical planner handles `op` (step 6c), `level` evaluations deep (a subquery's plan is one deeper than
+ * the operation it is evaluated in): a SELECT core, VALUES or a compound, possibly with ORDER BY and LIMIT, whose
+ * expressions read its own row or the rows of the operations it is evaluated in, and whose subqueries and FROM items
+ * it handles too. LIMIT and OFFSET read no rows.
  */
 function supportedPlan(op: PlanOp, level: number): boolean {
   const s = flatShape(op);
-  if (!s) return false;
-  const { all, limit } = shapeExprs(s);
-  return all.every((e) => e === undefined || readsRows(e, level)) && limit.every((e) => e === undefined || readsRows(e, -1));
+  if (s) {
+    const { all, limit } = shapeExprs(s);
+    if (!all.every((e) => e === undefined || readsRows(e, level)) || !limit.every((e) => e === undefined || readsRows(e, -1))) return false;
+    return (s.from ?? []).every((l) => supportedLeaf(l.op, level));
+  }
+  let n = op;
+  if (n.op === 'limit') {
+    if (!readsRows(n.count, -1) || (n.offset && !readsRows(n.offset, -1))) return false;
+    n = n.input;
+  }
+  if (n.op === 'sort') n = n.input;
+  if (n.op === 'values') return n.rows.every((r) => r.every((e) => readsRows(e, level)));
+  return n.op === 'setop' && supportedPlan(n.inputs[0], level) && supportedPlan(n.inputs[1], level);
+}
+
+/**
+ * A FROM item the physical planner handles: a table, a source, a recursive CTE, its working rows, or a nested plan.
+ * A nested plan that the planner may flatten into the query (a plain projection, filter or join of tables: see
+ * exec/flatten.ts) is left to the planner until flattening reads plans (step 7a), unless flattening is off.
+ */
+function supportedLeaf(op: PlanOp, level: number): boolean {
+  switch (op.op) {
+    case 'scan':
+    case 'source':
+    case 'working':
+      return true;
+    case 'iterate':
+      return supportedPlan(op.init, level) && op.steps.every((x) => supportedPlan(x, level)) && [op.limit, op.offset].every((e) => e === undefined || readsRows(e, -1));
+    default:
+      return supportedPlan(op, level) && (flatteningDisabled() || !mayFlatten(op));
+  }
+}
+
+/** True unless the planner surely does not flatten nested plan `op` (it may for a plain SELECT over tables). */
+function mayFlatten(op: PlanOp): boolean {
+  const s = flatShape(op);
+  if (!s || s.limit || s.sort || s.distinct || s.aggregate || s.having || s.windows.length || !s.from) return false;
+  return s.from.every((l) => l.op.op === 'scan') && !shapeExprs(s).all.some((e) => e !== undefined && hasNested(e));
 }
 
 /** True when `e`'s columns are at most `level` evaluations out (-1: none), and its subqueries are supported. */
@@ -3642,6 +3891,11 @@ function shallower(c: ColRef): ColRef {
   const d: PlanExpr = { ...c, depth: c.depth - 1 };
   return d as ColRef;
 }
+
+const SETOPS = { union: 'UNION', unionAll: 'UNION ALL', intersect: 'INTERSECT', except: 'EXCEPT' } as const;
+
+/** The SELECT of a FROM item the physical planner registers itself (never read). */
+const NO_SELECT = {} as SelectStmt;
 
 /** Maps a column of an operation's row to the register slot that holds it. */
 type ColMap = (c: ColRef) => PlanExpr;
