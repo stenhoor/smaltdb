@@ -15,14 +15,15 @@ import { CollSrc, type ColumnBinding, type CompileScope, bindExpr, boundMetadata
 import { type FunctionContext, aggregateFunctions, scalarFunctions } from '../../exec/functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../../exec/window.js';
 import { flattenCore, flatteningDisabled } from '../../exec/flatten.js';
+import { aggregateCallName } from '../ast-util.js';
 import { mayMatchMatview, matviewCoreOf } from '../../exec/planner.js';
 import { containsAggregate, containsWindow, coreReferences, exprEquals, firstAggregateCall, firstWindowCall, sameName, selectReferences } from '../../exec/planner.js';
-import type { PlanExpr } from '../../plan/expr.js';
+import { type PlanExpr, typeOf } from '../../plan/expr.js';
 import { getMeta, markFlattened, setMeta, setSubquerySql } from '../../exec/sql-meta.js';
 import type { AggCall, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../plan/ops.js';
 import type { CollationName } from '../../plan/types.js';
 import { Collation } from '../../values.js';
-import type { CallExpr, ColumnExpr, Expr, FrameBound, FromItem, JoinType, OrderingTerm, ResultColumn, SelectCore, SelectCoreSelect, SelectStmt, WindowSpec, WithClause } from '../ast.js';
+import type { CallExpr, ColumnExpr, DeleteStmt, Expr, FrameBound, FromItem, JoinType, OrderingTerm, ResultColumn, SelectCore, SelectCoreSelect, SelectStmt, WindowSpec, WithClause } from '../ast.js';
 
 /** What the front end needs of the catalog. */
 export interface FrontEndCatalog {
@@ -81,6 +82,22 @@ export function toPlan(
     }
     throw e;
   }
+}
+
+/**
+ * DELETE (ADR 0014, step 8a): a `delete` plan over the rows of `table` (resolved and checked by the database) that
+ * the WHERE keeps, with RETURNING over each deleted row. Throws the error the planner would raise.
+ */
+export function toDeletePlan(stmt: DeleteStmt, table: TableSchema, text: string, catalog: FrontEndCatalog): FrontEndWrite {
+  const fe = new FrontEnd(catalog, text);
+  const r = fe.deletePlan(stmt, table);
+  return { plan: fe.resolveRefs(r.plan), returning: r.returning };
+}
+
+/** A write's plan, and its RETURNING columns. */
+export interface FrontEndWrite {
+  plan: PlanOp;
+  returning?: { name: string; type: StaticType }[];
 }
 
 const ROWID_NAMES = new Set(['rowid', 'oid', '_rowid_']);
@@ -242,6 +259,99 @@ class FrontEnd {
       isCte: (n) => scope?.findCte(n) !== undefined,
       text: this.text,
     });
+  }
+
+  // ---------------------------------------------------------------- writes
+
+  deletePlan(stmt: DeleteStmt, table: TableSchema): { plan: PlanOp; returning?: { name: string; type: StaticType }[] } {
+    // As `Database.planTarget`: the target (in its resolved schema) in a scope under the statement's CTEs.
+    const withScope = new FeScope(null);
+    withScope.ctesOnly = true;
+    if (stmt.with) this.registerCtes(stmt.with, withScope);
+    const scope = new FeScope(stmt.with ? withScope : null);
+    const db = table.temp ? 'temp' : 'main';
+    const input = this.from({ kind: 'table', pos: 0, schema: db, name: table.name, alias: stmt.alias, end: 0 }, stmt.where, scope);
+    const rowid = scope.sources[0].rowid!;
+    const ret = stmt.returning ? this.returning(stmt.returning, table, stmt.alias) : undefined;
+    const plan: PlanOp = { op: 'delete', table: table.name, db, input, rowid, ...(ret ? { returning: ret.exprs } : {}) };
+    return { plan, returning: ret?.columns };
+  }
+
+  /**
+   * A write's RETURNING list over one row of `table` (its columns, then its rowid), as `Database.compileReturning`
+   * binds it (`Database.rowScope`).
+   */
+  private returning(list: ResultColumn[], table: TableSchema, alias: string | undefined): { exprs: PlanExpr[]; columns: { name: string; type: StaticType }[] } {
+    const cs = this.rowScope([{ table, names: [alias ?? table.name, table.name], offset: 0 }]);
+    const exprs: PlanExpr[] = [];
+    const columns: { name: string; type: StaticType }[] = [];
+    const q = alias ?? table.name;
+    for (const rc of list) {
+      if (rc.kind === 'star' || rc.kind === 'tableStar') {
+        if (rc.kind === 'tableStar' && rc.table.toLowerCase() !== q.toLowerCase() && rc.table.toLowerCase() !== table.name.toLowerCase()) {
+          throw new SmaltError('SMALT_ERROR', `no such table: ${rc.table}`);
+        }
+        for (const c of table.columns) {
+          const b = bindExpr({ kind: 'column', table: q, name: c.name, pos: 0, end: 0 }, cs);
+          exprs.push(b);
+          columns.push({ name: c.name, type: typeOf(b) });
+        }
+        continue;
+      }
+      const agg = aggregateCallName(rc.expr);
+      if (agg) throw new SmaltError('SMALT_ERROR', `misuse of aggregate function ${agg}()`);
+      const b = bindExpr(rc.expr, cs);
+      exprs.push(b);
+      columns.push({ name: rc.alias ?? (rc.expr.kind === 'column' ? rc.expr.name : this.text.slice(rc.expr.pos, rc.expr.end)), type: boundMetadata(b, this.catalog.funcCtx).type });
+    }
+    return { exprs, columns };
+  }
+
+  /**
+   * Names over single rows of tables (a write's target row, `excluded` in upserts), as `Database.rowsScope`: each
+   * source's columns, then its rowid, from `offset` in the row; unqualified names resolve to the first source that
+   * has the column. Subqueries see no enclosing columns.
+   */
+  private rowScope(sources: { table: TableSchema; names: string[]; offset: number }[]): CompileScope {
+    const outer = this.compileScope(new FeScope(null));
+    const bind = (src: (typeof sources)[number], name: string): ColumnBinding | null => {
+      const i = src.table.columns.findIndex((c) => sameName(c.name, name));
+      let at: number;
+      let type: StaticType;
+      let collation: Collation;
+      let affinity: Affinity;
+      if (i >= 0) {
+        const c = src.table.columns[i];
+        type = c.rowidAlias ? 'int' : c.type === 'INTEGER' ? 'int' : c.type === 'REAL' ? 'real' : c.type === 'TEXT' ? 'text' : c.type === 'BLOB' ? 'blob' : 'any';
+        affinity = (c.type === 'ANY' || c.type === 'BLOB' ? 'BLOB' : c.type) as Affinity;
+        collation = c.collation;
+        at = src.offset + i;
+      } else if (ROWID_NAMES.has(name.toLowerCase())) {
+        type = 'int';
+        affinity = 'INTEGER';
+        collation = Collation.Binary;
+        at = src.offset + src.table.columns.length;
+      } else return null;
+      return { reg: this.ref({ depth: 0, input: 0, index: () => at, type, collation }), type, collation, affinity };
+    };
+    return {
+      ...outer,
+      resolveColumn: (e) => {
+        if (e.table) {
+          const q = e.table.toLowerCase();
+          const src = sources.find((x) => x.names.some((n) => n.toLowerCase() === q));
+          if (!src) throw new SmaltError('SMALT_ERROR', `no such column: ${e.table}.${e.name}`);
+          const b = bind(src, e.name);
+          if (!b) throw new SmaltError('SMALT_ERROR', `no such column: ${e.table}.${e.name}`);
+          return b;
+        }
+        for (const src of sources) {
+          const b = bind(src, e.name);
+          if (b) return b;
+        }
+        throw new SmaltError('SMALT_ERROR', `no such column: ${e.name}`);
+      },
+    };
   }
 
   private registerCtes(w: WithClause, scope: FeScope): void {
@@ -1056,6 +1166,10 @@ class FrontEnd {
         break;
       case 'distinct':
         this.resolveRefs(o.input);
+        break;
+      case 'delete':
+        this.resolveRefs(o.input);
+        if (o.returning) list(o.returning);
         break;
       case 'window': {
         this.resolveRefs(o.input);

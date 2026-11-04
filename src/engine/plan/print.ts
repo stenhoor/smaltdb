@@ -80,6 +80,8 @@ export function printPlan(op: PlanOp, depth = 0): string {
     }
     case 'distinct':
       return `${pad}distinct\n${sub(op.input)}`;
+    case 'delete':
+      return `${pad}delete ${op.db}.${op.table} rowid #0.${op.rowid}${op.returning ? ` returning ${list(op.returning)}` : ''}\n${sub(op.input)}`;
     case 'window': {
       const calls = op.calls.map((c) => `${c.fn}(${c.star ? '*' : list(c.args)})`).join(', ');
       const part = op.partition.length ? ` partition [${list(op.partition.map((p) => p.expr))}]` : '';

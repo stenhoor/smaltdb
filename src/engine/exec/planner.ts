@@ -1222,6 +1222,116 @@ export class Planner {
   }
 
   /**
+   * A `delete` plan's target rows (ADR 0014, step 8a), as `Database.planTarget` plans them: the scan with its WHERE,
+   * reading the rowid; then registers for the deleted row and its RETURNING, as `Database.compileReturning`
+   * compiles it. Null for plans it does not handle.
+   */
+  planDelete(op: Extract<PlanOp, { op: 'delete' }>): { root: Operator; rowidReg: number; oldBase: number; oldRowid: number; returning: Fn[] | undefined } | null {
+    let n = op.input;
+    let where: PlanExpr | undefined;
+    if (n.op === 'filter') {
+      where = n.pred;
+      n = n.input;
+    }
+    if (n.op !== 'scan') return null;
+    if ((where && !readsRows(where, 0)) || !(op.returning ?? []).every((e) => readsRows(e, 0))) return null;
+    const table = this.env.getTable(n.table, n.db);
+    if (!table) return null;
+    const scope = new Scope(null);
+    const b = this.bindings(scope, null);
+    const root = this.planFromShape([{ op: n, join: null }], where, scope, null, b);
+    // The writer reads each row by its rowid.
+    const rowid = b.fromRow[op.rowid];
+    b.useOf(rowid)();
+    const ncols = table.columns.length;
+    const oldBase = this.regs.alloc(ncols);
+    const oldRowid = this.regs.alloc();
+    const row: ColMap = (c) => slotFor(c, c.index < ncols ? oldBase + c.index : oldRowid);
+    const returning = op.returning?.map((e) => compileBoundExpr(b.bind(e, row), this.env.funcCtx).fn);
+    return { root, rowidReg: rowid.reg, oldBase, oldRowid, returning };
+  }
+
+  /**
+   * How a plan's expressions bind to registers in `scope`: `fromRow` holds the FROM row's registers (filled by
+   * `planFromShape`), `fromSlot` maps its columns, and `bind` binds an expression with its subqueries planned. Columns of
+   * enclosing operations (depth > 0) go through `outer`, which marks the scope correlated.
+   */
+  private bindings(scope: Scope, outer: ColMap | null): Bindings {
+    const up =
+      (m: ColMap): ColMap =>
+      (c) => {
+        if (c.depth === 0) return m(c);
+        scope.correlated = true;
+        return outer!(shallower(c));
+      };
+    const sub = (n: PlanExpr, f: ColMap): PlanExpr => this.subqueryExpr(n, f);
+    // `col`: the table column (-1: the rowid), or the source's column. Marking it read is the slot's `use`.
+    const fromRow: FromCell[] = [];
+    const useOf = (f: FromCell): (() => void) => {
+      const { reg, src, col } = f;
+      if (src.access) return col < 0 ? () => this.dryCompile || src.access!.useRowid(reg) : () => this.dryCompile || src.access!.use(col, reg);
+      return () => this.dryCompile || src.external?.projection?.add(src.cols[col].name.toLowerCase());
+    };
+    return {
+      bind: (e, m) => rebind(e, up(m), sub),
+      analysis: (e, m) => rebind(e, up(m)),
+      fromRow,
+      useOf,
+      fromSlot: (c) => slotFor(c, fromRow[c.index].reg, useOf(fromRow[c.index])),
+    };
+  }
+
+  /**
+   * FROM and WHERE of a plan: the join region over `from` (or one empty row), with the WHERE conjuncts. The FROM row's
+   * registers are each source's columns, in FROM order, marked as read when an expression reading them is compiled;
+   * join conditions read input 0 (the sources before) and input 1 (the source being joined).
+   */
+  private planFromShape(from: FromLeaf[] | null, where: PlanExpr | undefined, scope: Scope, outer: ColMap | null, b: Bindings): Operator {
+    const { bind, fromSlot, fromRow, useOf } = b;
+    // A WHERE / ON conjunct with a subquery is bound for analysis with placeholders, and planned where it is placed.
+    const conjunct = (e: PlanExpr, m: ColMap): BoundConjunct => (hasNested(e) ? { bound: b.analysis(e, m), compile: () => bind(e, m) } : { bound: bind(e, m) });
+    if (!from) {
+      this.lastScan = null;
+      const root = new SingleRow();
+      return where ? new Filter(root, compileBoundExpr(bind(where, fromSlot), this.env.funcCtx).fn) : root;
+    }
+    const leaves = from;
+    const offsets: number[] = [];
+    leaves.reduce((at, l) => (offsets.push(at), at + planWidth(l.op)), 0);
+    const onSlot =
+      (p: number): ColMap =>
+      (c) => {
+        const f = fromRow[c.input === 1 ? offsets[p] + c.index : c.index];
+        return slotFor(c, f.reg, useOf(f));
+      };
+    return this.planFrom(undefined, undefined, scope, {
+      items: leaves.map((l, p) => ({ item: l.op.op === 'scan' || l.op.op === 'source' ? leafItem(l.op, p) : { kind: 'subquery', select: NO_SELECT, alias: `#${p}`, pos: 0, end: 0 }, joinType: JOIN_TYPES[l.join ?? 'inner'] })),
+      // Nested plans read the rows of the operation this one is evaluated in, as derived tables do.
+      source: (p) => {
+        const l = leaves[p].op;
+        if (l.op === 'scan' || l.op === 'source') return undefined;
+        if (l.op === 'working') {
+          const w = this.workings.get(l.id)!;
+          return { plan: { root: w.scan, outRegs: w.regs, columns: w.columns, correlated: true }, working: true };
+        }
+        return { plan: l.op === 'iterate' ? this.physicalIterate(l, outer) : this.physicalAny(l, null, outer) };
+      },
+      args: (p) => {
+        const l = leaves[p].op;
+        return l.op === 'source' && l.kind === 'function' ? l.args.map((a) => bind(a, fromSlot)) : undefined;
+      },
+      added: (p) => {
+        const src = scope.sources[p];
+        const l = leaves[p].op;
+        if (l.op === 'scan') for (const c of l.columns) fromRow.push({ reg: c < 0 ? src.rowidReg : src.cols[c].reg, src, col: c });
+        else for (let i = 0; i < src.cols.length; i++) fromRow.push({ reg: src.cols[i].reg, src, col: i });
+      },
+      on: (p) => (leaves[p].on ? splitBoundConjuncts(leaves[p].on!).map((c) => conjunct(c, onSlot(p))) : []),
+      where: () => (where ? splitBoundConjuncts(where).map((c) => conjunct(c, fromSlot)) : []),
+    });
+  }
+
+  /**
    * A plan `supportedPlan` accepts: a SELECT core (`physical`), or VALUES or a compound with its ORDER BY and LIMIT,
    * as `planSelect` plans them. `outRegs`: the registers to write the results to (the cores of a compound and the
    * steps of a recursive CTE share them).
@@ -1324,75 +1434,14 @@ export class Planner {
     const ctx = this.env.funcCtx;
     const compile = (e: PlanExpr): Compiled => compileBoundExpr(e, ctx);
     const scope = new Scope(null);
-    // Columns of enclosing operations: the subquery is correlated, and depends on what the enclosing mapping marks.
-    const up =
-      (m: ColMap): ColMap =>
-      (c) => {
-        if (c.depth === 0) return m(c);
-        scope.correlated = true;
-        return outer!(shallower(c));
-      };
-    const sub = (n: PlanExpr, f: ColMap): PlanExpr => this.subqueryExpr(n, f);
-    const bind = (e: PlanExpr, m: ColMap): PlanExpr => rebind(e, up(m), sub);
-    // A WHERE / ON conjunct with a subquery is bound for analysis with placeholders, and planned where it is placed.
-    const conjunct = (e: PlanExpr, m: ColMap): BoundConjunct => (hasNested(e) ? { bound: rebind(e, up(m)), compile: () => bind(e, m) } : { bound: bind(e, m) });
+    const b = this.bindings(scope, outer);
+    const { bind, fromSlot, fromRow, useOf } = b;
     const limitFns = (): [Fn, Fn | undefined] => [compile(bind(s.limit!.count, NO_COLUMNS)).fn, s.limit!.offset ? compile(bind(s.limit!.offset, NO_COLUMNS)).fn : undefined];
     const limit = (root: Operator): Operator => (s.limit ? new Limit(root, ...limitFns()) : root);
 
     const fast = this.countRowsOf(s, given, outRegs);
     if (fast) return { ...fast, root: limit(fast.root) };
-
-    // The FROM row: the registers of each source's columns, in FROM order, marked as read when an expression reading
-    // them is compiled. Join conditions read input 0 (the sources before) and input 1 (the source being joined).
-    // `col`: the table column (-1: the rowid), or the source's column. Marking it read is the slot's `use`.
-    const fromRow: { reg: number; src: Source; col: number }[] = [];
-    const useOf = (f: { reg: number; src: Source; col: number }): (() => void) => {
-      const { reg, src, col } = f;
-      if (src.access) return col < 0 ? () => this.dryCompile || src.access!.useRowid(reg) : () => this.dryCompile || src.access!.use(col, reg);
-      return () => this.dryCompile || src.external?.projection?.add(src.cols[col].name.toLowerCase());
-    };
-    const fromSlot: ColMap = (c) => slotFor(c, fromRow[c.index].reg, useOf(fromRow[c.index]));
-    let root: Operator;
-    if (s.from) {
-      const leaves = s.from;
-      const offsets: number[] = [];
-      leaves.reduce((at, l) => (offsets.push(at), at + planWidth(l.op)), 0);
-      const onSlot =
-        (p: number): ColMap =>
-        (c) => {
-          const f = fromRow[c.input === 1 ? offsets[p] + c.index : c.index];
-          return slotFor(c, f.reg, useOf(f));
-        };
-      root = this.planFrom(undefined, undefined, scope, {
-        items: leaves.map((l, p) => ({ item: l.op.op === 'scan' || l.op.op === 'source' ? leafItem(l.op, p) : { kind: 'subquery', select: NO_SELECT, alias: `#${p}`, pos: 0, end: 0 }, joinType: JOIN_TYPES[l.join ?? 'inner'] })),
-        // Nested plans read the rows of the operation this one is evaluated in, as derived tables do.
-        source: (p) => {
-          const l = leaves[p].op;
-          if (l.op === 'scan' || l.op === 'source') return undefined;
-          if (l.op === 'working') {
-            const w = this.workings.get(l.id)!;
-            return { plan: { root: w.scan, outRegs: w.regs, columns: w.columns, correlated: true }, working: true };
-          }
-          return { plan: l.op === 'iterate' ? this.physicalIterate(l, outer) : this.physicalAny(l, null, outer) };
-        },
-        args: (p) => {
-          const l = leaves[p].op;
-          return l.op === 'source' && l.kind === 'function' ? l.args.map((a) => bind(a, fromSlot)) : undefined;
-        },
-        added: (p) => {
-          const src = scope.sources[p];
-          const l = leaves[p].op;
-          if (l.op === 'scan') for (const c of l.columns) fromRow.push({ reg: c < 0 ? src.rowidReg : src.cols[c].reg, src, col: c });
-          else for (let i = 0; i < src.cols.length; i++) fromRow.push({ reg: src.cols[i].reg, src, col: i });
-        },
-        on: (p) => (leaves[p].on ? splitBoundConjuncts(leaves[p].on!).map((c) => conjunct(c, onSlot(p))) : []),
-        where: () => (s.where ? splitBoundConjuncts(s.where).map((c) => conjunct(c, fromSlot)) : []),
-      });
-    } else {
-      this.lastScan = null;
-      root = new SingleRow();
-      if (s.where) root = new Filter(root, compile(bind(s.where, fromSlot)).fn);
-    }
+    let root = this.planFromShape(s.from, s.where, scope, outer, b);
 
     // The aggregate's output row: keys, then aggregate calls (registers allocated where first read, as planCore
     // does while binding), then carried bare columns (the FROM row's registers).
@@ -3616,6 +3665,8 @@ function planWidth(op: PlanOp): number {
       return planWidth(op.init);
     case 'join':
       return op.kind === 'semi' || op.kind === 'anti' ? planWidth(op.inputs[0]) : planWidth(op.inputs[0]) + planWidth(op.inputs[1]);
+    case 'delete':
+      return op.returning?.length ?? 0;
   }
 }
 
@@ -3790,6 +3841,19 @@ const NO_SELECT = {} as SelectStmt;
 
 /** Maps a column of an operation's row to the register slot that holds it. */
 type ColMap = (c: ColRef) => PlanExpr;
+
+/** A FROM row cell: its register, its source and the source's column (-1: a table's rowid). */
+type FromCell = { reg: number; src: Source; col: number };
+
+/** See `Planner.bindings`. */
+interface Bindings {
+  bind: (e: PlanExpr, m: ColMap) => PlanExpr;
+  /** Bound for analysis: subqueries are placeholders. */
+  analysis: (e: PlanExpr, m: ColMap) => PlanExpr;
+  fromRow: FromCell[];
+  useOf: (f: FromCell) => () => void;
+  fromSlot: ColMap;
+}
 
 /** For LIMIT / OFFSET, which read no row. */
 const NO_COLUMNS: ColMap = () => {

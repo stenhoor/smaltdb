@@ -1,6 +1,7 @@
 /**
  * Small AST helpers shared by the planner, flattening, morsel analysis and MV matching.
  */
+import { aggregateFunctions } from '../exec/functions.js';
 import type { Expr } from './ast.js';
 
 const NO_POS = { pos: 0, end: 0 };
@@ -58,4 +59,23 @@ export function and(a: Expr | undefined, b: Expr | undefined): Expr | undefined 
 /** The conjunction of `list` (undefined when empty). */
 export function andAll(list: Expr[]): Expr | undefined {
   return list.reduce<Expr | undefined>((acc, e) => (acc ? ({ kind: 'binary', op: 'AND', left: acc, right: e, ...NO_POS } as Expr) : e), undefined);
+}
+
+/** Name of an aggregate function called by `e` (outside nested SELECTs), if any. */
+export function aggregateCallName(e: Expr): string | undefined {
+  let hit: string | undefined;
+  const go = (x: unknown): void => {
+    if (hit || x === null || typeof x !== 'object') return;
+    if (Array.isArray(x)) return x.forEach(go);
+    if (Object.getPrototypeOf(x) !== Object.prototype) return;
+    const o = x as Record<string, unknown>;
+    if (o.kind === 'select' && 'core' in o) return;
+    if (o.kind === 'call' && aggregateFunctions.has(String(o.name)) && o.over === undefined && !((o.name === 'min' || o.name === 'max') && (o.args as unknown[]).length > 1)) {
+      hit = String(o.name);
+      return;
+    }
+    for (const k of Object.keys(o)) go(o[k]);
+  };
+  go(e);
+  return hit;
 }

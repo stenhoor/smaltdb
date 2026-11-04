@@ -24,8 +24,9 @@ import { type ExternalScan, Planner, type QueryPlan, Registers, markUnordered } 
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
-import { planMode, shadowCheck } from './exec/plan-shadow.js';
-import { type FrontEndCatalog, type FrontEndResult, toPlan } from './sql/frontend/select.js';
+import { planMode, shadowCheck, shadowWrite } from './exec/plan-shadow.js';
+import { aggregateCallName } from './sql/ast-util.js';
+import { type FrontEndCatalog, type FrontEndResult, toDeletePlan, toPlan } from './sql/frontend/select.js';
 import { type MatviewCandidate, matchMatview } from './exec/mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import type { ReaderSettings } from '../shared/protocol.js';
@@ -3757,13 +3758,10 @@ export class Database implements FunctionContext {
   private compileDelete(stmt: DeleteStmt, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
     if (stmt.orderBy.length || stmt.limit) throw new SmaltError('SMALT_UNSUPPORTED', 'DELETE ... ORDER BY/LIMIT is not supported');
     const table = this.targetTable(stmt.table, stmt.schema);
-    const { root, colRegs, rowidReg } = this.planTarget(table, stmt.alias, stmt.where, planner, undefined, stmt.with);
+    const { root, rowidReg, oldBase, oldRowid, ret } = this.deleteParts(stmt, table, planner);
     // DELETE without WHERE truncates, unless foreign keys need to see every row.
     const truncate = !stmt.where && !stmt.returning;
     const ncols = table.columns.length;
-    const oldBase = planner.regs.alloc(ncols);
-    const oldRowid = planner.regs.alloc();
-    const ret = stmt.returning ? this.compileReturning(stmt.returning, table, stmt.alias, this.rowScope(table, stmt.alias, oldBase, oldRowid, planner), planner.sqlText) : undefined;
     const exec = (r: SqlValue[], out?: SqlValue[][]): RunResult => {
       if (truncate && !this.fk.involved(table)) {
         this.touchTable(table);
@@ -3796,6 +3794,44 @@ export class Database implements FunctionContext {
       return { changes, lastInsertRowid: this.lastRowid };
     };
     return { exec, returning: ret && { columns: ret.columns, types: ret.types } };
+  }
+
+  /**
+   * DELETE's target rows (the scan with its WHERE, reading the rowid) and its RETURNING over registers for the
+   * deleted row, planned as `SMALT_PLAN` says: through the plan layer (step 8a), or the planner's AST path.
+   */
+  private deleteParts(stmt: DeleteStmt, table: TableSchema, planner: Planner): DeleteParts {
+    const legacy = (): DeleteParts => {
+      const { root, rowidReg } = this.planTarget(table, stmt.alias, stmt.where, planner, undefined, stmt.with);
+      const oldBase = planner.regs.alloc(table.columns.length);
+      const oldRowid = planner.regs.alloc();
+      const ret = stmt.returning ? this.compileReturning(stmt.returning, table, stmt.alias, this.rowScope(table, stmt.alias, oldBase, oldRowid, planner), planner.sqlText) : undefined;
+      return { root, rowidReg, oldBase, oldRowid, ret };
+    };
+    const physical = (): DeleteParts | null => {
+      const fe = toDeletePlan(stmt, table, planner.sqlText, this.frontEndCatalog());
+      const p = fe.plan.op === 'delete' ? planner.planDelete(fe.plan) : null;
+      if (!p) return null;
+      const ret = fe.returning && { columns: fe.returning.map((c) => c.name), types: fe.returning.map((c) => c.type), fns: p.returning! };
+      return { root: p.root, rowidReg: p.rowidReg, oldBase: p.oldBase, oldRowid: p.oldRowid, ret };
+    };
+    switch (planMode()) {
+      case 'legacy':
+        return legacy();
+      case 'plan':
+        return physical() ?? legacy();
+      case 'shadow': {
+        const start = planner.mark();
+        const first = planner.subplans.length;
+        return shadowWrite(planner.sqlText, legacy, physical, start, (p) =>
+          [
+            ...explainRows(p.root).map((x) => `${x.id} ${x.parent} ${x.detail}`),
+            ...planner.subplans.slice(first).flatMap((x) => [x.label, ...explainRows(x.root).map((r) => `  ${r.id} ${r.parent} ${r.detail}`)]),
+            `returning ${p.ret ? p.ret.columns.map((c, i) => `${c} ${p.ret!.types[i]}`).join(', ') : '-'}`,
+          ].join('\n'),
+        );
+      }
+    }
   }
 
   // ---------------------------------------------------------------- PRAGMA
@@ -4362,24 +4398,6 @@ export class RowCursor {
   }
 }
 
-/** Name of an aggregate function called by `e` (outside nested SELECTs), if any. */
-function aggregateCallName(e: Expr): string | undefined {
-  let hit: string | undefined;
-  const go = (x: unknown): void => {
-    if (hit || x === null || typeof x !== 'object') return;
-    if (Array.isArray(x)) return x.forEach(go);
-    if (Object.getPrototypeOf(x) !== Object.prototype) return;
-    const o = x as Record<string, unknown>;
-    if (o.kind === 'select' && 'core' in o) return;
-    if (o.kind === 'call' && aggregateFunctions.has(String(o.name)) && o.over === undefined && !((o.name === 'min' || o.name === 'max') && (o.args as unknown[]).length > 1)) {
-      hit = String(o.name);
-      return;
-    }
-    for (const k of Object.keys(o)) go(o[k]);
-  };
-  go(e);
-  return hit;
-}
 
 /** A value can be stored in a column of this type without conversion (materialized views keep query results exact). */
 function fitsStorage(v: SqlValue, t: string): boolean {
@@ -4439,4 +4457,13 @@ interface MorselEntry {
   q: MorselQuery;
   types?: StaticType[];
   final?: Statement;
+}
+
+/** See `Database.deleteParts`. */
+interface DeleteParts {
+  root: Operator;
+  rowidReg: number;
+  oldBase: number;
+  oldRowid: number;
+  ret: { columns: string[]; types: StaticType[]; fns: Fn[] } | undefined;
 }

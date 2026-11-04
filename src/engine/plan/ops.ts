@@ -104,6 +104,11 @@ export type PlanOp =
       readonly carry: readonly PlanExpr[];
     }
   | { readonly op: 'distinct'; readonly input: PlanOp; readonly collations: readonly CollationName[] }
+  /**
+   * DELETE: deletes the rows of `table` whose rowids `input` gives in its column `rowid`. `returning` reads each
+   * deleted row: the table's columns, then its rowid. Outputs the RETURNING rows.
+   */
+  | { readonly op: 'delete'; readonly table: string; readonly db: 'main' | 'temp'; readonly input: PlanOp; readonly rowid: number; readonly returning?: readonly PlanExpr[] }
   /** One window (PARTITION BY, ORDER BY, frame): outputs its input's columns, then one column per call. */
   | {
       readonly op: 'window';
