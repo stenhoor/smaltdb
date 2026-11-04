@@ -8,7 +8,7 @@
  * errors against the current planner's. The one shape the front end does not handle is a table function that reads
  * external data (`read_csv()` and the like: its columns come from the data); `toPlan` returns null for it.
  */
-import { type TableSchema, storageTypeFor } from '../../catalog/schema.js';
+import { type TableSchema, findColumn, storageTypeFor } from '../../catalog/schema.js';
 import { SmaltError } from '../../errors.js';
 import { type Affinity, type StaticType, affinityOfStorage, staticTypeOfStorage } from '../../exec/convert.js';
 import { CollSrc, type ColumnBinding, type CompileScope, bindExpr, boundMetadata, conjuncts, withCompiledMeta } from '../../exec/expr.js';
@@ -23,7 +23,7 @@ import { getMeta, markFlattened, setMeta, setSubquerySql } from '../../exec/sql-
 import type { AggCall, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../plan/ops.js';
 import type { CollationName } from '../../plan/types.js';
 import { Collation } from '../../values.js';
-import type { CallExpr, ColumnExpr, DeleteStmt, Expr, UpdateStmt, FrameBound, FromItem, JoinType, OrderingTerm, ResultColumn, SelectCore, SelectCoreSelect, SelectStmt, WindowSpec, WithClause } from '../ast.js';
+import type { CallExpr, ColumnExpr, DeleteStmt, Expr, InsertStmt, UpdateStmt, UpsertClause, FrameBound, FromItem, JoinType, OrderingTerm, ResultColumn, SelectCore, SelectCoreSelect, SelectStmt, WindowSpec, WithClause } from '../ast.js';
 
 /** What the front end needs of the catalog. */
 export interface FrontEndCatalog {
@@ -88,20 +88,78 @@ export function toPlan(
  * DELETE (ADR 0014, step 8a): a `delete` plan over the rows of `table` (resolved and checked by the database) that
  * the WHERE keeps, with RETURNING over each deleted row. Throws the error the planner would raise.
  */
-export function toDeletePlan(stmt: DeleteStmt, table: TableSchema, text: string, catalog: FrontEndCatalog): FrontEndWrite {
-  const fe = new FrontEnd(catalog, text);
-  const r = fe.deletePlan(stmt, table);
-  return { plan: fe.resolveRefs(r.plan), returning: r.returning };
+export function toDeletePlan(stmt: DeleteStmt, table: TableSchema, text: string, catalog: FrontEndCatalog): FrontEndWrite | null {
+  return unlessUnsupported(() => {
+    const fe = new FrontEnd(catalog, text);
+    const r = fe.deletePlan(stmt, table);
+    return { plan: fe.resolveRefs(r.plan), returning: r.returning };
+  });
+}
+
+/** `f`'s result, or null for a shape the front end does not handle yet (e.g. an external table function). */
+function unlessUnsupported<T>(f: () => T): T | null {
+  try {
+    return f();
+  } catch (e) {
+    if (e instanceof Unsupported) return null;
+    throw e;
+  }
 }
 
 /**
  * UPDATE (ADR 0014, step 8b): an `update` plan over the rows of `table` (resolved and checked by the database), with
  * the FROM sources, that the WHERE keeps; its SET values, and RETURNING over each updated row.
  */
-export function toUpdatePlan(stmt: UpdateStmt, table: TableSchema, text: string, catalog: FrontEndCatalog): FrontEndWrite {
-  const fe = new FrontEnd(catalog, text);
-  const r = fe.updatePlan(stmt, table);
-  return { plan: fe.resolveRefs(r.plan), returning: r.returning };
+export function toUpdatePlan(stmt: UpdateStmt, table: TableSchema, text: string, catalog: FrontEndCatalog): FrontEndWrite | null {
+  return unlessUnsupported(() => {
+    const fe = new FrontEnd(catalog, text);
+    const r = fe.updatePlan(stmt, table);
+    return { plan: fe.resolveRefs(r.plan), returning: r.returning };
+  });
+}
+
+/**
+ * INSERT (ADR 0014, step 8c): an `append` plan for `stmt` (its WITH merged into the SELECT source) into `table`,
+ * whose values go to the table's `columns` (resolved by the database: -1 for the rowid). Its SELECT source has
+ * materialized-view matching (`rewriteSelect`, the statement's policy). `source`: the SELECT's result columns.
+ */
+export function toInsertPlan(
+  stmt: InsertStmt,
+  table: TableSchema,
+  columns: number[],
+  text: string,
+  catalog: FrontEndCatalog,
+  rewriteSelect?: (select: SelectStmt, text: string) => SelectStmt | null,
+): (FrontEndWrite & { source?: FrontEndColumn[] }) | null {
+  return unlessUnsupported(() => {
+    const fe = new FrontEnd(catalog, text, rewriteSelect);
+    const r = fe.insertPlan(stmt, table, columns);
+    return { plan: fe.resolveRefs(r.plan), returning: r.returning, source: r.source };
+  });
+}
+
+/**
+ * The constraint an ON CONFLICT clause (`n`th of `count`) targets: an index of `table`, -1 for its INTEGER PRIMARY
+ * KEY, null for any; throws SQLite's errors. Shared by the planner's AST path and the front end.
+ */
+export function upsertTarget(u: UpsertClause, n: number, count: number, table: TableSchema): number | null {
+  if (!u.target) {
+    if (n !== count - 1) throw new SmaltError('SMALT_ERROR', 'a target-less ON CONFLICT clause must be the last one');
+    return null;
+  }
+  if (u.target.where) throw new SmaltError('SMALT_UNSUPPORTED', 'ON CONFLICT targets with WHERE (partial indexes) are not supported yet');
+  const cols = u.target.columns.map((ic) => {
+    if (ic.expr.kind !== 'column' && !(ic.expr.kind === 'collate' && ic.expr.expr.kind === 'column')) throw new SmaltError('SMALT_ERROR', 'ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint');
+    const name = ic.expr.kind === 'column' ? ic.expr.name : (ic.expr.expr as ColumnExpr).name;
+    const i = findColumn(table, name);
+    if (i < 0) throw new SmaltError('SMALT_ERROR', `no such column: ${name}`);
+    return i;
+  });
+  const set = new Set(cols);
+  if (cols.length === 1 && cols[0] === table.rowidAlias) return -1;
+  const i = table.indexes.findIndex((idx) => idx.unique && idx.columns.length === set.size && idx.columns.every((c) => set.has(c.column)));
+  if (i < 0) throw new SmaltError('SMALT_ERROR', 'ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint');
+  return i;
 }
 
 /** A write's plan, and its RETURNING columns. */
@@ -272,6 +330,48 @@ class FrontEnd {
   }
 
   // ---------------------------------------------------------------- writes
+
+  /** As `Database.compileInsert`: RETURNING, then the ON CONFLICT clauses, then the rows (their errors in that order). */
+  insertPlan(stmt: InsertStmt, table: TableSchema, columns: number[]): { plan: PlanOp; returning?: { name: string; type: StaticType }[]; source?: FrontEndColumn[] } {
+    const ncols = table.columns.length;
+    const ret = stmt.returning ? this.returning(stmt.returning, table, stmt.alias) : undefined;
+    const upserts = stmt.upsert.map((u, n) => {
+      const target = upsertTarget(u, n, stmt.upsert.length, table);
+      if (u.action.kind === 'nothing') return { target };
+      if (!u.target) throw new SmaltError('SMALT_ERROR', 'ON CONFLICT DO UPDATE requires a conflict target');
+      // DO UPDATE sees the existing row (table name/alias, unqualified) and `excluded.*` (the proposed row).
+      const cs = this.rowScope([
+        { table, names: [stmt.alias ?? table.name, table.name], offset: 0 },
+        { table, names: ['excluded'], offset: ncols + 1 },
+      ]);
+      const sets: { column: number; value: PlanExpr }[] = [];
+      for (const sc of u.action.set) {
+        if (sc.columns.length !== 1) throw new SmaltError('SMALT_UNSUPPORTED', 'row-value assignments are not supported yet');
+        const column = findColumn(table, sc.columns[0]);
+        if (column < 0) throw new SmaltError('SMALT_ERROR', `no such column: ${sc.columns[0]}`);
+        sets.push({ column, value: bindExpr(sc.value, cs) });
+      }
+      const where = u.action.where ? bindExpr(u.action.where, cs) : undefined;
+      return { target, update: { sets, ...(where ? { where } : {}) } };
+    });
+    let input: PlanOp | null = null;
+    let source: FrontEndColumn[] | undefined;
+    if (stmt.source.kind === 'values') {
+      const cs = this.compileScope(new FeScope(null));
+      const rows = stmt.source.rows.map((row) => {
+        if (row.length !== columns.length) throw new SmaltError('SMALT_ERROR', `table ${table.name} has ${ncols} columns but ${row.length} values were supplied`);
+        return row.map((e) => bindExpr(e, cs));
+      });
+      input = { op: 'values', rows, types: rows[0].map((e) => typeOf(e)) };
+    } else if (stmt.source.kind === 'select') {
+      const r = this.select(stmt.source.select, null);
+      if (r.columns.length !== columns.length) throw new SmaltError('SMALT_ERROR', `table ${table.name} has ${ncols} columns but ${r.columns.length} values were supplied`);
+      input = r.plan;
+      source = r.columns;
+    }
+    const plan: PlanOp = { op: 'append', table: table.name, db: table.temp ? 'temp' : 'main', input, columns, upserts, ...(ret ? { returning: ret.exprs } : {}) };
+    return { plan, returning: ret?.columns, source };
+  }
 
   updatePlan(stmt: UpdateStmt, table: TableSchema): { plan: PlanOp; returning?: { name: string; type: StaticType }[] } {
     // As `Database.planTarget`: the target (in its resolved schema), joined with the FROM sources, under the CTEs.
@@ -1208,6 +1308,15 @@ class FrontEnd {
         break;
       case 'delete':
         this.resolveRefs(o.input);
+        if (o.returning) list(o.returning);
+        break;
+      case 'append':
+        if (o.input) this.resolveRefs(o.input);
+        for (const u of o.upserts) {
+          if (!u.update) continue;
+          for (const x of u.update.sets) (x as { value: PlanExpr }).value = ex(x.value);
+          if (u.update.where) (u.update as { where?: PlanExpr }).where = ex(u.update.where);
+        }
         if (o.returning) list(o.returning);
         break;
       case 'update':

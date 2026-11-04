@@ -110,6 +110,25 @@ export type PlanOp =
    */
   | { readonly op: 'delete'; readonly table: string; readonly db: 'main' | 'temp'; readonly input: PlanOp; readonly rowid: number; readonly returning?: readonly PlanExpr[] }
   /**
+   * INSERT: appends a row to `table` for each row of `input` (none: one row of defaults), its columns assigned to the
+   * table's `columns` (-1: the rowid; the others take their defaults). Each of `upserts` handles a conflict on the
+   * constraint `target` (an index of the table, -1 its INTEGER PRIMARY KEY, null any): nothing, or `update`, whose
+   * expressions read the existing row (the table's columns, then its rowid) and then the proposed row (`excluded`,
+   * likewise). `returning` reads each inserted or updated row.
+   */
+  | {
+      readonly op: 'append';
+      readonly table: string;
+      readonly db: 'main' | 'temp';
+      readonly input: PlanOp | null;
+      readonly columns: readonly number[];
+      readonly upserts: readonly {
+        readonly target: number | null;
+        readonly update?: { readonly sets: readonly { readonly column: number; readonly value: PlanExpr }[]; readonly where?: PlanExpr };
+      }[];
+      readonly returning?: readonly PlanExpr[];
+    }
+  /**
    * UPDATE: for each row of `input` (the target's rows, joined with the FROM sources when `from`), sets the target
    * row whose rowid is in column `rowid`: each of `sets` assigns `value` (over the input row) to the table's column
    * `column` (-1: the rowid). `returning` reads each updated row: the table's columns, then its rowid.

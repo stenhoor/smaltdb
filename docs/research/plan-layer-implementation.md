@@ -235,6 +235,14 @@ operators.
   the SET values as `compileUpdate` does (the target's column registers, which the writer fills with each old row,
   and `markUnordered` without FROM); the table's defaults and CHECK constraints stay compiled from the schema, and
   RETURNING compiles over the new row's registers (`compileRowExprs`). The writer loop stays in the engine.
+- **8c (done), `append`:** the plan op holds the input rows (a `values` op, a SELECT plan with the statement's WITH
+  merged in and materialized-view matching, or none for DEFAULT VALUES), the table column each input column fills
+  (-1 for the rowid), the ON CONFLICT clauses (the target constraint from `upsertTarget`, shared with the AST path,
+  and DO UPDATE's SET values and WHERE over the existing row, then `excluded`), and RETURNING over the new row.
+  `Database.insertParts` compiles the defaults and CHECK constraints from the schema for both paths, then either the
+  AST path or the physical plan (`planPlan` for a SELECT input, `compileAt` for VALUES rows and DO UPDATE over
+  explicit registers); the conflict modes, affinities and the writer loop stay in the engine. A write the front end
+  does not handle (an external table function in its FROM) returns null, and the AST path plans it.
 
 `delete`, then `update`, then `append` (column mapping, conflict modes, upsert with `excluded.*` as a second input,
 RETURNING, the single-row fast path). They compile to today's `TableWriter` programs. What belongs to the table stays
