@@ -138,16 +138,22 @@ class Emitter {
   /** Numeric literals, read from K once per function instance (`head()`) instead of written into the source. */
   private readonly hoisted: string[] = [];
 
+  /**
+   * Pipelines write numeric literals into the source: they scan whole tables, so V8 specializing on the constant
+   * matters more than reusing the compiled function for another literal.
+   */
+  inlineNumbers = false;
+
   private number(x: number): string {
+    if (this.inlineNumbers) return `(${String(x)})`;
     const i = this.consts.push(x) - 1;
     this.hoisted.push(`const $c${i} = K[${i}];`);
     return `$c${i}`;
   }
 
   /**
-   * Declarations of the literals: they live in K, not in the source, so statements that differ only in their
-   * literals share one compiled function (and its type feedback). Per-row functions read them once per instance
-   * (before the function); pipelines, which loop over many rows per call, copy them into locals on entry.
+   * Declarations of the literals of a per-row function: they live in K, not in the source, so statements that differ
+   * only in their literals share one compiled function (and its type feedback), read once per instance.
    */
   head(): string {
     return this.hoisted.length ? this.hoisted.join(' ') + ' ' : '';
@@ -614,6 +620,7 @@ class Pipeline {
 
   constructor(fallback: (e: PlanExpr) => FallbackNode) {
     this.em = new Emitter(fallback);
+    this.em.inlineNumbers = true;
     this.em.regRef = (reg, type) => {
       const flagged = type === 'int' || type === 'real';
       if (!this.localRegs.has(reg)) this.localRegs.set(reg, flagged);
@@ -840,7 +847,7 @@ export function generateFusedAggregate(
   pl.addPredicates(preds);
   pl.addAggregates(aggs, (i) => `S${i}`);
   const src = [...aggs.map((_, i) => `const S${i} = S[${i}];`), ...scanLoop(pl, source)].join('\n');
-  return compileFn(['H', 'K', 'T'], `return function smaltFusedAggregate(r, S) {\n${pl.em.head()}${src}\n};`, [helpers, pl.em.consts, truthy]);
+  return compileFn(['H', 'K', 'T'], `return function smaltFusedAggregate(r, S) {\n${src}\n};`, [helpers, pl.em.consts, truthy]);
 }
 
 /** A columnar scan's decode list (column, register pairs) and rowid registers. */
@@ -944,7 +951,7 @@ export function generateScanFilter(
     '}',
     'return k;',
   ].join('\n');
-  return compileFn(['H', 'K', 'T'], `return function smaltScanFilter(st, r, out) {\n${pl.em.head()}${src}\n};`, [helpers, pl.em.consts, truthy]);
+  return compileFn(['H', 'K', 'T'], `return function smaltScanFilter(st, r, out) {\n${src}\n};`, [helpers, pl.em.consts, truthy]);
 }
 
 /** Group lookup helpers for generated GROUP BY pipelines. */
@@ -985,5 +992,5 @@ export function generateGroupAggregate(
   pl.rowLines.push(...keyLines, `const key = ${keyExpr};`, 'let G = groups.get(key);', `if (G === undefined) { G = H.newGroup([${keyVals.join(', ')}]); groups.set(key, G); order.push(G); }`, 'const GS = G.st;');
   pl.addAggregates(aggs, (i) => `GS[${i}]`);
   const src = scanLoop(pl, source).join('\n');
-  return compileFn(['H', 'K', 'T'], `return function smaltGroupAggregate(r, groups, order) {\n${pl.em.head()}${src}\n};`, [helpers, pl.em.consts, truthy]);
+  return compileFn(['H', 'K', 'T'], `return function smaltGroupAggregate(r, groups, order) {\n${src}\n};`, [helpers, pl.em.consts, truthy]);
 }
