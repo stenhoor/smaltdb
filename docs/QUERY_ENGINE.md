@@ -22,10 +22,10 @@ SQL text
     per next() call
 ```
 
-Some statements still take the planner's AST path (`Planner.planSelect`), which resolves names and builds operators
-in one pass: SELECTs answered from a materialized view (matching rewrites the AST until step 7c), views and FROM
-subqueries that flattening may merge into the query (`exec/flatten.ts`, until step 7a), and INSERT, UPDATE and
-DELETE (step 8). `SMALT_PLAN=legacy` plans every SELECT that way until the AST path is removed (after step 8); see
+The front end merges simple views and FROM subqueries into the query with the AST flattener (`exec/flatten.ts`)
+before binding, as the planner does. Some statements still take the planner's AST path (`Planner.planSelect`), which
+resolves names and builds operators in one pass: SELECTs answered from a materialized view (matching rewrites the AST
+until step 7c), and INSERT, UPDATE and DELETE (step 8). `SMALT_PLAN=legacy` plans every SELECT that way until the AST path is removed (after step 8); see
 [TESTING.md](TESTING.md) for the modes.
 
 The steps after the parser depend on SQL text or AST in several places:

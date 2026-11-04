@@ -1,17 +1,7 @@
 import type { TableStats } from './stats.js';
-import { flattenCore } from './flatten.js';
+import { flattenCore, flatteningDisabled } from './flatten.js';
 import { type FrameSpec, NAVIGATION, RANKING, WINDOW_ARITY, Window, type WindowCallKind, type WindowDef } from './window.js';
 
-let flattenOff: boolean | undefined;
-/** SMALT_NO_FLATTEN=1 disables query flattening (tests compare both paths). */
-function flattenDisabledCheck(): boolean {
-  if (flattenOff === undefined) {
-    const g = globalThis as { process?: { env?: Record<string, string | undefined> } };
-    flattenOff = !!g.process?.env?.SMALT_NO_FLATTEN;
-  }
-  return flattenOff;
-}
-const flatteningDisabled = flattenDisabledCheck;
 let decorrelateOff: boolean | undefined;
 /** SMALT_NO_DECORRELATE=1 disables subquery decorrelation (tests compare both paths). */
 function decorrelationDisabled(): boolean {
@@ -63,7 +53,7 @@ import {
 import { type AggregateState, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type ColumnarHelpers, type FusedAggSpec, type FusedHelpers, type PipelineSource, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter } from './codegen.js';
 import { CODEGEN_HELPERS_FOR_FUSION } from './expr.js';
-import { getMeta, isOpaque, setMeta } from './sql-meta.js';
+import { getMeta, isFlattened, isOpaque, setMeta } from './sql-meta.js';
 import { printExpr } from '../plan/print.js';
 import type { Frame } from '../storage/pager.js';
 import { PH_RIGHT } from '../storage/format.js';
@@ -1607,7 +1597,8 @@ export class Planner {
    */
   private decorrelatePlan(op: PlanOp, kind: 'exists' | 'scalar', f: ColMap): Compiled | null {
     const s = flatShape(op);
-    if (!s) return null;
+    // `decorrelate` reads the subquery before flattening: views and FROM subqueries there are not base tables.
+    if (!s || isFlattened(op)) return null;
     const a = s.aggregate;
     if (s.limit?.offset || !s.from || !s.where || (a && a.keys.length) || s.having || s.windows.length) return null;
     if (kind === 'scalar' && (s.limit || s.sort)) return null;
@@ -3834,9 +3825,8 @@ function supportedPlan(op: PlanOp, level: number): boolean {
 }
 
 /**
- * A FROM item the physical planner handles: a table, a source, a recursive CTE, its working rows, or a nested plan.
- * A nested plan that the planner may flatten into the query (a plain projection, filter or join of tables: see
- * exec/flatten.ts) is left to the planner until flattening reads plans (step 7a), unless flattening is off.
+ * A FROM item the physical planner handles: a table, a source, a recursive CTE, its working rows, or a nested plan
+ * (the front end has already merged the views and FROM subqueries that flattening merges: exec/flatten.ts).
  */
 function supportedLeaf(op: PlanOp, level: number): boolean {
   switch (op.op) {
@@ -3847,15 +3837,8 @@ function supportedLeaf(op: PlanOp, level: number): boolean {
     case 'iterate':
       return supportedPlan(op.init, level) && op.steps.every((x) => supportedPlan(x, level)) && [op.limit, op.offset].every((e) => e === undefined || readsRows(e, -1));
     default:
-      return supportedPlan(op, level) && (flatteningDisabled() || !mayFlatten(op));
+      return supportedPlan(op, level);
   }
-}
-
-/** True unless the planner surely does not flatten nested plan `op` (it may for a plain SELECT over tables). */
-function mayFlatten(op: PlanOp): boolean {
-  const s = flatShape(op);
-  if (!s || s.limit || s.sort || s.distinct || s.aggregate || s.having || s.windows.length || !s.from) return false;
-  return s.from.every((l) => l.op.op === 'scan') && everyExpr(s, (e) => !hasNested(e));
 }
 
 /** True when `e`'s columns are at most `level` evaluations out (-1: none), and its subqueries are supported. */

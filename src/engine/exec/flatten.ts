@@ -32,6 +32,16 @@ export interface FlattenContext {
   expanding?: ReadonlySet<string>;
 }
 
+let flattenOff: boolean | undefined;
+/** SMALT_NO_FLATTEN=1 disables query flattening (tests compare both paths). */
+export function flatteningDisabled(): boolean {
+  if (flattenOff === undefined) {
+    const g = globalThis as { process?: { env?: Record<string, string | undefined> } };
+    flattenOff = !!g.process?.env?.SMALT_NO_FLATTEN;
+  }
+  return flattenOff;
+}
+
 /** Thrown internally to decline flattening a source. */
 class Decline extends Error {}
 const decline = (): never => {
@@ -208,6 +218,10 @@ export function flattenCore(core: SelectCoreSelect, orderBy: OrderingTerm[], ctx
   if (!core.from) return unchanged;
   const links = linearize(core.from);
   if (!links) return unchanged;
+  // Most SELECTs read only tables: nothing to flatten, so skip the walks below.
+  const isView = (it: FromItem): boolean =>
+    it.kind === 'table' && (!it.schema || ['main', 'temp'].includes(it.schema.toLowerCase())) && !(!it.schema && ctx.isCte(it.name)) && !ctx.getTable(it.name, it.schema) && ctx.getView(it.name, it.schema) !== undefined;
+  if (!links.some((l) => (l.item.kind === 'subquery' && l.item.alias) || isView(l.item))) return unchanged;
   // Identifiers mentioned inside nested SELECTs of the outer query (possible correlated references).
   const nested = new Set<string>();
   const noteNested = (e: Expr | undefined): void => {

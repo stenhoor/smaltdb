@@ -191,14 +191,21 @@ operators.
   plans in place instead of copying them (`resolveRefs`), result columns and shapes have one object layout, and the
   physical planner creates a column's read marking only for columns an expression reads.
 - **Deleting the AST path** (`Planner.planSelect`, `SMALT_PLAN=legacy`, the internal `slot` / `native` nodes; about 2k
-  lines) waits for step 8: writes, materialized-view matching and refresh (7c), and views and subqueries flattening
-  may merge (7a) still run on it (owner decision on #46, replacing item 11 below).
+  lines) waits for step 8: writes and materialized-view matching and refresh (7c) still run on it (owner decision on
+  #46, replacing item 11 below).
 - **Hardest parts:** projection-pushdown parity, register order (window snapshots), outer references from subqueries
   over aggregate rows, correlation of derived tables, estimates keyed by the same operators.
 
 ### Step 7: the optimizations move onto the plan (four PRs)
 
-- **7a, flattening** (`plan/opt/flatten.ts`), with the decline rules of `exec/flatten.ts`.
+- **7a (done), flattening:** the SQL front end runs the AST flattener (`exec/flatten.ts`) at the points where
+  `Planner.planSelect` does, so plans and SQL semantics are the planner's by construction (owner decision on #46). A
+  flattener on plans can't reproduce it: its decline rules read names a plan no longer has (nested references,
+  ambiguous unqualified names, USING / NATURAL, WINDOW clauses), and substituting after binding keeps a view
+  column's collation where the AST flattener rebinds the expression. A plan-level flattener (`plan/opt/flatten.ts`,
+  for plans built without SQL too) follows once the AST path is deleted. The front end marks a SELECT it flattened,
+  and decorrelation declines for it, as `decorrelate` reads the SQL before flattening. The flattener now returns
+  early for SELECTs that read only tables. In slt, no SELECT falls back.
 - **7b, decorrelation** into `lookup`, or a semi join for a top-level WHERE conjunct; it stays lazy and keeps today's
   equivalence conditions (collation, no COLLATE on the inner side, affinity converters).
 - **7c, materialized-view matching** on canonical plans, by column position.

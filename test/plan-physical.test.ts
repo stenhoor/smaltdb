@@ -81,10 +81,11 @@ const HANDLED = [
   'SELECT d.a, d.n FROM (SELECT a, count(*) AS n FROM t GROUP BY a) d JOIN u ON u.x = d.a WHERE d.n > 17',
   'SELECT * FROM (SELECT DISTINCT y FROM u) ORDER BY 1',
   'SELECT k FROM (SELECT a AS k FROM t ORDER BY r DESC LIMIT 3) ORDER BY 1',
+  // Views and FROM subqueries the front end merges into the query (7a), and one it does not (USING inside).
+  'SELECT k FROM (SELECT a AS k FROM t WHERE id < 4) ORDER BY 1',
+  'SELECT d.k, u.y FROM (SELECT a AS k, id FROM t WHERE id < 30) d LEFT JOIN u ON u.x = d.k WHERE d.id > 25',
+  'SELECT * FROM (SELECT t.id, t2.r FROM t JOIN t AS t2 USING (a)) WHERE id < 3',
 ];
-
-// A derived table the planner may flatten into the query: left to it until flattening reads plans (step 7a).
-const FLATTENED = ['SELECT k FROM (SELECT a AS k FROM t WHERE id < 4) ORDER BY 1'];
 
 const params = (sql: string) => (sql.includes('?') ? [7] : undefined);
 const run = (db: Database, sql: string) => db.prepare(sql).all(params(sql));
@@ -105,15 +106,5 @@ describe('physical planner', () => {
     const before = shadowStats.physical;
     for (const q of HANDLED) run(db, q);
     expect(shadowStats.physical - before).toBe(HANDLED.length);
-  });
-
-  it.skipIf(!!process.env.SMALT_NO_FLATTEN)('leaves derived tables the planner may flatten to the planner', async () => {
-    const db = await setup();
-    setPlanMode('legacy');
-    const want = FLATTENED.map((q) => run(db, q));
-    setPlanMode('shadow');
-    const before = shadowStats.physical;
-    FLATTENED.forEach((q, i) => expect(run(db, q), q).toEqual(want[i]));
-    expect(shadowStats.physical).toBe(before);
   });
 });
