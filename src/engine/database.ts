@@ -1008,10 +1008,11 @@ export class Database implements FunctionContext {
     return { root: plan.root, columns: plan.columns.map((c) => ({ name: c.name, type: c.type })), subplans: planner.subplans, estimates: planner.estimates };
   }
 
-  /** What the SQL front end (ADR 0014, step 5) reads of the catalog. */
+  /** What the SQL front end (ADR 0014, step 5) reads of the catalog (it reads the database's state when called). */
   private frontEndCatalog(): FrontEndCatalog {
+    if (this.feCatalog) return this.feCatalog;
     const deps = this.plannerDeps();
-    return {
+    return (this.feCatalog = {
       getTable: deps.getTable,
       getView: deps.getView,
       isExternal: (n) => this.externals.has(n.toLowerCase()),
@@ -1019,8 +1020,10 @@ export class Database implements FunctionContext {
       isExternalFunction: deps.isExternalFunction,
       virtualTable: deps.virtualTable,
       funcCtx: this,
-    };
+    });
   }
+
+  private feCatalog: FrontEndCatalog | null = null;
 
   /** A top-level SELECT, planned as `SMALT_PLAN` says (exec/plan-shadow.ts). */
   private planSelectStmt(stmt: SelectStmt, text: string, planner: Planner): QueryPlan {
@@ -1053,8 +1056,9 @@ export class Database implements FunctionContext {
         return shadowCheck(stmt, text, this.frontEndCatalog(), () => planner.planSelect(stmt, null), () => planner.usedMatview, physical);
       }
       case 'plan': {
-        // Materialized-view matching still rewrites the AST (step 7).
-        if (!planner.rewritesToMatview(stmt)) {
+        // Materialized-view matching rewrites the AST, of any SELECT the statement plans (step 7c): while a view could
+        // answer one, the statement takes the AST path.
+        if (!planner.env.rewriteSelect || !this.hasRewriteCandidates()) {
           const fe = toPlan(stmt, text, this.frontEndCatalog());
           const p = fe && planner.planPlan(fe.plan, fe.columns);
           if (p) return p;
@@ -1699,6 +1703,13 @@ export class Database implements FunctionContext {
   private matviewRewriteOn = false;
 
   /** The query rewritten to read a fresh materialized view, when one provably answers it. */
+  /** Whether materialized-view matching has a view to match: a fresh, populated materialized view. */
+  private hasRewriteCandidates(): boolean {
+    if (!this.matviewRewriteOn) return false;
+    for (const t of this.tables.values()) if (t.matview?.populated && t.matview.fresh) return true;
+    return false;
+  }
+
   private matviewRewrite(stmt: SelectStmt, text: string, exclude: string | null = null): SelectStmt | null {
     if (!this.matviewRewriteOn) return null;
     const views: MatviewCandidate[] = [];

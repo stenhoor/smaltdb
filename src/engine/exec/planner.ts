@@ -556,13 +556,6 @@ export class Planner {
   /** Some SELECT was rewritten to read a materialized view (SMALT_PLAN=shadow compares only unrewritten plans). */
   usedMatview = false;
 
-  /** Whether `stmt` (a top-level SELECT) would be answered from a materialized view: SMALT_PLAN=plan then plans its AST. */
-  rewritesToMatview(stmt: SelectStmt): boolean {
-    const r = this.matviewRewrite(stmt, null) !== null;
-    this.usedMatview = false;
-    return r;
-  }
-
   /** One SELECT of a compound (UNION / INTERSECT / EXCEPT) answered from a materialized view. */
   private matviewCore(core: SelectCore, parent: Scope | null): SelectCore {
     if (!this.env.rewriteSelect) return core;
@@ -2273,7 +2266,7 @@ export class Planner {
       b = { bound, compilable, deps: compilable ? this.depsOf(bound, scope) : null };
       byExpr.set(e, b);
     }
-    return { expr: e, bound: b.bound, compilable: b.compilable, deps: b.deps, placed: false };
+    return { expr: e, bound: b.bound, compilable: b.compilable, deps: b.deps, placed: false, lazy: undefined };
   }
 
   /** The source and column a bound slot reads, among `scope`'s sources. */
@@ -3088,8 +3081,9 @@ export class Planner {
 
   /** A conjunct the physical planner bound from a plan. */
   private boundConjunct(b: BoundConjunct, scope: Scope): ConjunctInfo {
-    if (b.compile) return { bound: b.bound, compilable: false, deps: null, placed: false, lazy: b.compile };
-    return { bound: b.bound, compilable: true, deps: this.depsOf(b.bound, scope), placed: false };
+    // In `conjunct`'s property order.
+    if (b.compile) return { expr: undefined, bound: b.bound, compilable: false, deps: null, placed: false, lazy: b.compile };
+    return { expr: undefined, bound: b.bound, compilable: true, deps: this.depsOf(b.bound, scope), placed: false, lazy: undefined };
   }
 
   private orderSegmentDP(segment: number[], prefix: Set<number>, prefixRows: number, pool: ConjunctInfo[], scope: Scope, cs: CompileScope): { order: number[]; rows: number } {
@@ -3734,13 +3728,24 @@ const JOIN_TYPES: Readonly<Record<JoinKind, JoinType>> = { inner: 'INNER', cross
 function leafItem(op: ScanOp | SourceOp, p: number): FromItem {
   // (Nested plans are registered as planned sources: see BoundFrom.source.)
   const alias = `#${p}`;
-  if (op.op === 'scan') return { kind: 'table', name: op.table, alias, ...(op.db ? { schema: op.db } : {}), ...(op.indexedBy !== undefined ? { indexedBy: op.indexedBy } : {}), pos: 0, end: 0 };
-  if (op.kind === 'function') return { kind: 'function', name: op.name, args: [], alias, pos: 0, end: 0 };
-  return { kind: 'table', name: op.name, alias, ...(op.schema ? { schema: op.schema } : {}), pos: 0, end: 0 };
+  // In the parser's property order (the planner reads FROM items of both).
+  if (op.op === 'scan') return { kind: 'table', pos: 0, schema: op.db, name: op.table, alias, indexedBy: op.indexedBy, end: 0 };
+  if (op.kind === 'function') return { kind: 'function', pos: 0, name: op.name, args: [], alias, end: 0 };
+  return { kind: 'table', pos: 0, schema: op.schema, name: op.name, alias, indexedBy: undefined, end: 0 };
 }
 
-/** Match a plan the physical planner handles, or null. */
+/** A plan operation's shape, kept on it: the planner asks for one several times (checks, planning, decorrelation). */
+const SHAPE: unique symbol = Symbol('shape');
+
+/** Match a SELECT core, or null. */
 function flatShape(op: PlanOp): FlatShape | null {
+  const o = op as { [SHAPE]?: FlatShape | null };
+  let s = o[SHAPE];
+  if (s === undefined) o[SHAPE] = s = matchShape(op);
+  return s;
+}
+
+function matchShape(op: PlanOp): FlatShape | null {
   let n = op;
   const s: Partial<FlatShape> = {};
   if (n.op === 'limit') {
@@ -3786,27 +3791,18 @@ function flatShape(op: PlanOp): FlatShape | null {
   return s as FlatShape;
 }
 
-/** Every expression of a flat shape (results, keys, conditions, arguments), for checking. */
-function shapeExprs(s: FlatShape): { all: (PlanExpr | undefined)[]; limit: (PlanExpr | undefined)[] } {
+/** Whether `f` holds for every expression of a flat shape but LIMIT / OFFSET (results, keys, conditions, arguments). */
+function everyExpr(s: FlatShape, f: (e: PlanExpr) => boolean): boolean {
+  const ok = (e: PlanExpr | undefined): boolean => e === undefined || f(e);
   const a = s.aggregate;
-  return {
-    all: [
-      ...s.project,
-      ...(s.sort ?? []).map((k) => k.expr),
-      s.having,
-      s.where,
-      ...(a ? [...a.keys.map((k) => k.expr), ...a.aggs.flatMap((c) => [...c.args, c.filter]), ...a.carry] : []),
-      ...s.windows.flatMap((w) => [
-        ...w.partition.map((p) => p.expr),
-        ...w.order.map((k) => k.expr),
-        w.frame.start.offset,
-        w.frame.end.offset,
-        ...w.calls.flatMap((c) => [...c.args, c.filter]),
-      ]),
-      ...(s.from ?? []).flatMap((l) => [l.on, ...(l.op.op === 'source' ? l.op.args : [])]),
-    ],
-    limit: [s.limit?.count, s.limit?.offset],
-  };
+  if (!s.project.every(ok) || !ok(s.having) || !ok(s.where)) return false;
+  if (s.sort && !s.sort.every((k) => ok(k.expr))) return false;
+  if (a && !(a.keys.every((k) => ok(k.expr)) && a.aggs.every((c) => c.args.every(ok) && ok(c.filter)) && a.carry.every(ok))) return false;
+  for (const w of s.windows) {
+    if (!w.partition.every((x) => ok(x.expr)) || !w.order.every((k) => ok(k.expr)) || !ok(w.frame.start.offset) || !ok(w.frame.end.offset)) return false;
+    if (!w.calls.every((c) => c.args.every(ok) && ok(c.filter))) return false;
+  }
+  return (s.from ?? []).every((l) => ok(l.on) && (l.op.op !== 'source' || l.op.args.every(ok)));
 }
 
 /**
@@ -3818,8 +3814,7 @@ function shapeExprs(s: FlatShape): { all: (PlanExpr | undefined)[]; limit: (Plan
 function supportedPlan(op: PlanOp, level: number): boolean {
   const s = flatShape(op);
   if (s) {
-    const { all, limit } = shapeExprs(s);
-    if (!all.every((e) => e === undefined || readsRows(e, level)) || !limit.every((e) => e === undefined || readsRows(e, -1))) return false;
+    if (!everyExpr(s, (e) => readsRows(e, level)) || (s.limit && (!readsRows(s.limit.count, -1) || (s.limit.offset && !readsRows(s.limit.offset, -1))))) return false;
     return (s.from ?? []).every((l) => supportedLeaf(l.op, level));
   }
   let n = op;
@@ -3854,7 +3849,7 @@ function supportedLeaf(op: PlanOp, level: number): boolean {
 function mayFlatten(op: PlanOp): boolean {
   const s = flatShape(op);
   if (!s || s.limit || s.sort || s.distinct || s.aggregate || s.having || s.windows.length || !s.from) return false;
-  return s.from.every((l) => l.op.op === 'scan') && !shapeExprs(s).all.some((e) => e !== undefined && hasNested(e));
+  return s.from.every((l) => l.op.op === 'scan') && everyExpr(s, (e) => !hasNested(e));
 }
 
 /** True when `e`'s columns are at most `level` evaluations out (-1: none), and its subqueries are supported. */

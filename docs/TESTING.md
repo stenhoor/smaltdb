@@ -80,21 +80,22 @@ to it must show in review: update the files with `npx vitest run test/codegen-so
 While the plan layer ([ADR 0014](adr/0014-shared-plan-layer.md)) is built, `SMALT_PLAN` selects how SELECTs are
 planned (`src/engine/exec/plan-shadow.ts`):
 
-- unset (or `legacy`): the current planner, from the AST.
-- `plan`: the SQL front end (`src/engine/sql/frontend/`, step 5) makes a plan, and the physical planner
+- unset or `plan` (the default): the SQL front end (`src/engine/sql/frontend/`, step 5) makes a plan, and the physical planner
   (`Planner.planPlan`, step 6) builds its operators. Derived tables and views the planner may flatten (until
-  flattening reads plans, step 7a) go through the current planner, and so do statements answered from a
+  flattening reads plans, step 7a) go through the planner's AST path, and so do statements answered from a
   materialized view.
+- `legacy`: the planner's AST path for every SELECT, until step 6d removes it.
 - `shadow` (tests): both. The front end must agree with the planner on every result column's name, type, collation,
   declared type and affinity, and on planning errors; the physical planner's operators must give the planner's
   `EXPLAIN` rows and record the same subplans (subqueries), and then they run. A disagreement fails the statement with `SMALT_INTERNAL`.
 
-CI runs the whole suite with `SMALT_PLAN=shadow`, and `test/plan-shapes.test.ts` and `test/codegen-source.test.ts`
-with `SMALT_PLAN=plan` (the same plan shapes and generated code; shadow mode generates code for both planners, so
-the generated-code snapshot skips there). Run `npm run slt` or the differential tests the same way.
+CI runs the whole suite in the default mode and with `SMALT_PLAN=shadow`, and `test/plan-shapes.test.ts` and
+`test/codegen-source.test.ts` also with `SMALT_PLAN=legacy`: both paths give the same plan shapes and generated code
+(shadow mode generates code for both planners, so the generated-code snapshot skips there). Run `npm run slt` or the
+differential tests the same way.
 `SMALT_PLAN_STATS=<file>` appends each skipped statement to `<file>` as a JSON line with the reason, and each
 statement the physical planner does not handle yet (reason `physical planner: not handled yet`).
-`test/plan-physical.test.ts` checks single-table plans in each mode.
+`test/plan-physical.test.ts` checks the physical planner's shapes in each mode.
 
 ## Plugins
 

@@ -6,22 +6,27 @@
 
 ## 1. Pipeline
 
-**As built.** There is no bound logical plan yet: the planner goes from the parser's output straight to operators.
+**As built.** A SELECT goes through the plan layer ([ADR 0014](adr/0014-shared-plan-layer.md), step 6):
 
 ```
 SQL text
   → Lexer (single-pass scanner over the string, no regex)            sql/lexer.ts
   → Parser (recursive descent + Pratt for expressions) → AST          sql/parser.ts
-  → AST rewrites: materialized-view matching, view and subquery       exec/mv-match.ts, exec/flatten.ts
-    flattening
-  → Planner, in one pass: name resolution, typing, register           exec/planner.ts
-    allocation, projection pushdown, decorrelation, costing,
-    join ordering, access paths, operator construction
+  → SQL front end: name resolution, typing, SQL's collation and       sql/frontend/select.ts
+    affinity rules made explicit → plan (positional columns)          plan/
+  → Physical planner: registers, projection pushdown, decorrelation,  exec/planner.ts (planPlan)
+    costing, join ordering, access paths, operator construction
   → Pipeline fusion: scan → filter → aggregate chains compiled        exec/codegen.ts
-    to generated code (recompiled from the AST kept on operators)
+    to generated code from plan expressions
   → Operators: a pull model over a shared register file, one row      exec/operators.ts
     per next() call
 ```
+
+Some statements still take the planner's AST path (`Planner.planSelect`), which resolves names and builds operators
+in one pass: SELECTs answered from a materialized view (matching rewrites the AST until step 7c), views and FROM
+subqueries that flattening may merge into the query (`exec/flatten.ts`, until step 7a), and INSERT, UPDATE and
+DELETE (step 8). `SMALT_PLAN=legacy` plans every SELECT that way until the AST path is removed (step 6d); see
+[TESTING.md](TESTING.md) for the modes.
 
 The steps after the parser depend on SQL text or AST in several places:
 - operators keep parts of the AST (`Filter.ast`, `AggSpec.argAsts`) for fusion;

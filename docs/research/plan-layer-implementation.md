@@ -181,7 +181,12 @@ operators.
     plan the planner may flatten into the query (a plain projection, filter or join of tables) still goes through
     the planner until flattening reads plans (step 7a), unless flattening is off. In slt, 2 SELECTs (plain views)
     are left.
-  - **6c-iv:** the default becomes `plan`.
+  - **6c-iv (done):** the default becomes `plan` (`SMALT_PLAN=legacy` keeps the AST path until 6d). While
+    materialized-view matching is on and a fresh materialized view exists, SELECTs take the AST path, since matching
+    rewrites any SELECT a statement plans (until step 7c). Planning
+    small statements costs 2–8 µs more (0–20% of planning, 1–5% of prepare and first run, within this machine's
+    noise of about 5%): the front end and the physical planner each copy expressions once (`resolveRefs`,
+    `rebind`), which 6d can remove by compiling `col`s directly.
 - **6d, deletion** (about 2k lines removed): the AST paths of the planner and the internal `slot` / `native` nodes.
 - **Hardest parts:** projection-pushdown parity, register order (window snapshots), outer references from subqueries
   over aggregate rows, correlation of derived tables, estimates keyed by the same operators.
