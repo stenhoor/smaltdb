@@ -13,7 +13,7 @@ file; keep the working rules the same.
 | `npm run check` | `npm run typecheck` then `npm test` (vitest): what CI's `test` job runs | Before every commit |
 | `npm run test:browser` | Builds `dist/`, then runs the browser integration tests (Playwright). CI runs them on Chromium, Firefox and WebKit | Changes to the client, worker, server, OPFS or multi-tab code |
 | `npm run slt` | The sqllogictest subset (122k records) | Changes to the parser, planner, expressions or functions |
-| `npm run bench` | Storage micro-benchmarks in Node (`bench:browser` compares engines in a browser) | Performance work; compare with `bench/results/` |
+| `npm run bench` | Storage micro-benchmarks in Node (`bench:browser` compares engines in a browser against SQLite WASM; `bench:native` in Node against native SQLite) | Performance work; compare with `bench/results/` |
 | `npm run docs:dev` | The docs site (VitePress) with live reload; `npm run docs:build` fails on dead links | Docs changes |
 | `npm run build` | `dist/` (client, worker, engine) and type declarations | Packaging and release checks |
 

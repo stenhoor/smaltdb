@@ -1,5 +1,6 @@
 import { Database, type Statement } from '../../../src/engine/database.js';
 import { OpfsVfs } from '../../../src/engine/vfs/opfs.js';
+import type { Vfs } from '../../../src/engine/vfs/types.js';
 import { ANALYTIC_DDL, type Adapter, analyticRow, valueFor } from '../adapter.js';
 
 /** smaltdb through its SQL layer, hosted in the benchmark worker and called synchronously (like SQLite). */
@@ -8,18 +9,26 @@ export class SmaltdbAdapter implements Adapter {
   readonly config: string;
   readonly atomicCommits = true;
 
-  /** `memory`: an in-memory database (no OPFS, no WAL, no checksums) for CPU-only comparisons. */
-  constructor(readonly memory = false) {
+  /**
+   * `memory`: an in-memory database (no OPFS, no WAL, no checksums) for CPU-only comparisons. `vfs`: files on
+   * another VFS than OPFS (the Node harness passes a file-system VFS), described by `storage`.
+   */
+  constructor(
+    readonly memory = false,
+    vfs?: Vfs,
+    storage = 'OPFS sync handles',
+  ) {
     this.name = memory ? 'smaltdb (:memory:)' : 'smaltdb';
     this.config = memory
       ? 'in-memory database (in-memory undo images, no WAL, no checksums), 8 KiB pages, prepared statements'
-      : 'OPFS sync handles, WAL (auto-checkpoint 4 MiB), 8 KiB pages, 64 MiB cache, flush per commit, prepared statements';
+      : `${storage}, WAL (auto-checkpoint 4 MiB), 8 KiB pages, 64 MiB cache, flush per commit, prepared statements`;
+    this.vfs = vfs ?? new OpfsVfs({ rootDir: 'smaltdb-bench' });
   }
 
   get persistent(): boolean {
     return !this.memory;
   }
-  private vfs = new OpfsVfs({ rootDir: 'smaltdb-bench' });
+  private readonly vfs: Vfs;
   private db!: Database;
   private insert!: Statement;
   private readonly opts = { pageSize: 8192, cacheSizeBytes: 64 * 1024 * 1024 };

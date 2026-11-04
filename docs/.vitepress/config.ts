@@ -176,6 +176,7 @@ export default defineConfig({
         collapsed: true,
         items: [
           { text: 'Benchmark methodology', link: '/research/benchmark-methodology' },
+          { text: 'Against SQLite WASM and native (2026-11)', link: '/research/benchmark-2026-11-04' },
           { text: 'M0 baseline', link: '/research/m0-baseline' },
           { text: 'M1 baseline', link: '/research/m1-baseline' },
           { text: 'M3 optimizer', link: '/research/m3-optimizer' },
