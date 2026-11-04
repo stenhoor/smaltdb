@@ -1,15 +1,12 @@
 > SELECT * FROM customers WHERE id = 42
 columns: id int, name text, region text, tier int
   Project
-    Filter [est 1]
-      RowidLookup: SEARCH customers USING INTEGER PRIMARY KEY (rowid=?)
+    RowidLookup: SEARCH customers USING INTEGER PRIMARY KEY (rowid=?) [est 1]
 
 > SELECT name FROM customers WHERE id BETWEEN 10 AND 20
 columns: name text
   Project
-    Filter [est 218]
-      Filter
-        TableScan: SEARCH customers USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)
+    TableScan: SEARCH customers USING INTEGER PRIMARY KEY (rowid>? AND rowid<?) [est 218]
 
 > SELECT name FROM customers WHERE region = 'EU'
 columns: name text

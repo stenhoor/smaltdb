@@ -18,12 +18,19 @@ const SHAPES: [string, (i: number) => string][] = [
   ['group by + having', (i) => `SELECT y, count(*), sum(x) FROM t WHERE x > ${i} GROUP BY y HAVING sum(x) > ${i}`],
   ['join', (i) => `SELECT t.name, u.v FROM t JOIN u ON u.t_id = t.id WHERE t.x = ${i}`],
   ['correlated subquery', (i) => `SELECT name FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id AND u.v > ${i})`],
+  // Writes (steps 8a-8c), on their own table, each round in one transaction so commits don't dilute the ratio.
+  ['INSERT VALUES', (i) => `INSERT INTO w(k, v, s) VALUES (${i}, ${i} * 0.5, 'w${i}')`],
+  ['INSERT … ON CONFLICT DO UPDATE', (i) => `INSERT INTO w(k, v) VALUES (${i % 50}, ${i}) ON CONFLICT(k) DO UPDATE SET v = w.v + excluded.v`],
+  ['INSERT … SELECT', (i) => `INSERT INTO w2 SELECT ${i}, x, name FROM t WHERE id = ${i % 2 + 1}`],
+  ['UPDATE by key', (i) => `UPDATE w SET v = v + 1, s = 's${i}' WHERE k = ${i % 50}`],
+  ['DELETE by key', (i) => `DELETE FROM w WHERE k = ${-i}`],
 ];
 
 const vfs = new MemoryVfs();
 const db = Database.openFile(vfs.openSync('p.db'), {}, vfs.openSync('p.db-wal'));
 db.exec('CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, x INT, y REAL); CREATE INDEX t_x ON t(x)');
 db.exec('CREATE TABLE u(id INTEGER PRIMARY KEY, t_id INT, v REAL); CREATE INDEX u_t ON u(t_id)');
+db.exec('CREATE TABLE w(id INTEGER PRIMARY KEY, k INT UNIQUE, v REAL, s TEXT DEFAULT \'d\', CHECK (v >= 0)); CREATE TABLE w2(a INT, b INT, c TEXT)');
 db.exec("INSERT INTO t VALUES (1, 'a', 1, 1.5), (2, 'b', 2, 2.5); INSERT INTO u VALUES (1, 1, 3.0)");
 
 function median(xs: number[]): number {
@@ -38,7 +45,9 @@ console.log('|---|---|---|---|');
 let base = 0;
 for (const [name, sql] of SHAPES) {
   const run = (): void => {
+    db.exec('BEGIN');
     for (let i = 0; i < N; i++) db.prepare(sql(base++)).all();
+    db.exec('COMMIT');
   };
   const ms: Record<string, number[]> = { plan: [], legacy: [] };
   for (const m of MODES) {

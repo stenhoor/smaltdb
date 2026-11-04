@@ -1,6 +1,6 @@
 > SELECT count(*) FROM k WHERE v > 10
 expression:
-const v0n = (r[2] === null); const v0 = v0n ? 0 : (r[2] > (10) ? 1 : 0);
+const $c0 = K[0]; const v0n = (r[2] === null); const v0 = v0n ? 0 : (r[2] > $c0 ? 1 : 0);
 return (v0n ? null : v0);
 --
 pipeline(H, K, T):
@@ -127,11 +127,11 @@ for (let g = 0; g < ng; g++) {
 
 > SELECT sum(v * w) FROM k WHERE g = 3 AND w < 500
 expression:
-const v0n = (r[1] === null); const v0 = v0n ? 0 : (r[1] == (3) ? 1 : 0);
+const $c0 = K[0]; const v0n = (r[1] === null); const v0 = v0n ? 0 : (r[1] == $c0 ? 1 : 0);
 return (v0n ? null : v0);
 --
 expression:
-const v0n = (r[3] === null); const v0 = v0n ? 0 : (r[3] < (500) ? 1 : 0);
+const $c0 = K[0]; const v0n = (r[3] === null); const v0 = v0n ? 0 : (r[3] < $c0 ? 1 : 0);
 return (v0n ? null : v0);
 --
 expression:
@@ -257,7 +257,7 @@ for (let g = 0; g < ng; g++) {
 
 > SELECT id, v FROM k WHERE w = 999
 expression:
-const v0n = (r[3] === null); const v0 = v0n ? 0 : (r[3] == (999) ? 1 : 0);
+const $c0 = K[0]; const v0n = (r[3] === null); const v0 = v0n ? 0 : (r[3] == $c0 ? 1 : 0);
 return (v0n ? null : v0);
 --
 loader:
@@ -274,7 +274,7 @@ return true;
 
 > SELECT median(v), stddev(v) FROM k WHERE g < 4
 expression:
-const v0n = (r[1] === null); const v0 = v0n ? 0 : (r[1] < (4) ? 1 : 0);
+const $c0 = K[0]; const v0n = (r[1] === null); const v0 = v0n ? 0 : (r[1] < $c0 ? 1 : 0);
 return (v0n ? null : v0);
 --
 pipeline(H, K, T):

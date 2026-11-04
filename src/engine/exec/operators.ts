@@ -239,7 +239,8 @@ export class TableScan implements Operator {
     }
     if (this.reverse) {
       if (this.hiVal !== null) {
-        const target = typeof this.hiVal === 'number' ? Math.min(Math.floor(this.hiVal), I64_MAX_N) : this.hiVal;
+        // I64_MAX_N is 2^63 as a double, past every rowid: clamp to the largest rowid instead.
+        const target = typeof this.hiVal === 'number' ? (this.hiVal >= I64_MAX_N ? 9223372036854775807n : Math.floor(this.hiVal)) : this.hiVal;
         writeRowidKey(this.keyBuf, 0, target);
         const found = c.seek(this.keyBuf);
         if (!found) {
@@ -260,7 +261,7 @@ export class TableScan implements Operator {
       // Ceil for fractional bounds; exclusive integer bounds are handled by skipping equal keys.
       let start: number | bigint = loKey;
       if (typeof start === 'number') {
-        if (start > I64_MAX_N) return false;
+        if (start >= I64_MAX_N) return false; // 2^63 or more: past every rowid
         start = Math.max(Math.ceil(start), -9223372036854775808);
       }
       writeRowidKey(this.keyBuf, 0, start);
@@ -311,7 +312,8 @@ export class RowidLookup implements Operator {
     for (const f of this.keyFns) {
       const p = rowidProbe(f(r));
       if (p === null || p === 'text') continue;
-      if (typeof p === 'number' && !Number.isInteger(p)) continue;
+      // A REAL equals a rowid only when it is an integer in the int64 range (I64_MAX_N rounds to 2^63).
+      if (typeof p === 'number' && (!Number.isInteger(p) || p >= I64_MAX_N || p < -I64_MAX_N)) continue;
       this.keys.push(p);
     }
     if (this.keys.length > 1) {

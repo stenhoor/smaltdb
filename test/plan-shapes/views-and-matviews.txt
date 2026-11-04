@@ -7,10 +7,9 @@ columns: id int, customer_id int, day int, amount real
 > SELECT p.amount, c.name FROM paid_orders p JOIN customers c ON c.id = p.customer_id WHERE p.day = 2
 columns: amount real, name text
   Project
-    Filter
-      NestedLoopJoin [est 13.3]
-        IndexScan: SEARCH orders USING INDEX orders_day_status (=?,=?) [est 13.6]
-        RowidLookup: SEARCH customers USING INTEGER PRIMARY KEY (rowid=?) [est 0.977]
+    NestedLoopJoin [est 13.3]
+      IndexScan: SEARCH orders USING INDEX orders_day_status (=?,=?) [est 13.6]
+      RowidLookup: SEARCH customers USING INTEGER PRIMARY KEY (rowid=?) [est 0.977]
 
 > SELECT * FROM customer_totals WHERE customer_id = 9
 columns: customer_id int, n int, total real

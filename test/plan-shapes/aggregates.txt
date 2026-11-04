@@ -42,8 +42,7 @@ columns: sum(amount) real
 columns: tier int, group_concat(name) text
   Project
     HashAggregate: USE TEMP B-TREE FOR GROUP BY
-      Filter [est 660]
-        TableScan: SEARCH customers USING INTEGER PRIMARY KEY (rowid<?)
+      TableScan: SEARCH customers USING INTEGER PRIMARY KEY (rowid<?) [est 660]
 
 > SELECT median(amount), stddev(amount) FROM orders
 columns: median(amount) real, stddev(amount) real
