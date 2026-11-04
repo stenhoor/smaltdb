@@ -100,7 +100,7 @@ import {
 import { type ColumnStore, ROW_GROUP_ROWS, type Zone, zoneMayMatch } from '../storage/columnar.js';
 import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
 import { anyNode } from '../sql/ast-util.js';
-import { type PlanExpr, lit } from '../plan/expr.js';
+import { type BoundExpr, type PlanExpr, lit } from '../plan/expr.js';
 import type { AggCall, JoinKind, PlanOp, SortKey as PlanSortKey } from '../plan/ops.js';
 import type { CollationName } from '../plan/types.js';
 import type { ExternalSource } from '../external/external.js';
@@ -363,10 +363,10 @@ function filterOnConjunct(child: Operator, c: ConjunctInfo, cs: CompileScope): F
 const PROBE_OPS: Readonly<Record<string, string>> = { 'sql.eq': '=', 'sql.lt': '<', 'sql.le': '<=', 'sql.gt': '>', 'sql.ge': '>=', 'sql.is': 'IS' };
 
 /** The operand of a bound comparison, without the affinity conversion SQL applies to it. */
-const unconvertedOperand = (x: PlanExpr): PlanExpr => (x.k === 'call' && (x.fn === 'sql.affinity_numeric' || x.fn === 'sql.affinity_text') ? x.args[0] : x);
+const unconvertedOperand = <E extends BoundExpr>(x: E): E => (x.k === 'call' && (x.fn === 'sql.affinity_numeric' || x.fn === 'sql.affinity_text') ? (x.args[0] as E) : x);
 
 /** Visit the register slots of a bound expression (not inside compiled nodes or nested plans). */
-function forEachSlot(e: PlanExpr, f: (reg: number) => void): void {
+function forEachSlot(e: BoundExpr, f: (reg: number) => void): void {
   switch (e.k) {
     case 'slot':
       f(e.reg);
@@ -429,7 +429,7 @@ interface ConjunctInfo {
    * conjunct with a subquery is bound for analysis only: its subqueries are placeholders, and it compiles from
    * `expr`.
    */
-  bound: PlanExpr;
+  bound: BoundExpr;
   compilable: boolean;
   /** Positions of current-scope sources referenced; null = depends on everything (subqueries). */
   deps: Set<number> | null;
@@ -437,16 +437,16 @@ interface ConjunctInfo {
   /** RIGHT/FULL JOIN: earliest step (FROM position) at which this WHERE conjunct may be applied. */
   minStep?: number;
   /** Not compilable and bound from a plan: binds it with its subqueries planned (the physical planner). */
-  lazy?: () => PlanExpr;
+  lazy?: () => BoundExpr;
 }
 
 /** FROM items, join conditions and WHERE conjuncts the physical planner bound from a plan (see planFrom). */
 interface BoundFrom {
   items: { item: FromItem; joinType: JoinType }[];
   /** A table function's arguments (item `p`), bound to the earlier items' registers. */
-  args(p: number): PlanExpr[] | undefined;
+  args(p: number): BoundExpr[] | undefined;
   /** An external table function's named arguments (item `p`), bound. */
-  named?(p: number): Record<string, PlanExpr> | undefined;
+  named?(p: number): Record<string, BoundExpr> | undefined;
   /** Item `p` planned (a nested plan), or undefined: registered from its FROM item. `working`: a recursive step's rows. */
   source(p: number): { plan: QueryPlan; working?: boolean } | undefined;
   /** Item `p` was registered: its registers are known. */
@@ -461,8 +461,8 @@ interface BoundFrom {
  * `compile` binds it with its subqueries planned, when it is placed.
  */
 interface BoundConjunct {
-  bound: PlanExpr;
-  compile?: () => PlanExpr;
+  bound: BoundExpr;
+  compile?: () => BoundExpr;
 }
 
 interface AccessChoice {
@@ -536,9 +536,9 @@ export class Planner {
    * (FusedScanAggregate). Returns null when the shape or the aggregates do not qualify.
    */
   /** Match `Filter* -> forward full TableScan`; returns the scan and the predicate ASTs (outermost last). */
-  private scanChain(src: Operator): { scan: TableScan | ColumnScan | ColumnarTableScan; preds: PlanExpr[] } | null {
+  private scanChain(src: Operator): { scan: TableScan | ColumnScan | ColumnarTableScan; preds: BoundExpr[] } | null {
     if (!codegenEnabled()) return null;
-    const preds: PlanExpr[] = [];
+    const preds: BoundExpr[] = [];
     let node: Operator = src;
     while (node instanceof Filter) {
       if (!node.expr || planHasSubquery(node.expr)) return null;
@@ -608,7 +608,7 @@ export class Planner {
   }
 
   /** Scan + filter + GROUP BY + aggregates in one generated loop. */
-  private tryFuseGroupAggregate(src: Operator, groupExprs: PlanExpr[], groupColls: Collation[], groupRegs: number[], aggs: AggSpec[], scope: Scope): Operator | null {
+  private tryFuseGroupAggregate(src: Operator, groupExprs: BoundExpr[], groupColls: Collation[], groupRegs: number[], aggs: AggSpec[], scope: Scope): Operator | null {
     const chain = this.scanChain(src);
     const specs = this.fusedAggSpecs(aggs);
     if (!chain || !specs || groupExprs.some(planHasSubquery)) return null;
@@ -739,7 +739,7 @@ export class Planner {
    */
   planDelete(op: Extract<PlanOp, { op: 'delete' }>): { root: Operator; rowidReg: number; oldBase: number; oldRowid: number; returning: Fn[] | undefined } | null {
     let n = op.input;
-    let where: PlanExpr | undefined;
+    let where: BoundExpr | undefined;
     if (n.op === 'filter') {
       where = n.pred;
       n = n.input;
@@ -769,7 +769,7 @@ export class Planner {
    */
   planUpdate(op: Extract<PlanOp, { op: 'update' }>): { root: Operator; rowidReg: number; colRegs: number[]; sets: { column: number; c: Compiled }[] } | null {
     let n = op.input;
-    let where: PlanExpr | undefined;
+    let where: BoundExpr | undefined;
     if (n.op === 'filter') {
       where = n.pred;
       n = n.input;
@@ -796,12 +796,12 @@ export class Planner {
    * Expressions over a written row held in registers (RETURNING): the table's `ncols` columns from `base`, then its
    * rowid in `rowidReg`.
    */
-  compileRowExprs(exprs: readonly PlanExpr[], ncols: number, base: number, rowidReg: number): Fn[] {
+  compileRowExprs(exprs: readonly BoundExpr[], ncols: number, base: number, rowidReg: number): Fn[] {
     return this.compileAt(exprs, (i) => (i < ncols ? base + i : rowidReg)).map((c) => c.fn);
   }
 
   /** Expressions whose columns are registers: column `i` reads `regOf(i)` (for VALUES rows: none). */
-  compileAt(exprs: readonly PlanExpr[], regOf: (index: number) => number): Compiled[] {
+  compileAt(exprs: readonly BoundExpr[], regOf: (index: number) => number): Compiled[] {
     const b = this.bindings(new Scope(null), null);
     const row: ColMap = (c) => slotFor(c, regOf(c.index));
     return exprs.map((e) => compileBoundExpr(b.bind(e, row), this.env.funcCtx));
@@ -820,7 +820,7 @@ export class Planner {
         scope.correlated = true;
         return outer!(shallower(c));
       };
-    const sub = (n: PlanExpr, f: ColMap): PlanExpr => this.subqueryExpr(n, f);
+    const sub = (n: BoundExpr, f: ColMap): BoundExpr => this.subqueryExpr(n, f);
     // `col`: the table column (-1: the rowid), or the source's column. Marking it read is the slot's `use`.
     const fromRow: FromCell[] = [];
     const useOf = (f: FromCell): (() => void) => {
@@ -842,10 +842,10 @@ export class Planner {
    * registers are each source's columns, in FROM order, marked as read when an expression reading them is compiled;
    * join conditions read input 0 (the sources before) and input 1 (the source being joined).
    */
-  private planFromShape(from: FromLeaf[] | null, where: PlanExpr | undefined, scope: Scope, outer: ColMap | null, b: Bindings): Operator {
+  private planFromShape(from: FromLeaf[] | null, where: BoundExpr | undefined, scope: Scope, outer: ColMap | null, b: Bindings): Operator {
     const { bind, fromSlot, fromRow, useOf } = b;
     // A WHERE / ON conjunct with a subquery is bound for analysis with placeholders, and planned where it is placed.
-    const conjunct = (e: PlanExpr, m: ColMap): BoundConjunct => (hasNested(e) ? { bound: b.analysis(e, m), compile: () => bind(e, m) } : { bound: bind(e, m) });
+    const conjunct = (e: BoundExpr, m: ColMap): BoundConjunct => (hasNested(e) ? { bound: b.analysis(e, m), compile: () => bind(e, m) } : { bound: bind(e, m) });
     if (!from) {
       this.lastScan = null;
       const root = new SingleRow();
@@ -929,7 +929,7 @@ export class Planner {
       plan = { root, outRegs: regs, columns, correlated };
     }
     if (lim) {
-      const bind = (e: PlanExpr): Fn => compileBoundExpr(rebind(e, NO_COLUMNS, (m, f) => this.subqueryExpr(m, f)), this.env.funcCtx).fn;
+      const bind = (e: BoundExpr): Fn => compileBoundExpr(rebind(e, NO_COLUMNS, (m, f) => this.subqueryExpr(m, f)), this.env.funcCtx).fn;
       plan.root = new Limit(plan.root, bind(lim.count), lim.offset ? bind(lim.offset) : undefined);
     }
     return plan;
@@ -979,7 +979,7 @@ export class Planner {
           return { index: at, desc: k.desc, nullsFirst: k.nullsFirst, collation: columns[at].collation };
         })
       : null;
-    const bind = (e: PlanExpr): Fn => compileBoundExpr(rebind(e, NO_COLUMNS, (m, f) => this.subqueryExpr(m, f)), this.env.funcCtx).fn;
+    const bind = (e: BoundExpr): Fn => compileBoundExpr(rebind(e, NO_COLUMNS, (m, f) => this.subqueryExpr(m, f)), this.env.funcCtx).fn;
     const root = new RecursiveCte(op.name, initPlan.root, steps, outRegs, scan, op.distinct, columns.map((c) => c.collation), order, op.limit ? bind(op.limit) : undefined, op.offset ? bind(op.offset) : undefined);
     return { root, outRegs, columns, correlated };
   }
@@ -992,7 +992,7 @@ export class Planner {
   private physical(op: PlanOp, given: ResultColumnInfo[] | null, outer: ColMap | null, outRegs?: number[]): QueryPlan {
     const s = flatShape(op)!;
     const ctx = this.env.funcCtx;
-    const compile = (e: PlanExpr): Compiled => compileBoundExpr(e, ctx);
+    const compile = (e: BoundExpr): Compiled => compileBoundExpr(e, ctx);
     const scope = new Scope(null);
     const b = this.bindings(scope, outer);
     const { bind, fromSlot, fromRow, useOf } = b;
@@ -1005,7 +1005,7 @@ export class Planner {
 
     // The aggregate's output row: keys, then aggregate calls (registers allocated where first read, as planCore
     // does while binding), then carried bare columns (the FROM row's registers).
-    let agg: { groupFns: Fn[]; groupColls: Collation[]; groupRegs: number[]; groupExprs: PlanExpr[]; aggs: AggSpec[]; bare: Set<number> } | null = null;
+    let agg: { groupFns: Fn[]; groupColls: Collation[]; groupRegs: number[]; groupExprs: BoundExpr[]; aggs: AggSpec[]; bare: Set<number> } | null = null;
     let outSlot = fromSlot;
     if (s.aggregate) {
       const a = s.aggregate;
@@ -1055,7 +1055,7 @@ export class Planner {
         if (def === undefined) {
           const partition = w.partition.map((x) => compile(bind(x.expr, outSlot)).fn);
           const order = w.order.map((k) => ({ fn: compile(bind(k.expr, outSlot)).fn, desc: k.desc, nullsFirst: k.nullsFirst, collation: collationId(k.collation) }));
-          const offset = (b: { offset?: PlanExpr }): Fn | undefined => (b.offset ? compile(bind(b.offset, outSlot)).fn : undefined);
+          const offset = (b: { offset?: BoundExpr }): Fn | undefined => (b.offset ? compile(bind(b.offset, outSlot)).fn : undefined);
           const frame: FrameSpec = {
             unit: w.frame.unit,
             start: { kind: w.frame.start.kind, offset: offset(w.frame.start) },
@@ -1156,22 +1156,22 @@ export class Planner {
    * decorrelated when it qualifies, else its plan re-run per outer row (or once, when uncorrelated). `f` maps the
    * columns of the operation it is evaluated in.
    */
-  private subqueryExpr(n: PlanExpr, f: ColMap): PlanExpr {
+  private subqueryExpr(n: BoundExpr, f: ColMap): BoundExpr {
     const ctx = this.env.funcCtx;
-    const test = (c: Fn): PlanExpr => subqueryNative({ fn: c, type: 'int', collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false });
-    const inTest = (x: PlanExpr & { k: 'inSubquery' }): Fn => {
+    const test = (c: Fn): BoundExpr => subqueryNative({ fn: c, type: 'int', collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false });
+    const inTest = (x: BoundExpr & { k: 'inSubquery' }): Fn => {
       const probe = compilePlanExpr(rebind(x.probe, f, (m, g) => this.subqueryExpr(m, g)), ctx);
       return this.inFromPlan(this.physicalAny(x.plan, null, f), probe);
     };
     if (n.k === 'not') {
-      const t = inTest(n.arg as PlanExpr & { k: 'inSubquery' });
+      const t = inTest(n.arg as BoundExpr & { k: 'inSubquery' });
       return test((r) => {
         const v = t(r);
         return v === null ? null : v === 1 ? 0 : 1;
       });
     }
     if (n.k === 'inSubquery') return test(inTest(n));
-    const q = n as PlanExpr & { k: 'subquery' };
+    const q = n as BoundExpr & { k: 'subquery' };
     const dec = decorrelationDisabled() ? null : this.decorrelatePlan(q.plan, q.mode, f);
     if (q.mode === 'exists') return test(dec ? dec.fn : this.existsFromPlan(this.physicalAny(q.plan, null, f)));
     return subqueryNative(dec ?? this.scalarFromPlan(this.physicalAny(q.plan, null, f)));
@@ -1266,7 +1266,7 @@ export class Planner {
       return null;
     }
     if (plan.correlated) return null;
-    const outerOf = (e: PlanExpr): Compiled => compileBoundExpr(rebind(e, (c) => f(shallower(c)), (m, g) => this.subqueryExpr(m, g)), this.env.funcCtx);
+    const outerOf = (e: PlanExpr): Compiled => compilePlanExpr(rebind(e, (c) => f(shallower(c)), (m, g) => this.subqueryExpr(m, g)), this.env.funcCtx);
     const keyFns: { outer: Fn; convOuter: ((v: SqlValue) => SqlValue) | null; convInner: ((v: SqlValue) => SqlValue) | null; coll: Collation }[] = [];
     for (let i = 0; i < pairs.length; i++) {
       const col = plan.columns[i];
@@ -1292,7 +1292,7 @@ export class Planner {
   }
 
   /** An aggregate call of a plan, with its arguments bound to the FROM row's registers by `bind`. */
-  private aggSpec(a: AggCall, bind: (e: PlanExpr) => PlanExpr): AggSpec {
+  private aggSpec(a: AggCall, bind: (e: BoundExpr) => BoundExpr): AggSpec {
     const def = aggregateFunctions.get(a.fn)!;
     const argExprs = a.args.map(bind);
     const args = argExprs.map((x) => compileBoundExpr(x, this.env.funcCtx));
@@ -1561,7 +1561,7 @@ export class Planner {
   }
 
   /** `planArgs`: a table function's arguments bound from a plan (the physical planner), in place of the AST's. */
-  private addSource(item: FromItem, joinType: JoinType, scope: Scope, planArgs?: PlanExpr[], planNamed?: Record<string, PlanExpr>): void {
+  private addSource(item: FromItem, joinType: JoinType, scope: Scope, planArgs?: BoundExpr[], planNamed?: Record<string, BoundExpr>): void {
     const position = scope.sources.length;
     const ext = this.externalScan(item, scope, planArgs, planNamed);
     if (ext) {
@@ -1683,7 +1683,7 @@ export class Planner {
    * Bound conjuncts by scope and AST node: ON conjuncts are listed again for every join step that costs them. Per
    * scope, because the same AST is planned again with other registers (a CTE or view referenced twice).
    */
-  private readonly boundConjuncts = new WeakMap<Scope, WeakMap<Expr, { bound: PlanExpr; compilable: boolean; deps: Set<number> | null }>>();
+  private readonly boundConjuncts = new WeakMap<Scope, WeakMap<Expr, { bound: BoundExpr; compilable: boolean; deps: Set<number> | null }>>();
 
   /** A WHERE / ON conjunct for the pool: bound once (columns are marked as read only when it is compiled). */
   private conjunct(e: Expr, scope: Scope): ConjunctInfo {
@@ -1713,7 +1713,7 @@ export class Planner {
   }
 
   /** `columnOf` on a bound operand: a plain column (or the rowid) of table source `src`. */
-  private columnOfBound(e: PlanExpr, src: Source, scope: Scope): number | 'rowid' | null {
+  private columnOfBound(e: BoundExpr, src: Source, scope: Scope): number | 'rowid' | null {
     if (e.k !== 'slot' || isOpaque(e) || !src.table) return null;
     const s = this.slotSource(e.reg, scope);
     return s && s.src === src ? s.col : null;
@@ -1723,7 +1723,7 @@ export class Planner {
    * A bound expression's shape for matching against index definitions: `src`'s columns by position, other
    * registers as such (expression indexes and partial-index predicates are bound against `src` alone).
    */
-  private shapeKey(e: PlanExpr, src: Source, scope: Scope): string {
+  private shapeKey(e: BoundExpr, src: Source, scope: Scope): string {
     return JSON.stringify(e, (k, v) => {
       if (v && typeof v === 'object' && (v as { k?: string }).k === 'slot') {
         const s = this.slotSource((v as { reg: number }).reg, scope);
@@ -1735,7 +1735,7 @@ export class Planner {
   }
 
   /** An index's expression or WHERE predicate bound against `src` alone (cached per source). */
-  private indexBound(src: Source, e: Expr): PlanExpr {
+  private indexBound(src: Source, e: Expr): BoundExpr {
     let m = this.indexBounds.get(src);
     if (!m) this.indexBounds.set(src, (m = new Map()));
     let b = m.get(e);
@@ -1749,10 +1749,10 @@ export class Planner {
     return b;
   }
 
-  private readonly indexBounds = new WeakMap<Source, Map<Expr, PlanExpr>>();
+  private readonly indexBounds = new WeakMap<Source, Map<Expr, BoundExpr>>();
 
   /** Positions of the current-scope sources a bound expression reads. */
-  private depsOf(b: PlanExpr, scope: Scope): Set<number> {
+  private depsOf(b: BoundExpr, scope: Scope): Set<number> {
     const out = new Set<number>();
     forEachSlot(b, (reg) => {
       const s = this.slotSource(reg, scope);
@@ -1762,7 +1762,7 @@ export class Planner {
   }
 
   /** `colRef` on a bound operand: a column of a table source (also under COLLATE, not under unary +). */
-  private colRefOf(e: PlanExpr, scope: Scope): { src: Source; col: number | 'rowid' } | null {
+  private colRefOf(e: BoundExpr, scope: Scope): { src: Source; col: number | 'rowid' } | null {
     const x = unconvertedOperand(e);
     if (x.k !== 'slot') return null;
     if (isOpaque(x) && getMeta(x)?.collSrc !== CollSrc.Explicit) return null;
@@ -1771,7 +1771,7 @@ export class Planner {
   }
 
   /** `selectivity` on a bound conjunct: the same estimates, read from SQL's operators as `sql.*` calls. */
-  private selectivityOf(e: PlanExpr, scope: Scope): number {
+  private selectivityOf(e: BoundExpr, scope: Scope): number {
     // BETWEEN, NOT BETWEEN, COLLATE and unary + keep their own estimates (they were not comparisons in the AST).
     if (isOpaque(e)) {
       if (e.k === 'and') return 0.25;
@@ -1861,7 +1861,7 @@ export class Planner {
     const N = this.tableRows(src);
     const table = src.table!;
     const access = src.access!;
-    type Probe = { op: string; other: PlanExpr; deps: Set<number>; col: number | 'rowid'; colExpr: PlanExpr; conj: ConjunctInfo; list?: PlanExpr[]; exprKey?: string };
+    type Probe = { op: string; other: BoundExpr; deps: Set<number>; col: number | 'rowid'; colExpr: BoundExpr; conj: ConjunctInfo; list?: BoundExpr[]; exprKey?: string };
     // Expression indexes: comparisons whose one side is an expression over this source alone.
     const exprIndexes = table.indexes.some((i) => i.columns.some((c) => c.expr));
     const probes: Probe[] = [];
@@ -2101,7 +2101,7 @@ export class Planner {
     src: Source,
     table: TableSchema,
     access: TableAccess,
-    probes: { op: string; other: PlanExpr; deps: Set<number>; col: number | 'rowid'; colExpr: PlanExpr }[],
+    probes: { op: string; other: BoundExpr; deps: Set<number>; col: number | 'rowid'; colExpr: BoundExpr }[],
     cs: CompileScope,
     N: number,
   ): AccessOption[] {
@@ -2192,7 +2192,7 @@ export class Planner {
         // Partition pruning: the conjunct reads only this source's columns, through deterministic functions.
         const used = new Set<number>();
         let ok = true;
-        const visit = (x: PlanExpr): void => {
+        const visit = (x: BoundExpr): void => {
           if (!ok) return;
           switch (x.k) {
             case 'lit':
@@ -2256,15 +2256,15 @@ export class Planner {
    * a AND b` (split into two conjuncts) and `column IN (constants)` on a Parquet source, tested against
    * each row group's statistics (zone maps): false when no row of the group can satisfy it.
    */
-  private rowGroupCheck(e: PlanExpr, src: Source, scope: Scope): ((zones: Map<string, Zone>, rows: number) => boolean | undefined) | null {
-    const colName = (x: PlanExpr): string | null => {
+  private rowGroupCheck(e: BoundExpr, src: Source, scope: Scope): ((zones: Map<string, Zone>, rows: number) => boolean | undefined) | null {
+    const colName = (x: BoundExpr): string | null => {
       if (x.k !== 'slot' || isOpaque(x)) return null;
       const s = this.slotSource(x.reg, scope);
       if (!s || s.src !== src) return null;
       const c = src.cols.find((col) => col.reg === x.reg);
       return c ? c.name.toLowerCase() : null;
     };
-    const constant = (x: PlanExpr): SqlValue | undefined => {
+    const constant = (x: BoundExpr): SqlValue | undefined => {
       if (x.k !== 'lit' || isOpaque(x)) return undefined;
       const v = x.value;
       if (typeof v === 'bigint') return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : undefined;
@@ -2318,12 +2318,12 @@ export class Planner {
    * `item` as an external table or a `read_csv` / `read_json` call, if it is one. A call from a plan has its arguments
    * bound (`planArgs`, `planNamed`; the front end checked that they are constant).
    */
-  private externalScan(item: FromItem, scope: Scope, planArgs?: PlanExpr[], planNamed?: Record<string, PlanExpr>): ExternalScan | undefined {
+  private externalScan(item: FromItem, scope: Scope, planArgs?: BoundExpr[], planNamed?: Record<string, BoundExpr>): ExternalScan | undefined {
     if (item.kind === 'function') {
       if (!this.env.isExternalFunction?.(item.name) || !this.env.externalFunction) return undefined;
       const cs = this.compileScope(scope);
       if (planArgs) {
-        const v = (b: PlanExpr): SqlValue => compileBoundExpr(b, cs.funcCtx).fn([]);
+        const v = (b: BoundExpr): SqlValue => compileBoundExpr(b, cs.funcCtx).fn([]);
         const named: Record<string, SqlValue> = {};
         for (const [k, b] of Object.entries(planNamed ?? {})) named[k] = v(b);
         return this.env.externalFunction(item.name, planArgs.map(v), named);
@@ -2357,9 +2357,9 @@ export class Planner {
    * O(log n) probes). Handles constant bounds and bounds of fixed width over the same unknown
    * (`x >= ?1 AND x < ?1 + 10`). Undefined when it cannot tell (non-numeric, unknown bounds).
    */
-  private rangeFraction(idx: TableSchema['indexes'][number], lo: { other: PlanExpr; op: string } | undefined, hi: { other: PlanExpr; op: string } | undefined): number | undefined {
-    const num = (e: PlanExpr): number | undefined => (e.k === 'lit' && !isOpaque(e) && typeof e.value === 'number' ? e.value : undefined);
-    const linear = (e: PlanExpr): { base: string; off: number } | undefined => {
+  private rangeFraction(idx: TableSchema['indexes'][number], lo: { other: BoundExpr; op: string } | undefined, hi: { other: BoundExpr; op: string } | undefined): number | undefined {
+    const num = (e: BoundExpr): number | undefined => (e.k === 'lit' && !isOpaque(e) && typeof e.value === 'number' ? e.value : undefined);
+    const linear = (e: BoundExpr): { base: string; off: number } | undefined => {
       if (e.k === 'lit' && !isOpaque(e)) return typeof e.value === 'number' ? { base: '', off: e.value } : undefined;
       if (e.k === 'call' && !isOpaque(e) && e.fn === 'sql.neg' && num(e.args[0]) !== undefined) return { base: '', off: -num(e.args[0])! };
       if (e.k === 'call' && !isOpaque(e) && (e.fn === 'sql.add' || e.fn === 'sql.sub') && num(e.args[1]) !== undefined) {
@@ -2586,8 +2586,8 @@ export class Planner {
       const right = unconvertedOperand(e.args[1]);
       const dl = this.depsOf(left, scope);
       const dr = this.depsOf(right, scope);
-      let inner: PlanExpr;
-      let outer: PlanExpr;
+      let inner: BoundExpr;
+      let outer: BoundExpr;
       if (dl.size === 1 && dl.has(p) && !dr.has(p) && dr.size > 0) {
         inner = left;
         outer = right;
@@ -2913,7 +2913,7 @@ function topN(lim: Fn, off: Fn | undefined): (r: SqlValue[]) => number {
 
 // ------------------------------------------------------------------ physical planner helpers (ADR 0014, step 6b)
 
-type ColRef = PlanExpr & { k: 'col' };
+type ColRef = BoundExpr & { k: 'col' };
 type ScanOp = Extract<PlanOp, { op: 'scan' }>;
 type AggregateOp = Extract<PlanOp, { op: 'aggregate' }>;
 
@@ -3066,8 +3066,8 @@ function matchShape(op: PlanOp): FlatShape | null {
 }
 
 /** Whether `f` holds for every expression of a flat shape but LIMIT / OFFSET (results, keys, conditions, arguments). */
-function everyExpr(s: FlatShape, f: (e: PlanExpr) => boolean): boolean {
-  const ok = (e: PlanExpr | undefined): boolean => e === undefined || f(e);
+function everyExpr(s: FlatShape, f: (e: BoundExpr) => boolean): boolean {
+  const ok = (e: BoundExpr | undefined): boolean => e === undefined || f(e);
   const a = s.aggregate;
   if (!s.project.every(ok) || !ok(s.having) || !ok(s.where)) return false;
   if (s.sort && !s.sort.every((k) => ok(k.expr))) return false;
@@ -3119,7 +3119,7 @@ function supportedLeaf(op: PlanOp, level: number): boolean {
 }
 
 /** True when `e`'s columns are at most `level` evaluations out (-1: none), and its subqueries are supported. */
-function readsRows(e: PlanExpr, level: number): boolean {
+function readsRows(e: BoundExpr, level: number): boolean {
   switch (e.k) {
     case 'col':
       return e.depth <= level;
@@ -3149,7 +3149,7 @@ function readsRows(e: PlanExpr, level: number): boolean {
 
 /** Column `c` read from the operation one evaluation out. */
 function shallower(c: ColRef): ColRef {
-  const d: PlanExpr = { ...c, depth: c.depth - 1 };
+  const d: BoundExpr = { ...c, depth: c.depth - 1 };
   return d as ColRef;
 }
 
@@ -3159,16 +3159,16 @@ const SETOPS = { union: 'UNION', unionAll: 'UNION ALL', intersect: 'INTERSECT', 
 const NO_SELECT = {} as SelectStmt;
 
 /** Maps a column of an operation's row to the register slot that holds it. */
-type ColMap = (c: ColRef) => PlanExpr;
+type ColMap = (c: ColRef) => BoundExpr;
 
 /** A FROM row cell: its register, its source and the source's column (-1: a table's rowid). */
 type FromCell = { reg: number; src: Source; col: number };
 
 /** See `Planner.bindings`. */
 interface Bindings {
-  bind: (e: PlanExpr, m: ColMap) => PlanExpr;
+  bind: (e: BoundExpr, m: ColMap) => BoundExpr;
   /** Bound for analysis: subqueries are placeholders. */
-  analysis: (e: PlanExpr, m: ColMap) => PlanExpr;
+  analysis: (e: BoundExpr, m: ColMap) => BoundExpr;
   fromRow: FromCell[];
   useOf: (f: FromCell) => () => void;
   fromSlot: ColMap;
@@ -3180,7 +3180,7 @@ const NO_COLUMNS: ColMap = () => {
 };
 
 /** True when `e` has a subquery (not counting compiled nodes). */
-function hasNested(e: PlanExpr): boolean {
+function hasNested(e: BoundExpr): boolean {
   switch (e.k) {
     case 'subquery':
     case 'inSubquery':
@@ -3201,7 +3201,7 @@ function hasNested(e: PlanExpr): boolean {
 }
 
 /** Which rows a subquery's expression reads: its own (`inner`), the enclosing ones (`outer`), both, or neither. */
-function sideOf(e: PlanExpr): 'inner' | 'outer' | 'mixed' | 'none' | 'bad' {
+function sideOf(e: BoundExpr): 'inner' | 'outer' | 'mixed' | 'none' | 'bad' {
   if (hasNested(e)) return 'bad';
   let i = false;
   let o = false;
@@ -3210,8 +3210,8 @@ function sideOf(e: PlanExpr): 'inner' | 'outer' | 'mixed' | 'none' | 'bad' {
 }
 
 /** The AND-ed parts of a predicate, as `conjuncts` splits its AST (BETWEEN stays whole). */
-function andParts(e: PlanExpr, out: PlanExpr[] = []): PlanExpr[] {
-  if (e.k === 'and' && !getMeta(e)?.opaque) for (const x of e.args) andParts(x, out);
+function andParts<E extends BoundExpr>(e: E, out: E[] = []): E[] {
+  if (e.k === 'and' && !getMeta(e)?.opaque) for (const x of e.args) andParts(x as E, out);
   else out.push(e);
   return out;
 }
@@ -3219,7 +3219,7 @@ function andParts(e: PlanExpr, out: PlanExpr[] = []): PlanExpr[] {
 const COLLATION_NAMES: readonly CollationName[] = ['binary', 'nocase', 'rtrim'];
 
 /** A compiled subquery, as the binder makes one. */
-const subqueryNative = (c: Compiled): PlanExpr => ({ k: 'native', compiled: c, type: c.type, subquery: true });
+const subqueryNative = (c: Compiled): BoundExpr => ({ k: 'native', compiled: c, type: c.type, subquery: true });
 
 /** An empty plan in place of a subquery's, in a conjunct bound for analysis (as `conjunct` does). */
 const PLACEHOLDER: PlanOp = { op: 'values', rows: [], types: [] };
@@ -3228,8 +3228,10 @@ const PLACEHOLDER: PlanOp = { op: 'values', rows: [], types: [] };
  * A copy of `e` with each column replaced by `f(column)`, keeping every node's SQL metadata. `sub` compiles its
  * subqueries (and NOT IN as one test); without it they become placeholders, as for analysis.
  */
-function rebind(e: PlanExpr, f: (c: ColRef) => PlanExpr, sub?: (n: PlanExpr, f: (c: ColRef) => PlanExpr) => PlanExpr): PlanExpr {
-  const r = (x: PlanExpr): PlanExpr => rebind(x, f, sub);
+function rebind(e: PlanExpr, f: (c: ColRef) => PlanExpr): PlanExpr;
+function rebind(e: BoundExpr, f: (c: ColRef) => BoundExpr, sub?: (n: BoundExpr, f: (c: ColRef) => BoundExpr) => BoundExpr): BoundExpr;
+function rebind(e: BoundExpr, f: (c: ColRef) => BoundExpr, sub?: (n: BoundExpr, f: (c: ColRef) => BoundExpr) => BoundExpr): BoundExpr {
+  const r = (x: BoundExpr): BoundExpr => rebind(x, f, sub);
   switch (e.k) {
     case 'col':
       return f(e);
@@ -3242,7 +3244,7 @@ function rebind(e: PlanExpr, f: (c: ColRef) => PlanExpr, sub?: (n: PlanExpr, f: 
       return { ...e, arg: r(e.arg) };
     case 'cast':
     case 'isNull':
-      return { ...e, arg: r(e.arg) } as PlanExpr;
+      return { ...e, arg: r(e.arg) } as BoundExpr;
     case 'case':
       return { ...e, whens: e.whens.map((w) => ({ when: r(w.when), then: r(w.then) })), else: r(e.else) };
     case 'subquery':
@@ -3257,8 +3259,8 @@ function rebind(e: PlanExpr, f: (c: ColRef) => PlanExpr, sub?: (n: PlanExpr, f: 
 }
 
 /** The register slot for column `c`, with its SQL metadata; `use` marks the column as read when compiled. */
-function slotFor(c: ColRef, reg: number, use?: () => void): PlanExpr {
-  const slot: PlanExpr = use ? { k: 'slot', reg, type: c.type, use } : { k: 'slot', reg, type: c.type };
+function slotFor(c: ColRef, reg: number, use?: () => void): BoundExpr {
+  const slot: BoundExpr = use ? { k: 'slot', reg, type: c.type, use } : { k: 'slot', reg, type: c.type };
   const m = getMeta(c);
   if (m) setMeta(slot, m);
   return slot;
@@ -3268,7 +3270,7 @@ function slotFor(c: ColRef, reg: number, use?: () => void): PlanExpr {
  * The conjuncts of a bound WHERE predicate, as `conjuncts` and `splitBetween` split its AST: AND (not one a COLLATE
  * copied), and the two comparisons of a BETWEEN.
  */
-function splitBoundConjuncts(e: PlanExpr, out: PlanExpr[] = []): PlanExpr[] {
+function splitBoundConjuncts(e: BoundExpr, out: BoundExpr[] = []): BoundExpr[] {
   if (e.k === 'and') {
     const m = getMeta(e);
     if (!m?.opaque) {

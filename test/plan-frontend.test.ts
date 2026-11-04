@@ -97,3 +97,39 @@ describe('SQL front end', () => {
     expect(plan(catalog, 'SELECT table_name FROM information_schema.tables')!.columns).toEqual(['table_name text']);
   });
 });
+
+// Plans are the contract between languages and the engine (ADR 0015 section 9): plain data, with no closures and no
+// planner-internal nodes, so they can be sent to workers and built by other languages.
+describe('plans are plain data', () => {
+  const QUERIES = [
+    'SELECT CURRENT_DATE, CURRENT_TIME, CURRENT_TIMESTAMP',
+    "SELECT a, CURRENT_TIMESTAMP > '2000' FROM t WHERE s = 'x'",
+    'SELECT t.a, u.y FROM t JOIN u ON u.x = t.a WHERE t.id < 5 ORDER BY 1',
+    'SELECT a, count(*), sum(id) FROM t GROUP BY a HAVING count(*) > 1',
+    'SELECT id, (SELECT max(y) FROM u WHERE u.x = t.a) FROM t',
+    'SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a) AND a IN (SELECT x FROM u)',
+    'SELECT a, rank() OVER (PARTITION BY s ORDER BY id) FROM t',
+    'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5) SELECT i FROM n',
+    'SELECT va FROM v UNION SELECT x FROM u',
+  ];
+  const offending = (o: unknown, seen = new Set<unknown>()): string[] => {
+    if (typeof o === 'function') return ['function'];
+    if (!o || typeof o !== 'object' || seen.has(o)) return [];
+    seen.add(o);
+    const k = (o as { k?: unknown }).k;
+    if (k === 'slot' || k === 'native') return [String(k)];
+    return Object.values(o).flatMap((v) => offending(v, seen));
+  };
+  it('carry no closures, registers or compiled parts', async () => {
+    const { catalog } = await setup();
+    for (const q of QUERIES) {
+      const r = toPlan(parseOne(q).stmt as SelectStmt, q, catalog);
+      expect(offending(r.plan), q).toEqual([]);
+      expect(() => JSON.stringify(r.plan), q).not.toThrow();
+    }
+  });
+  it('read the clock with a call', async () => {
+    const { catalog } = await setup();
+    expect(plan(catalog, 'SELECT CURRENT_DATE, CURRENT_TIMESTAMP')!.text).toBe('project sql.current_date(), sql.current_timestamp()\n  values ()');
+  });
+});

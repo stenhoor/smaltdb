@@ -1,6 +1,6 @@
 /** Text form of plan expressions, for tests, debugging and (later) EXPLAIN. */
 import type { SqlValue } from '../values.js';
-import type { PlanExpr } from './expr.js';
+import type { BoundExpr } from './expr.js';
 import type { PlanOp } from './ops.js';
 
 function literal(v: SqlValue): string {
@@ -14,7 +14,7 @@ function literal(v: SqlValue): string {
  * `#input.index` for a column (with `^depth` when it reads an enclosing operation), `$n` for a parameter, and
  * `fn(args)` for calls, with `[collation]` when one is set.
  */
-export function printExpr(e: PlanExpr): string {
+export function printExpr(e: BoundExpr): string {
   switch (e.k) {
     case 'col':
       return `#${e.input}.${e.index}${e.depth ? `^${e.depth}` : ''}`;
@@ -49,7 +49,7 @@ export function printExpr(e: PlanExpr): string {
 /** Indented text form of a plan, one operation per line, for tests and debugging. */
 export function printPlan(op: PlanOp, depth = 0): string {
   const pad = '  '.repeat(depth);
-  const list = (xs: readonly PlanExpr[]): string => xs.map(printExpr).join(', ');
+  const list = (xs: readonly BoundExpr[]): string => xs.map(printExpr).join(', ');
   const sub = (o: PlanOp): string => printPlan(o, depth + 1);
   switch (op.op) {
     case 'scan':

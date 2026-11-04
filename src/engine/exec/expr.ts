@@ -17,7 +17,7 @@ import { type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, sc
 import { type CodegenHelpers, type FallbackNode, codegenEnabled, generate, generatedType, isCodegenRoot } from './codegen.js';
 import { WINDOW_ARITY } from './window.js';
 import { type SqlMeta, getMeta, setMeta } from './sql-meta.js';
-import { type PlanExpr, call, lit, param, typeOf } from '../plan/expr.js';
+import { type BoundExpr, call, lit, param, typeOf } from '../plan/expr.js';
 import type { CollationName } from '../plan/types.js';
 import type { PlanOp } from '../plan/ops.js';
 import { decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
@@ -57,7 +57,7 @@ export interface ColumnBinding {
    */
   use?: () => void;
   /** The name resolved to a select-list alias, bound by the SQL front end: use this plan expression. */
-  bound?: PlanExpr;
+  bound?: BoundExpr;
 }
 
 /** Name resolution and planner callbacks used while compiling expressions. */
@@ -136,13 +136,13 @@ export function compileExpr(e: Expr, scope: CompileScope): Compiled {
  * `compileExpr`, also returning the bound plan expression: operators keep it, so that pipeline fusion compiles it
  * again without binding names a second time.
  */
-export function compileWithPlan(e: Expr, scope: CompileScope): { compiled: Compiled; bound: PlanExpr } {
+export function compileWithPlan(e: Expr, scope: CompileScope): { compiled: Compiled; bound: BoundExpr } {
   const bound = bindExpr(e, scope);
   return { compiled: compileBoundExpr(bound, scope.funcCtx), bound };
 }
 
 /** Compile a bound expression: generated code for arithmetic / comparison / logic roots, otherwise closures. */
-export function compileBoundExpr(b: PlanExpr, ctx: FunctionContext): Compiled {
+export function compileBoundExpr(b: BoundExpr, ctx: FunctionContext): Compiled {
   if (!codegenEnabled() || !isCodegenRoot(b)) return compilePlanExpr(b, ctx);
   if (b.k === 'call' && !b.fn.startsWith('sql.')) {
     // A math call: keep the closure compiler's result when it is constant (folded) or a register read.
@@ -157,7 +157,7 @@ export function compileBoundExpr(b: PlanExpr, ctx: FunctionContext): Compiled {
  * The static metadata `compileBoundExpr` gives a bound expression (type, collation, affinity), without generating
  * code: the SQL front end (ADR 0014, step 5) derives its result columns' metadata exactly as the planner does.
  */
-export function boundMetadata(b: PlanExpr, ctx: FunctionContext): Pick<Compiled, 'type' | 'collation' | 'collSrc' | 'affinity'> {
+export function boundMetadata(b: BoundExpr, ctx: FunctionContext): Pick<Compiled, 'type' | 'collation' | 'collSrc' | 'affinity'> {
   if (!codegenEnabled() || !isCodegenRoot(b)) return compilePlanExpr(b, ctx);
   if (b.k === 'call' && !b.fn.startsWith('sql.')) {
     const c = compilePlanExpr(b, ctx);
@@ -168,12 +168,12 @@ export function boundMetadata(b: PlanExpr, ctx: FunctionContext): Pick<Compiled,
 }
 
 /** How fused pipelines compile a node of a bound expression with the closure compiler. */
-export function pipelineCompiler(scope: CompileScope): (e: PlanExpr) => FallbackNode {
+export function pipelineCompiler(scope: CompileScope): (e: BoundExpr) => FallbackNode {
   return (e) => compilePlanExpr(e, scope.funcCtx);
 }
 
 /** True if a bound expression runs a subquery (fused pipelines leave those to the operators). */
-export function planHasSubquery(e: PlanExpr): boolean {
+export function planHasSubquery(e: BoundExpr): boolean {
   switch (e.k) {
     case 'native':
       return e.subquery === true;
@@ -218,28 +218,28 @@ const COLLATION_NAMES: readonly CollationName[] = ['binary', 'nocase', 'rtrim'];
 const collationName = (c: Collation): CollationName => COLLATION_NAMES[c];
 const collationId = (n: CollationName | undefined): Collation => (n === 'nocase' ? Collation.NoCase : n === 'rtrim' ? Collation.RTrim : Collation.Binary);
 
-function withMeta<T extends PlanExpr>(e: T, m: SqlMeta): T {
+function withMeta<T extends BoundExpr>(e: T, m: SqlMeta): T {
   if (m.collation !== Collation.Binary || m.collSrc !== CollSrc.None || m.affinity !== 'NONE' || m.opaque) setMeta(e, m);
   return e;
 }
 
-const metaOf = (e: PlanExpr): SqlMeta => getMeta(e) ?? NO_META;
+const metaOf = (e: BoundExpr): SqlMeta => getMeta(e) ?? NO_META;
 
 /** A copy of `e` carrying the SQL metadata of `c` (the SQL front end: a select-list alias, as the planner compiled it). */
-export function withCompiledMeta(e: PlanExpr, c: Pick<Compiled, 'collation' | 'collSrc' | 'affinity'>): PlanExpr {
+export function withCompiledMeta(e: BoundExpr, c: Pick<Compiled, 'collation' | 'collSrc' | 'affinity'>): BoundExpr {
   const copy = { ...e };
   setMeta(copy, { ...metaOf(e), collation: c.collation, collSrc: c.collSrc, affinity: c.affinity });
   return copy;
 }
 
 /** Mark `e` as an SQL form that code generation leaves to the closure compiler (see SqlMeta.opaque). */
-function opaque<T extends PlanExpr>(e: T): T {
+function opaque<T extends BoundExpr>(e: T): T {
   setMeta(e, { ...metaOf(e), opaque: true });
   return e;
 }
 
 /** The parts of a bound expression the SQL rules for comparisons read. */
-const operand = (e: PlanExpr): SqlOperand => {
+const operand = (e: BoundExpr): SqlOperand => {
   const m = metaOf(e);
   return { type: typeOf(e), collation: m.collation, collSrc: m.collSrc, affinity: m.affinity };
 };
@@ -247,12 +247,12 @@ const operand = (e: PlanExpr): SqlOperand => {
 const AFFINITY_CALLS = new Set(['sql.affinity_numeric', 'sql.affinity_text']);
 
 /** `left op right` with SQLite's collation and affinity rules made explicit: a collation attribute and conversion calls. */
-function bindComparison(op: string, a: PlanExpr, b: PlanExpr): PlanExpr {
+function bindComparison(op: string, a: BoundExpr, b: BoundExpr): BoundExpr {
   const oa = operand(a);
   const ob = operand(b);
   const coll = comparisonCollation(oa, ob);
   const [ca, cb] = comparisonConverters(oa, ob);
-  const wrap = (x: PlanExpr, conv: unknown): PlanExpr =>
+  const wrap = (x: BoundExpr, conv: unknown): BoundExpr =>
     conv === null ? x : call(conv === applyNumericAffinity ? 'sql.affinity_numeric' : 'sql.affinity_text', [x], typeOf(x));
   return call(COMPARISON_FUNCTIONS[op], [wrap(a, ca), wrap(b, cb)], 'int', collationName(coll));
 }
@@ -263,7 +263,7 @@ function bindComparison(op: string, a: PlanExpr, b: PlanExpr): PlanExpr {
  * select-list aliases compiled here, at the moment the closure compiler always did, so planning order, registers
  * and errors are unchanged.
  */
-export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
+export function bindExpr(e: Expr, scope: CompileScope): BoundExpr {
   if (scope.groupRef) {
     const g = scope.groupRef(e);
     if (g) return withMeta({ k: 'slot', reg: g.reg, type: g.type }, { collation: g.collation, collSrc: g.collation ? CollSrc.Column : CollSrc.None, affinity: g.affinity });
@@ -277,7 +277,7 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
       const b = scope.resolveColumn(e, true);
       if (b.bound) return b.bound;
       if (b.compiled) return native(b.compiled);
-      const slot: PlanExpr = b.use ? { k: 'slot', reg: b.reg, type: b.type, use: b.use } : { k: 'slot', reg: b.reg, type: b.type };
+      const slot: BoundExpr = b.use ? { k: 'slot', reg: b.reg, type: b.type, use: b.use } : { k: 'slot', reg: b.reg, type: b.type };
       return withMeta(slot, { collation: b.collation, collSrc: CollSrc.Column, affinity: b.affinity });
     }
     case 'collate': {
@@ -308,7 +308,7 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
       const x = bindExpr(e.expr, scope);
       const lo = bindExpr(e.low, scope);
       const hi = bindExpr(e.high, scope);
-      const both: PlanExpr = opaque({ k: 'and', args: [bindComparison('>=', x, lo), bindComparison('<=', x, hi)] });
+      const both: BoundExpr = opaque({ k: 'and', args: [bindComparison('>=', x, lo), bindComparison('<=', x, hi)] });
       return e.not ? opaque({ k: 'not', arg: both }) : both;
     }
     case 'isNull':
@@ -323,7 +323,7 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
       if (scope.planSubquery) {
         const probe = bindExpr(e.expr, scope);
         const sub = scope.planSubquery(e.select, 'in');
-        const node: PlanExpr = { k: 'inSubquery', probe, plan: sub.plan, collation: 'binary' };
+        const node: BoundExpr = { k: 'inSubquery', probe, plan: sub.plan, collation: 'binary' };
         return e.not ? { k: 'not', arg: node } : node;
       }
       const probe = compilePlanExpr(bindExpr(e.expr, scope), scope.funcCtx);
@@ -338,7 +338,7 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
     }
     case 'exists': {
       if (scope.planSubquery) {
-        const node: PlanExpr = { k: 'subquery', mode: 'exists', plan: scope.planSubquery(e.select, 'exists').plan, type: 'int', collation: 'binary' };
+        const node: BoundExpr = { k: 'subquery', mode: 'exists', plan: scope.planSubquery(e.select, 'exists').plan, type: 'int', collation: 'binary' };
         return e.not ? { k: 'not', arg: node } : node;
       }
       const f = scope.existsSubquery(e.select);
@@ -348,7 +348,7 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
     case 'subquery': {
       if (scope.planSubquery) {
         const { plan, column } = scope.planSubquery(e.select, 'scalar');
-        const node: PlanExpr = { k: 'subquery', mode: 'scalar', plan, type: column.type, collation: collationName(column.collation) };
+        const node: BoundExpr = { k: 'subquery', mode: 'scalar', plan, type: column.type, collation: collationName(column.collation) };
         // As the compiled scalar subquery: its column's collation, from a column.
         return withMeta(node, { collation: column.collation, collSrc: column.collation ? CollSrc.Column : CollSrc.None, affinity: 'NONE' });
       }
@@ -388,16 +388,16 @@ export function bindExpr(e: Expr, scope: CompileScope): PlanExpr {
 }
 
 /** `e` with no SQL metadata, even where the node it copies had some (a compiled alias keeps its own otherwise). */
-function stripped(e: PlanExpr): PlanExpr {
+function stripped(e: BoundExpr): BoundExpr {
   setMeta(e, NO_META);
   return e;
 }
 
-function native(c: Compiled, subquery = false): PlanExpr {
+function native(c: Compiled, subquery = false): BoundExpr {
   return subquery ? { k: 'native', compiled: c, type: c.type, subquery: true } : { k: 'native', compiled: c, type: c.type };
 }
 
-function bindBinary(op: string, a: PlanExpr, b: PlanExpr): PlanExpr {
+function bindBinary(op: string, a: BoundExpr, b: BoundExpr): BoundExpr {
   switch (op) {
     case 'AND':
       return { k: 'and', args: [a, b] };
@@ -435,7 +435,7 @@ function bindBinary(op: string, a: PlanExpr, b: PlanExpr): PlanExpr {
 
 const NO_FN: Fn = () => null;
 
-function bindCall(e: CallExpr, scope: CompileScope): PlanExpr {
+function bindCall(e: CallExpr, scope: CompileScope): BoundExpr {
   if (e.over !== undefined) {
     if (!scope.windowRef) throw new SmaltError('SMALT_ERROR', `misuse of window function ${e.name}()`);
     const b = scope.windowRef(e);
@@ -450,8 +450,8 @@ function bindCall(e: CallExpr, scope: CompileScope): PlanExpr {
   }
   if (e.distinct || e.star || e.filter) throw new SmaltError('SMALT_ERROR', `DISTINCT/FILTER/* is only valid with aggregate functions`);
   if (name === 'current_time' || name === 'current_date' || name === 'current_timestamp') {
-    const ctx = scope.funcCtx;
-    return native({ fn: () => currentTimeText(name, ctx.now()), type: 'text', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false });
+    // A plain call, so plans carry no closure: the clock is read when the statement runs.
+    return call(`sql.${name}`, [], 'text');
   }
   const def = scalarFunctions.get(name);
   if (!def) {
@@ -483,7 +483,7 @@ function bindCall(e: CallExpr, scope: CompileScope): PlanExpr {
 }
 
 /** Compile a bound expression to a closure, with its SQL metadata. */
-export function compilePlanExpr(e: PlanExpr, ctx: FunctionContext): Compiled {
+export function compilePlanExpr(e: BoundExpr, ctx: FunctionContext): Compiled {
   const c = compileBound(e, ctx);
   const m = getMeta(e);
   if (m === undefined) return c;
@@ -495,8 +495,8 @@ export function compilePlanExpr(e: PlanExpr, ctx: FunctionContext): Compiled {
   return c;
 }
 
-function compileBound(e: PlanExpr, ctx: FunctionContext): Compiled {
-  const sub = (x: PlanExpr): Compiled => compilePlanExpr(x, ctx);
+function compileBound(e: BoundExpr, ctx: FunctionContext): Compiled {
+  const sub = (x: BoundExpr): Compiled => compilePlanExpr(x, ctx);
   switch (e.k) {
     case 'lit':
       return konst(e.value, e.type);
@@ -549,8 +549,8 @@ function compileBound(e: PlanExpr, ctx: FunctionContext): Compiled {
 }
 
 /** A call of an `sql.*` function: the closure the SQL rules always built for that operator. */
-function compileSqlCall(e: Extract<PlanExpr, { k: 'call' }>, ctx: FunctionContext, negated: boolean): Compiled {
-  const sub = (x: PlanExpr): Compiled => compilePlanExpr(x, ctx);
+function compileSqlCall(e: Extract<BoundExpr, { k: 'call' }>, ctx: FunctionContext, negated: boolean): Compiled {
+  const sub = (x: BoundExpr): Compiled => compilePlanExpr(x, ctx);
   const args = e.args;
   switch (e.fn) {
     case 'sql.in_list':
@@ -560,6 +560,12 @@ function compileSqlCall(e: Extract<PlanExpr, { k: 'call' }>, ctx: FunctionContex
       const [x, pat, esc] = args.map(sub);
       const { fn } = sqlFunction(e.fn).compile(esc ? [x, pat, esc] : [x, pat], { negated });
       return fold({ fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: x.constant && pat.constant && (esc?.constant ?? true) });
+    }
+    case 'sql.current_date':
+    case 'sql.current_time':
+    case 'sql.current_timestamp': {
+      const kind = e.fn.slice(4) as 'current_date' | 'current_time' | 'current_timestamp';
+      return { fn: () => currentTimeText(kind, ctx.now()), type: 'text', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
     }
     case 'sql.neg':
       return compileUnary('-', sub(args[0]));
@@ -588,7 +594,7 @@ function compileSqlCall(e: Extract<PlanExpr, { k: 'call' }>, ctx: FunctionContex
   }
 }
 
-function compileScalarCall(e: Extract<PlanExpr, { k: 'call' }>, ctx: FunctionContext): Compiled {
+function compileScalarCall(e: Extract<BoundExpr, { k: 'call' }>, ctx: FunctionContext): Compiled {
   const def = scalarFunctions.get(e.fn)!;
   const args = e.args.map((a) => compilePlanExpr(a, ctx));
   const compiledArgs: CompiledArg[] = args.map((a) => ({ fn: a.fn, type: a.type, collation: a.collation }));
@@ -721,7 +727,7 @@ function compileInList(not: boolean, x: Compiled, list: Compiled[]): Compiled {
   return { ...base, constant: false, fn };
 }
 
-function compileCase(e: Extract<PlanExpr, { k: 'case' }>, ctx: FunctionContext): Compiled {
+function compileCase(e: Extract<BoundExpr, { k: 'case' }>, ctx: FunctionContext): Compiled {
   const whens = e.whens.map((w) => ({ test: compilePlanExpr(w.when, ctx).fn, then: compilePlanExpr(w.then, ctx) }));
   const els = compilePlanExpr(e.else, ctx);
   const thens = whens.map((w) => w.then.fn);
