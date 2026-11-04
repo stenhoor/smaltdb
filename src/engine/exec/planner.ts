@@ -137,6 +137,11 @@ export interface PlannerEnv {
    * materialized view, or null. Absent when the statement may not use views.
    */
   rewriteSelect?(select: SelectStmt, text: string): SelectStmt | null;
+  /**
+   * Whether materialized-view matching has a view to match (a fresh, populated materialized view). The physical
+   * planner leaves a statement to the AST path when it would decorrelate a subquery then (see AstPathNeeded).
+   */
+  matviewCandidates?(): boolean;
   /** M8: an external table by name (its columns from the catalog; its rows once loaded). */
   externalTable?(name: string): ExternalScan | undefined;
   /** M8: a reading table function (`read_csv`, `read_json`) called with constant arguments. */
@@ -518,14 +523,8 @@ export class Planner {
    */
   private matviewRewrite(stmt: SelectStmt, parent: Scope | null): SelectStmt | null {
     const rewrite = this.env.rewriteSelect;
-    const core = stmt.core;
-    if (!rewrite || stmt.with || stmt.compound.length > 0 || core.kind !== 'select' || core.from?.kind !== 'table') return null;
-    const from = core.from;
-    if (!from.schema && parent?.findCte(from.name)) return null;
-    if (parent !== null && !this.readsOnlyItsTable(stmt, from)) return null;
-    const r = rewrite(stmt, this.sqlText);
-    if (r) this.usedMatview = true;
-    return r;
+    if (!rewrite || !mayMatchMatview(stmt, parent !== null, (n) => parent?.findCte(n) !== undefined, (n, schema) => this.env.getTable(n, schema))) return null;
+    return rewrite(stmt, this.sqlText);
   }
 
   /**
@@ -543,33 +542,10 @@ export class Planner {
     };
   }
 
-  /** Some SELECT was rewritten to read a materialized view (SMALT_PLAN=shadow compares only unrewritten plans). */
-  usedMatview = false;
-
   /** One SELECT of a compound (UNION / INTERSECT / EXCEPT) answered from a materialized view. */
   private matviewCore(core: SelectCore, parent: Scope | null): SelectCore {
     if (!this.env.rewriteSelect) return core;
-    const r = this.matviewRewrite({ kind: 'select', core, compound: [], orderBy: [], pos: core.pos, end: core.end }, parent);
-    // A rewrite keeps a single core without ORDER BY / LIMIT when the input had none.
-    return r && !r.with && r.compound.length === 0 && r.orderBy.length === 0 && !r.limit ? r.core : core;
-  }
-
-  /** Every column reference of `stmt` is to its single FROM table `from` (or a bare result alias in ORDER BY). */
-  private readsOnlyItsTable(stmt: SelectStmt, from: Extract<FromItem, { kind: 'table' }>): boolean {
-    const t = this.env.getTable(from.name, from.schema);
-    if (!t) return false;
-    const qualifier = (from.alias ?? from.name).toLowerCase();
-    const names = new Set([...t.columns.map((c) => c.name.toLowerCase()), ...ROWID_NAMES]);
-    const own = (n: Record<string, unknown>): boolean => {
-      const c = n as unknown as ColumnExpr;
-      if (c.schema) return false;
-      return c.table ? c.table.toLowerCase() === qualifier : names.has(c.name.toLowerCase());
-    };
-    const core = stmt.core as SelectCoreSelect;
-    const aliases = new Set(core.columns.flatMap((c) => (c.kind === 'expr' && c.alias ? [c.alias.toLowerCase()] : [])));
-    const orderAliases = stmt.orderBy.filter((o) => o.expr.kind === 'column' && !o.expr.table && aliases.has(o.expr.name.toLowerCase()) && !names.has(o.expr.name.toLowerCase()));
-    const rest = { ...stmt, orderBy: stmt.orderBy.filter((o) => !orderAliases.includes(o)) };
-    return !anyNode(rest, (n) => n.kind === 'column' && !own(n));
+    return matviewCoreOf(core, (stmt) => this.matviewRewrite(stmt, parent));
   }
 
   planSelect(stmt: SelectStmt, parent: Scope | null, outRegs?: number[]): QueryPlan {
@@ -1661,6 +1637,9 @@ export class Planner {
         exprs: [...pairs.map((_p, i) => keyCol(i)), shifted],
       };
     }
+    // The planner plans the inner side from SQL, which materialized-view matching may answer: until decorrelation
+    // reads plans (step 7b), such a statement takes the AST path.
+    if (this.env.rewriteSelect && this.env.matviewCandidates?.()) throw new AstPathNeeded();
     let plan: QueryPlan;
     try {
       plan = this.physical(inner, null, null);
@@ -3996,6 +3975,50 @@ function splitBoundConjuncts(e: PlanExpr, out: PlanExpr[] = []): PlanExpr[] {
 
 const COLLATION_IDS: Readonly<Record<CollationName, Collation>> = { binary: Collation.Binary, nocase: Collation.NoCase, rtrim: Collation.RTrim };
 const collationId = (n: CollationName): Collation => COLLATION_IDS[n];
+
+/**
+ * Thrown by the physical planner for a statement the planner's AST path must plan (a decorrelated subquery whose
+ * inner side a materialized view may answer). The caller restores the planner (`Planner.mark`) and plans the AST.
+ */
+export class AstPathNeeded extends Error {}
+
+/**
+ * Whether materialized-view matching may answer `stmt` (a SELECT the planner, or the SQL front end, plans). Not when
+ * its table name means a CTE (`isCte`), and not when, `nested` in another query, it reads that query's columns: the
+ * matcher compares column names without qualifiers, so an outer `o.x` would turn into the view's `x`.
+ */
+export function mayMatchMatview(stmt: SelectStmt, nested: boolean, isCte: (name: string) => boolean, getTable: (name: string, schema?: string) => TableSchema | undefined): boolean {
+  const core = stmt.core;
+  if (stmt.with || stmt.compound.length > 0 || core.kind !== 'select' || core.from?.kind !== 'table') return false;
+  const from = core.from;
+  if (!from.schema && isCte(from.name)) return false;
+  return !nested || readsOnlyItsTable(stmt, from, getTable);
+}
+
+/** One SELECT of a compound answered from a materialized view (`rewrite`), or `core` as it was. */
+export function matviewCoreOf(core: SelectCore, rewrite: (stmt: SelectStmt) => SelectStmt | null): SelectCore {
+  const r = rewrite({ kind: 'select', core, compound: [], orderBy: [], pos: core.pos, end: core.end });
+  // A rewrite keeps a single core without ORDER BY / LIMIT when the input had none.
+  return r && !r.with && r.compound.length === 0 && r.orderBy.length === 0 && !r.limit ? r.core : core;
+}
+
+/** Every column reference of `stmt` is to its single FROM table `from` (or a bare result alias in ORDER BY). */
+function readsOnlyItsTable(stmt: SelectStmt, from: Extract<FromItem, { kind: 'table' }>, getTable: (name: string, schema?: string) => TableSchema | undefined): boolean {
+  const t = getTable(from.name, from.schema);
+  if (!t) return false;
+  const qualifier = (from.alias ?? from.name).toLowerCase();
+  const names = new Set([...t.columns.map((c) => c.name.toLowerCase()), ...ROWID_NAMES]);
+  const own = (n: Record<string, unknown>): boolean => {
+    const c = n as unknown as ColumnExpr;
+    if (c.schema) return false;
+    return c.table ? c.table.toLowerCase() === qualifier : names.has(c.name.toLowerCase());
+  };
+  const core = stmt.core as SelectCoreSelect;
+  const aliases = new Set(core.columns.flatMap((c) => (c.kind === 'expr' && c.alias ? [c.alias.toLowerCase()] : [])));
+  const orderAliases = stmt.orderBy.filter((o) => o.expr.kind === 'column' && !o.expr.table && aliases.has(o.expr.name.toLowerCase()) && !names.has(o.expr.name.toLowerCase()));
+  const rest = { ...stmt, orderBy: stmt.orderBy.filter((o) => !orderAliases.includes(o)) };
+  return !anyNode(rest, (n) => n.kind === 'column' && !own(n));
+}
 
 export type { Scope };
 

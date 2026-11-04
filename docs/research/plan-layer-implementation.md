@@ -191,7 +191,7 @@ operators.
   plans in place instead of copying them (`resolveRefs`), result columns and shapes have one object layout, and the
   physical planner creates a column's read marking only for columns an expression reads.
 - **Deleting the AST path** (`Planner.planSelect`, `SMALT_PLAN=legacy`, the internal `slot` / `native` nodes; about 2k
-  lines) waits for step 8: writes and materialized-view matching and refresh (7c) still run on it (owner decision on
+  lines) waits for step 8: writes and materialized-view validation and refresh still run on it (owner decision on
   #46, replacing item 11 below).
 - **Hardest parts:** projection-pushdown parity, register order (window snapshots), outer references from subqueries
   over aggregate rows, correlation of derived tables, estimates keyed by the same operators.
@@ -208,7 +208,12 @@ operators.
   early for SELECTs that read only tables. In slt, no SELECT falls back.
 - **7b, decorrelation** into `lookup`, or a semi join for a top-level WHERE conjunct; it stays lazy and keeps today's
   equivalence conditions (collation, no COLLATE on the inner side, affinity converters).
-- **7c, materialized-view matching** on canonical plans, by column position.
+- **7c (done), materialized-view matching:** as for 7a, the SQL front end applies the AST matcher
+  (`exec/mv-match.ts`, through `PlannerEnv.rewriteSelect`) to every SELECT where `Planner.planSelect` does, with
+  the same eligibility (`mayMatchMatview`, shared), so plans are the planner's; shadow mode now compares rewritten
+  statements too. One case stays on the AST path: a decorrelated subquery's inner side, which the planner builds and
+  plans as SQL (`AstPathNeeded`, while a fresh materialized view exists), until decorrelation reads plans (7b).
+  Matching on canonical plans, by column position, follows once the AST path is deleted.
 - **7d, morsels.** The parts are plans: the `partial` reader message carries the serialized plan, its format version
   and a schema cookie instead of SQL text; the merge reads a `partials` input instead of the `smalt_partials()` table.
 - A plan-hash cache sits behind the text-keyed statement cache.

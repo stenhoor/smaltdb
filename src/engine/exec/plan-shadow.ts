@@ -67,14 +67,14 @@ export function shadowCheck(
   text: string,
   catalog: FrontEndCatalog,
   legacy: () => QueryPlan,
-  rewritten: () => boolean,
+  rewriteSelect: ((select: SelectStmt, text: string) => SelectStmt | null) | undefined,
   physical?: (fe: FrontEndResult) => QueryPlan | null,
 ): QueryPlan {
   let fe: FrontEndResult | null = null;
   let feError: unknown;
   let unsupported = '';
   try {
-    fe = toPlan(stmt, text, catalog, (reason) => (unsupported = reason));
+    fe = toPlan(stmt, text, catalog, (reason) => (unsupported = reason), rewriteSelect);
   } catch (e) {
     feError = e ?? new Error('undefined');
   }
@@ -93,9 +93,8 @@ export function shadowCheck(
     throw e;
   }
   if (feError !== undefined) throw mismatch(text, `whether it is valid: the front end raised ${describe(feError)}`);
-  // Materialized-view matching rewrites the statement (it moves onto plans in step 7); compare unrewritten plans only.
-  if (fe === null || rewritten()) {
-    skip(fe === null ? unsupported : 'rewritten to a materialized view', text);
+  if (fe === null) {
+    skip(unsupported, text);
     return plan;
   }
   shadowStats.checked++;

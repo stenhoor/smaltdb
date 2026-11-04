@@ -15,6 +15,7 @@ import { CollSrc, type ColumnBinding, type CompileScope, bindExpr, boundMetadata
 import { type FunctionContext, aggregateFunctions, scalarFunctions } from '../../exec/functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../../exec/window.js';
 import { flattenCore, flatteningDisabled } from '../../exec/flatten.js';
+import { mayMatchMatview, matviewCoreOf } from '../../exec/planner.js';
 import { containsAggregate, containsWindow, coreReferences, exprEquals, firstAggregateCall, firstWindowCall, sameName, selectReferences } from '../../exec/planner.js';
 import type { PlanExpr } from '../../plan/expr.js';
 import { getMeta, markFlattened, setMeta } from '../../exec/sql-meta.js';
@@ -62,9 +63,15 @@ class Unsupported extends Error {}
  * Plan a SELECT. `text` is the statement's SQL text (result columns are named from it). Returns null for shapes the
  * front end does not handle yet; throws the error the current planner would raise.
  */
-export function toPlan(stmt: SelectStmt, text: string, catalog: FrontEndCatalog, onUnsupported?: (reason: string) => void): FrontEndResult | null {
+export function toPlan(
+  stmt: SelectStmt,
+  text: string,
+  catalog: FrontEndCatalog,
+  onUnsupported?: (reason: string) => void,
+  rewriteSelect?: (select: SelectStmt, text: string) => SelectStmt | null,
+): FrontEndResult | null {
   try {
-    const fe = new FrontEnd(catalog, text);
+    const fe = new FrontEnd(catalog, text, rewriteSelect);
     const r = fe.select(stmt, null);
     return { plan: fe.resolveRefs(r.plan), columns: r.columns };
   } catch (e) {
@@ -164,14 +171,32 @@ class FrontEnd {
   private readonly expandingViews = new Set<string>();
   private readonly expandingAliases = new Set<string>();
 
+  /**
+   * `rewriteSelect`: materialized-view matching (the statement's, as `PlannerEnv.rewriteSelect`), applied to every
+   * SELECT where `Planner.planSelect` applies it (ADR 0014, step 7c).
+   */
   constructor(
     private readonly catalog: FrontEndCatalog,
     private text: string,
+    private readonly rewriteSelect?: (select: SelectStmt, text: string) => SelectStmt | null,
   ) {}
+
+  /** `stmt` answered from a materialized view, or null (`Planner.matviewRewrite`). */
+  private matviewRewrite(stmt: SelectStmt, parent: FeScope | null): SelectStmt | null {
+    const rewrite = this.rewriteSelect;
+    if (!rewrite || !mayMatchMatview(stmt, parent !== null, (n) => parent?.findCte(n) !== undefined, (n, schema) => this.catalog.getTable(n, schema))) return null;
+    return rewrite(stmt, this.text);
+  }
+
+  /** One SELECT of a compound answered from a materialized view (`Planner.matviewCore`). */
+  private matviewCore(core: SelectCore, parent: FeScope | null): SelectCore {
+    return this.rewriteSelect ? matviewCoreOf(core, (stmt) => this.matviewRewrite(stmt, parent)) : core;
+  }
 
   // ---------------------------------------------------------------- statements
 
   select(stmt: SelectStmt, parent: FeScope | null): CoreResult {
+    stmt = this.matviewRewrite(stmt, parent) ?? stmt;
     const withScope = new FeScope(parent);
     withScope.ctesOnly = true;
     if (stmt.with) this.registerCtes(stmt.with, withScope);
@@ -184,10 +209,10 @@ class FrontEnd {
       if (f.changed) markFlattened(plan);
       return { plan, columns: r.columns };
     }
-    const first = this.core(this.flatten(stmt.core, [], base).core, base, null, undefined);
+    const first = this.core(this.flatten(this.matviewCore(stmt.core, base), [], base).core, base, null, undefined);
     let plan = first.plan;
     for (const c of stmt.compound) {
-      const next = this.core(this.flatten(c.core, [], base).core, base, null, first.columns.length);
+      const next = this.core(this.flatten(this.matviewCore(c.core, base), [], base).core, base, null, first.columns.length);
       if (next.columns.length !== first.columns.length) {
         throw new SmaltError('SMALT_ERROR', `SELECTs to the left and right of ${c.op} do not have the same number of result columns`);
       }

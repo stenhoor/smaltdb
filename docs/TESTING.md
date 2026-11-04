@@ -81,12 +81,13 @@ While the plan layer ([ADR 0014](adr/0014-shared-plan-layer.md)) is built, `SMAL
 planned (`src/engine/exec/plan-shadow.ts`):
 
 - unset or `plan` (the default): the SQL front end (`src/engine/sql/frontend/`, step 5) makes a plan, and the physical planner
-  (`Planner.planPlan`, step 6) builds its operators. Statements answered from a materialized view go through the
-  planner's AST path (until step 7c).
+  (`Planner.planPlan`, step 6) builds its operators. A SELECT whose decorrelated subquery a materialized view may
+  answer goes through the planner's AST path (until step 7b).
 - `legacy`: the planner's AST path for every SELECT, until it is deleted after step 8.
 - `shadow` (tests): both. The front end must agree with the planner on every result column's name, type, collation,
   declared type and affinity, and on planning errors; the physical planner's operators must give the planner's
-  `EXPLAIN` rows and record the same subplans (subqueries), and then they run. A disagreement fails the statement with `SMALT_INTERNAL`.
+  `EXPLAIN` rows and record the same subplans (subqueries), and then they run. A disagreement fails the statement
+  with `SMALT_INTERNAL`. Statements answered from materialized views are compared too.
 
 CI runs the whole suite in the default mode and with `SMALT_PLAN=shadow`, and `test/plan-shapes.test.ts` and
 `test/codegen-source.test.ts` also with `SMALT_PLAN=legacy`: both paths give the same plan shapes and generated code
