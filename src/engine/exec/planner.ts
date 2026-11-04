@@ -40,7 +40,6 @@ import {
   compileBoundExpr,
   compileExpr,
   compilePlanExpr,
-  compileWithPlan,
   comparisonCollation,
   pipelineCompiler,
   planHasSubquery,
@@ -211,8 +210,7 @@ interface Source {
   /** `INDEXED BY name` (string) / `NOT INDEXED` (null). */
   indexedBy?: string | null;
   joinType: JoinType;
-  on: Expr[];
-  /** The join condition's conjuncts bound from a plan (the physical planner), in place of `on`. */
+  /** The join condition's conjuncts, bound from the plan. */
   onBound?: BoundConjunct[];
   /** Lower-cased column names merged by USING/NATURAL (hidden from unqualified lookup and *). */
   hidden: Set<string>;
@@ -343,17 +341,10 @@ export function walk(e: Expr, visit: (e: Expr) => boolean | void): void {
   }
 }
 
-/** A Filter on `e`, keeping the bound predicate for pipeline fusion. */
-function filterOn(child: Operator, e: Expr, cs: CompileScope): Filter {
-  const { compiled, bound } = compileWithPlan(e, cs);
-  return new Filter(child, compiled.fn, bound);
-}
-
 /** A Filter on a pool conjunct: compiled from its bound form (bound once, when the pool was built). */
 function filterOnConjunct(child: Operator, c: ConjunctInfo, cs: CompileScope): Filter {
   if (!c.compilable) {
-    if (!c.lazy) return filterOn(child, c.expr!, cs);
-    const b = c.lazy();
+    const b = c.lazy!();
     return new Filter(child, compileBoundExpr(b, cs.funcCtx).fn, b);
   }
   return new Filter(child, compileBoundExpr(c.bound, cs.funcCtx).fn, c.bound);
@@ -422,12 +413,10 @@ export function containsAggregate(e: Expr | undefined): boolean {
 }
 
 interface ConjunctInfo {
-  /** The conjunct's AST; absent when the physical planner bound it from a plan (always compilable). */
-  expr?: Expr;
   /**
    * The conjunct bound to a plan expression, which the access-path and cost analysis read (ADR 0014, step 6a). A
-   * conjunct with a subquery is bound for analysis only: its subqueries are placeholders, and it compiles from
-   * `expr`.
+   * conjunct with a subquery is bound for analysis only: its subqueries are placeholders, and `lazy` binds it with its
+   * subqueries planned when it is placed.
    */
   bound: BoundExpr;
   compilable: boolean;
@@ -442,7 +431,7 @@ interface ConjunctInfo {
 
 /** FROM items, join conditions and WHERE conjuncts the physical planner bound from a plan (see planFrom). */
 interface BoundFrom {
-  items: { item: FromItem; joinType: JoinType }[];
+  items: { item: PlanLeaf; joinType: JoinType }[];
   /** A table function's arguments (item `p`), bound to the earlier items' registers. */
   args(p: number): BoundExpr[] | undefined;
   /** An external table function's named arguments (item `p`), bound. */
@@ -860,8 +849,8 @@ export class Planner {
         const f = fromRow[c.input === 1 ? offsets[p] + c.index : c.index];
         return slotFor(c, f.reg, useOf(f));
       };
-    return this.planFrom(undefined, undefined, scope, {
-      items: leaves.map((l, p) => ({ item: l.op.op === 'scan' || l.op.op === 'source' ? leafItem(l.op, p) : { kind: 'subquery', select: NO_SELECT, alias: `#${p}`, pos: 0, end: 0 }, joinType: JOIN_TYPES[l.join ?? 'inner'] })),
+    return this.planFrom(scope, {
+      items: leaves.map((l, p) => ({ item: planLeaf(l.op, p), joinType: JOIN_TYPES[l.join ?? 'inner'] })),
       // Nested plans read the rows of the operation this one is evaluated in, as derived tables do.
       source: (p) => {
         const l = leaves[p].op;
@@ -1342,52 +1331,21 @@ export class Planner {
    * Plan FROM + WHERE into an operator tree; registers sources in `scope`. `bound` (the physical planner) gives the
    * FROM items and their join conditions and the WHERE conjuncts already bound, in place of `from` and `where`.
    */
-  private planFrom(from: FromItem | undefined, where: Expr | undefined, scope: Scope, bound?: BoundFrom): Operator {
+  /**
+   * The join region of a plan: its leaves (`bound.items`), join conditions and WHERE conjuncts, all bound from the plan
+   * (the front end resolved USING / NATURAL into conditions).
+   */
+  private planFrom(scope: Scope, bound: BoundFrom): Operator {
     this.lastScan = null;
-    if (!from && !bound) {
-      let root: Operator = new SingleRow();
-      if (where) root = new Filter(root, compileExpr(where, this.compileScope(scope)).fn);
-      return root;
-    }
-    const items: { item: FromItem; joinType: JoinType; on?: Expr; using?: string[]; natural: boolean }[] = [];
-    if (bound) items.push(...bound.items.map((it) => ({ ...it, natural: false })));
-    else this.flattenFrom(from!, 'INNER', undefined, undefined, false, items);
+    const items = bound.items;
     items.forEach((it, p) => {
-      const planned = bound?.source(p);
-      if (planned) this.addPlannedSource(planned.plan, it.joinType, scope, (it.item as { alias: string }).alias, planned.working === true);
-      else this.addSource(it.item, it.joinType, scope, bound?.args(p), bound?.named?.(p));
-      bound?.added(p);
+      const planned = bound.source(p);
+      if (planned) this.addPlannedSource(planned.plan, it.joinType, scope, it.item.alias, planned.working === true);
+      else this.addSource(it.item, it.joinType, scope, bound.args(p) ?? [], bound.named?.(p));
+      bound.added(p);
     });
-
-    // USING / NATURAL become equality conjuncts in the ON clause.
-    items.forEach((it, p) => {
-      const src = scope.sources[p];
-      if (bound) {
-        src.onBound = bound.on(p);
-        return;
-      }
-      if (it.on) src.on.push(...conjuncts(it.on));
-      let using = it.using;
-      if (it.natural) {
-        using = src.cols
-          .filter((c) => scope.sources.slice(0, p).some((s) => s.cols.some((x) => sameName(x.name, c.name) && !s.hidden.has(x.name.toLowerCase()))))
-          .map((c) => c.name);
-      }
-      for (const name of using ?? []) {
-        const left = scope.sources.slice(0, p).find((s) => s.cols.some((c) => sameName(c.name, name)) && !s.hidden.has(name.toLowerCase()));
-        if (!left || !src.cols.some((c) => sameName(c.name, name))) {
-          throw new SmaltError('SMALT_ERROR', `cannot join using column ${name} - column not present in both tables`);
-        }
-        src.hidden.add(name.toLowerCase());
-        src.on.push({
-          kind: 'binary',
-          op: '=',
-          left: { kind: 'column', table: left.name, name, pos: 0, end: 0 },
-          right: { kind: 'column', table: src.name, name, pos: 0, end: 0 },
-          pos: 0,
-          end: 0,
-        });
-      }
+    items.forEach((_it, p) => {
+      scope.sources[p].onBound = bound.on(p);
     });
 
     // RIGHT / FULL JOIN make every earlier source NULL-extendable: WHERE conjuncts reading those
@@ -1397,15 +1355,8 @@ export class Planner {
       if (s.joinType === 'RIGHT' || s.joinType === 'FULL') outerAt.push(i);
     });
     const hasOuter = outerAt.length > 0;
-    if (hasOuter && items.some((it, i) => (it.using || it.natural) && (scope.sources[i].joinType === 'RIGHT' || scope.sources[i].joinType === 'FULL'))) {
-      throw new SmaltError('SMALT_UNSUPPORTED', 'USING / NATURAL with RIGHT or FULL JOIN is not supported yet');
-    }
     const pool: ConjunctInfo[] = [];
-    const addPool = (e: Expr): void => {
-      for (const c of splitBetween(e)) pool.push(this.conjunct(c, scope));
-    };
-    for (const c of conjuncts(where)) addPool(c);
-    if (bound) for (const b of bound.where()) pool.push(this.boundConjunct(b, scope));
+    for (const b of bound.where()) pool.push(this.boundConjunct(b, scope));
     if (hasOuter) {
       for (const c of pool) {
         let m = -1;
@@ -1415,7 +1366,6 @@ export class Planner {
     }
     for (const src of scope.sources) {
       if (src.joinType !== 'INNER' && src.joinType !== 'CROSS') continue;
-      for (const c of src.on) addPool(c);
       for (const b of src.onBound ?? []) pool.push(this.boundConjunct(b, scope));
     }
     if (!hasOuter) this.prunePartitions(scope, pool);
@@ -1525,7 +1475,7 @@ export class Planner {
 
   private andAll(cs: ConjunctInfo[], scope: CompileScope): Fn | undefined {
     if (cs.length === 0) return undefined;
-    const fns = cs.map((c) => (c.expr ? compileExpr(c.expr, scope) : compileBoundExpr(c.lazy ? c.lazy() : c.bound, scope.funcCtx)).fn);
+    const fns = cs.map((c) => compileBoundExpr(c.lazy ? c.lazy() : c.bound, scope.funcCtx).fn);
     if (fns.length === 1) return fns[0];
     return (r) => {
       let sawNull = false;
@@ -1538,30 +1488,8 @@ export class Planner {
     };
   }
 
-  private flattenFrom(
-    item: FromItem,
-    joinType: JoinType,
-    on: Expr | undefined,
-    using: string[] | undefined,
-    natural: boolean,
-    out: { item: FromItem; joinType: JoinType; on?: Expr; using?: string[]; natural: boolean }[],
-  ): void {
-    if (item.kind === 'join') {
-      this.flattenFrom(item.left, joinType, on, using, natural, out);
-      if (item.right.kind === 'join') {
-        if (item.joinType === 'LEFT') throw new SmaltError('SMALT_UNSUPPORTED', 'LEFT JOIN with a parenthesized join on the right is not supported yet');
-        this.flattenFrom(item.right, 'INNER', undefined, undefined, false, out);
-        if (item.on) out[out.length - 1].on = out[out.length - 1].on ? ({ kind: 'binary', op: 'AND', left: out[out.length - 1].on!, right: item.on, pos: 0, end: 0 } as Expr) : item.on;
-      } else {
-        out.push({ item: item.right, joinType: item.joinType === 'CROSS' ? 'INNER' : item.joinType, on: item.on, using: item.using, natural: item.natural });
-      }
-      return;
-    }
-    out.push({ item, joinType, on, using, natural });
-  }
-
-  /** `planArgs`: a table function's arguments bound from a plan (the physical planner), in place of the AST's. */
-  private addSource(item: FromItem, joinType: JoinType, scope: Scope, planArgs?: BoundExpr[], planNamed?: Record<string, BoundExpr>): void {
+  /** Register a leaf of a plan as a source of `scope`. `planArgs`: a table function's arguments, bound. */
+  private addSource(item: PlanLeaf, joinType: JoinType, scope: Scope, planArgs: BoundExpr[], planNamed?: Record<string, BoundExpr>): void {
     const position = scope.sources.length;
     const ext = this.externalScan(item, scope, planArgs, planNamed);
     if (ext) {
@@ -1574,7 +1502,7 @@ export class Planner {
       const cols: SourceColumn[] = columns.map((c, i) => ({ name: c.name, reg: regs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '', index: i }));
       // Formats with pushdown (Parquet) read only the columns the statement uses (recorded as they resolve).
       if (ext.source.pushdown) ext.source.projection ??= new Set();
-      scope.sources.push({ name: (item as { alias?: string }).alias ?? (item as { name: string }).name, cols, rowidReg: -1, sub, lateral: false, joinType, on: [], hidden: new Set(), position, external: ext.source, externalTable: item.kind === 'table' });
+      scope.sources.push({ name: (item as { alias?: string }).alias ?? (item as { name: string }).name, cols, rowidReg: -1, sub, lateral: false, joinType, hidden: new Set(), position, external: ext.source, externalTable: item.kind === 'table' });
       return;
     }
     const isInfoSchema = item.kind === 'table' && item.schema?.toLowerCase() === 'information_schema';
@@ -1588,7 +1516,7 @@ export class Planner {
         const root = new VirtualScan('temp.sqlite_schema', () => vt.rows([]), regs);
         const columns: ResultColumnInfo[] = vt.columns.map((c) => ({ name: c.name, type: c.type, collation: Collation.Binary, affinity: 'NONE' }));
         const cols: SourceColumn[] = columns.map((c, i) => ({ name: c.name, reg: regs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: '', index: i }));
-        scope.sources.push({ name: (item as { alias?: string }).alias ?? item.name, cols, rowidReg: -1, sub: { root, outRegs: regs, columns, correlated: false }, lateral: false, joinType, on: [], hidden: new Set(), position });
+        scope.sources.push({ name: (item as { alias?: string }).alias ?? item.name, cols, rowidReg: -1, sub: { root, outRegs: regs, columns, correlated: false }, lateral: false, joinType, hidden: new Set(), position });
         return;
       }
     }
@@ -1598,25 +1526,14 @@ export class Planner {
         if (isInfoSchema) throw new SmaltError('SMALT_ERROR', `no such table: information_schema.${item.name}`);
         throw new SmaltError('SMALT_ERROR', `no such table-valued function: ${item.name}`);
       }
-      const args = item.kind === 'function' ? item.args : [];
-      const cs = this.compileScope(scope);
-      const argFns = planArgs ? planArgs.map((a) => compileBoundExpr(a, cs.funcCtx).fn) : args.map((a) => compileExpr(a, cs).fn);
-      // Arguments that read earlier sources of this FROM make the source lateral.
+      const argFns = planArgs.map((a) => compileBoundExpr(a, this.env.funcCtx).fn);
+      // Arguments that read earlier sources of this FROM make the source lateral; a subquery or a column of an enclosing
+      // query makes it correlated.
       let lateral = false;
       let correlated = false;
-      for (const a of planArgs ?? []) {
-        // As for the AST below: a subquery makes the source correlated; columns of this FROM make it lateral.
+      for (const a of planArgs) {
         if (planHasSubquery(a)) correlated = true;
         else forEachSlot(a, (reg) => (this.slotSource(reg, scope) ? (lateral = true) : (correlated = true)));
-      }
-      for (const a of planArgs ? [] : args) {
-        const d = this.deps(a, scope);
-        if (d === null) correlated = true;
-        else if (d.size > 0) lateral = true;
-        // A column that does not resolve in this FROM belongs to an enclosing query.
-        walk(a, (x) => {
-          if (x.kind === 'column' && this.findSourcePosition(x, scope) < 0) correlated = true;
-        });
       }
       const regs = vt.columns.map(() => this.regs.alloc());
       const alias = item.alias ?? item.name;
@@ -1625,11 +1542,10 @@ export class Planner {
       const sub: QueryPlan = { root, outRegs: regs, columns, correlated: correlated || lateral };
       if (correlated) scope.correlated = true;
       const cols: SourceColumn[] = columns.map((c, i) => ({ name: c.name, reg: regs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: '', index: i }));
-      scope.sources.push({ name: alias, cols, rowidReg: -1, sub, lateral, joinType, on: [], hidden: new Set(), position });
+      scope.sources.push({ name: alias, cols, rowidReg: -1, sub, lateral, joinType, hidden: new Set(), position });
       return;
     }
-    if (item.kind === 'subquery') throw new SmaltError('SMALT_INTERNAL', 'FROM subqueries are planned through the plan layer');
-    if (item.kind === 'join') throw new SmaltError('SMALT_ERROR', 'unexpected join');
+    if (item.kind === 'nested') throw new SmaltError('SMALT_INTERNAL', 'nested plans are planned as sources');
     if (item.schema && !['main', 'temp'].includes(item.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${item.schema}`);
     const table = this.env.getTable(item.name, item.schema);
     if (!table) throw new SmaltError('SMALT_ERROR', `no such table: ${item.schema ? `${item.schema}.` : ''}${item.name}`);
@@ -1652,7 +1568,6 @@ export class Planner {
       cols,
       rowidReg: table.rowidAlias >= 0 ? base + table.rowidAlias : base + table.columns.length,
       joinType,
-      on: [],
       hidden: new Set(),
       position,
       indexedBy: item.indexedBy,
@@ -1670,36 +1585,12 @@ export class Planner {
   private addPlannedSource(sub: QueryPlan, joinType: JoinType, scope: Scope, name: string, working: boolean): void {
     if (sub.correlated && !working) scope.correlated = true;
     const cols: SourceColumn[] = sub.columns.map((c, i) => ({ name: c.name, reg: sub.outRegs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '', index: i }));
-    scope.sources.push({ name, cols, rowidReg: -1, sub, joinType, on: [], hidden: new Set(), position: scope.sources.length });
+    scope.sources.push({ name, cols, rowidReg: -1, sub, joinType, hidden: new Set(), position: scope.sources.length });
   }
 
   private sourceRegs(src: Source): number[] {
     if (src.access) return src.access.registers();
     return src.cols.map((c) => c.reg);
-  }
-
-  /** Current-scope sources referenced by an expression (null when it contains a subquery). */
-  /**
-   * Bound conjuncts by scope and AST node: ON conjuncts are listed again for every join step that costs them. Per
-   * scope, because the same AST is planned again with other registers (a CTE or view referenced twice).
-   */
-  private readonly boundConjuncts = new WeakMap<Scope, WeakMap<Expr, { bound: BoundExpr; compilable: boolean; deps: Set<number> | null }>>();
-
-  /** A WHERE / ON conjunct for the pool: bound once (columns are marked as read only when it is compiled). */
-  private conjunct(e: Expr, scope: Scope): ConjunctInfo {
-    let byExpr = this.boundConjuncts.get(scope);
-    if (byExpr === undefined) this.boundConjuncts.set(scope, (byExpr = new WeakMap()));
-    let b = byExpr.get(e);
-    if (b === undefined) {
-      const compilable = !hasSubquery(e);
-      const cs = this.compileScope(scope);
-      // A conjunct with a subquery: bound for analysis, with placeholders for the subqueries (not planned here).
-      const analysis: CompileScope = compilable ? cs : { ...cs, planSubquery: () => ({ plan: { op: 'values', rows: [], types: [] }, column: { type: 'any', collation: Collation.Binary } }) };
-      const bound = bindExpr(e, analysis);
-      b = { bound, compilable, deps: compilable ? this.depsOf(bound, scope) : null };
-      byExpr.set(e, b);
-    }
-    return { expr: e, bound: b.bound, compilable: b.compilable, deps: b.deps, placed: false, lazy: undefined };
   }
 
   /** The source and column a bound slot reads, among `scope`'s sources. */
@@ -1822,32 +1713,6 @@ export class Planner {
       default:
         return 0.33;
     }
-  }
-
-  private deps(e: Expr, scope: Scope): Set<number> | null {
-    if (hasSubquery(e)) return null;
-    const out = new Set<number>();
-    walk(e, (x) => {
-      if (x.kind === 'column') {
-        const p = this.findSourcePosition(x, scope);
-        if (p >= 0) out.add(p);
-      }
-    });
-    return out;
-  }
-
-  private findSourcePosition(e: ColumnExpr, scope: Scope): number {
-    if (e.table) {
-      const s = scope.sources.find((s) => sameName(s.name, e.table!));
-      return s ? s.position : -1;
-    }
-    const matches = scope.sources.filter((s) => !s.hidden.has(e.name.toLowerCase()) && s.cols.some((c) => sameName(c.name, e.name)));
-    if (matches.length >= 1) return matches[0].position;
-    if (ROWID_NAMES.has(e.name.toLowerCase())) {
-      const t = scope.sources.filter((s) => s.table);
-      if (t.length === 1) return t[0].position;
-    }
-    return -1;
   }
 
   // ---------------------------------------------------------------- access paths
@@ -2318,24 +2183,13 @@ export class Planner {
    * `item` as an external table or a `read_csv` / `read_json` call, if it is one. A call from a plan has its arguments
    * bound (`planArgs`, `planNamed`; the front end checked that they are constant).
    */
-  private externalScan(item: FromItem, scope: Scope, planArgs?: BoundExpr[], planNamed?: Record<string, BoundExpr>): ExternalScan | undefined {
+  private externalScan(item: PlanLeaf, scope: Scope, planArgs: BoundExpr[], planNamed?: Record<string, BoundExpr>): ExternalScan | undefined {
     if (item.kind === 'function') {
       if (!this.env.isExternalFunction?.(item.name) || !this.env.externalFunction) return undefined;
-      const cs = this.compileScope(scope);
-      if (planArgs) {
-        const v = (b: BoundExpr): SqlValue => compileBoundExpr(b, cs.funcCtx).fn([]);
-        const named: Record<string, SqlValue> = {};
-        for (const [k, b] of Object.entries(planNamed ?? {})) named[k] = v(b);
-        return this.env.externalFunction(item.name, planArgs.map(v), named);
-      }
-      const value = (e: Expr): SqlValue => {
-        const c = compileExpr(e, cs);
-        if (!c.constant) throw new SmaltError('SMALT_ERROR', `${item.name}() arguments must be constants`);
-        return c.fn([]);
-      };
+      const v = (b: BoundExpr): SqlValue => compileBoundExpr(b, this.env.funcCtx).fn([]);
       const named: Record<string, SqlValue> = {};
-      for (const [k, e] of Object.entries(item.named ?? {})) named[k] = value(e);
-      return this.env.externalFunction(item.name, item.args.map(value), named);
+      for (const [k, b] of Object.entries(planNamed ?? {})) named[k] = v(b);
+      return this.env.externalFunction(item.name, planArgs.map(v), named);
     }
     if (item.kind !== 'table' || !this.env.externalTable) return undefined;
     if (item.schema && item.schema.toLowerCase() !== 'main') return undefined;
@@ -2507,18 +2361,15 @@ export class Planner {
   }
 
   private leftOnInfos(src: Source, scope: Scope): ConjunctInfo[] {
-    if (src.onBound) return src.onBound.map((b) => this.boundConjunct(b, scope));
-    const infos = src.on.flatMap((e) => splitBetween(e)).map((e) => this.conjunct(e, scope));
-    // As SQLite: an outer join's condition reads only this source and the ones before it.
-    if (infos.some((c) => c.deps !== null && [...c.deps].some((p) => p > src.position))) throw new SmaltError('SMALT_ERROR', 'ON clause references tables to its right');
-    return infos;
+    // (The front end rejects an outer join's condition that reads a later source, as SQLite does.)
+    return (src.onBound ?? []).map((b) => this.boundConjunct(b, scope));
   }
 
   /** A conjunct the physical planner bound from a plan. */
   private boundConjunct(b: BoundConjunct, scope: Scope): ConjunctInfo {
     // In `conjunct`'s property order.
-    if (b.compile) return { expr: undefined, bound: b.bound, compilable: false, deps: null, placed: false, lazy: b.compile };
-    return { expr: undefined, bound: b.bound, compilable: true, deps: this.depsOf(b.bound, scope), placed: false, lazy: undefined };
+    if (b.compile) return { bound: b.bound, compilable: false, deps: null, placed: false, lazy: b.compile };
+    return { bound: b.bound, compilable: true, deps: this.depsOf(b.bound, scope), placed: false, lazy: undefined };
   }
 
   private orderSegmentDP(segment: number[], prefix: Set<number>, prefixRows: number, pool: ConjunctInfo[], scope: Scope, cs: CompileScope): { order: number[]; rows: number } {
@@ -2891,17 +2742,6 @@ function flipOp(op: string): string {
   }
 }
 
-/** `x BETWEEN a AND b` becomes `x >= a AND x <= b` so each bound can drive an access path. */
-function splitBetween(e: Expr): Expr[] {
-  if (e.kind === 'between' && !e.not) {
-    return [
-      { kind: 'binary', op: '>=', left: e.expr, right: e.low, pos: e.pos, end: e.end },
-      { kind: 'binary', op: '<=', left: e.expr, right: e.high, pos: e.pos, end: e.end },
-    ];
-  }
-  return [e];
-}
-
 /** The LIMIT (plus OFFSET) a Sort may stop at, or -1 for all rows. */
 function topN(lim: Fn, off: Fn | undefined): (r: SqlValue[]) => number {
   return (r) => {
@@ -2914,10 +2754,8 @@ function topN(lim: Fn, off: Fn | undefined): (r: SqlValue[]) => number {
 // ------------------------------------------------------------------ physical planner helpers (ADR 0014, step 6b)
 
 type ColRef = BoundExpr & { k: 'col' };
-type ScanOp = Extract<PlanOp, { op: 'scan' }>;
 type AggregateOp = Extract<PlanOp, { op: 'aggregate' }>;
 
-type SourceOp = Extract<PlanOp, { op: 'source' }>;
 type WindowOp = Extract<PlanOp, { op: 'window' }>;
 /** A FROM item: a table, a source, or a nested plan (a derived table, view, CTE or the working rows of one). */
 type FromLeaf = { op: PlanOp; join: JoinKind | null; on?: PlanExpr };
@@ -2992,13 +2830,21 @@ function planWidth(op: PlanOp): number {
 const JOIN_TYPES: Readonly<Record<JoinKind, JoinType>> = { inner: 'INNER', cross: 'INNER', left: 'LEFT', right: 'RIGHT', full: 'FULL', semi: 'INNER', anti: 'INNER' };
 
 /** The FROM item the planner registers for a plan's table or source (named by position: names are resolved). */
-function leafItem(op: ScanOp | SourceOp, p: number): FromItem {
-  // (Nested plans are registered as planned sources: see BoundFrom.source.)
+/**
+ * A FROM leaf of a plan, as the join planner registers it: a table, a table function or virtual table, or a nested
+ * plan (planned separately: see BoundFrom.source). `alias` is the leaf's position (`#p`).
+ */
+type PlanLeaf =
+  | { readonly kind: 'table'; readonly name: string; readonly schema?: string; readonly alias: string; readonly indexedBy?: string | null }
+  | { readonly kind: 'function'; readonly name: string; readonly alias: string }
+  | { readonly kind: 'nested'; readonly alias: string };
+
+function planLeaf(op: PlanOp, p: number): PlanLeaf {
   const alias = `#${p}`;
-  // In the parser's property order (the planner reads FROM items of both).
-  if (op.op === 'scan') return { kind: 'table', pos: 0, schema: op.db, name: op.table, alias, indexedBy: op.indexedBy, end: 0 };
-  if (op.kind === 'function') return { kind: 'function', pos: 0, name: op.name, args: [], alias, end: 0 };
-  return { kind: 'table', pos: 0, schema: op.schema, name: op.name, alias, indexedBy: undefined, end: 0 };
+  if (op.op === 'scan') return { kind: 'table', schema: op.db, name: op.table, alias, indexedBy: op.indexedBy };
+  if (op.op !== 'source') return { kind: 'nested', alias };
+  if (op.kind === 'function') return { kind: 'function', name: op.name, alias };
+  return { kind: 'table', schema: op.schema, name: op.name, alias };
 }
 
 /** A plan operation's shape, kept on it: the planner asks for one several times (checks, planning, decorrelation). */
@@ -3154,9 +3000,6 @@ function shallower(c: ColRef): ColRef {
 }
 
 const SETOPS = { union: 'UNION', unionAll: 'UNION ALL', intersect: 'INTERSECT', except: 'EXCEPT' } as const;
-
-/** The SELECT of a FROM item the physical planner registers itself (never read). */
-const NO_SELECT = {} as SelectStmt;
 
 /** Maps a column of an operation's row to the register slot that holds it. */
 type ColMap = (c: ColRef) => BoundExpr;
