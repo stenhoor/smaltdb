@@ -176,6 +176,10 @@ Decisions and their rationale: [ADR 0005](adr/0005-cost-based-optimizer.md).
 - **Generated code in joins.** Standalone scans of join sources run as fused scan + filter pipelines. Text
   `=`/`!=` under BINARY collation is generated code. `textcol = 'literal'` in a fused scan is checked on the raw
   UTF-8 bytes before the row is decoded.
+- **Literals are not in generated source.** Text and numeric literals are read from the function's constants
+  (`K`), so statements that differ only in their literals share one compiled function: a new statement text costs
+  no `new Function`. Integer divisors of `/` and `%` stay in the source, where V8 turns the division into a
+  multiplication. Rowid seeks and rowid ranges enforce their conditions exactly, so those conditions get no filter.
 - **Verification.** The differential test `test/differential-joins.test.ts` runs random 2–4 table
   INNER/LEFT/CROSS/comma joins over tables of very different sizes against SQLite, with and without `ANALYZE`,
   in both code generation modes.
