@@ -267,8 +267,15 @@ setting and its own ADR.
 Performance is non-negotiable, so every step has a measured budget:
 
 - **No new passes in-process:** a language hands the engine plan objects, and the only addition is the validator's
-  walk. Compiling directly from plans (removing the rebinding) pays for it. Today the plan layer plans small
-  statements 1.0–1.45× as slowly as the deleted AST path did (#46).
+  walk.
+- **Where planning time goes** (profiled 2026-11-04, three statement shapes): physical planning 35% (of which code
+  generation for fused scans 17%, join regions and access paths 24%), the SQL front end 16%, parsing 8.5%, compiling
+  expressions 5%, and the planner's rebinding of plan expressions to registers only 1.6%. So removing the rebinding
+  would not pay for the validator or close the gap to the deleted AST path (small statements 1.0–1.45× as slow,
+  #46): the largest single cost is compiling a fused scan (about 1.8 ms) for every statement with new literals,
+  because fused scans write their literals into the generated source.
+- **Any slowdown is reported to the owner,** with its measurements; the owner decides whether to accept it until a
+  later change removes it.
 - **Faster where SQL is reparsed today:** morsel workers receive plans instead of SQL text, which saves a parse and a
   bind per morsel and per reader, and opening a database parses no DDL.
 - **The gates for every step:**
@@ -304,8 +311,10 @@ Performance is non-negotiable, so every step has a measured budget:
 Each step is its own PR. Every suite and benchmark gate (section 10) stays green at every step.
 
 1. This ADR.
-2. **Compile from plans:** remove `slot` / `native` and the rebinding (coupling 6, and the register half of 5).
-   Functions are named by behaviour (section 7).
+2. **Compile from plans:** plans carry no `slot` / `native` (they become planner-internal, and `CURRENT_*` becomes a
+   plain call), so plans are plain data (coupling 6). The rebinding stays, as it is 1.6% of planning (section 10);
+   compiled fused scans shared between statements that differ only in their literals address the larger cost, with
+   their measured slowdowns put to the owner. Functions are named by behaviour (section 7).
 3. **The planner takes plans only:** materialized-view matching on plans, no `FromItem` or SQL callbacks, and
    `PlannerEnv` split into `BindContext` and the physical environment (couplings 5 and 8).
 4. **One expression compiler:** CHECK, DEFAULT, index and partial-index expressions as plan expressions
