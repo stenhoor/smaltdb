@@ -139,8 +139,8 @@ class Emitter {
   private readonly hoisted: string[] = [];
 
   /**
-   * Pipelines write numeric literals into the source: they scan whole tables, so V8 specializing on the constant
-   * matters more than reusing the compiled function for another literal.
+   * Write numeric literals into the source instead of reading them from K: V8 then specializes on the constant. Only a
+   * pipeline specialized by its {@link Tier} does, since each new literal then costs a new compiled function.
    */
   inlineNumbers = false;
 
@@ -631,9 +631,9 @@ class Pipeline {
   private readonly localRegs = new Map<number, boolean>(); // reg -> flagged
   readonly rowLines: string[] = [];
 
-  constructor(fallback: (e: BoundExpr) => FallbackNode) {
+  constructor(fallback: (e: BoundExpr) => FallbackNode, inline: boolean) {
     this.em = new Emitter(fallback);
-    this.em.inlineNumbers = true;
+    this.em.inlineNumbers = inline;
     this.em.regRef = (reg, type) => {
       const flagged = type === 'int' || type === 'real';
       if (!this.localRegs.has(reg)) this.localRegs.set(reg, flagged);
@@ -846,6 +846,48 @@ function compileFn<T>(params: string[], src: string, args: unknown[]): T {
 }
 
 /**
+ * Rows a pipeline scans over its runs before it is compiled again with its literals written in: the break-even of the
+ * two tiers (bench/micro/pipeline-tiers.ts). Compiling a pipeline costs about 1.8 ms; reading its literals from locals
+ * instead of the source makes a scan at most about 4.6% slower, at about 0.12 µs a row, so the compile is repaid after
+ * 1.8 ms / (4.6% × 0.12 µs) ≈ 300k rows. Below that, statements that differ only in their literals share one compiled
+ * pipeline and lose less than they would spend compiling.
+ */
+const SPECIALIZE_ROWS = 300_000;
+let specializeRows = SPECIALIZE_ROWS;
+
+/** @internal Tests: the specialization threshold (null: the default). */
+export function setSpecializeRows(n: number | null): void {
+  specializeRows = n ?? SPECIALIZE_ROWS;
+}
+
+/**
+ * A generated pipeline in two tiers. `make(false)` reads its literals from K into locals at the start of each run, so a
+ * statement with new literals reuses a compiled function; `make(true)` writes them in. `rows` estimates the rows one run scans. The first run of a pipeline
+ * over at least `specializeRows` rows is specialized at once; otherwise it is once its runs reach that many rows.
+ */
+export class Tier<F> {
+  private fn: F | null = null;
+  private specialized = false;
+  private scanned = 0;
+  constructor(
+    private readonly make: (inline: boolean) => F,
+    private readonly rows: number,
+  ) {}
+
+  /** The function for the next run (it may change between runs, never during one). */
+  run(): F {
+    if (!this.specialized) {
+      this.scanned += this.rows;
+      if (this.scanned >= specializeRows) {
+        this.specialized = true;
+        this.fn = this.make(true);
+      } else if (this.fn === null) this.fn = this.make(false);
+    }
+    return this.fn!;
+  }
+}
+
+/**
  * Generate one function that scans every leaf of a table, decodes the needed columns, evaluates
  * the WHERE conjuncts and steps the aggregates — no per-row operator calls.
  */
@@ -855,12 +897,13 @@ export function generateFusedAggregate(
   source: PipelineSource,
   helpers: FusedHelpers | ColumnarHelpers,
   fallback: (e: BoundExpr) => FallbackNode,
+  inline: boolean,
 ): (r: SqlValue[], states: unknown[]) => void {
-  const pl = new Pipeline(fallback);
+  const pl = new Pipeline(fallback, inline);
   pl.addPredicates(preds);
   pl.addAggregates(aggs, (i) => `S${i}`);
   const src = [...aggs.map((_, i) => `const S${i} = S[${i}];`), ...scanLoop(pl, source)].join('\n');
-  return compileFn(['H', 'K', 'T'], `return function smaltFusedAggregate(r, S) {\n${src}\n};`, [helpers, pl.em.consts, truthy]);
+  return compileFn(['H', 'K', 'T'], `return function smaltFusedAggregate(r, S) {\n${pl.em.head()}${src}\n};`, [helpers, pl.em.consts, truthy]);
 }
 
 /** A columnar scan's decode list (column, register pairs) and rowid registers. */
@@ -942,8 +985,9 @@ export function generateScanFilter(
   loaderSpec: () => LoaderSpec,
   helpers: FusedHelpers,
   fallback: (e: BoundExpr) => FallbackNode,
+  inline: boolean,
 ): (st: ScanState, r: SqlValue[], out: SqlValue[]) => number {
-  const pl = new Pipeline(fallback);
+  const pl = new Pipeline(fallback, inline);
   pl.addPredicates(preds);
   const w = outRegs.length;
   const writes = outRegs.map((o, j) => `out[k * ${w} + ${j}] = ${pl.regValue(o.reg, o.type)};`);
@@ -964,7 +1008,7 @@ export function generateScanFilter(
     '}',
     'return k;',
   ].join('\n');
-  return compileFn(['H', 'K', 'T'], `return function smaltScanFilter(st, r, out) {\n${src}\n};`, [helpers, pl.em.consts, truthy]);
+  return compileFn(['H', 'K', 'T'], `return function smaltScanFilter(st, r, out) {\n${pl.em.head()}${src}\n};`, [helpers, pl.em.consts, truthy]);
 }
 
 /** Group lookup helpers for generated GROUP BY pipelines. */
@@ -985,8 +1029,9 @@ export function generateGroupAggregate(
   source: PipelineSource,
   helpers: (FusedHelpers | ColumnarHelpers) & GroupHelpers & { newGroup: (keys: SqlValue[]) => { keys: SqlValue[]; st: unknown[] } },
   fallback: (e: BoundExpr) => FallbackNode,
+  inline: boolean,
 ): (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => void {
-  const pl = new Pipeline(fallback);
+  const pl = new Pipeline(fallback, inline);
   pl.addPredicates(preds);
   const em = pl.em;
   const keyLines: string[] = [];
@@ -1005,5 +1050,5 @@ export function generateGroupAggregate(
   pl.rowLines.push(...keyLines, `const key = ${keyExpr};`, 'let G = groups.get(key);', `if (G === undefined) { G = H.newGroup([${keyVals.join(', ')}]); groups.set(key, G); order.push(G); }`, 'const GS = G.st;');
   pl.addAggregates(aggs, (i) => `GS[${i}]`);
   const src = scanLoop(pl, source).join('\n');
-  return compileFn(['H', 'K', 'T'], `return function smaltGroupAggregate(r, groups, order) {\n${src}\n};`, [helpers, pl.em.consts, truthy]);
+  return compileFn(['H', 'K', 'T'], `return function smaltGroupAggregate(r, groups, order) {\n${pl.em.head()}${src}\n};`, [helpers, pl.em.consts, truthy]);
 }

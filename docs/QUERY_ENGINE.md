@@ -177,8 +177,12 @@ Decisions and their rationale: [ADR 0005](adr/0005-cost-based-optimizer.md).
 - **Literals in generated code.** Per-row expression functions read text and numeric literals from their
   constants (`K`), so statements that differ only in their literals share one compiled function: a new point query
   or projection costs no `new Function`. Integer divisors of `/` and `%` stay in the source, where V8 turns the
-  division into a multiplication. Pipelines (fused scans and aggregates) keep numeric literals in the source: they
-  scan whole tables, where V8 specializing on the constant is worth a compile. Rowid seeks and rowid ranges enforce
+  division into a multiplication. Pipelines (fused scans and aggregates) run in two tiers (`Tier` in
+  `exec/codegen.ts`), chosen by table size: first with their numeric literals read from `K` into locals, shared
+  between statements that differ only in their literals, then, once a statement's runs have scanned 300k rows (at
+  once over a table that large), compiled again with the literals in the source, where V8 specializes on the
+  constant. Compiling a pipeline costs about 1.8 ms, and literals in locals make a scan at most about 4.6% slower, so
+  300k rows is where the two cost the same (`bench/micro/pipeline-tiers.ts`). Rowid seeks and rowid ranges enforce
   their conditions exactly, so those conditions get no filter.
 - **Verification.** The differential test `test/differential-joins.test.ts` runs random 2–4 table
   INNER/LEFT/CROSS/comma joins over tables of very different sizes against SQLite, with and without `ANALYZE`,

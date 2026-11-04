@@ -48,7 +48,7 @@ import {
   conjuncts,
 } from './expr.js';
 import { type AggregateState, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
-import { type ColumnarHelpers, type FusedAggSpec, type FusedHelpers, type PipelineSource, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter } from './codegen.js';
+import { type ColumnarHelpers, type FusedAggSpec, type FusedHelpers, type PipelineSource, Tier, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter } from './codegen.js';
 import { CODEGEN_HELPERS_FOR_FUSION } from './expr.js';
 import { getMeta, isFlattened, isOpaque, setMeta, subquerySql } from './sql-meta.js';
 import { printExpr } from '../plan/print.js';
@@ -593,7 +593,7 @@ export class Planner {
     const cs = this.compileScope(scope);
     const helpers = this.fusedHelpers(access);
     const table = access.table!;
-    const build = (cap: number) => {
+    const build = (cap: number, inline: boolean) => {
       const spec = access.loaderSpec();
       const outs: { reg: number; type: StaticType }[] = [];
       for (let i = 0; i < spec.decode.length; i += 2) {
@@ -601,10 +601,10 @@ export class Planner {
         outs.push({ reg: spec.decode[i + 1], type: t === 'INTEGER' ? 'int' : t === 'REAL' ? 'real' : 'any' });
       }
       for (const reg of spec.rowidRegs) outs.push({ reg, type: 'int' });
-      const fill = generateScanFilter(preds, outs, cap, () => access.loaderSpec(), helpers, pipelineCompiler(cs));
+      const fill = generateScanFilter(preds, outs, cap, () => access.loaderSpec(), helpers, pipelineCompiler(cs), inline);
       return { fill, regs: outs.map((o) => o.reg) };
     };
-    return new FusedScanFilter(access, build, helpers.first, helpers.release);
+    return new FusedScanFilter(access, build, helpers.first, helpers.release, this.scannedRows(access));
   }
 
   /** Scan + filter + GROUP BY + aggregates in one generated loop. */
@@ -627,21 +627,21 @@ export class Planner {
       },
     };
     const groupSpecs = groupExprs.map((expr, i) => ({ expr, collation: groupColls[i] }));
-    const gen = (scan: TableScan | ColumnScan) =>
-      generateGroupAggregate(chain.preds, groupSpecs, specs, this.pipelineSource(scan), { ...helpers, ...(scan instanceof ColumnScan ? this.columnarHelpers(scan) : this.fusedHelpers(access)) }, pipelineCompiler(cs));
+    const gen = (scan: TableScan | ColumnScan, inline: boolean) =>
+      generateGroupAggregate(chain.preds, groupSpecs, specs, this.pipelineSource(scan), { ...helpers, ...(scan instanceof ColumnScan ? this.columnarHelpers(scan) : this.fusedHelpers(access)) }, pipelineCompiler(cs), inline);
     // A columnar table: one loop over the delta store's leaves, one over the segments, same groups.
     const build =
       node instanceof ColumnarTableScan
-        ? () => {
-            const a = gen(node.delta);
-            const b = gen(node.segments);
+        ? (inline: boolean) => {
+            const a = gen(node.delta, inline);
+            const b = gen(node.segments, inline);
             return (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => {
               a(r, groups, order);
               b(r, groups, order);
             };
           }
-        : () => gen(node);
-    return new FusedGroupAggregate(access, build, groupRegs, aggs, node instanceof TableScan ? undefined : node.fusedLabel('group aggregate'), budget);
+        : (inline: boolean) => gen(node, inline);
+    return new FusedGroupAggregate(access, build, groupRegs, aggs, this.scannedRows(access), node instanceof TableScan ? undefined : node.fusedLabel('group aggregate'), budget);
   }
 
   private tryFuseAggregate(src: Operator, aggs: AggSpec[], scope: Scope): Operator | null {
@@ -653,18 +653,20 @@ export class Planner {
     const access = node.access;
     const cs = this.compileScope(scope);
     if (node instanceof ColumnScan) {
-      const run = generateFusedAggregate(preds, specs, this.pipelineSource(node), this.columnarHelpers(node), pipelineCompiler(cs));
-      return new FusedScanAggregate(access, aggs, run as (r: SqlValue[], states: AggregateState[]) => void, node.fusedLabel('aggregate'));
+      const make = (inline: boolean) => generateFusedAggregate(preds, specs, this.pipelineSource(node), this.columnarHelpers(node), pipelineCompiler(cs), inline) as (r: SqlValue[], states: AggregateState[]) => void;
+      return new FusedScanAggregate(access, aggs, new Tier(make, this.scannedRows(access)), node.fusedLabel('aggregate'));
     }
     if (node instanceof ColumnarTableScan) {
       // The delta store's leaves, then the segments, stepping the same aggregate states.
-      const a = generateFusedAggregate(preds, specs, this.pipelineSource(node.delta), this.fusedHelpers(access), pipelineCompiler(cs));
-      const b = generateFusedAggregate(preds, specs, this.pipelineSource(node.segments), this.columnarHelpers(node.segments), pipelineCompiler(cs));
-      const run = (r: SqlValue[], states: AggregateState[]): void => {
-        a(r, states);
-        b(r, states);
+      const make = (inline: boolean) => {
+        const a = generateFusedAggregate(preds, specs, this.pipelineSource(node.delta), this.fusedHelpers(access), pipelineCompiler(cs), inline);
+        const b = generateFusedAggregate(preds, specs, this.pipelineSource(node.segments), this.columnarHelpers(node.segments), pipelineCompiler(cs), inline);
+        return (r: SqlValue[], states: AggregateState[]): void => {
+          a(r, states);
+          b(r, states);
+        };
       };
-      return new FusedScanAggregate(access, aggs, run, node.fusedLabel('aggregate'));
+      return new FusedScanAggregate(access, aggs, new Tier(make, this.scannedRows(access)), node.fusedLabel('aggregate'));
     }
     const tree = access.tree;
     const pager = tree.pager;
@@ -686,8 +688,15 @@ export class Planner {
       release: (page) => pager.release(page as Frame),
       slow: (page, off, r) => access.loadCell(page, off, r),
     };
-    const run = generateFusedAggregate(preds, specs, { rows: () => access.loaderSpec() }, helpers, pipelineCompiler(cs));
-    return new FusedScanAggregate(access, aggs, run as (r: SqlValue[], states: AggregateState[]) => void);
+    const make = (inline: boolean) => generateFusedAggregate(preds, specs, { rows: () => access.loaderSpec() }, helpers, pipelineCompiler(cs), inline) as (r: SqlValue[], states: AggregateState[]) => void;
+    return new FusedScanAggregate(access, aggs, new Tier(make, this.scannedRows(access)));
+  }
+
+  /** The rows one run of a fused loop over `access` scans: the table's live rows (for the loop's tiers, codegen.ts). */
+  private scannedRows(access: TableAccess): number {
+    const t = access.table;
+    if (!t) return 0;
+    return this.env.liveRows ? this.env.liveRows(t) : access.tree.estimateCount();
   }
 
   /** Rows source for generated pipelines: leaf pages, or the column store of a columnar scan. */
