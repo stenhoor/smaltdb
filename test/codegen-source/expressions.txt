@@ -21,7 +21,7 @@ return (v0n ? null : v0);
 --
 pipeline(H, K, T):
 return function smaltScanFilter(st, r, out) {
-let f = st.f; let i = st.i; let k = 0;
+let f = st.f; let i = st.i; let k = 0; let pg = 0;
 while (f !== null) {
   const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
   for (; i < n; i++) {
@@ -32,7 +32,8 @@ while (f !== null) {
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }
-  f = H.next(f); st.f = f; i = 0; st.i = 0;
+  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;
+  if (++pg === st.chunk && f !== null) return k;
 }
 return k;
 };
@@ -53,7 +54,7 @@ return (v0n ? null : v0);
 --
 pipeline(H, K, T):
 return function smaltScanFilter(st, r, out) {
-let f = st.f; let i = st.i; let k = 0;
+let f = st.f; let i = st.i; let k = 0; let pg = 0;
 while (f !== null) {
   const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
   for (; i < n; i++) {
@@ -64,7 +65,8 @@ while (f !== null) {
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }
-  f = H.next(f); st.f = f; i = 0; st.i = 0;
+  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;
+  if (++pg === st.chunk && f !== null) return k;
 }
 return k;
 };
@@ -84,7 +86,7 @@ return (v0n ? null : v0);
 --
 pipeline(H, K, T):
 return function smaltScanFilter(st, r, out) {
-let f = st.f; let i = st.i; let k = 0;
+let f = st.f; let i = st.i; let k = 0; let pg = 0;
 while (f !== null) {
   const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
   for (; i < n; i++) {
@@ -95,7 +97,8 @@ while (f !== null) {
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }
-  f = H.next(f); st.f = f; i = 0; st.i = 0;
+  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;
+  if (++pg === st.chunk && f !== null) return k;
 }
 return k;
 };
@@ -131,7 +134,7 @@ return v0;
 --
 pipeline(H, K, T):
 return function smaltScanFilter(st, r, out) {
-let f = st.f; let i = st.i; let k = 0;
+let f = st.f; let i = st.i; let k = 0; let pg = 0;
 while (f !== null) {
   const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
   for (; i < n; i++) {
@@ -142,7 +145,8 @@ while (f !== null) {
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }
-  f = H.next(f); st.f = f; i = 0; st.i = 0;
+  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;
+  if (++pg === st.chunk && f !== null) return k;
 }
 return k;
 };
@@ -150,7 +154,7 @@ return k;
 > SELECT i IS NULL, u IS NOT NULL, i IS u FROM t
 pipeline(H, K, T):
 return function smaltScanFilter(st, r, out) {
-let f = st.f; let i = st.i; let k = 0;
+let f = st.f; let i = st.i; let k = 0; let pg = 0;
 while (f !== null) {
   const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
   for (; i < n; i++) {
@@ -161,7 +165,8 @@ while (f !== null) {
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }
-  f = H.next(f); st.f = f; i = 0; st.i = 0;
+  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;
+  if (++pg === st.chunk && f !== null) return k;
 }
 return k;
 };
@@ -182,7 +187,7 @@ return (v1n ? null : v1);
 --
 pipeline(H, K, T):
 return function smaltScanFilter(st, r, out) {
-let f = st.f; let i = st.i; let k = 0;
+let f = st.f; let i = st.i; let k = 0; let pg = 0;
 while (f !== null) {
   const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
   for (; i < n; i++) {
@@ -193,7 +198,8 @@ while (f !== null) {
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }
-  f = H.next(f); st.f = f; i = 0; st.i = 0;
+  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;
+  if (++pg === st.chunk && f !== null) return k;
 }
 return k;
 };
@@ -201,7 +207,7 @@ return k;
 > SELECT i & 3, i | 4, i << 2, ~i FROM t
 pipeline(H, K, T):
 return function smaltScanFilter(st, r, out) {
-let f = st.f; let i = st.i; let k = 0;
+let f = st.f; let i = st.i; let k = 0; let pg = 0;
 while (f !== null) {
   const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
   for (; i < n; i++) {
@@ -212,7 +218,8 @@ while (f !== null) {
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }
-  f = H.next(f); st.f = f; i = 0; st.i = 0;
+  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;
+  if (++pg === st.chunk && f !== null) return k;
 }
 return k;
 };
@@ -220,7 +227,7 @@ return k;
 > SELECT s || i, s LIKE ?, c GLOB ? FROM t
 pipeline(H, K, T):
 return function smaltScanFilter(st, r, out) {
-let f = st.f; let i = st.i; let k = 0;
+let f = st.f; let i = st.i; let k = 0; let pg = 0;
 while (f !== null) {
   const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
   for (; i < n; i++) {
@@ -231,7 +238,8 @@ while (f !== null) {
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }
-  f = H.next(f); st.f = f; i = 0; st.i = 0;
+  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;
+  if (++pg === st.chunk && f !== null) return k;
 }
 return k;
 };
@@ -239,7 +247,7 @@ return k;
 > SELECT i IN (1, 2, 3), s IN (?, ?), r BETWEEN 1 AND 2 FROM t
 pipeline(H, K, T):
 return function smaltScanFilter(st, r, out) {
-let f = st.f; let i = st.i; let k = 0;
+let f = st.f; let i = st.i; let k = 0; let pg = 0;
 while (f !== null) {
   const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
   for (; i < n; i++) {
@@ -250,7 +258,8 @@ while (f !== null) {
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }
-  f = H.next(f); st.f = f; i = 0; st.i = 0;
+  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;
+  if (++pg === st.chunk && f !== null) return k;
 }
 return k;
 };
@@ -258,7 +267,7 @@ return k;
 > SELECT CASE WHEN i > 5 THEN r ELSE i END, CASE i WHEN 1 THEN ? ELSE 0 END FROM t
 pipeline(H, K, T):
 return function smaltScanFilter(st, r, out) {
-let f = st.f; let i = st.i; let k = 0;
+let f = st.f; let i = st.i; let k = 0; let pg = 0;
 while (f !== null) {
   const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
   for (; i < n; i++) {
@@ -269,7 +278,8 @@ while (f !== null) {
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }
-  f = H.next(f); st.f = f; i = 0; st.i = 0;
+  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;
+  if (++pg === st.chunk && f !== null) return k;
 }
 return k;
 };
@@ -277,7 +287,7 @@ return k;
 > SELECT CAST(r AS INTEGER), CAST(i AS TEXT), CAST(s AS REAL) FROM t
 pipeline(H, K, T):
 return function smaltScanFilter(st, r, out) {
-let f = st.f; let i = st.i; let k = 0;
+let f = st.f; let i = st.i; let k = 0; let pg = 0;
 while (f !== null) {
   const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
   for (; i < n; i++) {
@@ -288,7 +298,8 @@ while (f !== null) {
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }
-  f = H.next(f); st.f = f; i = 0; st.i = 0;
+  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;
+  if (++pg === st.chunk && f !== null) return k;
 }
 return k;
 };
@@ -307,7 +318,7 @@ return (v3n ? null : v3);
 --
 pipeline(H, K, T):
 return function smaltScanFilter(st, r, out) {
-let f = st.f; let i = st.i; let k = 0;
+let f = st.f; let i = st.i; let k = 0; let pg = 0;
 while (f !== null) {
   const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
   for (; i < n; i++) {
@@ -318,7 +329,8 @@ while (f !== null) {
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }
-  f = H.next(f); st.f = f; i = 0; st.i = 0;
+  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;
+  if (++pg === st.chunk && f !== null) return k;
 }
 return k;
 };
@@ -335,7 +347,7 @@ return (v0n ? null : v0);
 --
 pipeline(H, K, T):
 return function smaltScanFilter(st, r, out) {
-let f = st.f; let i = st.i; let k = 0;
+let f = st.f; let i = st.i; let k = 0; let pg = 0;
 while (f !== null) {
   const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
   for (; i < n; i++) {
@@ -346,7 +358,8 @@ while (f !== null) {
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }
-  f = H.next(f); st.f = f; i = 0; st.i = 0;
+  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;
+  if (++pg === st.chunk && f !== null) return k;
 }
 return k;
 };
@@ -364,7 +377,7 @@ return (v1n ? null : v1);
 --
 pipeline(H, K, T):
 return function smaltScanFilter(st, r, out) {
-let f = st.f; let i = st.i; let k = 0;
+let f = st.f; let i = st.i; let k = 0; let pg = 0;
 while (f !== null) {
   const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
   for (; i < n; i++) {
@@ -375,7 +388,8 @@ while (f !== null) {
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }
-  f = H.next(f); st.f = f; i = 0; st.i = 0;
+  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;
+  if (++pg === st.chunk && f !== null) return k;
 }
 return k;
 };
@@ -399,7 +413,7 @@ return v0;
 --
 pipeline(H, K, T):
 return function smaltScanFilter(st, r, out) {
-let f = st.f; let i = st.i; let k = 0;
+let f = st.f; let i = st.i; let k = 0; let pg = 0;
 while (f !== null) {
   const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
   for (; i < n; i++) {
@@ -410,7 +424,8 @@ while (f !== null) {
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }
-  f = H.next(f); st.f = f; i = 0; st.i = 0;
+  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;
+  if (++pg === st.chunk && f !== null) return k;
 }
 return k;
 };

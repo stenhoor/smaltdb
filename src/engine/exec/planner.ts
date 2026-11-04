@@ -48,7 +48,7 @@ import {
   conjuncts,
 } from './expr.js';
 import { type AggregateState, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
-import { type ColumnarHelpers, type FusedAggSpec, type FusedHelpers, type PipelineSource, Tier, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter } from './codegen.js';
+import { type ColumnarHelpers, type FusedAggSpec, type FusedHelpers, type PipelineSource, type ScanProgress, Adaptive, CHUNK_GROUPS, CHUNK_LEAVES, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter } from './codegen.js';
 import { CODEGEN_HELPERS_FOR_FUSION } from './expr.js';
 import { getMeta, isFlattened, isOpaque, setMeta, subquerySql } from './sql-meta.js';
 import { printExpr } from '../plan/print.js';
@@ -635,13 +635,18 @@ export class Planner {
         ? (inline: boolean) => {
             const a = gen(node.delta, inline);
             const b = gen(node.segments, inline);
-            return (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => {
-              a(r, groups, order);
-              b(r, groups, order);
+            return (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[], P: ScanProgress): number => {
+              if (P.phase === 0) {
+                if (a(r, groups, order, P)) return 1;
+                P.phase = 1;
+                P.f = null;
+                P.g = 0;
+              }
+              return b(r, groups, order, P);
             };
           }
         : (inline: boolean) => gen(node, inline);
-    return new FusedGroupAggregate(access, build, groupRegs, aggs, this.scannedRows(access), node instanceof TableScan ? undefined : node.fusedLabel('group aggregate'), budget);
+    return new FusedGroupAggregate(access, build, groupRegs, aggs, this.scannedRows(access), node instanceof TableScan ? CHUNK_LEAVES : CHUNK_GROUPS, node instanceof TableScan ? undefined : node.fusedLabel('group aggregate'), budget);
   }
 
   private tryFuseAggregate(src: Operator, aggs: AggSpec[], scope: Scope): Operator | null {
@@ -653,20 +658,25 @@ export class Planner {
     const access = node.access;
     const cs = this.compileScope(scope);
     if (node instanceof ColumnScan) {
-      const make = (inline: boolean) => generateFusedAggregate(preds, specs, this.pipelineSource(node), this.columnarHelpers(node), pipelineCompiler(cs), inline) as (r: SqlValue[], states: AggregateState[]) => void;
-      return new FusedScanAggregate(access, aggs, new Tier(make, this.scannedRows(access)), node.fusedLabel('aggregate'));
+      const make = (inline: boolean) => generateFusedAggregate(preds, specs, this.pipelineSource(node), this.columnarHelpers(node), pipelineCompiler(cs), inline) as (r: SqlValue[], states: AggregateState[], P: ScanProgress) => number;
+      return new FusedScanAggregate(access, aggs, new Adaptive(make), this.scannedRows(access), CHUNK_GROUPS, node.fusedLabel('aggregate'));
     }
     if (node instanceof ColumnarTableScan) {
       // The delta store's leaves, then the segments, stepping the same aggregate states.
       const make = (inline: boolean) => {
         const a = generateFusedAggregate(preds, specs, this.pipelineSource(node.delta), this.fusedHelpers(access), pipelineCompiler(cs), inline);
         const b = generateFusedAggregate(preds, specs, this.pipelineSource(node.segments), this.columnarHelpers(node.segments), pipelineCompiler(cs), inline);
-        return (r: SqlValue[], states: AggregateState[]): void => {
-          a(r, states);
-          b(r, states);
+        return (r: SqlValue[], states: AggregateState[], P: ScanProgress): number => {
+          if (P.phase === 0) {
+            if (a(r, states, P)) return 1;
+            P.phase = 1;
+            P.f = null;
+            P.g = 0;
+          }
+          return b(r, states, P);
         };
       };
-      return new FusedScanAggregate(access, aggs, new Tier(make, this.scannedRows(access)), node.fusedLabel('aggregate'));
+      return new FusedScanAggregate(access, aggs, new Adaptive(make), this.scannedRows(access), CHUNK_GROUPS, node.fusedLabel('aggregate'));
     }
     const tree = access.tree;
     const pager = tree.pager;
@@ -688,8 +698,8 @@ export class Planner {
       release: (page) => pager.release(page as Frame),
       slow: (page, off, r) => access.loadCell(page, off, r),
     };
-    const make = (inline: boolean) => generateFusedAggregate(preds, specs, { rows: () => access.loaderSpec() }, helpers, pipelineCompiler(cs), inline) as (r: SqlValue[], states: AggregateState[]) => void;
-    return new FusedScanAggregate(access, aggs, new Tier(make, this.scannedRows(access)));
+    const make = (inline: boolean) => generateFusedAggregate(preds, specs, { rows: () => access.loaderSpec() }, helpers, pipelineCompiler(cs), inline) as (r: SqlValue[], states: AggregateState[], P: ScanProgress) => number;
+    return new FusedScanAggregate(access, aggs, new Adaptive(make), this.scannedRows(access), CHUNK_LEAVES);
   }
 
   /** The rows one run of a fused loop over `access` scans: the table's live rows (for the loop's tiers, codegen.ts). */

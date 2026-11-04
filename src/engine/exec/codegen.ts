@@ -846,44 +846,47 @@ function compileFn<T>(params: string[], src: string, args: unknown[]): T {
 }
 
 /**
- * Rows a pipeline scans over its runs before it is compiled again with its literals written in: the break-even of the
- * two tiers (bench/micro/pipeline-tiers.ts). Compiling a pipeline costs about 1.8 ms; reading its literals from locals
- * instead of the source makes a scan at most about 4.6% slower, at about 0.12 µs a row, so the compile is repaid after
- * 1.8 ms / (4.6% × 0.12 µs) ≈ 300k rows. Below that, statements that differ only in their literals share one compiled
- * pipeline and lose less than they would spend compiling.
+ * Mid-scan tiers (after Kohn, Leis and Neumann, "Adaptive Execution of Compiled Queries", ICDE 2018): a fused loop starts
+ * shared (literals from K), pauses every chunk, and switches to the specialized loop (literals written in) when the
+ * rows still to scan, at the time per row measured so far, would lose more than switching costs.
+ * SLOWDOWN: how much slower the shared loop is at most (measured, bench/micro/pipeline-tiers.ts).
+ * SWITCH_MS: what switching costs (compile and warm-up of the new loop, measured: up to about 12 ms).
  */
-const SPECIALIZE_ROWS = 300_000;
-let specializeRows = SPECIALIZE_ROWS;
+const SLOWDOWN = 0.046;
+const SWITCH_MS = 12;
+/** Leaves (row tables) or row groups (columnar) between checks. */
+export const CHUNK_LEAVES = 64;
+export const CHUNK_GROUPS = 1;
 
-/** @internal Tests: the specialization threshold (null: the default). */
-export function setSpecializeRows(n: number | null): void {
-  specializeRows = n ?? SPECIALIZE_ROWS;
+let switchMs = SWITCH_MS;
+/** @internal Tests: the switch cost the rule assumes (null: the default). */
+export function setSwitchCost(ms: number | null): void {
+  switchMs = ms ?? SWITCH_MS;
 }
 
-/**
- * A generated pipeline in two tiers. `make(false)` reads its literals from K into locals at the start of each run, so a
- * statement with new literals reuses a compiled function; `make(true)` writes them in. `rows` estimates the rows one run scans. The first run of a pipeline
- * over at least `specializeRows` rows is specialized at once; otherwise it is once its runs reach that many rows.
- */
-export class Tier<F> {
-  private fn: F | null = null;
-  private specialized = false;
-  private scanned = 0;
-  constructor(
-    private readonly make: (inline: boolean) => F,
-    private readonly rows: number,
-  ) {}
+/** A fused loop in mid-scan tiers: `make(false)` is the shared loop, `make(true)` the specialized one. */
+export class Adaptive<F> {
+  private shared: F | null = null;
+  private spec: F | null = null;
+  constructor(private readonly make: (inline: boolean) => F) {}
 
-  /** The function for the next run (it may change between runs, never during one). */
-  run(): F {
-    if (!this.specialized) {
-      this.scanned += this.rows;
-      if (this.scanned >= specializeRows) {
-        this.specialized = true;
-        this.fn = this.make(true);
-      } else if (this.fn === null) this.fn = this.make(false);
-    }
-    return this.fn!;
+  /** The specialized loop, if a run has switched to it (later runs start with it). */
+  get specialized(): F | null {
+    return this.spec;
+  }
+
+  start(): F {
+    return this.spec ?? (this.shared ??= this.make(false));
+  }
+
+  /**
+   * At a pause: the loop to continue with. Switches when `remaining` rows at the measured time per row
+   * (`elapsedMs` for `scanned` rows) would lose more than switching costs.
+   */
+  check(scanned: number, remaining: number, elapsedMs: number): F {
+    if (this.spec) return this.spec;
+    if (scanned > 0 && remaining * (elapsedMs / scanned) * SLOWDOWN > switchMs) this.spec = this.make(true);
+    return this.spec ?? this.shared!;
   }
 }
 
@@ -898,12 +901,12 @@ export function generateFusedAggregate(
   helpers: FusedHelpers | ColumnarHelpers,
   fallback: (e: BoundExpr) => FallbackNode,
   inline: boolean,
-): (r: SqlValue[], states: unknown[]) => void {
+): (r: SqlValue[], states: unknown[], P: ScanProgress) => number {
   const pl = new Pipeline(fallback, inline);
   pl.addPredicates(preds);
   pl.addAggregates(aggs, (i) => `S${i}`);
   const src = [...aggs.map((_, i) => `const S${i} = S[${i}];`), ...scanLoop(pl, source)].join('\n');
-  return compileFn(['H', 'K', 'T'], `return function smaltFusedAggregate(r, S) {\n${pl.em.head()}${src}\n};`, [helpers, pl.em.consts, truthy]);
+  return compileFn(['H', 'K', 'T'], `return function smaltFusedAggregate(r, S, P) {\n${pl.em.head()}${src}\n};`, [helpers, pl.em.consts, truthy]);
 }
 
 /** A columnar scan's decode list (column, register pairs) and rowid registers. */
@@ -939,7 +942,8 @@ function scanLoop(pl: Pipeline, source: PipelineSource): string[] {
     const { prologue, rowStart } = pl.finish(source.rows());
     return [
       ...prologue,
-      'let f = H.first();',
+      // Resumable (mid-scan tiers): P.f is the leaf to resume at; pauses every P.chunk leaves (returns 1).
+      'let f = P.f !== null ? P.f : H.first(); P.f = null; let pg = 0;',
       'try {',
       '  while (f !== null) {',
       '    const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);',
@@ -947,23 +951,30 @@ function scanLoop(pl: Pipeline, source: PipelineSource): string[] {
       ...rowStart.map((l) => '      ' + l),
       ...pl.rowLines.map((l) => '      ' + l),
       '    }',
+      '    P.rows += n;',
       '    f = H.next(f);',
+      '    if (++pg === P.chunk && f !== null) { P.f = f; f = null; return 1; }',
       '  }',
       '} finally { if (f !== null) H.release(f); }',
+      'return 0;',
     ];
   }
   const { prologue, groupStart, rowStart, dense } = pl.finishColumnar(source.columns());
   const loop = (start: string[]): string[] => ['for (let i = 0; i < n; i++) {', ...start.map((l) => '  ' + l), ...pl.rowLines.map((l) => '  ' + l), '}'];
   return [
     ...prologue,
-    'H.open(r);',
-    'const ng = H.groups();',
-    'for (let g = 0; g < ng; g++) {',
+    // Resumable (mid-scan tiers): P.g is the row group to resume at; pauses every P.chunk groups (returns 1).
+    'if (P.g === 0) H.open(r);',
+    'const ng = H.groups(); let cg = 0;',
+    'for (let g = P.g; g < ng; g++) {',
     '  if (!H.keep(g)) continue;',
     '  const n = H.rows(g); const base = g * H.RG;',
     ...groupStart.map((l) => '  ' + l),
     ...(dense ? [`  if (${dense.test}) {`, ...loop(dense.rowStart).map((l) => '    ' + l), '  } else {', ...loop(rowStart).map((l) => '    ' + l), '  }'] : loop(rowStart).map((l) => '  ' + l)),
+    '  P.rows += n;',
+    '  if (++cg === P.chunk && g + 1 < ng) { P.g = g + 1; return 1; }',
     '}',
+    'return 0;',
   ];
 }
 
@@ -971,6 +982,19 @@ function scanLoop(pl: Pipeline, source: PipelineSource): string[] {
 export interface ScanState {
   f: { bytes: Uint8Array; view: DataView } | null;
   i: number;
+  /** Rows of the leaves finished so far (mid-scan tiers). */
+  rows: number;
+  /** Leaves to scan before returning to the operator, which may switch tiers (-1: no pause). */
+  chunk: number;
+}
+
+/** Progress of a resumable fused aggregate loop (mid-scan tiers): where to resume, and rows scanned. */
+export interface ScanProgress {
+  f: unknown;
+  g: number;
+  rows: number;
+  chunk: number;
+  phase: number;
 }
 
 /**
@@ -994,7 +1018,7 @@ export function generateScanFilter(
   const { prologue, rowStart } = pl.finish(loaderSpec());
   const src = [
     ...prologue,
-    'let f = st.f; let i = st.i; let k = 0;',
+    'let f = st.f; let i = st.i; let k = 0; let pg = 0;',
     'while (f !== null) {',
     '  const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);',
     '  for (; i < n; i++) {',
@@ -1004,7 +1028,8 @@ export function generateScanFilter(
     '    k++;',
     `    if (k === ${cap}) { st.i = i + 1; return k; }`,
     '  }',
-    '  f = H.next(f); st.f = f; i = 0; st.i = 0;',
+    '  st.rows += n; f = H.next(f); st.f = f; i = 0; st.i = 0;',
+    '  if (++pg === st.chunk && f !== null) return k;',
     '}',
     'return k;',
   ].join('\n');
@@ -1030,7 +1055,7 @@ export function generateGroupAggregate(
   helpers: (FusedHelpers | ColumnarHelpers) & GroupHelpers & { newGroup: (keys: SqlValue[]) => { keys: SqlValue[]; st: unknown[] } },
   fallback: (e: BoundExpr) => FallbackNode,
   inline: boolean,
-): (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => void {
+): (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[], P: ScanProgress) => number {
   const pl = new Pipeline(fallback, inline);
   pl.addPredicates(preds);
   const em = pl.em;
@@ -1050,5 +1075,5 @@ export function generateGroupAggregate(
   pl.rowLines.push(...keyLines, `const key = ${keyExpr};`, 'let G = groups.get(key);', `if (G === undefined) { G = H.newGroup([${keyVals.join(', ')}]); groups.set(key, G); order.push(G); }`, 'const GS = G.st;');
   pl.addAggregates(aggs, (i) => `GS[${i}]`);
   const src = scanLoop(pl, source).join('\n');
-  return compileFn(['H', 'K', 'T'], `return function smaltGroupAggregate(r, groups, order) {\n${pl.em.head()}${src}\n};`, [helpers, pl.em.consts, truthy]);
+  return compileFn(['H', 'K', 'T'], `return function smaltGroupAggregate(r, groups, order, P) {\n${pl.em.head()}${src}\n};`, [helpers, pl.em.consts, truthy]);
 }

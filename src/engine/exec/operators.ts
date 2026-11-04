@@ -4,7 +4,25 @@ import { compareKeyAt } from '../util/bytes.js';
 import { type Chunk, type ColumnStore, ROW_GROUP_ROWS, chunkValue, zoneMayMatch } from '../storage/columnar.js';
 import { KeyEncoder, type KeyColumn, KEY_AFTER_NULL, ROWID_KEY_SIZE, decodeKey, readIndexRowid, readRowidKey, rowidSuffixStart, writeRowidKey } from '../storage/key-codec.js';
 import { type RecordReader, decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
-import { type LoaderHelpers, type LoaderSpec, type ScanState, Tier, codegenEnabled, generateLoader } from './codegen.js';
+import { Adaptive, CHUNK_LEAVES, type LoaderHelpers, type LoaderSpec, type ScanProgress, type ScanState, codegenEnabled, generateLoader } from './codegen.js';
+
+/**
+ * Run a resumable fused loop in mid-scan tiers (codegen.ts `Adaptive`): it pauses every `chunk` leaves or row groups,
+ * and at each pause the rule may switch it to the specialized loop for the rest of the scan.
+ */
+function runAdaptive<A extends unknown[]>(ad: Adaptive<(...args: [...A, ScanProgress]) => number>, args: A, rows: number, chunk: number): void {
+  const P: ScanProgress = { f: null, g: 0, rows: 0, chunk, phase: 0 };
+  let fn = ad.start();
+  if (ad.specialized) P.chunk = -1;
+  const t0 = performance.now();
+  while (fn(...args, P)) {
+    const next = ad.check(P.rows, Math.max(0, rows - P.rows), performance.now() - t0);
+    if (next !== fn) {
+      fn = next;
+      P.chunk = -1;
+    }
+  }
+}
 
 const LOADER_HELPERS: LoaderHelpers = { readInt64, utf8: decodeUtf8, tagged: decodeTagged, rowid: readRowidKey };
 import { Collation, type SqlValue, compareValues } from '../values.js';
@@ -2262,8 +2280,11 @@ export class FusedScanAggregate implements Operator {
   constructor(
     readonly access: TableAccess,
     readonly aggs: AggSpec[],
-    /** Generated (in tiers, codegen.ts): run(r, states) consumes the whole table. */
-    private readonly run: Tier<(r: SqlValue[], states: AggregateState[]) => void>,
+    /** Generated (in mid-scan tiers, codegen.ts): run(r, states, P) scans the table, pausing every chunk. */
+    private readonly run: Adaptive<(r: SqlValue[], states: AggregateState[], P: ScanProgress) => number>,
+    /** The rows one run scans (estimated) and the chunk between checks, for the tiers. */
+    private readonly rows: number,
+    private readonly chunk: number,
     private readonly label?: string,
   ) {}
 
@@ -2275,7 +2296,7 @@ export class FusedScanAggregate implements Operator {
     this.r = r;
     this.done = false;
     this.states = this.aggs.map((a) => a.def.create(a.star ? [] : a.argTypes, a.collation));
-    this.run.run()(r, this.states);
+    runAdaptive(this.run, [r, this.states], this.rows, this.chunk);
   }
 
   next(): boolean {
@@ -2302,13 +2323,14 @@ export class FusedScanFilter implements Operator {
   private fill: ((st: ScanState, r: SqlValue[], out: SqlValue[]) => number) | null = null;
   private built: { fill: (st: ScanState, r: SqlValue[], out: SqlValue[]) => number; regs: number[] } | null = null;
   private regs: number[] = [];
-  private readonly st: ScanState = { f: null, i: 0 };
+  private readonly st: ScanState = { f: null, i: 0, rows: 0, chunk: CHUNK_LEAVES };
   private buf: SqlValue[] = [];
   private count = 0;
   private pos = 0;
   private done = false;
   private r!: SqlValue[];
-  private readonly tier: Tier<{ fill: (st: ScanState, r: SqlValue[], out: SqlValue[]) => number; regs: number[] }>;
+  private readonly tier: Adaptive<{ fill: (st: ScanState, r: SqlValue[], out: SqlValue[]) => number; regs: number[] }>;
+  private t0 = 0;
 
   constructor(
     readonly access: TableAccess,
@@ -2316,9 +2338,17 @@ export class FusedScanFilter implements Operator {
     private readonly first: () => { bytes: Uint8Array; view: DataView } | null,
     private readonly release: (page: { bytes: Uint8Array; view: DataView }) => void,
     /** The rows one run scans (estimated), for the generated loop's tiers (codegen.ts). */
-    rows: number,
+    private readonly rows: number,
   ) {
-    this.tier = new Tier((inline) => build(SCAN_BATCH, inline), rows);
+    this.tier = new Adaptive((inline) => build(SCAN_BATCH, inline));
+  }
+
+  private use(b: { fill: (st: ScanState, r: SqlValue[], out: SqlValue[]) => number; regs: number[] }): void {
+    if (b === this.built) return;
+    this.built = b;
+    this.fill = b.fill;
+    this.regs = b.regs;
+    if (this.buf.length < SCAN_BATCH * Math.max(1, b.regs.length)) this.buf = new Array(SCAN_BATCH * Math.max(1, b.regs.length)).fill(null);
   }
 
   get detail(): string {
@@ -2326,30 +2356,33 @@ export class FusedScanFilter implements Operator {
   }
 
   open(r: SqlValue[]): void {
-    // Generated on open, when the decode list is final; the specialized tier replaces it between runs.
-    const b = this.tier.run();
-    if (b !== this.built) {
-      this.built = b;
-      this.fill = b.fill;
-      this.regs = b.regs;
-      this.buf = new Array(SCAN_BATCH * Math.max(1, b.regs.length)).fill(null);
-    }
+    // Generated on open, when the decode list is final; the rule may switch tiers at a pause (next()).
+    this.use(this.tier.start());
     this.close();
     this.r = r;
     this.st.f = this.first();
     this.st.i = 0;
+    this.st.rows = 0;
+    this.st.chunk = this.tier.specialized ? -1 : CHUNK_LEAVES;
+    this.t0 = performance.now();
     this.count = 0;
     this.pos = 0;
     this.done = false;
   }
 
   next(): boolean {
-    if (this.pos >= this.count) {
+    while (this.pos >= this.count) {
       if (this.done) return false;
       this.count = this.fill!(this.st, this.r, this.buf);
       this.pos = 0;
-      if (this.count < SCAN_BATCH) this.done = true;
-      if (this.count === 0) return false;
+      if (this.st.f === null) this.done = true;
+      else if (this.st.chunk !== -1) {
+        const b = this.tier.check(this.st.rows, Math.max(0, this.rows - this.st.rows), performance.now() - this.t0);
+        if (b !== this.built) {
+          this.use(b);
+          this.st.chunk = -1;
+        }
+      }
     }
     const regs = this.regs;
     const w = regs.length;
@@ -2371,8 +2404,7 @@ export class FusedScanFilter implements Operator {
 /** Scan + WHERE + GROUP BY + aggregates fused into one generated loop (hash aggregation inline). */
 export class FusedGroupAggregate implements Operator {
   readonly children: Operator[] = [];
-  private readonly tier: Tier<(r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => void>;
-  private run: ((r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => void) | null = null;
+  private readonly tier: Adaptive<(r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[], P: ScanProgress) => number>;
   private order: { keys: SqlValue[]; st: AggregateState[] }[] = [];
   private gi = 0;
   private r!: SqlValue[];
@@ -2383,16 +2415,17 @@ export class FusedGroupAggregate implements Operator {
 
   constructor(
     readonly access: TableAccess,
-    build: (inline: boolean) => (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => void,
+    build: (inline: boolean) => (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[], P: ScanProgress) => number,
     readonly groupRegs: number[],
     readonly aggs: AggSpec[],
     /** The rows one run scans (estimated), for the generated loop's tiers (codegen.ts). */
-    rows: number,
+    private readonly rows: number,
+    private readonly chunk: number,
     private readonly label?: string,
     /** Group memory used by the generated loop's newGroup (null: unlimited). */
     private readonly budget: { used: number; limit: number; area: SpillArea } | null = null,
   ) {
-    this.tier = new Tier(build, rows);
+    this.tier = new Adaptive(build);
   }
 
   get detail(): string {
@@ -2400,7 +2433,6 @@ export class FusedGroupAggregate implements Operator {
   }
 
   open(r: SqlValue[]): void {
-    this.run = this.tier.run();
     this.r = r;
     this.gi = 0;
     // Re-opened without close (the inner side of a nested loop): end the previous delegation, or
@@ -2413,7 +2445,7 @@ export class FusedGroupAggregate implements Operator {
       this.budget.limit = this.fallback && this.budget.area.enabled ? this.budget.area.workMem : Infinity;
     }
     try {
-      this.run(r, new Map(), order);
+      runAdaptive(this.tier, [r, new Map(), order], this.rows, this.chunk);
     } catch (e) {
       if (e !== SpillRestart || !this.fallback) throw e;
       // Too many groups to hold: run the query again with the hash aggregate, which spills.

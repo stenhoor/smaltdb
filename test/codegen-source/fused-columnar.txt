@@ -4,9 +4,9 @@ const $c0 = K[0]; const v0n = (r[2] === null); const v0 = v0n ? 0 : (r[2] > $c0 
 return (v0n ? null : v0);
 --
 pipeline(H, K, T):
-return function smaltFusedAggregate(r, S) {
+return function smaltFusedAggregate(r, S, P) {
 const $c0 = K[0]; const S0 = S[0];
-let f = H.first();
+let f = P.f !== null ? P.f : H.first(); P.f = null; let pg = 0;
 try {
   while (f !== null) {
     const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
@@ -18,17 +18,20 @@ try {
       if (!(!v0n && v0 != 0)) continue;
       { S0.n++; }
     }
+    P.rows += n;
     f = H.next(f);
+    if (++pg === P.chunk && f !== null) { P.f = f; f = null; return 1; }
   }
 } finally { if (f !== null) H.release(f); }
+return 0;
 };
 --
 pipeline(H, K, T):
-return function smaltFusedAggregate(r, S) {
+return function smaltFusedAggregate(r, S, P) {
 const $c0 = K[0]; const S0 = S[0];
-H.open(r);
-const ng = H.groups();
-for (let g = 0; g < ng; g++) {
+if (P.g === 0) H.open(r);
+const ng = H.groups(); let cg = 0;
+for (let g = P.g; g < ng; g++) {
   if (!H.keep(g)) continue;
   const n = H.rows(g); const base = g * H.RG;
   const ch0 = H.chunk(g, 2); const nb0 = ch0.nulls; const nv0 = ch0.num; const dc0 = ch0.dict; const cd0 = ch0.codes; const vs0 = ch0.vals;
@@ -51,13 +54,16 @@ for (let g = 0; g < ng; g++) {
       { S0.n++; }
     }
   }
+  P.rows += n;
+  if (++cg === P.chunk && g + 1 < ng) { P.g = g + 1; return 1; }
 }
+return 0;
 };
 
 > SELECT g, sum(v), avg(w), max(w) FROM k GROUP BY g
 pipeline(H, K, T):
-return function smaltGroupAggregate(r, groups, order) {
-let f = H.first();
+return function smaltGroupAggregate(r, groups, order, P) {
+let f = P.f !== null ? P.f : H.first(); P.f = null; let pg = 0;
 try {
   while (f !== null) {
     const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
@@ -74,16 +80,19 @@ try {
       { GS[1].step1((c3n ? null : c3)); }
       { GS[2].step1((c3n ? null : c3)); }
     }
+    P.rows += n;
     f = H.next(f);
+    if (++pg === P.chunk && f !== null) { P.f = f; f = null; return 1; }
   }
 } finally { if (f !== null) H.release(f); }
+return 0;
 };
 --
 pipeline(H, K, T):
-return function smaltGroupAggregate(r, groups, order) {
-H.open(r);
-const ng = H.groups();
-for (let g = 0; g < ng; g++) {
+return function smaltGroupAggregate(r, groups, order, P) {
+if (P.g === 0) H.open(r);
+const ng = H.groups(); let cg = 0;
+for (let g = P.g; g < ng; g++) {
   if (!H.keep(g)) continue;
   const n = H.rows(g); const base = g * H.RG;
   const ch0 = H.chunk(g, 1); const nb0 = ch0.nulls; const nv0 = ch0.num; const dc0 = ch0.dict; const cd0 = ch0.codes; const vs0 = ch0.vals;
@@ -122,7 +131,10 @@ for (let g = 0; g < ng; g++) {
       { GS[2].step1((c3n ? null : c3)); }
     }
   }
+  P.rows += n;
+  if (++cg === P.chunk && g + 1 < ng) { P.g = g + 1; return 1; }
 }
+return 0;
 };
 
 > SELECT sum(v * w) FROM k WHERE g = 3 AND w < 500
@@ -139,9 +151,9 @@ let v0n = ((r[2] === null) || (r[3] === null)); let v0 = 0; if (!v0n) { const x 
 return (v0n ? null : v0);
 --
 pipeline(H, K, T):
-return function smaltFusedAggregate(r, S) {
+return function smaltFusedAggregate(r, S, P) {
 const $c0 = K[0]; const $c1 = K[1]; const S0 = S[0];
-let f = H.first();
+let f = P.f !== null ? P.f : H.first(); P.f = null; let pg = 0;
 try {
   while (f !== null) {
     const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
@@ -155,17 +167,20 @@ try {
       if (!(!v1n && v1 != 0)) continue;
       { let v2n = (c2n || c3n); let v2 = 0; if (!v2n) { const x = c2; const y = c3; if (typeof x === 'number' && typeof y === 'number') { { const z = x * y; if (z === z) v2 = z; else v2n = true; } } else { const s = H.arith["*R"](x, y); if (s === null) v2n = true; else v2 = s; } } S0.step1((v2n ? null : v2)); }
     }
+    P.rows += n;
     f = H.next(f);
+    if (++pg === P.chunk && f !== null) { P.f = f; f = null; return 1; }
   }
 } finally { if (f !== null) H.release(f); }
+return 0;
 };
 --
 pipeline(H, K, T):
-return function smaltFusedAggregate(r, S) {
+return function smaltFusedAggregate(r, S, P) {
 const $c0 = K[0]; const $c1 = K[1]; const S0 = S[0];
-H.open(r);
-const ng = H.groups();
-for (let g = 0; g < ng; g++) {
+if (P.g === 0) H.open(r);
+const ng = H.groups(); let cg = 0;
+for (let g = P.g; g < ng; g++) {
   if (!H.keep(g)) continue;
   const n = H.rows(g); const base = g * H.RG;
   const ch0 = H.chunk(g, 1); const nb0 = ch0.nulls; const nv0 = ch0.num; const dc0 = ch0.dict; const cd0 = ch0.codes; const vs0 = ch0.vals;
@@ -198,7 +213,10 @@ for (let g = 0; g < ng; g++) {
       { let v2n = (c2n || c3n); let v2 = 0; if (!v2n) { const x = c2; const y = c3; if (typeof x === 'number' && typeof y === 'number') { { const z = x * y; if (z === z) v2 = z; else v2n = true; } } else { const s = H.arith["*R"](x, y); if (s === null) v2n = true; else v2 = s; } } S0.step1((v2n ? null : v2)); }
     }
   }
+  P.rows += n;
+  if (++cg === P.chunk && g + 1 < ng) { P.g = g + 1; return 1; }
 }
+return 0;
 };
 
 > SELECT s, count(*) FROM k WHERE s <> 's1' GROUP BY s
@@ -207,8 +225,8 @@ const v0n = (r[4] === null); const v0 = v0n ? 0 : (r[4] !== K[0] ? 1 : 0);
 return (v0n ? null : v0);
 --
 pipeline(H, K, T):
-return function smaltGroupAggregate(r, groups, order) {
-let f = H.first();
+return function smaltGroupAggregate(r, groups, order, P) {
+let f = P.f !== null ? P.f : H.first(); P.f = null; let pg = 0;
 try {
   while (f !== null) {
     const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
@@ -225,16 +243,19 @@ try {
       const GS = G.st;
       { GS[0].n++; }
     }
+    P.rows += n;
     f = H.next(f);
+    if (++pg === P.chunk && f !== null) { P.f = f; f = null; return 1; }
   }
 } finally { if (f !== null) H.release(f); }
+return 0;
 };
 --
 pipeline(H, K, T):
-return function smaltGroupAggregate(r, groups, order) {
-H.open(r);
-const ng = H.groups();
-for (let g = 0; g < ng; g++) {
+return function smaltGroupAggregate(r, groups, order, P) {
+if (P.g === 0) H.open(r);
+const ng = H.groups(); let cg = 0;
+for (let g = P.g; g < ng; g++) {
   if (!H.keep(g)) continue;
   const n = H.rows(g); const base = g * H.RG;
   const ch0 = H.chunk(g, 4); const nb0 = ch0.nulls; const nv0 = ch0.num; const dc0 = ch0.dict; const cd0 = ch0.codes; const vs0 = ch0.vals;
@@ -252,7 +273,10 @@ for (let g = 0; g < ng; g++) {
     const GS = G.st;
     { GS[0].n++; }
   }
+  P.rows += n;
+  if (++cg === P.chunk && g + 1 < ng) { P.g = g + 1; return 1; }
 }
+return 0;
 };
 
 > SELECT id, v FROM k WHERE w = 999
@@ -278,10 +302,10 @@ const $c0 = K[0]; const v0n = (r[1] === null); const v0 = v0n ? 0 : (r[1] < $c0 
 return (v0n ? null : v0);
 --
 pipeline(H, K, T):
-return function smaltFusedAggregate(r, S) {
+return function smaltFusedAggregate(r, S, P) {
 const $c0 = K[0]; const S0 = S[0];
 const S1 = S[1];
-let f = H.first();
+let f = P.f !== null ? P.f : H.first(); P.f = null; let pg = 0;
 try {
   while (f !== null) {
     const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
@@ -294,18 +318,21 @@ try {
       { S0.step1((c2n ? null : c2)); }
       { S1.step1((c2n ? null : c2)); }
     }
+    P.rows += n;
     f = H.next(f);
+    if (++pg === P.chunk && f !== null) { P.f = f; f = null; return 1; }
   }
 } finally { if (f !== null) H.release(f); }
+return 0;
 };
 --
 pipeline(H, K, T):
-return function smaltFusedAggregate(r, S) {
+return function smaltFusedAggregate(r, S, P) {
 const $c0 = K[0]; const S0 = S[0];
 const S1 = S[1];
-H.open(r);
-const ng = H.groups();
-for (let g = 0; g < ng; g++) {
+if (P.g === 0) H.open(r);
+const ng = H.groups(); let cg = 0;
+for (let g = P.g; g < ng; g++) {
   if (!H.keep(g)) continue;
   const n = H.rows(g); const base = g * H.RG;
   const ch0 = H.chunk(g, 1); const nb0 = ch0.nulls; const nv0 = ch0.num; const dc0 = ch0.dict; const cd0 = ch0.codes; const vs0 = ch0.vals;
@@ -333,5 +360,8 @@ for (let g = 0; g < ng; g++) {
       { S1.step1((c2n ? null : c2)); }
     }
   }
+  P.rows += n;
+  if (++cg === P.chunk && g + 1 < ng) { P.g = g + 1; return 1; }
 }
+return 0;
 };
