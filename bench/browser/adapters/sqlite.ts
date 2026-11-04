@@ -17,7 +17,11 @@ export class SqliteAdapter implements Adapter {
 
   readonly persistent: boolean;
 
-  constructor(private readonly journal: SqliteJournal) {
+  /** `load`: the sqlite-wasm module (the browser harness serves it under /nm/; the Node harness imports the package). */
+  constructor(
+    private readonly journal: SqliteJournal,
+    private readonly load: () => Promise<any> = () => importUrl('/nm/@sqlite.org/sqlite-wasm/dist/index.mjs'),
+  ) {
     this.persistent = journal !== 'MEMORY-DB';
     this.name = this.persistent ? `SQLite WASM (journal ${journal})` : 'SQLite WASM (:memory:)';
     this.atomicCommits = journal !== 'OFF';
@@ -43,7 +47,7 @@ export class SqliteAdapter implements Adapter {
   }
 
   async open(): Promise<void> {
-    const mod = await importUrl('/nm/@sqlite.org/sqlite-wasm/dist/index.mjs');
+    const mod = await this.load();
     const sqlite3 = await mod.default({ print: () => {}, printErr: () => {} });
     this.version = sqlite3.version.libVersion;
     this.sqlite3 = sqlite3;
