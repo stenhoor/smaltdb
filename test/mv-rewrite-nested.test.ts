@@ -46,7 +46,8 @@ function compare(db: Database, used: string[], sql: string): string[] {
   const got = db.query(sql).rows;
   const ordered = /ORDER BY/i.test(sql);
   expect(canon(got, ordered), sql).toEqual(canon(want, ordered));
-  return [...used];
+  // Each view once (SMALT_PLAN=shadow plans every SELECT with both planners).
+  return [...new Set(used)];
 }
 
 describe('materialized views answer nested SELECTs', () => {

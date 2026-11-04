@@ -20,7 +20,7 @@ import { type StaticType, truthy } from './exec/convert.js';
 import { type CompileScope, type Compiled, type Fn, compileExpr } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
-import { type ExternalScan, Planner, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
+import { AstPathNeeded, type ExternalScan, Planner, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
@@ -1044,7 +1044,7 @@ export class Database implements FunctionContext {
           const want = subplans();
           const end = planner.mark();
           start();
-          const p = planner.planPlan(fe.plan, fe.columns);
+          const p = this.physicalOrNull(planner, fe);
           if (!p) {
             end();
             return null;
@@ -1053,18 +1053,27 @@ export class Database implements FunctionContext {
           if (got !== want) throw new SmaltError('SMALT_INTERNAL', `SMALT_PLAN=shadow: the physical planner disagrees with the planner on subqueries\n  in: ${text}\nphysical:\n${got}\nplanner:\n${want}`);
           return p;
         };
-        return shadowCheck(stmt, text, this.frontEndCatalog(), () => planner.planSelect(stmt, null), () => planner.usedMatview, physical);
+        return shadowCheck(stmt, text, this.frontEndCatalog(), () => planner.planSelect(stmt, null), planner.env.rewriteSelect, physical);
       }
       case 'plan': {
-        // Materialized-view matching rewrites the AST, of any SELECT the statement plans (step 7c): while a view could
-        // answer one, the statement takes the AST path.
-        if (!planner.env.rewriteSelect || !this.hasRewriteCandidates()) {
-          const fe = toPlan(stmt, text, this.frontEndCatalog());
-          const p = fe && planner.planPlan(fe.plan, fe.columns);
-          if (p) return p;
-        }
+        // The front end applies materialized-view matching as the planner does (step 7c).
+        const fe = toPlan(stmt, text, this.frontEndCatalog(), undefined, planner.env.rewriteSelect);
+        const before = planner.mark();
+        const p = fe && this.physicalOrNull(planner, fe);
+        if (p) return p;
+        before();
         return planner.planSelect(stmt, null);
       }
+    }
+  }
+
+  /** The physical planner's operators for `fe`, or null when the statement takes the AST path. */
+  private physicalOrNull(planner: Planner, fe: FrontEndResult): QueryPlan | null {
+    try {
+      return planner.planPlan(fe.plan, fe.columns);
+    } catch (e) {
+      if (e instanceof AstPathNeeded) return null;
+      throw e;
     }
   }
 
@@ -1158,6 +1167,7 @@ export class Database implements FunctionContext {
   private plannerDeps(rewrite: { exclude: string | null } | null = null): ConstructorParameters<typeof Planner>[0] {
     return {
       rewriteSelect: rewrite ? (select, text) => this.matviewRewrite(select, text, rewrite.exclude) : undefined,
+      matviewCandidates: () => this.hasRewriteCandidates(),
       externalTable: (n) => this.externalTableScan(n),
       externalFunction: (n, args, named) => this.externalFunctionScan(n, args, named),
       isExternalFunction: (n) => this.external.plugins.isExternalFunction(n),
