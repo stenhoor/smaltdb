@@ -2,7 +2,7 @@
  * SQL metadata of bound plan expressions (ADR 0014): what SQL knows about an expression besides its type, kept beside
  * the plan rather than in it, as a symbol-keyed property that serializing a plan leaves out.
  */
-import type { PlanExpr } from '../plan/expr.js';
+import type { BoundExpr } from '../plan/expr.js';
 import type { PlanOp } from '../plan/ops.js';
 import type { SelectStmt } from '../sql/ast.js';
 import type { Collation } from '../values.js';
@@ -23,14 +23,14 @@ export interface SqlMeta {
 const SQL_META: unique symbol = Symbol('sql');
 type WithMeta = { [SQL_META]?: SqlMeta };
 
-export const getMeta = (e: PlanExpr): SqlMeta | undefined => (e as WithMeta)[SQL_META];
+export const getMeta = (e: BoundExpr): SqlMeta | undefined => (e as WithMeta)[SQL_META];
 
-export const setMeta = (e: PlanExpr, m: SqlMeta): void => {
+export const setMeta = (e: BoundExpr, m: SqlMeta): void => {
   (e as WithMeta)[SQL_META] = m;
 };
 
 /** True when code generation should hand `e` to the closure compiler whole. */
-export const isOpaque = (e: PlanExpr): boolean => (e as WithMeta)[SQL_META]?.opaque === true;
+export const isOpaque = (e: BoundExpr): boolean => (e as WithMeta)[SQL_META]?.opaque === true;
 
 const FLATTENED: unique symbol = Symbol('flattened');
 

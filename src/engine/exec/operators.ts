@@ -795,7 +795,7 @@ export class Filter implements Operator {
     readonly child: Operator,
     readonly pred: Fn,
     /** The bound predicate (lets the planner fuse scan + filter + aggregate into generated code). */
-    readonly expr?: import('../plan/expr.js').PlanExpr,
+    readonly expr?: import('../plan/expr.js').BoundExpr,
   ) {
     this.children = [child];
   }
@@ -1100,8 +1100,8 @@ export interface AggSpec {
   isMinMax: boolean;
   /** Function name and bound argument / FILTER expressions (for pipeline fusion). */
   name: string;
-  argExprs: import('../plan/expr.js').PlanExpr[];
-  filterExpr?: import('../plan/expr.js').PlanExpr;
+  argExprs: import('../plan/expr.js').BoundExpr[];
+  filterExpr?: import('../plan/expr.js').BoundExpr;
 }
 
 interface Group {

@@ -6,19 +6,26 @@
 import { type TableSchema, findColumn, storageTypeFor } from '../../catalog/schema.js';
 import { SmaltError } from '../../errors.js';
 import { type Affinity, type StaticType, affinityOfStorage, staticTypeOfStorage } from '../../exec/convert.js';
-import { CollSrc, type ColumnBinding, type CompileScope, bindExpr, boundMetadata, compileBoundExpr, conjuncts, withCompiledMeta } from '../../exec/expr.js';
+import { CollSrc, type ColumnBinding, type CompileScope, bindExpr as bindAst, boundMetadata, compileBoundExpr, conjuncts, withCompiledMeta as withCompiledMetaBound } from '../../exec/expr.js';
 import { type FunctionContext, aggregateFunctions, scalarFunctions } from '../../exec/functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../../exec/window.js';
 import { flattenCore, flatteningDisabled } from '../../exec/flatten.js';
 import { aggregateCallName } from '../ast-util.js';
 import { mayMatchMatview, matviewCoreOf } from '../../exec/planner.js';
 import { containsAggregate, containsWindow, coreReferences, exprEquals, firstAggregateCall, firstWindowCall, sameName, selectReferences } from '../../exec/planner.js';
-import { type PlanExpr, typeOf } from '../../plan/expr.js';
+import { type BoundExpr, type PlanExpr, typeOf } from '../../plan/expr.js';
 import { getMeta, markFlattened, setMeta, setSubquerySql } from '../../exec/sql-meta.js';
 import type { AggCall, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../plan/ops.js';
 import type { CollationName } from '../../plan/types.js';
 import { Collation, type SqlValue } from '../../values.js';
 import type { CallExpr, ColumnExpr, DeleteStmt, Expr, InsertStmt, UpdateStmt, UpsertClause, FrameBound, FromItem, JoinType, OrderingTerm, ResultColumn, SelectCore, SelectCoreSelect, SelectStmt, WindowSpec, WithClause } from '../ast.js';
+
+/**
+ * The binder, for the front end. Its result stands for columns by `slot`s until `resolveRefs` replaces them with `col`
+ * references, before the plan leaves the front end (and `resolveRefs` rejects anything else that is not plan).
+ */
+const bindExpr = (e: Expr, scope: CompileScope): PlanExpr => bindAst(e, scope) as PlanExpr;
+const withCompiledMeta = (e: PlanExpr, c: Parameters<typeof withCompiledMetaBound>[1]): PlanExpr => withCompiledMetaBound(e, c) as PlanExpr;
 
 /** What the front end needs of the catalog. */
 export interface FrontEndCatalog {
@@ -1378,12 +1385,12 @@ class FrontEnd {
   }
 
   /** `e` with its slots replaced (in place, below the root; the root itself when it is a slot is returned replaced). */
-  private resolveExpr(e: PlanExpr): PlanExpr {
-    const w = e as Mutable<PlanExpr>;
+  private resolveExpr(e: BoundExpr): PlanExpr {
+    const w = e as Mutable<BoundExpr>;
     switch (w.k) {
       case 'slot': {
         const r = this.refs[w.reg];
-        if (!r) return e;
+        if (!r) throw new SmaltError('SMALT_INTERNAL', 'a register the front end does not know reached a plan');
         // The slot's SQL metadata (collation source, affinity) stays with the column, for the physical planner.
         const c: PlanExpr = { k: 'col', input: r.input, index: r.index(), depth: r.depth, type: r.type, collation: collationName(r.collation) };
         const m = getMeta(e);
@@ -1395,29 +1402,32 @@ class FrontEnd {
       case 'or': {
         const args = w.args as PlanExpr[];
         for (let i = 0; i < args.length; i++) args[i] = this.resolveExpr(args[i]);
-        return e;
+        return e as PlanExpr;
       }
       case 'cast':
       case 'not':
       case 'isNull':
         w.arg = this.resolveExpr(w.arg);
-        return e;
+        return e as PlanExpr;
       case 'case':
         for (const x of w.whens as { when: PlanExpr; then: PlanExpr }[]) {
           x.when = this.resolveExpr(x.when);
           x.then = this.resolveExpr(x.then);
         }
         w.else = this.resolveExpr(w.else);
-        return e;
+        return e as PlanExpr;
       case 'subquery':
         this.resolveRefs(w.plan);
-        return e;
+        return e as PlanExpr;
       case 'inSubquery':
         w.probe = this.resolveExpr(w.probe);
         this.resolveRefs(w.plan);
-        return e;
+        return e as PlanExpr;
+      case 'native':
+        // Plans are serializable: a compiled closure never leaves the front end.
+        throw new SmaltError('SMALT_INTERNAL', 'a compiled expression reached a plan');
       default:
-        return e;
+        return e as PlanExpr;
     }
   }
 }

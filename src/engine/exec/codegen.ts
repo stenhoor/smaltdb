@@ -1,4 +1,4 @@
-import type { PlanExpr } from '../plan/expr.js';
+import type { BoundExpr } from '../plan/expr.js';
 import type { SqlValue } from '../values.js';
 import { isOpaque } from './sql-meta.js';
 import { type StaticType, truthy } from './convert.js';
@@ -74,7 +74,7 @@ const utf8Encoder = new TextEncoder();
  * operands (where the conversions change nothing) or on text under BINARY with neither operand converting to a
  * number (checked by `binaryTextOperands`), so they compare the operands themselves.
  */
-const unconverted = (x: PlanExpr): PlanExpr => (x.k === 'call' && (x.fn === 'sql.affinity_numeric' || x.fn === 'sql.affinity_text') ? x.args[0] : x);
+const unconverted = (x: BoundExpr): BoundExpr => (x.k === 'call' && (x.fn === 'sql.affinity_numeric' || x.fn === 'sql.affinity_text') ? x.args[0] : x);
 const isNum = (t: StaticType): boolean => t === 'int' || t === 'real' || t === 'num';
 
 let enabled: boolean | undefined;
@@ -96,7 +96,7 @@ export function codegenEnabled(): boolean {
 }
 
 /** Worth generating code for: arithmetic, numeric comparison, boolean logic or a math function at the root. */
-export function isCodegenRoot(e: PlanExpr): boolean {
+export function isCodegenRoot(e: BoundExpr): boolean {
   if (isOpaque(e)) return false;
   switch (e.k) {
     case 'call':
@@ -111,7 +111,7 @@ export function isCodegenRoot(e: PlanExpr): boolean {
 }
 
 /** A call of a math function that generated code can emit inline. */
-function mathCall(e: PlanExpr): InlineMath | undefined {
+function mathCall(e: BoundExpr): InlineMath | undefined {
   if (e.k !== 'call' || e.fn.startsWith('sql.')) return undefined;
   return inlineMath(e.fn, e.args.length);
 }
@@ -124,7 +124,7 @@ class Emitter {
   private n = 0;
   readonly consts: unknown[] = [];
 
-  constructor(private readonly fallback: (e: PlanExpr) => FallbackNode) {}
+  constructor(private readonly fallback: (e: BoundExpr) => FallbackNode) {}
 
   private tmp(): string {
     return 'v' + this.n++;
@@ -168,7 +168,7 @@ class Emitter {
     return { ...this.regRef(reg, type), type };
   }
 
-  private viaFallback(e: PlanExpr): Gen {
+  private viaFallback(e: BoundExpr): Gen {
     const c = this.fallback(e);
     if (c.reg !== undefined) return this.reg(c.reg, c.type);
     if (c.constant) return this.literal(c.fn([]), c.type);
@@ -182,7 +182,7 @@ class Emitter {
    * An integer literal divisor of `/` or `%` stays in the source: V8 turns division by a known constant into a
    * multiplication, and such divisors are usually part of the query's shape rather than values that vary.
    */
-  private divisor(op: string, e: PlanExpr): Gen | undefined {
+  private divisor(op: string, e: BoundExpr): Gen | undefined {
     if ((op !== '/' && op !== '%') || e.k !== 'lit' || typeof e.value !== 'number' || !Number.isSafeInteger(e.value) || Object.is(e.value, -0)) return undefined;
     return { v: `(${e.value})`, nul: 'false', type: e.type, num: true };
   }
@@ -194,7 +194,7 @@ class Emitter {
   }
 
   /** Emit `e` (unsupported node kinds go through the closure compiler). */
-  gen(e: PlanExpr): Gen {
+  gen(e: BoundExpr): Gen {
     if (isOpaque(e)) return this.viaFallback(e);
     switch (e.k) {
       case 'slot':
@@ -322,7 +322,7 @@ class Emitter {
     return `T(${plain(a)})`;
   }
 
-  private logic(op: 'AND' | 'OR', le: PlanExpr, re: PlanExpr): Gen {
+  private logic(op: 'AND' | 'OR', le: BoundExpr, re: BoundExpr): Gen {
     const a = this.gen(le);
     const ta = this.tmp();
     const v = this.tmp();
@@ -344,7 +344,7 @@ class Emitter {
   }
 
   /** The closure compiler's view of `e` (type, register, collation, affinity). */
-  fallbackOf(e: PlanExpr): FallbackNode {
+  fallbackOf(e: BoundExpr): FallbackNode {
     return this.fallback(e);
   }
 
@@ -354,7 +354,7 @@ class Emitter {
   }
 
   /** Both comparison operands use BINARY collation and neither applies numeric affinity. */
-  binaryTextOperands(l: PlanExpr, r: PlanExpr): boolean {
+  binaryTextOperands(l: BoundExpr, r: BoundExpr): boolean {
     const ok = (c: FallbackNode): boolean => (c.collation ?? 0) === 0 && (c.affinity === undefined || c.affinity === 'TEXT' || c.affinity === 'NONE' || c.affinity === 'BLOB');
     const cl = this.fallback(l);
     const cr = this.fallback(r);
@@ -414,7 +414,7 @@ class Emitter {
  * The static type `generate` gives `e`, without generating a function (the SQL front end compares result types with
  * the planner's; a constant folded to NULL makes generated arithmetic `num`, for example).
  */
-export function generatedType(e: PlanExpr, fallback: (e: PlanExpr) => FallbackNode): StaticType {
+export function generatedType(e: BoundExpr, fallback: (e: BoundExpr) => FallbackNode): StaticType {
   return new Emitter(fallback).gen(e).type;
 }
 
@@ -436,9 +436,9 @@ export function traceGeneratedCode(on: boolean): string[] {
  * expressions in post-aggregation scopes are already register slots (the binder resolved them).
  */
 export function generate(
-  e: PlanExpr,
+  e: BoundExpr,
   helpers: CodegenHelpers,
-  fallback: (e: PlanExpr) => FallbackNode,
+  fallback: (e: BoundExpr) => FallbackNode,
 ): { fn: (r: SqlValue[]) => SqlValue; type: StaticType; source: string } {
   const em = new Emitter(fallback);
   const g = em.gen(e);
@@ -604,10 +604,10 @@ export function generateLoader(spec: LoaderSpec, helpers: LoaderHelpers): Loader
 export interface FusedAggSpec {
   kind: 'countStar' | 'count' | 'step' | 'step2';
   /** Argument expression (count/step/step2). */
-  arg?: PlanExpr;
+  arg?: BoundExpr;
   /** Second argument expression (step2: two-argument aggregates such as corr and percentile). */
-  arg2?: PlanExpr;
-  filter?: PlanExpr;
+  arg2?: BoundExpr;
+  filter?: BoundExpr;
 }
 
 export interface FusedHelpers extends LoaderHelpers, CodegenHelpers {
@@ -631,7 +631,7 @@ class Pipeline {
   private readonly localRegs = new Map<number, boolean>(); // reg -> flagged
   readonly rowLines: string[] = [];
 
-  constructor(fallback: (e: PlanExpr) => FallbackNode) {
+  constructor(fallback: (e: BoundExpr) => FallbackNode) {
     this.em = new Emitter(fallback);
     this.em.inlineNumbers = true;
     this.em.regRef = (reg, type) => {
@@ -651,7 +651,7 @@ class Pipeline {
   private readonly textEq: { reg: number; bytes: Uint8Array }[] = [];
 
   /** WHERE: every conjunct must be true (NULL counts as false). */
-  addPredicates(preds: PlanExpr[]): void {
+  addPredicates(preds: BoundExpr[]): void {
     for (const p of preds) {
       const eq = this.textEqualityConjunct(p);
       if (eq) this.textEq.push(eq);
@@ -660,7 +660,7 @@ class Pipeline {
     }
   }
 
-  private textEqualityConjunct(p: PlanExpr): { reg: number; bytes: Uint8Array } | null {
+  private textEqualityConjunct(p: BoundExpr): { reg: number; bytes: Uint8Array } | null {
     if (p.k !== 'call' || p.fn !== 'sql.eq' || isOpaque(p)) return null;
     const left = unconverted(p.args[0]);
     const right = unconverted(p.args[1]);
@@ -850,11 +850,11 @@ function compileFn<T>(params: string[], src: string, args: unknown[]): T {
  * the WHERE conjuncts and steps the aggregates — no per-row operator calls.
  */
 export function generateFusedAggregate(
-  preds: PlanExpr[],
+  preds: BoundExpr[],
   aggs: FusedAggSpec[],
   source: PipelineSource,
   helpers: FusedHelpers | ColumnarHelpers,
-  fallback: (e: PlanExpr) => FallbackNode,
+  fallback: (e: BoundExpr) => FallbackNode,
 ): (r: SqlValue[], states: unknown[]) => void {
   const pl = new Pipeline(fallback);
   pl.addPredicates(preds);
@@ -936,12 +936,12 @@ export interface ScanState {
  * number of rows written (0 = scan finished). The current leaf stays pinned in `st.f` between calls.
  */
 export function generateScanFilter(
-  preds: PlanExpr[],
+  preds: BoundExpr[],
   outRegs: { reg: number; type: StaticType }[],
   cap: number,
   loaderSpec: () => LoaderSpec,
   helpers: FusedHelpers,
-  fallback: (e: PlanExpr) => FallbackNode,
+  fallback: (e: BoundExpr) => FallbackNode,
 ): (st: ScanState, r: SqlValue[], out: SqlValue[]) => number {
   const pl = new Pipeline(fallback);
   pl.addPredicates(preds);
@@ -979,12 +979,12 @@ export interface GroupHelpers {
  * its aggregates.
  */
 export function generateGroupAggregate(
-  preds: PlanExpr[],
-  groupExprs: { expr: PlanExpr; collation: number }[],
+  preds: BoundExpr[],
+  groupExprs: { expr: BoundExpr; collation: number }[],
   aggs: FusedAggSpec[],
   source: PipelineSource,
   helpers: (FusedHelpers | ColumnarHelpers) & GroupHelpers & { newGroup: (keys: SqlValue[]) => { keys: SqlValue[]; st: unknown[] } },
-  fallback: (e: PlanExpr) => FallbackNode,
+  fallback: (e: BoundExpr) => FallbackNode,
 ): (r: SqlValue[], groups: Map<unknown, unknown>, order: unknown[]) => void {
   const pl = new Pipeline(fallback);
   pl.addPredicates(preds);
