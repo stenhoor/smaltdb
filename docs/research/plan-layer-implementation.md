@@ -229,6 +229,12 @@ operators.
   planner plans the scan and WHERE as `Database.planTarget` does (no projection: the scan decodes what WHERE reads,
   and the rowid), then the deleted row's registers and RETURNING; the writer loop stays in the engine. Shadow mode
   compares the target scan's EXPLAIN rows, subplans, RETURNING columns and errors.
+- **8b (done), `update`:** the plan op holds the target's rows (the target joined with the FROM sources, with its
+  WHERE), the rowid's column, the SET assignments (a column, -1 for the rowid, and a value over the FROM row) bound
+  in `Database.compileUpdate`'s order, and RETURNING over the updated row. The physical planner plans the rows and
+  the SET values as `compileUpdate` does (the target's column registers, which the writer fills with each old row,
+  and `markUnordered` without FROM); the table's defaults and CHECK constraints stay compiled from the schema, and
+  RETURNING compiles over the new row's registers (`compileRowExprs`). The writer loop stays in the engine.
 
 `delete`, then `update`, then `append` (column mapping, conflict modes, upsert with `excluded.*` as a second input,
 RETURNING, the single-row fast path). They compile to today's `TableWriter` programs. What belongs to the table stays

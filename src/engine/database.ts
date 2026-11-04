@@ -26,7 +26,7 @@ import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from '.
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
 import { planMode, shadowCheck, shadowWrite } from './exec/plan-shadow.js';
 import { aggregateCallName } from './sql/ast-util.js';
-import { type FrontEndCatalog, type FrontEndResult, toDeletePlan, toPlan } from './sql/frontend/select.js';
+import { type FrontEndCatalog, type FrontEndResult, toDeletePlan, toPlan, toUpdatePlan } from './sql/frontend/select.js';
 import { type MatviewCandidate, matchMatview } from './exec/mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import type { ReaderSettings } from '../shared/protocol.js';
@@ -3666,30 +3666,10 @@ export class Database implements FunctionContext {
   private compileUpdate(stmt: UpdateStmt, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
     if (stmt.orderBy.length || stmt.limit) throw new SmaltError('SMALT_UNSUPPORTED', 'UPDATE ... ORDER BY/LIMIT is not supported');
     const table = this.targetTable(stmt.table, stmt.schema);
-    const { root, colRegs, rowidReg, scope } = this.planTarget(table, stmt.alias, stmt.where, planner, stmt.from, stmt.with);
-    // Target rowids are collected and sorted before any change: scan order is not observable.
-    if (!stmt.from) markUnordered(root);
-    const sets: { col: number; c: Compiled }[] = [];
-    for (const s of stmt.set) {
-      if (s.columns.length !== 1) throw new SmaltError('SMALT_UNSUPPORTED', 'row-value assignments are not supported yet');
-      const name = s.columns[0];
-      let col = findColumn(table, name);
-      if (col < 0) {
-        if (['rowid', 'oid', '_rowid_'].includes(name.toLowerCase())) col = -2;
-        else throw new SmaltError('SMALT_ERROR', `no such column: ${name}`);
-      }
-      sets.push({ col, c: compileExpr(s.value, scope) });
-    }
+    const { root, colRegs, rowidReg, sets, defaults, base, checkRowid, checks, ret } = this.updateParts(stmt, table, planner);
     // The statement's OR action; without one, each constraint's ON CONFLICT action applies.
     const mode: ConflictMode | undefined = stmt.or;
     const ncols = table.columns.length;
-    const emptyScope = planner.compileScope(planner.newScope());
-    const defaults: (Fn | null)[] = table.columns.map((c) => (c.defaultExpr ? compileExpr(c.defaultExpr, emptyScope).fn : null));
-    const base = planner.regs.alloc(ncols);
-    const checkRowid = planner.regs.alloc();
-    const newRowScope = this.rowScope(table, stmt.alias, base, checkRowid, planner);
-    const checks = this.compileChecks(table, newRowScope, planner.sqlText);
-    const ret = stmt.returning ? this.compileReturning(stmt.returning, table, stmt.alias, newRowScope, planner.sqlText) : undefined;
     const withFrom = stmt.from !== undefined;
 
     const exec = (r: SqlValue[], out?: SqlValue[][]): RunResult => {
@@ -3797,6 +3777,85 @@ export class Database implements FunctionContext {
   }
 
   /**
+   * UPDATE's target rows (the target joined with the FROM sources, with its WHERE, reading the rowid), its SET values,
+   * then what belongs to the table (defaults and CHECK over the new row's registers) and RETURNING, planned as
+   * `SMALT_PLAN` says: through the plan layer (step 8b), or the planner's AST path.
+   */
+  private updateParts(stmt: UpdateStmt, table: TableSchema, planner: Planner): UpdateParts {
+    type Target = Pick<UpdateParts, 'root' | 'colRegs' | 'rowidReg' | 'sets'>;
+    type Returning = (base: number, checkRowid: number, newRowScope: CompileScope) => UpdateParts['ret'];
+    const finish = (t: Target, returning: Returning): UpdateParts => {
+      const emptyScope = planner.compileScope(planner.newScope());
+      const defaults: (Fn | null)[] = table.columns.map((c) => (c.defaultExpr ? compileExpr(c.defaultExpr, emptyScope).fn : null));
+      const base = planner.regs.alloc(table.columns.length);
+      const checkRowid = planner.regs.alloc();
+      const newRowScope = this.rowScope(table, stmt.alias, base, checkRowid, planner);
+      const checks = this.compileChecks(table, newRowScope, planner.sqlText);
+      return { ...t, defaults, base, checkRowid, checks, ret: returning(base, checkRowid, newRowScope) };
+    };
+    const legacy = (): UpdateParts => {
+      const { root, colRegs, rowidReg, scope } = this.planTarget(table, stmt.alias, stmt.where, planner, stmt.from, stmt.with);
+      // Target rowids are collected and sorted before any change: scan order is not observable.
+      if (!stmt.from) markUnordered(root);
+      const sets: { col: number; c: Compiled }[] = [];
+      for (const s of stmt.set) {
+        if (s.columns.length !== 1) throw new SmaltError('SMALT_UNSUPPORTED', 'row-value assignments are not supported yet');
+        const name = s.columns[0];
+        let col = findColumn(table, name);
+        if (col < 0) {
+          if (['rowid', 'oid', '_rowid_'].includes(name.toLowerCase())) col = -2;
+          else throw new SmaltError('SMALT_ERROR', `no such column: ${name}`);
+        }
+        sets.push({ col, c: compileExpr(s.value, scope) });
+      }
+      return finish({ root, colRegs, rowidReg, sets }, (_b, _r, newRowScope) =>
+        stmt.returning ? this.compileReturning(stmt.returning, table, stmt.alias, newRowScope, planner.sqlText) : undefined,
+      );
+    };
+    const physical = (): UpdateParts | null => {
+      const fe = toUpdatePlan(stmt, table, planner.sqlText, this.frontEndCatalog());
+      const op = fe.plan;
+      const p = op.op === 'update' ? planner.planUpdate(op) : null;
+      if (!p || op.op !== 'update') return null;
+      // The writer's rowid assignment is column -2.
+      const sets = p.sets.map((x) => ({ col: x.column < 0 ? -2 : x.column, c: x.c }));
+      return finish({ root: p.root, colRegs: p.colRegs, rowidReg: p.rowidReg, sets }, (base, checkRowid) =>
+        fe.returning && op.returning
+          ? { columns: fe.returning.map((c) => c.name), types: fe.returning.map((c) => c.type), fns: planner.compileRowExprs(op.returning, table.columns.length, base, checkRowid) }
+          : undefined,
+      );
+    };
+    return this.planWrite(planner, legacy, physical, (p) => [`set ${p.sets.map((x) => `${x.col} ${x.c.type}`).join(', ')}`, ...this.describeWrite(planner, p.root, p.ret)]);
+  }
+
+  /** A write's parts from the plan layer or the AST path, as `SMALT_PLAN` says (shadow: both, compared). */
+  private planWrite<T>(planner: Planner, legacy: () => T, physical: () => T | null, describe: (t: T) => string[]): T {
+    switch (planMode()) {
+      case 'legacy':
+        return legacy();
+      case 'plan':
+        return physical() ?? legacy();
+      case 'shadow': {
+        const start = planner.mark();
+        this.writeSubplans = planner.subplans.length;
+        return shadowWrite(planner.sqlText, legacy, physical, start, (t) => describe(t).join('\n'));
+      }
+    }
+  }
+
+  /** Where the subplans of the write being compared in shadow mode start. */
+  private writeSubplans = 0;
+
+  /** A write's target scan (EXPLAIN rows), its subplans and its RETURNING columns, for shadow mode. */
+  private describeWrite(planner: Planner, root: Operator, ret: { columns: string[]; types: StaticType[] } | undefined): string[] {
+    return [
+      ...explainRows(root).map((x) => `${x.id} ${x.parent} ${x.detail}`),
+      ...planner.subplans.slice(this.writeSubplans).flatMap((x) => [x.label, ...explainRows(x.root).map((r) => `  ${r.id} ${r.parent} ${r.detail}`)]),
+      `returning ${ret ? ret.columns.map((c, i) => `${c} ${ret.types[i]}`).join(', ') : '-'}`,
+    ];
+  }
+
+  /**
    * DELETE's target rows (the scan with its WHERE, reading the rowid) and its RETURNING over registers for the
    * deleted row, planned as `SMALT_PLAN` says: through the plan layer (step 8a), or the planner's AST path.
    */
@@ -3815,23 +3874,7 @@ export class Database implements FunctionContext {
       const ret = fe.returning && { columns: fe.returning.map((c) => c.name), types: fe.returning.map((c) => c.type), fns: p.returning! };
       return { root: p.root, rowidReg: p.rowidReg, oldBase: p.oldBase, oldRowid: p.oldRowid, ret };
     };
-    switch (planMode()) {
-      case 'legacy':
-        return legacy();
-      case 'plan':
-        return physical() ?? legacy();
-      case 'shadow': {
-        const start = planner.mark();
-        const first = planner.subplans.length;
-        return shadowWrite(planner.sqlText, legacy, physical, start, (p) =>
-          [
-            ...explainRows(p.root).map((x) => `${x.id} ${x.parent} ${x.detail}`),
-            ...planner.subplans.slice(first).flatMap((x) => [x.label, ...explainRows(x.root).map((r) => `  ${r.id} ${r.parent} ${r.detail}`)]),
-            `returning ${p.ret ? p.ret.columns.map((c, i) => `${c} ${p.ret!.types[i]}`).join(', ') : '-'}`,
-          ].join('\n'),
-        );
-      }
-    }
+    return this.planWrite(planner, legacy, physical, (p) => this.describeWrite(planner, p.root, p.ret));
   }
 
   // ---------------------------------------------------------------- PRAGMA
@@ -4457,6 +4500,19 @@ interface MorselEntry {
   q: MorselQuery;
   types?: StaticType[];
   final?: Statement;
+}
+
+/** See `Database.updateParts`. */
+interface UpdateParts {
+  root: Operator;
+  colRegs: number[];
+  rowidReg: number;
+  sets: { col: number; c: Compiled }[];
+  defaults: (Fn | null)[];
+  base: number;
+  checkRowid: number;
+  checks: { fn: Fn; name: string }[];
+  ret: { columns: string[]; types: StaticType[]; fns: Fn[] } | undefined;
 }
 
 /** See `Database.deleteParts`. */

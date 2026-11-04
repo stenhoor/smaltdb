@@ -119,7 +119,29 @@ const DELETES = [
   'DELETE FROM u RETURNING x',
 ];
 
+const UPDATES = [
+  'UPDATE t SET a = a + 1 WHERE id < 10',
+  'UPDATE t AS q SET s = upper(q.s), r = r * 2 WHERE q.a = 4 RETURNING id, s, r',
+  'UPDATE u SET y = (SELECT s FROM t WHERE t.id = u.x) WHERE x > 5 RETURNING *',
+  'UPDATE t SET a = u.x FROM u WHERE u.x = t.id AND u.y = \'y2\' RETURNING rowid, a',
+  'UPDATE t SET rowid = rowid + 1000 WHERE id > 295',
+  'WITH k(v) AS (SELECT 3) UPDATE c SET v = v + 1 WHERE g IN (SELECT v FROM k) RETURNING g',
+];
+
 describe('physical planner, writes', () => {
+  it('updates the same rows and returns the same RETURNING rows', async () => {
+    const results = async (mode: 'legacy' | 'plan' | 'shadow') => {
+      const db = await setup();
+      setPlanMode(mode);
+      return UPDATES.map((q) => ({ rows: db.prepare(q).all(), t: db.prepare('SELECT * FROM t ORDER BY id').all() }));
+    };
+    const want = await results('legacy');
+    expect(await results('plan')).toEqual(want);
+    const before = shadowStats.physical;
+    expect(await results('shadow')).toEqual(want);
+    expect(shadowStats.physical - before).toBe(UPDATES.length * 2);
+  });
+
   it('deletes the same rows and returns the same RETURNING rows', async () => {
     const results = async (mode: 'legacy' | 'plan' | 'shadow') => {
       const db = await setup();
