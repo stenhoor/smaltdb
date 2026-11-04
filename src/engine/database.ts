@@ -697,6 +697,19 @@ export class Database implements FunctionContext {
   private writerFor(table: TableSchema): TableWriter {
     this.touchTable(table);
     const c = table.columnar;
+    // Row tables keep one writer per schema object, reused by later statements (its encoders and buffers cost
+    // more to build than a one-row write); one taken by the running statement is busy until it ends.
+    const reuse = !c && this.executeDepth > 0;
+    if (reuse) {
+      const e = this.writers.get(table);
+      // CREATE INDEX adds to a table's index list in place: a writer serves only the list it was built for.
+      const cached = e !== undefined && e.version === this.schemaVersion && e.indexes === table.indexes && e.count === table.indexes.length ? e.w : undefined;
+      if (cached !== undefined && !this.writersBusy.has(cached)) {
+        cached.resetStatement();
+        this.writersBusy.add(cached);
+        return cached;
+      }
+    }
     const w = c
       ? new ColumnarTableWriter(table, this.pager, (root) => this.tree(root), () => this.storeOf(table, true), this.tree(c.delRoot), (dDelta, dDeleted) => {
           this.columnarTouched.add(table);
@@ -713,8 +726,17 @@ export class Database implements FunctionContext {
     w.onDelete = (row) => {
       if (this.fk.involved(table)) this.fk.afterDelete(table, row);
     };
+    if (reuse) {
+      const e = this.writers.get(table);
+      if (e === undefined || this.writersBusy.has(e.w) === false) this.writers.set(table, { w, version: this.schemaVersion, indexes: table.indexes, count: table.indexes.length });
+      this.writersBusy.add(w);
+    }
     return w;
   }
+
+  /** Reusable row-table writers (see writerFor), by schema object: DDL replaces the object. */
+  private readonly writers = new WeakMap<TableSchema, { w: TableWriter; version: number; indexes: TableSchema['indexes']; count: number }>();
+  private readonly writersBusy = new Set<TableWriter>();
 
   /** Foreign-key enforcement (on by default; PRAGMA foreign_keys = OFF disables it). */
   private readonly fk = new ForeignKeys({
@@ -1282,6 +1304,20 @@ export class Database implements FunctionContext {
 
   /** @internal Run a write/utility program inside statement + (auto)transaction boundaries. */
   execute<T>(program: Program, body: () => T): T {
+    if (program.readonly && this.executeDepth === 0) return this.executeInner(program, body);
+    this.executeDepth++;
+    try {
+      return this.executeInner(program, body);
+    } finally {
+      // The outermost statement is done: its row writers can serve the next statement.
+      if (--this.executeDepth === 0 && this.writersBusy.size > 0) this.writersBusy.clear();
+    }
+  }
+
+  /** Nesting depth of `execute` (statements run from inside a statement, e.g. a refresh). */
+  private executeDepth = 0;
+
+  private executeInner<T>(program: Program, body: () => T): T {
     if (!program.readonly && this.activeCursors.size > 0) {
       throw new SmaltError('SMALT_BUSY', 'cannot modify the database while a query cursor is open; finish or close it first');
     }
@@ -3461,6 +3497,8 @@ export class Database implements FunctionContext {
     const exec = (r: SqlValue[], out?: SqlValue[][]): RunResult => {
       writer ??= this.writerFor(table);
       writer.resetStatement();
+      // Kept across runs: busy for this run too, so a nested write to the table takes another writer.
+      if (this.executeDepth > 0) this.writersBusy.add(writer);
       const w = writer;
       let changes = 0;
       let last = this.lastRowid;
