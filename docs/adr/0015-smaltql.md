@@ -130,7 +130,7 @@ Every package publishes under the smaltworks npm organization as `@smaltworks/<r
 - **Imports change** from `smaltdb` and `smaltdb/engine` to `@smaltworks/smaltdb` (engine and client) and
   `@smaltworks/smaltql` (`open()` for SQL). The plugins' peer dependency, `packed.json`, the docs, `CLAUDE.md`, and
   smaltui and smaltbi follow.
-- **The rename is a separate issue,** one PR per repository, before the first publish.
+- **The rename is a separate issue,** one PR per repository, just before the first publish (step 11).
 
 ### 3. The language interface
 
@@ -231,12 +231,12 @@ result from it.
 - **The same plan gives the same result** whichever language built it. Results never depend on how a language
   processes engine output: a language returns the engine's values and does not post-process them.
 - **smaltdf documents its own semantics** in its own docs. They are no longer divergences from SQL, and smaltdf
-  reviews its divergence list once it is on plans (step 11).
+  reviews its divergence list once it is on plans (step 10).
 - **The engine owns every implementation, SQL's rules included.** Code generation inlines them, so moving them out
   would cost speed. The registry publishes each function's metadata through `BindContext`. A language that needs an
   operation the engine lacks adds it to the engine, with a PR in smaltdb.
 - **Today's `sql.*` functions** hold SQLite's conversion and comparison rules. They are operations like any other,
-  open to every language; renaming them by behaviour is part of step 3.
+  open to every language; renaming them by behaviour is part of step 2.
 
 ### 8. smaltql's language rule
 
@@ -304,21 +304,20 @@ Performance is non-negotiable, so every step has a measured budget:
 Each step is its own PR. Every suite and benchmark gate (section 10) stays green at every step.
 
 1. This ADR.
-2. **Package names** (section 2): a separate issue, one PR per repository, before any publish.
-3. **Compile from plans:** remove `slot` / `native` and the rebinding (coupling 6, and the register half of 5).
+2. **Compile from plans:** remove `slot` / `native` and the rebinding (coupling 6, and the register half of 5).
    Functions are named by behaviour (section 7).
-4. **The planner takes plans only:** materialized-view matching on plans, no `FromItem` or SQL callbacks, and
+3. **The planner takes plans only:** materialized-view matching on plans, no `FromItem` or SQL callbacks, and
    `PlannerEnv` split into `BindContext` and the physical environment (couplings 5 and 8).
-5. **One expression compiler:** CHECK, DEFAULT, index and partial-index expressions as plan expressions
+4. **One expression compiler:** CHECK, DEFAULT, index and partial-index expressions as plan expressions
    (coupling 4).
-6. **Plan serialization and the validator.** Morsel parts travel as plans (coupling 7; ADR 0014 step 7d).
-7. **Bound statements and `bind()`:** `database.ts` dispatches on bound statements; DDL becomes schema operations;
+5. **Plan serialization and the validator.** Morsel parts travel as plans (coupling 7; ADR 0014 step 7d).
+6. **Bound statements and `bind()`:** `database.ts` dispatches on bound statements; DDL becomes schema operations;
    transactions, settings and maintenance become bound kinds (couplings 2 and 9).
-8. **Language-neutral catalog storage,** and opening without a parser (coupling 3). This is its own file format
+7. **Language-neutral catalog storage,** and opening without a parser (coupling 3). This is its own file format
    change.
-9. **The public plan API:** `preparePlan` / `queryPlan` in-process, over the worker protocol and in `MethodContext`
+8. **The public plan API:** `preparePlan` / `queryPlan` in-process, over the worker protocol and in `MethodContext`
    (coupling 10; ADR 0014 step 9), with smaltql's needs (section 3).
-10. **The boundary, then the move:**
+9. **The boundary, then the move:**
     - `src/engine/sql/`, the front end and `exec/flatten.ts` become a workspace package in this repository that
       reaches the engine only through the language interface and the plan API, with a check that engine code never
       imports it;
@@ -326,11 +325,13 @@ Each step is its own PR. Every suite and benchmark gate (section 10) stays green
     - smaltql exports its `open()`, and smaltdb gains `defineWorker`;
     - smaltdb stops exporting `parse` and no longer registers SQL itself;
     - smaltui and smaltbi import `open()` from smaltql.
-11. **smaltdf on plans,** in its own repository: its compiler builds plans instead of SQL, maps each method to the
+10. **smaltdf on plans,** in its own repository: its compiler builds plans instead of SQL, maps each method to the
     operation it means (section 7), and reviews its divergence list.
+11. **Package names** (section 2): a separate issue, one PR per repository, just before the first publish.
+    Nothing depends on the names until then.
 12. **Publish** `@smaltworks/smaltdb`, `@smaltworks/smaltql`, `@smaltworks/smaltdf` and the plugins together.
 
-Steps 3–6 are refactors inside smaltdb with no public change. Steps 7–10 change the engine's exports, and step 10
+Steps 2–5 are refactors inside smaltdb with no public change. Steps 6–9 change the engine's exports, and step 9
 moves `open()` for SQL into smaltql.
 
 ## Owner's decisions (2026-11-04)
@@ -350,13 +351,14 @@ moves `open()` for SQL into smaltql.
 5. **Stability:** the language API and the plan format freeze at 1.0, which includes smaltql and smaltdf.
 6. **Functions:** the engine owns every implementation, SQL's rules included.
 7. **One record:** the two drafts are one ADR 0015.
+8. **The rename comes last:** the package names change just before the first publish, not before the engine work.
 
 Earlier owner decisions this ADR relies on are in ADR 0014 ("Owner's decisions").
 
 ## Open points for the owner
 
 1. **Release order:** whether 0.9.0 waits for the split (one change of package and structure for users), or 0.9.0
-   publishes after step 9 and the split follows.
+   publishes after step 8 and the split follows.
 2. **How to say it:** smalt-Q-L or smalt-quel (a brand question, recorded in `stenhoor/smalt-brand`).
 
 ## Alternatives considered
@@ -393,7 +395,7 @@ Earlier owner decisions this ADR relies on are in ADR 0014 ("Owner's decisions")
 - **The plan format, the language API and the schema operations become public surfaces,** frozen at 1.0.
 - **One file-format change before 1.0,** for the catalog.
 - **Applications change their imports:** the package rename, and `open()` from the language they use. smaltui and
-  smaltbi change in steps 2 and 10.
+  smaltbi change in steps 9 and 11.
 - **One more repository and package to release,** in step with smaltdb, and cross-repository CI.
 - **The brand:** smaltql has its own mark and colour (smalt-brand `BRAND.md`), and smaltdb keeps its tagline and
   positioning line.
