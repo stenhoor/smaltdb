@@ -1,6 +1,6 @@
 # ADR 0015: The language API: SQL in its own repository, smaltdf on plans
 
-- **Status:** proposed; the owner's decisions are recorded below (2026-11-04)
+- **Status:** accepted (owner's decisions below, 2026-11-04)
 - **Date:** 2026-11-04
 - **Builds on:** [ADR 0012](0012-plugins.md) (plugins), [ADR 0013](0013-plugin-api-v1.md) (plugin API v1),
   [ADR 0014](0014-shared-plan-layer.md) (shared plan layer)
