@@ -6,7 +6,6 @@ import sqliteInit from '@sqlite.org/sqlite-wasm';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
-import { planMode } from '../src/engine/exec/plan-shadow.js';
 
 type Sqlite = { exec(sql: string): void; selectArrays(sql: string): unknown[][] };
 let sqlite3: { oo1: { DB: new (name: string) => Sqlite } };
@@ -25,9 +24,7 @@ const QUERIES = [
   'SELECT (WITH t AS (SELECT * FROM t) SELECT count(*) FROM t)',
 ];
 
-// The planner's AST path (SMALT_PLAN=legacy, and the reference in shadow mode) plans a CTE body against the enclosing
-// scopes only, so it differs here; it is being deleted (ADR 0014).
-describe.skipIf(planMode() !== 'plan')('CTE visibility', () => {
+describe('CTE visibility', () => {
   it('matches SQLite', async () => {
     const lite = new sqlite3.oo1.DB(':memory:');
     lite.exec(DDL);

@@ -22,12 +22,11 @@ SQL text
     per next() call
 ```
 
-Before binding, the front end applies the planner's two AST rewrites at the same points as the planner:
+Before binding, the front end applies two AST rewrites:
 materialized-view matching (`exec/mv-match.ts`) and the merging of simple views and FROM subqueries
 (`exec/flatten.ts`). Every SELECT, INSERT, UPDATE and DELETE goes through the plan layer, and so do the queries
 the engine plans for itself (materialized-view layout and refresh, view checks after DDL). The planner's AST path
-(`Planner.planSelect` and the compile functions in `database.ts`) is no longer reached in the default mode;
-`SMALT_PLAN=legacy` plans every statement that way until it is removed; see [TESTING.md](TESTING.md) for the modes.
+(`Planner.planSelect` and the write compile functions in `database.ts`) has been deleted.
 
 The steps after the parser depend on SQL text or AST in several places:
 - operators keep parts of the AST (`Filter.ast`, `AggSpec.argAsts`) for fusion;

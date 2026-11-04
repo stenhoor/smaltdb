@@ -1,12 +1,7 @@
 /**
- * The SQL front end (ADR 0014, step 5): turns a parsed SELECT into a plan (plan/ops.ts) whose expressions reference
- * columns by position. It does the name-resolution half of what exec/planner.ts does today, in the same order and
- * with the same errors, and leaves costing, access paths and operators to the physical planner (step 6).
- *
- * Until step 6 the plans are not executed: `SMALT_PLAN=shadow` (exec/plan-shadow.ts) builds one beside every
- * compiled SELECT and checks its result columns (names, types, collations, declared types, affinities) and its
- * errors against the current planner's. The one shape the front end does not handle is a table function that reads
- * external data (`read_csv()` and the like: its columns come from the data); `toPlan` returns null for it.
+ * The SQL front end (ADR 0014): turns a parsed statement into a plan (plan/ops.ts) whose expressions reference
+ * columns by position: name resolution, view and CTE expansion, flattening, materialized-view matching and the
+ * SQLite errors that go with them. Costing, access paths and operators are the physical planner's (exec/planner.ts).
  */
 import { type TableSchema, findColumn, storageTypeFor } from '../../catalog/schema.js';
 import { SmaltError } from '../../errors.js';
@@ -84,68 +79,36 @@ function tableShape(table: TableSchema): { cols: FeColumn[]; columns: number[] }
   return s;
 }
 
-/** A shape the front end does not handle yet. */
-class Unsupported extends Error {}
-
 /** A join condition read a source after the one it joins (FrontEnd.from moves it to the WHERE, or rejects it). */
 class LaterSource extends Error {}
 
 /**
- * Plan a SELECT. `text` is the statement's SQL text (result columns are named from it). Returns null for shapes the
- * front end does not handle yet; throws the error the current planner would raise.
+ * Plan a SELECT. `text` is the statement's SQL text (result columns are named from it). Throws SQLite's errors.
  */
-export function toPlan(
-  stmt: SelectStmt,
-  text: string,
-  catalog: FrontEndCatalog,
-  onUnsupported?: (reason: string) => void,
-  rewriteSelect?: (select: SelectStmt, text: string) => SelectStmt | null,
-): FrontEndResult | null {
-  try {
-    const fe = new FrontEnd(catalog, text, rewriteSelect);
-    const r = fe.select(stmt, null);
-    return { plan: fe.resolveRefs(r.plan), columns: r.columns };
-  } catch (e) {
-    if (e instanceof Unsupported) {
-      onUnsupported?.(e.message);
-      return null;
-    }
-    throw e;
-  }
+export function toPlan(stmt: SelectStmt, text: string, catalog: FrontEndCatalog, rewriteSelect?: (select: SelectStmt, text: string) => SelectStmt | null): FrontEndResult {
+  const fe = new FrontEnd(catalog, text, rewriteSelect);
+  const r = fe.select(stmt, null);
+  return { plan: fe.resolveRefs(r.plan), columns: r.columns };
 }
 
 /**
  * DELETE (ADR 0014, step 8a): a `delete` plan over the rows of `table` (resolved and checked by the database) that
  * the WHERE keeps, with RETURNING over each deleted row. Throws the error the planner would raise.
  */
-export function toDeletePlan(stmt: DeleteStmt, table: TableSchema, text: string, catalog: FrontEndCatalog): FrontEndWrite | null {
-  return unlessUnsupported(() => {
-    const fe = new FrontEnd(catalog, text);
-    const r = fe.deletePlan(stmt, table);
-    return { plan: fe.resolveRefs(r.plan), returning: r.returning };
-  });
-}
-
-/** `f`'s result, or null for a shape the front end does not handle yet (e.g. an external table function). */
-function unlessUnsupported<T>(f: () => T): T | null {
-  try {
-    return f();
-  } catch (e) {
-    if (e instanceof Unsupported) return null;
-    throw e;
-  }
+export function toDeletePlan(stmt: DeleteStmt, table: TableSchema, text: string, catalog: FrontEndCatalog): FrontEndWrite {
+  const fe = new FrontEnd(catalog, text);
+  const r = fe.deletePlan(stmt, table);
+  return { plan: fe.resolveRefs(r.plan), returning: r.returning };
 }
 
 /**
  * UPDATE (ADR 0014, step 8b): an `update` plan over the rows of `table` (resolved and checked by the database), with
  * the FROM sources, that the WHERE keeps; its SET values, and RETURNING over each updated row.
  */
-export function toUpdatePlan(stmt: UpdateStmt, table: TableSchema, text: string, catalog: FrontEndCatalog): FrontEndWrite | null {
-  return unlessUnsupported(() => {
-    const fe = new FrontEnd(catalog, text);
-    const r = fe.updatePlan(stmt, table);
-    return { plan: fe.resolveRefs(r.plan), returning: r.returning };
-  });
+export function toUpdatePlan(stmt: UpdateStmt, table: TableSchema, text: string, catalog: FrontEndCatalog): FrontEndWrite {
+  const fe = new FrontEnd(catalog, text);
+  const r = fe.updatePlan(stmt, table);
+  return { plan: fe.resolveRefs(r.plan), returning: r.returning };
 }
 
 /**
@@ -160,17 +123,15 @@ export function toInsertPlan(
   text: string,
   catalog: FrontEndCatalog,
   rewriteSelect?: (select: SelectStmt, text: string) => SelectStmt | null,
-): (FrontEndWrite & { source?: FrontEndColumn[] }) | null {
-  return unlessUnsupported(() => {
-    const fe = new FrontEnd(catalog, text, rewriteSelect);
-    const r = fe.insertPlan(stmt, table, columns);
-    return { plan: fe.resolveRefs(r.plan), returning: r.returning, source: r.source };
-  });
+): FrontEndWrite & { source?: FrontEndColumn[] } {
+  const fe = new FrontEnd(catalog, text, rewriteSelect);
+  const r = fe.insertPlan(stmt, table, columns);
+  return { plan: fe.resolveRefs(r.plan), returning: r.returning, source: r.source };
 }
 
 /**
  * The constraint an ON CONFLICT clause (`n`th of `count`) targets: an index of `table`, -1 for its INTEGER PRIMARY
- * KEY, null for any; throws SQLite's errors. Shared by the planner's AST path and the front end.
+ * KEY, null for any; throws SQLite's errors.
  */
 export function upsertTarget(u: UpsertClause, n: number, count: number, table: TableSchema): number | null {
   if (!u.target) {

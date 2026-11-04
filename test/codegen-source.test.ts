@@ -68,8 +68,7 @@ const CORPUS: Record<string, string[]> = {
   ],
 };
 
-// SMALT_PLAN=shadow generates code for both planners' operators; CI checks the physical planner's with SMALT_PLAN=plan.
-describe.skipIf(!!env.SMALT_NO_CODEGEN || env.SMALT_PLAN === 'shadow')('generated code (snapshot)', async () => {
+describe.skipIf(!!env.SMALT_NO_CODEGEN)('generated code (snapshot)', async () => {
   const db = await fixture();
   for (const [group, queries] of Object.entries(CORPUS)) {
     it(group, async () => {

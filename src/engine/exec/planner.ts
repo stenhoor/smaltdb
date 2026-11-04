@@ -1,6 +1,5 @@
 import type { TableStats } from './stats.js';
-import { flattenCore, flatteningDisabled } from './flatten.js';
-import { type FrameSpec, NAVIGATION, RANKING, WINDOW_ARITY, Window, type WindowCallKind, type WindowDef } from './window.js';
+import { type FrameSpec, WINDOW_ARITY, Window, type WindowCallKind, type WindowDef } from './window.js';
 
 let decorrelateOff: boolean | undefined;
 /** SMALT_NO_DECORRELATE=1 disables subquery decorrelation (tests compare both paths). */
@@ -12,20 +11,18 @@ function decorrelationDisabled(): boolean {
   return decorrelateOff;
 }
 import { SmaltError } from '../errors.js';
-import { type TableSchema, findColumn, isColumnar, storageTypeFor } from '../catalog/schema.js';
+import { type TableSchema, isColumnar, storageTypeFor } from '../catalog/schema.js';
 import type {
   CallExpr,
   ColumnExpr,
   Expr,
   FromItem,
   JoinType,
-  OrderingTerm,
   ResultColumn,
   SelectCore,
   SelectCoreSelect,
   SelectStmt,
   WindowSpec,
-  WithClause,
 } from '../sql/ast.js';
 import { type BTree, BTreeCursor } from '../storage/btree.js';
 import { KEY_AFTER_NULL, decodeKey, rowidSuffixStart } from '../storage/key-codec.js';
@@ -102,7 +99,6 @@ import {
 } from './operators.js';
 import { type ColumnStore, ROW_GROUP_ROWS, type Zone, zoneMayMatch } from '../storage/columnar.js';
 import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
-import { deletedBitmap, rowidsOf, zoneOf } from './columnar-table.js';
 import { anyNode } from '../sql/ast-util.js';
 import { type PlanExpr, lit } from '../plan/expr.js';
 import type { AggCall, JoinKind, PlanOp, SortKey as PlanSortKey } from '../plan/ops.js';
@@ -519,373 +515,6 @@ export class Planner {
 
   // ================================================================ SELECT
 
-  /**
-   * Any SELECT this planner plans (the statement, subqueries, CTE bodies, view bodies, INSERT
-   * sources) may be answered from a materialized view. Not when its table name means a CTE, and not
-   * when it reads the enclosing query's columns: the matcher compares column names without
-   * qualifiers, so an outer `o.x` would turn into the view's `x`.
-   */
-  private matviewRewrite(stmt: SelectStmt, parent: Scope | null): SelectStmt | null {
-    const rewrite = this.env.rewriteSelect;
-    if (!rewrite || !mayMatchMatview(stmt, parent !== null, (n) => parent?.findCte(n) !== undefined, (n, schema) => this.env.getTable(n, schema))) return null;
-    return rewrite(stmt, this.sqlText);
-  }
-
-  /**
-   * SMALT_PLAN=shadow: returns a function that forgets what planning registered since (registers, external sources,
-   * recorded subplans), so the physical planner's plan replaces the planner's as if planned alone.
-   */
-  mark(): () => void {
-    const regs = this.regs.count;
-    const externals = [...this.externals];
-    const subplans = [...this.subplans];
-    return () => {
-      this.regs.count = regs;
-      this.externals.splice(0, this.externals.length, ...externals);
-      this.subplans.splice(0, this.subplans.length, ...subplans);
-    };
-  }
-
-  /** One SELECT of a compound (UNION / INTERSECT / EXCEPT) answered from a materialized view. */
-  private matviewCore(core: SelectCore, parent: Scope | null): SelectCore {
-    if (!this.env.rewriteSelect) return core;
-    return matviewCoreOf(core, (stmt) => this.matviewRewrite(stmt, parent));
-  }
-
-  planSelect(stmt: SelectStmt, parent: Scope | null, outRegs?: number[]): QueryPlan {
-    stmt = this.matviewRewrite(stmt, parent) ?? stmt;
-    const withScope = new Scope(parent);
-    if (stmt.with) this.registerCtes(stmt.with, withScope);
-    const base = stmt.with ? withScope : parent;
-
-    if (stmt.compound.length === 0) {
-      const f = this.flatten(stmt.core, stmt.orderBy, base);
-      return this.planCoreWithOrder(f.core, f.changed ? { ...stmt, core: f.core, orderBy: f.orderBy } : stmt, base, outRegs);
-    }
-
-    // Compound: every core writes the same registers.
-    const first = this.planCore(this.flatten(this.matviewCore(stmt.core, base), [], base).core, base, outRegs, null);
-    const regs = first.outRegs;
-    let root: Operator = first.root;
-    let correlated = first.correlated;
-    for (const c of stmt.compound) {
-      const next = this.planCore(this.flatten(this.matviewCore(c.core, base), [], base).core, base, regs, null);
-      if (next.outRegs.length !== regs.length) {
-        throw new SmaltError('SMALT_ERROR', `SELECTs to the left and right of ${c.op} do not have the same number of result columns`);
-      }
-      correlated ||= next.correlated;
-      root = new Compound(root, next.root, c.op, regs, first.columns.map((x) => x.collation));
-    }
-    if (stmt.orderBy.length) {
-      const keys: SortKey[] = stmt.orderBy.map((t) => {
-        const idx = this.compoundOrderIndex(t, first.columns, stmt.core);
-        return { reg: regs[idx], desc: t.desc, nullsFirst: t.nulls ? t.nulls === 'FIRST' : !t.desc, collation: first.columns[idx].collation };
-      });
-      root = new Sort(root, keys, regs, undefined, this.env.spill ?? null);
-    }
-    root = this.applyLimit(root, stmt, base);
-    return { root, outRegs: regs, columns: first.columns, correlated };
-  }
-
-  /** Merge simple views / FROM subqueries into the core (see flatten.ts). */
-  private flatten(core: SelectCore, orderBy: OrderingTerm[], scope: Scope | null): { core: SelectCore; orderBy: OrderingTerm[]; changed: boolean } {
-    if (core.kind !== 'select' || !core.from || flatteningDisabled()) return { core, orderBy, changed: false };
-    return flattenCore(core, orderBy, {
-      getTable: (n, schema) => this.env.getTable(n, schema),
-      getView: (n, schema) => this.env.getView?.(n, schema),
-      isCte: (n) => scope?.findCte(n) !== undefined,
-      text: this.sqlText,
-    });
-  }
-
-  private registerCtes(w: WithClause, scope: Scope): void {
-    for (const c of w.ctes) {
-      const recursive = w.recursive && selectReferences(c.select, c.name);
-      scope.ctes.set(c.name.toLowerCase(), { select: c.select, columns: c.columns, recursive });
-    }
-  }
-
-  /** Plan a WITH RECURSIVE CTE as a RecursiveCte operator (see operators.ts). */
-  private planRecursiveCte(name: string, cte: CteEntry, parent: Scope | null): QueryPlan {
-    const select = cte.select;
-    const cores = [select.core, ...select.compound.map((c) => c.core)];
-    const refs = cores.map((c) => coreReferences(c, name));
-    const k = refs.indexOf(true);
-    if (k <= 0) throw new SmaltError('SMALT_ERROR', `recursive reference in a subquery: ${name}`);
-    for (let i = k; i < cores.length; i++) {
-      if (!refs[i]) throw new SmaltError('SMALT_ERROR', `circular reference: ${name}`);
-    }
-    const ops = select.compound.slice(k - 1).map((c) => c.op);
-    if (ops.some((op) => op !== 'UNION' && op !== 'UNION ALL')) throw new SmaltError('SMALT_ERROR', `recursive reference in a subquery: ${name}`);
-    const distinct = ops.includes('UNION');
-    // The initial (non-recursive) part, itself possibly a compound.
-    const init: SelectStmt = { ...select, with: undefined, core: select.core, compound: select.compound.slice(0, k - 1), orderBy: [], limit: undefined, offset: undefined };
-    const initPlan = this.planSelect(init, parent);
-    const outRegs = initPlan.outRegs;
-    if (cte.columns && cte.columns.length !== outRegs.length) {
-      throw new SmaltError('SMALT_ERROR', `table ${name} has ${outRegs.length} values for ${cte.columns.length} columns`);
-    }
-    const columns = initPlan.columns.map((c, i) => ({ ...c, name: cte.columns?.[i] ?? c.name }));
-    const wregs = outRegs.map(() => this.regs.alloc());
-    const scan = new WorkingScan(name, wregs);
-    let correlated = initPlan.correlated;
-    const steps = cores.slice(k).map((core) => {
-      const s = new Scope(parent);
-      s.ctes.set(name.toLowerCase(), { select, columns: cte.columns, working: { scan, regs: wregs, columns } });
-      const plan = this.planCore(core, s, outRegs, null);
-      if (plan.outRegs.length !== outRegs.length) {
-        throw new SmaltError('SMALT_ERROR', `SELECTs to the left and right of ${ops[0]} do not have the same number of result columns`);
-      }
-      correlated ||= plan.correlated;
-      return plan.root;
-    });
-    const order = select.orderBy.length
-      ? select.orderBy.map((t) => {
-          const idx = this.compoundOrderIndex(t, columns, select.core);
-          return { index: idx, desc: t.desc, nullsFirst: t.nulls ? t.nulls === 'FIRST' : !t.desc, collation: columns[idx].collation };
-        })
-      : null;
-    const ls = this.compileScope(new Scope(parent));
-    const limitFn = select.limit ? compileExpr(select.limit, ls).fn : undefined;
-    const offsetFn = select.offset ? compileExpr(select.offset, ls).fn : undefined;
-    const root = new RecursiveCte(name, initPlan.root, steps, outRegs, scan, distinct, columns.map((c) => c.collation), order, limitFn, offsetFn);
-    return { root, outRegs, columns, correlated };
-  }
-
-  private compoundOrderIndex(t: OrderingTerm, cols: ResultColumnInfo[], core: SelectCore): number {
-    const e = t.expr;
-    if (e.kind === 'literal' && typeof e.value === 'number' && Number.isInteger(e.value)) {
-      if (e.value < 1 || e.value > cols.length) throw new SmaltError('SMALT_ERROR', `ORDER BY term out of range - should be between 1 and ${cols.length}`);
-      return e.value - 1;
-    }
-    if (e.kind === 'column' && !e.table) {
-      const i = cols.findIndex((c) => sameName(c.name, e.name));
-      if (i >= 0) return i;
-    }
-    if (core.kind === 'select') {
-      const i = core.columns.findIndex((rc) => rc.kind === 'expr' && exprEquals(rc.expr, e));
-      if (i >= 0) return i;
-    }
-    throw new SmaltError('SMALT_ERROR', 'ORDER BY term does not match any column in the result set');
-  }
-
-  private applyLimit(root: Operator, stmt: SelectStmt, scope: Scope | null): Operator {
-    if (!stmt.limit) {
-      if (stmt.offset) throw new SmaltError('SMALT_ERROR', 'OFFSET without LIMIT');
-      return root;
-    }
-    const s = this.compileScope(new Scope(scope));
-    const lim = compileExpr(stmt.limit, s).fn;
-    const off = stmt.offset ? compileExpr(stmt.offset, s).fn : undefined;
-    return new Limit(root, lim, off);
-  }
-
-  /** Plan a single SELECT core including ORDER BY / LIMIT of the enclosing statement. */
-  private planCoreWithOrder(core: SelectCore, stmt: SelectStmt, parent: Scope | null, outRegs?: number[]): QueryPlan {
-    const plan = this.planCore(core, parent, outRegs, stmt);
-    plan.root = this.applyLimit(plan.root, stmt, parent);
-    return plan;
-  }
-
-  /**
-   * Plan one SELECT core. When `stmt` is given, its ORDER BY is planned too (it may reference
-   * source columns that are not in the result).
-   */
-  private planCore(core: SelectCore, parent: Scope | null, outRegs: number[] | undefined, stmt: SelectStmt | null): QueryPlan {
-    if (core.kind === 'values') return this.planValues(core.rows, parent, outRegs, stmt);
-    const fast = this.planCountStar(core, outRegs);
-    if (fast) return fast;
-    const scope = new Scope(parent);
-    let root = this.planFrom(core.from, core.where, scope);
-
-    const resultCols = this.expandResultColumns(core.columns, scope);
-    // Select-list aliases are visible (as a fallback) to WHERE-less clauses below.
-    scope.aliases = new Map();
-    for (const rc of resultCols) if (rc.alias) scope.aliases.set(rc.alias.toLowerCase(), rc.expr);
-
-    const isAgg =
-      core.groupBy.length > 0 ||
-      core.having !== undefined ||
-      resultCols.some((c) => containsAggregate(c.expr)) ||
-      (stmt?.orderBy.some((t) => containsAggregate(t.expr)) ?? false);
-
-    let exprScope: CompileScope;
-    let agg: { groupFns: Fn[]; groupColls: Collation[]; groupRegs: number[]; aggs: AggSpec[]; bare: Set<number> } | null = null;
-    let groupExprsForFusion: PlanExpr[] = [];
-    if (isAgg) {
-      const baseCompile = this.compileScope(scope);
-      const groupCompiled = core.groupBy.map((g) => this.compileGroupTerm(g, scope, resultCols, baseCompile));
-      const groupRegs = groupCompiled.map(() => this.regs.alloc());
-      const aggs: AggSpec[] = [];
-      const aggAsts: CallExpr[] = [];
-      const bare = new Set<number>();
-      agg = { groupFns: groupCompiled.map((g) => g.fn), groupColls: groupCompiled.map((g) => g.collation), groupRegs, aggs, bare };
-      const groupAsts = core.groupBy.map((g) => this.resolveGroupAst(g, resultCols));
-      groupExprsForFusion = groupCompiled.map((g) => g.bound);
-      exprScope = {
-        ...baseCompile,
-        resolveColumn: (e, defer) => {
-          const b = baseCompile.resolveColumn(e, defer);
-          // reg -1: an expanded select-list alias (its own columns were recorded while compiling it).
-          if (b.reg >= 0) bare.add(b.reg);
-          return b;
-        },
-        groupRef: (e) => {
-          const i = groupAsts.findIndex((g) => exprEquals(g, e));
-          if (i < 0) return undefined;
-          const c = groupCompiled[i];
-          return { reg: groupRegs[i], type: c.type, collation: c.collation, affinity: c.affinity };
-        },
-        aggregateRef: (call) => {
-          const existing = aggAsts.findIndex((a) => exprEquals(a, call));
-          if (existing >= 0) {
-            // The same aggregate again (sum(x) and typeof(sum(x))): one state, and the same result type.
-            const a = aggs[existing];
-            return { reg: a.outReg, type: a.def.resultType(a.argTypes), collation: a.collation, affinity: 'NONE' };
-          }
-          const def = aggregateFunctions.get(call.name)!;
-          if (call.star && call.name !== 'count') throw new SmaltError('SMALT_ERROR', `wrong number of arguments to function ${call.name}()`);
-          const n = call.args.length;
-          if (!call.star && (n < def.minArgs || n > def.maxArgs || (call.name === 'count' && n === 0))) {
-            throw new SmaltError('SMALT_ERROR', `wrong number of arguments to function ${call.name}()`);
-          }
-          // SQLite names the nested aggregate: max(sum(a)) is a misuse of sum().
-          const inner = call.args.map(firstAggregateCall).find((x) => x !== undefined);
-          if (inner) throw new SmaltError('SMALT_ERROR', `misuse of aggregate function ${inner.name}()`);
-          if (call.orderBy?.length) throw new SmaltError('SMALT_UNSUPPORTED', 'ORDER BY inside aggregate functions is not supported yet');
-          if (call.distinct && n !== 1) throw new SmaltError('SMALT_ERROR', 'DISTINCT aggregates must have exactly one argument');
-          const bound = call.args.map((a) => compileWithPlan(a, baseCompile));
-          const args = bound.map((b) => b.compiled);
-          const argTypes = args.map((a) => a.type);
-          const filter = call.filter ? compileWithPlan(call.filter, baseCompile) : undefined;
-          const spec: AggSpec = {
-            def,
-            args: args.map((a) => a.fn),
-            argTypes,
-            distinct: call.distinct,
-            filter: filter?.compiled.fn,
-            outReg: this.regs.alloc(),
-            collation: args[0]?.collSrc ? args[0].collation : Collation.Binary,
-            star: call.star,
-            isMinMax: call.name === 'min' || call.name === 'max',
-            name: call.name,
-            argExprs: bound.map((b) => b.bound),
-            filterExpr: filter?.bound,
-          };
-          aggs.push(spec);
-          aggAsts.push(call);
-          return { reg: spec.outReg, type: def.resultType(argTypes), collation: spec.collation, affinity: 'NONE' };
-        },
-      };
-      scope.aliasScope = exprScope;
-      // Subqueries in the result, HAVING and ORDER BY run on aggregate output rows.
-      scope.onOuterRef = (reg) => bare.add(reg);
-    } else {
-      exprScope = this.compileScope(scope);
-    }
-
-    // Window functions: result columns and ORDER BY terms may call f(...) OVER (...).
-    const noWindowScope = exprScope;
-    const windowDefs: WindowDef[] = [];
-    const hasWindows = resultCols.some((c) => containsWindow(c.expr)) || (stmt?.orderBy.some((t) => containsWindow(t.expr)) ?? false);
-    if (hasWindows) {
-      const seen: { ast: CallExpr; binding: ColumnBinding }[] = [];
-      exprScope = { ...exprScope, windowRef: (call) => this.windowRef(call, core as SelectCoreSelect, noWindowScope, windowDefs, seen) };
-    }
-
-    // Result expressions.
-    const compiled = resultCols.map((c) => compileExpr(c.expr, exprScope));
-    const regs = outRegs ?? compiled.map(() => this.regs.alloc());
-    if (regs.length !== compiled.length) {
-      throw new SmaltError('SMALT_ERROR', `SELECTs to the left and right of a compound operator do not have the same number of result columns`);
-    }
-    const columns: ResultColumnInfo[] = resultCols.map((c, i) => ({
-      name: c.name,
-      type: compiled[i].type,
-      declType: c.declType,
-      collation: compiled[i].collSrc !== CollSrc.None ? compiled[i].collation : Collation.Binary,
-      affinity: compiled[i].affinity,
-    }));
-
-    // ORDER BY keys (single core only).
-    const sortKeys: SortKey[] = [];
-    const extraFns: Fn[] = [];
-    const extraRegs: number[] = [];
-    if (stmt && stmt.compound.length === 0) {
-      for (const t of stmt.orderBy) {
-        const idx = this.orderByResultIndex(t.expr, resultCols);
-        let reg: number;
-        let coll: Collation;
-        if (idx >= 0) {
-          reg = regs[idx];
-          coll = t.expr.kind === 'collate' ? compileExpr(t.expr, exprScope).collation : columns[idx].collation;
-        } else {
-          const c = compileExpr(t.expr, exprScope);
-          reg = this.regs.alloc();
-          extraFns.push(c.fn);
-          extraRegs.push(reg);
-          coll = c.collSrc !== CollSrc.None ? c.collation : Collation.Binary;
-        }
-        sortKeys.push({ reg, desc: t.desc, nullsFirst: t.nulls ? t.nulls === 'FIRST' : !t.desc, collation: coll });
-      }
-    }
-
-    let having: Fn | undefined;
-    if (core.having) {
-      if (!agg) throw new SmaltError('SMALT_ERROR', 'a GROUP BY clause is required before HAVING');
-      having = compileExpr(core.having, noWindowScope).fn;
-    }
-
-    if (agg) {
-      // One output row from order-insensitive aggregates: index scans below may fetch in rowid order.
-      if (agg.groupFns.length === 0 && agg.bare.size === 0 && agg.aggs.every((a) => ORDER_INSENSITIVE_AGGS.has(a.name))) markUnordered(root);
-      const fused =
-        agg.bare.size > 0
-          ? null
-          : agg.groupFns.length === 0
-            ? this.tryFuseAggregate(root, agg.aggs, scope)
-            : this.tryFuseGroupAggregate(root, groupExprsForFusion, agg.groupColls, agg.groupRegs, agg.aggs, scope);
-      const hashAgg = new HashAggregate(root, agg.groupFns, agg.groupColls, agg.groupRegs, agg.aggs, [...agg.bare], this.env.spill ?? null);
-      // A fused GROUP BY that outgrows work_mem starts over as the (spilling) hash aggregate.
-      if (fused instanceof FusedGroupAggregate) fused.fallback = hashAgg;
-      root = fused ?? hashAgg;
-      if (having) root = new Filter(root, having);
-    }
-
-    // ORDER BY the rowid (named, or a result column that is the rowid) of a simple scan: read in rowid order. The
-    // rowid is an integer, so its collation does not matter; NULLS FIRST / LAST only when it is the default.
-    let sortNeeded = sortKeys.length > 0;
-    if (sortNeeded && !agg && !core.distinct && scope.sources.length === 1 && stmt?.orderBy.length === 1) {
-      const src = scope.sources[0];
-      const term = stmt.orderBy[0];
-      const scan = this.lastScan;
-      const idx = this.orderByResultIndex(term.expr, resultCols);
-      const key = idx >= 0 ? resultCols[idx].expr : term.expr.kind === 'collate' ? term.expr.expr : term.expr;
-      if (scan && src.table && scan.access === src.access && this.rowidRegOf(key, scope) >= 0) {
-        if (term.nulls === undefined || (term.nulls === 'FIRST') === !term.desc) {
-          scan.reverse = term.desc;
-          sortNeeded = false;
-        }
-      }
-    }
-
-    if (!agg) root = this.tryFuseScanFilter(root, scope);
-    if (windowDefs.length) {
-      // Registers the projection reads from each input row (restored by the Window operator).
-      const snap = agg
-        ? [...agg.groupRegs, ...agg.aggs.map((a) => a.outReg), ...agg.bare]
-        : scope.sources.flatMap((src) => [...src.cols.map((c) => c.reg), ...(src.rowidReg >= 0 ? [src.rowidReg] : [])]);
-      root = new Window(root, [...new Set(snap)], windowDefs);
-    }
-    root = new Project(root, [...compiled.map((c) => c.fn), ...extraFns], [...regs, ...extraRegs]);
-    if (core.distinct) root = new Distinct(root, regs, columns.map((c) => c.collation));
-    if (sortNeeded) {
-      const limitHint = stmt?.limit ? this.topNHint(stmt, parent) : undefined;
-      root = new Sort(root, sortKeys, [...regs, ...extraRegs], limitHint, this.env.spill ?? null);
-    }
-    return { root, outRegs: regs, columns, correlated: scope.correlated };
-  }
-
   /** Resolve `OVER name` / `OVER (base ...)` against the core's WINDOW clause, like SQLite. */
   private resolveWindowSpec(over: WindowSpec | string, core: SelectCoreSelect): WindowSpec {
     const named = (name: string): WindowSpec => {
@@ -900,110 +529,6 @@ export class Planner {
     if (over.orderBy.length && base.orderBy.length) throw new SmaltError('SMALT_ERROR', `cannot override ORDER BY clause of window: ${over.base}`);
     if (base.frame) throw new SmaltError('SMALT_ERROR', `cannot override frame specification of window: ${over.base}`);
     return { ...over, base: undefined, partitionBy: base.partitionBy, orderBy: over.orderBy.length ? over.orderBy : base.orderBy };
-  }
-
-  /** Register a window function call (see window.ts) and return the register holding its value. */
-  private windowRef(call: CallExpr, core: SelectCoreSelect, scope: CompileScope, defs: WindowDef[], seen: { ast: CallExpr; binding: ColumnBinding }[]): ColumnBinding {
-    const hit = seen.find((x) => exprEquals(x.ast, call));
-    if (hit) return hit.binding;
-    const name = call.name;
-    const aggDef = aggregateFunctions.get(name);
-    const builtin = WINDOW_ARITY[name];
-    if (!builtin && !aggDef) {
-      if (scalarFunctions.has(name)) throw new SmaltError('SMALT_ERROR', `${name}() may not be used as a window function`);
-      throw new SmaltError('SMALT_ERROR', `no such function: ${name}`);
-    }
-    const n = call.args.length;
-    const [minA, maxA] = builtin ?? [aggDef!.minArgs, aggDef!.maxArgs];
-    if (call.star ? name !== 'count' : n < minA || n > maxA || (name === 'count' && n === 0)) {
-      throw new SmaltError('SMALT_ERROR', `wrong number of arguments to function ${name}()`);
-    }
-    if (call.distinct) throw new SmaltError('SMALT_ERROR', 'DISTINCT is not supported for window functions');
-    if (builtin && call.filter) throw new SmaltError('SMALT_ERROR', `FILTER clause may only be used with aggregate window functions`);
-    // SQLite names the nested window function: sum(rank() OVER ()) OVER () is a misuse of rank().
-    for (const a of call.args) {
-      const inner = firstWindowCall(a);
-      if (inner) throw new SmaltError('SMALT_ERROR', `misuse of window function ${inner.name}()`);
-    }
-    const spec = this.resolveWindowSpec(call.over!, core);
-    const args = call.args.map((a) => compileExpr(a, scope));
-    // One WindowDef per distinct (PARTITION BY, ORDER BY, frame).
-    const strip = (x: unknown): string => JSON.stringify(x, (k, v) => (k === 'pos' || k === 'end' ? undefined : typeof v === 'bigint' ? `${v}n` : v instanceof Uint8Array ? [...v] : v));
-    const key = strip({ p: spec.partitionBy, o: spec.orderBy, f: spec.frame });
-    let defIndex = defs.findIndex((d) => (d as WindowDef & { key?: string }).key === key);
-    if (defIndex < 0) {
-      const part = spec.partitionBy.map((e) => compileExpr(e, scope));
-      const order = spec.orderBy.map((t) => {
-        const c = compileExpr(t.expr, scope);
-        return { fn: c.fn, desc: t.desc, nullsFirst: t.nulls ? t.nulls === 'FIRST' : !t.desc, collation: c.collSrc !== CollSrc.None ? c.collation : Collation.Binary };
-      });
-      const f = spec.frame;
-      const frame: FrameSpec = f
-        ? {
-            unit: f.unit,
-            start: { kind: f.start.kind, offset: 'offset' in f.start ? compileExpr(f.start.offset, scope).fn : undefined },
-            end: f.end ? { kind: f.end.kind, offset: 'offset' in f.end ? compileExpr(f.end.offset, scope).fn : undefined } : { kind: 'currentRow' },
-            exclude: f.exclude ?? 'NO OTHERS',
-          }
-        : order.length
-          ? { unit: 'RANGE', start: { kind: 'unboundedPreceding' }, end: { kind: 'currentRow' }, exclude: 'NO OTHERS' }
-          : { unit: 'ROWS', start: { kind: 'unboundedPreceding' }, end: { kind: 'unboundedFollowing' }, exclude: 'NO OTHERS' };
-      const rank = (k: string): number => ['unboundedPreceding', 'preceding', 'currentRow', 'following', 'unboundedFollowing'].indexOf(k);
-      if (frame.start.kind === 'unboundedFollowing' || frame.end.kind === 'unboundedPreceding' || rank(frame.start.kind) > rank(frame.end.kind)) {
-        throw new SmaltError('SMALT_ERROR', 'unsupported frame specification');
-      }
-      if (frame.unit === 'RANGE' && (frame.start.offset || frame.end.offset) && order.length !== 1) {
-        throw new SmaltError('SMALT_ERROR', 'RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression');
-      }
-      const def: WindowDef & { key?: string } = { partition: part.map((c) => c.fn), partitionColls: part.map((c) => (c.collSrc !== CollSrc.None ? c.collation : Collation.Binary)), order, frame, calls: [], key };
-      defs.push(def);
-      defIndex = defs.length - 1;
-    }
-    const outReg = this.regs.alloc();
-    const kind: WindowCallKind = builtin ? (name as WindowCallKind) : 'aggregate';
-    defs[defIndex].calls.push({
-      kind,
-      name,
-      args: args.map((a) => a.fn),
-      filter: call.filter ? compileExpr(call.filter, scope).fn : undefined,
-      outReg,
-      agg: aggDef && !builtin ? { def: aggDef, argTypes: args.map((a) => a.type), collation: args[0]?.collSrc ? args[0].collation : Collation.Binary, star: call.star } : undefined,
-    });
-    const type: StaticType =
-      kind === 'aggregate'
-        ? aggDef!.resultType(args.map((a) => a.type))
-        : kind === 'percent_rank' || kind === 'cume_dist'
-          ? 'real'
-          : RANKING.has(kind)
-            ? 'int'
-            : (args[0]?.type ?? 'any') === 'null'
-              ? 'any'
-              : kind === 'lag' || kind === 'lead'
-                ? args.length > 2 && args[2].type !== args[0].type
-                  ? 'any'
-                  : args[0].type
-                : args[0].type;
-    const binding: ColumnBinding = { reg: outReg, type, collation: args[0]?.collSrc && NAVIGATION.has(kind) ? args[0].collation : Collation.Binary, affinity: 'NONE' };
-    seen.push({ ast: call, binding });
-    return binding;
-  }
-
-  /** `SELECT count(*) FROM table` with nothing else: count leaf cells (like SQLite's OP_Count). */
-  private planCountStar(core: SelectCore, outRegs: number[] | undefined): QueryPlan | null {
-    if (core.kind !== 'select' || core.distinct || core.where || core.groupBy.length || core.having) return null;
-    if (core.columns.length !== 1 || !core.from || core.from.kind !== 'table' || core.from.indexedBy !== undefined) return null;
-    const rc = core.columns[0];
-    if (rc.kind !== 'expr' || rc.expr.kind !== 'call' || rc.expr.name !== 'count' || !rc.expr.star || rc.expr.filter || rc.expr.over) return null;
-    const table = this.env.getTable(core.from.name, core.from.schema);
-    if (!table || isColumnar(table)) return null;
-    const reg = outRegs ? outRegs[0] : this.regs.alloc();
-    const name = rc.alias ?? this.sqlText.slice(rc.expr.pos, rc.expr.end);
-    return {
-      root: new CountRows(this.env.openTree(table.rootPage), table.name, reg),
-      outRegs: [reg],
-      columns: [{ name, type: 'int', collation: Collation.Binary, affinity: 'NONE' }],
-      correlated: false,
-    };
   }
 
   /**
@@ -1192,22 +717,6 @@ export class Planner {
           }
         : {}),
     };
-  }
-
-  /** Register of the rowid if `e` names the rowid of the single source, else -1. */
-  private rowidRegOf(e: Expr, scope: Scope): number {
-    if (e.kind !== 'column') return -1;
-    const src = scope.sources[0];
-    if (e.table && !sameName(e.table, src.name)) return -1;
-    const t = src.table!;
-    const ci = findColumn(t, e.name);
-    if (ci >= 0) return ci === t.rowidAlias ? src.rowidReg : -1;
-    return ROWID_NAMES.has(e.name.toLowerCase()) ? src.rowidReg : -1;
-  }
-
-  private topNHint(stmt: SelectStmt, parent: Scope | null): ((r: SqlValue[]) => number) | undefined {
-    const s = this.compileScope(new Scope(parent));
-    return topN(compileExpr(stmt.limit!, s).fn, stmt.offset ? compileExpr(stmt.offset, s).fn : undefined);
   }
 
   // ================================================================ physical planner (ADR 0014, step 6b)
@@ -1821,102 +1330,8 @@ export class Planner {
     return { root: new CountRows(this.env.openTree(table.rootPage), table.name, reg), outRegs: [reg], columns, correlated: false };
   }
 
-  private orderByResultIndex(e: Expr, cols: { alias?: string; expr: Expr; name: string }[]): number {
-    let inner = e;
-    if (inner.kind === 'collate') inner = inner.expr;
-    if (inner.kind === 'literal' && typeof inner.value === 'number' && Number.isInteger(inner.value)) {
-      if (inner.value < 1 || inner.value > cols.length) throw new SmaltError('SMALT_ERROR', `ORDER BY term out of range - should be between 1 and ${cols.length}`);
-      return inner.value - 1;
-    }
-    if (inner.kind === 'column' && !inner.table) {
-      const i = cols.findIndex((c) => c.alias !== undefined && sameName(c.alias, (inner as ColumnExpr).name));
-      if (i >= 0) return i;
-    }
-    return cols.findIndex((c) => exprEquals(c.expr, inner));
-  }
-
-  /** GROUP BY term: integer literal or alias refers to a result column. */
-  private resolveGroupAst(g: Expr, cols: { alias?: string; expr: Expr }[]): Expr {
-    if (g.kind === 'literal' && typeof g.value === 'number' && Number.isInteger(g.value)) {
-      if (g.value < 1 || g.value > cols.length) throw new SmaltError('SMALT_ERROR', `GROUP BY term out of range - should be between 1 and ${cols.length}`);
-      return cols[g.value - 1].expr;
-    }
-    return g;
-  }
-
-  private compileGroupTerm(g: Expr, scope: Scope, cols: { alias?: string; expr: Expr }[], cs: CompileScope): Compiled & { bound: PlanExpr } {
-    const ast = this.resolveGroupAst(g, cols);
-    if (containsAggregate(ast)) throw new SmaltError('SMALT_ERROR', 'aggregate functions are not allowed in the GROUP BY clause');
-    void scope;
-    const { compiled: c, bound } = compileWithPlan(ast, cs);
-    return { ...c, collation: c.collSrc !== CollSrc.None ? c.collation : Collation.Binary, bound };
-  }
-
-  private planValues(rows: Expr[][], parent: Scope | null, outRegs: number[] | undefined, stmt: SelectStmt | null): QueryPlan {
-    const width = rows[0].length;
-    for (const r of rows) if (r.length !== width) throw new SmaltError('SMALT_ERROR', 'all VALUES must have the same number of terms');
-    const scope = new Scope(parent);
-    const cs = this.compileScope(scope);
-    const compiled = rows.map((r) => r.map((e) => compileExpr(e, cs)));
-    const regs = outRegs ?? compiled[0].map(() => this.regs.alloc());
-    const columns: ResultColumnInfo[] = compiled[0].map((c, i) => ({ name: `column${i + 1}`, type: c.type, collation: Collation.Binary, affinity: 'NONE' as Affinity }));
-    let root: Operator = new Values(compiled.map((r) => r.map((c) => c.fn)), regs);
-    if (stmt && stmt.compound.length === 0 && stmt.orderBy.length) {
-      const keys = stmt.orderBy.map((t) => {
-        const idx = this.compoundOrderIndex(t, columns, { kind: 'values', rows, pos: 0, end: 0 } as SelectCore);
-        return { reg: regs[idx], desc: t.desc, nullsFirst: t.nulls ? t.nulls === 'FIRST' : !t.desc, collation: Collation.Binary };
-      });
-      root = new Sort(root, keys, regs, undefined, this.env.spill ?? null);
-    }
-    return { root, outRegs: regs, columns, correlated: scope.correlated };
-  }
-
-  private expandResultColumns(cols: ResultColumn[], scope: Scope): { expr: Expr; name: string; alias?: string; declType?: string }[] {
-    const out: { expr: Expr; name: string; alias?: string; declType?: string }[] = [];
-    for (const rc of cols) {
-      if (rc.kind === 'star' || rc.kind === 'tableStar') {
-        if (scope.sources.length === 0) throw new SmaltError('SMALT_ERROR', 'no tables specified');
-        let found = false;
-        for (const src of scope.sources) {
-          if (rc.kind === 'tableStar' && !sameName(src.name, rc.table)) continue;
-          found = true;
-          for (const c of src.cols) {
-            if (rc.kind === 'star' && src.hidden.has(c.name.toLowerCase())) continue;
-            out.push({
-              expr: { kind: 'column', table: src.name, name: c.name, pos: rc.pos, end: rc.end },
-              name: c.name,
-              declType: c.declType || undefined,
-            });
-          }
-        }
-        if (!found) throw new SmaltError('SMALT_ERROR', `no such table: ${(rc as { table: string }).table}`);
-      } else {
-        const e = rc.expr;
-        let name = rc.alias;
-        let declType: string | undefined;
-        if (e.kind === 'column') {
-          name ??= e.name;
-          const b = this.peekColumn(e, scope);
-          declType = b?.declType || undefined;
-        }
-        name ??= this.sqlText.slice(e.pos, e.end);
-        out.push({ expr: e, name, alias: rc.alias, declType });
-      }
-    }
-    return out;
-  }
-
   /** Source SQL text, used to name result columns. Set by the caller before planning. */
   sqlText = '';
-
-  private peekColumn(e: ColumnExpr, scope: Scope): SourceColumn | undefined {
-    for (const s of scope.sources) {
-      if (e.table && !sameName(e.table, s.name)) continue;
-      const c = s.cols.find((c) => sameName(c.name, e.name));
-      if (c) return c;
-    }
-    return undefined;
-  }
 
   // ================================================================ FROM / WHERE
 
@@ -1927,7 +1342,7 @@ export class Planner {
    * Plan FROM + WHERE into an operator tree; registers sources in `scope`. `bound` (the physical planner) gives the
    * FROM items and their join conditions and the WHERE conjuncts already bound, in place of `from` and `where`.
    */
-  planFrom(from: FromItem | undefined, where: Expr | undefined, scope: Scope, bound?: BoundFrom): Operator {
+  private planFrom(from: FromItem | undefined, where: Expr | undefined, scope: Scope, bound?: BoundFrom): Operator {
     this.lastScan = null;
     if (!from && !bound) {
       let root: Operator = new SingleRow();
@@ -2213,71 +1628,7 @@ export class Planner {
       scope.sources.push({ name: alias, cols, rowidReg: -1, sub, lateral, joinType, on: [], hidden: new Set(), position });
       return;
     }
-    const view =
-      item.kind === 'table' && (!item.schema || ['main', 'temp'].includes(item.schema.toLowerCase())) && !(!item.schema && scope.findCte(item.name)) && !this.env.getTable(item.name, item.schema)
-        ? this.env.getView?.(item.name, item.schema)
-        : undefined;
-    if (item.kind === 'subquery' || view || (item.kind === 'table' && !item.schema && scope.findCte(item.name))) {
-      let select: SelectStmt;
-      let names: string[] | undefined;
-      let alias: string | undefined;
-      let sub: QueryPlan;
-      if (item.kind === 'subquery') {
-        select = item.select;
-        alias = item.alias;
-        sub = this.planSelect(select, scope.parent, undefined);
-      } else if (view) {
-        // A view body sees only the schema (not the referencing query's CTEs or columns).
-        const key = view.name.toLowerCase();
-        if (this.expandingViews.has(key)) throw new SmaltError('SMALT_ERROR', `view ${view.name} is circularly defined`);
-        this.expandingViews.add(key);
-        // Result-column names come from the view's own SQL text.
-        const outerText = this.sqlText;
-        this.sqlText = view.sql;
-        try {
-          sub = this.planSelect(view.select, null, undefined);
-        } finally {
-          this.sqlText = outerText;
-          this.expandingViews.delete(key);
-        }
-        names = view.columns;
-        alias = (item as { alias?: string }).alias ?? (item as { name: string }).name;
-        if (names && names.length !== sub.columns.length) {
-          throw new SmaltError('SMALT_ERROR', `expected ${names.length} columns for '${view.name}' but got ${sub.columns.length}`);
-        }
-      } else {
-        const cteName = (item as { name: string }).name;
-        const cte = scope.findCte(cteName)!;
-        select = cte.select;
-        names = cte.columns;
-        alias = (item as { alias?: string }).alias ?? cteName;
-        if (cte.working) {
-          // The recursive step's working table: one row, re-read on every step (never cached).
-          const w = cte.working;
-          const cols: SourceColumn[] = w.columns.map((c, i) => ({ name: c.name, reg: w.regs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '', index: i }));
-          const ws: QueryPlan = { root: w.scan, outRegs: w.regs, columns: w.columns, correlated: true };
-          scope.sources.push({ name: alias, cols, rowidReg: -1, sub: ws, joinType, on: [], hidden: new Set(), position });
-          return;
-        }
-        sub = cte.recursive ? this.planRecursiveCte(cteName, cte, scope.parent) : this.planSelect(select, scope.parent, undefined);
-        if (cte.recursive) names = undefined; // already applied to the plan's columns
-      }
-      if (sub.correlated) scope.correlated = true;
-      if (names && names.length !== sub.columns.length) {
-        throw new SmaltError('SMALT_ERROR', `table ${alias} has ${sub.columns.length} values for ${names.length} columns`);
-      }
-      const cols: SourceColumn[] = sub.columns.map((c, i) => ({
-        name: names ? names[i] : c.name,
-        reg: sub.outRegs[i],
-        type: c.type,
-        collation: c.collation,
-        affinity: c.affinity,
-        declType: c.declType ?? '',
-        index: i,
-      }));
-      scope.sources.push({ name: alias ?? `(subquery-${position + 1})`, cols, rowidReg: -1, sub, joinType, on: [], hidden: new Set(), position });
-      return;
-    }
+    if (item.kind === 'subquery') throw new SmaltError('SMALT_INTERNAL', 'FROM subqueries are planned through the plan layer');
     if (item.kind === 'join') throw new SmaltError('SMALT_ERROR', 'unexpected join');
     if (item.schema && !['main', 'temp'].includes(item.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${item.schema}`);
     const table = this.env.getTable(item.name, item.schema);
@@ -2798,19 +2149,6 @@ export class Planner {
   /** >0 while compiling expressions only to inspect them (column use is not recorded). */
   private dryCompile = 0;
 
-  /** Run `fn` without recording column use (the scan will not decode the columns it resolves). */
-  untracked<T>(fn: () => T): T {
-    this.dryCompile++;
-    try {
-      return fn();
-    } finally {
-      this.dryCompile--;
-    }
-  }
-
-  /** Views being expanded (detects circular definitions). */
-  private readonly expandingViews = new Set<string>();
-
   /** Planner row estimates per operator (per loop for inner sides), shown by EXPLAIN ANALYZE. */
   readonly estimates = new WeakMap<Operator, number>();
 
@@ -3280,9 +2618,10 @@ export class Planner {
   compileScope(scope: Scope): CompileScope {
     return {
       resolveColumn: (e, defer) => this.resolveColumn(e, scope, defer),
-      scalarSubquery: (select) => this.scalarSubquery(select, scope),
-      existsSubquery: (select) => this.existsSubquery(select, scope),
-      inSubquery: (select, probe) => this.inSubquery(select, probe, scope),
+      // Subqueries are bound by the SQL front end (ADR 0014); what the planner compiles itself has none.
+      scalarSubquery: noSubquery,
+      existsSubquery: noSubquery,
+      inSubquery: noSubquery,
       funcCtx: this.env.funcCtx,
     };
   }
@@ -3290,13 +2629,6 @@ export class Planner {
   /** Create a fresh top-level scope (for DML and utility statements). */
   newScope(parent: Scope | null = null): Scope {
     return new Scope(parent);
-  }
-
-  /** A scope holding the CTEs of a `WITH` clause attached to INSERT / UPDATE / DELETE. */
-  cteScope(w: WithClause): Scope {
-    const s = new Scope(null);
-    this.registerCtes(w, s);
-    return s;
   }
 
   private resolveColumn(e: ColumnExpr, scope: Scope, defer = false): ColumnBinding {
@@ -3384,14 +2716,6 @@ export class Planner {
 
   // ---------------------------------------------------------------- subqueries
 
-  private scalarSubquery(select: SelectStmt, scope: Scope): Compiled {
-    const dec = decorrelationDisabled() ? null : this.decorrelate(select, scope, 'scalar');
-    if (dec) return dec;
-    const plan = this.planSelect(select, scope);
-    if (plan.outRegs.length !== 1) throw new SmaltError('SMALT_ERROR', `sub-select returns ${plan.outRegs.length} columns - expected 1`);
-    return this.scalarFromPlan(plan);
-  }
-
   /** A scalar subquery's value from its plan: the first column of its first row (cached unless correlated). */
   private scalarFromPlan(plan: QueryPlan): Compiled {
     this.recordSubplan(plan.correlated ? 'CORRELATED SCALAR SUBQUERY' : 'SCALAR SUBQUERY', plan.root);
@@ -3418,61 +2742,6 @@ export class Planner {
     };
     const col = plan.columns[0];
     return { fn, type: col.type, collation: col.collation, collSrc: col.collation ? CollSrc.Column : CollSrc.None, affinity: 'NONE', constant: false };
-  }
-
-  /**
-   * Decorrelate `EXISTS (SELECT … WHERE inner = outer AND …)` (a hash semi-join) and scalar
-   * aggregates `(SELECT agg(…) FROM … WHERE inner = outer AND …)` (one GROUP BY over the inner side,
-   * looked up per outer row). Applies only when every correlated conjunct is such an equality between
-   * an expression over the subquery's own base tables and one over the enclosing query (conjuncts over
-   * the enclosing query alone are evaluated per row as guards), and hashing with the comparison's
-   * collation and affinity is exactly equivalent to `=`. Otherwise returns null (re-run per row).
-   */
-  private decorrelate(select: SelectStmt, scope: Scope, kind: 'exists' | 'scalar'): Compiled | null {
-    const d = decorrelationSql(select, kind, (n) => scope.findCte(n) !== undefined, (n, schema) => this.env.getTable(n, schema));
-    if (!d) return null;
-    const { innerStmt, pairs, guards } = d;
-    let plan: QueryPlan;
-    try {
-      plan = this.planSelect(innerStmt, null);
-    } catch {
-      return null;
-    }
-    if (plan.correlated) return null;
-    // The outer expressions read the enclosing query's columns; in an aggregate query the aggregate
-    // must carry them to its output rows (as for a subquery that is not decorrelated).
-    const cs = this.compileScope(scope);
-    const outerScope: CompileScope = scope.onOuterRef
-      ? {
-          ...cs,
-          resolveColumn: (e, defer) => {
-            const b = cs.resolveColumn(e, defer);
-            if (b.reg >= 0) scope.onOuterRef!(b.reg);
-            return b;
-          },
-        }
-      : cs;
-    const keyFns: { outer: Fn; convOuter: ((v: SqlValue) => SqlValue) | null; convInner: ((v: SqlValue) => SqlValue) | null; coll: Collation }[] = [];
-    for (let i = 0; i < pairs.length; i++) {
-      const col = plan.columns[i];
-      // A column reference supplies its collation to the comparison even when it is BINARY.
-      const innerIsColumn = pairs[i].inner.kind === 'column';
-      const innerC: Compiled = { fn: () => null, type: col.type, collation: col.collation, collSrc: innerIsColumn || col.collation ? CollSrc.Column : CollSrc.None, affinity: col.affinity, constant: false };
-      const outerC = compileExpr(pairs[i].outer, outerScope);
-      const [l, r] = pairs[i].innerLeft ? [innerC, outerC] : [outerC, innerC];
-      const coll = comparisonCollation(l, r);
-      // A GROUP BY key groups with the inner expression's own collation: it must be the comparison's.
-      if (kind === 'scalar' && coll !== col.collation) return null;
-      if (pairs[i].inner.kind === 'collate') return null;
-      const [cl, cr] = comparisonConverters(l, r);
-      keyFns.push({ outer: outerC.fn, coll, convInner: pairs[i].innerLeft ? cl : cr, convOuter: pairs[i].innerLeft ? cr : cl });
-    }
-    this.recordSubplan(kind === 'exists' ? 'EXISTS (decorrelated: hash semi-join)' : 'SCALAR SUBQUERY (decorrelated: grouped lookup)', plan.root);
-    const guardFns = guards.map((g) => compileExpr(g, outerScope).fn);
-    // Value over an empty inner set (count(*) -> 0, sum -> NULL, ...): the result expression over no rows.
-    let emptyPlan: QueryPlan | null = null;
-    if (d.emptyStmt) emptyPlan = this.planSelect(d.emptyStmt, null);
-    return this.decorrelatedFn(kind, plan, keyFns, guardFns, emptyPlan);
   }
 
   /**
@@ -3540,17 +2809,6 @@ export class Planner {
       : { fn, type: resultCol.type, collation: resultCol.collation, collSrc: resultCol.collation ? CollSrc.Column : CollSrc.None, affinity: 'NONE', constant: false };
   }
 
-  /** True if any parent scope of `scope` exists (correlation can propagate through it). */
-  private isCorrelatedBeyond(scope: Scope): boolean {
-    return scope.correlated;
-  }
-
-  private existsSubquery(select: SelectStmt, scope: Scope): Fn {
-    const dec = decorrelationDisabled() ? null : this.decorrelate(select, scope, 'exists');
-    if (dec) return dec.fn;
-    return this.existsFromPlan(this.planSelect(select, scope));
-  }
-
   /** EXISTS from its plan: whether it has a row (cached unless correlated). */
   private existsFromPlan(plan: QueryPlan): Fn {
     this.recordSubplan(plan.correlated ? 'CORRELATED EXISTS' : 'EXISTS', plan.root);
@@ -3574,10 +2832,6 @@ export class Planner {
       }
       return v;
     };
-  }
-
-  private inSubquery(select: SelectStmt, probe: Compiled, scope: Scope): Fn {
-    return this.inFromPlan(this.planSelect(select, scope), probe);
   }
 
   /** `probe IN (subquery)` from the subquery's plan: 1, 0 or NULL (its rows are read once unless correlated). */
@@ -3620,12 +2874,6 @@ export class Planner {
       return hasNull ? null : 0;
     };
   }
-}
-
-function maxDep(d: Set<number>): number {
-  let m = -1;
-  for (const x of d) if (x > m) m = x;
-  return m;
 }
 
 function flipOp(op: string): string {
@@ -4176,6 +3424,11 @@ export function decorrelationSql(
       ? { kind: 'select', core: { ...core, columns: [{ kind: 'expr', expr: resultExpr!, pos: 0, end: 0 }], where: { kind: 'literal', value: 0, pos: 0, end: 0 } }, compound: [], orderBy: [], pos: 0, end: 0 }
       : null;
   return { innerStmt, emptyStmt, pairs, guards };
+}
+
+/** Subqueries in an expression the planner compiles from the AST (none since ADR 0014's front end binds them). */
+function noSubquery(): never {
+  throw new SmaltError('SMALT_INTERNAL', 'subqueries are bound by the SQL front end');
 }
 
 export type { Scope };

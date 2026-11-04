@@ -75,27 +75,13 @@ and the plan layer ([ADR 0014](adr/0014-shared-plan-layer.md)) moves code genera
 to it must show in review: update the files with `npx vitest run test/codegen-source.test.ts -u`. It skips under
 `SMALT_NO_CODEGEN`.
 
-## The SQL front end and the physical planner (`SMALT_PLAN`)
+## The SQL front end and the physical planner
 
-While the plan layer ([ADR 0014](adr/0014-shared-plan-layer.md)) is built, `SMALT_PLAN` selects how SELECTs are
-planned (`src/engine/exec/plan-shadow.ts`):
-
-- unset or `plan` (the default): the SQL front end (`src/engine/sql/frontend/`, step 5) makes a plan, and the physical planner
-  (`Planner.planPlan`, step 6) builds its operators.
-- `legacy`: the planner's AST path for every SELECT, until it is deleted after step 8.
-- `shadow` (tests): both. The front end must agree with the planner on every result column's name, type, collation,
-  declared type and affinity, and on planning errors; the physical planner's operators must give the planner's
-  `EXPLAIN` rows and record the same subplans (subqueries), and then they run. A disagreement fails the statement
-  with `SMALT_INTERNAL`. Statements answered from materialized views are compared too, and so are writes that go
-  through the plan layer (INSERT, UPDATE, DELETE): their target scan's `EXPLAIN` rows, subplans, RETURNING columns and errors.
-
-CI runs the whole suite in the default mode and with `SMALT_PLAN=shadow`, and `test/plan-shapes.test.ts` and
-`test/codegen-source.test.ts` also with `SMALT_PLAN=legacy`: both paths give the same plan shapes and generated code
-(shadow mode generates code for both planners, so the generated-code snapshot skips there). Run `npm run slt` or the
-differential tests the same way.
-`SMALT_PLAN_STATS=<file>` appends each skipped statement to `<file>` as a JSON line with the reason, and each
-statement the physical planner does not handle yet (reason `physical planner: not handled yet`).
-`test/plan-physical.test.ts` checks the physical planner's shapes in each mode.
+Every statement goes through the plan layer ([ADR 0014](adr/0014-shared-plan-layer.md)): the SQL front end
+(`src/engine/sql/frontend/`) makes a plan and the physical planner (`Planner.planPlan`, `planUpdate`, `planDelete`)
+builds its operators. There is no other path: a statement the physical planner declines fails with `SMALT_INTERNAL`.
+`test/plan-shapes.test.ts` pins the plan shapes (`EXPLAIN`), `test/codegen-source.test.ts` the generated code, and
+`test/plan-physical.test.ts` compares the shapes the physical planner builds, reads and writes, with SQLite.
 
 ## Plugins
 

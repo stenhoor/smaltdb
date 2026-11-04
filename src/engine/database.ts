@@ -19,14 +19,12 @@ import { MisuseError, SmaltError } from './errors.js';
 import { type StaticType, truthy } from './exec/convert.js';
 import { type CompileScope, type Compiled, type Fn, compileExpr } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFunctions } from './exec/functions.js';
-import { type ExecState, type Operator, SingleRow, explainAnalyze, explainRows } from './exec/operators.js';
-import { type ExternalScan, Planner, type PlannerEnv, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
+import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
+import { type ExternalScan, Planner, type PlannerEnv, type QueryPlan, Registers } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
-import { planMode, shadowCheck, shadowWrite } from './exec/plan-shadow.js';
-import { aggregateCallName } from './sql/ast-util.js';
-import { type FrontEndCatalog, type FrontEndResult, toDeletePlan, toInsertPlan, toPlan, toUpdatePlan, upsertTarget } from './sql/frontend/select.js';
+import { type FrontEndCatalog, toDeletePlan, toInsertPlan, toPlan, toUpdatePlan } from './sql/frontend/select.js';
 import { type MatviewCandidate, matchMatview } from './exec/mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import type { ReaderSettings } from '../shared/protocol.js';
@@ -34,9 +32,7 @@ import type {
   AlterTableStmt,
   RefreshStmt,
   ColumnDef,
-  ColumnExpr,
   CreateIndexStmt,
-  FromItem,
   CreateTableStmt,
   CreateViewStmt,
   CreateConnectionStmt,
@@ -47,11 +43,9 @@ import type {
   InsertStmt,
   ParsedStatement,
   PragmaStmt,
-  ResultColumn,
   SelectStmt,
   Stmt,
   UpdateStmt,
-  WithClause,
 } from './sql/ast.js';
 import { parse, parseOne } from './sql/parser.js';
 import {
@@ -849,7 +843,7 @@ export class Database implements FunctionContext {
           const deps: PlannerEnv = { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state };
           const planner = new Planner(deps, new Registers(0));
           planner.sqlText = v.sql;
-          const plan = this.planSelectStmt(v.select, v.sql, planner, this.catalogFor(deps), true);
+          const plan = this.planSelectStmt(v.select, v.sql, planner, this.catalogFor(deps));
           return plan.columns.map((c, i) => ({ name: v.columns?.[i] ?? c.name, declType: c.declType ?? '' }));
         } catch {
           return null;
@@ -1051,46 +1045,14 @@ export class Database implements FunctionContext {
   private feCatalog: FrontEndCatalog | null = null;
 
   /**
-   * A top-level SELECT, planned as `SMALT_PLAN` says (exec/plan-shadow.ts), against `catalog` (the planner's tables).
-   * `internal`: a query the engine plans for itself (materialized views, view checks), which shadow mode plans
-   * through the plan layer without comparing (the AST path's answers to them were never compared).
+   * A top-level SELECT through the plan layer (ADR 0014), against `catalog` (the planner's tables). The front end
+   * applies materialized-view matching as the planner does (step 7c).
    */
-  private planSelectStmt(stmt: SelectStmt, text: string, planner: Planner, catalog: FrontEndCatalog = this.frontEndCatalog(), internal = false): QueryPlan {
-    const mode = planMode();
-    switch (internal && mode === 'shadow' ? 'plan' : mode) {
-      case 'legacy':
-        return planner.planSelect(stmt, null);
-      case 'shadow': {
-        // The physical plan replaces the planner's, as if planned alone (registers, external sources, subplans),
-        // and must record the same subplans (subqueries) as the planner.
-        const start = planner.mark();
-        const first = planner.subplans.length;
-        const subplans = (): string =>
-          planner.subplans
-            .slice(first)
-            .map((x) => `${x.label}\n${explainRows(x.root).map((r) => `  ${r.id} ${r.parent} ${r.detail}`).join('\n')}`)
-            .join('\n');
-        const physical = (fe: FrontEndResult): QueryPlan | null => {
-          const want = subplans();
-          const end = planner.mark();
-          start();
-          const p = planner.planPlan(fe.plan, fe.columns);
-          if (!p) {
-            end();
-            return null;
-          }
-          const got = subplans();
-          if (got !== want) throw new SmaltError('SMALT_INTERNAL', `SMALT_PLAN=shadow: the physical planner disagrees with the planner on subqueries\n  in: ${text}\nphysical:\n${got}\nplanner:\n${want}`);
-          return p;
-        };
-        return shadowCheck(stmt, text, catalog, () => planner.planSelect(stmt, null), planner.env.rewriteSelect, physical);
-      }
-      case 'plan': {
-        // The front end applies materialized-view matching as the planner does (step 7c).
-        const fe = toPlan(stmt, text, catalog, undefined, planner.env.rewriteSelect);
-        return (fe && planner.planPlan(fe.plan, fe.columns)) ?? planner.planSelect(stmt, null);
-      }
-    }
+  private planSelectStmt(stmt: SelectStmt, text: string, planner: Planner, catalog: FrontEndCatalog = this.frontEndCatalog()): QueryPlan {
+    const fe = toPlan(stmt, text, catalog, planner.env.rewriteSelect);
+    const p = planner.planPlan(fe.plan, fe.columns);
+    if (!p) throw new SmaltError('SMALT_INTERNAL', `the physical planner declined a query\n  in: ${text}`);
+    return p;
   }
 
   /** @internal Compile a statement AST into a program for the current schema. */
@@ -1184,7 +1146,7 @@ export class Database implements FunctionContext {
     return {
       rewriteSelect: rewrite ? (select, text) => this.matviewRewrite(select, text, rewrite.exclude) : undefined,
       matviewCandidates: () => this.hasRewriteCandidates(),
-      planSql: rewrite ? (select, text) => toPlan(select, text, this.frontEndCatalog(), undefined, (s, t) => this.matviewRewrite(s, t, rewrite.exclude)) : undefined,
+      planSql: rewrite ? (select, text) => toPlan(select, text, this.frontEndCatalog(), (s, t) => this.matviewRewrite(s, t, rewrite.exclude)) : undefined,
       externalTable: (n) => this.externalTableScan(n),
       externalFunction: (n, args, named) => this.externalFunctionScan(n, args, named),
       isExternalFunction: (n) => this.external.plugins.isExternalFunction(n),
@@ -1657,7 +1619,7 @@ export class Database implements FunctionContext {
   private matviewLayout(name: string, select: SelectStmt, sql: string, names?: string[]): string {
     const planner = new Planner(this.plannerDeps(), new Registers(0));
     planner.sqlText = sql;
-    const plan = this.planSelectStmt(select, sql, planner, undefined, true);
+    const plan = this.planSelectStmt(select, sql, planner);
     if (names && names.length !== plan.columns.length) {
       throw new SmaltError('SMALT_ERROR', `materialized view ${name} has ${names.length} column names but its query returns ${plan.columns.length} columns`);
     }
@@ -1681,7 +1643,7 @@ export class Database implements FunctionContext {
     const regs = new Registers(0);
     const planner = new Planner(this.plannerDeps(), regs);
     planner.sqlText = sql;
-    const plan = this.planSelectStmt(select, sql, planner, undefined, true);
+    const plan = this.planSelectStmt(select, sql, planner);
     const externals = planner.finishExternals();
     const r: SqlValue[] = new Array(regs.count).fill(null);
     const root = plan.root;
@@ -3098,7 +3060,7 @@ export class Database implements FunctionContext {
         const deps: PlannerEnv = { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state };
         const planner = new Planner(deps, new Registers(0));
         planner.sqlText = v.sql;
-        this.planSelectStmt(v.select, v.sql, planner, this.catalogFor(deps), true);
+        this.planSelectStmt(v.select, v.sql, planner, this.catalogFor(deps));
       } catch (e) {
         // A view that was already broken (e.g. dangling) stays as it was, like SQLite.
         if (!this.viewWasValid.has(v.name.toLowerCase())) continue;
@@ -3116,7 +3078,7 @@ export class Database implements FunctionContext {
         const deps: PlannerEnv = { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state };
         const planner = new Planner(deps, new Registers(0));
         planner.sqlText = v.sql;
-        this.planSelectStmt(v.select, v.sql, planner, this.catalogFor(deps), true);
+        this.planSelectStmt(v.select, v.sql, planner, this.catalogFor(deps));
         this.viewWasValid.add(v.name.toLowerCase());
       } catch {
         /* already broken */
@@ -3326,35 +3288,6 @@ export class Database implements FunctionContext {
     };
   }
 
-  /** RETURNING list: result names/types and one function per output column. */
-  private compileReturning(list: ResultColumn[], table: TableSchema, alias: string | undefined, scope: CompileScope, sqlText: string): { columns: string[]; types: StaticType[]; fns: Fn[] } {
-    const columns: string[] = [];
-    const types: StaticType[] = [];
-    const fns: Fn[] = [];
-    const q = alias ?? table.name;
-    for (const rc of list) {
-      if (rc.kind === 'star' || rc.kind === 'tableStar') {
-        if (rc.kind === 'tableStar' && rc.table.toLowerCase() !== q.toLowerCase() && rc.table.toLowerCase() !== table.name.toLowerCase()) {
-          throw new SmaltError('SMALT_ERROR', `no such table: ${rc.table}`);
-        }
-        for (const c of table.columns) {
-          const b = scope.resolveColumn({ kind: 'column', table: q, name: c.name, pos: 0, end: 0 });
-          columns.push(c.name);
-          types.push(b.type);
-          fns.push((r) => r[b.reg]);
-        }
-        continue;
-      }
-      const agg = aggregateCallName(rc.expr);
-      if (agg) throw new SmaltError('SMALT_ERROR', `misuse of aggregate function ${agg}()`);
-      const c = compileExpr(rc.expr, scope);
-      columns.push(rc.alias ?? (rc.expr.kind === 'column' ? rc.expr.name : sqlText.slice(rc.expr.pos, rc.expr.end)));
-      types.push(c.type);
-      fns.push(c.fn);
-    }
-    return { columns, types, fns };
-  }
-
   private validateRow(
     table: TableSchema,
     row: SqlValue[],
@@ -3559,7 +3492,7 @@ export class Database implements FunctionContext {
   }
 
   /**
-   * INSERT's parts besides the column mapping, planned as `SMALT_PLAN` says (step 8c): what belongs to the table
+   * INSERT's parts besides the column mapping, planned through the plan layer (step 8c): what belongs to the table
    * (defaults, CHECK) over the new row's registers, RETURNING, the ON CONFLICT clauses, and the rows (VALUES, or the
    * SELECT through the SELECT pipeline).
    */
@@ -3575,31 +3508,9 @@ export class Database implements FunctionContext {
       const checks = this.compileChecks(table, rowScope, planner.sqlText);
       return { emptyScope, defaults, defaultReal, base, rowidReg, rowScope, checks };
     };
-    const tooMany = (n: number): SmaltError => new SmaltError('SMALT_ERROR', `table ${table.name} has ${ncols} columns but ${n} values were supplied`);
-    const legacy = (): InsertParts => {
-      const { emptyScope, rowScope, ...p } = prefix();
-      const ret = stmt.returning ? this.compileReturning(stmt.returning, table, stmt.alias, rowScope, planner.sqlText) : undefined;
-      const upserts = this.compileUpserts(stmt, table, p.base, p.rowidReg, planner);
-      let rows: InsertParts['rows'] = { kind: 'default' };
-      if (stmt.source.kind === 'values') {
-        rows = {
-          kind: 'values',
-          rows: stmt.source.rows.map((row) => {
-            if (row.length !== targets.length) throw tooMany(row.length);
-            return row.map((e) => compileExpr(e, emptyScope));
-          }),
-        };
-      } else if (stmt.source.kind === 'select') {
-        const plan = planner.planSelect(stmt.source.select, null);
-        if (plan.outRegs.length !== targets.length) throw tooMany(plan.outRegs.length);
-        rows = { kind: 'select', plan };
-      }
-      return { ...p, ret, upserts, rows };
-    };
     const physical = (): InsertParts | null => {
       const p = prefix();
       const fe = toInsertPlan(stmt, table, targets.map((t) => (t === -2 ? -1 : t)), planner.sqlText, this.frontEndCatalog(), planner.env.rewriteSelect);
-      if (!fe) return null;
       const op = fe.plan;
       if (op.op !== 'append') return null;
       const ret = fe.returning && op.returning ? { columns: fe.returning.map((c) => c.name), types: fe.returning.map((c) => c.type), fns: planner.compileRowExprs(op.returning, ncols, p.base, p.rowidReg) } : undefined;
@@ -3622,46 +3533,7 @@ export class Database implements FunctionContext {
       }
       return { defaults: p.defaults, defaultReal: p.defaultReal, base: p.base, rowidReg: p.rowidReg, checks: p.checks, ret, upserts, rows };
     };
-    return this.planWrite(planner, legacy, physical, (p) => [
-      `upserts ${p.upserts.map((u) => `${u.target} ${u.update ? u.update.sets.map((x) => `${x.col} ${x.c.type}`).join(' ') : 'nothing'}`).join(', ')}`,
-      ...(p.rows.kind === 'values' ? [`values ${p.rows.rows.map((r) => r.map((c) => c.type).join(' ')).join(', ')}`] : []),
-      ...this.describeWrite(planner, p.rows.kind === 'select' ? p.rows.plan.root : new SingleRow(), p.ret),
-    ]);
-  }
-
-  /** Compiled ON CONFLICT clauses: which constraint each targets and what it does. */
-  private compileUpserts(stmt: InsertStmt, table: TableSchema, base: number, rowidReg: number, planner: Planner): Upsert[] {
-    if (!stmt.upsert.length) return [];
-    const out: Upsert[] = [];
-    stmt.upsert.forEach((u, n) => {
-      const target = upsertTarget(u, n, stmt.upsert.length, table);
-      if (u.action.kind === 'nothing') {
-        out.push({ target, update: null });
-        return;
-      }
-      if (!u.target) throw new SmaltError('SMALT_ERROR', 'ON CONFLICT DO UPDATE requires a conflict target');
-      // DO UPDATE sees the existing row (table name/alias, unqualified) and `excluded.*` (the proposed row).
-      const ncols = table.columns.length;
-      const oldBase = planner.regs.alloc(ncols);
-      const oldRowid = planner.regs.alloc();
-      const scope = this.rowsScope(
-        [
-          { table, names: [stmt.alias ?? table.name, table.name], base: oldBase, rowidReg: oldRowid },
-          { table, names: ['excluded'], base, rowidReg },
-        ],
-        planner,
-      );
-      const sets: { col: number; c: Compiled }[] = [];
-      for (const sc of u.action.set) {
-        if (sc.columns.length !== 1) throw new SmaltError('SMALT_UNSUPPORTED', 'row-value assignments are not supported yet');
-        const col = findColumn(table, sc.columns[0]);
-        if (col < 0) throw new SmaltError('SMALT_ERROR', `no such column: ${sc.columns[0]}`);
-        sets.push({ col, c: compileExpr(sc.value, scope) });
-      }
-      const where = u.action.where ? compileExpr(u.action.where, scope).fn : null;
-      out.push({ target, update: { sets, where, oldBase, oldRowid } });
-    });
-    return out;
+    return this.planWrite(planner, physical);
   }
 
   /**
@@ -3717,30 +3589,6 @@ export class Database implements FunctionContext {
       return { row: next, rowid: newRowid };
     }
     return undefined;
-  }
-
-  /** Plan a scan of `table` filtered by `where`, decoding every column and the rowid. */
-  private planTarget(
-    table: TableSchema,
-    alias: string | undefined,
-    where: Expr | undefined,
-    planner: Planner,
-    from?: FromItem,
-    w?: WithClause,
-  ): { root: Operator; colRegs: number[]; rowidReg: number; scope: CompileScope } {
-    const scope = planner.newScope(w ? planner.cteScope(w) : null);
-    // The resolved target's own schema: a TEMP table and a main table may share the name.
-    const target: FromItem = { kind: 'table', schema: table.temp ? 'temp' : 'main', name: table.name, alias, pos: 0, end: 0 };
-    // UPDATE ... FROM: the target joined with the FROM sources (the WHERE holds the join conditions).
-    const item: FromItem = from ? { kind: 'join', joinType: 'INNER', natural: false, left: target, right: from, pos: 0, end: 0 } : target;
-    const root = planner.planFrom(item, where, scope);
-    const cs = planner.compileScope(scope);
-    const q = alias ?? table.name;
-    // Rows are re-read by rowid before they change, so the scan only decodes what WHERE (and, with
-    // FROM, the SET expressions evaluated during the join) reference.
-    const colRegs = planner.untracked(() => table.columns.map((c) => cs.resolveColumn({ kind: 'column', table: q, name: c.name, pos: 0, end: 0 }).reg));
-    const rowidReg = cs.resolveColumn({ kind: 'column', table: q, name: 'rowid', pos: 0, end: 0 }).reg;
-    return { root, colRegs, rowidReg, scope: cs };
   }
 
   private compileUpdate(stmt: UpdateStmt, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
@@ -3858,8 +3706,8 @@ export class Database implements FunctionContext {
 
   /**
    * UPDATE's target rows (the target joined with the FROM sources, with its WHERE, reading the rowid), its SET values,
-   * then what belongs to the table (defaults and CHECK over the new row's registers) and RETURNING, planned as
-   * `SMALT_PLAN` says: through the plan layer (step 8b), or the planner's AST path.
+   * then what belongs to the table (defaults and CHECK over the new row's registers) and RETURNING, planned
+   * through the plan layer (step 8b).
    */
   private updateParts(stmt: UpdateStmt, table: TableSchema, planner: Planner): UpdateParts {
     type Target = Pick<UpdateParts, 'root' | 'colRegs' | 'rowidReg' | 'sets'>;
@@ -3873,28 +3721,8 @@ export class Database implements FunctionContext {
       const checks = this.compileChecks(table, newRowScope, planner.sqlText);
       return { ...t, defaults, base, checkRowid, checks, ret: returning(base, checkRowid, newRowScope) };
     };
-    const legacy = (): UpdateParts => {
-      const { root, colRegs, rowidReg, scope } = this.planTarget(table, stmt.alias, stmt.where, planner, stmt.from, stmt.with);
-      // Target rowids are collected and sorted before any change: scan order is not observable.
-      if (!stmt.from) markUnordered(root);
-      const sets: { col: number; c: Compiled }[] = [];
-      for (const s of stmt.set) {
-        if (s.columns.length !== 1) throw new SmaltError('SMALT_UNSUPPORTED', 'row-value assignments are not supported yet');
-        const name = s.columns[0];
-        let col = findColumn(table, name);
-        if (col < 0) {
-          if (['rowid', 'oid', '_rowid_'].includes(name.toLowerCase())) col = -2;
-          else throw new SmaltError('SMALT_ERROR', `no such column: ${name}`);
-        }
-        sets.push({ col, c: compileExpr(s.value, scope) });
-      }
-      return finish({ root, colRegs, rowidReg, sets }, (_b, _r, newRowScope) =>
-        stmt.returning ? this.compileReturning(stmt.returning, table, stmt.alias, newRowScope, planner.sqlText) : undefined,
-      );
-    };
     const physical = (): UpdateParts | null => {
       const fe = toUpdatePlan(stmt, table, planner.sqlText, this.frontEndCatalog());
-      if (!fe) return null;
       const op = fe.plan;
       const p = op.op === 'update' ? planner.planUpdate(op) : null;
       if (!p || op.op !== 'update') return null;
@@ -3906,63 +3734,29 @@ export class Database implements FunctionContext {
           : undefined,
       );
     };
-    return this.planWrite(planner, legacy, physical, (p) => [`set ${p.sets.map((x) => `${x.col} ${x.c.type}`).join(', ')}`, ...this.describeWrite(planner, p.root, p.ret)]);
+    return this.planWrite(planner, physical);
   }
 
-  /** A write's parts from the plan layer or the AST path, as `SMALT_PLAN` says (shadow: both, compared). */
-  private planWrite<T>(planner: Planner, legacy: () => T, physical: () => T | null, describe: (t: T) => string[]): T {
-    switch (planMode()) {
-      case 'legacy':
-        return legacy();
-      case 'plan': {
-        // A write the physical planner gives up on part-way: the AST path plans it as if alone.
-        const restore = planner.mark();
-        const p = physical();
-        if (p) return p;
-        restore();
-        return legacy();
-      }
-      case 'shadow': {
-        const start = planner.mark();
-        this.writeSubplans = planner.subplans.length;
-        return shadowWrite(planner.sqlText, legacy, physical, start, (t) => describe(t).join('\n'));
-      }
-    }
-  }
-
-  /** Where the subplans of the write being compared in shadow mode start. */
-  private writeSubplans = 0;
-
-  /** A write's target scan (EXPLAIN rows), its subplans and its RETURNING columns, for shadow mode. */
-  private describeWrite(planner: Planner, root: Operator, ret: { columns: string[]; types: StaticType[] } | undefined): string[] {
-    return [
-      ...explainRows(root).map((x) => `${x.id} ${x.parent} ${x.detail}`),
-      ...planner.subplans.slice(this.writeSubplans).flatMap((x) => [x.label, ...explainRows(x.root).map((r) => `  ${r.id} ${r.parent} ${r.detail}`)]),
-      `returning ${ret ? ret.columns.map((c, i) => `${c} ${ret.types[i]}`).join(', ') : '-'}`,
-    ];
+  /** A write's parts from the plan layer (ADR 0014), which plans every write. */
+  private planWrite<T>(planner: Planner, physical: () => T | null): T {
+    const p = physical();
+    if (!p) throw new SmaltError('SMALT_INTERNAL', `the physical planner declined a write\n  in: ${planner.sqlText}`);
+    return p;
   }
 
   /**
    * DELETE's target rows (the scan with its WHERE, reading the rowid) and its RETURNING over registers for the
-   * deleted row, planned as `SMALT_PLAN` says: through the plan layer (step 8a), or the planner's AST path.
+   * deleted row, planned through the plan layer (step 8a).
    */
   private deleteParts(stmt: DeleteStmt, table: TableSchema, planner: Planner): DeleteParts {
-    const legacy = (): DeleteParts => {
-      const { root, rowidReg } = this.planTarget(table, stmt.alias, stmt.where, planner, undefined, stmt.with);
-      const oldBase = planner.regs.alloc(table.columns.length);
-      const oldRowid = planner.regs.alloc();
-      const ret = stmt.returning ? this.compileReturning(stmt.returning, table, stmt.alias, this.rowScope(table, stmt.alias, oldBase, oldRowid, planner), planner.sqlText) : undefined;
-      return { root, rowidReg, oldBase, oldRowid, ret };
-    };
     const physical = (): DeleteParts | null => {
       const fe = toDeletePlan(stmt, table, planner.sqlText, this.frontEndCatalog());
-      if (!fe) return null;
       const p = fe.plan.op === 'delete' ? planner.planDelete(fe.plan) : null;
       if (!p) return null;
       const ret = fe.returning && { columns: fe.returning.map((c) => c.name), types: fe.returning.map((c) => c.type), fns: p.returning! };
       return { root: p.root, rowidReg: p.rowidReg, oldBase: p.oldBase, oldRowid: p.oldRowid, ret };
     };
-    return this.planWrite(planner, legacy, physical, (p) => this.describeWrite(planner, p.root, p.ret));
+    return this.planWrite(planner, physical);
   }
 
   // ---------------------------------------------------------------- PRAGMA

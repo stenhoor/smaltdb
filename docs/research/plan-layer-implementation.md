@@ -190,14 +190,17 @@ operators.
   (`bench/micro/prepare.ts` now runs both modes in turn in one process: ratios 0.97–1.05). The front end completes its
   plans in place instead of copying them (`resolveRefs`), result columns and shapes have one object layout, and the
   physical planner creates a column's read marking only for columns an expression reads.
-- **Deleting the AST path** (`Planner.planSelect`, `SMALT_PLAN=legacy`, the internal `slot` / `native` nodes; about 2k
-  lines) waited for step 8: writes and materialized-view validation and refresh still ran on it (owner decision on
+- **Deleting the AST path (done)** (`Planner.planSelect`, `SMALT_PLAN=legacy|shadow`, `exec/plan-shadow.ts` and the
+  legacy write compile functions; about 1.2k lines) waited for step 8: writes and materialized-view validation and refresh still ran on it (owner decision on
   #46, replacing item 11 below). Before the deletion, the plan layer covers what still fell back: external table
   functions (`read_csv(…)`: the front end evaluates the constant arguments and asks the catalog for the columns),
   correlated recursive CTEs (a recursive step's scope holds only the working rows' name, so it is not a query level),
   inner-join conditions that read a later source (moved to the WHERE, as SQLite does; an outer join's is SQLite's
   error), and the engine's own queries. With every fallback made an error, the suite, sqllogictest and the plugin
-  suites never reach the AST path.
+  suites never reach the AST path. Then the AST path went: planning a SELECT or a write has no fallback (a statement
+  the physical planner declines is `SMALT_INTERNAL`), the front end has no "unsupported" escape, and
+  `test/plan-physical.test.ts` compares with SQLite instead of the AST path. The internal `slot` / `native` nodes
+  remain until code generation compiles directly from plans (no re-binding).
 - **Hardest parts:** projection-pushdown parity, register order (window snapshots), outer references from subqueries
   over aggregate rows, correlation of derived tables, estimates keyed by the same operators.
 
