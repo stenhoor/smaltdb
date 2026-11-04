@@ -3,6 +3,7 @@
  * the plan rather than in it, as a symbol-keyed property that serializing a plan leaves out.
  */
 import type { PlanExpr } from '../plan/expr.js';
+import type { PlanOp } from '../plan/ops.js';
 import type { Collation } from '../values.js';
 import type { Affinity } from './convert.js';
 
@@ -29,3 +30,15 @@ export const setMeta = (e: PlanExpr, m: SqlMeta): void => {
 
 /** True when code generation should hand `e` to the closure compiler whole. */
 export const isOpaque = (e: PlanExpr): boolean => (e as WithMeta)[SQL_META]?.opaque === true;
+
+const FLATTENED: unique symbol = Symbol('flattened');
+
+/**
+ * Marks a SELECT's plan whose views or FROM subqueries the SQL front end merged into it (exec/flatten.ts).
+ * Decorrelation reads a subquery's SQL before flattening, so it does not apply to such a plan (as in the planner).
+ */
+export const markFlattened = (op: PlanOp): void => {
+  (op as { [FLATTENED]?: true })[FLATTENED] = true;
+};
+
+export const isFlattened = (op: PlanOp): boolean => (op as { [FLATTENED]?: true })[FLATTENED] === true;

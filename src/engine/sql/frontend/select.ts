@@ -14,9 +14,10 @@ import { type Affinity, type StaticType, affinityOfStorage, staticTypeOfStorage 
 import { CollSrc, type ColumnBinding, type CompileScope, bindExpr, boundMetadata, conjuncts, withCompiledMeta } from '../../exec/expr.js';
 import { type FunctionContext, aggregateFunctions, scalarFunctions } from '../../exec/functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../../exec/window.js';
+import { flattenCore, flatteningDisabled } from '../../exec/flatten.js';
 import { containsAggregate, containsWindow, coreReferences, exprEquals, firstAggregateCall, firstWindowCall, sameName, selectReferences } from '../../exec/planner.js';
 import type { PlanExpr } from '../../plan/expr.js';
-import { getMeta, setMeta } from '../../exec/sql-meta.js';
+import { getMeta, markFlattened, setMeta } from '../../exec/sql-meta.js';
 import type { AggCall, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../plan/ops.js';
 import type { CollationName } from '../../plan/types.js';
 import { Collation } from '../../values.js';
@@ -176,13 +177,17 @@ class FrontEnd {
     if (stmt.with) this.registerCtes(stmt.with, withScope);
     const base = stmt.with ? withScope : parent;
     if (stmt.compound.length === 0) {
-      const r = this.core(stmt.core, base, stmt, undefined);
-      return { plan: this.limit(r.plan, stmt, base), columns: r.columns };
+      const f = this.flatten(stmt.core, stmt.orderBy, base);
+      const s = f.changed ? { ...stmt, core: f.core, orderBy: f.orderBy } : stmt;
+      const r = this.core(f.core, base, s, undefined);
+      const plan = this.limit(r.plan, s, base);
+      if (f.changed) markFlattened(plan);
+      return { plan, columns: r.columns };
     }
-    const first = this.core(stmt.core, base, null, undefined);
+    const first = this.core(this.flatten(stmt.core, [], base).core, base, null, undefined);
     let plan = first.plan;
     for (const c of stmt.compound) {
-      const next = this.core(c.core, base, null, first.columns.length);
+      const next = this.core(this.flatten(c.core, [], base).core, base, null, first.columns.length);
       if (next.columns.length !== first.columns.length) {
         throw new SmaltError('SMALT_ERROR', `SELECTs to the left and right of ${c.op} do not have the same number of result columns`);
       }
@@ -198,6 +203,20 @@ class FrontEnd {
       plan = { op: 'sort', input: plan, keys };
     }
     return { plan: this.limit(plan, stmt, base), columns: first.columns };
+  }
+
+  /**
+   * Merge simple views and FROM subqueries into the core, with the planner's AST flattener (exec/flatten.ts) at the
+   * same points as `Planner.planSelect`, so plans and SQL semantics are the planner's (ADR 0014, step 7a).
+   */
+  private flatten(core: SelectCore, orderBy: OrderingTerm[], scope: FeScope | null): { core: SelectCore; orderBy: OrderingTerm[]; changed: boolean } {
+    if (core.kind !== 'select' || !core.from || flatteningDisabled()) return { core, orderBy, changed: false };
+    return flattenCore(core, orderBy, {
+      getTable: (n, schema) => this.catalog.getTable(n, schema),
+      getView: (n, schema) => this.catalog.getView?.(n, schema),
+      isCte: (n) => scope?.findCte(n) !== undefined,
+      text: this.text,
+    });
   }
 
   private registerCtes(w: WithClause, scope: FeScope): void {
