@@ -40,6 +40,8 @@ interface Gen {
   v: string;
   type: StaticType;
   nul?: string;
+  /** Always a JS number (a numeric literal read from K): generated code needs no typeof check for it. */
+  num?: true;
 }
 
 /** JS boolean expression: the value is SQL NULL. */
@@ -133,6 +135,24 @@ class Emitter {
     return `K[${this.consts.length - 1}]`;
   }
 
+  /** Numeric literals, read from K once per function instance (`head()`) instead of written into the source. */
+  private readonly hoisted: string[] = [];
+
+  private number(x: number): string {
+    const i = this.consts.push(x) - 1;
+    this.hoisted.push(`const $c${i} = K[${i}];`);
+    return `$c${i}`;
+  }
+
+  /**
+   * Declarations of the literals: they live in K, not in the source, so statements that differ only in their
+   * literals share one compiled function (and its type feedback). Per-row functions read them once per instance
+   * (before the function); pipelines, which loop over many rows per call, copy them into locals on entry.
+   */
+  head(): string {
+    return this.hoisted.length ? this.hoisted.join(' ') + ' ' : '';
+  }
+
   /** How generated code reads register `reg` (fused pipelines map decoded columns to flagged locals). */
   regRef: (reg: number, type: StaticType) => { v: string; nul?: string } = (reg) => ({ v: `r[${reg}]` });
   /** Set when a closure-compiled node was emitted: it reads the register file directly. */
@@ -152,9 +172,18 @@ class Emitter {
     return { v, type: c.type };
   }
 
+  /**
+   * An integer literal divisor of `/` or `%` stays in the source: V8 turns division by a known constant into a
+   * multiplication, and such divisors are usually part of the query's shape rather than values that vary.
+   */
+  private divisor(op: string, e: PlanExpr): Gen | undefined {
+    if ((op !== '/' && op !== '%') || e.k !== 'lit' || typeof e.value !== 'number' || !Number.isSafeInteger(e.value) || Object.is(e.value, -0)) return undefined;
+    return { v: `(${e.value})`, nul: 'false', type: e.type, num: true };
+  }
+
   private literal(value: SqlValue, type: StaticType): Gen {
     if (value === null) return { v: '0', nul: 'true', type: 'null' };
-    if (typeof value === 'number' && Number.isFinite(value)) return { v: Object.is(value, -0) ? '0' : `(${String(value)})`, nul: 'false', type };
+    if (typeof value === 'number' && Number.isFinite(value)) return { v: Object.is(value, -0) ? '0' : this.number(value), nul: 'false', type, num: true };
     return { v: this.konst(value), nul: 'false', type };
   }
 
@@ -185,7 +214,7 @@ class Emitter {
       }
       case 'call': {
         const arith = ARITH[e.fn];
-        if (arith !== undefined) return this.arith(arith, this.gen(e.args[0]), this.gen(e.args[1]));
+        if (arith !== undefined) return this.arith(arith, this.gen(e.args[0]), this.divisor(arith, e.args[1]) ?? this.gen(e.args[1]));
         const cmp = CMP[e.fn];
         if (cmp !== undefined) {
           // Numeric comparisons only; anything involving text/affinity/collation uses the closure compiler.
@@ -367,9 +396,10 @@ class Emitter {
         realFast = `{ const z = x ${op} y; if (z === z) ${v} = z; else ${vn} = true; }`;
     }
     const fast = real ? realFast : bothInt ? intFast : `if (Number.isSafeInteger(x) && Number.isSafeInteger(y)) { ${intFast} } else { ${realFast} }`;
-    this.lines.push(
-      `let ${vn} = ${orNull(nullOf(a), nullOf(b))}; let ${v} = 0; if (!${vn}) { const ${x} = ${a.v}; const ${y} = ${b.v}; if (typeof x === 'number' && typeof y === 'number') { ${fast} } else ${slow} }`,
-    );
+    // A literal operand is known to be a number (V8 cannot see that through K).
+    const checks = [a.num ? '' : `typeof x === 'number'`, b.num ? '' : `typeof y === 'number'`].filter((c) => c);
+    const body = checks.length ? `if (${checks.join(' && ')}) { ${fast} } else ${slow}` : fast;
+    this.lines.push(`let ${vn} = ${orNull(nullOf(a), nullOf(b))}; let ${v} = 0; if (!${vn}) { const ${x} = ${a.v}; const ${y} = ${b.v}; ${body} }`);
     return { v, nul: vn, type };
   }
 }
@@ -406,13 +436,15 @@ export function generate(
 ): { fn: (r: SqlValue[]) => SqlValue; type: StaticType; source: string } {
   const em = new Emitter(fallback);
   const g = em.gen(e);
+  const head = em.head();
   const body = `${em.lines.join('\n')}\nreturn ${em.value(g)};`;
-  traced?.push(`expression:\n${body}`);
-  let factory = factories.get(body);
+  const key = head + body;
+  traced?.push(`expression:\n${key}`);
+  let factory = factories.get(key);
   if (factory === undefined) {
-    factory = new Function('H', 'K', 'T', `"use strict"; return function smaltExpr(r) {\n${body}\n};`) as Factory;
+    factory = new Function('H', 'K', 'T', `"use strict"; ${head}return function smaltExpr(r) {\n${body}\n};`) as Factory;
     if (factories.size > 2000) factories.clear();
-    factories.set(body, factory);
+    factories.set(key, factory);
   }
   return { fn: factory(helpers, em.consts, truthy), type: g.type, source: body };
 }
@@ -808,7 +840,7 @@ export function generateFusedAggregate(
   pl.addPredicates(preds);
   pl.addAggregates(aggs, (i) => `S${i}`);
   const src = [...aggs.map((_, i) => `const S${i} = S[${i}];`), ...scanLoop(pl, source)].join('\n');
-  return compileFn(['H', 'K', 'T'], `return function smaltFusedAggregate(r, S) {\n${src}\n};`, [helpers, pl.em.consts, truthy]);
+  return compileFn(['H', 'K', 'T'], `return function smaltFusedAggregate(r, S) {\n${pl.em.head()}${src}\n};`, [helpers, pl.em.consts, truthy]);
 }
 
 /** A columnar scan's decode list (column, register pairs) and rowid registers. */
@@ -912,7 +944,7 @@ export function generateScanFilter(
     '}',
     'return k;',
   ].join('\n');
-  return compileFn(['H', 'K', 'T'], `return function smaltScanFilter(st, r, out) {\n${src}\n};`, [helpers, pl.em.consts, truthy]);
+  return compileFn(['H', 'K', 'T'], `return function smaltScanFilter(st, r, out) {\n${pl.em.head()}${src}\n};`, [helpers, pl.em.consts, truthy]);
 }
 
 /** Group lookup helpers for generated GROUP BY pipelines. */
@@ -953,5 +985,5 @@ export function generateGroupAggregate(
   pl.rowLines.push(...keyLines, `const key = ${keyExpr};`, 'let G = groups.get(key);', `if (G === undefined) { G = H.newGroup([${keyVals.join(', ')}]); groups.set(key, G); order.push(G); }`, 'const GS = G.st;');
   pl.addAggregates(aggs, (i) => `GS[${i}]`);
   const src = scanLoop(pl, source).join('\n');
-  return compileFn(['H', 'K', 'T'], `return function smaltGroupAggregate(r, groups, order) {\n${src}\n};`, [helpers, pl.em.consts, truthy]);
+  return compileFn(['H', 'K', 'T'], `return function smaltGroupAggregate(r, groups, order) {\n${pl.em.head()}${src}\n};`, [helpers, pl.em.consts, truthy]);
 }
