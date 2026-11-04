@@ -39,7 +39,7 @@
 | **Session manager** | One session per connection. Holds the prepared-statement cache, transaction state, and settings. |
 | **Lexer / Parser** | Hand-written recursive-descent parser with Pratt parsing for expressions. Produces an AST. No parser generator, which keeps the bundle small and the parser fast. |
 | **AST rewrites** | Materialized-view matching and view/subquery flattening rewrite the parser's output (`exec/mv-match.ts`, `exec/flatten.ts`). |
-| **Planner** | One pass from the AST to operators (`exec/planner.ts`): resolves names against the catalog, infers types, expands `*`, decorrelates subqueries, and chooses join order and access paths by cost. There is no separate binder or logical plan yet; [ADR 0014](adr/0014-shared-plan-layer.md) adds one. See [QUERY_ENGINE.md](QUERY_ENGINE.md). |
+| **Planner** | The SQL front end (`sql/frontend/select.ts`) resolves names against the catalog, infers types, expands `*` and makes SQL's rules explicit in a positional plan ([ADR 0014](adr/0014-shared-plan-layer.md)); the physical planner (`exec/planner.ts`) decorrelates subqueries, chooses join order and access paths by cost, and builds operators. Writes and a few SELECTs still go from the AST to operators in one pass. See [QUERY_ENGINE.md](QUERY_ENGINE.md). |
 | **Executor** | Vectorized operators that process batches of about 1024 rows held in typed arrays. Expressions compile to specialized JS closures, or to generated code if CSP allows it **[Q-9]**. |
 | **Catalog** | System tables stored in the database itself. `information_schema` and `sqlite_schema` are views over the catalog. |
 | **Statistics** | Row counts, NDV sketches (HyperLogLog), histograms, and min/max per column. Updated by `ANALYZE` and incrementally on write. |
@@ -86,7 +86,7 @@ src/
                       compiler, code generation, functions, window, spill, statistics, writes
     catalog/          schema, ALTER, information_schema
     external/         external tables (the plugin host side)
-    plan/             the shared plan layer (planned: ADR 0014)
+    plan/             the shared plan layer (ADR 0014): plan operations and expressions
     database.ts       the engine's Database: statements, transactions, catalog loading
     server.ts         the worker server; worker.ts and worker-runtime.ts start it
 test/                 unit, differential and property tests (Vitest, Node + MemoryVfs)

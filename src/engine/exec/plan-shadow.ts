@@ -1,9 +1,9 @@
 /**
  * `SMALT_PLAN` selects how SELECTs are planned while the plan layer (ADR 0014) is built:
  *
- * - unset or `legacy`: the current planner, from the AST;
- * - `plan`: the SQL front end (sql/frontend/select.ts) makes a plan and the physical planner (`Planner.planPlan`)
- *   builds its operators; shapes either does not handle yet go through the current planner;
+ * - unset or `plan` (the default): the SQL front end (sql/frontend/select.ts) makes a plan and the physical planner
+ *   (`Planner.planPlan`) builds its operators; what either does not handle yet goes through the AST path;
+ * - `legacy`: the planner's AST path (`Planner.planSelect`), until step 6d removes it;
  * - `shadow` (tests): both. The front end must agree with the planner on the result columns (name, type, collation,
  *   declared type, affinity) and on errors, and the physical planner's operators on the planner's `EXPLAIN` rows; the
  *   physical planner's operators then run. A disagreement raises SMALT_INTERNAL, so the test suite, the differential
@@ -23,7 +23,7 @@ export function planMode(): 'legacy' | 'plan' | 'shadow' {
     const g = globalThis as { process?: { env?: Record<string, string | undefined> } };
     mode = g.process?.env?.SMALT_PLAN;
   }
-  return mode === 'plan' || mode === 'shadow' ? mode : 'legacy';
+  return mode === 'legacy' || mode === 'shadow' ? mode : 'plan';
 }
 
 /** @internal Tests: set the planning mode (null: read `SMALT_PLAN` again). */

@@ -28,8 +28,8 @@ jobs:
       # The SQL front end must agree with the planner on every SELECT, and the physical planner on its operators
       # (ADR 0014, steps 5 and 6).
       - run: SMALT_PLAN=shadow npx vitest run
-      # Plans through the physical planner: the same plan shapes and generated code.
-      - run: SMALT_PLAN=plan npx vitest run test/plan-shapes.test.ts test/codegen-source.test.ts
+      # The planner's AST path (until step 6d): the same plan shapes and generated code.
+      - run: SMALT_PLAN=legacy npx vitest run test/plan-shapes.test.ts test/codegen-source.test.ts
 
   browser:
     runs-on: ubuntu-latest
