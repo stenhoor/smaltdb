@@ -25,9 +25,8 @@ SQL text
 Before binding, the front end applies the planner's two AST rewrites at the same points as the planner:
 materialized-view matching (`exec/mv-match.ts`) and the merging of simple views and FROM subqueries
 (`exec/flatten.ts`). INSERT, UPDATE and DELETE still take the planner's AST path (`Planner.planSelect` and the
-compile functions in `database.ts`), which resolves names and builds operators in one pass, until step 8; so does a
-SELECT whose decorrelated subquery a materialized view may answer (until decorrelation reads plans, step 7b).
-`SMALT_PLAN=legacy` plans every SELECT that way until the AST path is removed (after step 8); see
+compile functions in `database.ts`), which resolves names and builds operators in one pass, until step 8; every
+SELECT goes through the plan layer. `SMALT_PLAN=legacy` plans every SELECT that way until the AST path is removed (after step 8); see
 [TESTING.md](TESTING.md) for the modes.
 
 The steps after the parser depend on SQL text or AST in several places:

@@ -206,14 +206,17 @@ operators.
   for plans built without SQL too) follows once the AST path is deleted. The front end marks a SELECT it flattened,
   and decorrelation declines for it, as `decorrelate` reads the SQL before flattening. The flattener now returns
   early for SELECTs that read only tables. In slt, no SELECT falls back.
-- **7b, decorrelation** into `lookup`, or a semi join for a top-level WHERE conjunct; it stays lazy and keeps today's
-  equivalence conditions (collation, no COLLATE on the inner side, affinity converters).
+- **7b (done), decorrelation:** the physical planner decides decorrelation on the subquery's plan (6c-ii), and now
+  also plans the inner side the way the planner does where materialized-view matching may answer it: the front end
+  keeps each subquery's SQL on its plan, and while a fresh materialized view exists the inner side and the value
+  over no rows are planned from the SQL the planner builds (`decorrelationSql`, shared) through the front end. No
+  SELECT takes the AST path any more. Decorrelation into `lookup` or semi-join plan operations (lazy, with today's
+  equivalence conditions) would change plans against the planner's, so it follows once the AST path is deleted.
 - **7c (done), materialized-view matching:** as for 7a, the SQL front end applies the AST matcher
   (`exec/mv-match.ts`, through `PlannerEnv.rewriteSelect`) to every SELECT where `Planner.planSelect` does, with
   the same eligibility (`mayMatchMatview`, shared), so plans are the planner's; shadow mode now compares rewritten
-  statements too. One case stays on the AST path: a decorrelated subquery's inner side, which the planner builds and
-  plans as SQL (`AstPathNeeded`, while a fresh materialized view exists), until decorrelation reads plans (7b).
-  Matching on canonical plans, by column position, follows once the AST path is deleted.
+  statements too. A decorrelated subquery's inner side, which the planner builds and plans as SQL, took the AST path
+  (while a fresh materialized view exists) until 7b. Matching on canonical plans, by column position, follows once the AST path is deleted.
 - **7d, morsels.** The parts are plans: the `partial` reader message carries the serialized plan, its format version
   and a schema cookie instead of SQL text; the merge reads a `partials` input instead of the `smalt_partials()` table.
 - A plan-hash cache sits behind the text-keyed statement cache.
