@@ -51,6 +51,9 @@ export interface FrontEndResult {
   columns: FrontEndColumn[];
 }
 
+/** A plan node's fields, writable (the front end completes its own plans in place). */
+type Mutable<T> = T extends unknown ? { -readonly [K in keyof T]: T[K] } : never;
+
 /** A shape the front end does not handle yet. */
 class Unsupported extends Error {}
 
@@ -402,7 +405,7 @@ class FrontEnd {
     const columns: FrontEndColumn[] = resultCols.map((c, i) => ({
       name: c.name,
       type: compiled[i].type,
-      ...(c.declType !== undefined ? { declType: c.declType } : {}),
+      declType: c.declType,
       collation: compiled[i].collSrc !== CollSrc.None ? compiled[i].collation : Collation.Binary,
       affinity: compiled[i].affinity,
     }));
@@ -938,68 +941,97 @@ class FrontEnd {
 
   // ---------------------------------------------------------------- positions
 
-  /** Replace the binder's register slots with positional column references, through nested plans too. */
+  /**
+   * Replace the binder's register slots with positional column references, through nested plans too. The plan is the
+   * front end's own until it is returned, so this replaces them in place (a slot shared by two parents is replaced in
+   * both: it is the same column).
+   */
   resolveRefs(op: PlanOp): PlanOp {
+    const o = op as Mutable<PlanOp>;
     const ex = (e: PlanExpr): PlanExpr => this.resolveExpr(e);
-    const list = (xs: readonly PlanExpr[]): PlanExpr[] => xs.map(ex);
-    switch (op.op) {
+    const list = (xs: readonly PlanExpr[]): void => {
+      const w = xs as PlanExpr[];
+      for (let i = 0; i < w.length; i++) w[i] = ex(w[i]);
+    };
+    const keys = (ks: readonly { expr: PlanExpr }[]): void => {
+      for (const k of ks) (k as { expr: PlanExpr }).expr = ex(k.expr);
+    };
+    switch (o.op) {
       case 'scan':
       case 'working':
-        return op;
+        break;
       case 'source':
-        return { ...op, args: list(op.args) };
+        list(o.args);
+        break;
       case 'iterate':
-        return {
-          ...op,
-          init: this.resolveRefs(op.init),
-          steps: op.steps.map((x) => this.resolveRefs(x)),
-          ...(op.order ? { order: op.order.map((k) => ({ ...k, expr: ex(k.expr) })) } : {}),
-          ...(op.limit ? { limit: ex(op.limit) } : {}),
-          ...(op.offset ? { offset: ex(op.offset) } : {}),
-        };
+        this.resolveRefs(o.init);
+        for (const x of o.steps) this.resolveRefs(x);
+        if (o.order) keys(o.order);
+        if (o.limit) o.limit = ex(o.limit);
+        if (o.offset) o.offset = ex(o.offset);
+        break;
       case 'values':
-        return { ...op, rows: op.rows.map(list) };
+        for (const r of o.rows) list(r);
+        break;
       case 'filter':
-        return { ...op, input: this.resolveRefs(op.input), pred: ex(op.pred) };
+        this.resolveRefs(o.input);
+        o.pred = ex(o.pred);
+        break;
       case 'project':
-        return { ...op, input: this.resolveRefs(op.input), exprs: list(op.exprs) };
+        this.resolveRefs(o.input);
+        list(o.exprs);
+        break;
       case 'limit':
-        return { ...op, input: this.resolveRefs(op.input), count: ex(op.count), ...(op.offset ? { offset: ex(op.offset) } : {}) };
+        this.resolveRefs(o.input);
+        o.count = ex(o.count);
+        if (o.offset) o.offset = ex(o.offset);
+        break;
       case 'join':
-        return { ...op, inputs: [this.resolveRefs(op.inputs[0]), this.resolveRefs(op.inputs[1])], ...(op.on ? { on: ex(op.on) } : {}) };
+        this.resolveRefs(o.inputs[0]);
+        this.resolveRefs(o.inputs[1]);
+        if (o.on) o.on = ex(o.on);
+        break;
       case 'setop':
-        return { ...op, inputs: [this.resolveRefs(op.inputs[0]), this.resolveRefs(op.inputs[1])] };
+        this.resolveRefs(o.inputs[0]);
+        this.resolveRefs(o.inputs[1]);
+        break;
       case 'sort':
-        return { ...op, input: this.resolveRefs(op.input), keys: op.keys.map((k) => ({ ...k, expr: ex(k.expr) })) };
+        this.resolveRefs(o.input);
+        keys(o.keys);
+        break;
       case 'aggregate':
-        return {
-          ...op,
-          input: this.resolveRefs(op.input),
-          keys: op.keys.map((k) => ({ ...k, expr: ex(k.expr) })),
-          aggs: op.aggs.map((a) => ({ ...a, args: list(a.args), ...(a.filter ? { filter: ex(a.filter) } : {}) })),
-          carry: list(op.carry),
-        };
+        this.resolveRefs(o.input);
+        keys(o.keys);
+        for (const c of o.aggs as Mutable<AggCall>[]) {
+          list(c.args);
+          if (c.filter) c.filter = ex(c.filter);
+        }
+        list(o.carry);
+        break;
       case 'distinct':
-        return { ...op, input: this.resolveRefs(op.input) };
+        this.resolveRefs(o.input);
+        break;
       case 'window': {
-        const bound = (b: { kind: string; offset?: PlanExpr }) => (b.offset ? { kind: b.kind, offset: ex(b.offset) } : b);
-        return {
-          ...op,
-          input: this.resolveRefs(op.input),
-          partition: op.partition.map((p) => ({ ...p, expr: ex(p.expr) })),
-          order: op.order.map((k) => ({ ...k, expr: ex(k.expr) })),
-          frame: { ...op.frame, start: bound(op.frame.start), end: bound(op.frame.end) },
-          calls: op.calls.map((c) => ({ ...c, args: list(c.args), ...(c.filter ? { filter: ex(c.filter) } : {}) })),
-        };
+        this.resolveRefs(o.input);
+        keys(o.partition);
+        keys(o.order);
+        for (const b of [o.frame.start, o.frame.end] as { offset?: PlanExpr }[]) if (b.offset) b.offset = ex(b.offset);
+        for (const c of o.calls as Mutable<WindowCall>[]) {
+          list(c.args);
+          if (c.filter) c.filter = ex(c.filter);
+        }
+        break;
       }
     }
+    return op;
   }
 
+  /** `e` with its slots replaced (in place, below the root; the root itself when it is a slot is returned replaced). */
   private resolveExpr(e: PlanExpr): PlanExpr {
-    const ex = (x: PlanExpr): PlanExpr => this.resolveExpr(x);
-    switch (e.k) {
+    const w = e as Mutable<PlanExpr>;
+    switch (w.k) {
       case 'slot': {
-        const r = this.refs[e.reg];
+        const r = this.refs[w.reg];
         if (!r) return e;
         // The slot's SQL metadata (collation source, affinity) stays with the column, for the physical planner.
         const c: PlanExpr = { k: 'col', input: r.input, index: r.index(), depth: r.depth, type: r.type, collation: collationName(r.collation) };
@@ -1008,20 +1040,31 @@ class FrontEnd {
         return c;
       }
       case 'call':
-        return { ...e, args: e.args.map(ex) };
+      case 'and':
+      case 'or': {
+        const args = w.args as PlanExpr[];
+        for (let i = 0; i < args.length; i++) args[i] = this.resolveExpr(args[i]);
+        return e;
+      }
       case 'cast':
       case 'not':
       case 'isNull':
-        return { ...e, arg: ex(e.arg) } as PlanExpr;
-      case 'and':
-      case 'or':
-        return { ...e, args: e.args.map(ex) };
+        w.arg = this.resolveExpr(w.arg);
+        return e;
       case 'case':
-        return { ...e, whens: e.whens.map((w) => ({ when: ex(w.when), then: ex(w.then) })), else: ex(e.else) };
+        for (const x of w.whens as { when: PlanExpr; then: PlanExpr }[]) {
+          x.when = this.resolveExpr(x.when);
+          x.then = this.resolveExpr(x.then);
+        }
+        w.else = this.resolveExpr(w.else);
+        return e;
       case 'subquery':
-        return { ...e, plan: this.resolveRefs(e.plan) };
+        this.resolveRefs(w.plan);
+        return e;
       case 'inSubquery':
-        return { ...e, probe: ex(e.probe), plan: this.resolveRefs(e.plan) };
+        w.probe = this.resolveExpr(w.probe);
+        this.resolveRefs(w.plan);
+        return e;
       default:
         return e;
     }

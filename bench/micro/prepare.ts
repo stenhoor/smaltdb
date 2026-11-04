@@ -1,9 +1,12 @@
 // Planning cost of small statements: parse, plan and compile (no cached statement), in µs per statement. The plan
-// layer (ADR 0014) adds passes between parsing and operators; this is its budget check for small queries.
+// layer (ADR 0014) adds passes between parsing and operators; this is its budget check for small queries. Each round
+// runs every planning mode in turn in one process (SMALT_PLAN: the plan layer, and the planner's AST path), so the
+// ratio is not skewed by machine noise between runs.
 // Run (ROUNDS, default 7):
 //   npx esbuild bench/micro/prepare.ts --bundle --platform=node --format=esm --outfile=.cache/prepare-bench.mjs && node .cache/prepare-bench.mjs
 import { Database } from '../../src/engine/database.js';
 import { MemoryVfs } from '../../src/engine/vfs/memory.js';
+import { setPlanMode } from '../../src/engine/exec/plan-shadow.js';
 
 const ROUNDS = Number(process.argv[2] ?? 7);
 const N = 3000;
@@ -28,19 +31,29 @@ function median(xs: number[]): number {
   return s[Math.floor(s.length / 2)];
 }
 
+const MODES = ['plan', 'legacy'] as const;
 console.log(`planning cost per statement, median of ${ROUNDS} rounds of ${N} (µs)`);
-console.log('| Statement | prepare + first run |');
-console.log('|---|---|');
+console.log('| Statement | plan layer | AST path | ratio |');
+console.log('|---|---|---|---|');
+let base = 0;
 for (const [name, sql] of SHAPES) {
-  const run = (base: number): void => {
-    for (let i = 0; i < N; i++) db.prepare(sql(base + i)).all();
+  const run = (): void => {
+    for (let i = 0; i < N; i++) db.prepare(sql(base++)).all();
   };
-  run(0); // warm up
-  const ms: number[] = [];
-  for (let r = 1; r <= ROUNDS; r++) {
-    const t0 = performance.now();
-    run(r * N);
-    ms.push(performance.now() - t0);
+  const ms: Record<string, number[]> = { plan: [], legacy: [] };
+  for (const m of MODES) {
+    setPlanMode(m);
+    run(); // warm up
   }
-  console.log(`| ${name} | ${((median(ms) * 1000) / N).toFixed(1)} |`);
+  for (let r = 1; r <= ROUNDS; r++) {
+    for (const m of MODES) {
+      setPlanMode(m);
+      const t0 = performance.now();
+      run();
+      ms[m].push(performance.now() - t0);
+    }
+  }
+  const us = (m: string): number => (median(ms[m]) * 1000) / N;
+  console.log(`| ${name} | ${us('plan').toFixed(1)} | ${us('legacy').toFixed(1)} | ${(us('plan') / us('legacy')).toFixed(2)} |`);
 }
+setPlanMode(null);

@@ -84,7 +84,7 @@ planned (`src/engine/exec/plan-shadow.ts`):
   (`Planner.planPlan`, step 6) builds its operators. Derived tables and views the planner may flatten (until
   flattening reads plans, step 7a) go through the planner's AST path, and so do statements answered from a
   materialized view.
-- `legacy`: the planner's AST path for every SELECT, until step 6d removes it.
+- `legacy`: the planner's AST path for every SELECT, until it is deleted after step 8.
 - `shadow` (tests): both. The front end must agree with the planner on every result column's name, type, collation,
   declared type and affinity, and on planning errors; the physical planner's operators must give the planner's
   `EXPLAIN` rows and record the same subplans (subqueries), and then they run. A disagreement fails the statement with `SMALT_INTERNAL`.

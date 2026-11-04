@@ -3,7 +3,7 @@
  *
  * - unset or `plan` (the default): the SQL front end (sql/frontend/select.ts) makes a plan and the physical planner
  *   (`Planner.planPlan`) builds its operators; what either does not handle yet goes through the AST path;
- * - `legacy`: the planner's AST path (`Planner.planSelect`), until step 6d removes it;
+ * - `legacy`: the planner's AST path (`Planner.planSelect`), until it is deleted after step 8;
  * - `shadow` (tests): both. The front end must agree with the planner on the result columns (name, type, collation,
  *   declared type, affinity) and on errors, and the physical planner's operators on the planner's `EXPLAIN` rows; the
  *   physical planner's operators then run. A disagreement raises SMALT_INTERNAL, so the test suite, the differential
