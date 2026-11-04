@@ -57,6 +57,31 @@ export interface FrontEndResult {
 /** A plan node's fields, writable (the front end completes its own plans in place). */
 type Mutable<T> = T extends unknown ? { -readonly [K in keyof T]: T[K] } : never;
 
+/** A source's hidden columns when it has none (replaced by a new set on the first USING / NATURAL column). */
+const NO_HIDDEN: Set<string> = new Set();
+
+/**
+ * A table's source columns and scan columns (the rowid last when it has no alias), built once per table schema:
+ * the front end only reads them, and DDL replaces the schema object.
+ */
+const tableShapes = new WeakMap<TableSchema, { cols: FeColumn[]; columns: number[] }>();
+function tableShape(table: TableSchema): { cols: FeColumn[]; columns: number[] } {
+  let s = tableShapes.get(table);
+  if (s === undefined) {
+    const cols: FeColumn[] = table.columns.map((c) => ({
+      name: c.name,
+      type: c.rowidAlias ? 'int' : staticTypeOfStorage(c.type),
+      collation: c.collation,
+      affinity: affinityOfStorage(c.type),
+      declType: c.declaredType,
+    }));
+    const columns = table.columns.map((_c, i) => i);
+    if (table.rowidAlias < 0) columns.push(-1);
+    tableShapes.set(table, (s = { cols, columns }));
+  }
+  return s;
+}
+
 /** A shape the front end does not handle yet. */
 class Unsupported extends Error {}
 
@@ -587,8 +612,7 @@ class FrontEnd {
     const scope = new FeScope(parent);
     let root = this.from(core.from, core.where, scope);
     const resultCols = this.expandResultColumns(core.columns, scope);
-    scope.aliases = new Map();
-    for (const rc of resultCols) if (rc.alias) scope.aliases.set(rc.alias.toLowerCase(), rc.expr);
+    for (const rc of resultCols) if (rc.alias) (scope.aliases ??= new Map()).set(rc.alias.toLowerCase(), rc.expr);
 
     const isAgg =
       core.groupBy.length > 0 || core.having !== undefined || resultCols.some((c) => containsAggregate(c.expr)) || (stmt?.orderBy.some((t) => containsAggregate(t.expr)) ?? false);
@@ -895,7 +919,7 @@ class FrontEnd {
           if (rc.kind === 'tableStar' && !sameName(src.name, rc.table)) continue;
           found = true;
           for (const c of src.cols) {
-            if (rc.kind === 'star' && src.hidden.has(c.name.toLowerCase())) continue;
+            if (rc.kind === 'star' && src.hidden.size > 0 && src.hidden.has(c.name.toLowerCase())) continue;
             out.push({ expr: { kind: 'column', table: src.name, name: c.name, pos: rc.pos, end: rc.end }, name: c.name, declType: c.declType || undefined });
           }
         }
@@ -952,6 +976,7 @@ class FrontEnd {
         if (!left || !src.cols.some((c) => sameName(c.name, name))) {
           throw new SmaltError('SMALT_ERROR', `cannot join using column ${name} - column not present in both tables`);
         }
+        if (src.hidden === NO_HIDDEN) src.hidden = new Set();
         src.hidden.add(name.toLowerCase());
         ons[p].push({ kind: 'binary', op: '=', left: { kind: 'column', table: left.name, name, pos: 0, end: 0 }, right: { kind: 'column', table: src.name, name, pos: 0, end: 0 }, pos: 0, end: 0 });
       }
@@ -1012,7 +1037,7 @@ class FrontEnd {
       const ext = this.catalog.externalColumns?.(item.name);
       if (ext) {
         const cols: FeColumn[] = ext.map((c) => ({ name: c.name, type: c.type, collation: Collation.Binary, affinity: affinityOfStorage(storageTypeFor(c.declType)), declType: c.declType ?? '' }));
-        this.push(scope, { name: item.alias ?? item.name, cols, offset: 0, rowid: null, position, width: cols.length, hidden: new Set() });
+        this.push(scope, { name: item.alias ?? item.name, cols, offset: 0, rowid: null, position, width: cols.length, hidden: NO_HIDDEN });
         return { op: 'source', kind: 'external', name: item.name, args: [], types: cols.map((c) => c.type) };
       }
     }
@@ -1026,7 +1051,7 @@ class FrontEnd {
       const vt = this.catalog.virtualTable?.('temp', 'sqlite_schema');
       if (vt) {
         const cols: FeColumn[] = vt.columns.map((c) => ({ name: c.name, type: c.type, collation: Collation.Binary, affinity: 'NONE', declType: '' }));
-        this.push(scope, { name: (item as { alias?: string }).alias ?? item.name, cols, offset: 0, rowid: null, position, width: cols.length, hidden: new Set() });
+        this.push(scope, { name: (item as { alias?: string }).alias ?? item.name, cols, offset: 0, rowid: null, position, width: cols.length, hidden: NO_HIDDEN });
         return { op: 'source', kind: 'virtual', schema: 'temp', name: 'sqlite_schema', args: [], types: cols.map((c) => c.type) };
       }
     }
@@ -1048,7 +1073,7 @@ class FrontEnd {
         }
       }
       const cols: FeColumn[] = vt.columns.map((c) => ({ name: c.name, type: c.type, collation: Collation.Binary, affinity: 'NONE', declType: '' }));
-      this.push(scope, { name: item.alias ?? item.name, cols, offset: 0, rowid: null, position, width: cols.length, hidden: new Set() });
+      this.push(scope, { name: item.alias ?? item.name, cols, offset: 0, rowid: null, position, width: cols.length, hidden: NO_HIDDEN });
       return isInfoSchema
         ? { op: 'source', kind: 'virtual', schema: 'information_schema', name: item.name, args, types: cols.map((c) => c.type) }
         : { op: 'source', kind: 'function', name: item.name, args, types: cols.map((c) => c.type) };
@@ -1091,7 +1116,7 @@ class FrontEnd {
           // The recursive step's working table: the previous step's rows.
           const w = cte.working;
           const cols: FeColumn[] = w.columns.map((c) => ({ name: c.name, type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '' }));
-          this.push(scope, { name: alias, cols, offset: 0, rowid: null, position, width: cols.length, hidden: new Set() });
+          this.push(scope, { name: alias, cols, offset: 0, rowid: null, position, width: cols.length, hidden: NO_HIDDEN });
           return { op: 'working', id: w.id, types: cols.map((c) => c.type) };
         }
         sub = cte.recursive ? this.recursive(cteName, cte, scope.parent) : this.select(cte.select, scope.parent);
@@ -1101,7 +1126,7 @@ class FrontEnd {
         throw new SmaltError('SMALT_ERROR', `table ${alias} has ${sub.columns.length} values for ${names.length} columns`);
       }
       const cols: FeColumn[] = sub.columns.map((c, i) => ({ name: names ? names[i] : c.name, type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '' }));
-      this.push(scope, { name: alias ?? `(subquery-${position + 1})`, cols, offset: 0, rowid: null, position, width: cols.length, hidden: new Set() });
+      this.push(scope, { name: alias ?? `(subquery-${position + 1})`, cols, offset: 0, rowid: null, position, width: cols.length, hidden: NO_HIDDEN });
       return sub.plan;
     }
     if (item.schema && !['main', 'temp'].includes(item.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${item.schema}`);
@@ -1110,19 +1135,14 @@ class FrontEnd {
     if (typeof item.indexedBy === 'string' && !table.indexes.some((i) => sameName(i.name, item.indexedBy!))) throw new SmaltError('SMALT_ERROR', `no such index: ${item.indexedBy}`);
     const name = item.alias ?? table.name;
     for (const s of scope.sources) if (sameName(s.name, name)) throw new SmaltError('SMALT_ERROR', `ambiguous table name: ${name}`);
-    const cols: FeColumn[] = table.columns.map((c) => ({
-      name: c.name,
-      type: c.rowidAlias ? 'int' : staticTypeOfStorage(c.type),
-      collation: c.collation,
-      affinity: affinityOfStorage(c.type),
-      declType: c.declaredType,
-    }));
+    const { cols, columns } = tableShape(table);
     const n = table.columns.length;
     const hasAlias = table.rowidAlias >= 0;
-    this.push(scope, { name, cols, offset: 0, rowid: hasAlias ? table.rowidAlias : n, position, width: hasAlias ? n : n + 1, hidden: new Set() });
-    const columns = table.columns.map((_c, i) => i);
+    this.push(scope, { name, cols, offset: 0, rowid: hasAlias ? table.rowidAlias : n, position, width: hasAlias ? n : n + 1, hidden: NO_HIDDEN });
     const db = table.temp ? 'temp' : item.schema?.toLowerCase() === 'main' ? 'main' : undefined;
-    return { op: 'scan', table: table.name, ...(db ? { db } : {}), columns: hasAlias ? columns : [...columns, -1], ...(item.indexedBy !== undefined ? { indexedBy: item.indexedBy } : {}) };
+    const scan: Mutable<Extract<PlanOp, { op: 'scan' }>> = db ? { op: 'scan', table: table.name, db, columns } : { op: 'scan', table: table.name, columns };
+    if (item.indexedBy !== undefined) scan.indexedBy = item.indexedBy;
+    return scan;
   }
 
   private push(scope: FeScope, src: FeSource): void {
@@ -1199,7 +1219,7 @@ class FrontEnd {
     }
     let found: { src: FeSource; col: number } | undefined;
     for (const src of scope.sources) {
-      if (src.hidden.has(e.name.toLowerCase())) continue;
+      if (src.hidden.size > 0 && src.hidden.has(e.name.toLowerCase())) continue;
       const c = src.cols.findIndex((c) => sameName(c.name, e.name));
       if (c < 0) continue;
       if (found) throw new SmaltError('SMALT_ERROR', `ambiguous column name: ${e.name}`);

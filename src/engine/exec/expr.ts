@@ -239,7 +239,10 @@ function opaque<T extends PlanExpr>(e: T): T {
 }
 
 /** The parts of a bound expression the SQL rules for comparisons read. */
-const operand = (e: PlanExpr): SqlOperand => ({ type: typeOf(e), ...metaOf(e) });
+const operand = (e: PlanExpr): SqlOperand => {
+  const m = metaOf(e);
+  return { type: typeOf(e), collation: m.collation, collSrc: m.collSrc, affinity: m.affinity };
+};
 
 const AFFINITY_CALLS = new Set(['sql.affinity_numeric', 'sql.affinity_text']);
 
