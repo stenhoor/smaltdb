@@ -86,10 +86,10 @@ const WRITE_BATCH_BYTES = 1024 * 1024;
 
 /** Undo information for one savepoint level (statement journal or SQL SAVEPOINT). */
 interface Savepoint {
-  /** Page images captured on first modification within this level. */
-  images: Map<number, Uint8Array>;
-  /** Uncaptured pages (re)allocated within this level; dropped on rollback. */
-  fresh: Set<number>;
+  /** Page images captured on first modification within this level (created on the first one). */
+  images: Map<number, Uint8Array> | null;
+  /** Uncaptured pages (re)allocated within this level; dropped on rollback (created on the first one). */
+  fresh: Set<number> | null;
   pageCount: number;
   /** Database header bytes (first DB_HEADER_SIZE) at the start of this level. */
   header: Uint8Array;
@@ -291,16 +291,37 @@ export class Pager {
   }
 
   private newLevel(): Savepoint {
-    return { images: new Map(), fresh: new Set(), pageCount: this.pageCount, header: this.header.slice(0, DB_HEADER_SIZE) };
+    return { images: null, fresh: null, pageCount: this.pageCount, header: this.header.slice(0, DB_HEADER_SIZE) };
+  }
+
+  /**
+   * Buffers for savepoint (statement) page images and header copies, reused: most statements capture a page or
+   * two and release them at once, and allocating an ArrayBuffer per capture dominated small writes.
+   */
+  private readonly imagePool: Uint8Array[] = [];
+  private readonly headerPool: Uint8Array[] = [];
+
+  private savepointImage(src: Uint8Array): Uint8Array {
+    const img = this.imagePool.pop() ?? new Uint8Array(this.pageSize);
+    img.set(src);
+    return img;
+  }
+
+  /** Return a savepoint level's buffers that nothing keeps (a level popped without merging, or merged and left over). */
+  private recycle(sp: Savepoint, kept: Map<number, Uint8Array> | null): void {
+    if (sp.images !== null) {
+      for (const [pgno, img] of sp.images) if (kept?.get(pgno) !== img && this.imagePool.length < 256) this.imagePool.push(img);
+    }
+    if (this.headerPool.length < 16) this.headerPool.push(sp.header);
   }
 
   /** In memory: keep the committed contents of a page before its first change in the transaction. */
   private captureTxn(f: Frame): void {
     const t = this.txn!;
-    if (f.pgno < t.pageCount && !t.images.has(f.pgno)) {
+    if (f.pgno < t.pageCount && !t.images?.has(f.pgno)) {
       const img = this.imageBuffer();
       img.set(f.bytes);
-      t.images.set(f.pgno, img);
+      (t.images ??= new Map()).set(f.pgno, img);
     }
   }
 
@@ -489,8 +510,8 @@ export class Pager {
     if (this.readOnly) throw new SmaltError('SMALT_READONLY', 'attempt to write a read-only snapshot');
     if (this.txn !== null && !f.dirty) this.captureTxn(f);
     const sp = this.top;
-    if (sp !== undefined && f.pgno < sp.pageCount && !sp.images.has(f.pgno) && !sp.fresh.has(f.pgno)) {
-      sp.images.set(f.pgno, f.bytes.slice());
+    if (sp !== undefined && f.pgno < sp.pageCount && !sp.images?.has(f.pgno) && !sp.fresh?.has(f.pgno)) {
+      (sp.images ??= new Map()).set(f.pgno, this.savepointImage(f.bytes));
     }
     f.unverified = false; // contents of a dirty frame are authoritative
     if (!f.dirty) {
@@ -525,7 +546,9 @@ export class Pager {
 
   /** Open a savepoint level; returns its depth (1-based). */
   beginSavepoint(): number {
-    this.savepoints.push({ images: new Map(), fresh: new Set(), pageCount: this.pageCount, header: this.header.slice(0, DB_HEADER_SIZE) });
+    const header = this.headerPool.pop() ?? new Uint8Array(DB_HEADER_SIZE);
+    header.set(this.header.subarray(0, DB_HEADER_SIZE));
+    this.savepoints.push({ images: null, fresh: null, pageCount: this.pageCount, header });
     return this.savepoints.length;
   }
 
@@ -535,11 +558,17 @@ export class Pager {
     while (this.savepoints.length >= depth) {
       const child = this.savepoints.pop()!;
       const parent = this.top;
-      if (!parent) break;
-      for (const [pgno, img] of child.images) {
-        if (pgno < parent.pageCount && !parent.images.has(pgno) && !parent.fresh.has(pgno)) parent.images.set(pgno, img);
+      if (!parent) {
+        this.recycle(child, null);
+        break;
       }
-      for (const pgno of child.fresh) if (pgno < parent.pageCount && !parent.images.has(pgno)) parent.fresh.add(pgno);
+      if (child.images !== null) {
+        for (const [pgno, img] of child.images) {
+          if (pgno < parent.pageCount && !parent.images?.has(pgno) && !parent.fresh?.has(pgno)) (parent.images ??= new Map()).set(pgno, img);
+        }
+      }
+      if (child.fresh !== null) for (const pgno of child.fresh) if (pgno < parent.pageCount && !parent.images?.has(pgno)) (parent.fresh ??= new Set()).add(pgno);
+      this.recycle(child, parent.images);
     }
   }
 
@@ -550,19 +579,25 @@ export class Pager {
   rollbackToSavepoint(depth: number, keep: boolean): void {
     this.checkDepth(depth);
     for (const f of this.frames) if (f.pins > 0) throw new MisuseError(`savepoint rollback with pinned page ${f.pgno}`);
-    while (this.savepoints.length >= depth) this.restoreLevel(this.savepoints.pop()!);
+    while (this.savepoints.length >= depth) {
+      const sp = this.savepoints.pop()!;
+      this.restoreLevel(sp);
+      this.recycle(sp, null);
+    }
     if (keep) this.beginSavepoint();
   }
 
   private restoreLevel(sp: Savepoint): void {
     // Pages allocated past the level's end of file disappear; reused free pages revert to their stored image.
     for (const f of this.frames) if (f.pgno >= sp.pageCount) this.discard(f);
-    for (const pgno of sp.fresh) {
-      if (sp.images.has(pgno)) continue;
-      const f = this.map.get(pgno);
-      if (f !== undefined) this.discard(f);
+    if (sp.fresh !== null) {
+      for (const pgno of sp.fresh) {
+        if (sp.images?.has(pgno)) continue;
+        const f = this.map.get(pgno);
+        if (f !== undefined) this.discard(f);
+      }
     }
-    for (const [pgno, image] of sp.images) {
+    if (sp.images !== null) for (const [pgno, image] of sp.images) {
       let f = this.map.get(pgno);
       if (f === undefined) f = this.takeFrame(pgno);
       else f.pins++;
@@ -634,7 +669,7 @@ export class Pager {
     // statement (then either captured, or clean, so its committed image is on disk). Remember it so
     // a statement rollback drops this frame instead of writing it.
     const sp = this.top;
-    if (sp !== undefined && pgno < sp.pageCount && !sp.images.has(pgno)) sp.fresh.add(pgno);
+    if (sp !== undefined && pgno < sp.pageCount && !sp.images?.has(pgno)) (sp.fresh ??= new Set()).add(pgno);
     f.unverified = false;
     f.bytes.fill(0);
     this.markDirtyNoCapture(f);
@@ -880,8 +915,8 @@ export class Pager {
   private captureForStatement(f: Frame): void {
     if (this.txn !== null) this.captureTxn(f);
     const sp = this.top;
-    if (sp !== undefined && f.pgno < sp.pageCount && !sp.images.has(f.pgno) && !sp.fresh.has(f.pgno)) {
-      sp.images.set(f.pgno, f.bytes.slice());
+    if (sp !== undefined && f.pgno < sp.pageCount && !sp.images?.has(f.pgno) && !sp.fresh?.has(f.pgno)) {
+      (sp.images ??= new Map()).set(f.pgno, this.savepointImage(f.bytes));
     }
   }
 

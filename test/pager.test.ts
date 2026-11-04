@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { CorruptionError } from '../src/engine/errors.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
 import { Pager } from '../src/engine/storage/pager.js';
-import { openMemoryPager } from './helpers.js';
+import { openMemoryPager, rng } from './helpers.js';
 
 describe('Pager', () => {
   it('initializes a new database and reopens it', () => {
@@ -161,5 +161,63 @@ describe('Pager read-ahead', () => {
     expect(p2.stats.reads).toBe(readsBefore);
     expect(() => p2.get(44)).toThrow(CorruptionError);
     expect(p2.pinnedCount()).toBe(0);
+  });
+
+  it('nested savepoints restore every page exactly (pooled undo images)', () => {
+    // Random writes, allocations and frees under nested savepoints, released and rolled back at random,
+    // against a model: a stack of page-content snapshots. Buffers for savepoint images are reused, so an image
+    // recycled while a level still needs it would restore the wrong bytes.
+    for (const seed of [1, 2, 3, 4, 5]) {
+      const r = rng(seed);
+      const { pager } = openMemoryPager({ pageSize: 1024 });
+      const pages: number[] = [];
+      for (let i = 0; i < 12; i++) {
+        const f = pager.allocate();
+        f.bytes[200] = i;
+        pages.push(f.pgno);
+        pager.release(f);
+      }
+      pager.commit();
+      const read = (): Map<number, number> => {
+        const m = new Map<number, number>();
+        for (const pg of pages) {
+          const f = pager.get(pg);
+          m.set(pg, f.bytes[200] * 256 + f.bytes[201]);
+          pager.release(f);
+        }
+        return m;
+      };
+      const model: Map<number, number>[] = [];
+      for (let step = 0; step < 3000; step++) {
+        const op = r();
+        if (op < 0.2 && model.length < 6) {
+          model.push(read());
+          pager.beginSavepoint();
+        } else if (op < 0.3 && model.length > 0) {
+          const depth = 1 + Math.floor(r() * model.length);
+          model.length = depth - 1;
+          pager.releaseSavepoint(depth);
+        } else if (op < 0.4 && model.length > 0) {
+          const depth = 1 + Math.floor(r() * model.length);
+          const want = model[depth - 1];
+          model.length = depth - 1;
+          pager.rollbackToSavepoint(depth, false);
+          expect(read(), `seed ${seed} step ${step}`).toEqual(want);
+        } else {
+          const pg = pages[Math.floor(r() * pages.length)];
+          const f = pager.get(pg);
+          pager.markDirty(f);
+          f.bytes[200] = Math.floor(r() * 256);
+          f.bytes[201] = Math.floor(r() * 256);
+          pager.release(f);
+        }
+      }
+      while (model.length > 0) {
+        const want = model.pop()!;
+        pager.rollbackToSavepoint(model.length + 1, false);
+        expect(read()).toEqual(want);
+      }
+      expect(pager.pinnedCount()).toBe(0);
+    }
   });
 });
