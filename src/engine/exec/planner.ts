@@ -2565,17 +2565,20 @@ export class Planner {
       options.push({ label, cost, rows, dependsOnOuter, build });
     };
 
-    // Rowid equality / IN / range.
+    // Rowid equality / IN / range. The lookups and range bounds apply the comparison's numeric affinity exactly as
+    // the condition does (`rowidProbe`), so the conditions they use need no filter. A seek reads no more pages than
+    // a scan, so on tiny tables it costs at most the scan (which would also generate a pipeline).
+    const seek = (k: number): number => Math.min(k * COST.probe, N * COST.scanRow * 0.9);
     for (const pr of probes) {
       if (pr.col !== 'rowid') continue;
       if (pr.op === '=') {
-        consider('rowid=', COST.probe, 1, pr.deps.size > 0, () => {
+        consider('rowid=', seek(1), 1, pr.deps.size > 0, () => {
           const leaf = new RowidLookup(access, [compileBoundExpr(pr.other, ctx).fn]);
-          return { leaf, dependsOnOuter: pr.deps.size > 0 };
+          return { leaf, dependsOnOuter: pr.deps.size > 0, consumed: [pr.conj] };
         });
       } else if (pr.op === 'in') {
         const k = pr.list!.length;
-        consider('rowid in', k * COST.probe, k, pr.deps.size > 0, () => ({ leaf: new RowidLookup(access, pr.list!.map((x) => compileBoundExpr(x, ctx).fn)), dependsOnOuter: pr.deps.size > 0 }));
+        consider('rowid in', seek(k), k, pr.deps.size > 0, () => ({ leaf: new RowidLookup(access, pr.list!.map((x) => compileBoundExpr(x, ctx).fn)), dependsOnOuter: pr.deps.size > 0, consumed: [pr.conj] }));
       }
     }
     const rowidRange = probes.filter((x) => x.col === 'rowid' && ['<', '<=', '>', '>='].includes(x.op));
@@ -2589,7 +2592,7 @@ export class Planner {
           lo ? { fn: compileBoundExpr(lo.other, ctx).fn, inclusive: lo.op === '>=' } : undefined,
           hi ? { fn: compileBoundExpr(hi.other, ctx).fn, inclusive: hi.op === '<=' } : undefined,
         );
-        return { leaf: scan, dependsOnOuter: outerDep([lo, hi].filter((x): x is Probe => !!x)), scan };
+        return { leaf: scan, dependsOnOuter: outerDep([lo, hi].filter((x): x is Probe => !!x)), scan, consumed: [lo, hi].filter((x): x is Probe => !!x).map((x) => x.conj) };
       });
     }
 

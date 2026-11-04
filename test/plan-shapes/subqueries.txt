@@ -47,8 +47,7 @@ columns: name text, (SELECT count(*) FROM orders o WHERE o.customer_id = c.id) i
 > SELECT name, (SELECT max(day) FROM orders o WHERE o.customer_id = c.id AND o.status = c.region) FROM customers c WHERE c.id < 5
 columns: name text, (SELECT max(day) FROM orders o WHERE o.customer_id = c.id AND o.status = c.region) int
   Project
-    Filter [est 660]
-      TableScan: SEARCH customers USING INTEGER PRIMARY KEY (rowid<?)
+    TableScan: SEARCH customers USING INTEGER PRIMARY KEY (rowid<?) [est 660]
   SCALAR SUBQUERY (decorrelated: grouped lookup):
     Project
       FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)

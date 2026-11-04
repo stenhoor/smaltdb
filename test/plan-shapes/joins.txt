@@ -2,8 +2,7 @@
 columns: name text, amount real
   Project
     NestedLoopJoin [est 9.77]
-      Filter [est 1]
-        RowidLookup: SEARCH customers USING INTEGER PRIMARY KEY (rowid=?)
+      RowidLookup: SEARCH customers USING INTEGER PRIMARY KEY (rowid=?) [est 1]
       IndexScan: SEARCH orders USING INDEX orders_customer (=?) [est 9.77]
 
 > SELECT c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id WHERE c.region = 'EU'
@@ -46,16 +45,14 @@ columns: region text, category text, sum(i.qty * p.price) real
 columns: name text, label text
   Project
     HashJoin: HASH JOIN [est 660]
-      Filter [est 660]
-        TableScan: SEARCH customers USING INTEGER PRIMARY KEY (rowid<?)
+      TableScan: SEARCH customers USING INTEGER PRIMARY KEY (rowid<?) [est 660]
       FusedScanFilter: SCAN tiers (fused scan + filter) [est 4]
 
 > SELECT c.id, o.id FROM customers c LEFT JOIN orders o ON o.customer_id = c.id WHERE c.id < 10
 columns: id int, id int
   Project
     HashJoin: LEFT HASH JOIN [est 6450]
-      Filter [est 660]
-        TableScan: SEARCH customers USING INTEGER PRIMARY KEY (rowid<?)
+      TableScan: SEARCH customers USING INTEGER PRIMARY KEY (rowid<?) [est 660]
       FusedScanFilter: SCAN orders (fused scan + filter) [est 20000]
 
 > SELECT c.id FROM customers c LEFT JOIN orders o ON o.customer_id = c.id WHERE o.id IS NULL
@@ -92,17 +89,15 @@ columns: count(*) int
 > SELECT o.id FROM orders o JOIN customers c USING (id) WHERE c.tier = 1
 columns: id int
   Project
-    Filter
-      NestedLoopJoin [est 500]
-        FusedScanFilter: SCAN customers (fused scan + filter) [est 500]
-        RowidLookup: SEARCH orders USING INTEGER PRIMARY KEY (rowid=?) [est 1]
+    NestedLoopJoin [est 500]
+      FusedScanFilter: SCAN customers (fused scan + filter) [est 500]
+      RowidLookup: SEARCH orders USING INTEGER PRIMARY KEY (rowid=?) [est 1]
 
 > SELECT a.id, b.id FROM orders a JOIN orders b ON b.customer_id = a.customer_id WHERE a.id = 100
 columns: id int, id int
   Project
     NestedLoopJoin [est 9.77]
-      Filter [est 1]
-        RowidLookup: SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
+      RowidLookup: SEARCH orders USING INTEGER PRIMARY KEY (rowid=?) [est 1]
       IndexScan: SEARCH orders USING COVERING INDEX orders_customer (=?) [est 9.77]
 
 > SELECT o.id FROM orders o JOIN customers c ON c.id = o.customer_id JOIN tiers t ON t.tier = c.tier WHERE t.label = ?
