@@ -1246,9 +1246,49 @@ export class Planner {
     const ncols = table.columns.length;
     const oldBase = this.regs.alloc(ncols);
     const oldRowid = this.regs.alloc();
-    const row: ColMap = (c) => slotFor(c, c.index < ncols ? oldBase + c.index : oldRowid);
-    const returning = op.returning?.map((e) => compileBoundExpr(b.bind(e, row), this.env.funcCtx).fn);
+    const returning = op.returning && this.compileRowExprs(op.returning, ncols, oldBase, oldRowid);
     return { root, rowidReg: rowid.reg, oldBase, oldRowid, returning };
+  }
+
+  /**
+   * An `update` plan's target rows and SET values (ADR 0014, step 8b), as `Database.compileUpdate` plans them: the
+   * target (joined with the FROM sources) with its WHERE, reading the rowid; the registers of the target's columns
+   * (the writer loads each old row there before the SET values read it); then the SET values over the FROM row.
+   * Null for plans it does not handle.
+   */
+  planUpdate(op: Extract<PlanOp, { op: 'update' }>): { root: Operator; rowidReg: number; colRegs: number[]; sets: { column: number; c: Compiled }[] } | null {
+    let n = op.input;
+    let where: PlanExpr | undefined;
+    if (n.op === 'filter') {
+      where = n.pred;
+      n = n.input;
+    }
+    const from = fromLeaves(n);
+    if (!from || from[0].op.op !== 'scan' || !from.every((l, i) => i === 0 || supportedLeaf(l.op, 0))) return null;
+    const exprs = [where, ...from.map((l) => l.on), ...op.sets.map((x) => x.value), ...(op.returning ?? [])];
+    if (!exprs.every((e) => e === undefined || readsRows(e, 0))) return null;
+    const table = this.env.getTable(from[0].op.table, from[0].op.db);
+    if (!table) return null;
+    const scope = new Scope(null);
+    const b = this.bindings(scope, null);
+    const root = this.planFromShape(from, where, scope, null, b);
+    const rowid = b.fromRow[op.rowid];
+    b.useOf(rowid)();
+    const colRegs = table.columns.map((_c, i) => b.fromRow[i].reg);
+    // Target rowids are collected and sorted before any change: scan order is not observable.
+    if (!op.from) markUnordered(root);
+    const sets = op.sets.map((x) => ({ column: x.column, c: compileBoundExpr(b.bind(x.value, b.fromSlot), this.env.funcCtx) }));
+    return { root, rowidReg: rowid.reg, colRegs, sets };
+  }
+
+  /**
+   * Expressions over a written row held in registers (RETURNING): the table's `ncols` columns from `base`, then its
+   * rowid in `rowidReg`.
+   */
+  compileRowExprs(exprs: readonly PlanExpr[], ncols: number, base: number, rowidReg: number): Fn[] {
+    const b = this.bindings(new Scope(null), null);
+    const row: ColMap = (c) => slotFor(c, c.index < ncols ? base + c.index : rowidReg);
+    return exprs.map((e) => compileBoundExpr(b.bind(e, row), this.env.funcCtx).fn);
   }
 
   /**
@@ -3666,6 +3706,7 @@ function planWidth(op: PlanOp): number {
     case 'join':
       return op.kind === 'semi' || op.kind === 'anti' ? planWidth(op.inputs[0]) : planWidth(op.inputs[0]) + planWidth(op.inputs[1]);
     case 'delete':
+    case 'update':
       return op.returning?.length ?? 0;
   }
 }

@@ -109,6 +109,21 @@ export type PlanOp =
    * deleted row: the table's columns, then its rowid. Outputs the RETURNING rows.
    */
   | { readonly op: 'delete'; readonly table: string; readonly db: 'main' | 'temp'; readonly input: PlanOp; readonly rowid: number; readonly returning?: readonly PlanExpr[] }
+  /**
+   * UPDATE: for each row of `input` (the target's rows, joined with the FROM sources when `from`), sets the target
+   * row whose rowid is in column `rowid`: each of `sets` assigns `value` (over the input row) to the table's column
+   * `column` (-1: the rowid). `returning` reads each updated row: the table's columns, then its rowid.
+   */
+  | {
+      readonly op: 'update';
+      readonly table: string;
+      readonly db: 'main' | 'temp';
+      readonly input: PlanOp;
+      readonly rowid: number;
+      readonly sets: readonly { readonly column: number; readonly value: PlanExpr }[];
+      readonly from: boolean;
+      readonly returning?: readonly PlanExpr[];
+    }
   /** One window (PARTITION BY, ORDER BY, frame): outputs its input's columns, then one column per call. */
   | {
       readonly op: 'window';

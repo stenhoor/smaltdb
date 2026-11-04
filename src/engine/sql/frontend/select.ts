@@ -23,7 +23,7 @@ import { getMeta, markFlattened, setMeta, setSubquerySql } from '../../exec/sql-
 import type { AggCall, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../plan/ops.js';
 import type { CollationName } from '../../plan/types.js';
 import { Collation } from '../../values.js';
-import type { CallExpr, ColumnExpr, DeleteStmt, Expr, FrameBound, FromItem, JoinType, OrderingTerm, ResultColumn, SelectCore, SelectCoreSelect, SelectStmt, WindowSpec, WithClause } from '../ast.js';
+import type { CallExpr, ColumnExpr, DeleteStmt, Expr, UpdateStmt, FrameBound, FromItem, JoinType, OrderingTerm, ResultColumn, SelectCore, SelectCoreSelect, SelectStmt, WindowSpec, WithClause } from '../ast.js';
 
 /** What the front end needs of the catalog. */
 export interface FrontEndCatalog {
@@ -91,6 +91,16 @@ export function toPlan(
 export function toDeletePlan(stmt: DeleteStmt, table: TableSchema, text: string, catalog: FrontEndCatalog): FrontEndWrite {
   const fe = new FrontEnd(catalog, text);
   const r = fe.deletePlan(stmt, table);
+  return { plan: fe.resolveRefs(r.plan), returning: r.returning };
+}
+
+/**
+ * UPDATE (ADR 0014, step 8b): an `update` plan over the rows of `table` (resolved and checked by the database), with
+ * the FROM sources, that the WHERE keeps; its SET values, and RETURNING over each updated row.
+ */
+export function toUpdatePlan(stmt: UpdateStmt, table: TableSchema, text: string, catalog: FrontEndCatalog): FrontEndWrite {
+  const fe = new FrontEnd(catalog, text);
+  const r = fe.updatePlan(stmt, table);
   return { plan: fe.resolveRefs(r.plan), returning: r.returning };
 }
 
@@ -262,6 +272,35 @@ class FrontEnd {
   }
 
   // ---------------------------------------------------------------- writes
+
+  updatePlan(stmt: UpdateStmt, table: TableSchema): { plan: PlanOp; returning?: { name: string; type: StaticType }[] } {
+    // As `Database.planTarget`: the target (in its resolved schema), joined with the FROM sources, under the CTEs.
+    const withScope = new FeScope(null);
+    withScope.ctesOnly = true;
+    if (stmt.with) this.registerCtes(stmt.with, withScope);
+    const scope = new FeScope(stmt.with ? withScope : null);
+    const db = table.temp ? 'temp' : 'main';
+    const target: FromItem = { kind: 'table', pos: 0, schema: db, name: table.name, alias: stmt.alias, end: 0 };
+    const item: FromItem = stmt.from ? { kind: 'join', joinType: 'INNER', natural: false, left: target, right: stmt.from, pos: 0, end: 0 } : target;
+    const input = this.from(item, stmt.where, scope);
+    const rowid = scope.sources[0].rowid!;
+    // As `Database.compileUpdate`: each assignment's target column, then its value over the FROM row.
+    const cs = this.compileScope(scope);
+    const sets: { column: number; value: PlanExpr }[] = [];
+    for (const s of stmt.set) {
+      if (s.columns.length !== 1) throw new SmaltError('SMALT_UNSUPPORTED', 'row-value assignments are not supported yet');
+      const name = s.columns[0];
+      let column = table.columns.findIndex((c) => sameName(c.name, name));
+      if (column < 0) {
+        if (ROWID_NAMES.has(name.toLowerCase())) column = -1;
+        else throw new SmaltError('SMALT_ERROR', `no such column: ${name}`);
+      }
+      sets.push({ column, value: bindExpr(s.value, cs) });
+    }
+    const ret = stmt.returning ? this.returning(stmt.returning, table, stmt.alias) : undefined;
+    const plan: PlanOp = { op: 'update', table: table.name, db, input, rowid, sets, from: stmt.from !== undefined, ...(ret ? { returning: ret.exprs } : {}) };
+    return { plan, returning: ret?.columns };
+  }
 
   deletePlan(stmt: DeleteStmt, table: TableSchema): { plan: PlanOp; returning?: { name: string; type: StaticType }[] } {
     // As `Database.planTarget`: the target (in its resolved schema) in a scope under the statement's CTEs.
@@ -1169,6 +1208,11 @@ class FrontEnd {
         break;
       case 'delete':
         this.resolveRefs(o.input);
+        if (o.returning) list(o.returning);
+        break;
+      case 'update':
+        this.resolveRefs(o.input);
+        for (const x of o.sets) (x as { value: PlanExpr }).value = ex(x.value);
         if (o.returning) list(o.returning);
         break;
       case 'window': {
