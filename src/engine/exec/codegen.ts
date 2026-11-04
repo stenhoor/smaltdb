@@ -569,7 +569,18 @@ function cellIsFast(spec: LoaderSpec): string {
  * types baked in. Returns false (caller uses the generic reader) for cells whose value is in
  * overflow pages or whose record has a different column count (older rows after ADD COLUMN).
  */
+/**
+ * Loader factories by table layout (its slot array, shared by a table's readers) and then by decoded columns and
+ * rowid registers: a statement over a known layout skips building the loader's source.
+ */
+const loaderBySpec = new WeakMap<Int32Array, Map<string, (H: LoaderHelpers) => Loader>>();
+
 export function generateLoader(spec: LoaderSpec, helpers: LoaderHelpers): Loader {
+  let byLayout = loaderBySpec.get(spec.slots);
+  if (byLayout === undefined) loaderBySpec.set(spec.slots, (byLayout = new Map()));
+  const key = `${spec.decode.join(',')}|${spec.rowidRegs.join(',')}`;
+  const known = traced ? undefined : byLayout.get(key);
+  if (known !== undefined) return known(helpers);
   const L: string[] = [];
   L.push('const p = c.page; const b = p.bytes; const dv = p.view; const off = c.cellOffset();');
   L.push(`if (!(${cellIsFast(spec)})) return false;`);
@@ -583,6 +594,8 @@ export function generateLoader(spec: LoaderSpec, helpers: LoaderHelpers): Loader
     if (loaderFactories.size > 500) loaderFactories.clear();
     loaderFactories.set(body, factory);
   }
+  if (byLayout.size > 200) byLayout.clear();
+  byLayout.set(key, factory);
   return factory(helpers);
 }
 

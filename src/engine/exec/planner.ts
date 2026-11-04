@@ -1971,7 +1971,10 @@ export class Planner {
 
     // RIGHT / FULL JOIN make every earlier source NULL-extendable: WHERE conjuncts reading those
     // sources must not be pushed below the join (FROM order is kept; see OuterJoin).
-    const outerAt = scope.sources.flatMap((s, i) => (s.joinType === 'RIGHT' || s.joinType === 'FULL' ? [i] : []));
+    const outerAt: number[] = [];
+    scope.sources.forEach((s, i) => {
+      if (s.joinType === 'RIGHT' || s.joinType === 'FULL') outerAt.push(i);
+    });
     const hasOuter = outerAt.length > 0;
     if (hasOuter && items.some((it, i) => (it.using || it.natural) && (scope.sources[i].joinType === 'RIGHT' || scope.sources[i].joinType === 'FULL'))) {
       throw new SmaltError('SMALT_UNSUPPORTED', 'USING / NATURAL with RIGHT or FULL JOIN is not supported yet');
