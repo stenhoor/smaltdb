@@ -102,7 +102,12 @@ import type { AggCall, JoinKind, PlanOp, SortKey as PlanSortKey } from '../plan/
 import type { CollationName } from '../plan/types.js';
 import type { ExternalSource } from '../external/external.js';
 
-export interface PlannerEnv {
+/**
+ * The physical environment the planner plans against (ADR 0015 section 3): tables with their storage, the rows of
+ * virtual tables and external sources, trees, statistics, spilling and execution state. Languages bind against the
+ * logical catalog instead (plan/bind-context.ts `BindContext`).
+ */
+export interface PhysicalEnv {
   /** A table by name; `schema` 'main' / 'temp' picks that schema when a TEMP table shadows a main one. */
   getTable(name: string, schema?: string): TableSchema | undefined;
   /**
@@ -110,8 +115,6 @@ export interface PlannerEnv {
    * functions such as `pragma_table_info(t)` (schema undefined). Rows are computed at open.
    */
   virtualTable?(schema: string | undefined, name: string): { columns: { name: string; type: StaticType }[]; rows: (args: SqlValue[]) => SqlValue[][] } | undefined;
-  /** A view's definition, expanded where the view is referenced. */
-  getView?(name: string, schema?: string): { name: string; sql: string; columns?: string[]; select: SelectStmt } | undefined;
   openTree(rootPage: number): BTree;
   /** On-demand statistics for a table without ANALYZE results (sampled; cached by the database). */
   sampledStats?(table: TableSchema): TableStats | undefined;
@@ -126,20 +129,14 @@ export interface PlannerEnv {
   /** Scratch file for sorts and hash aggregates that outgrow work_mem (M7.2). */
   spill?: SpillArea | null;
   /**
-   * Materialized-view matching (M7.5): `select` (SQL text `text`) rewritten to read a fresh
-   * materialized view, or null. Absent when the statement may not use views.
-   */
-  /**
    * Materialized-view matching on plans (exec/plan-mv-match.ts), under the statement's policy: the planner applies it
    * to the plans it builds itself (a decorrelated subquery's inner side).
    */
   rewritePlan?(plan: PlanOp): PlanOp;
   /** M8: an external table by name (its columns from the catalog; its rows once loaded). */
   externalTable?(name: string): ExternalScan | undefined;
-  /** M8: a reading table function (`read_csv`, `read_json`) called with constant arguments. */
+  /** M8: a table function over external data (`read_csv`, `read_json`) called with constant arguments; undefined for other functions. */
   externalFunction?(name: string, args: SqlValue[], named: Record<string, SqlValue>): ExternalScan | undefined;
-  /** Whether `name` is a table function over external data (built in or from a plugin). */
-  isExternalFunction?(name: string): boolean;
 }
 
 /** Table functions that read external data (their arguments must be constants). */
@@ -485,7 +482,7 @@ const SUBQUERY_ROWS = 1000;
 
 export class Planner {
   constructor(
-    readonly env: PlannerEnv,
+    readonly env: PhysicalEnv,
     readonly regs: Registers,
   ) {}
 
@@ -2163,7 +2160,7 @@ export class Planner {
    */
   private externalScan(item: PlanLeaf, scope: Scope, planArgs: BoundExpr[], planNamed?: Record<string, BoundExpr>): ExternalScan | undefined {
     if (item.kind === 'function') {
-      if (!this.env.isExternalFunction?.(item.name) || !this.env.externalFunction) return undefined;
+      if (!this.env.externalFunction) return undefined;
       const v = (b: BoundExpr): SqlValue => compileBoundExpr(b, this.env.funcCtx).fn([]);
       const named: Record<string, SqlValue> = {};
       for (const [k, b] of Object.entries(planNamed ?? {})) named[k] = v(b);

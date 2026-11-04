@@ -22,9 +22,10 @@ SQL text
     per next() call
 ```
 
-Before binding, the front end applies two AST rewrites:
-materialized-view matching (`exec/mv-match.ts`) and the merging of simple views and FROM subqueries
-(`exec/flatten.ts`). Every SELECT, INSERT, UPDATE and DELETE goes through the plan layer, and so do the queries
+Before binding, the front end merges simple views and FROM subqueries into the query (`exec/flatten.ts`, an AST
+rewrite). Materialized-view matching works on the bound plan (`exec/plan-mv-match.ts`), at any depth, including the
+inner sides the planner builds when it decorrelates a subquery. Languages bind against the logical catalog
+(`plan/bind-context.ts` `BindContext`); the planner plans against its physical environment (`PhysicalEnv`). Every SELECT, INSERT, UPDATE and DELETE goes through the plan layer, and so do the queries
 the engine plans for itself (materialized-view layout and refresh, view checks after DDL). The planner's AST path
 (`Planner.planSelect` and the write compile functions in `database.ts`) has been deleted.
 

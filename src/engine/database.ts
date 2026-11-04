@@ -22,11 +22,12 @@ import type { CollationName } from './plan/types.js';
 import { type CompileScope, type Compiled, type Fn, compileExpr } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
-import { type ExternalScan, Planner, type PlannerEnv, type QueryPlan, Registers } from './exec/planner.js';
+import { type ExternalScan, type PhysicalEnv, Planner, type QueryPlan, Registers } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
-import { type FrontEndCatalog, toDeletePlan, toInsertPlan, toPlan, toUpdatePlan } from './sql/frontend/select.js';
+import { toDeletePlan, toInsertPlan, toPlan, toUpdatePlan } from './sql/frontend/select.js';
+import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import type { ReaderSettings } from '../shared/protocol.js';
@@ -842,10 +843,10 @@ export class Database implements FunctionContext {
         const v = this.views.get(name.toLowerCase());
         if (!v) return null;
         try {
-          const deps: PlannerEnv = { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state };
-          const planner = new Planner(deps, new Registers(0));
+          const { env, catalog } = this.viewCheckEnv();
+          const planner = new Planner(env, new Registers(0));
           planner.sqlText = v.sql;
-          const plan = this.planSelectStmt(v.select, v.sql, planner, this.catalogFor(deps));
+          const plan = this.planSelectStmt(v.select, v.sql, planner, catalog);
           return plan.columns.map((c, i) => ({ name: v.columns?.[i] ?? c.name, declType: c.declType ?? '' }));
         } catch {
           return null;
@@ -1026,31 +1027,45 @@ export class Database implements FunctionContext {
   }
 
   /** What the SQL front end (ADR 0014, step 5) reads of the catalog (it reads the database's state when called). */
-  private frontEndCatalog(): FrontEndCatalog {
-    return (this.feCatalog ??= this.catalogFor(this.plannerDeps()));
+  /** The logical catalog languages bind against (plan/bind-context.ts): the planner's tables, views and sources. */
+  private bindContext(): BindContext {
+    return (this.bindCtx ??= {
+      getTable: (n, schema) => this.plannedTable(n, schema),
+      getView: (n, schema) => this.getView(n, schema),
+      isExternal: (n) => this.externals.has(n.toLowerCase()),
+      externalColumns: (n) => this.externalTableScan(n)?.columns,
+      externalFunctionColumns: (n, args, named) => this.externalFunctionScan(n, args, named)?.columns,
+      isExternalFunction: (n) => this.external.plugins.isExternalFunction(n),
+      virtualTable: (schema, n) => this.virtualTable(schema, n),
+      funcCtx: this,
+    });
   }
 
-  /** The SQL front end's view of the planner dependencies `deps` (the same tables, views and sources). */
-  private catalogFor(deps: PlannerEnv): FrontEndCatalog {
+  private bindCtx: BindContext | null = null;
+
+  /** The environment that checks a view still plans after a schema change: tables and views only, no sources. */
+  private viewCheckEnv(): { env: PhysicalEnv; catalog: BindContext } {
+    const getTable = (n: string): TableSchema | undefined => this.getTable(n);
     return {
-      getTable: deps.getTable,
-      getView: deps.getView,
-      isExternal: (n) => this.externals.has(n.toLowerCase()),
-      externalColumns: (n) => deps.externalTable?.(n)?.columns,
-      externalFunctionColumns: (n, args, named) => deps.externalFunction?.(n, args, named)?.columns,
-      isExternalFunction: deps.isExternalFunction,
-      virtualTable: deps.virtualTable,
-      funcCtx: this,
+      env: { getTable, openTree: (root) => this.tree(root), funcCtx: this, state: this.state },
+      catalog: { getTable, getView: (n) => this.getView(n), isExternal: (n) => this.externals.has(n.toLowerCase()), funcCtx: this },
     };
   }
 
-  private feCatalog: FrontEndCatalog | null = null;
+  /** A table the planner reads: a materialized view must have been populated. */
+  private plannedTable(name: string, schema?: string): TableSchema | undefined {
+    const t = this.getTable(name, schema);
+    if (t?.matview && !t.matview.populated) {
+      throw new SmaltError('SMALT_ERROR', `materialized view "${t.name}" has not been populated (use REFRESH MATERIALIZED VIEW)`);
+    }
+    return t;
+  }
 
   /**
    * A top-level SELECT through the plan layer (ADR 0014), against `catalog` (the planner's tables), with
    * materialized-view matching on its plan under the statement's policy (exec/plan-mv-match.ts).
    */
-  private planSelectStmt(stmt: SelectStmt, text: string, planner: Planner, catalog: FrontEndCatalog = this.frontEndCatalog()): QueryPlan {
+  private planSelectStmt(stmt: SelectStmt, text: string, planner: Planner, catalog: BindContext = this.bindContext()): QueryPlan {
     const fe = toPlan(stmt, text, catalog);
     const rewrite = planner.env.rewritePlan;
     const p = planner.planPlan(rewrite ? rewrite(fe.plan) : fe.plan, fe.columns);
@@ -1145,20 +1160,12 @@ export class Database implements FunctionContext {
   }
 
   /** What the planner reads from the database. Unpopulated materialized views cannot be read. */
-  private plannerDeps(rewrite: { exclude: string | null } | null = null): ConstructorParameters<typeof Planner>[0] {
+  private plannerDeps(rewrite: { exclude: string | null } | null = null): PhysicalEnv {
     return {
       rewritePlan: rewrite ? (plan) => this.matviewRewritePlan(plan, rewrite.exclude) : undefined,
       externalTable: (n) => this.externalTableScan(n),
-      externalFunction: (n, args, named) => this.externalFunctionScan(n, args, named),
-      isExternalFunction: (n) => this.external.plugins.isExternalFunction(n),
-      getTable: (n, schema) => {
-        const t = this.getTable(n, schema);
-        if (t?.matview && !t.matview.populated) {
-          throw new SmaltError('SMALT_ERROR', `materialized view "${t.name}" has not been populated (use REFRESH MATERIALIZED VIEW)`);
-        }
-        return t;
-      },
-      getView: (n, schema) => this.getView(n, schema),
+      externalFunction: (n, args, named) => (this.external.plugins.isExternalFunction(n) ? this.externalFunctionScan(n, args, named) : undefined),
+      getTable: (n, schema) => this.plannedTable(n, schema),
       virtualTable: (schema, n) => this.virtualTable(schema, n),
       openTree: (root) => this.tree(root),
       sampledStats: (t) => this.sampledStats(t),
@@ -1170,6 +1177,7 @@ export class Database implements FunctionContext {
       spill: this.spill,
     };
   }
+
 
   /** Program for a write statement; with RETURNING it produces rows (and still counts changes). */
   private dmlProgram(c: { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } }, singleRowWrite = false): Omit<Program, 'regCount'> {
@@ -1727,7 +1735,7 @@ export class Database implements FunctionContext {
       if (m.plan?.version !== this.schemaVersion) {
         let bound: PlanOp | null;
         try {
-          bound = toPlan(m.select, m.sql, this.frontEndCatalog()).plan;
+          bound = toPlan(m.select, m.sql, this.bindContext()).plan;
         } catch {
           bound = null;
         }
@@ -1852,7 +1860,7 @@ export class Database implements FunctionContext {
     if (!m) return null;
     // A fresh materialized view answers it more cheaply than any split of the base table.
     if (m.parsed.stmt.kind === 'select' && this.matviewRewriteOn) {
-      const plan = toPlan(m.parsed.stmt, m.parsed.text, this.frontEndCatalog()).plan;
+      const plan = toPlan(m.parsed.stmt, m.parsed.text, this.bindContext()).plan;
       if (this.matviewRewritePlan(plan) !== plan) return null;
     }
     const t = this.getTable(m.q.table)!;
@@ -3060,10 +3068,10 @@ export class Database implements FunctionContext {
     this.loadSchema();
     for (const v of this.views.values()) {
       try {
-        const deps: PlannerEnv = { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state };
-        const planner = new Planner(deps, new Registers(0));
+        const { env, catalog } = this.viewCheckEnv();
+        const planner = new Planner(env, new Registers(0));
         planner.sqlText = v.sql;
-        this.planSelectStmt(v.select, v.sql, planner, this.catalogFor(deps));
+        this.planSelectStmt(v.select, v.sql, planner, catalog);
       } catch (e) {
         // A view that was already broken (e.g. dangling) stays as it was, like SQLite.
         if (!this.viewWasValid.has(v.name.toLowerCase())) continue;
@@ -3078,10 +3086,10 @@ export class Database implements FunctionContext {
     this.viewWasValid = new Set();
     for (const v of this.views.values()) {
       try {
-        const deps: PlannerEnv = { getTable: (n) => this.getTable(n), getView: (n) => this.getView(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state };
-        const planner = new Planner(deps, new Registers(0));
+        const { env, catalog } = this.viewCheckEnv();
+        const planner = new Planner(env, new Registers(0));
         planner.sqlText = v.sql;
-        this.planSelectStmt(v.select, v.sql, planner, this.catalogFor(deps));
+        this.planSelectStmt(v.select, v.sql, planner, catalog);
         this.viewWasValid.add(v.name.toLowerCase());
       } catch {
         /* already broken */
@@ -3513,7 +3521,7 @@ export class Database implements FunctionContext {
     };
     const physical = (): InsertParts | null => {
       const p = prefix();
-      const fe = toInsertPlan(stmt, table, targets.map((t) => (t === -2 ? -1 : t)), planner.sqlText, this.frontEndCatalog());
+      const fe = toInsertPlan(stmt, table, targets.map((t) => (t === -2 ? -1 : t)), planner.sqlText, this.bindContext());
       // Materialized-view matching may answer the SELECT source (under the statement's policy).
       const rewrite = planner.env.rewritePlan;
       const op = rewrite ? rewrite(fe.plan) : fe.plan;
@@ -3727,7 +3735,7 @@ export class Database implements FunctionContext {
       return { ...t, defaults, base, checkRowid, checks, ret: returning(base, checkRowid, newRowScope) };
     };
     const physical = (): UpdateParts | null => {
-      const fe = toUpdatePlan(stmt, table, planner.sqlText, this.frontEndCatalog());
+      const fe = toUpdatePlan(stmt, table, planner.sqlText, this.bindContext());
       const op = fe.plan;
       const p = op.op === 'update' ? planner.planUpdate(op) : null;
       if (!p || op.op !== 'update') return null;
@@ -3755,7 +3763,7 @@ export class Database implements FunctionContext {
    */
   private deleteParts(stmt: DeleteStmt, table: TableSchema, planner: Planner): DeleteParts {
     const physical = (): DeleteParts | null => {
-      const fe = toDeletePlan(stmt, table, planner.sqlText, this.frontEndCatalog());
+      const fe = toDeletePlan(stmt, table, planner.sqlText, this.bindContext());
       const p = fe.plan.op === 'delete' ? planner.planDelete(fe.plan) : null;
       if (!p) return null;
       const ret = fe.returning && { columns: fe.returning.map((c) => c.name), types: fe.returning.map((c) => c.type), fns: p.returning! };

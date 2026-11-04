@@ -7,7 +7,7 @@ import { type TableSchema, findColumn, storageTypeFor } from '../../catalog/sche
 import { SmaltError } from '../../errors.js';
 import { type Affinity, type StaticType, affinityOfStorage, staticTypeOfStorage } from '../../exec/convert.js';
 import { CollSrc, type ColumnBinding, type CompileScope, bindExpr as bindAst, boundMetadata, compileBoundExpr, conjuncts, withCompiledMeta as withCompiledMetaBound } from '../../exec/expr.js';
-import { type FunctionContext, aggregateFunctions, scalarFunctions } from '../../exec/functions.js';
+import { aggregateFunctions, scalarFunctions } from '../../exec/functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../../exec/window.js';
 import { flattenCore, flatteningDisabled } from '../../exec/flatten.js';
 import { aggregateCallName } from '../ast-util.js';
@@ -15,6 +15,7 @@ import { containsAggregate, containsWindow, coreReferences, exprEquals, firstAgg
 import { type BoundExpr, type PlanExpr, typeOf } from '../../plan/expr.js';
 import { getMeta, markFlattened, setMeta } from '../../exec/sql-meta.js';
 import type { AggCall, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../plan/ops.js';
+import type { BindContext } from '../../plan/bind-context.js';
 import type { CollationName } from '../../plan/types.js';
 import { Collation, type SqlValue } from '../../values.js';
 import type { CallExpr, ColumnExpr, DeleteStmt, Expr, InsertStmt, UpdateStmt, UpsertClause, FrameBound, FromItem, JoinType, OrderingTerm, ResultColumn, SelectCore, SelectCoreSelect, SelectStmt, WindowSpec, WithClause } from '../ast.js';
@@ -25,23 +26,6 @@ import type { CallExpr, ColumnExpr, DeleteStmt, Expr, InsertStmt, UpdateStmt, Up
  */
 const bindExpr = (e: Expr, scope: CompileScope): PlanExpr => bindAst(e, scope) as PlanExpr;
 const withCompiledMeta = (e: PlanExpr, c: Parameters<typeof withCompiledMetaBound>[1]): PlanExpr => withCompiledMetaBound(e, c) as PlanExpr;
-
-/** What the front end needs of the catalog. */
-export interface FrontEndCatalog {
-  getTable(name: string, schema?: string): TableSchema | undefined;
-  getView?(name: string, schema?: string): { name: string; sql: string; columns?: string[]; select: SelectStmt } | undefined;
-  /** True for an external table (not handled by the front end yet). */
-  isExternal?(name: string): boolean;
-  /** The columns of an external table. */
-  externalColumns?(name: string): { name: string; type: StaticType; declType?: string }[] | undefined;
-  /** The columns of an external table function call (`read_csv('…')`) with these constant arguments. */
-  externalFunctionColumns?(name: string, args: SqlValue[], named: Record<string, SqlValue>): { name: string; type: StaticType; declType?: string }[] | undefined;
-  /** A table function that reads external data (`read_csv`): its columns come from the data. */
-  isExternalFunction?(name: string): boolean;
-  /** Virtual tables: `information_schema.<name>`, the TEMP catalog, table-valued functions (schema undefined). */
-  virtualTable?(schema: string | undefined, name: string): { columns: { name: string; type: StaticType }[] } | undefined;
-  funcCtx: FunctionContext;
-}
 
 /** A result column, with the metadata SQL keeps beside the plan. */
 export interface FrontEndColumn {
@@ -91,7 +75,7 @@ class LaterSource extends Error {}
 /**
  * Plan a SELECT. `text` is the statement's SQL text (result columns are named from it). Throws SQLite's errors.
  */
-export function toPlan(stmt: SelectStmt, text: string, catalog: FrontEndCatalog): FrontEndResult {
+export function toPlan(stmt: SelectStmt, text: string, catalog: BindContext): FrontEndResult {
   const fe = new FrontEnd(catalog, text);
   const r = fe.select(stmt, null);
   return { plan: fe.resolveRefs(r.plan), columns: r.columns };
@@ -101,7 +85,7 @@ export function toPlan(stmt: SelectStmt, text: string, catalog: FrontEndCatalog)
  * DELETE (ADR 0014, step 8a): a `delete` plan over the rows of `table` (resolved and checked by the database) that
  * the WHERE keeps, with RETURNING over each deleted row. Throws the error the planner would raise.
  */
-export function toDeletePlan(stmt: DeleteStmt, table: TableSchema, text: string, catalog: FrontEndCatalog): FrontEndWrite {
+export function toDeletePlan(stmt: DeleteStmt, table: TableSchema, text: string, catalog: BindContext): FrontEndWrite {
   const fe = new FrontEnd(catalog, text);
   const r = fe.deletePlan(stmt, table);
   return { plan: fe.resolveRefs(r.plan), returning: r.returning };
@@ -111,7 +95,7 @@ export function toDeletePlan(stmt: DeleteStmt, table: TableSchema, text: string,
  * UPDATE (ADR 0014, step 8b): an `update` plan over the rows of `table` (resolved and checked by the database), with
  * the FROM sources, that the WHERE keeps; its SET values, and RETURNING over each updated row.
  */
-export function toUpdatePlan(stmt: UpdateStmt, table: TableSchema, text: string, catalog: FrontEndCatalog): FrontEndWrite {
+export function toUpdatePlan(stmt: UpdateStmt, table: TableSchema, text: string, catalog: BindContext): FrontEndWrite {
   const fe = new FrontEnd(catalog, text);
   const r = fe.updatePlan(stmt, table);
   return { plan: fe.resolveRefs(r.plan), returning: r.returning };
@@ -127,7 +111,7 @@ export function toInsertPlan(
   table: TableSchema,
   columns: number[],
   text: string,
-  catalog: FrontEndCatalog,
+  catalog: BindContext,
 ): FrontEndWrite & { source?: FrontEndColumn[] } {
   const fe = new FrontEnd(catalog, text);
   const r = fe.insertPlan(stmt, table, columns);
@@ -255,7 +239,7 @@ class FrontEnd {
   private readonly expandingAliases = new Set<string>();
 
   constructor(
-    private readonly catalog: FrontEndCatalog,
+    private readonly catalog: BindContext,
     private text: string,
   ) {}
 

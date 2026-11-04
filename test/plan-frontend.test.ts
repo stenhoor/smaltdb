@@ -3,11 +3,12 @@ import { describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
 import { parseOne } from '../src/engine/sql/parser.js';
 import type { SelectStmt } from '../src/engine/sql/ast.js';
-import { type FrontEndCatalog, toPlan } from '../src/engine/sql/frontend/select.js';
+import type { BindContext } from '../src/engine/plan/bind-context.js';
+import { toPlan } from '../src/engine/sql/frontend/select.js';
 import { printPlan } from '../src/engine/plan/print.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
 
-async function setup(): Promise<{ db: Database; catalog: FrontEndCatalog }> {
+async function setup(): Promise<{ db: Database; catalog: BindContext }> {
   const db = await Database.open(new MemoryVfs(), 'db');
   db.exec(`
     CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, s TEXT COLLATE NOCASE);
@@ -15,11 +16,11 @@ async function setup(): Promise<{ db: Database; catalog: FrontEndCatalog }> {
     CREATE VIEW v AS SELECT a AS va, s FROM t WHERE a > 0;
     CREATE TABLE w(a INT, z TEXT);
   `);
-  const catalog = (db as unknown as { frontEndCatalog(): FrontEndCatalog }).frontEndCatalog();
+  const catalog = (db as unknown as { bindContext(): BindContext }).bindContext();
   return { db, catalog };
 }
 
-const plan = (catalog: FrontEndCatalog, sql: string) => {
+const plan = (catalog: BindContext, sql: string) => {
   const r = toPlan(parseOne(sql).stmt as SelectStmt, sql, catalog);
   return r && { text: printPlan(r.plan), columns: r.columns.map((c) => `${c.name} ${c.type}${c.declType ? ` ${c.declType}` : ''}${c.collation ? ' nocase' : ''}`) };
 };
