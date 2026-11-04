@@ -55,7 +55,7 @@ export function printPlan(op: PlanOp, depth = 0): string {
     case 'scan':
       return `${pad}scan ${op.db ? `${op.db}.` : ''}${op.table} [${op.columns.join(', ')}]`;
     case 'source':
-      return `${pad}${op.kind} ${op.schema ? `${op.schema}.` : ''}${op.name}(${list(op.args)})`;
+      return `${pad}${op.kind} ${op.schema ? `${op.schema}.` : ''}${op.name}(${[list(op.args), ...Object.entries(op.named ?? {}).map(([k, e]) => `${k} => ${printExpr(e)}`)].filter((x) => x).join(', ')})`;
     case 'iterate':
       return [`${pad}iterate #${op.id}${op.distinct ? ' distinct' : ''}${op.limit ? ` limit ${printExpr(op.limit)}` : ''}`, sub(op.init), ...op.steps.map(sub)].join('\n');
     case 'working':

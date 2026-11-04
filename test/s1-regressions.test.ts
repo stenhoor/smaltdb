@@ -134,7 +134,8 @@ describe('S1-4: materialized-view freshness', () => {
   it('a CTE named like its base table still depends on the table', async () => {
     const db = await fileDb();
     db.exec('CREATE TABLE t(x INT); INSERT INTO t VALUES (1), (2), (3)');
-    db.exec('CREATE MATERIALIZED VIEW mv AS WITH t AS (SELECT * FROM t WHERE x > 0) SELECT count(*) AS n FROM t');
+    // The body names the table as main.t: an unqualified t in a CTE named t is a circular reference, as in SQLite.
+    db.exec('CREATE MATERIALIZED VIEW mv AS WITH t AS (SELECT * FROM main.t WHERE x > 0) SELECT count(*) AS n FROM t');
     db.exec('INSERT INTO t VALUES (4)');
     expect(fresh(db)).toBe('NO');
   });

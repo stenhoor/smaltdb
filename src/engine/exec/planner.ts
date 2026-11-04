@@ -449,6 +449,8 @@ interface BoundFrom {
   items: { item: FromItem; joinType: JoinType }[];
   /** A table function's arguments (item `p`), bound to the earlier items' registers. */
   args(p: number): PlanExpr[] | undefined;
+  /** An external table function's named arguments (item `p`), bound. */
+  named?(p: number): Record<string, PlanExpr> | undefined;
   /** Item `p` planned (a nested plan), or undefined: registered from its FROM item. `working`: a recursive step's rows. */
   source(p: number): { plan: QueryPlan; working?: boolean } | undefined;
   /** Item `p` was registered: its registers are known. */
@@ -1365,6 +1367,10 @@ export class Planner {
         const l = leaves[p].op;
         return l.op === 'source' && l.kind === 'function' ? l.args.map((a) => bind(a, fromSlot)) : undefined;
       },
+      named: (p) => {
+        const l = leaves[p].op;
+        return l.op === 'source' && l.named ? Object.fromEntries(Object.entries(l.named).map(([k, a]) => [k, bind(a, fromSlot)])) : undefined;
+      },
       added: (p) => {
         const src = scope.sources[p];
         const l = leaves[p].op;
@@ -1934,7 +1940,7 @@ export class Planner {
     items.forEach((it, p) => {
       const planned = bound?.source(p);
       if (planned) this.addPlannedSource(planned.plan, it.joinType, scope, (it.item as { alias: string }).alias, planned.working === true);
-      else this.addSource(it.item, it.joinType, scope, bound?.args(p));
+      else this.addSource(it.item, it.joinType, scope, bound?.args(p), bound?.named?.(p));
       bound?.added(p);
     });
 
@@ -2140,9 +2146,9 @@ export class Planner {
   }
 
   /** `planArgs`: a table function's arguments bound from a plan (the physical planner), in place of the AST's. */
-  private addSource(item: FromItem, joinType: JoinType, scope: Scope, planArgs?: PlanExpr[]): void {
+  private addSource(item: FromItem, joinType: JoinType, scope: Scope, planArgs?: PlanExpr[], planNamed?: Record<string, PlanExpr>): void {
     const position = scope.sources.length;
-    const ext = this.externalScan(item, scope);
+    const ext = this.externalScan(item, scope, planArgs, planNamed);
     if (ext) {
       // External data (M8): rows loaded before the statement runs, scanned like a virtual table.
       this.externals.push(ext.source);
@@ -2970,11 +2976,20 @@ export class Planner {
     return this.externals;
   }
 
-  /** `item` as an external table or a `read_csv` / `read_json` call, if it is one. */
-  private externalScan(item: FromItem, scope: Scope): ExternalScan | undefined {
+  /**
+   * `item` as an external table or a `read_csv` / `read_json` call, if it is one. A call from a plan has its arguments
+   * bound (`planArgs`, `planNamed`; the front end checked that they are constant).
+   */
+  private externalScan(item: FromItem, scope: Scope, planArgs?: PlanExpr[], planNamed?: Record<string, PlanExpr>): ExternalScan | undefined {
     if (item.kind === 'function') {
       if (!this.env.isExternalFunction?.(item.name) || !this.env.externalFunction) return undefined;
       const cs = this.compileScope(scope);
+      if (planArgs) {
+        const v = (b: PlanExpr): SqlValue => compileBoundExpr(b, cs.funcCtx).fn([]);
+        const named: Record<string, SqlValue> = {};
+        for (const [k, b] of Object.entries(planNamed ?? {})) named[k] = v(b);
+        return this.env.externalFunction(item.name, planArgs.map(v), named);
+      }
       const value = (e: Expr): SqlValue => {
         const c = compileExpr(e, cs);
         if (!c.constant) throw new SmaltError('SMALT_ERROR', `${item.name}() arguments must be constants`);
@@ -3155,7 +3170,10 @@ export class Planner {
 
   private leftOnInfos(src: Source, scope: Scope): ConjunctInfo[] {
     if (src.onBound) return src.onBound.map((b) => this.boundConjunct(b, scope));
-    return src.on.flatMap((e) => splitBetween(e)).map((e) => this.conjunct(e, scope));
+    const infos = src.on.flatMap((e) => splitBetween(e)).map((e) => this.conjunct(e, scope));
+    // As SQLite: an outer join's condition reads only this source and the ones before it.
+    if (infos.some((c) => c.deps !== null && [...c.deps].some((p) => p > src.position))) throw new SmaltError('SMALT_ERROR', 'ON clause references tables to its right');
+    return infos;
   }
 
   /** A conjunct the physical planner bound from a plan. */
