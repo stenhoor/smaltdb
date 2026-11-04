@@ -1376,8 +1376,14 @@ export class Planner {
 
     // The FROM row: the registers of each source's columns, in FROM order, marked as read when an expression reading
     // them is compiled. Join conditions read input 0 (the sources before) and input 1 (the source being joined).
-    const fromRow: { reg: number; use: () => void }[] = [];
-    const fromSlot: ColMap = (c) => slotFor(c, fromRow[c.index].reg, fromRow[c.index].use);
+    // `col`: the table column (-1: the rowid), or the source's column. Marking it read is the slot's `use`.
+    const fromRow: { reg: number; src: Source; col: number }[] = [];
+    const useOf = (f: { reg: number; src: Source; col: number }): (() => void) => {
+      const { reg, src, col } = f;
+      if (src.access) return col < 0 ? () => this.dryCompile || src.access!.useRowid(reg) : () => this.dryCompile || src.access!.use(col, reg);
+      return () => this.dryCompile || src.external?.projection?.add(src.cols[col].name.toLowerCase());
+    };
+    const fromSlot: ColMap = (c) => slotFor(c, fromRow[c.index].reg, useOf(fromRow[c.index]));
     let root: Operator;
     if (s.from) {
       const leaves = s.from;
@@ -1387,7 +1393,7 @@ export class Planner {
         (p: number): ColMap =>
         (c) => {
           const f = fromRow[c.input === 1 ? offsets[p] + c.index : c.index];
-          return slotFor(c, f.reg, f.use);
+          return slotFor(c, f.reg, useOf(f));
         };
       root = this.planFrom(undefined, undefined, scope, {
         items: leaves.map((l, p) => ({ item: l.op.op === 'scan' || l.op.op === 'source' ? leafItem(l.op, p) : { kind: 'subquery', select: NO_SELECT, alias: `#${p}`, pos: 0, end: 0 }, joinType: JOIN_TYPES[l.join ?? 'inner'] })),
@@ -1408,15 +1414,8 @@ export class Planner {
         added: (p) => {
           const src = scope.sources[p];
           const l = leaves[p].op;
-          if (l.op === 'scan') {
-            const access = src.access!;
-            for (const c of l.columns) {
-              const reg = c < 0 ? src.rowidReg : src.cols[c].reg;
-              fromRow.push({ reg, use: c < 0 ? () => this.dryCompile || access.useRowid(reg) : () => this.dryCompile || access.use(c, reg) });
-            }
-          } else {
-            for (const c of src.cols) fromRow.push({ reg: c.reg, use: () => this.dryCompile || src.external?.projection?.add(c.name.toLowerCase()) });
-          }
+          if (l.op === 'scan') for (const c of l.columns) fromRow.push({ reg: c < 0 ? src.rowidReg : src.cols[c].reg, src, col: c });
+          else for (let i = 0; i < src.cols.length; i++) fromRow.push({ reg: src.cols[i].reg, src, col: i });
         },
         on: (p) => (leaves[p].on ? splitBoundConjuncts(leaves[p].on!).map((c) => conjunct(c, onSlot(p))) : []),
         where: () => (s.where ? splitBoundConjuncts(s.where).map((c) => conjunct(c, fromSlot)) : []),
@@ -1457,7 +1456,7 @@ export class Planner {
         const from = a.carry[i - a.keys.length - a.aggs.length] as ColRef;
         const f = fromRow[from.index];
         bare.add(f.reg);
-        return slotFor(c, f.reg, f.use);
+        return slotFor(c, f.reg, useOf(f));
       };
     }
 
@@ -3747,48 +3746,55 @@ function flatShape(op: PlanOp): FlatShape | null {
 
 function matchShape(op: PlanOp): FlatShape | null {
   let n = op;
-  const s: Partial<FlatShape> = {};
+  let limit: FlatShape['limit'];
+  let width = -1;
+  let sort: FlatShape['sort'];
+  let distinct: FlatShape['distinct'];
   if (n.op === 'limit') {
-    s.limit = { count: n.count, ...(n.offset ? { offset: n.offset } : {}) };
+    limit = { count: n.count, offset: n.offset };
     n = n.input;
   }
   // The projection that drops ORDER BY expressions which are not results.
   if (n.op === 'project' && n.input.op === 'sort' && n.exprs.every((e, i) => e.k === 'col' && e.depth === 0 && e.index === i)) {
-    s.width = n.exprs.length;
+    width = n.exprs.length;
     n = n.input;
   }
   if (n.op === 'sort') {
-    s.sort = n.keys;
+    sort = n.keys;
     n = n.input;
   }
   if (n.op === 'distinct') {
-    s.distinct = n.collations;
+    distinct = n.collations;
     n = n.input;
   }
   if (n.op !== 'project') return null;
-  s.project = n.exprs;
-  s.width ??= n.exprs.length;
+  const project = n.exprs;
+  if (width < 0) width = project.length;
   n = n.input;
-  s.windows = [];
+  const windows: WindowOp[] = [];
   while (n.op === 'window') {
-    s.windows.unshift(n);
+    windows.unshift(n);
     n = n.input;
   }
+  let having: PlanExpr | undefined;
+  let aggregate: AggregateOp | undefined;
+  let where: PlanExpr | undefined;
   if (n.op === 'filter' && n.input.op === 'aggregate') {
-    s.having = n.pred;
+    having = n.pred;
     n = n.input;
   }
   if (n.op === 'aggregate') {
-    s.aggregate = n;
+    aggregate = n;
     n = n.input;
   }
   if (n.op === 'filter') {
-    s.where = n.pred;
+    where = n.pred;
     n = n.input;
   }
-  if (n.op === 'values' && n.rows.length === 1 && n.rows[0].length === 0) s.from = null;
-  else if (!(s.from = fromLeaves(n))) return null;
-  return s as FlatShape;
+  const from = n.op === 'values' && n.rows.length === 1 && n.rows[0].length === 0 ? null : fromLeaves(n);
+  if (from === null && n.op !== 'values') return null;
+  // One object shape for every plan (the planner reads these often).
+  return { limit, sort, distinct, project, width, windows, having, aggregate, where, from };
 }
 
 /** Whether `f` holds for every expression of a flat shape but LIMIT / OFFSET (results, keys, conditions, arguments). */

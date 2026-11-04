@@ -44,7 +44,7 @@
 | `and`, `or`, `not`, `isNull`, `case` | Three-valued logic over 0 / 1 / NULL. |
 | `subquery { mode: scalar \| exists }`, `inSubquery` | Dependent evaluation of a nested plan. |
 | `lookup` | Step 7: a decorrelated dependent evaluation (keys, probe, guards, empty-set plan), lazy and cached per execution, as `decorrelate` is today. |
-| `slot`, `native` (internal) | Only while steps 3–5 run next to the current planner: an aggregate, group or window output register, and a subexpression the current planner compiled. Rejected by the validator, never serialized, removed in step 6d. |
+| `slot`, `native` (internal) | Only while steps 3–5 run next to the current planner: an aggregate, group or window output register, and a subexpression the current planner compiled. Rejected by the validator, never serialized, removed with the AST path after step 8. |
 
 **Operations:** `scan` (table and column positions, rowid as -1), `filter`, `project` (with output names), `limit`,
 `join` (inner, left, right, full, semi, anti, cross; output is the inputs concatenated), `sort`, `aggregate` (keys,
@@ -154,7 +154,7 @@ part can be on by default. Shadow mode also compares `EXPLAIN` rows from both pa
 operators.
 - **6a (done):** access-path and cost analysis read bound conjuncts (step 4b-ii above).
 - **6b (done), one source:** `Planner.planPlan` (in `exec/planner.ts` while it shares the planner's access-path code;
-  it moves to `exec/physical.ts` with 6d) builds operators for plans over one table or no FROM: scan (access paths
+  it moves to `exec/physical.ts` when the AST path goes) builds operators for plans over one table or no FROM: scan (access paths
   through `planFrom`, with the WHERE conjuncts bound from the plan), filter, project, aggregate (fused or hashed, with
   carried bare columns), HAVING, distinct, sort (top-N), limit; the count fast path, ORDER BY rowid elimination and
   fusion. Registers are allocated in the planner's order, so plan shapes and generated code are byte-identical under
@@ -181,13 +181,18 @@ operators.
     plan the planner may flatten into the query (a plain projection, filter or join of tables) still goes through
     the planner until flattening reads plans (step 7a), unless flattening is off. In slt, 2 SELECTs (plain views)
     are left.
-  - **6c-iv (done):** the default becomes `plan` (`SMALT_PLAN=legacy` keeps the AST path until 6d). While
+  - **6c-iv (done):** the default becomes `plan` (`SMALT_PLAN=legacy` keeps the AST path until it is deleted). While
     materialized-view matching is on and a fresh materialized view exists, SELECTs take the AST path, since matching
     rewrites any SELECT a statement plans (until step 7c). Planning
-    small statements costs 2–8 µs more (0–20% of planning, 1–5% of prepare and first run, within this machine's
-    noise of about 5%): the front end and the physical planner each copy expressions once (`resolveRefs`,
-    `rebind`), which 6d can remove by compiling `col`s directly.
-- **6d, deletion** (about 2k lines removed): the AST paths of the planner and the internal `slot` / `native` nodes.
+    small statements cost 2–8 µs more at first (0–20% of planning, 1–5% of prepare and first run), which 6d brings
+    within noise.
+- **6d (done), planning cost:** the plan path plans small statements as fast as the AST path, within noise
+  (`bench/micro/prepare.ts` now runs both modes in turn in one process: ratios 0.97–1.05). The front end completes its
+  plans in place instead of copying them (`resolveRefs`), result columns and shapes have one object layout, and the
+  physical planner creates a column's read marking only for columns an expression reads.
+- **Deleting the AST path** (`Planner.planSelect`, `SMALT_PLAN=legacy`, the internal `slot` / `native` nodes; about 2k
+  lines) waits for step 8: writes, materialized-view matching and refresh (7c), and views and subqueries flattening
+  may merge (7a) still run on it (owner decision on #46, replacing item 11 below).
 - **Hardest parts:** projection-pushdown parity, register order (window snapshots), outer references from subqueries
   over aggregate rows, correlation of derived tables, estimates keyed by the same operators.
 
@@ -237,7 +242,8 @@ with foreign keys.
 9. **Builders and the catalog:** do builders resolve names to positions through a catalog handle, or do clients pass
    positions?
 10. **Morsel readers** resolve tables by position, so a plan sent to a reader carries a schema cookie.
-11. **Deleting the current planner** at the end of step 6 (6d), not after step 9, so step 7 is written once.
+11. **Deleting the current planner** after step 8 (the owner changed this from "at the end of step 6" on #46: writes,
+    materialized views and flattening still use it).
 12. **Gates:** add a prepare-time budget for small queries.
 13. **PR series:** step 4b is added and steps are split into short PR series (3a–c, 5a–b, 6a–d, 7a–d, 8a–c, 9a–c),
     where the ADR says one PR per step.
