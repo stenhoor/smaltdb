@@ -13,6 +13,7 @@ async function setup(): Promise<Database> {
     CREATE INDEX t_a ON t(a);
     CREATE TABLE u(x INT, y TEXT);
     CREATE TABLE c(g INT, v INT) WITH (storage = 'columnar');
+    CREATE TABLE k(id INTEGER PRIMARY KEY, n TEXT UNIQUE, cnt INT DEFAULT 0, d TEXT DEFAULT 'dflt', CHECK (cnt >= 0));
   `);
   db.exec('BEGIN');
   for (let i = 1; i <= 300; i++) {
@@ -128,7 +129,38 @@ const UPDATES = [
   'WITH k(v) AS (SELECT 3) UPDATE c SET v = v + 1 WHERE g IN (SELECT v FROM k) RETURNING g',
 ];
 
+const INSERTS = [
+  "INSERT INTO k VALUES (1, 'a', 1, 'x'), (2, 'b', 2, 'y')",
+  "INSERT INTO k(n) VALUES ('c') RETURNING id, n, cnt, d",
+  'INSERT INTO k DEFAULT VALUES RETURNING *',
+  'INSERT INTO u(rowid, x) VALUES (1000, 5) RETURNING rowid, x, y',
+  "INSERT INTO k(n, cnt) SELECT 'm' || x, x FROM u WHERE x > 8 GROUP BY x ORDER BY x RETURNING n, cnt",
+  "INSERT INTO k(n) VALUES ('a') ON CONFLICT DO NOTHING",
+  "INSERT INTO k(n, cnt) VALUES ('a', 4), ('z', 7) ON CONFLICT(n) DO UPDATE SET cnt = k.cnt + excluded.cnt, d = excluded.n WHERE excluded.cnt > 1 RETURNING *",
+  "INSERT INTO k AS q(n, cnt) VALUES ('b', 9) ON CONFLICT(n) DO UPDATE SET cnt = q.cnt * 10 WHERE q.cnt < excluded.cnt",
+  "INSERT OR REPLACE INTO k(id, n) VALUES (1, 'b')",
+  "WITH w(v) AS (SELECT a FROM t WHERE id < 4) INSERT INTO k(n, cnt) SELECT 'w' || v, v FROM w",
+  'INSERT INTO k(n, cnt) SELECT n || n, cnt + 1 FROM k WHERE cnt < 3',
+  'INSERT INTO u SELECT id, s FROM t WHERE a = (SELECT max(a) FROM t) RETURNING x',
+  'INSERT INTO c SELECT g + 10, sum(v) FROM c GROUP BY g',
+];
+
 describe('physical planner, writes', () => {
+  it('inserts the same rows and returns the same RETURNING rows', async () => {
+    const results = async (mode: 'legacy' | 'plan' | 'shadow') => {
+      const db = await setup();
+      setPlanMode(mode);
+      return INSERTS.map((q) => ({ rows: db.prepare(q).all(), k: db.prepare('SELECT * FROM k ORDER BY id').all() }));
+    };
+    const want = await results('legacy');
+    expect(await results('plan')).toEqual(want);
+    const before = shadowStats.physical;
+    expect(await results('shadow')).toEqual(want);
+    // Each INSERT, and each SELECT of k.
+    expect(shadowStats.physical - before).toBe(INSERTS.length * 2);
+  });
+
+
   it('updates the same rows and returns the same RETURNING rows', async () => {
     const results = async (mode: 'legacy' | 'plan' | 'shadow') => {
       const db = await setup();

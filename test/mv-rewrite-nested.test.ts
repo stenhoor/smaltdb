@@ -95,7 +95,8 @@ describe('materialized views answer nested SELECTs', () => {
     db.exec('PRAGMA matview_rewrite = 1');
     used.length = 0;
     db.exec('INSERT INTO r2 SELECT g, sum(x) FROM t GROUP BY g');
-    expect(used).toEqual(['ma']);
+    // Shadow mode plans the INSERT with both planners.
+    expect([...new Set(used)]).toEqual(['ma']);
     expect(db.query('SELECT * FROM r2 ORDER BY g').rows).toEqual(db.query('SELECT * FROM r1 ORDER BY g').rows);
   });
 });

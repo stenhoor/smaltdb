@@ -80,6 +80,8 @@ export function printPlan(op: PlanOp, depth = 0): string {
     }
     case 'distinct':
       return `${pad}distinct\n${sub(op.input)}`;
+    case 'append':
+      return `${pad}append ${op.db}.${op.table} [${op.columns.join(', ')}]${op.upserts.length ? ` upserts ${op.upserts.length}` : ''}${op.returning ? ` returning ${list(op.returning)}` : ''}${op.input ? `\n${sub(op.input)}` : ''}`;
     case 'update':
       return `${pad}update ${op.db}.${op.table} rowid #0.${op.rowid} set ${op.sets.map((x) => `${x.column} = ${printExpr(x.value)}`).join(', ')}${op.returning ? ` returning ${list(op.returning)}` : ''}\n${sub(op.input)}`;
     case 'delete':

@@ -1286,9 +1286,14 @@ export class Planner {
    * rowid in `rowidReg`.
    */
   compileRowExprs(exprs: readonly PlanExpr[], ncols: number, base: number, rowidReg: number): Fn[] {
+    return this.compileAt(exprs, (i) => (i < ncols ? base + i : rowidReg)).map((c) => c.fn);
+  }
+
+  /** Expressions whose columns are registers: column `i` reads `regOf(i)` (for VALUES rows: none). */
+  compileAt(exprs: readonly PlanExpr[], regOf: (index: number) => number): Compiled[] {
     const b = this.bindings(new Scope(null), null);
-    const row: ColMap = (c) => slotFor(c, c.index < ncols ? base + c.index : rowidReg);
-    return exprs.map((e) => compileBoundExpr(b.bind(e, row), this.env.funcCtx).fn);
+    const row: ColMap = (c) => slotFor(c, regOf(c.index));
+    return exprs.map((e) => compileBoundExpr(b.bind(e, row), this.env.funcCtx));
   }
 
   /**
@@ -3707,6 +3712,7 @@ function planWidth(op: PlanOp): number {
       return op.kind === 'semi' || op.kind === 'anti' ? planWidth(op.inputs[0]) : planWidth(op.inputs[0]) + planWidth(op.inputs[1]);
     case 'delete':
     case 'update':
+    case 'append':
       return op.returning?.length ?? 0;
   }
 }
