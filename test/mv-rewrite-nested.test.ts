@@ -7,7 +7,18 @@
 import { describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
-import type { SelectStmt } from '../src/engine/sql/ast.js';
+import type { PlanOp } from '../src/engine/plan/ops.js';
+
+/** The tables a plan scans, subqueries included. */
+function scans(p: unknown, out: string[] = []): string[] {
+  if (Array.isArray(p)) for (const x of p) scans(x, out);
+  else if (p && typeof p === 'object') {
+    const o = p as Record<string, unknown>;
+    if (o.op === 'scan' && typeof o.table === 'string') out.push(o.table);
+    for (const v of Object.values(o)) scans(v, out);
+  }
+  return out;
+}
 
 async function setup() {
   const db = await Database.open(new MemoryVfs(), 'db');
@@ -22,13 +33,13 @@ async function setup() {
   `);
   // Which views answered the SELECTs planned since the last reset.
   const used: string[] = [];
-  const d = db as unknown as { matviewRewrite: (s: SelectStmt, text: string, exclude?: string | null) => SelectStmt | null };
-  const real = d.matviewRewrite.bind(db);
-  d.matviewRewrite = (s, text, exclude) => {
-    const r = real(s, text, exclude);
-    if (r) {
-      const from = r.core.kind === 'select' ? r.core.from : undefined;
-      used.push(from?.kind === 'table' ? from.name : from?.kind === 'subquery' && from.select.core.kind === 'select' && from.select.core.from?.kind === 'table' ? from.select.core.from.name : '?');
+  const d = db as unknown as { matviewRewritePlan: (p: PlanOp, exclude?: string | null) => PlanOp };
+  const real = d.matviewRewritePlan.bind(db);
+  d.matviewRewritePlan = (p, exclude) => {
+    const r = real(p, exclude);
+    if (r !== p) {
+      const before = new Set(scans(p));
+      used.push(...scans(r).filter((n) => !before.has(n)));
     }
     return r;
   };

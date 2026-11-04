@@ -149,6 +149,8 @@ export interface MatViewInfo {
   fresh?: boolean;
   /** Base tables the view reads (lower case, through views). */
   deps?: Set<string>;
+  /** The definition bound to a plan for materialized-view matching (runtime only; null if it cannot be bound). */
+  plan?: { version: number; plan: import('../plan/ops.js').PlanOp | null };
   /**
    * Refresh policy (M8.1, `WITH (refresh_every = seconds, refresh_on_reconnect = true)`): run by the
    * engine worker as `REFRESH … IF CHANGED`. Parsed from `sql` on first use.

@@ -16,7 +16,9 @@ import {
   literalValue,
 } from './catalog/schema.js';
 import { MisuseError, SmaltError } from './errors.js';
-import { type StaticType, truthy } from './exec/convert.js';
+import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
+import type { PlanOp } from './plan/ops.js';
+import type { CollationName } from './plan/types.js';
 import { type CompileScope, type Compiled, type Fn, compileExpr } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
@@ -25,7 +27,7 @@ import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
 import { type FrontEndCatalog, toDeletePlan, toInsertPlan, toPlan, toUpdatePlan } from './sql/frontend/select.js';
-import { type MatviewCandidate, matchMatview } from './exec/mv-match.js';
+import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import type { ReaderSettings } from '../shared/protocol.js';
 import type {
@@ -1045,12 +1047,13 @@ export class Database implements FunctionContext {
   private feCatalog: FrontEndCatalog | null = null;
 
   /**
-   * A top-level SELECT through the plan layer (ADR 0014), against `catalog` (the planner's tables). The front end
-   * applies materialized-view matching as the planner does (step 7c).
+   * A top-level SELECT through the plan layer (ADR 0014), against `catalog` (the planner's tables), with
+   * materialized-view matching on its plan under the statement's policy (exec/plan-mv-match.ts).
    */
   private planSelectStmt(stmt: SelectStmt, text: string, planner: Planner, catalog: FrontEndCatalog = this.frontEndCatalog()): QueryPlan {
-    const fe = toPlan(stmt, text, catalog, planner.env.rewriteSelect);
-    const p = planner.planPlan(fe.plan, fe.columns);
+    const fe = toPlan(stmt, text, catalog);
+    const rewrite = planner.env.rewritePlan;
+    const p = planner.planPlan(rewrite ? rewrite(fe.plan) : fe.plan, fe.columns);
     if (!p) throw new SmaltError('SMALT_INTERNAL', `the physical planner declined a query\n  in: ${text}`);
     return p;
   }
@@ -1144,9 +1147,7 @@ export class Database implements FunctionContext {
   /** What the planner reads from the database. Unpopulated materialized views cannot be read. */
   private plannerDeps(rewrite: { exclude: string | null } | null = null): ConstructorParameters<typeof Planner>[0] {
     return {
-      rewriteSelect: rewrite ? (select, text) => this.matviewRewrite(select, text, rewrite.exclude) : undefined,
-      matviewCandidates: () => this.hasRewriteCandidates(),
-      planSql: rewrite ? (select, text) => toPlan(select, text, this.frontEndCatalog(), (s, t) => this.matviewRewrite(s, t, rewrite.exclude)) : undefined,
+      rewritePlan: rewrite ? (plan) => this.matviewRewritePlan(plan, rewrite.exclude) : undefined,
       externalTable: (n) => this.externalTableScan(n),
       externalFunction: (n, args, named) => this.externalFunctionScan(n, args, named),
       isExternalFunction: (n) => this.external.plugins.isExternalFunction(n),
@@ -1705,17 +1706,13 @@ export class Database implements FunctionContext {
   /** `PRAGMA matview_rewrite`: answer queries from fresh materialized views (M7.5; off by default). */
   private matviewRewriteOn = false;
 
-  /** The query rewritten to read a fresh materialized view, when one provably answers it. */
-  /** Whether materialized-view matching has a view to match: a fresh, populated materialized view. */
-  private hasRewriteCandidates(): boolean {
-    if (!this.matviewRewriteOn) return false;
-    for (const t of this.tables.values()) if (t.matview?.populated && t.matview.fresh) return true;
-    return false;
-  }
-
-  private matviewRewrite(stmt: SelectStmt, text: string, exclude: string | null = null): SelectStmt | null {
-    if (!this.matviewRewriteOn) return null;
-    const views: MatviewCandidate[] = [];
+  /**
+   * `plan` with the parts that a fresh materialized view answers read from that view (exec/plan-mv-match.ts), under
+   * `PRAGMA matview_rewrite`. `exclude`: views over this table are not used (the statement writes it).
+   */
+  private matviewRewritePlan(plan: PlanOp, exclude: string | null = null): PlanOp {
+    if (!this.matviewRewriteOn) return plan;
+    const views: PlanMatview[] = [];
     for (const t of this.tables.values()) {
       const m = t.matview;
       if (!m?.populated || !m.fresh) continue;
@@ -1726,22 +1723,25 @@ export class Database implements FunctionContext {
       if (exclude !== null && deps.has(exclude)) continue;
       // External data changes without the database noticing: such a view is a cache, refreshed explicitly.
       if (this.externals.size > 0 && [...deps].some((d) => this.externals.has(d))) continue;
-      const from = m.select.core.kind === 'select' && m.select.core.from?.kind === 'table' ? this.getTable(m.select.core.from.name, m.select.core.from.schema) : undefined;
-      views.push({ name: t.name, select: m.select, columns: t.columns.map((c) => c.name), baseColumns: from ? from.columns.map((c) => c.name) : [] });
+      // The view's definition as a plan, bound once per schema version.
+      if (m.plan?.version !== this.schemaVersion) {
+        let bound: PlanOp | null;
+        try {
+          bound = toPlan(m.select, m.sql, this.frontEndCatalog()).plan;
+        } catch {
+          bound = null;
+        }
+        m.plan = { version: this.schemaVersion, plan: bound };
+      }
+      if (!m.plan.plan) continue;
+      views.push({
+        name: t.name,
+        plan: m.plan.plan,
+        types: t.columns.map((c) => (c.rowidAlias ? 'int' : staticTypeOfStorage(c.type))),
+        collations: t.columns.map((c) => MATVIEW_COLLATIONS[c.collation ?? Collation.Binary]),
+      });
     }
-    if (views.length === 0) return null;
-    const m = matchMatview(stmt, text, views, (name) => {
-      const t = this.getTable(name);
-      if (!t || t.system) return undefined;
-      return {
-        hasColumn: (c) => findColumn(t, c) >= 0,
-        binaryColumn: (c) => {
-          const i = findColumn(t, c);
-          return i >= 0 && (t.columns[i].collation ?? Collation.Binary) === Collation.Binary;
-        },
-      };
-    });
-    return m ? m.stmt : null;
+    return matchMatviews(plan, views);
   }
 
   private setMatviewRewrite(on: boolean): void {
@@ -1851,7 +1851,10 @@ export class Database implements FunctionContext {
     const m = this.morselQuery(sql);
     if (!m) return null;
     // A fresh materialized view answers it more cheaply than any split of the base table.
-    if (m.parsed.stmt.kind === 'select' && this.matviewRewrite(m.parsed.stmt, m.parsed.text)) return null;
+    if (m.parsed.stmt.kind === 'select' && this.matviewRewriteOn) {
+      const plan = toPlan(m.parsed.stmt, m.parsed.text, this.frontEndCatalog()).plan;
+      if (this.matviewRewritePlan(plan) !== plan) return null;
+    }
     const t = this.getTable(m.q.table)!;
     const rows = this.liveRows(t);
     if (rows < minRows) return null;
@@ -3510,8 +3513,10 @@ export class Database implements FunctionContext {
     };
     const physical = (): InsertParts | null => {
       const p = prefix();
-      const fe = toInsertPlan(stmt, table, targets.map((t) => (t === -2 ? -1 : t)), planner.sqlText, this.frontEndCatalog(), planner.env.rewriteSelect);
-      const op = fe.plan;
+      const fe = toInsertPlan(stmt, table, targets.map((t) => (t === -2 ? -1 : t)), planner.sqlText, this.frontEndCatalog());
+      // Materialized-view matching may answer the SELECT source (under the statement's policy).
+      const rewrite = planner.env.rewritePlan;
+      const op = rewrite ? rewrite(fe.plan) : fe.plan;
       if (op.op !== 'append') return null;
       const ret = fe.returning && op.returning ? { columns: fe.returning.map((c) => c.name), types: fe.returning.map((c) => c.type), fns: planner.compileRowExprs(op.returning, ncols, p.base, p.rowidReg) } : undefined;
       const upserts: Upsert[] = op.upserts.map((u) => {
@@ -4417,3 +4422,6 @@ interface DeleteParts {
   oldRowid: number;
   ret: { columns: string[]; types: StaticType[]; fns: Fn[] } | undefined;
 }
+
+/** Collation names by `Collation` (materialized-view matching reads a view's columns as plan columns). */
+const MATVIEW_COLLATIONS: readonly CollationName[] = ['binary', 'nocase', 'rtrim'];

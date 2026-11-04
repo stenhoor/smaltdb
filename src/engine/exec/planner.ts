@@ -18,7 +18,6 @@ import type {
   Expr,
   FromItem,
   JoinType,
-  ResultColumn,
   SelectCore,
   SelectCoreSelect,
   SelectStmt,
@@ -49,7 +48,7 @@ import {
 import { type AggregateState, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type ColumnarHelpers, type FusedAggSpec, type FusedHelpers, type PipelineSource, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter } from './codegen.js';
 import { CODEGEN_HELPERS_FOR_FUSION } from './expr.js';
-import { getMeta, isFlattened, isOpaque, setMeta, subquerySql } from './sql-meta.js';
+import { getMeta, isFlattened, isOpaque, setMeta } from './sql-meta.js';
 import { printExpr } from '../plan/print.js';
 import type { Frame } from '../storage/pager.js';
 import { PH_RIGHT } from '../storage/format.js';
@@ -98,7 +97,6 @@ import {
 } from './operators.js';
 import { type ColumnStore, ROW_GROUP_ROWS, type Zone, zoneMayMatch } from '../storage/columnar.js';
 import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
-import { anyNode } from '../sql/ast-util.js';
 import { type BoundExpr, type PlanExpr, lit } from '../plan/expr.js';
 import type { AggCall, JoinKind, PlanOp, SortKey as PlanSortKey } from '../plan/ops.js';
 import type { CollationName } from '../plan/types.js';
@@ -131,14 +129,11 @@ export interface PlannerEnv {
    * Materialized-view matching (M7.5): `select` (SQL text `text`) rewritten to read a fresh
    * materialized view, or null. Absent when the statement may not use views.
    */
-  rewriteSelect?(select: SelectStmt, text: string): SelectStmt | null;
   /**
-   * Whether materialized-view matching has a view to match (a fresh, populated materialized view). The physical
-   * planner then plans a decorrelated subquery's inner side from SQL (`planSql`), which matching may answer.
+   * Materialized-view matching on plans (exec/plan-mv-match.ts), under the statement's policy: the planner applies it
+   * to the plans it builds itself (a decorrelated subquery's inner side).
    */
-  matviewCandidates?(): boolean;
-  /** The SQL front end's plan for a SELECT (with this statement's materialized-view matching), or null. */
-  planSql?(select: SelectStmt, text: string): { plan: PlanOp; columns: ResultColumnInfo[] } | null;
+  rewritePlan?(plan: PlanOp): PlanOp;
   /** M8: an external table by name (its columns from the catalog; its rows once loaded). */
   externalTable?(name: string): ExternalScan | undefined;
   /** M8: a reading table function (`read_csv`, `read_json`) called with constant arguments. */
@@ -385,14 +380,6 @@ function forEachSlot(e: BoundExpr, f: (reg: number) => void): void {
     default:
       return;
   }
-}
-
-function hasSubquery(e: Expr): boolean {
-  let found = false;
-  walk(e, (x) => {
-    if (x.kind === 'subquery' || x.kind === 'exists' || x.kind === 'inSelect') found = true;
-  });
-  return found;
 }
 
 /** A call that is an aggregate (not a window function, not scalar min/max of several arguments). */
@@ -1237,20 +1224,11 @@ export class Planner {
         exprs: [...pairs.map((_p, i) => keyCol(i)), shifted],
       };
     }
-    // The planner plans the inner side (and the value over no rows) as SQL, which materialized-view matching may
-    // answer: while a view could, plan that SQL through the front end (step 7b).
-    const src = subquerySql(op);
-    const sql =
-      src && this.env.rewriteSelect && this.env.planSql && this.env.matviewCandidates?.()
-        ? decorrelationSql(src.select, kind, src.isCte, (n, schema) => this.env.getTable(n, schema))
-        : null;
-    const fromSql = (stmt: SelectStmt): QueryPlan | null => {
-      const fe = this.env.planSql!(stmt, src!.text);
-      return fe && this.physicalAny(fe.plan, fe.columns, null);
-    };
+    // Materialized-view matching may answer the inner side, as any plan.
+    const rewrite = this.env.rewritePlan;
     let plan: QueryPlan;
     try {
-      plan = (sql && fromSql(sql.innerStmt)) || this.physical(inner, null, null);
+      plan = this.physical(rewrite ? rewrite(inner) : inner, null, null);
     } catch {
       return null;
     }
@@ -1275,7 +1253,7 @@ export class Planner {
     let emptyPlan: QueryPlan | null = null;
     if (kind === 'scalar') {
       const empty: PlanOp = { op: 'project', input: { op: 'aggregate', input: { op: 'filter', input: from, pred: lit(0, 'int') }, keys: [], aggs: a!.aggs, carry: [] }, exprs: [value!] };
-      emptyPlan = (sql?.emptyStmt && fromSql(sql.emptyStmt)) || this.physical(empty, null, null);
+      emptyPlan = this.physical(empty, null, null);
     }
     return this.decorrelatedFn(kind, plan, keyFns, guardFns, emptyPlan);
   }
@@ -3131,145 +3109,6 @@ function splitBoundConjuncts(e: BoundExpr, out: BoundExpr[] = []): BoundExpr[] {
 
 const COLLATION_IDS: Readonly<Record<CollationName, Collation>> = { binary: Collation.Binary, nocase: Collation.NoCase, rtrim: Collation.RTrim };
 const collationId = (n: CollationName): Collation => COLLATION_IDS[n];
-
-/**
- * Whether materialized-view matching may answer `stmt` (a SELECT the planner, or the SQL front end, plans). Not when
- * its table name means a CTE (`isCte`), and not when, `nested` in another query, it reads that query's columns: the
- * matcher compares column names without qualifiers, so an outer `o.x` would turn into the view's `x`.
- */
-export function mayMatchMatview(stmt: SelectStmt, nested: boolean, isCte: (name: string) => boolean, getTable: (name: string, schema?: string) => TableSchema | undefined): boolean {
-  const core = stmt.core;
-  if (stmt.with || stmt.compound.length > 0 || core.kind !== 'select' || core.from?.kind !== 'table') return false;
-  const from = core.from;
-  if (!from.schema && isCte(from.name)) return false;
-  return !nested || readsOnlyItsTable(stmt, from, getTable);
-}
-
-/** One SELECT of a compound answered from a materialized view (`rewrite`), or `core` as it was. */
-export function matviewCoreOf(core: SelectCore, rewrite: (stmt: SelectStmt) => SelectStmt | null): SelectCore {
-  const r = rewrite({ kind: 'select', core, compound: [], orderBy: [], pos: core.pos, end: core.end });
-  // A rewrite keeps a single core without ORDER BY / LIMIT when the input had none.
-  return r && !r.with && r.compound.length === 0 && r.orderBy.length === 0 && !r.limit ? r.core : core;
-}
-
-/** Every column reference of `stmt` is to its single FROM table `from` (or a bare result alias in ORDER BY). */
-function readsOnlyItsTable(stmt: SelectStmt, from: Extract<FromItem, { kind: 'table' }>, getTable: (name: string, schema?: string) => TableSchema | undefined): boolean {
-  const t = getTable(from.name, from.schema);
-  if (!t) return false;
-  const qualifier = (from.alias ?? from.name).toLowerCase();
-  const names = new Set([...t.columns.map((c) => c.name.toLowerCase()), ...ROWID_NAMES]);
-  const own = (n: Record<string, unknown>): boolean => {
-    const c = n as unknown as ColumnExpr;
-    if (c.schema) return false;
-    return c.table ? c.table.toLowerCase() === qualifier : names.has(c.name.toLowerCase());
-  };
-  const core = stmt.core as SelectCoreSelect;
-  const aliases = new Set(core.columns.flatMap((c) => (c.kind === 'expr' && c.alias ? [c.alias.toLowerCase()] : [])));
-  const orderAliases = stmt.orderBy.filter((o) => o.expr.kind === 'column' && !o.expr.table && aliases.has(o.expr.name.toLowerCase()) && !names.has(o.expr.name.toLowerCase()));
-  const rest = { ...stmt, orderBy: stmt.orderBy.filter((o) => !orderAliases.includes(o)) };
-  return !anyNode(rest, (n) => n.kind === 'column' && !own(n));
-}
-
-/**
- * The SQL `Planner.decorrelate` plans for a subquery it decorrelates (null when it does not qualify): the inner side
- * (the key expressions, grouped for a scalar or DISTINCT for EXISTS, over the uncorrelated WHERE), the scalar form's
- * value over no rows, and the key pairs and guards it compiles against the enclosing query. The physical planner
- * plans the same SQL where materialized-view matching may answer it (ADR 0014, step 7b).
- */
-export function decorrelationSql(
-  select: SelectStmt,
-  kind: 'exists' | 'scalar',
-  isCte: (name: string) => boolean,
-  getTable: (name: string, schema?: string) => TableSchema | undefined,
-): { innerStmt: SelectStmt; emptyStmt: SelectStmt | null; pairs: { inner: Expr; outer: Expr; innerLeft: boolean }[]; guards: Expr[] } | null {
-  if (select.with || select.compound.length || select.offset) return null;
-  const core = select.core;
-  if (core.kind !== 'select' || !core.where || !core.from || core.groupBy.length || core.having || core.windows.length) return null;
-  if (kind === 'scalar' && (select.limit || select.orderBy.length)) return null;
-  if (kind === 'exists' && select.limit && !(select.limit.kind === 'literal' && typeof select.limit.value === 'number' && select.limit.value >= 1)) return null;
-  // EXISTS over an aggregate always has its one row: the semi-join's keys would lose that.
-  if (kind === 'exists' && core.columns.some((c) => c.kind === 'expr' && containsAggregate(c.expr))) return null;
-  // Inner sources: base tables only (known columns).
-  const inner = new Map<string, Set<string>>();
-  const addFrom = (f: FromItem): boolean => {
-    if (f.kind === 'join') {
-      if (f.joinType !== 'INNER' && f.joinType !== 'CROSS') return false;
-      if (f.on && hasSubquery(f.on)) return false;
-      return addFrom(f.left) && addFrom(f.right);
-    }
-    if (f.kind !== 'table' || (f.schema && f.schema.toLowerCase() !== 'main') || (!f.schema && isCte(f.name))) return false;
-    const t = getTable(f.name, f.schema);
-    if (!t) return false;
-    inner.set((f.alias ?? f.name).toLowerCase(), new Set([...t.columns.map((c) => c.name.toLowerCase()), 'rowid', 'oid', '_rowid_']));
-    return true;
-  };
-  if (!addFrom(core.from)) return null;
-  const side = (e: Expr): 'inner' | 'outer' | 'mixed' | 'none' | 'bad' => {
-    if (hasSubquery(e)) return 'bad';
-    let i = false;
-    let o = false;
-    walk(e, (x) => {
-      if (x.kind !== 'column') return;
-      const isInner = x.table ? inner.has(x.table.toLowerCase()) && inner.get(x.table.toLowerCase())!.has(x.name.toLowerCase()) : [...inner.values()].some((c) => c.has(x.name.toLowerCase()));
-      if (isInner) i = true;
-      else o = true;
-    });
-    return i && o ? 'mixed' : i ? 'inner' : o ? 'outer' : 'none';
-  };
-  // The ON conditions of inner joins must not read the enclosing query.
-  const onOk = (f: FromItem): boolean => (f.kind === 'join' ? (!f.on || ['inner', 'none'].includes(side(f.on))) && onOk(f.left) && onOk(f.right) : true);
-  if (!onOk(core.from)) return null;
-  const pairs: { inner: Expr; outer: Expr; innerLeft: boolean }[] = [];
-  const guards: Expr[] = [];
-  const rest: Expr[] = [];
-  for (const c of conjuncts(core.where)) {
-    const sd = side(c);
-    if (sd === 'inner' || sd === 'none') rest.push(c);
-    else if (sd === 'outer') guards.push(c);
-    else if (sd === 'mixed' && c.kind === 'binary' && c.op === '=') {
-      const l = side(c.left);
-      const r = side(c.right);
-      if (l === 'inner' && r === 'outer') pairs.push({ inner: c.left, outer: c.right, innerLeft: true });
-      else if (l === 'outer' && r === 'inner') pairs.push({ inner: c.right, outer: c.left, innerLeft: false });
-      else return null;
-    } else return null;
-  }
-  if (pairs.length === 0) return null;
-  // Result columns of the scalar form must be aggregates of the inner rows (no bare columns).
-  let resultExpr: Expr | undefined;
-  if (kind === 'scalar') {
-    if (core.columns.length !== 1 || core.columns[0].kind !== 'expr' || core.distinct) return null;
-    resultExpr = core.columns[0].expr;
-    if (!containsAggregate(resultExpr) || containsWindow(resultExpr) || side(resultExpr) === 'outer' || side(resultExpr) === 'mixed' || side(resultExpr) === 'bad') return null;
-    let bare = false;
-    const scan = (e: Expr): void => {
-      if (isAggregateCall(e)) return;
-      if (e.kind === 'column') bare = true;
-      walk(e, (x) => {
-        if (x === e) return;
-        if (isAggregateCall(x)) return false;
-        if (x.kind === 'column') bare = true;
-      });
-    };
-    scan(resultExpr);
-    if (bare) return null;
-  }
-  const where = rest.reduce<Expr | undefined>((acc, e) => (acc ? { kind: 'binary', op: 'AND', left: acc, right: e, pos: e.pos, end: e.end } : e), undefined);
-  const keyCols: ResultColumn[] = pairs.map((p, i) => ({ kind: 'expr', expr: p.inner, alias: `k${i}`, pos: 0, end: 0 }));
-  const innerCore: SelectCoreSelect = {
-    ...core,
-    distinct: kind === 'exists',
-    columns: kind === 'scalar' ? [...keyCols, { kind: 'expr', expr: resultExpr!, alias: 'v', pos: 0, end: 0 }] : keyCols,
-    where,
-    groupBy: kind === 'scalar' ? pairs.map((p) => p.inner) : [],
-  };
-  const innerStmt: SelectStmt = { kind: 'select', core: innerCore, compound: [], orderBy: [], pos: select.pos, end: select.end };
-  const emptyStmt: SelectStmt | null =
-    kind === 'scalar'
-      ? { kind: 'select', core: { ...core, columns: [{ kind: 'expr', expr: resultExpr!, pos: 0, end: 0 }], where: { kind: 'literal', value: 0, pos: 0, end: 0 } }, compound: [], orderBy: [], pos: 0, end: 0 }
-      : null;
-  return { innerStmt, emptyStmt, pairs, guards };
-}
 
 /** Subqueries in an expression the planner compiles from the AST (none since ADR 0014's front end binds them). */
 function noSubquery(): never {

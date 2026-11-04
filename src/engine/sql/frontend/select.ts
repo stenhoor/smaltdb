@@ -11,10 +11,9 @@ import { type FunctionContext, aggregateFunctions, scalarFunctions } from '../..
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../../exec/window.js';
 import { flattenCore, flatteningDisabled } from '../../exec/flatten.js';
 import { aggregateCallName } from '../ast-util.js';
-import { mayMatchMatview, matviewCoreOf } from '../../exec/planner.js';
 import { containsAggregate, containsWindow, coreReferences, exprEquals, firstAggregateCall, firstWindowCall, sameName, selectReferences } from '../../exec/planner.js';
 import { type BoundExpr, type PlanExpr, typeOf } from '../../plan/expr.js';
-import { getMeta, markFlattened, setMeta, setSubquerySql } from '../../exec/sql-meta.js';
+import { getMeta, markFlattened, setMeta } from '../../exec/sql-meta.js';
 import type { AggCall, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../plan/ops.js';
 import type { CollationName } from '../../plan/types.js';
 import { Collation, type SqlValue } from '../../values.js';
@@ -92,8 +91,8 @@ class LaterSource extends Error {}
 /**
  * Plan a SELECT. `text` is the statement's SQL text (result columns are named from it). Throws SQLite's errors.
  */
-export function toPlan(stmt: SelectStmt, text: string, catalog: FrontEndCatalog, rewriteSelect?: (select: SelectStmt, text: string) => SelectStmt | null): FrontEndResult {
-  const fe = new FrontEnd(catalog, text, rewriteSelect);
+export function toPlan(stmt: SelectStmt, text: string, catalog: FrontEndCatalog): FrontEndResult {
+  const fe = new FrontEnd(catalog, text);
   const r = fe.select(stmt, null);
   return { plan: fe.resolveRefs(r.plan), columns: r.columns };
 }
@@ -120,8 +119,8 @@ export function toUpdatePlan(stmt: UpdateStmt, table: TableSchema, text: string,
 
 /**
  * INSERT (ADR 0014, step 8c): an `append` plan for `stmt` (its WITH merged into the SELECT source) into `table`,
- * whose values go to the table's `columns` (resolved by the database: -1 for the rowid). Its SELECT source has
- * materialized-view matching (`rewriteSelect`, the statement's policy). `source`: the SELECT's result columns.
+ * whose values go to the table's `columns` (resolved by the database: -1 for the rowid). `source`: the SELECT's
+ * result columns.
  */
 export function toInsertPlan(
   stmt: InsertStmt,
@@ -129,9 +128,8 @@ export function toInsertPlan(
   columns: number[],
   text: string,
   catalog: FrontEndCatalog,
-  rewriteSelect?: (select: SelectStmt, text: string) => SelectStmt | null,
 ): FrontEndWrite & { source?: FrontEndColumn[] } {
-  const fe = new FrontEnd(catalog, text, rewriteSelect);
+  const fe = new FrontEnd(catalog, text);
   const r = fe.insertPlan(stmt, table, columns);
   return { plan: fe.resolveRefs(r.plan), returning: r.returning, source: r.source };
 }
@@ -256,32 +254,14 @@ class FrontEnd {
   private readonly expandingViews = new Set<string>();
   private readonly expandingAliases = new Set<string>();
 
-  /**
-   * `rewriteSelect`: materialized-view matching (the statement's, as `PlannerEnv.rewriteSelect`), applied to every
-   * SELECT where `Planner.planSelect` applies it (ADR 0014, step 7c).
-   */
   constructor(
     private readonly catalog: FrontEndCatalog,
     private text: string,
-    private readonly rewriteSelect?: (select: SelectStmt, text: string) => SelectStmt | null,
   ) {}
-
-  /** `stmt` answered from a materialized view, or null (`Planner.matviewRewrite`). */
-  private matviewRewrite(stmt: SelectStmt, parent: FeScope | null): SelectStmt | null {
-    const rewrite = this.rewriteSelect;
-    if (!rewrite || !mayMatchMatview(stmt, parent !== null, (n) => parent?.findCte(n) !== undefined, (n, schema) => this.catalog.getTable(n, schema))) return null;
-    return rewrite(stmt, this.text);
-  }
-
-  /** One SELECT of a compound answered from a materialized view (`Planner.matviewCore`). */
-  private matviewCore(core: SelectCore, parent: FeScope | null): SelectCore {
-    return this.rewriteSelect ? matviewCoreOf(core, (stmt) => this.matviewRewrite(stmt, parent)) : core;
-  }
 
   // ---------------------------------------------------------------- statements
 
   select(stmt: SelectStmt, parent: FeScope | null): CoreResult {
-    stmt = this.matviewRewrite(stmt, parent) ?? stmt;
     const withScope = new FeScope(parent);
     withScope.ctesOnly = true;
     if (stmt.with) this.registerCtes(stmt.with, withScope);
@@ -294,10 +274,10 @@ class FrontEnd {
       if (f.changed) markFlattened(plan);
       return { plan, columns: r.columns };
     }
-    const first = this.core(this.flatten(this.matviewCore(stmt.core, base), [], base).core, base, null, undefined);
+    const first = this.core(this.flatten(stmt.core, [], base).core, base, null, undefined);
     let plan = first.plan;
     for (const c of stmt.compound) {
-      const next = this.core(this.flatten(this.matviewCore(c.core, base), [], base).core, base, null, first.columns.length);
+      const next = this.core(this.flatten(c.core, [], base).core, base, null, first.columns.length);
       if (next.columns.length !== first.columns.length) {
         throw new SmaltError('SMALT_ERROR', `SELECTs to the left and right of ${c.op} do not have the same number of result columns`);
       }
@@ -1195,8 +1175,6 @@ class FrontEnd {
       inSubquery: refuse,
       planSubquery: (select, mode) => {
         const r = this.select(select, scope);
-        // Decorrelation plans SQL derived from the subquery's (where materialized-view matching may answer it).
-        setSubquerySql(r.plan, { select, text: this.text, isCte: (n) => scope.findCte(n) !== undefined });
         if (mode !== 'exists' && r.columns.length !== 1) throw new SmaltError('SMALT_ERROR', `sub-select returns ${r.columns.length} columns - expected 1`);
         return { plan: r.plan, column: { type: r.columns[0]?.type ?? 'any', collation: r.columns[0]?.collation ?? Collation.Binary } };
       },
