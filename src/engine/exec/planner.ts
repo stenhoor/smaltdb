@@ -414,7 +414,7 @@ export function isAggregateCall(e: Expr): e is CallExpr {
 }
 
 export function containsAggregate(e: Expr | undefined): boolean {
-  if (!e) return false;
+  if (!e || e.kind === 'column' || e.kind === 'literal' || e.kind === 'param') return false;
   let found = false;
   walk(e, (x) => {
     if (isAggregateCall(x)) {
@@ -4214,7 +4214,7 @@ export function firstAggregateCall(e: Expr): CallExpr | undefined {
 }
 
 export function containsWindow(e: Expr | undefined): boolean {
-  if (!e) return false;
+  if (!e || e.kind === 'column' || e.kind === 'literal' || e.kind === 'param') return false;
   let found = false;
   walk(e, (x) => {
     if (x.kind === 'call' && x.over !== undefined) {
