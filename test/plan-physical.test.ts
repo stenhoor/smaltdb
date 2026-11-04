@@ -1,28 +1,45 @@
-/** The physical planner (ADR 0014, step 6b): operators for the SQL front end's plans over one table. */
-import { afterAll, describe, expect, it } from 'vitest';
+/**
+ * The physical planner (ADR 0014): statements over the shapes it plans (access paths, fusion, joins, subqueries,
+ * windows, compounds, CTEs, derived tables, writes with RETURNING and ON CONFLICT), compared with SQLite. Plan shapes
+ * are pinned by test/plan-shapes.test.ts.
+ */
+import sqliteInit from '@sqlite.org/sqlite-wasm';
+import { beforeAll, describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
-import { setPlanMode, shadowStats } from '../src/engine/exec/plan-shadow.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
 
-afterAll(() => setPlanMode(null));
+type Sqlite = { exec(sql: string): void; selectArrays(sql: string, bind?: unknown[]): unknown[][] };
+let sqlite3: { oo1: { DB: new (name: string) => Sqlite } };
+beforeAll(async () => {
+  sqlite3 = (await (sqliteInit as unknown as (o: object) => Promise<unknown>)({ print: () => {}, printErr: () => {} })) as never;
+});
 
-async function setup(): Promise<Database> {
-  const db = await Database.open(new MemoryVfs(), 'db');
-  db.exec(`
-    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, s TEXT COLLATE NOCASE, r REAL);
-    CREATE INDEX t_a ON t(a);
-    CREATE TABLE u(x INT, y TEXT);
-    CREATE TABLE c(g INT, v INT) WITH (storage = 'columnar');
-    CREATE TABLE k(id INTEGER PRIMARY KEY, n TEXT UNIQUE, cnt INT DEFAULT 0, d TEXT DEFAULT 'dflt', CHECK (cnt >= 0));
-  `);
-  db.exec('BEGIN');
+const ddl = (columnar: boolean): string => `
+  CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, s TEXT COLLATE NOCASE, r REAL);
+  CREATE INDEX t_a ON t(a);
+  CREATE TABLE u(x INT, y TEXT);
+  CREATE TABLE c(g INT, v INT)${columnar ? " WITH (storage = 'columnar')" : ''};
+  CREATE TABLE k(id INTEGER PRIMARY KEY, n TEXT UNIQUE, cnt INT DEFAULT 0, d TEXT DEFAULT 'dflt', CHECK (cnt >= 0));
+`;
+
+function rows(): string {
+  const out: string[] = [];
   for (let i = 1; i <= 300; i++) {
-    db.exec(`INSERT INTO t VALUES (${i}, ${i % 17}, '${String.fromCharCode(65 + (i % 5))}${i % 3}', ${i / 4})`);
-    db.exec(`INSERT INTO u VALUES (${i % 11}, 'y${i % 7}')`);
-    db.exec(`INSERT INTO c VALUES (${i % 4}, ${i})`);
+    out.push(`INSERT INTO t VALUES (${i}, ${i % 17}, '${String.fromCharCode(65 + (i % 5))}${i % 3}', ${i / 4})`);
+    out.push(`INSERT INTO u VALUES (${i % 11}, 'y${i % 7}')`);
+    out.push(`INSERT INTO c VALUES (${i % 4}, ${i})`);
   }
-  db.exec('COMMIT');
-  return db;
+  return `BEGIN; ${out.join('; ')}; COMMIT;`;
+}
+
+async function setup(): Promise<{ db: Database; lite: Sqlite }> {
+  const db = await Database.open(new MemoryVfs(), 'db');
+  db.exec(ddl(true));
+  db.exec(rows());
+  const lite = new sqlite3.oo1.DB(':memory:');
+  lite.exec(ddl(false));
+  lite.exec(rows());
+  return { db, lite };
 }
 
 // Single-table shapes: access paths, fusion, aggregates (fused and hashed), bare columns, ORDER BY (rowid order,
@@ -54,8 +71,7 @@ const HANDLED = [
   'SELECT t.id, u.x FROM t FULL JOIN u ON u.x = t.a + 20',
   'SELECT a.id, b.id FROM t a JOIN t b USING (a) WHERE a.id < 4 AND b.id < 4',
   'SELECT t.id, p.name FROM t, pragma_table_info(\'t\') p WHERE t.id < 3',
-  'SELECT u.y, max(t.r) FROM t JOIN u ON u.x = t.a GROUP BY u.y ORDER BY 2 DESC',
-  'SELECT table_name FROM information_schema.tables ORDER BY 1',
+  'SELECT u.y, max(t.r) FROM t JOIN u ON u.x = t.a GROUP BY u.y ORDER BY 2 DESC, 1',
   // Subqueries (6c-ii): uncorrelated, correlated, decorrelated, over aggregate rows, nested, in ON and arguments.
   'SELECT a FROM t WHERE id IN (SELECT x FROM u)',
   'SELECT a FROM t WHERE a NOT IN (SELECT x FROM u WHERE x > 3) ORDER BY 1',
@@ -75,7 +91,7 @@ const HANDLED = [
   'SELECT s, count(*), row_number() OVER (ORDER BY count(*) DESC, s) FROM t GROUP BY s',
   'SELECT a FROM t WHERE id < 5 UNION SELECT x FROM u WHERE x > 8 ORDER BY 1 DESC LIMIT 4',
   'SELECT a FROM t INTERSECT SELECT x FROM u EXCEPT SELECT 3',
-  'VALUES (1, \'a\'), (3, \'b\'), (2, NULL) ORDER BY 1',
+  'VALUES (1, \'a\'), (3, \'b\'), (2, NULL)',
   'SELECT * FROM (VALUES (1), (2)) v',
   'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20) SELECT count(*), max(i) FROM n',
   'SELECT u.x, w.r FROM u CROSS JOIN (SELECT 1 AS r) w LIMIT 2',
@@ -89,24 +105,15 @@ const HANDLED = [
 ];
 
 const params = (sql: string) => (sql.includes('?') ? [7] : undefined);
-const run = (db: Database, sql: string) => db.prepare(sql).all(params(sql));
-const explain = (db: Database, sql: string) => db.prepare(`EXPLAIN ${sql}`).all(params(sql));
+// Rows in a stable order where the statement does not fix one.
+const ordered = (sql: string, r: unknown[][]): unknown[][] => (/ORDER BY [^)]*$/i.test(sql) ? r : [...r].sort((x, y) => (JSON.stringify(x) < JSON.stringify(y) ? -1 : 1)));
+const run = (db: Database, sql: string): unknown[][] => ordered(sql, db.prepare(sql).all(params(sql)).map((r) => Object.values(r)));
+const runLite = (lite: Sqlite, sql: string): unknown[][] => ordered(sql, lite.selectArrays(sql, params(sql)));
 
 describe('physical planner', () => {
-  it('builds the planner\'s operators for single-table plans, with the same results', async () => {
-    const db = await setup();
-    setPlanMode('legacy');
-    const want = HANDLED.map((q) => ({ rows: run(db, q), plan: explain(db, q) }));
-    setPlanMode('plan');
-    HANDLED.forEach((q, i) => {
-      expect(run(db, q), q).toEqual(want[i].rows);
-      expect(explain(db, q), q).toEqual(want[i].plan);
-    });
-    // Shadow mode checks EXPLAIN against the planner and runs the physical planner's operators.
-    setPlanMode('shadow');
-    const before = shadowStats.physical;
-    for (const q of HANDLED) run(db, q);
-    expect(shadowStats.physical - before).toBe(HANDLED.length);
+  it('gives the rows SQLite gives', async () => {
+    const { db, lite } = await setup();
+    for (const q of HANDLED) expect(run(db, q), q).toEqual(runLite(lite, q));
   });
 });
 
@@ -146,45 +153,15 @@ const INSERTS = [
 ];
 
 describe('physical planner, writes', () => {
-  it('inserts the same rows and returns the same RETURNING rows', async () => {
-    const results = async (mode: 'legacy' | 'plan' | 'shadow') => {
-      const db = await setup();
-      setPlanMode(mode);
-      return INSERTS.map((q) => ({ rows: db.prepare(q).all(), k: db.prepare('SELECT * FROM k ORDER BY id').all() }));
-    };
-    const want = await results('legacy');
-    expect(await results('plan')).toEqual(want);
-    const before = shadowStats.physical;
-    expect(await results('shadow')).toEqual(want);
-    // Each INSERT, and each SELECT of k.
-    expect(shadowStats.physical - before).toBe(INSERTS.length * 2);
-  });
-
-
-  it('updates the same rows and returns the same RETURNING rows', async () => {
-    const results = async (mode: 'legacy' | 'plan' | 'shadow') => {
-      const db = await setup();
-      setPlanMode(mode);
-      return UPDATES.map((q) => ({ rows: db.prepare(q).all(), t: db.prepare('SELECT * FROM t ORDER BY id').all() }));
-    };
-    const want = await results('legacy');
-    expect(await results('plan')).toEqual(want);
-    const before = shadowStats.physical;
-    expect(await results('shadow')).toEqual(want);
-    expect(shadowStats.physical - before).toBe(UPDATES.length * 2);
-  });
-
-  it('deletes the same rows and returns the same RETURNING rows', async () => {
-    const results = async (mode: 'legacy' | 'plan' | 'shadow') => {
-      const db = await setup();
-      setPlanMode(mode);
-      return DELETES.map((q) => ({ rows: db.prepare(q).all(), left: db.prepare('SELECT count(*) FROM t').all().concat(db.prepare('SELECT count(*) FROM u').all()) }));
-    };
-    const want = await results('legacy');
-    expect(await results('plan')).toEqual(want);
-    const before = shadowStats.physical;
-    expect(await results('shadow')).toEqual(want);
-    // Each DELETE, and each SELECT counting the rows left.
-    expect(shadowStats.physical - before).toBe(DELETES.length * 3);
-  });
+  // Each statement's RETURNING rows, then the table it changed.
+  const writes = (stmts: string[], after: string) => async () => {
+    const { db, lite } = await setup();
+    for (const q of stmts) {
+      expect(run(db, q), q).toEqual(runLite(lite, q));
+      expect(run(db, after), q).toEqual(runLite(lite, after));
+    }
+  };
+  it('inserts the rows SQLite inserts and returns the same RETURNING rows', writes(INSERTS, 'SELECT * FROM k ORDER BY id'));
+  it('updates the rows SQLite updates and returns the same RETURNING rows', writes(UPDATES, 'SELECT * FROM t ORDER BY id'));
+  it('deletes the rows SQLite deletes and returns the same RETURNING rows', writes(DELETES, 'SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM u), (SELECT count(*) FROM c)'));
 });
