@@ -223,6 +223,13 @@ operators.
 
 ### Step 8: writes through the plan (three PRs)
 
+- **8a (done), `delete`:** the plan op holds the target's rows (a scan with its WHERE, bound as a FROM table under
+  the statement's CTEs), the rowid's column, and RETURNING over the deleted row (the table's columns, then its
+  rowid), bound with `Database.rowsScope`'s rules (its types and affinities, both names, its errors). The physical
+  planner plans the scan and WHERE as `Database.planTarget` does (no projection: the scan decodes what WHERE reads,
+  and the rowid), then the deleted row's registers and RETURNING; the writer loop stays in the engine. Shadow mode
+  compares the target scan's EXPLAIN rows, subplans, RETURNING columns and errors.
+
 `delete`, then `update`, then `append` (column mapping, conflict modes, upsert with `excluded.*` as a second input,
 RETURNING, the single-row fast path). They compile to today's `TableWriter` programs. What belongs to the table stays
 in the engine for every language: storage affinity, defaults, CHECK, NOT NULL, foreign keys, AUTOINCREMENT,

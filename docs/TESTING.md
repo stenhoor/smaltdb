@@ -86,7 +86,8 @@ planned (`src/engine/exec/plan-shadow.ts`):
 - `shadow` (tests): both. The front end must agree with the planner on every result column's name, type, collation,
   declared type and affinity, and on planning errors; the physical planner's operators must give the planner's
   `EXPLAIN` rows and record the same subplans (subqueries), and then they run. A disagreement fails the statement
-  with `SMALT_INTERNAL`. Statements answered from materialized views are compared too.
+  with `SMALT_INTERNAL`. Statements answered from materialized views are compared too, and so are writes that go
+  through the plan layer (DELETE): their target scan's `EXPLAIN` rows, subplans, RETURNING columns and errors.
 
 CI runs the whole suite in the default mode and with `SMALT_PLAN=shadow`, and `test/plan-shapes.test.ts` and
 `test/codegen-source.test.ts` also with `SMALT_PLAN=legacy`: both paths give the same plan shapes and generated code

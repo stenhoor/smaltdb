@@ -108,3 +108,29 @@ describe('physical planner', () => {
     expect(shadowStats.physical - before).toBe(HANDLED.length);
   });
 });
+
+// Writes (step 8): the target scan, WHERE and RETURNING go through the physical planner.
+const DELETES = [
+  'DELETE FROM t WHERE a = 3',
+  'DELETE FROM t WHERE id BETWEEN 10 AND 20 RETURNING id, a * 2, s',
+  'DELETE FROM u AS x WHERE x.x IN (SELECT a FROM t WHERE id < 5) RETURNING *',
+  'DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a AND u.y = \'y3\') RETURNING rowid',
+  'WITH k(v) AS (SELECT 7) DELETE FROM c WHERE v IN (SELECT v FROM k) RETURNING g, v',
+  'DELETE FROM u RETURNING x',
+];
+
+describe('physical planner, writes', () => {
+  it('deletes the same rows and returns the same RETURNING rows', async () => {
+    const results = async (mode: 'legacy' | 'plan' | 'shadow') => {
+      const db = await setup();
+      setPlanMode(mode);
+      return DELETES.map((q) => ({ rows: db.prepare(q).all(), left: db.prepare('SELECT count(*) FROM t').all().concat(db.prepare('SELECT count(*) FROM u').all()) }));
+    };
+    const want = await results('legacy');
+    expect(await results('plan')).toEqual(want);
+    const before = shadowStats.physical;
+    expect(await results('shadow')).toEqual(want);
+    // Each DELETE, and each SELECT counting the rows left.
+    expect(shadowStats.physical - before).toBe(DELETES.length * 3);
+  });
+});

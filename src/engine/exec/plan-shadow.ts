@@ -31,6 +31,47 @@ export function setPlanMode(m: 'legacy' | 'plan' | 'shadow' | null): void {
   mode = m;
 }
 
+/**
+ * SMALT_PLAN=shadow for a write (step 8): `legacy` (the planner's AST path) and then `physical` (the front end and
+ * the physical planner) plan it, and must raise the same planning error or describe their parts the same way
+ * (`describe`: the target scan's EXPLAIN rows, subplans, RETURNING columns). `restore` resets the planner between
+ * the two. The physical planner's parts are returned (the planner's when it does not handle the write).
+ */
+export function shadowWrite<T>(text: string, legacy: () => T, physical: () => T | null, restore: () => void, describe: (t: T) => string): T {
+  let want: T | undefined;
+  let wantError: unknown;
+  try {
+    want = legacy();
+  } catch (e) {
+    const code = (e as { code?: string }).code;
+    if (code !== 'SMALT_ERROR' && code !== 'SMALT_UNSUPPORTED') throw e;
+    wantError = e;
+  }
+  const kept = want;
+  restore();
+  let got: T | null;
+  try {
+    got = physical();
+  } catch (e) {
+    if (wantError === undefined) throw mismatch(text, `whether it is valid: the front end raised ${describeError(e)}`);
+    if (describeError(e) !== describeError(wantError)) throw mismatch(text, `the error: front end ${describeError(e)}; planner ${describeError(wantError)}`);
+    shadowStats.checked++;
+    throw e;
+  }
+  if (wantError !== undefined) throw mismatch(text, `whether it is valid: the planner raised ${describeError(wantError)}`);
+  if (got === null) {
+    if (statsFile && statsFs) statsFs.appendFileSync(statsFile, JSON.stringify({ reason: 'physical planner: not handled yet', text }) + '\n');
+    restore();
+    return legacy();
+  }
+  shadowStats.checked++;
+  shadowStats.physical++;
+  const a = describe(kept!);
+  const b = describe(got);
+  if (a !== b) throw new SmaltError('SMALT_INTERNAL', `SMALT_PLAN=shadow: the physical planner disagrees with the planner on a write\n  in: ${text}\nphysical:\n${b}\nplanner:\n${a}`);
+  return got;
+}
+
 /** True when SELECTs are checked against the SQL front end. */
 export function planShadowEnabled(): boolean {
   return planMode() === 'shadow';
@@ -56,7 +97,7 @@ function mismatch(text: string, what: string): SmaltError {
   return new SmaltError('SMALT_INTERNAL', `SMALT_PLAN=shadow: the SQL front end disagrees with the planner on ${what}\n  in: ${text}`);
 }
 
-const describe = (e: unknown): string => (e instanceof Error ? `${(e as { code?: string }).code ?? e.name}: ${e.message}` : String(e));
+const describeError = (e: unknown): string => (e instanceof Error ? `${(e as { code?: string }).code ?? e.name}: ${e.message}` : String(e));
 
 /**
  * Plan `stmt` with `legacy` (the current planner) and check the SQL front end against it; then, when `physical`
@@ -86,13 +127,13 @@ export function shadowCheck(
     const code = (e as { code?: string }).code;
     if (code !== 'SMALT_ERROR' && code !== 'SMALT_UNSUPPORTED') throw e;
     if (feError !== undefined) {
-      if (describe(feError) !== describe(e)) throw mismatch(text, `the error: front end ${describe(feError)}; planner ${describe(e)}`);
+      if (describeError(feError) !== describeError(e)) throw mismatch(text, `the error: front end ${describeError(feError)}; planner ${describeError(e)}`);
       shadowStats.checked++;
-    } else if (fe !== null) throw mismatch(text, `whether it is valid: the planner raised ${describe(e)}`);
+    } else if (fe !== null) throw mismatch(text, `whether it is valid: the planner raised ${describeError(e)}`);
     else skip(unsupported, text);
     throw e;
   }
-  if (feError !== undefined) throw mismatch(text, `whether it is valid: the front end raised ${describe(feError)}`);
+  if (feError !== undefined) throw mismatch(text, `whether it is valid: the front end raised ${describeError(feError)}`);
   if (fe === null) {
     skip(unsupported, text);
     return plan;
