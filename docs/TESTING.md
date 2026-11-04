@@ -81,8 +81,7 @@ While the plan layer ([ADR 0014](adr/0014-shared-plan-layer.md)) is built, `SMAL
 planned (`src/engine/exec/plan-shadow.ts`):
 
 - unset or `plan` (the default): the SQL front end (`src/engine/sql/frontend/`, step 5) makes a plan, and the physical planner
-  (`Planner.planPlan`, step 6) builds its operators. A SELECT whose decorrelated subquery a materialized view may
-  answer goes through the planner's AST path (until step 7b).
+  (`Planner.planPlan`, step 6) builds its operators.
 - `legacy`: the planner's AST path for every SELECT, until it is deleted after step 8.
 - `shadow` (tests): both. The front end must agree with the planner on every result column's name, type, collation,
   declared type and affinity, and on planning errors; the physical planner's operators must give the planner's

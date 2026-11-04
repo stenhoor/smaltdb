@@ -20,7 +20,7 @@ import { type StaticType, truthy } from './exec/convert.js';
 import { type CompileScope, type Compiled, type Fn, compileExpr } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
-import { AstPathNeeded, type ExternalScan, Planner, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
+import { type ExternalScan, Planner, type QueryPlan, Registers, markUnordered } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
@@ -1044,7 +1044,7 @@ export class Database implements FunctionContext {
           const want = subplans();
           const end = planner.mark();
           start();
-          const p = this.physicalOrNull(planner, fe);
+          const p = planner.planPlan(fe.plan, fe.columns);
           if (!p) {
             end();
             return null;
@@ -1058,22 +1058,8 @@ export class Database implements FunctionContext {
       case 'plan': {
         // The front end applies materialized-view matching as the planner does (step 7c).
         const fe = toPlan(stmt, text, this.frontEndCatalog(), undefined, planner.env.rewriteSelect);
-        const before = planner.mark();
-        const p = fe && this.physicalOrNull(planner, fe);
-        if (p) return p;
-        before();
-        return planner.planSelect(stmt, null);
+        return (fe && planner.planPlan(fe.plan, fe.columns)) ?? planner.planSelect(stmt, null);
       }
-    }
-  }
-
-  /** The physical planner's operators for `fe`, or null when the statement takes the AST path. */
-  private physicalOrNull(planner: Planner, fe: FrontEndResult): QueryPlan | null {
-    try {
-      return planner.planPlan(fe.plan, fe.columns);
-    } catch (e) {
-      if (e instanceof AstPathNeeded) return null;
-      throw e;
     }
   }
 
@@ -1168,6 +1154,7 @@ export class Database implements FunctionContext {
     return {
       rewriteSelect: rewrite ? (select, text) => this.matviewRewrite(select, text, rewrite.exclude) : undefined,
       matviewCandidates: () => this.hasRewriteCandidates(),
+      planSql: rewrite ? (select, text) => toPlan(select, text, this.frontEndCatalog(), undefined, (s, t) => this.matviewRewrite(s, t, rewrite.exclude)) : undefined,
       externalTable: (n) => this.externalTableScan(n),
       externalFunction: (n, args, named) => this.externalFunctionScan(n, args, named),
       isExternalFunction: (n) => this.external.plugins.isExternalFunction(n),

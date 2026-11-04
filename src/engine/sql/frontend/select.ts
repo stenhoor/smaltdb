@@ -18,7 +18,7 @@ import { flattenCore, flatteningDisabled } from '../../exec/flatten.js';
 import { mayMatchMatview, matviewCoreOf } from '../../exec/planner.js';
 import { containsAggregate, containsWindow, coreReferences, exprEquals, firstAggregateCall, firstWindowCall, sameName, selectReferences } from '../../exec/planner.js';
 import type { PlanExpr } from '../../plan/expr.js';
-import { getMeta, markFlattened, setMeta } from '../../exec/sql-meta.js';
+import { getMeta, markFlattened, setMeta, setSubquerySql } from '../../exec/sql-meta.js';
 import type { AggCall, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../plan/ops.js';
 import type { CollationName } from '../../plan/types.js';
 import { Collation } from '../../values.js';
@@ -901,6 +901,8 @@ class FrontEnd {
       inSubquery: refuse,
       planSubquery: (select, mode) => {
         const r = this.select(select, scope);
+        // Decorrelation plans SQL derived from the subquery's (where materialized-view matching may answer it).
+        setSubquerySql(r.plan, { select, text: this.text, isCte: (n) => scope.findCte(n) !== undefined });
         if (mode !== 'exists' && r.columns.length !== 1) throw new SmaltError('SMALT_ERROR', `sub-select returns ${r.columns.length} columns - expected 1`);
         return { plan: r.plan, column: { type: r.columns[0]?.type ?? 'any', collation: r.columns[0]?.collation ?? Collation.Binary } };
       },
