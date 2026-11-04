@@ -69,10 +69,22 @@ const HANDLED = [
   'SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a AND EXISTS (SELECT 1 FROM c WHERE c.g = u.x AND c.v = t.id))',
   'SELECT t.id, u.y FROM t LEFT JOIN u ON u.x = t.a AND u.y IN (SELECT y FROM u WHERE x = 1) WHERE t.id < 8',
   'SELECT (SELECT count(*) FROM u), (SELECT 1 WHERE EXISTS (SELECT 1 FROM t))',
+  // Windows, compounds, VALUES, recursive CTEs, derived tables the planner does not flatten (6c-iii).
+  'SELECT a, rank() OVER (ORDER BY id), sum(r) OVER (PARTITION BY s ORDER BY id ROWS 2 PRECEDING) FROM t LIMIT 5',
+  'SELECT s, count(*), row_number() OVER (ORDER BY count(*) DESC, s) FROM t GROUP BY s',
+  'SELECT a FROM t WHERE id < 5 UNION SELECT x FROM u WHERE x > 8 ORDER BY 1 DESC LIMIT 4',
+  'SELECT a FROM t INTERSECT SELECT x FROM u EXCEPT SELECT 3',
+  'VALUES (1, \'a\'), (3, \'b\'), (2, NULL) ORDER BY 1',
+  'SELECT * FROM (VALUES (1), (2)) v',
+  'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20) SELECT count(*), max(i) FROM n',
+  'SELECT u.x, w.r FROM u CROSS JOIN (SELECT 1 AS r) w LIMIT 2',
+  'SELECT d.a, d.n FROM (SELECT a, count(*) AS n FROM t GROUP BY a) d JOIN u ON u.x = d.a WHERE d.n > 17',
+  'SELECT * FROM (SELECT DISTINCT y FROM u) ORDER BY 1',
+  'SELECT k FROM (SELECT a AS k FROM t ORDER BY r DESC LIMIT 3) ORDER BY 1',
 ];
 
-// Shapes the physical planner leaves to the planner (6c-iii).
-const JOINS = ['SELECT u.x, w.r FROM u CROSS JOIN (SELECT 1 AS r) w LIMIT 2', 'SELECT a, rank() OVER (ORDER BY id) FROM t LIMIT 3'];
+// A derived table the planner may flatten into the query: left to it until flattening reads plans (step 7a).
+const FLATTENED = ['SELECT k FROM (SELECT a AS k FROM t WHERE id < 4) ORDER BY 1'];
 
 const params = (sql: string) => (sql.includes('?') ? [7] : undefined);
 const run = (db: Database, sql: string) => db.prepare(sql).all(params(sql));
@@ -95,13 +107,13 @@ describe('physical planner', () => {
     expect(shadowStats.physical - before).toBe(HANDLED.length);
   });
 
-  it('leaves derived tables and windows to the planner', async () => {
+  it.skipIf(!!process.env.SMALT_NO_FLATTEN)('leaves derived tables the planner may flatten to the planner', async () => {
     const db = await setup();
     setPlanMode('legacy');
-    const want = JOINS.map((q) => run(db, q));
+    const want = FLATTENED.map((q) => run(db, q));
     setPlanMode('shadow');
     const before = shadowStats.physical;
-    JOINS.forEach((q, i) => expect(run(db, q), q).toEqual(want[i]));
+    FLATTENED.forEach((q, i) => expect(run(db, q), q).toEqual(want[i]));
     expect(shadowStats.physical).toBe(before);
   });
 });
