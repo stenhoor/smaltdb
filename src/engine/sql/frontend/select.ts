@@ -14,7 +14,7 @@ import { aggregateCallName } from '../ast-util.js';
 import { containsAggregate, containsWindow, coreReferences, exprEquals, firstAggregateCall, firstWindowCall, sameName, selectReferences } from '../../exec/planner.js';
 import { type BoundExpr, type PlanExpr, typeOf } from '../../plan/expr.js';
 import { getMeta, markFlattened, setMeta } from '../../exec/sql-meta.js';
-import type { AggCall, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../plan/ops.js';
+import type { AggCall, ConflictAction, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../plan/ops.js';
 import type { BindContext } from '../../plan/bind-context.js';
 import type { CollationName } from '../../plan/types.js';
 import { Collation, type SqlValue } from '../../values.js';
@@ -82,40 +82,52 @@ export function toPlan(stmt: SelectStmt, text: string, catalog: BindContext): Fr
 }
 
 /**
- * DELETE (ADR 0014, step 8a): a `delete` plan over the rows of `table` (resolved and checked by the database) that
- * the WHERE keeps, with RETURNING over each deleted row. Throws the error the planner would raise.
+ * INSERT, UPDATE or DELETE as a write plan (`append`, `update`, `delete`; ADR 0015 step 6): the front end resolves
+ * its own target (through `catalog.writeTarget`, which refuses what may not be written), the INSERT column list and
+ * the statement's conflict action. `source`: an INSERT … SELECT's result columns.
  */
-export function toDeletePlan(stmt: DeleteStmt, table: TableSchema, text: string, catalog: BindContext): FrontEndWrite {
+export function toWritePlan(stmt: InsertStmt | UpdateStmt | DeleteStmt, text: string, catalog: BindContext): FrontEndWrite & { source?: FrontEndColumn[] } {
   const fe = new FrontEnd(catalog, text);
+  if (stmt.kind === 'insert') {
+    // WITH ... INSERT: the CTEs belong to the row source.
+    if (stmt.with) {
+      if (stmt.source.kind !== 'select') throw new SmaltError('SMALT_UNSUPPORTED', 'WITH ... INSERT ... VALUES is not supported yet');
+      const sel = stmt.source.select;
+      const merged = sel.with ? { ...sel.with, recursive: sel.with.recursive || stmt.with.recursive, ctes: [...stmt.with.ctes, ...sel.with.ctes] } : stmt.with;
+      stmt = { ...stmt, with: undefined, source: { kind: 'select', select: { ...sel, with: merged } } };
+    }
+    const table = catalog.writeTarget(stmt.table, stmt.schema);
+    if (stmt.source.kind === 'default' && stmt.columns) throw new SmaltError('SMALT_ERROR', `0 values for ${stmt.columns.length} columns`);
+    // DEFAULT VALUES supplies no values: every column takes its default. -1: the rowid (a table without an alias).
+    const columns: number[] =
+      stmt.source.kind === 'default'
+        ? []
+        : stmt.columns
+          ? stmt.columns.map((name) => {
+              const i = findColumn(table, name);
+              if (i < 0) {
+                if (ROWID_NAMES.has(name.toLowerCase()) && table.rowidAlias < 0) return -1;
+                throw new SmaltError('SMALT_ERROR', `table ${table.name} has no column named ${name}`);
+              }
+              return i;
+            })
+          : table.columns.map((_, i) => i);
+    const r = fe.insertPlan(stmt, table, columns);
+    return { plan: withConflict(fe.resolveRefs(r.plan), stmt.or), returning: r.returning, source: r.source };
+  }
+  if (stmt.orderBy.length || stmt.limit) throw new SmaltError('SMALT_UNSUPPORTED', `${stmt.kind === 'update' ? 'UPDATE' : 'DELETE'} ... ORDER BY/LIMIT is not supported`);
+  const table = catalog.writeTarget(stmt.table, stmt.schema);
+  if (stmt.kind === 'update') {
+    const r = fe.updatePlan(stmt, table);
+    return { plan: withConflict(fe.resolveRefs(r.plan), stmt.or), returning: r.returning };
+  }
   const r = fe.deletePlan(stmt, table);
   return { plan: fe.resolveRefs(r.plan), returning: r.returning };
 }
 
-/**
- * UPDATE (ADR 0014, step 8b): an `update` plan over the rows of `table` (resolved and checked by the database), with
- * the FROM sources, that the WHERE keeps; its SET values, and RETURNING over each updated row.
- */
-export function toUpdatePlan(stmt: UpdateStmt, table: TableSchema, text: string, catalog: BindContext): FrontEndWrite {
-  const fe = new FrontEnd(catalog, text);
-  const r = fe.updatePlan(stmt, table);
-  return { plan: fe.resolveRefs(r.plan), returning: r.returning };
-}
-
-/**
- * INSERT (ADR 0014, step 8c): an `append` plan for `stmt` (its WITH merged into the SELECT source) into `table`,
- * whose values go to the table's `columns` (resolved by the database: -1 for the rowid). `source`: the SELECT's
- * result columns.
- */
-export function toInsertPlan(
-  stmt: InsertStmt,
-  table: TableSchema,
-  columns: number[],
-  text: string,
-  catalog: BindContext,
-): FrontEndWrite & { source?: FrontEndColumn[] } {
-  const fe = new FrontEnd(catalog, text);
-  const r = fe.insertPlan(stmt, table, columns);
-  return { plan: fe.resolveRefs(r.plan), returning: r.returning, source: r.source };
+/** A write plan with SQL's `OR` action (`INSERT OR REPLACE`, …) as its conflict action. */
+function withConflict(plan: PlanOp, or: string | undefined): PlanOp {
+  return or === undefined ? plan : ({ ...plan, onConflict: or.toLowerCase() as ConflictAction } as PlanOp);
 }
 
 /**

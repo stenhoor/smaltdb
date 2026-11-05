@@ -302,6 +302,7 @@ class Validator {
       }
       case 'update': {
         const n = this.tableWidth(o.table, o.db);
+        if (o.onConflict !== undefined && !CONFLICT_ACTIONS.has(o.onConflict)) this.fail(`unknown conflict action ${JSON.stringify(o.onConflict)}`, 'onConflict');
         const w = sub(o.input, 'input');
         if (!Number.isInteger(o.rowid) || o.rowid < 0 || o.rowid >= w) this.fail(`input has no column ${o.rowid}`, 'rowid');
         const scopes = reading(w);
@@ -317,6 +318,7 @@ class Validator {
       }
       case 'append': {
         const n = this.tableWidth(o.table, o.db);
+        if (o.onConflict !== undefined && !CONFLICT_ACTIONS.has(o.onConflict)) this.fail(`unknown conflict action ${JSON.stringify(o.onConflict)}`, 'onConflict');
         const cols = columnsOf(o.columns, n, o.table, 'columns');
         if (o.input !== null) {
           const w = sub(o.input, 'input');
@@ -463,5 +465,6 @@ class Validator {
 /** Path segments of the validation running (at most two per nesting level). */
 const PATH: (string | number)[] = new Array<string | number>(2 * MAX_PLAN_DEPTH + 8).fill('');
 
+const CONFLICT_ACTIONS = new Set(['rollback', 'abort', 'fail', 'ignore', 'replace']);
 const JOIN_KINDS = new Set(['inner', 'left', 'right', 'full', 'semi', 'anti', 'cross']);
 const SETOP_KINDS = new Set(['union', 'unionAll', 'intersect', 'except']);
