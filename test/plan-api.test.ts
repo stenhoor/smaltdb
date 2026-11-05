@@ -44,6 +44,20 @@ describe('plan API', () => {
     expect(d.queryPlan(g).rows).toEqual([['a', 15, 2], ['b', 20, 1], ['c', 30, 1], ['d', null, 1]]);
   });
 
+  it("compares text with the collation a comparison call names", () => {
+    const d = db();
+    d.exec("INSERT INTO t VALUES (5, 'B', 50)");
+    const ids = (pred: p.PlanExpr): unknown[] => d.queryPlan(p.project(p.filter(p.scan('t', [0, 1, 2]), pred), [id])).rows.flat();
+    // A column against a literal (a fused scan's text equality) and against an expression (generated code).
+    expect(ids(p.call('sql.eq', [name, p.lit('b')], 'int', 'nocase'))).toEqual([2, 5]);
+    expect(ids(p.call('sql.eq', [name, p.lit('b')], 'int'))).toEqual([2]);
+    expect(ids(p.call('sql.eq', [name, p.call('upper', [p.lit('b')], 'text')], 'int', 'nocase'))).toEqual([2, 5]);
+    expect(ids(p.call('sql.ne', [name, p.call('upper', [p.lit('b')], 'text')], 'int', 'nocase'))).toEqual([1, 3, 4]);
+    expect(ids(p.call('sql.eq', [name, p.call('upper', [p.lit('b')], 'text')], 'int'))).toEqual([5]);
+    // As SQL compares them.
+    expect(d.query("SELECT id FROM t WHERE name = 'b' COLLATE NOCASE ORDER BY id").rows.flat()).toEqual([2, 5]);
+  });
+
   it('takes positional parameters only, as many as the plan reads', () => {
     const d = db();
     const q = p.filter(p.scan('t', [0]), p.call('sql.eq', [id, p.param(1, 'int')], 'int'));
