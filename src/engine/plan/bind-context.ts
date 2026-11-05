@@ -15,6 +15,11 @@ import type { SqlValue } from '../values.js';
 export interface BindContext {
   /** A table by name; `schema` 'main' / 'temp' picks that schema when a TEMP table shadows a main one. */
   getTable(name: string, schema?: string): TableSchema | undefined;
+  /**
+   * The table a statement writes, by name: throws when there is none, or when it may not be written (a view, an
+   * external table, the catalog and system tables, a materialized view).
+   */
+  writeTarget(name: string, schema?: string): TableSchema;
   /** A view's definition, bound where the view is read. */
   getView?(name: string, schema?: string): { name: string; sql: string; columns?: string[]; select: SelectStmt } | undefined;
   /** True for an external table. */

@@ -55,6 +55,12 @@ export interface WindowCall {
 
 export type JoinKind = 'inner' | 'left' | 'right' | 'full' | 'semi' | 'anti' | 'cross';
 
+/**
+ * What a write does when a row violates a constraint, for the whole statement (SQL's `INSERT OR …` / `UPDATE OR …`).
+ * Absent: each constraint's own action applies (its ON CONFLICT clause, else abort).
+ */
+export type ConflictAction = 'rollback' | 'abort' | 'fail' | 'ignore' | 'replace';
+
 export type PlanOp =
   /**
    * Rows of a table: `columns` lists table column indexes, -1 for the rowid. `db` names the schema when the query
@@ -114,12 +120,13 @@ export type PlanOp =
    * table's `columns` (-1: the rowid; the others take their defaults). Each of `upserts` handles a conflict on the
    * constraint `target` (an index of the table, -1 its INTEGER PRIMARY KEY, null any): nothing, or `update`, whose
    * expressions read the existing row (the table's columns, then its rowid) and then the proposed row (`excluded`,
-   * likewise). `returning` reads each inserted or updated row.
+   * likewise). `returning` reads each inserted or updated row. `onConflict`: the statement's conflict action.
    */
   | {
       readonly op: 'append';
       readonly table: string;
       readonly db: 'main' | 'temp';
+      readonly onConflict?: ConflictAction;
       readonly input: PlanOp | null;
       readonly columns: readonly number[];
       readonly upserts: readonly {
@@ -131,12 +138,14 @@ export type PlanOp =
   /**
    * UPDATE: for each row of `input` (the target's rows, joined with the FROM sources when `from`), sets the target
    * row whose rowid is in column `rowid`: each of `sets` assigns `value` (over the input row) to the table's column
-   * `column` (-1: the rowid). `returning` reads each updated row: the table's columns, then its rowid.
+   * `column` (-1: the rowid). `returning` reads each updated row: the table's columns, then its rowid. `onConflict`:
+   * the statement's conflict action.
    */
   | {
       readonly op: 'update';
       readonly table: string;
       readonly db: 'main' | 'temp';
+      readonly onConflict?: ConflictAction;
       readonly input: PlanOp;
       readonly rowid: number;
       readonly sets: readonly { readonly column: number; readonly value: PlanExpr }[];

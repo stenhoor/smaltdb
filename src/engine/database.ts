@@ -17,7 +17,7 @@ import {
 } from './catalog/schema.js';
 import { MisuseError, SmaltError } from './errors.js';
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
-import type { PlanOp } from './plan/ops.js';
+import type { ConflictAction, PlanOp } from './plan/ops.js';
 import { type EncodedPlan, decodePlan, encodePlan, planFromJSON, planToJSON } from './plan/codec.js';
 import { type ValidateCatalog, validatePlan } from './plan/validate.js';
 import { type PlanExpr, forEachCol, typeOf } from './plan/expr.js';
@@ -29,7 +29,7 @@ import { type ExternalScan, type PhysicalEnv, Planner, type QueryPlan, Registers
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type PlanMorsels, planMorsels } from './exec/plan-morsel.js';
-import { toDeletePlan, toInsertPlan, toPlan, toRowExpr, toUpdatePlan, toValueExpr } from './sql/frontend/select.js';
+import { type FrontEndWrite, toPlan, toRowExpr, toValueExpr, toWritePlan } from './sql/frontend/select.js';
 import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
@@ -43,15 +43,12 @@ import type {
   CreateViewStmt,
   CreateConnectionStmt,
   CreateExternalTableStmt,
-  DeleteStmt,
   DropStmt,
   Expr,
-  InsertStmt,
   ParsedStatement,
   PragmaStmt,
   SelectStmt,
   Stmt,
-  UpdateStmt,
 } from './sql/ast.js';
 import { parse, parseOne } from './sql/parser.js';
 import {
@@ -1057,6 +1054,7 @@ export class Database implements FunctionContext {
   private bindContext(): BindContext {
     return (this.bindCtx ??= {
       getTable: (n, schema) => this.plannedTable(n, schema),
+      writeTarget: (n, schema) => this.targetTable(n, schema),
       getView: (n, schema) => this.getView(n, schema),
       isExternal: (n) => this.externals.has(n.toLowerCase()),
       externalColumns: (n) => this.externalTableScan(n)?.columns,
@@ -1074,7 +1072,7 @@ export class Database implements FunctionContext {
     const getTable = (n: string): TableSchema | undefined => this.getTable(n);
     return {
       env: { getTable, openTree: (root) => this.tree(root), funcCtx: this, state: this.state },
-      catalog: { getTable, getView: (n) => this.getView(n), isExternal: (n) => this.externals.has(n.toLowerCase()), funcCtx: this },
+      catalog: { getTable, writeTarget: (n, schema) => this.targetTable(n, schema), getView: (n) => this.getView(n), isExternal: (n) => this.externals.has(n.toLowerCase()), funcCtx: this },
     };
   }
 
@@ -1111,15 +1109,10 @@ export class Database implements FunctionContext {
         const plan = this.planSelectStmt(stmt, ps.text, planner);
         return done({ plan, readonly: true, columns: plan.columns.map((c) => c.name), columnTypes: plan.columns.map((c) => c.type) });
       }
-      case 'insert': {
-        const single = stmt.source.kind === 'values' && stmt.source.rows.length === 1 && !this.mayReplace(stmt) && !stmt.upsert.length && !this.fkInvolvedNow(stmt.table);
-        const c = this.compileInsert(stmt, planner);
-        return done(this.dmlProgram(c, single));
-      }
+      case 'insert':
       case 'update':
-        return done(this.dmlProgram(this.compileUpdate(stmt, planner)));
       case 'delete':
-        return done(this.dmlProgram(this.compileDelete(stmt, planner)));
+        return done(this.compileWrite(this.received(toWritePlan(stmt, ps.text, this.bindContext())), planner));
       case 'createTable':
         return done({ exec: () => this.createTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
       case 'createIndex':
@@ -3390,15 +3383,28 @@ export class Database implements FunctionContext {
   }
 
   /** Whether an INSERT may delete rows to resolve conflicts (OR REPLACE, or a constraint's ON CONFLICT REPLACE). */
-  private mayReplace(stmt: InsertStmt): boolean {
-    if (stmt.or !== undefined) return stmt.or === 'REPLACE';
-    let table: TableSchema | undefined;
-    try {
-      table = this.getTable(stmt.table);
-    } catch {
-      return false; // compileInsert reports it
+  private mayReplace(op: AppendOp, table: TableSchema): boolean {
+    if (op.onConflict !== undefined) return op.onConflict === 'replace';
+    return table.pkConflict === 'REPLACE' || table.indexes.some((i) => i.onConflict === 'REPLACE') || table.columns.some((c) => c.notNullConflict === 'REPLACE');
+  }
+
+  /** A write plan's program (INSERT, UPDATE, DELETE), from the plan alone. */
+  private compileWrite(fe: FrontEndWrite & { source?: ResultColumnInfo[] }, planner: Planner): Omit<Program, 'regCount'> {
+    const op = fe.plan;
+    switch (op.op) {
+      case 'append': {
+        const table = this.targetTable(op.table, op.db);
+        // A single row with no conflict handling or foreign keys writes once, after every check: no statement journal.
+        const single = op.input?.op === 'values' && op.input.rows.length === 1 && !this.mayReplace(op, table) && op.upserts.length === 0 && !this.fkInvolvedNow(op.table);
+        return this.dmlProgram(this.compileInsert(op, fe, table, planner), single);
+      }
+      case 'update':
+        return this.dmlProgram(this.compileUpdate(op, fe, this.targetTable(op.table, op.db), planner));
+      case 'delete':
+        return this.dmlProgram(this.compileDelete(op, fe, this.targetTable(op.table, op.db), planner));
+      default:
+        throw new SmaltError('SMALT_INTERNAL', `not a write plan: ${op.op}`);
     }
-    return !!table && (table.pkConflict === 'REPLACE' || table.indexes.some((i) => i.onConflict === 'REPLACE') || table.columns.some((c) => c.notNullConflict === 'REPLACE'));
   }
 
   /** Normalize a rowid value (INTEGER PRIMARY KEY must hold an integer). */
@@ -3412,35 +3418,13 @@ export class Database implements FunctionContext {
     throw new SmaltError('SMALT_MISMATCH', 'datatype mismatch');
   }
 
-  private compileInsert(stmt: InsertStmt, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
-    // WITH ... INSERT: the CTEs belong to the row source.
-    if (stmt.with) {
-      if (stmt.source.kind !== 'select') throw new SmaltError('SMALT_UNSUPPORTED', 'WITH ... INSERT ... VALUES is not supported yet');
-      const sel = stmt.source.select;
-      const merged = sel.with ? { ...sel.with, recursive: sel.with.recursive || stmt.with.recursive, ctes: [...stmt.with.ctes, ...sel.with.ctes] } : stmt.with;
-      stmt = { ...stmt, with: undefined, source: { kind: 'select', select: { ...sel, with: merged } } };
-    }
-    const table = this.targetTable(stmt.table, stmt.schema);
+  private compileInsert(op: AppendOp, fe: FrontEndWrite & { source?: ResultColumnInfo[] }, table: TableSchema, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
     const ncols = table.columns.length;
-    if (stmt.source.kind === 'default' && stmt.columns) {
-      throw new SmaltError('SMALT_ERROR', `0 values for ${stmt.columns.length} columns`);
-    }
-    // DEFAULT VALUES supplies no values: every column takes its default.
-    const targets: number[] = stmt.source.kind === 'default'
-      ? []
-      : stmt.columns
-      ? stmt.columns.map((name) => {
-          const i = findColumn(table, name);
-          if (i < 0) {
-            if (['rowid', 'oid', '_rowid_'].includes(name.toLowerCase()) && table.rowidAlias < 0) return -2;
-            throw new SmaltError('SMALT_ERROR', `table ${table.name} has no column named ${name}`);
-          }
-          return i;
-        })
-      : table.columns.map((_, i) => i);
+    // Where each value goes: a column, or -2 for the rowid of a table without an alias.
+    const targets = op.columns.map((c) => (c === -1 ? -2 : c));
     // The statement's OR action; without one, each constraint's ON CONFLICT action applies.
-    const mode: ConflictMode | undefined = stmt.or;
-    const { defaults, defaultReal, base, rowidReg, checks, ret, upserts, rows } = this.insertParts(stmt, table, targets, planner);
+    const mode = conflictMode(op.onConflict);
+    const { defaults, defaultReal, base, rowidReg, checks, ret, upserts, rows } = this.insertParts(op, fe, table, planner);
 
     // Row source: each produces values for `targets`.
     let rowsFn: (r: SqlValue[], emit: (vals: SqlValue[], real: boolean[]) => void) => void;
@@ -3453,9 +3437,9 @@ export class Database implements FunctionContext {
       };
     } else {
       const plan = rows.plan;
-      const select = (stmt.source as { select: SelectStmt }).select;
       const reals = plan.columns.map((c) => c.type === 'real');
-      const selfRef = JSON.stringify(select, (k, v) => (k === 'pos' || k === 'end' ? undefined : typeof v === 'bigint' ? v.toString() : v instanceof Uint8Array ? [...v] : v)).toLowerCase().includes(`"name":"${table.name.toLowerCase()}"`);
+      // The SELECT reads the table it writes (in a subquery or a view, too).
+      const selfRef = scansTable(op.input, table.name);
       rowsFn = (r, emit) => {
         const root = plan.root;
         if (selfRef) {
@@ -3552,7 +3536,7 @@ export class Database implements FunctionContext {
    * (defaults, CHECK) over the new row's registers, RETURNING, the ON CONFLICT clauses, and the rows (VALUES, or the
    * SELECT through the SELECT pipeline).
    */
-  private insertParts(stmt: InsertStmt, table: TableSchema, targets: number[], planner: Planner): InsertParts {
+  private insertParts(appended: AppendOp, fe: FrontEndWrite & { source?: ResultColumnInfo[] }, table: TableSchema, planner: Planner): InsertParts {
     const ncols = table.columns.length;
     const prefix = () => {
       const compiled = this.compileDefaults(table, planner);
@@ -3565,10 +3549,9 @@ export class Database implements FunctionContext {
     };
     const physical = (): InsertParts | null => {
       const p = prefix();
-      const fe = this.received(toInsertPlan(stmt, table, targets.map((t) => (t === -2 ? -1 : t)), planner.sqlText, this.bindContext()));
       // Materialized-view matching may answer the SELECT source (under the statement's policy).
       const rewrite = planner.env.rewritePlan;
-      const op = rewrite ? rewrite(fe.plan) : fe.plan;
+      const op = rewrite ? rewrite(appended) : appended;
       if (op.op !== 'append') return null;
       const ret = fe.returning && op.returning ? { columns: fe.returning.map((c) => c.name), types: fe.returning.map((c) => c.type), fns: planner.compileRowExprs(op.returning, ncols, p.base, p.rowidReg) } : undefined;
       const upserts: Upsert[] = op.upserts.map((u) => {
@@ -3582,7 +3565,7 @@ export class Database implements FunctionContext {
         return { target: u.target, update: { sets, where, oldBase, oldRowid } };
       });
       let rows: InsertParts['rows'] = { kind: 'default' };
-      if (op.input?.op === 'values' && stmt.source.kind === 'values') rows = { kind: 'values', rows: op.input.rows.map((row) => planner.compileAt(row, () => -1)) };
+      if (op.input?.op === 'values') rows = { kind: 'values', rows: op.input.rows.map((row) => planner.compileAt(row, () => -1)) };
       else if (op.input) {
         const plan = planner.planPlan(op.input, fe.source!);
         if (!plan) return null;
@@ -3648,14 +3631,12 @@ export class Database implements FunctionContext {
     return undefined;
   }
 
-  private compileUpdate(stmt: UpdateStmt, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
-    if (stmt.orderBy.length || stmt.limit) throw new SmaltError('SMALT_UNSUPPORTED', 'UPDATE ... ORDER BY/LIMIT is not supported');
-    const table = this.targetTable(stmt.table, stmt.schema);
-    const { root, colRegs, rowidReg, sets, defaults, base, checkRowid, checks, ret } = this.updateParts(stmt, table, planner);
+  private compileUpdate(op: UpdateOp, fe: FrontEndWrite, table: TableSchema, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
+    const { root, colRegs, rowidReg, sets, defaults, base, checkRowid, checks, ret } = this.updateParts(op, fe, table, planner);
     // The statement's OR action; without one, each constraint's ON CONFLICT action applies.
-    const mode: ConflictMode | undefined = stmt.or;
+    const mode = conflictMode(op.onConflict);
     const ncols = table.columns.length;
-    const withFrom = stmt.from !== undefined;
+    const withFrom = op.from;
 
     const exec = (r: SqlValue[], out?: SqlValue[][]): RunResult => {
       // Two passes, like SQLite: collect target rowids first (Halloween-safe), then update them in
@@ -3720,12 +3701,10 @@ export class Database implements FunctionContext {
     return { exec, returning: ret && { columns: ret.columns, types: ret.types } };
   }
 
-  private compileDelete(stmt: DeleteStmt, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
-    if (stmt.orderBy.length || stmt.limit) throw new SmaltError('SMALT_UNSUPPORTED', 'DELETE ... ORDER BY/LIMIT is not supported');
-    const table = this.targetTable(stmt.table, stmt.schema);
-    const { root, rowidReg, oldBase, oldRowid, ret } = this.deleteParts(stmt, table, planner);
-    // DELETE without WHERE truncates, unless foreign keys need to see every row.
-    const truncate = !stmt.where && !stmt.returning;
+  private compileDelete(op: DeleteOp, fe: FrontEndWrite, table: TableSchema, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
+    const { root, rowidReg, oldBase, oldRowid, ret } = this.deleteParts(op, fe, planner);
+    // Deleting every row without RETURNING truncates, unless foreign keys need to see every row.
+    const truncate = !op.returning && wholeTable(op.input);
     const ncols = table.columns.length;
     const exec = (r: SqlValue[], out?: SqlValue[][]): RunResult => {
       if (truncate && !this.fk.involved(table)) {
@@ -3766,7 +3745,7 @@ export class Database implements FunctionContext {
    * then what belongs to the table (defaults and CHECK over the new row's registers) and RETURNING, planned
    * through the plan layer (step 8b).
    */
-  private updateParts(stmt: UpdateStmt, table: TableSchema, planner: Planner): UpdateParts {
+  private updateParts(op: UpdateOp, fe: FrontEndWrite, table: TableSchema, planner: Planner): UpdateParts {
     type Target = Pick<UpdateParts, 'root' | 'colRegs' | 'rowidReg' | 'sets'>;
     type Returning = (base: number, checkRowid: number) => UpdateParts['ret'];
     const finish = (t: Target, returning: Returning): UpdateParts => {
@@ -3777,10 +3756,8 @@ export class Database implements FunctionContext {
       return { ...t, defaults, base, checkRowid, checks, ret: returning(base, checkRowid) };
     };
     const physical = (): UpdateParts | null => {
-      const fe = this.received(toUpdatePlan(stmt, table, planner.sqlText, this.bindContext()));
-      const op = fe.plan;
-      const p = op.op === 'update' ? planner.planUpdate(op) : null;
-      if (!p || op.op !== 'update') return null;
+      const p = planner.planUpdate(op);
+      if (!p) return null;
       // The writer's rowid assignment is column -2.
       const sets = p.sets.map((x) => ({ col: x.column < 0 ? -2 : x.column, c: x.c }));
       return finish({ root: p.root, colRegs: p.colRegs, rowidReg: p.rowidReg, sets }, (base, checkRowid) =>
@@ -3803,10 +3780,9 @@ export class Database implements FunctionContext {
    * DELETE's target rows (the scan with its WHERE, reading the rowid) and its RETURNING over registers for the
    * deleted row, planned through the plan layer (step 8a).
    */
-  private deleteParts(stmt: DeleteStmt, table: TableSchema, planner: Planner): DeleteParts {
+  private deleteParts(op: DeleteOp, fe: FrontEndWrite, planner: Planner): DeleteParts {
     const physical = (): DeleteParts | null => {
-      const fe = this.received(toDeletePlan(stmt, table, planner.sqlText, this.bindContext()));
-      const p = fe.plan.op === 'delete' ? planner.planDelete(fe.plan) : null;
+      const p = planner.planDelete(op);
       if (!p) return null;
       const ret = fe.returning && { columns: fe.returning.map((c) => c.name), types: fe.returning.map((c) => c.type), fns: p.returning! };
       return { root: p.root, rowidReg: p.rowidReg, oldBase: p.oldBase, oldRowid: p.oldRowid, ret };
@@ -4484,3 +4460,30 @@ interface DeleteParts {
 
 /** Collation names by `Collation` (materialized-view matching reads a view's columns as plan columns). */
 const MATVIEW_COLLATIONS: readonly CollationName[] = ['binary', 'nocase', 'rtrim'];
+
+type AppendOp = Extract<PlanOp, { op: 'append' }>;
+type UpdateOp = Extract<PlanOp, { op: 'update' }>;
+type DeleteOp = Extract<PlanOp, { op: 'delete' }>;
+
+/** A plan's conflict action as the writer's mode (undefined: each constraint's own). */
+function conflictMode(a: ConflictAction | undefined): ConflictMode | undefined {
+  return a === undefined ? undefined : (a.toUpperCase() as ConflictMode);
+}
+
+/** Whether `plan` (or a subquery or nested plan in it) scans table `name`. */
+function scansTable(plan: unknown, name: string): boolean {
+  const lower = name.toLowerCase();
+  const seen = (x: unknown): boolean => {
+    if (Array.isArray(x)) return x.some(seen);
+    if (!x || typeof x !== 'object' || x instanceof Uint8Array) return false;
+    const o = x as Record<string, unknown>;
+    if (o.op === 'scan' && typeof o.table === 'string' && o.table.toLowerCase() === lower) return true;
+    return Object.values(o).some(seen);
+  };
+  return seen(plan);
+}
+
+/** Whether a delete's input is every row of its table (a scan, under projections only). */
+function wholeTable(op: PlanOp): boolean {
+  return op.op === 'scan' || (op.op === 'project' && wholeTable(op.input));
+}
