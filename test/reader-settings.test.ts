@@ -65,7 +65,7 @@ class SettingReaders implements ReaderPool {
       try {
         r.refreshSnapshot();
         r.applyReaderSettings(task.settings);
-        done(null, r.runPartial(task.sql, task.params as never, task.lo, task.hi));
+        done(null, r.runPartial(structuredClone(task)));
       } catch (e) {
         done(String(e), null);
       }

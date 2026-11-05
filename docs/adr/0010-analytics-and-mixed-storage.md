@@ -133,7 +133,7 @@ from columnar tables, ALTER TABLE, TEMP columnar tables and ANALYZE statistics. 
 Partial aggregates are computed over rowid ranges on parallel reader workers and merged on the owner. This works
 in Chromium, where shared OPFS handles allow parallel readers (ADR 0009).
 
-**Eligible queries** (`exec/morsel.ts`): a single SELECT over one file table (row table, columnar table or columnar
+**Eligible queries** (`exec/morsel.ts`; since [ADR 0015](0015-smaltql.md) step 5 the analysis works on plans, in `exec/plan-morsel.ts`, and readers receive the partial plan instead of SQL): a single SELECT over one file table (row table, columnar table or columnar
 view).
 - *Aggregates:* only those that merge exactly: `count`, `sum`, `total`, `min`/`max` with one argument, and `avg`.
   They may use `FILTER`, but not `DISTINCT` or `ORDER BY` inside the call.

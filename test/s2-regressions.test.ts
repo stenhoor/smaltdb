@@ -194,7 +194,7 @@ class FakeReaders implements ReaderPool {
       this.busy--;
       if (fail) return done('reader failed', null);
       r.refreshSnapshot();
-      done(null, r.runPartial(task.sql, task.params as never, task.lo, task.hi));
+      done(null, r.runPartial(structuredClone(task)));
     }, 5);
     return true;
   }

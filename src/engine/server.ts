@@ -25,6 +25,7 @@ import { type SmaltPlugin, askError } from './plugin.js';
 import type { Vfs } from './vfs/types.js';
 import { type ReaderSettings, type Request, type Response, encodeColumns } from '../shared/protocol.js';
 import type { SqlValue } from './values.js';
+import type { EncodedPlan } from './plan/codec.js';
 
 /** Sends a response to a session. */
 export type Send = (session: string, msg: Response, transfer?: Transferable[]) => void;
@@ -74,19 +75,20 @@ export interface ReaderPool {
   /** Readers idle right now (morsel parallelism needs at least two). */
   idle?(): number;
   /**
-   * Run the partial aggregates of `task.sql` over rowids [lo, hi) on an idle reader (M7.4);
+   * Run the partial aggregates of `task.plan` over its rowid range on an idle reader (M7.4);
    * `done` receives its rows, or an error message. False when no reader is idle.
    */
   partial?(task: PartialTask, done: (err: string | null, rows: SqlValue[][] | null) => void): boolean;
 }
 
-/** One morsel of a parallel aggregate. */
+/** One morsel of a parallel aggregate: the partial plan, the key readers cache its program by, and its parameters. */
 export interface PartialTask {
-  sql: string;
-  params?: unknown;
-  lo: number;
-  hi: number;
-  /** The owner's PRAGMA settings, applied by the reader before it runs the partial query. */
+  /** The partial plan (plan/codec.ts), the same for every range of a query. */
+  plan: EncodedPlan;
+  key: string;
+  /** The query's parameters, then the range's first and last-plus-one rowid. */
+  params: SqlValue[];
+  /** The owner's PRAGMA settings, applied by the reader before it runs the partial plan. */
   settings: ReaderSettings;
 }
 
@@ -618,6 +620,12 @@ export class EngineServer {
     if (idle < 2) return false;
     const ranges = db.parallelSplit(sql, idle);
     if (!ranges) return false;
+    let tasks: Omit<PartialTask, 'settings'>[];
+    try {
+      tasks = ranges.map((r) => db.partialTask(sql, req.params as BindParams | undefined, r.lo, r.hi));
+    } catch {
+      return false; // run it normally, which reports the error
+    }
     const job: MorselJob = { session, id: req.id, cancelled: false };
     const settings = db.readerSettings;
     const release = db.holdReads();
@@ -651,8 +659,8 @@ export class EngineServer {
     };
     this.morselJobs.push(job);
     this.watch(session);
-    ranges.forEach((r, i) => {
-      const ok = pool.partial!({ sql, params: req.params, lo: r.lo, hi: r.hi, settings }, (err, rows) => {
+    tasks.forEach((t, i) => {
+      const ok = pool.partial!({ ...t, settings }, (err, rows) => {
         if (err !== null) failed ??= err;
         else partials[i] = rows!;
         if (--pending === 0) finish();

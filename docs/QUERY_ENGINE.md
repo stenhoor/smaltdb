@@ -28,13 +28,14 @@ inner sides the planner builds when it decorrelates a subquery. Languages bind a
 (`plan/bind-context.ts` `BindContext`); the planner plans against its physical environment (`PhysicalEnv`). A table's
 own expressions (CHECK, DEFAULT, index keys and partial-index WHERE) are bound by the front end too, as plan
 expressions over the table's row (`toRowExpr`, `toValueExpr`), and compiled like every other plan expression: the
-engine has one expression compiler (`compileBoundExpr`). Every SELECT, INSERT, UPDATE and DELETE goes through the plan layer, and so do the queries
+engine has one expression compiler (`compileBoundExpr`). Morsel parallelism splits an aggregate's plan into partial
+aggregates over rowid ranges and their merge (`exec/plan-morsel.ts`); reader workers receive the partial plan, encoded
+(`plan/codec.ts`), validate it (`plan/validate.ts`, as every plan is) and plan it once per query. Every SELECT, INSERT, UPDATE and DELETE goes through the plan layer, and so do the queries
 the engine plans for itself (materialized-view layout and refresh, view checks after DDL). The planner's AST path
 (`Planner.planSelect` and the write compile functions in `database.ts`) has been deleted.
 
 The steps after the parser depend on SQL text or AST in several places:
 - operators keep parts of the AST (`Filter.ast`, `AggSpec.argAsts`) for fusion;
-- morsel parallelism (`exec/morsel.ts`) sends SQL text to reader workers, which parse it again;
 - output column names come from the query text;
 - compiled statements are cached by their SQL text.
 

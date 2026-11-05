@@ -73,4 +73,34 @@ describe('morsel parallelism (partial aggregates over rowid ranges)', () => {
     expect(ranges[0].lo).toBe(3);
     expect(ranges[3].hi).toBe(150001);
   });
+
+  it('sends readers one plan per query, planned once per reader (ADR 0015 step 5)', async () => {
+    const db = await setup();
+    const sql = 'SELECT g, count(*), sum(n) FROM t WHERE x > ? GROUP BY g ORDER BY g';
+    const ranges = db.parallelSplit(sql, 4, 0)!;
+    const tasks = ranges.map((r) => db.partialTask(sql, [10], r.lo, r.hi));
+    // The same plan and key for every range; the range is in the parameters.
+    expect(new Set(tasks.map((t) => JSON.stringify(t.plan, (_k, v) => (typeof v === 'bigint' ? String(v) : v)))).size).toBe(1);
+    expect(new Set(tasks.map((t) => t.key)).size).toBe(1);
+    expect(tasks.map((t) => t.params)).toEqual(ranges.map((r) => [10, r.lo, r.hi]));
+    // A reader plans it once, then runs it for each range.
+    const reader = await setup();
+    const planned: unknown[] = [];
+    const d = reader as unknown as { planProgram: (...a: unknown[]) => unknown };
+    const real = d.planProgram.bind(reader);
+    d.planProgram = (...a) => (planned.push(a[0]), real(...a));
+    const rows = tasks.flatMap((t) => reader.runPartial(structuredClone(t)));
+    expect(planned.length).toBe(1);
+    expect(db.mergePartials(sql, [10], rows)).toEqual(db.query(sql, [10]));
+  });
+
+  it('readers validate the plans they receive', async () => {
+    const db = await setup();
+    const sql = 'SELECT g, count(*) FROM t GROUP BY g';
+    const r = db.parallelSplit(sql, 2, 0)![0];
+    const task = structuredClone(db.partialTask(sql, undefined, r.lo, r.hi));
+    // Tamper with the plan: the scan reads a column the table does not have.
+    (task.plan.plan as { input: { input: { input: { columns: number[] } } } }).input.input.input.columns = [99, -1];
+    expect(() => db.runPartial({ ...task, key: 'tampered' })).toThrow(/invalid plan at plan\.input\.input\.input\.columns\[0\]: table t has no column 99/);
+  });
 });
