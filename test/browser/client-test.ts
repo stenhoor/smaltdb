@@ -12,6 +12,8 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   const check = (name: string, ok: boolean, detail?: unknown) => checks.push({ name, ok, detail: detail === undefined ? undefined : JSON.stringify(detail) });
 
   const db = await open('client-test', { worker: () => new Worker(new URL('./plugin-worker.js', location.href), { type: 'module' }) });
+  const lang = await db.query('SELECT smalt_worker_language()', undefined, { rowMode: 'array' });
+  check('worker: a language given to defineWorker is the one the engine reads', JSON.stringify(lang) === JSON.stringify([['defineWorker']]), lang);
   await db.exec('DROP TABLE IF EXISTS items');
   await db.exec('CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT NOT NULL, price REAL, qty INT)');
   let t0 = performance.now();

@@ -287,7 +287,8 @@ serve({ plugins: [io, external, parquet] });
 
 | Member or export | Description |
 |---|---|
-| `serve(options?: { plugins?: readonly SmaltPlugin[] })` (`smaltdb/worker-runtime`) | Makes the current dedicated worker an engine worker, with these plugins in it and in its parallel readers. Call it once, at the top level of the worker script; a second call fails with `SMALT_MISUSE`. |
+| `serve(options?: { plugins?: readonly SmaltPlugin[]; languages?: readonly SmaltLanguage[] })` (`smaltdb/worker-runtime`) | Makes the current dedicated worker an engine worker, with these plugins installed and these languages registered in it and in its parallel readers. Call it once, at the top level of the worker script; a second call fails with `SMALT_MISUSE`. |
+| `defineWorker(options?)` (`smaltdb/worker-runtime`) | The same as `serve`, under the name a language's worker entry uses (see [Languages](#languages)). |
 | `db.plugins: readonly { name: string; version: string }[]` | The plugins installed in this engine (getter). |
 | `db.callPlugin(plugin: string, method: string, args: unknown[], options?: { session?: string; signal?: AbortSignal }): Promise<unknown>` | Call a plugin method. Plugin helpers such as `importCSV(db, …)` call it. `session` names the calling client session (default `'local'`); the worker server sets it. See [Writing plugins](./plugins#calling-plugin-methods). |
 | `PLUGIN_API_VERSION` | The plugin interface version this engine implements (`1`). |
@@ -308,7 +309,8 @@ name, to every database in the same engine: its statements, and the views and st
 A language reaches the engine only through `smaltdb/language`: the language interface, the plan types, values and
 collations, type and affinity conversion, the function registry and schema lookups. `smaltdb/engine`,
 `smaltdb/worker-runtime` and `smaltdb/language` share one engine, so a language registered through one is the one the
-others read. Both the interface and `smaltdb/language` are experimental: they change as SQL moves to its own package
+others read. A worker registers languages with `defineWorker({ languages, plugins })` from `smaltdb/worker-runtime`,
+in its own entry, as it installs plugins. Both the interface and `smaltdb/language` are experimental: they change as SQL moves to its own package
 ([ADR 0015](../../adr/0015-smaltql.md)).
 
 ## Errors

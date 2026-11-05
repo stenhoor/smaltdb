@@ -1,12 +1,13 @@
 /// <reference lib="webworker" />
 /**
- * The engine worker runtime (smaltdb/worker-runtime). `serve({ plugins })` makes the current
- * dedicated worker an engine worker. The default worker (smaltdb/worker) is `serve()`; an
- * application that uses plugins (ADR 0012) writes its own entry:
+ * The engine worker runtime (smaltdb/worker-runtime). `defineWorker({ languages, plugins })` (or `serve`, the same)
+ * makes the current dedicated worker an engine worker with those languages registered (ADR 0015) and those plugins
+ * installed (ADR 0012). The default worker (smaltdb/worker) is `serve()`; an application that uses plugins or another
+ * language writes its own entry:
  *
- *     import { serve } from 'smaltdb/worker-runtime';
+ *     import { defineWorker } from 'smaltdb/worker-runtime';
  *     import parquet from '@smaltdb/parquet';
- *     serve({ plugins: [parquet] });
+ *     defineWorker({ plugins: [parquet] });
  *
  * and opens the database with `open(name, { worker: () => new Worker(new URL('./db-worker.ts',
  * import.meta.url), { type: 'module' }) })`. Parallel readers are started from the same
@@ -31,9 +32,12 @@ import type { SqlValue } from './values.js';
 import { detectCapabilities } from './vfs/capabilities.js';
 import { OpfsVfs } from './vfs/opfs.js';
 import type { SmaltPlugin } from './plugin.js';
+import { registerLanguage, type SmaltLanguage } from './plan/language.js';
 import type { BusMessage, ReaderMessage, ReaderSettings, Request, Response } from '../shared/protocol.js';
 
 export interface ServeOptions {
+  /** Languages to register in this worker's engine (and its parallel readers), by their names. */
+  languages?: readonly SmaltLanguage[];
   /** Plugins to install in this worker's engine (and its parallel readers). */
   plugins?: readonly SmaltPlugin[];
 }
@@ -44,6 +48,7 @@ let serving = false;
 export function serve(options: ServeOptions = {}): void {
   if (serving) throw new SmaltError('SMALT_MISUSE', 'serve() was already called in this worker');
   serving = true;
+  for (const language of options.languages ?? []) registerLanguage(language);
   const plugins = options.plugins ?? [];
   const installed = plugins.map((p) => ({ name: p.name, version: p.version }));
   const scope = self as unknown as DedicatedWorkerGlobalScope;
@@ -260,4 +265,12 @@ export function serve(options: ServeOptions = {}): void {
       scope.onmessage!(e);
     }
   };
+}
+
+/**
+ * Makes the current dedicated worker an engine worker with these languages and plugins (ADR 0015): what a language's
+ * worker entry calls. The same as `serve`; call one of them once, at the top level of the worker script.
+ */
+export function defineWorker(options: ServeOptions = {}): void {
+  serve(options);
 }
