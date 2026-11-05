@@ -12,10 +12,9 @@
  * | `maintenance` | analyze, vacuum, refresh a materialized view |
  * | `schema` | a schema operation |
  *
- * `schema` carries a schema operation (plan/schema.ts); ALTER TABLE still carries its SQL.
+ * `schema` carries a schema operation (plan/schema.ts).
  */
 import type { ResultColumnInfo } from '../exec/planner.js';
-import type { ParsedStatement } from '../sql/ast.js';
 import type { PlanExpr } from './expr.js';
 import type { PlanOp } from './ops.js';
 import type { PlanType } from './types.js';
@@ -63,6 +62,5 @@ export type BoundStatement =
       readonly withData: boolean;
       readonly ifChanged: boolean;
     }
-  /** A schema operation; ALTER TABLE still as SQL until it becomes one. */
-  | { readonly kind: 'schema'; readonly op: SchemaOp }
-  | { readonly kind: 'schema'; readonly sql: ParsedStatement };
+  /** A schema operation. */
+  | { readonly kind: 'schema'; readonly op: SchemaOp };

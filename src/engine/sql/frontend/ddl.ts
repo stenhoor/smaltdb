@@ -9,10 +9,10 @@ import { scalarFunctions } from '../../exec/functions.js';
 import type { BindContext } from '../../plan/bind-context.js';
 import type { PlanExpr } from '../../plan/expr.js';
 import type { ConflictAction } from '../../plan/ops.js';
-import type { CheckDef, ColumnDef, DefaultDef, ExprDef, ForeignKeyDef, IndexColumnDef, IndexDef, KeyColumnDef, KeyDef, TableDef } from '../../plan/schema.js';
+import type { AlterAction, CheckDef, ColumnDef, DefaultDef, DeferredError, ExprDef, ForeignKeyDef, IndexColumnDef, IndexDef, KeyColumnDef, KeyDef, TableDef } from '../../plan/schema.js';
 import type { CollationName } from '../../plan/types.js';
 import { type SqlValue, normalizeInt } from '../../values.js';
-import type { ColumnConstraint, ColumnDef as SqlColumnDef, ConflictAction as SqlConflict, CreateIndexStmt, CreateTableStmt, Expr, ForeignKeyClause, IndexedColumn } from '../ast.js';
+import type { AlterTableStmt, ColumnConstraint, ColumnDef as SqlColumnDef, ConflictAction as SqlConflict, CreateIndexStmt, CreateTableStmt, Expr, ForeignKeyClause, IndexedColumn } from '../ast.js';
 import { anyNode } from '../ast-util.js';
 import { parseOne } from '../parser.js';
 import { toRowExpr, toValueExpr } from './select.js';
@@ -143,25 +143,25 @@ export function toTableDef(stmt: CreateTableStmt, text: string, catalog: BindCon
     };
   });
   const keys: KeyDef[] = [];
-  const checkExprs: { name?: string; expr: Expr }[] = [];
+  const checkExprs: { name?: string; expr: Expr; ofColumn?: number }[] = [];
   const fks: ForeignKeyDef[] = [];
   let pkSeen = false;
-  const key = (kind: KeyDef['kind'], cols: { index: number; desc: boolean; collation?: string }[], name: string | undefined, onConflict: SqlConflict | undefined, autoincrement = false): void => {
+  const key = (kind: KeyDef['kind'], cols: { index: number; desc: boolean; collation?: string }[], name: string | undefined, onConflict: SqlConflict | undefined, autoincrement = false, ofColumn?: number): void => {
     if (kind === 'primaryKey') {
       if (pkSeen) throw new SmaltError('SMALT_ERROR', `table "${stmt.name}" has more than one primary key`);
       pkSeen = true;
     }
     const kc: KeyColumnDef[] = cols.map((c) => ({ column: c.index, desc: c.desc, collation: collationName(c.collation, columns[c.index].collation) }));
     const oc = lower(onConflict);
-    keys.push({ kind, columns: kc, ...(name !== undefined ? { name } : {}), ...(oc ? { onConflict: oc } : {}), ...(autoincrement ? { autoincrement } : {}) });
+    keys.push({ kind, columns: kc, ...(name !== undefined ? { name } : {}), ...(oc ? { onConflict: oc } : {}), ...(autoincrement ? { autoincrement } : {}), ...(ofColumn !== undefined ? { ofColumn } : {}) });
   };
   // Column constraints first, then table constraints (SQLite numbers automatic indexes in this order).
   stmt.columns.forEach((def, i) => {
     for (const c of def.constraints) {
-      if (c.kind === 'primaryKey') key('primaryKey', [{ index: i, desc: c.desc }], c.name, c.onConflict, c.autoincrement);
-      else if (c.kind === 'unique') key('unique', [{ index: i, desc: false }], c.name, c.onConflict);
-      else if (c.kind === 'check') checkExprs.push({ name: c.name, expr: c.expr });
-      else if (c.kind === 'references') fks.push(fkDef(c.name, [i], c));
+      if (c.kind === 'primaryKey') key('primaryKey', [{ index: i, desc: c.desc }], c.name, c.onConflict, c.autoincrement, i);
+      else if (c.kind === 'unique') key('unique', [{ index: i, desc: false }], c.name, c.onConflict, false, i);
+      else if (c.kind === 'check') checkExprs.push({ name: c.name, expr: c.expr, ofColumn: i });
+      else if (c.kind === 'references') fks.push({ ...fkDef(c.name, [i], c), ofColumn: i });
     }
   });
   for (const tc of stmt.constraints) {
@@ -184,7 +184,7 @@ export function toTableDef(stmt: CreateTableStmt, text: string, catalog: BindCon
       fks.push(fkDef(tc.name, idx, tc.references));
     }
   }
-  const checks: CheckDef[] = checkExprs.map((c) => ({ ...(c.name !== undefined ? { name: c.name } : {}), text: textOf(c.expr, text) }));
+  const checks: CheckDef[] = checkExprs.map((c) => ({ ...(c.name !== undefined ? { name: c.name } : {}), text: textOf(c.expr, text), ...(c.ofColumn !== undefined ? { ofColumn: c.ofColumn } : {}) }));
   return { name: stmt.name, columns, keys, checks, foreignKeys: fks, storage: tableStorage(stmt) };
 }
 
@@ -288,3 +288,58 @@ function checkIndexExpr(e: Expr, what: string): void {
 
 /** An index of a stored table as the planner and writers use it. */
 export type { IndexSchema };
+
+/**
+ * ALTER TABLE as the change it makes (plan/schema.ts `AlterAction`). ADD COLUMN's column is bound here: its DEFAULT,
+ * and its CHECKs over the table's row with the new column. What SQL forbids in an added column is reported by the
+ * engine after its own checks on the target (`invalid`), in SQLite's order.
+ */
+export function toAlterAction(stmt: AlterTableStmt, text: string, catalog: BindContext): AlterAction {
+  const a = stmt.action;
+  if (a.kind !== 'addColumn') return a.kind === 'renameTable' ? { kind: a.kind, newName: a.newName } : a.kind === 'renameColumn' ? { kind: a.kind, column: a.column, newName: a.newName } : { kind: a.kind, column: a.column };
+  const def = a.column;
+  const columnText = text.slice(def.pos, def.end);
+  const placeholder: ColumnDef = { name: def.name, declaredType: def.type ?? '', type: storageTypeFor(def.type), notNull: false, collation: 'binary' };
+  const unbound = (invalid?: DeferredError): AlterAction => ({ kind: 'addColumn', column: placeholder, checks: [], foreignKeys: [], text: columnText, ...(invalid ? { invalid } : {}) });
+  const table = catalog.getTable(stmt.table, stmt.schema);
+  const fail = (e: unknown, prefix = ''): AlterAction => {
+    if (!(e instanceof SmaltError)) throw e;
+    return unbound({ code: e.code, message: prefix + e.message });
+  };
+  try {
+    const cons = def.constraints;
+    if (cons.some((c) => c.kind === 'primaryKey')) throw new SmaltError('SMALT_ERROR', 'Cannot add a PRIMARY KEY column');
+    if (cons.some((c) => c.kind === 'unique')) throw new SmaltError('SMALT_ERROR', 'Cannot add a UNIQUE column');
+    if (cons.some((c) => c.kind === 'generated')) throw new SmaltError('SMALT_UNSUPPORTED', 'generated columns are not supported yet');
+    checkConstraintExprs([def], [], `error in table ${table?.name ?? stmt.table} after add column: `);
+    const dflt = cons.find((c) => c.kind === 'default') as { expr: Expr } | undefined;
+    if (dflt && !isConstantDefault(dflt.expr)) throw new SmaltError('SMALT_ERROR', 'Cannot add a column with non-constant default');
+    if (cons.some((c) => c.kind === 'notNull') && literalValue(dflt?.expr) === null) throw new SmaltError('SMALT_ERROR', 'Cannot add a NOT NULL column with default value NULL');
+  } catch (e) {
+    return fail(e);
+  }
+  // Not a table (a view, nothing): the engine reports it before using the column.
+  if (!table) return unbound();
+  const one: CreateTableStmt = { kind: 'createTable', name: table.name, temp: false, ifNotExists: false, columns: [def], constraints: [], options: {}, pos: stmt.pos, end: stmt.end } as unknown as CreateTableStmt;
+  let added: TableDef;
+  try {
+    added = toTableDef(one, text, catalog);
+  } catch (e) {
+    return fail(e);
+  }
+  const n = table.columns.length;
+  const column = added.columns[0];
+  // The new row: the table's columns, then the new one (its rowid after them).
+  const row: TableSchema = { ...table, columns: [...table.columns, tableSchemaFromDef({ ...added, keys: [], checks: [], foreignKeys: [] }, '', 0).table.columns[0]] };
+  const checkAsts = cons(def, 'check') as { expr: Expr }[];
+  let checks: CheckDef[];
+  try {
+    checks = added.checks.map((c, i) => ({ ...c, expr: toRowExpr(checkAsts[i].expr, row, text, catalog), ofColumn: n }));
+  } catch (e) {
+    return fail(e, `error in table ${table.name}: `);
+  }
+  const foreignKeys = added.foreignKeys.map((f) => ({ ...f, columns: [n], ofColumn: n }));
+  return { kind: 'addColumn', column, checks, foreignKeys, text: columnText };
+}
+
+const cons = (def: SqlColumnDef, kind: ColumnConstraint['kind']): ColumnConstraint[] => constraintsOf(def.constraints, kind);
