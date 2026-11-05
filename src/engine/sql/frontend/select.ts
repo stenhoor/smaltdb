@@ -6,12 +6,13 @@
 import { type TableSchema, findColumn, storageTypeFor } from '../../catalog/schema.js';
 import { SmaltError } from '../../errors.js';
 import { type Affinity, type StaticType, affinityOfStorage, staticTypeOfStorage } from '../../exec/convert.js';
-import { CollSrc, type ColumnBinding, type CompileScope, bindExpr as bindAst, boundMetadata, compileBoundExpr, conjuncts, withCompiledMeta as withCompiledMetaBound } from '../../exec/expr.js';
+import { CollSrc, boundMetadata, compileBoundExpr } from '../../exec/expr.js';
+import { type ColumnBinding, type CompileScope, bindExpr as bindAst, conjuncts, withCompiledMeta as withCompiledMetaBound } from './bind-expr.js';
 import { aggregateFunctions, scalarFunctions } from '../../exec/functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../../exec/window.js';
-import { flattenCore, flatteningDisabled } from '../../exec/flatten.js';
+import { flattenCore, flatteningDisabled } from './flatten.js';
 import { aggregateCallName } from '../ast-util.js';
-import { containsAggregate, containsWindow, coreReferences, exprEquals, firstAggregateCall, firstWindowCall, sameName, selectReferences } from '../../exec/planner.js';
+import { containsAggregate, containsWindow, coreReferences, exprEquals, firstAggregateCall, firstWindowCall, sameName, selectReferences } from './ast-helpers.js';
 import { type BoundExpr, type PlanExpr, typeOf } from '../../plan/expr.js';
 import { getMeta, markFlattened, setMeta } from '../../exec/sql-meta.js';
 import type { AggCall, ConflictAction, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../plan/ops.js';
