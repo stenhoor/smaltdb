@@ -25,7 +25,7 @@ import { readRowidKey } from '../storage/key-codec.js';
 export type { Fn };
 
 /** Where a compiled expression's collation came from (SQLite precedence: explicit > column > none). */
-export const enum CollSrc {
+export enum CollSrc {
   None = 0,
   Column = 1,
   Explicit = 2,
