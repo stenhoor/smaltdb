@@ -1,4 +1,5 @@
 import type { BoundExpr } from '../plan/expr.js';
+import type { CollationName } from '../plan/types.js';
 import type { SqlValue } from '../values.js';
 import { isOpaque } from './sql-meta.js';
 import { type StaticType, truthy } from './convert.js';
@@ -236,7 +237,7 @@ class Emitter {
             this.lines.push(...inner);
             return this.compare(cmp, a, b);
           }
-          if ((cmp === '=' || cmp === '!=') && a.type === 'text' && b.type === 'text' && this.binaryTextOperands(left, right)) {
+          if ((cmp === '=' || cmp === '!=') && a.type === 'text' && b.type === 'text' && this.binaryTextOperands(left, right, e.collation)) {
             // Text = text under BINARY: UTF-16 equality is UTF-8 byte equality, so compare JS strings.
             this.lines.push(...inner);
             const v = this.tmp();
@@ -353,8 +354,12 @@ class Emitter {
     return this.konst(x);
   }
 
-  /** Both comparison operands use BINARY collation and neither applies numeric affinity. */
-  binaryTextOperands(l: BoundExpr, r: BoundExpr): boolean {
+  /**
+   * The comparison (its own `collation`, absent for BINARY) and both of its operands use BINARY collation, and neither
+   * operand applies numeric affinity. A plan built without SQL gives its collation only on the call.
+   */
+  binaryTextOperands(l: BoundExpr, r: BoundExpr, collation: CollationName | undefined): boolean {
+    if ((collation ?? 'binary') !== 'binary') return false;
     const ok = (c: FallbackNode): boolean => (c.collation ?? 0) === 0 && (c.affinity === undefined || c.affinity === 'TEXT' || c.affinity === 'NONE' || c.affinity === 'BLOB');
     const cl = this.fallback(l);
     const cr = this.fallback(r);
@@ -670,7 +675,7 @@ class Pipeline {
     ] as const) {
       if (lit.k !== 'lit' || typeof lit.value !== 'string') continue;
       const c = this.em.fallbackOf(col);
-      if (c.reg === undefined || c.type !== 'text' || !this.em.binaryTextOperands(col, lit)) continue;
+      if (c.reg === undefined || c.type !== 'text' || !this.em.binaryTextOperands(col, lit, p.collation)) continue;
       return { reg: c.reg, bytes: utf8Encoder.encode(lit.value) };
     }
     return null;
