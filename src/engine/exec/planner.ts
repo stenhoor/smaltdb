@@ -2658,7 +2658,7 @@ function fromLeaves(op: PlanOp, out: FromLeaf[] = []): FromLeaf[] | null {
 }
 
 /** The number of columns a plan outputs. */
-function planWidth(op: PlanOp): number {
+export function planWidth(op: PlanOp): number {
   switch (op.op) {
     case 'scan':
       return op.columns.length;

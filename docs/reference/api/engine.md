@@ -19,7 +19,8 @@ The SQL, the values, the parameters and the errors are the same as in the client
 | Export | Description |
 |---|---|
 | [`Database`](#database) | A database connection |
-| [`Statement`](#statement), [`RowCursor`](#rowcursor) | Prepared statements and their result cursors |
+| [`Statement`](#statement), [`PlanStatement`](#plans), [`PreparedStatement`](#statement), [`RowCursor`](#rowcursor) | Prepared statements and their result cursors |
+| [`plan`](#plans), `PlanStatementInput`, `PlanColumn` | The plan format: types, builders, validator and codec (experimental) |
 | [`MemoryVfs`, `OpfsVfs`, `Vfs`, `VfsFile`, `OpenOptions`](#vfs) | Storage back ends |
 | [`SmaltError`, `CorruptionError`, `MisuseError`, `SqlSyntaxError`](#errors) | Error classes |
 | [`parse`, `parseOne`](#parsing) | The SQL parser |
@@ -118,9 +119,53 @@ console.log(rows); // [[2, 12]]
 
 `registerCredentials(db, name, provider)` and `setFetch(db, fn)` from `@smaltdb/external/client` work the same way; with the in-process engine, functions in a credentials provider are called in this thread. See the [client's plugin helpers](./client#plugin-helpers).
 
+## Plans
+
+A statement can also be given as plan data instead of SQL: the engine's own description of a query or write ([ADR 0014](../../adr/0014-shared-plan-layer), [QUERY_ENGINE](../../QUERY_ENGINE)), which every language builds and which the engine plans and runs. The plan format is **experimental** (`plan.PLAN_FORMAT_VERSION` is `0`): it may change in any release until smaltdf, its first user besides SQL, has proven it.
+
+| Method | Description |
+|---|---|
+| `preparePlan(stmt: PlanStatementInput): PlanStatement` | Compile a statement given as plan data. A `PlanStatement` has the same members as a [`Statement`](#statement), but no `sql`. |
+| `queryPlan(stmt: PlanStatementInput, params?: SqlValue[]): QueryResult` | Run a query plan and return `{ columns, rows }`. Compiled plans are cached by their canonical form (see `statementCacheSize`). |
+| `queryPlanAsync(stmt, params?, options?: { signal?: AbortSignal }): Promise<QueryResult>` | `queryPlan` for a plan that reads [external data](#external-data). |
+
+`PlanStatementInput` is a plan operation (a query whose columns are named `column1`, `column2`, … and typed `any`), or one of:
+
+- `{ kind: 'query', plan, columns? }`: a query and its result columns, each `{ name, type?, declaredType?, collation?, affinity? }`;
+- `{ kind: 'write', plan, returning? }`: an `append`, `update` or `delete` plan, with the names and types of its RETURNING values;
+- `{ kind: 'explain', mode: 'plan' | 'analyze', query }`;
+- a transaction, setting, maintenance or schema statement, as `plan.BoundStatement` describes them.
+
+The engine validates every plan before planning it: operations and functions must exist, with the right arguments, and every column position must be within its input. An invalid plan fails with [`SMALT_PLAN`](./errors#smalt-plan), whose message gives the path to the part that is wrong. Parameters are positional: a plan reads `param` 0, 1, …, and is run with an array of that many values.
+
+The `plan` namespace holds the format's types (`PlanOp`, `PlanExpr`, `PlanType`, …), the validator (`validatePlan`), the codec (`planToJSON`, `planFromJSON`, `encodePlan`, `decodePlan`) and builders that fill in the usual values:
+
+| Builders | |
+|---|---|
+| Expressions | `col(input, index, type, collation?, depth?)`, `lit(value)`, `param(index, type?)`, `call(fn, args, type, collation?)`, `cast`, `and`, `or`, `not`, `isNull`, `isNotNull`, `caseWhen`, `scalar`, `exists`, `inPlan` |
+| Sort keys and aggregates | `asc(expr, options?)`, `desc(expr, options?)`, `agg(fn, args, type, options?)` |
+| Queries | `scan(table, columns, options?)`, `values`, `filter`, `project`, `sort`, `limit`, `join`, `aggregate`, `distinct`, `setop` |
+| Writes | `append(table, input, columns, options?)`, `update(table, input, rowid, sets, options?)`, `remove(table, input, rowid, options?)` |
+
+Columns are referenced by position: `col(0, 2, 'int')` is column 2 of the operation's input (a join's condition reads input 0, its left side, and input 1). Functions are the engine's: SQL's comparison and arithmetic rules are `sql.*` functions such as `sql.gt` and `sql.mul`.
+
+```ts
+import { Database, plan as p } from 'smaltdb/engine';
+
+const db = Database.openMemory();
+db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, n INT); INSERT INTO t VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)");
+
+// SELECT name, n * 2 AS twice FROM t WHERE n > ? ORDER BY n DESC
+const n = p.col(0, 2, 'int');
+const rows = p.filter(p.scan('t', [0, 1, 2]), p.call('sql.gt', [n, p.param(0, 'int')], 'int'));
+const query = p.project(p.sort(rows, [p.desc(n)]), [p.col(0, 1, 'text'), p.call('sql.mul', [n, p.lit(2)], 'int')]);
+const r = db.queryPlan({ kind: 'query', plan: query, columns: [{ name: 'name', type: 'text' }, { name: 'twice', type: 'int' }] }, [15]);
+console.log(r); // { columns: ['name', 'twice'], rows: [['c', 60], ['b', 40]] }
+```
+
 ## Statement
 
-A compiled statement, from `db.prepare()`. It compiles again by itself after schema changes.
+A compiled statement, from `db.prepare()`. It compiles again by itself after schema changes. `Statement` and [`PlanStatement`](#plans) are both `PreparedStatement`s.
 
 | Member | Description |
 |---|---|
