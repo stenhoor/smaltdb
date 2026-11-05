@@ -7,7 +7,7 @@
  * Multi-byte page fields are little-endian; index keys are big-endian (memcmp-comparable).
  */
 
-export const FORMAT_MAJOR = 3;
+export const FORMAT_MAJOR = 4;
 export const FORMAT_MINOR = 0;
 export const MAGIC = new Uint8Array([0x73, 0x6d, 0x61, 0x6c, 0x74, 0x64, 0x62, 0x00]); // "smaltdb\0"
 
@@ -50,5 +50,6 @@ export const DH_FREELIST_COUNT = 28; // u32
 export const DH_SCHEMA_COOKIE = 32; // u32
 export const DH_CHANGE_COUNTER = 36; // u32
 export const DH_CATALOG_ROOT = 40; // u32
+export const DH_DEFINITION_ROOT = 44; // u32 (format 4: root of the stored definitions, 0 = none yet)
 export const DH_CHECKPOINT_LSN = 48; // u64
 // 56..127 reserved (future: encryption salt/KDF params, application id, ...)

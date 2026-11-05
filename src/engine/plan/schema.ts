@@ -2,8 +2,8 @@
  * Schema definitions and operations, language-neutral (ADR 0015 section 5): what a language hands the engine for DDL.
  * Expressions are plan expressions (CHECK and index expressions over the table's row: column `i` is `#0.i`, the rowid
  * `#0.n`; DEFAULT over no columns), with their source text kept for display (PRAGMA table_info, information_schema,
- * error messages). `source` is the statement in its language, which the catalog stores until it stores these
- * definitions themselves (ADR 0015 step 7).
+ * error messages). `source` is the statement in its language: the catalog stores it beside the definition, for
+ * display (catalog/stored.ts).
  */
 import type { SqlValue } from '../values.js';
 import type { PlanExpr } from './expr.js';

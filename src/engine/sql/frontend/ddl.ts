@@ -202,11 +202,6 @@ export function withBoundChecks(def: TableDef, stmt: CreateTableStmt, text: stri
 /** The parsed CREATE TABLE of each table object (SQL's own cache: the engine keeps no syntax trees). */
 const parsedTables = new WeakMap<TableSchema, CreateTableStmt>();
 
-/** Remember the statement a table was read from, so binding its expressions later parses nothing. */
-export function rememberTableStmt(table: TableSchema, stmt: CreateTableStmt): void {
-  parsedTables.set(table, stmt);
-}
-
 /**
  * A stored table's CHECK and DEFAULT expressions bound over `table` (the table its definition gave): what opening left
  * unbound, bound where first used. A failure is the binder's error.

@@ -151,7 +151,10 @@ export interface ColumnarTableInfo {
 export interface MatViewInfo {
   /** CREATE MATERIALIZED VIEW text. */
   sql: string;
+  /** Its query, as its language's syntax: read from `sql` where first used. */
   select: import('../sql/ast.js').SelectStmt;
+  /** Its options (storage, location, refresh policy). */
+  options?: Readonly<Record<string, SqlValue>>;
   storage: 'row' | 'columnar';
   /** False after `WITH NO DATA` until the first REFRESH; reading it is an error. */
   populated: boolean;

@@ -1,5 +1,6 @@
 import {
   ConstraintError,
+  type IndexEval,
   type IndexSchema,
   type MatViewInfo,
   type TableSchema,
@@ -26,10 +27,11 @@ import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type PlanMorsels, planMorsels } from './exec/plan-morsel.js';
 import { toPlan } from './sql/frontend/select.js';
-import { bindStoredTableExprs, checkConstraintExprs, rememberTableStmt, isConstantDefault, literalValue, tableStorage, toIndexDef, toTableDef, withBoundChecks } from './sql/frontend/ddl.js';
+import { bindStoredTableExprs, checkConstraintExprs, isConstantDefault, literalValue, toIndexDef, toTableDef, withBoundChecks } from './sql/frontend/ddl.js';
 import { bindStatement } from './sql/frontend/bind.js';
 import type { BoundQuery, BoundStatement, BoundTransaction, BoundWrite } from './plan/bound.js';
-import type { SchemaOp, Source } from './plan/schema.js';
+import type { ColumnDef as ColumnDefinition, SchemaOp, Source, TableDef } from './plan/schema.js';
+import { SYSTEM_TABLES, type StoredDef, type StoredText, type SystemTableName, decodeDef, encodeDef, isSystemTable, systemTableSql } from './catalog/stored.js';
 import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
@@ -40,8 +42,6 @@ import type {
   CreateIndexStmt,
   CreateTableStmt,
   CreateViewStmt,
-  CreateConnectionStmt,
-  CreateExternalTableStmt,
   Expr,
   ParsedStatement,
   SelectStmt,
@@ -110,7 +110,6 @@ export interface DatabaseOptions extends PagerOptions {
   spillPath?: string | false;
 }
 
-const CATALOG_SQL = 'CREATE TABLE smalt_schema(type TEXT, name TEXT, tbl_name TEXT, rootpage INTEGER, sql TEXT)';
 const CATALOG_NAMES = new Set(['smalt_schema', 'sqlite_schema', 'sqlite_master']);
 
 /** A view: its defining SELECT, expanded by the planner wherever the view is referenced. */
@@ -280,6 +279,7 @@ export class Database implements FunctionContext {
     if (this.pager.catalogRoot === 0) {
       if (reader) throw new SmaltError('SMALT_CANTOPEN', 'reader: the database has no catalog yet');
       this.pager.catalogRoot = BTree.create(this.pager);
+      this.pager.definitionRoot = BTree.create(this.pager);
       this.pager.commit();
     }
     this.loadSchema();
@@ -905,35 +905,43 @@ export class Database implements FunctionContext {
     this.connections.clear();
     this.externals.clear();
     this.catalog.clear();
-    const catStmt = parseOne(CATALOG_SQL).stmt as CreateTableStmt;
-    this.catalogTable = { ...tableSchemaFromDef(toTableDef(catStmt, CATALOG_SQL, undefined), CATALOG_SQL, this.pager.catalogRoot).table, system: true };
+    this.catalogTable = { ...tableSchemaFromDef(SYSTEM_TABLES.smalt_schema, systemTableSql('smalt_schema'), this.pager.catalogRoot).table, system: true };
+    // Opening parses nothing: objects are read from their stored definitions (catalog/stored.ts).
     const rows = this.scanCatalog();
+    const defs = this.scanDefinitions();
+    const def = <K extends StoredDef['kind']>(key: string, kind: K): Extract<StoredDef, { kind: K }> => {
+      const d = defs.get(key);
+      if (!d) throw new SmaltError('SMALT_CORRUPT', `missing definition of ${key}`);
+      const v = decodeDef(d, key);
+      if (v.kind !== kind) throw new SmaltError('SMALT_CORRUPT', `definition of ${key} is a ${v.kind}, not a ${kind}`);
+      return v as Extract<StoredDef, { kind: K }>;
+    };
     const autoRoots = new Map<string, number>();
     for (const r of rows) if (r.type === 'index' && r.sql === null) autoRoots.set(r.name.toLowerCase(), r.rootpage);
+    const columnarTables = new Set<string>();
     for (const r of rows) {
       if (r.type === 'connection') {
-        const c = parseOne(r.sql!).stmt as CreateConnectionStmt;
+        const c = def(connectionKey(r.name), 'connection');
         this.catalog.set(connectionKey(r.name), { type: 'connection', name: r.name, rowid: r.rowid });
-        this.connections.set(r.name.toLowerCase(), { name: r.name, options: c.with, sql: r.sql! });
+        this.connections.set(r.name.toLowerCase(), { name: r.name, options: { ...c.options }, sql: r.sql! });
         continue;
       }
       this.catalog.set(r.name.toLowerCase(), { type: r.type as CatalogEntry['type'], name: r.name, rowid: r.rowid });
       if (r.type === 'external') {
-        const x = parseOne(r.sql!).stmt as CreateExternalTableStmt;
-        this.externals.set(r.name.toLowerCase(), { name: r.name, columns: x.columns.map((c) => ({ name: c.name, declType: c.type ?? '' })), options: x.with, sql: r.sql! });
+        const x = def(r.name.toLowerCase(), 'external');
+        this.externals.set(r.name.toLowerCase(), { name: r.name, columns: x.columns.map((c) => ({ name: c.name, declType: c.declaredType })), options: { ...x.options }, sql: r.sql! });
         continue;
       }
       if (r.type === 'view') {
-        const v = parseOne(r.sql!).stmt as CreateViewStmt;
-        this.views.set(r.name.toLowerCase(), { name: r.name, sql: r.sql!, columns: v.columns, select: v.select });
+        const v = def(r.name.toLowerCase(), 'view');
+        this.views.set(r.name.toLowerCase(), lazyView(r.name, { language: v.language, text: r.sql! }, v.columns ? [...v.columns] : undefined));
         continue;
       }
       if (r.type !== 'table') continue;
-      const stmt = parseOne(r.sql!).stmt as CreateTableStmt;
-      // CHECKs and DEFAULTs are bound where first used: opening binds nothing, and a stored table opens even if one no
-      // longer binds.
-      const { table, implicitIndexes } = tableSchemaFromDef(toTableDef(stmt, r.sql!, undefined), r.sql!, r.rootpage);
-      rememberTableStmt(table, stmt);
+      const t = isSystemTable(r.name) ? SYSTEM_TABLES[r.name.toLowerCase() as SystemTableName] : def(r.name.toLowerCase(), 'table').table;
+      if (t.storage === 'columnar') columnarTables.add(r.name.toLowerCase());
+      const { table, implicitIndexes } = tableSchemaFromDef(t, r.sql!, r.rootpage);
+      if (isSystemTable(r.name)) table.system = true;
       implicitIndexes.forEach((spec, i) => {
         const name = autoIndexName(table.name, i + 1);
         const root = autoRoots.get(name.toLowerCase());
@@ -944,11 +952,10 @@ export class Database implements FunctionContext {
       });
       this.tables.set(table.name.toLowerCase(), table);
     }
-    this.loadMatviews(rows.filter((r) => r.type === 'matview'));
-    this.loadColumnar();
+    this.loadMatviews(rows.filter((r) => r.type === 'matview'), (key) => def(key, 'matview'));
+    this.loadColumnar(columnarTables);
     for (const r of rows) {
       if (r.type !== 'index' || r.sql === null) continue;
-      const stmt = parseOne(r.sql).stmt as CreateIndexStmt;
       const table = this.tables.get(r.tbl_name.toLowerCase());
       if (!table) throw new SmaltError('SMALT_CORRUPT', `index ${r.name} references missing table ${r.tbl_name}`);
       let root = r.rootpage;
@@ -958,8 +965,8 @@ export class Database implements FunctionContext {
         root = mv?.indexRoots.get(r.name.toLowerCase()) ?? this.createTree(true);
         mv?.indexRoots.set(r.name.toLowerCase(), root);
       }
-      const idx = indexSchemaFromDef(toIndexDef(stmt, r.sql, table, this.bindContext()), r.sql, table, root);
-      this.prepareIndex(table, idx);
+      const idx = indexSchemaFromDef(def(r.name.toLowerCase(), 'index').index, r.sql, table, root);
+      this.prepareIndex(table, idx, true);
       table.indexes.push(idx);
       this.indexes.set(idx.name.toLowerCase(), idx);
     }
@@ -1001,11 +1008,13 @@ export class Database implements FunctionContext {
     return new TableWriter(this.catalogTable, this.pager, (root) => this.tree(root));
   }
 
-  private addCatalogRow(type: string, name: string, tblName: string, root: number, sql: string | null, key = name.toLowerCase()): void {
+  /** Add a catalog row, and the object's definition (`def`; none for system tables and automatic indexes). */
+  private addCatalogRow(type: string, name: string, tblName: string, root: number, sql: string | null, key = name.toLowerCase(), def?: StoredDef): void {
     const w = this.catalogWriter();
     const rowid = w.newRowid();
     w.writeRow([type, name, tblName, root, sql], rowid);
     this.catalog.set(key, { type: type as CatalogEntry['type'], name, rowid });
+    if (def) this.writeDefinition(key, def);
   }
 
   private removeCatalogRow(name: string, key = name.toLowerCase()): void {
@@ -1013,7 +1022,76 @@ export class Database implements FunctionContext {
     if (!e) return;
     this.catalogWriter().deleteRow(e.rowid);
     this.catalog.delete(key);
+    this.deleteDefinition(key);
   }
+
+  /** Rows of smalt_definition by key (rebuilt when the schema is read). */
+  private definitionRows = new Map<string, number | bigint>();
+
+  /**
+   * The stored definitions by key, as text. Their table is not in the catalog (`sqlite_schema` does not list it): its
+   * root is in the database header.
+   */
+  private scanDefinitions(): Map<string, StoredText> {
+    this.definitionRows = new Map();
+    const out = new Map<string, StoredText>();
+    const root = this.pager.definitionRoot;
+    if (root === 0) return out;
+    const reader = new RecordReader(this.definitionTable().layout);
+    const c = new BTree(this.pager, root).cursor();
+    try {
+      for (let ok = c.first(); ok; ok = c.next()) {
+        c.loadValue();
+        reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+        c.loadKey();
+        const key = String(reader.column(0));
+        const exprs = reader.column(2);
+        out.set(key, { def: String(reader.column(1)), exprs: exprs === null ? null : String(exprs) });
+        this.definitionRows.set(key, readRowidKey(c.keyBytes, c.keyOffset));
+      }
+    } finally {
+      c.close();
+    }
+    return out;
+  }
+
+  /** The definitions table's schema (its tree is created with the database). */
+  private definitionTable(): TableSchema {
+    const root = this.pager.definitionRoot;
+    if (this.defTable?.rootPage !== root) this.defTable = { ...tableSchemaFromDef(SYSTEM_TABLES.smalt_definition, systemTableSql('smalt_definition'), root).table, system: true };
+    return this.defTable;
+  }
+
+  private defTable: TableSchema | null = null;
+
+  /** Store an object's definition under its catalog key (replacing the one there). */
+  private writeDefinition(key: string, def: StoredDef): void {
+    const w = this.definitionWriter();
+    const old = this.definitionRows.get(key);
+    if (old !== undefined) w.deleteRow(old);
+    const rowid = w.newRowid();
+    const text = encodeDef(def);
+    w.writeRow([key, text.def, text.exprs], rowid);
+    this.definitionRows.set(key, rowid);
+  }
+
+  private deleteDefinition(key: string): void {
+    const old = this.definitionRows.get(key);
+    if (old === undefined) return;
+    this.definitionWriter().deleteRow(old);
+    this.definitionRows.delete(key);
+  }
+
+  /** A writer for the definitions table (kept: DDL writes a definition per object), its rowid cache cleared. */
+  private definitionWriter(): TableWriter {
+    const table = this.definitionTable();
+    if (this.defWriter?.table !== table) this.defWriter = new TableWriter(table, this.pager, (root) => this.tree(root));
+    this.defWriter.resetStatement();
+    return this.defWriter;
+  }
+
+  private defWriter: TableWriter | null = null;
+
 
   private schemaChanged(): void {
     this.pager.schemaCookie = (this.pager.schemaCookie + 1) >>> 0;
@@ -1403,10 +1481,6 @@ export class Database implements FunctionContext {
 
   // ---------------------------------------------------------------- materialized views
 
-  private static readonly MATVIEW_SQL = 'CREATE TABLE smalt_matview(name TEXT, layout TEXT, populated INTEGER, refreshed_at TEXT)';
-  /** M8.1: the external sources a materialized view read at its last refresh, with their validators (JSON). */
-  private static readonly EXTCACHE_SQL = 'CREATE TABLE smalt_extcache(name TEXT, sources TEXT)';
-
   /**
    * CREATE MATERIALIZED VIEW: the result columns become a table (types from the query), filled by
    * running the query unless `WITH NO DATA`.
@@ -1433,19 +1507,19 @@ export class Database implements FunctionContext {
     this.dirtySchema = true;
     const layout = this.matviewLayout(stmt.name, select, sql, stmt.columns ? [...stmt.columns] : undefined);
     if (!this.tables.has('smalt_matview')) {
-      this.createTable(systemTableOp(Database.MATVIEW_SQL), true);
+      this.createTable(systemTableOp('smalt_matview'), true);
     }
     const root = this.createTree(inMemory);
-    const { table } = tableSchemaFromDef(toTableDef(parseOne(layout).stmt as CreateTableStmt, layout, undefined), layout, root);
-    table.matview = { sql, select, storage, populated: false, refreshedAt: null };
+    const { table } = tableSchemaFromDef(layout, layoutSql(layout), root);
+    table.matview = { sql, select, storage, options: { ...opts }, populated: false, refreshedAt: null };
     // A memory-resident view's root is assigned at runtime: the catalog records a marker.
-    this.addCatalogRow('matview', table.name, table.name, inMemory ? MEM_BASE : root, sql);
+    this.addCatalogRow('matview', table.name, table.name, inMemory ? MEM_BASE : root, sql, undefined, { kind: 'matview', language: stmt.source.language, ...(stmt.columns ? { columns: stmt.columns } : {}), options: stmt.options ?? {} });
     if (inMemory) {
       this.memViews.set(table.name.toLowerCase(), { root, indexRoots: new Map(), populated: false, refreshedAt: null, fresh: false });
       this.memDirty = true;
     }
     this.tables.set(table.name.toLowerCase(), table);
-    this.writeMatviewMeta(table.name, { layout, populated: false, refreshedAt: null });
+    this.writeMatviewMeta(table.name, { layout: encodeDef({ kind: 'table', table: layout }).def, populated: false, refreshedAt: null });
     let changes = 0;
     if (stmt.withData !== false) changes = this.fillMatview(table);
     this.schemaChanged();
@@ -1567,7 +1641,7 @@ export class Database implements FunctionContext {
     let t = this.tables.get('smalt_extcache');
     if (!t) {
       if (entries.length === 0) return;
-      this.createTable(systemTableOp(Database.EXTCACHE_SQL), true);
+      this.createTable(systemTableOp('smalt_extcache'), true);
       t = this.tables.get('smalt_extcache')!;
     }
     this.upsertMetaRow(t, name, entries.length ? () => [name, JSON.stringify(entries)] : null);
@@ -1613,7 +1687,7 @@ export class Database implements FunctionContext {
   /** @internal Refresh policy of a materialized view (`refresh_every`, `refresh_on_reconnect`). */
   matviewPolicy(info: NonNullable<TableSchema['matview']>): { every: number | null; onReconnect: boolean } {
     if (!info.policy) {
-      const w = (parseOne(info.sql).stmt as CreateViewStmt).with ?? {};
+      const w = info.options ?? {};
       const every = w.refresh_every === undefined || w.refresh_every === null ? null : Number(w.refresh_every);
       const r = w.refresh_on_reconnect;
       info.policy = { every, onReconnect: r !== undefined && r !== null && ['1', 'true', 'yes', 'on'].includes(String(r).toLowerCase()) };
@@ -1669,7 +1743,8 @@ export class Database implements FunctionContext {
   }
 
   /** The storage table definition (CREATE TABLE text) for a materialized view's query. */
-  private matviewLayout(name: string, select: SelectStmt, sql: string, names?: string[]): string {
+  /** The table a materialized view's rows are stored in: a column per result column of its query. */
+  private matviewLayout(name: string, select: SelectStmt, sql: string, names?: string[]): TableDef {
     const planner = new Planner(this.plannerDeps(), new Registers(0));
     planner.sqlText = sql;
     const plan = this.planSelectStmt(select, sql, planner);
@@ -1677,18 +1752,19 @@ export class Database implements FunctionContext {
       throw new SmaltError('SMALT_ERROR', `materialized view ${name} has ${names.length} column names but its query returns ${plan.columns.length} columns`);
     }
     const seen = new Set<string>();
-    const q = (x: string): string => `"${x.replace(/"/g, '""')}"`;
-    const defs = plan.columns.map((c, i) => {
+    const columns = plan.columns.map((c, i) => {
       const colName = names?.[i] ?? c.name;
       if (seen.has(colName.toLowerCase())) throw new SmaltError('SMALT_ERROR', `column "${colName}" specified more than once (name it with AS)`);
       seen.add(colName.toLowerCase());
       // A column copied from a table keeps its declared type; computed values get their static type.
-      const st = c.declType ? storageTypeFor(c.declType) : ({ int: 'INTEGER', real: 'REAL', text: 'TEXT', blob: 'BLOB' } as Record<string, string>)[c.type] ?? 'ANY';
-      const coll = c.collation === Collation.NoCase ? ' COLLATE NOCASE' : c.collation === Collation.RTrim ? ' COLLATE RTRIM' : '';
-      return `${q(colName)} ${st}${coll}`;
+      const st = (c.declType ? storageTypeFor(c.declType) : ({ int: 'INTEGER', real: 'REAL', text: 'TEXT', blob: 'BLOB' } as Record<string, string>)[c.type] ?? 'ANY') as ColumnDefinition['type'];
+      const collation: CollationName = c.collation === Collation.NoCase ? 'nocase' : c.collation === Collation.RTrim ? 'rtrim' : 'binary';
+      return { name: colName, declaredType: st, type: st, notNull: false, collation };
     });
-    return `CREATE TABLE ${q(name)}(${defs.join(', ')})`;
+    return { name, columns, keys: [], checks: [], foreignKeys: [], storage: 'row' };
   }
+
+
 
   /** Run a query to completion; `emit` reads each result row from the registers `r[outRegs[i]]`. */
   /** Run `select`, passing each row to `emit`; returns the external sources it read (M8). */
@@ -2011,8 +2087,6 @@ export class Database implements FunctionContext {
 
   // ---------------------------------------------------------------- columnar tables (M7.3)
 
-  private static readonly COLUMNAR_SQL = 'CREATE TABLE smalt_columnar(name TEXT, seg_root INTEGER, del_root INTEGER)';
-
   /** Columnar tables written by the running statement (compacted at its end). */
   private readonly columnarTouched = new Set<TableSchema>();
 
@@ -2067,7 +2141,7 @@ export class Database implements FunctionContext {
   }
 
   /** Attach segment and deletion roots to columnar tables (from smalt_columnar). */
-  private loadColumnar(): void {
+  private loadColumnar(columnarTables: ReadonlySet<string>): void {
     const meta = this.tables.get('smalt_columnar');
     const roots = new Map<string, { segRoot: number; delRoot: number }>();
     if (meta) {
@@ -2084,7 +2158,7 @@ export class Database implements FunctionContext {
       }
     }
     for (const t of this.tables.values()) {
-      if (t.matview || t.system || !/storage/i.test(t.sql) || tableStorage(parseOne(t.sql).stmt as CreateTableStmt) !== 'columnar') continue;
+      if (!columnarTables.has(t.name.toLowerCase())) continue;
       const r = roots.get(t.name.toLowerCase());
       if (!r) throw new SmaltError('SMALT_CORRUPT', `columnar table ${t.name} has no segments`);
       t.columnar = { ...r };
@@ -2228,7 +2302,7 @@ export class Database implements FunctionContext {
   }
 
   /** Build materialized views' table schemas from catalog rows and smalt_matview. */
-  private loadMatviews(rows: { name: string; rootpage: number; sql: string | null }[]): void {
+  private loadMatviews(rows: { name: string; rootpage: number; sql: string | null }[], defOf: (key: string) => Extract<StoredDef, { kind: 'matview' }>): void {
     if (rows.length === 0) return;
     const t = this.tables.get('smalt_matview');
     if (!t) throw new SmaltError('SMALT_CORRUPT', 'materialized views without smalt_matview');
@@ -2245,7 +2319,7 @@ export class Database implements FunctionContext {
     for (const r of rows) {
       const m = meta.get(r.name.toLowerCase());
       if (!m) throw new SmaltError('SMALT_CORRUPT', `missing metadata for materialized view ${r.name}`);
-      const def = parseOne(r.sql!).stmt as CreateViewStmt;
+      const def = defOf(r.name.toLowerCase());
       let root = r.rootpage;
       let populated = m.populated;
       let fresh = m.fresh;
@@ -2262,9 +2336,11 @@ export class Database implements FunctionContext {
         fresh = mv.fresh;
         refreshedAt = mv.refreshedAt;
       }
-      const { table } = tableSchemaFromDef(toTableDef(parseOne(m.layout).stmt as CreateTableStmt, m.layout, undefined), m.layout, root);
-      const storage = String(def.with?.storage ?? 'row').toLowerCase() as MatViewInfo['storage'];
-      table.matview = { sql: r.sql!, select: def.select, storage, populated, refreshedAt, fresh };
+      const layout = decodeDef({ def: m.layout, exprs: null }, `${r.name} layout`);
+      if (layout.kind !== 'table') throw new SmaltError('SMALT_CORRUPT', `layout of materialized view ${r.name} is not a table`);
+      const { table } = tableSchemaFromDef(layout.table, layoutSql(layout.table), root);
+      const storage = String(def.options.storage ?? 'row').toLowerCase() as MatViewInfo['storage'];
+      table.matview = lazyMatview({ sql: r.sql!, options: { ...def.options }, storage, populated, refreshedAt, fresh }, { language: def.language, text: r.sql! });
       this.tables.set(table.name.toLowerCase(), table);
     }
   }
@@ -2354,7 +2430,6 @@ export class Database implements FunctionContext {
     }
   }
 
-  private static readonly STAT_SQL = 'CREATE TABLE smalt_stat(tbl TEXT, idx TEXT, stat TEXT)';
 
   /** ANALYZE [schema | [schema.]table-or-index]: gather optimizer statistics and store them in smalt_stat. */
   private analyze(target: string | undefined, schema?: string): RunResult {
@@ -2379,7 +2454,7 @@ export class Database implements FunctionContext {
       else throw new SmaltError('SMALT_ERROR', `no such table or index: ${s ? `${schema}.` : ''}${target}`);
     }
     if (!this.tables.has('smalt_stat')) {
-      this.createTable(systemTableOp(Database.STAT_SQL), true);
+      this.createTable(systemTableOp('smalt_stat'), true);
     }
     const stat = this.tables.get('smalt_stat')!;
     const w = new TableWriter(stat, this.pager, (root) => this.tree(root));
@@ -2489,7 +2564,7 @@ export class Database implements FunctionContext {
     // Types, their options and checks come from plugins (@smaltdb/external: http, s3, azure).
     this.external.plugins.checkConnection(stmt.name, stmt.options);
     this.dirtySchema = true;
-    this.addCatalogRow('connection', stmt.name, stmt.name, 0, sql, connectionKey(stmt.name));
+    this.addCatalogRow('connection', stmt.name, stmt.name, 0, sql, connectionKey(stmt.name), { kind: 'connection', options: stmt.options });
     this.connections.set(lower, { name: stmt.name, options: stmt.options, sql });
     this.schemaChanged();
     return none;
@@ -2563,7 +2638,7 @@ export class Database implements FunctionContext {
       text = `CREATE EXTERNAL TABLE ${quoteIdent(stmt.name)} (${cols}) WITH (${opts})`;
     }
     this.dirtySchema = true;
-    this.addCatalogRow('external', stmt.name, stmt.name, 0, text);
+    this.addCatalogRow('external', stmt.name, stmt.name, 0, text, undefined, { kind: 'external', columns: columns.map((c) => ({ name: c.name, declaredType: c.declType })), options: stmt.options });
     this.externals.set(lower, { name: stmt.name, columns, options: stmt.options, sql: text });
     this.objectChanged(stmt.name);
     this.schemaChanged();
@@ -2657,7 +2732,7 @@ export class Database implements FunctionContext {
     this.checkNewName(stmt.name, 'view');
     this.dirtySchema = true;
     // Like SQLite, the body is not resolved until the view is used (it may reference tables created later).
-    this.addCatalogRow('view', stmt.name, stmt.name, 0, sql);
+    this.addCatalogRow('view', stmt.name, stmt.name, 0, sql, undefined, { kind: 'view', language: stmt.source.language, ...(columns ? { columns } : {}) });
     this.views.set(stmt.name.toLowerCase(), { name: stmt.name, sql, columns, select });
     this.objectChanged(stmt.name);
     this.schemaChanged();
@@ -2686,7 +2761,7 @@ export class Database implements FunctionContext {
       if (implicitIndexes.length > 0) throw new SmaltError('SMALT_UNSUPPORTED', 'columnar tables support no UNIQUE or PRIMARY KEY constraints other than INTEGER PRIMARY KEY');
       if (table.foreignKeys.length > 0) throw new SmaltError('SMALT_UNSUPPORTED', 'columnar tables cannot have foreign keys');
       if (!this.tables.has('smalt_columnar')) {
-        this.createTable(systemTableOp(Database.COLUMNAR_SQL), true);
+        this.createTable(systemTableOp('smalt_columnar'), true);
       }
       table.columnar = { segRoot: BTree.create(this.pager), delRoot: BTree.create(this.pager) };
       this.writeColumnarMeta(table.name, table.columnar);
@@ -2694,7 +2769,7 @@ export class Database implements FunctionContext {
     for (const fk of table.foreignKeys) {
       if (this.tables.get(fk.table.toLowerCase())?.columnar) throw new SmaltError('SMALT_UNSUPPORTED', `foreign keys cannot reference columnar table ${fk.table}`);
     }
-    this.addCatalogRow('table', table.name, table.name, root, sql);
+    this.addCatalogRow('table', table.name, table.name, root, sql, undefined, internal ? undefined : { kind: 'table', table: stmt.table });
     implicitIndexes.forEach((spec, i) => {
       const name = autoIndexName(table.name, i + 1);
       const iroot = BTree.create(this.pager);
@@ -2793,7 +2868,7 @@ export class Database implements FunctionContext {
       mv.indexRoots.set(idx.name.toLowerCase(), root);
       this.memDirty = true;
     }
-    this.addCatalogRow('index', idx.name, table.name, memory ? MEM_BASE : root, sql);
+    this.addCatalogRow('index', idx.name, table.name, memory ? MEM_BASE : root, sql, undefined, { kind: 'index', index: stmt });
     this.schemaChanged();
     return none;
   }
@@ -2862,9 +2937,29 @@ export class Database implements FunctionContext {
    * Validate and compile an index's expression columns and partial-index WHERE (like SQLite: no
    * subqueries, parameters or non-deterministic functions) into evaluators over a row.
    */
-  private prepareIndex(table: TableSchema, idx: IndexSchema): void {
-    idx.eval = undefined;
-    if (!idx.where && !idx.columns.some((c) => c.expr)) return;
+  /**
+   * Set up an index's evaluators (expression columns and partial WHERE). Opening a database compiles them where the
+   * index is first used (`lazy`); CREATE INDEX and ALTER TABLE compile them at once, so an error is theirs.
+   */
+  private prepareIndex(table: TableSchema, idx: IndexSchema, lazy = false): void {
+    if (!idx.where && !idx.columns.some((c) => c.expr)) {
+      idx.eval = undefined;
+      return;
+    }
+    if (!lazy) {
+      Object.defineProperty(idx, 'eval', { value: this.indexEval(table, idx), writable: true, enumerable: true, configurable: true });
+      return;
+    }
+    let ev: IndexEval | undefined;
+    Object.defineProperty(idx, 'eval', {
+      get: () => (ev ??= this.indexEval(table, idx)),
+      set: (v: IndexEval | undefined) => Object.defineProperty(idx, 'eval', { value: v, writable: true, enumerable: true, configurable: true }),
+      enumerable: true,
+      configurable: true,
+    });
+  }
+
+  private indexEval(table: TableSchema, idx: IndexSchema): IndexEval {
     const n = table.columns.length;
     const planner = new Planner({ getTable: (x) => this.getTable(x), openTree: (root) => this.tree(root), funcCtx: this, state: this.state }, new Registers(n + 1));
     // Bound by the language when the index was defined: plan expressions over the row (column i, the rowid at n).
@@ -2888,7 +2983,7 @@ export class Database implements FunctionContext {
     const deps = new Set<number>();
     for (const c of idx.columns) if (!c.expr) deps.add(c.column);
     for (const e of [...plan.cols, plan.where]) if (e) forEachCol(e, (c) => c.index < n && deps.add(c.index));
-    idx.eval = {
+    return {
       cols: cols.map((f) => (f ? (row: readonly SqlValue[], rowid: number | bigint) => f(load(row, rowid)) : null)),
       where: where ? (row, rowid) => truthy(where!(load(row, rowid))) === true : undefined,
       deps: [...deps],
@@ -3116,11 +3211,16 @@ export class Database implements FunctionContext {
   private validateAfterAlter(suffix: string, viewSuffix = suffix): void {
     const rows = this.scanCatalog();
     const built = new Map<string, TableSchema>();
+    // ALTER rewrote the tables' and indexes' SQL: their definitions are made again from it.
+    const defs = new Map<string, StoredDef>();
     for (const r of rows) {
       if (r.type !== 'table' || r.sql === null) continue;
       try {
+        if (isSystemTable(r.name)) continue;
         const stmt = parseOne(r.sql).stmt as CreateTableStmt;
-        const { table } = tableSchemaFromDef(withBoundChecks(toTableDef(stmt, r.sql, this.bindContext()), stmt, r.sql, this.bindContext()), r.sql, r.rootpage);
+        const tdef = withBoundChecks(toTableDef(stmt, r.sql, this.bindContext()), stmt, r.sql, this.bindContext());
+        const { table } = tableSchemaFromDef(tdef, r.sql, r.rootpage);
+        defs.set(r.name.toLowerCase(), { kind: 'table', table: tdef });
         const planner = new Planner({ getTable: (n) => this.getTable(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state }, new Registers(0));
         const base = planner.regs.alloc(table.columns.length);
         this.compileChecks(table, base, planner.regs.alloc(), planner);
@@ -3134,11 +3234,17 @@ export class Database implements FunctionContext {
       try {
         const t = built.get(r.tbl_name.toLowerCase());
         if (!t) throw new SmaltError('SMALT_ERROR', `no such table: ${r.tbl_name}`);
-        this.prepareIndex(t, indexSchemaFromDef(toIndexDef(parseOne(r.sql).stmt as CreateIndexStmt, r.sql, t, this.bindContext()), r.sql, t, r.rootpage));
+        const idef = toIndexDef(parseOne(r.sql).stmt as CreateIndexStmt, r.sql, t, this.bindContext());
+        this.prepareIndex(t, indexSchemaFromDef(idef, r.sql, t, r.rootpage));
+        defs.set(r.name.toLowerCase(), { kind: 'index', index: idef });
       } catch (e) {
         throw new SmaltError('SMALT_ERROR', `error in index ${r.name}${suffix}: ${(e as Error).message}`);
       }
     }
+    for (const [key, d] of defs) this.writeDefinition(key, d);
+    // A renamed table's and index's definitions move to their new names.
+    const keys = new Set(rows.map((r) => (r.type === 'connection' ? connectionKey(r.name) : r.name.toLowerCase())));
+    for (const key of [...this.definitionRows.keys()]) if (!keys.has(key)) this.deleteDefinition(key);
     this.loadSchema();
     for (const v of this.views.values()) {
       try {
@@ -3370,16 +3476,15 @@ export class Database implements FunctionContext {
   }
 
   /**
-   * The table's CHECK constraints and column DEFAULTs as plan expressions, bound from the table's SQL once per schema
-   * version: CHECKs over the table's row (column `i` is `#0.i`, the rowid `#0.n`), DEFAULTs reading no columns.
+   * The table's CHECK constraints and column DEFAULTs as plan expressions, once per schema version: CHECKs over the table's row (column `i` is `#0.i`, the rowid `#0.n`), DEFAULTs reading no columns.
    */
   private tableExprs(table: TableSchema): { checks: { expr: PlanExpr; name: string }[]; defaults: (PlanExpr | null)[] } {
     const hit = this.tableExprCache.get(table);
     if (hit && hit.version === this.schemaVersion) return hit;
     let checks = table.checks;
     let defaults = table.columns.map((c) => c.default);
-    // A stored table's CHECKs, and DEFAULTs naming functions that did not exist, are bound where first used: from the
-    // table's SQL, until the catalog stores definitions (ADR 0015 step 7). A failure is the binder's error.
+    // Stored definitions hold bound expressions; a DEFAULT naming a function that did not exist when the table was
+    // made is bound where first used, from the table's source. A failure is the binder's error.
     if (checks.some((c) => !c.expr) || defaults.some((d) => d && !d.expr)) {
       const b = bindStoredTableExprs(table, this.bindContext());
       checks = checks.map((c, i) => (c.expr ? c : { ...c, expr: b.checks[i] }));
@@ -4000,7 +4105,7 @@ export class Database implements FunctionContext {
               return 0;
             }
           };
-          let pages = 1 + check(this.pager.catalogRoot, 'smalt_schema');
+          let pages = 1 + check(this.pager.catalogRoot, 'smalt_schema') + check(this.pager.definitionRoot, 'smalt_definition');
           // Main tables shadowed by a TEMP table of the same name still own their pages.
           for (const t of [...this.tables.values(), ...this.shadowedMain.values()]) {
             pages += check(t.rootPage, `table ${t.name}`);
@@ -4508,9 +4613,9 @@ function wholeTable(op: PlanOp): boolean {
   return op.op === 'scan' || (op.op === 'project' && wholeTable(op.input));
 }
 
-/** A system table's CREATE TABLE as the schema operation the engine runs (nothing to bind: no CHECK or DEFAULT). */
-function systemTableOp(sql: string): Extract<SchemaOp, { op: 'createTable' }> {
-  return { op: 'createTable', table: toTableDef(parseOne(sql).stmt as CreateTableStmt, sql, undefined), temp: false, ifNotExists: false, source: { language: 'sql', text: sql } };
+/** A system table's CREATE TABLE as the schema operation the engine runs: its definition, in code. */
+function systemTableOp(name: SystemTableName): Extract<SchemaOp, { op: 'createTable' }> {
+  return { op: 'createTable', table: SYSTEM_TABLES[name], temp: false, ifNotExists: false, source: { language: 'sql', text: systemTableSql(name) } };
 }
 
 /**
@@ -4520,4 +4625,30 @@ function systemTableOp(sql: string): Extract<SchemaOp, { op: 'createTable' }> {
 function viewSelect(source: Source): SelectStmt {
   if (source.language !== 'sql') throw new SmaltError('SMALT_MISUSE', `view is written in ${source.language}, which is not registered`);
   return (parseOne(source.text).stmt as CreateViewStmt).select;
+}
+
+/** The CREATE TABLE text of a materialized view's storage table (as `sqlite_schema`-style display). */
+function layoutSql(def: TableDef): string {
+  const q = (x: string): string => `"${x.replace(/"/g, '""')}"`;
+  const coll = (c: CollationName): string => (c === 'nocase' ? ' COLLATE NOCASE' : c === 'rtrim' ? ' COLLATE RTRIM' : '');
+  return `CREATE TABLE ${q(def.name)}(${def.columns.map((c) => `${q(c.name)} ${c.declaredType}${coll(c.collation)}`).join(', ')})`;
+}
+
+/** A view read from the catalog: its query parsed from its source where first used. */
+function lazyView(name: string, source: Source, columns: string[] | undefined): ViewSchema {
+  let select: SelectStmt | undefined;
+  return {
+    name,
+    sql: source.text,
+    columns,
+    get select(): SelectStmt {
+      return (select ??= viewSelect(source));
+    },
+  };
+}
+
+/** A materialized view read from the catalog: its query parsed from its source where first used. */
+function lazyMatview(info: Omit<MatViewInfo, 'select'>, source: Source): MatViewInfo {
+  let select: SelectStmt | undefined;
+  return Object.defineProperty(info, 'select', { get: () => (select ??= viewSelect(source)), enumerable: true, configurable: true }) as MatViewInfo;
 }

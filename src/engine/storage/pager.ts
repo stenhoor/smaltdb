@@ -7,6 +7,7 @@ import {
   DEFAULT_PAGE_SIZE,
   DEFAULT_RESERVED_BYTES,
   DH_CATALOG_ROOT,
+  DH_DEFINITION_ROOT,
   DH_CHANGE_COUNTER,
   DH_FORMAT_MAJOR,
   DH_FORMAT_MINOR,
@@ -374,6 +375,15 @@ export class Pager {
 
   set catalogRoot(pgno: number) {
     this.setHeaderU32(DH_CATALOG_ROOT, pgno);
+  }
+
+  /** Root of the stored definitions (catalog/stored.ts), 0 until the first one is written. */
+  get definitionRoot(): number {
+    return this.hv.getUint32(DH_DEFINITION_ROOT, true);
+  }
+
+  set definitionRoot(pgno: number) {
+    this.setHeaderU32(DH_DEFINITION_ROOT, pgno);
   }
 
   get schemaCookie(): number {
