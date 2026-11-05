@@ -61,6 +61,7 @@ and they need only the baseline. Faster paths for newer browsers plug in behind 
 ## 5. Messaging protocol
 
 - Request: `{id, op: 'prepare'|'exec'|'step'|'close'|..., sql?, params?, options}`.
+- Plans (ADR 0014 section 4): `queryPlan` and `preparePlan` carry a statement as plan data, as JSON text (`plan`) with its format version (`planVersion`); a version the engine does not read is refused with `SMALT_PLAN`. Plan queries go to parallel readers as SQL queries do; prepared plans run on the owner.
 - Response: a stream of `{id, kind: 'batch', columns, buffers}` followed by `{id, kind: 'done', stats}`.
   Buffers are transferred, not copied.
 - Backpressure: the client acknowledges every K batches, and the engine pauses the cursor otherwise.

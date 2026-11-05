@@ -1,5 +1,6 @@
 // Runs on the page main thread: exercises the public client API against the real engine worker + OPFS.
 import { open } from '../../src/client/index.js';
+import * as p from '../../src/engine/plan/portable.js';
 import { registerCredentials, registerFile } from '@smaltdb/external/client';
 import { exportCSV, exportJSON, importCSV, importJSON } from '@smaltdb/io/client';
 
@@ -71,6 +72,21 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   timings.preparedLookupRoundTripUs = ((performance.now() - t0) * 1000) / 500;
   check('prepared statement lookups', found === 500);
   await st.finalize();
+
+  // Plans over the worker protocol: SELECT name, qty FROM items WHERE id <= ? ORDER BY id DESC, as plan data.
+  const id = p.col(0, 0, 'int');
+  const byId = p.project(p.sort(p.filter(p.scan('items', [0, 1, 3]), p.call('sql.le', [id, p.param(0, 'int')], 'int')), [p.desc(id)]), [p.col(0, 1, 'text'), p.col(0, 2, 'int')]);
+  const viaPlan = await db.queryPlan({ kind: 'query', plan: byId, columns: [{ name: 'name' }, { name: 'qty' }] }, [3], { rowMode: 'array' });
+  const viaSql = await db.query('SELECT name, qty FROM items WHERE id <= ? ORDER BY id DESC', [3], { rowMode: 'array' });
+  const prepared = await db.preparePlan(byId);
+  const preparedRows = await prepared.query([2], { rowMode: 'array' });
+  await prepared.finalize();
+  const inTx = await db.transaction((tx) => tx.queryPlan(p.aggregate(p.scan('items', [0]), [], [p.agg('count', [], 'int', { star: true })]), [], { rowMode: 'array' }));
+  check(
+    'plans: queryPlan, preparePlan and tx.queryPlan over the worker',
+    JSON.stringify(viaPlan) === JSON.stringify(viaSql) && viaPlan.columns[0] === 'name' && JSON.stringify(preparedRows) === JSON.stringify([['item-2', 2], ['item-1', 1]]) && inTx[0][0] === 2000,
+    [viaPlan, viaSql, preparedRows, inTx],
+  );
 
   try {
     await db.transaction(async (tx) => {

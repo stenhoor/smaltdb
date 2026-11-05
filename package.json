@@ -62,6 +62,10 @@
       "types": "./dist/types/client/index.d.ts",
       "default": "./dist/smaltdb.js"
     },
+    "./plan": {
+      "types": "./dist/types/engine/plan/portable.d.ts",
+      "default": "./dist/plan.js"
+    },
     "./engine": {
       "types": "./dist/types/engine/index.d.ts",
       "default": "./dist/engine.js"

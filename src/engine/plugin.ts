@@ -16,6 +16,7 @@ import type { Database } from './database.js';
 import { formatReal } from './catalog/schema.js';
 import { globPrefix, globRegExp, isGlob } from './external/glob.js';
 import type { StaticType } from './exec/convert.js';
+import type { PlanStatementInput } from './plan/statement.js';
 import type { Zone } from './storage/columnar.js';
 import type { SqlValue } from './values.js';
 
@@ -109,6 +110,11 @@ export interface MethodContext {
    * rows, column names and the static type of each column.
    */
   query(sql: string, params?: readonly SqlValue[] | Readonly<Record<string, SqlValue>>): Promise<{ columns: string[]; rows: SqlValue[][]; columnTypes: StaticType[] }>;
+  /**
+   * Run one statement given as plan data (`Database.preparePlan`; the plan format is experimental) and return its
+   * rows, column names and static types. Its external sources are fetched first. Optional: engines before 0.9.0 lack it.
+   */
+  queryPlan?(stmt: PlanStatementInput, params?: readonly SqlValue[]): Promise<{ columns: string[]; rows: SqlValue[][]; columnTypes: StaticType[] }>;
 }
 
 // ------------------------------------------------------------------ formats

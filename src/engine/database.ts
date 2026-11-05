@@ -560,7 +560,8 @@ export class Database implements FunctionContext {
     return validatePlan(p, this.validateCatalog);
   }
 
-  private cachedPlan(stmt: PlanStatementInput): PlanStatement {
+  /** @internal A compiled plan statement from the cache (or compiled and cached). */
+  cachedPlan(stmt: PlanStatementInput): PlanStatement {
     this.checkOpen();
     const key = canonicalJSON(stmt);
     let st = this.planCache.get(key);
@@ -693,7 +694,11 @@ export class Database implements FunctionContext {
       const st = this.prepare(sql);
       return this.withExternal(signal, st, () => ({ columns: st.columns, rows: st.all(params), columnTypes: st.columnTypes }));
     };
-    return this.external.plugins.call({ db: this, session: options.session ?? 'local', signal, query }, plugin, method, args);
+    const queryPlan = async (stmt: PlanStatementInput, params?: readonly SqlValue[]): Promise<{ columns: string[]; rows: SqlValue[][]; columnTypes: StaticType[] }> => {
+      const st = this.preparePlan(stmt);
+      return this.withExternal(signal, st, () => ({ columns: st.columns, rows: st.all(params as BindParams | undefined), columnTypes: st.columnTypes }));
+    };
+    return this.external.plugins.call({ db: this, session: options.session ?? 'local', signal, query, queryPlan }, plugin, method, args);
   }
 
   /** The plugins installed in this engine (name and version). */

@@ -89,7 +89,7 @@ export function serve(options: ServeOptions = {}): void {
         return;
       }
       if (m.type !== 'job') return;
-      if (m.req.op === 'query') {
+      if (m.req.op === 'query' || m.req.op === 'queryPlan') {
         // A new query: move to the latest commit and take the owner's settings first.
         try {
           server.db!.refreshSnapshot();
@@ -173,7 +173,7 @@ export function serve(options: ServeOptions = {}): void {
       }
     }
 
-    dispatch(session: string, req: Extract<Request, { op: 'query' }>, settings: ReaderSettings): boolean {
+    dispatch(session: string, req: Extract<Request, { op: 'query' | 'queryPlan' }>, settings: ReaderSettings): boolean {
       const r = this.workers.find((x) => x.ready && x.job === null);
       if (!r) return false;
       r.job = { kind: 'query', session, id: req.id };

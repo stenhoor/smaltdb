@@ -1,4 +1,4 @@
-// Builds dist/: smaltdb.js (client), smaltdb-worker.js (default engine worker), worker-runtime.js (serve() for
+// Builds dist/: smaltdb.js (client), plan.js (the plan format), smaltdb-worker.js (default engine worker), worker-runtime.js (serve() for
 // application worker entries with plugins), engine.js (synchronous engine for Node/workers).
 import { build } from 'esbuild';
 import { readFileSync, rmSync } from 'node:fs';
@@ -15,6 +15,8 @@ const common = { bundle: true, format: 'esm', target: 'es2022', sourcemap: true,
 await Promise.all([
   build({ ...common, entryPoints: ['src/client/index.ts'], outfile: 'dist/smaltdb.js', platform: 'browser' }),
   // The default engine worker (no plugins), and the runtime applications build their own worker entry with.
+  // The plan format (types, builders, codec) for clients that build plans: kept out of smaltdb.js.
+  build({ ...common, entryPoints: ['src/engine/plan/portable.ts'], outfile: 'dist/plan.js', platform: 'neutral' }),
   build({ ...common, entryPoints: ['src/engine/worker.ts'], outfile: 'dist/smaltdb-worker.js', platform: 'browser' }),
   build({ ...common, entryPoints: ['src/engine/worker-runtime.ts'], outfile: 'dist/worker-runtime.js', platform: 'browser' }),
   // Node / workers: the synchronous engine.
