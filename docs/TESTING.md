@@ -84,6 +84,11 @@ builds its operators. There is no other path: a statement the physical planner d
 `test/plan-shapes.test.ts` pins the plan shapes (`EXPLAIN`), `test/codegen-source.test.ts` the generated code, and
 `test/plan-physical.test.ts` compares the shapes the physical planner builds, reads and writes, with SQLite.
 
+Plans are data that can leave the process (`src/engine/plan/codec.ts`, [ADR 0015](adr/0015-smaltql.md) step 5):
+`test/plan-codec.test.ts` checks that a plan's JSON and structured-clone forms decode to the same plan, SQL metadata
+included. With `SMALT_PLAN_ROUNDTRIP=1`, every plan the front end makes goes through its JSON form before the engine
+plans it; CI runs the whole suite that way too.
+
 ## Plugins
 
 The plugins live in their own repositories ([ADR 0012](adr/0012-plugins.md)): `stenhoor/smaltdb-io`,

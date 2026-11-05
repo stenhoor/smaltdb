@@ -25,6 +25,8 @@ jobs:
       - run: node scripts/fetch-packed.mjs
       - run: npm run typecheck
       - run: npm test
+      # Every plan through its JSON form before it is planned (plan/codec.ts).
+      - run: SMALT_PLAN_ROUNDTRIP=1 npm test
 
   browser:
     runs-on: ubuntu-latest
