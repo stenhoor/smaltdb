@@ -4,7 +4,7 @@ import { Database } from '../src/engine/database.js';
 import { parseOne } from '../src/engine/sql/parser.js';
 import type { SelectStmt } from '../src/engine/sql/ast.js';
 import type { BindContext } from '../src/engine/plan/bind-context.js';
-import { toPlan, toRowExpr, toValueExpr } from '../src/engine/sql/frontend/select.js';
+import { toPlan, toValueExpr } from '../src/engine/sql/frontend/select.js';
 import { printExpr, printPlan } from '../src/engine/plan/print.js';
 import type { CreateTableStmt } from '../src/engine/sql/ast.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
@@ -143,7 +143,7 @@ describe('plans are plain data', () => {
     const t = catalog.getTable('p')!;
     const def = (parseOne(sql).stmt as CreateTableStmt).columns[2].constraints.find((c) => c.kind === 'default') as { expr: Parameters<typeof toValueExpr>[0] };
     // Column i is #0.i; the rowid (and its alias) is #0.n.
-    expect(t.checks.map((c) => printExpr(toRowExpr(c.expr, t, t.sql, catalog)))).toEqual(['sql.gt(#0.1, sql.affinity_numeric(0))', 'sql.lt(sql.affinity_numeric(length(#0.2)), #0.0)']);
+    expect(t.checks.map((c) => printExpr(c.expr!))).toEqual(['sql.gt(#0.1, sql.affinity_numeric(0))', 'sql.lt(sql.affinity_numeric(length(#0.2)), #0.0)']);
     expect(printExpr(toValueExpr(def.expr, sql, catalog))).toBe("upper('x')");
     const ev = t.indexes.find((i) => i.name === 'pa')!.eval!;
     expect(ev.plan.cols.map((e) => e && printExpr(e))).toEqual(['sql.mul(#0.1, 2)']);

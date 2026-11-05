@@ -1,10 +1,16 @@
 import { SmaltError } from '../errors.js';
 import type { PlanExpr } from '../plan/expr.js';
-import type { ColumnConstraint, ColumnDef, ConflictAction, CreateIndexStmt, CreateTableStmt, Expr, FkAction, ForeignKeyClause, IndexedColumn } from '../sql/ast.js';
-import { anyNode } from '../sql/ast-util.js';
+import type { ConflictAction as PlanConflict } from '../plan/ops.js';
+import type { CheckDef, DefaultDef, ExprDef, FkAction, IndexDef, TableDef } from '../plan/schema.js';
+import type { CollationName } from '../plan/types.js';
 import { RecordLayout, type StorageType } from '../storage/record.js';
 import { realToText } from '../util/fp.js';
-import { Collation, type SqlValue, collationByName, normalizeInt } from '../values.js';
+import { Collation, type SqlValue, normalizeInt } from '../values.js';
+
+/** A conflict resolution as the writer applies it (upper case, as SQL writes it). */
+export type ConflictAction = 'ROLLBACK' | 'ABORT' | 'FAIL' | 'IGNORE' | 'REPLACE';
+
+const upper = (a: PlanConflict | undefined): ConflictAction | undefined => (a === undefined ? undefined : (a.toUpperCase() as ConflictAction));
 
 /** Thrown for constraint violations; `code` mirrors SQLite extended result codes. */
 export class ConstraintError extends SmaltError {
@@ -26,7 +32,8 @@ export interface ColumnSchema {
   declaredNotNull?: boolean;
   /** `NOT NULL ON CONFLICT ...`: the resolution when the statement gives none (default ABORT). */
   notNullConflict?: ConflictAction;
-  defaultExpr?: Expr;
+  /** DEFAULT: its expression (over no columns), text and constant value. */
+  default?: DefaultDef;
   collation: Collation;
   /** Part of the PRIMARY KEY. */
   primaryKey: boolean;
@@ -37,8 +44,8 @@ export interface ColumnSchema {
 export interface IndexColumnSchema {
   /** Table column index, or -1 for an expression column. */
   column: number;
-  /** The indexed expression when `column` is -1. */
-  expr?: Expr;
+  /** The indexed expression when `column` is -1 (over the table's row). */
+  expr?: ExprDef;
   desc: boolean;
   collation: Collation;
 }
@@ -70,7 +77,8 @@ export interface IndexSchema {
   constraintName?: string;
   /** `UNIQUE / PRIMARY KEY ... ON CONFLICT ...`: the resolution when the statement gives none (default ABORT). */
   onConflict?: ConflictAction;
-  where?: Expr;
+  /** A partial index's WHERE (over the table's row). */
+  where?: ExprDef;
   /** Evaluators for expression columns and the partial-index WHERE (absent for plain indexes). */
   eval?: IndexEval;
   /** CREATE INDEX text (undefined for automatic indexes). */
@@ -89,7 +97,7 @@ export interface TableSchema {
   pkConflict?: ConflictAction;
   strict: boolean;
   indexes: IndexSchema[];
-  checks: { name?: string; expr: Expr }[];
+  checks: CheckDef[];
   foreignKeys: ForeignKeySchema[];
   sql: string;
   layout: RecordLayout;
@@ -288,36 +296,14 @@ export function coerceForColumn(v: SqlValue, col: ColumnSchema, table: string, i
   );
 }
 
-// ------------------------------------------------------------------ building schemas from DDL
-
-function constraintsOf(c: ColumnConstraint[], kind: ColumnConstraint['kind']): ColumnConstraint[] {
-  return c.filter((x) => x.kind === kind);
-}
-
 export function findColumn(table: TableSchema, name: string): number {
   const lower = name.toLowerCase();
   for (let i = 0; i < table.columns.length; i++) if (table.columns[i].name.toLowerCase() === lower) return i;
   return -1;
 }
 
-function indexedColumnName(ic: IndexedColumn): string {
-  if (ic.expr.kind === 'column' && ic.expr.table === undefined) return ic.expr.name;
-  if (ic.expr.kind === 'collate' && ic.expr.expr.kind === 'column') return ic.expr.expr.name;
-  throw new SmaltError('SMALT_UNSUPPORTED', 'expressions in index definitions are not supported yet');
-}
-
-function indexedColumnCollation(ic: IndexedColumn): string | undefined {
-  if (ic.collation) return ic.collation;
-  if (ic.expr.kind === 'collate') return ic.expr.collation;
-  return undefined;
-}
-
-function toCollation(name: string | undefined, fallback: Collation): Collation {
-  if (name === undefined) return fallback;
-  const c = collationByName(name);
-  if (c === undefined) throw new SmaltError('SMALT_ERROR', `no such collation sequence: ${name}`);
-  return c;
-}
+const COLLATIONS: Readonly<Record<CollationName, Collation>> = { binary: Collation.Binary, nocase: Collation.NoCase, rtrim: Collation.RTrim };
+const collationOf = (n: CollationName): Collation => COLLATIONS[n];
 
 /** Index specs implied by a CREATE TABLE (PRIMARY KEY / UNIQUE), in SQLite's numbering order. */
 export interface ImplicitIndexSpec {
@@ -345,11 +331,11 @@ export interface ForeignKeySchema {
 }
 
 /**
- * Build the table schema from a parsed CREATE TABLE. Root pages for the table and its implicit
- * indexes are filled in by the caller.
+ * The table schema a table definition gives (plan/schema.ts). Root pages for the table's implicit indexes are filled
+ * in by the caller. `sql`: the statement the catalog stores.
  */
-export function buildTableSchema(
-  stmt: CreateTableStmt,
+export function tableSchemaFromDef(
+  def: TableDef,
   sql: string,
   rootPage: number,
 ): {
@@ -358,97 +344,39 @@ export function buildTableSchema(
   /** Two identical UNIQUE / PRIMARY KEY constraints give different ON CONFLICT actions (an error on CREATE TABLE). */
   conflictingOnConflict: boolean;
 } {
-  if (stmt.options.withoutRowid) throw new SmaltError('SMALT_UNSUPPORTED', 'WITHOUT ROWID tables are not supported yet');
-  if (stmt.options.loose) throw new SmaltError('SMALT_UNSUPPORTED', 'LOOSE tables are not supported yet');
-  if (stmt.asSelect) throw new SmaltError('SMALT_UNSUPPORTED', 'CREATE TABLE ... AS SELECT is not supported yet');
-  if (stmt.columns.length === 0) throw new SmaltError('SMALT_ERROR', 'a table must have at least one column');
-
-  const columns: ColumnSchema[] = [];
-  const seen = new Set<string>();
-  for (const def of stmt.columns) {
-    const lower = def.name.toLowerCase();
-    if (seen.has(lower)) throw new SmaltError('SMALT_ERROR', `duplicate column name: ${def.name}`);
-    seen.add(lower);
-    const cs = def.constraints;
-    if (constraintsOf(cs, 'generated').length) throw new SmaltError('SMALT_UNSUPPORTED', 'generated columns are not supported yet');
-    const coll = constraintsOf(cs, 'collate')[0] as { collation: string } | undefined;
-    const dflt = constraintsOf(cs, 'default')[0] as { expr: Expr } | undefined;
-    // Like SQLite, the last NOT NULL clause decides the column's ON CONFLICT action.
-    const notNulls = constraintsOf(cs, 'notNull') as { onConflict?: ConflictAction }[];
-    columns.push({
-      name: def.name,
-      declaredType: def.type ?? '',
-      type: storageTypeFor(def.type),
-      notNull: constraintsOf(cs, 'notNull').length > 0,
-      declaredNotNull: constraintsOf(cs, 'notNull').length > 0,
-      notNullConflict: notNulls.length ? notNulls[notNulls.length - 1].onConflict : undefined,
-      defaultExpr: dflt?.expr,
-      collation: toCollation(coll?.collation, Collation.Binary),
-      primaryKey: false,
-      rowidAlias: false,
-    });
-  }
-
+  const columns: ColumnSchema[] = def.columns.map((c) => ({
+    name: c.name,
+    declaredType: c.declaredType,
+    type: c.type,
+    notNull: c.notNull,
+    declaredNotNull: c.notNull,
+    notNullConflict: upper(c.notNullConflict),
+    default: c.default,
+    collation: collationOf(c.collation),
+    primaryKey: false,
+    rowidAlias: false,
+  }));
   const implicit: ImplicitIndexSpec[] = [];
-  const checks: { name?: string; expr: Expr }[] = [];
-  let pkSeen = false;
   let rowidAlias = -1;
   let pkConflict: ConflictAction | undefined;
-
-  const fks: ForeignKeySchema[] = [];
-  let pkName: string | undefined;
-  const addPk = (cols: { index: number; desc: boolean; collation?: string }[], name?: string, onConflict?: ConflictAction): void => {
-    if (pkSeen) throw new SmaltError('SMALT_ERROR', `table "${stmt.name}" has more than one primary key`);
-    pkSeen = true;
-    pkName = name;
-    for (const c of cols) {
-      columns[c.index].primaryKey = true;
-      columns[c.index].notNull = true;
+  let autoincrement = false;
+  for (const k of def.keys) {
+    const cols = k.columns.map((c) => ({ column: c.column, desc: c.desc, collation: collationOf(c.collation) }));
+    if (k.kind === 'primaryKey') {
+      for (const c of k.columns) {
+        columns[c.column].primaryKey = true;
+        columns[c.column].notNull = true;
+      }
+      // INTEGER PRIMARY KEY (exact type name INTEGER, single column, ASC) aliases the rowid.
+      if (k.columns.length === 1 && columns[k.columns[0].column].declaredType === 'INTEGER' && !k.columns[0].desc) {
+        rowidAlias = k.columns[0].column;
+        columns[rowidAlias].rowidAlias = true;
+        pkConflict = upper(k.onConflict);
+        autoincrement = k.autoincrement === true;
+        continue;
+      }
     }
-    // INTEGER PRIMARY KEY (exact type name INTEGER, single column, ASC) aliases the rowid.
-    if (cols.length === 1 && columns[cols[0].index].declaredType === 'INTEGER' && !cols[0].desc) {
-      rowidAlias = cols[0].index;
-      columns[rowidAlias].rowidAlias = true;
-      pkConflict = onConflict;
-      return;
-    }
-    implicit.push({
-      origin: 'pk',
-      columns: cols.map((c) => ({ column: c.index, desc: c.desc, collation: toCollation(c.collation, columns[c.index].collation) })),
-      constraintName: name,
-      onConflict,
-    });
-  };
-
-  // Column constraints first, then table constraints (SQLite numbers autoindexes in this order).
-  stmt.columns.forEach((def, i) => {
-    for (const c of def.constraints) {
-      if (c.kind === 'primaryKey') addPk([{ index: i, desc: c.desc }], c.name, c.onConflict);
-      else if (c.kind === 'unique') implicit.push({ origin: 'u', columns: [{ column: i, desc: false, collation: columns[i].collation }], constraintName: c.name, onConflict: c.onConflict });
-      else if (c.kind === 'check') checks.push({ name: c.name, expr: c.expr });
-      else if (c.kind === 'references') fks.push(fkSchema(c.name, [i], c));
-    }
-  });
-  for (const tc of stmt.constraints) {
-    if (tc.kind === 'primaryKey' || tc.kind === 'unique') {
-      const cols = tc.columns.map((ic) => {
-        const name = indexedColumnName(ic);
-        const index = columns.findIndex((c) => c.name.toLowerCase() === name.toLowerCase());
-        if (index < 0) throw new SmaltError('SMALT_ERROR', `no such column: ${name}`);
-        return { index, desc: ic.desc, collation: indexedColumnCollation(ic) };
-      });
-      if (tc.kind === 'primaryKey') addPk(cols, tc.name, tc.onConflict);
-      else implicit.push({ origin: 'u', columns: cols.map((c) => ({ column: c.index, desc: c.desc, collation: toCollation(c.collation, columns[c.index].collation) })), constraintName: tc.name, onConflict: tc.onConflict });
-    } else if (tc.kind === 'check') {
-      checks.push({ name: tc.name, expr: tc.expr });
-    } else if (tc.kind === 'foreignKey') {
-      const idx = tc.columns.map((name) => {
-        const index = columns.findIndex((c) => c.name.toLowerCase() === name.toLowerCase());
-        if (index < 0) throw new SmaltError('SMALT_ERROR', `unknown column "${name}" in foreign key definition`);
-        return index;
-      });
-      fks.push(fkSchema(tc.name, idx, tc.references));
-    }
+    implicit.push({ origin: k.kind === 'primaryKey' ? 'pk' : 'u', columns: cols, constraintName: k.name, onConflict: upper(k.onConflict) });
   }
   // Drop UNIQUE constraints that duplicate the rowid alias (always unique anyway).
   const filtered = implicit.filter((s) => !(s.columns.length === 1 && s.columns[0].column === rowidAlias));
@@ -470,110 +398,27 @@ export function buildTableSchema(
       }
     }
   }
-
-  const types = columns.map((c) => c.type);
   const table: TableSchema = {
-    name: stmt.name,
+    name: def.name,
     rootPage,
     columns,
     rowidAlias,
     pkConflict,
     strict: true,
     indexes: [],
-    checks,
-    foreignKeys: fks,
+    checks: [...def.checks],
+    foreignKeys: def.foreignKeys.map((f) => ({ ...f, columns: [...f.columns], refColumns: f.refColumns ? [...f.refColumns] : undefined })),
     sql,
-    layout: new RecordLayout(types),
+    layout: new RecordLayout(columns.map((c) => c.type)),
     // Rows written before ALTER TABLE ADD COLUMN lack the new column: they read its (constant) default.
-    recordDefaults: columns.map((c) => literalValue(c.defaultExpr)),
+    recordDefaults: columns.map((c) => c.default?.value ?? null),
   };
-  if (rowidAlias >= 0 && (stmt.columns.some((d) => d.constraints.some((c) => c.kind === 'primaryKey' && c.autoincrement)) || stmt.constraints.some((c) => c.kind === 'primaryKey' && c.autoincrement))) {
-    table.autoincrement = true;
-  }
+  if (autoincrement) table.autoincrement = true;
   return { table, implicitIndexes: filtered, conflictingOnConflict };
 }
 
-function fkSchema(name: string | undefined, columns: number[], c: ForeignKeyClause): ForeignKeySchema {
-  if (c.columns && c.columns.length !== columns.length) {
-    throw new SmaltError('SMALT_ERROR', `number of columns in foreign key does not match the number of columns in the referenced table`);
-  }
-  return { name, columns, table: c.table, refColumns: c.columns, onDelete: c.onDelete ?? 'NO ACTION', onUpdate: c.onUpdate ?? 'NO ACTION', deferrable: !!c.deferrable, isDeferrable: !!c.isDeferrable };
+/** The index schema an index definition gives, on `table`. */
+export function indexSchemaFromDef(def: IndexDef, sql: string, table: TableSchema, rootPage: number): IndexSchema {
+  const columns: IndexColumnSchema[] = def.columns.map((c) => ({ column: c.column, ...(c.expr ? { expr: c.expr } : {}), desc: c.desc, collation: collationOf(c.collation) }));
+  return { name: def.name, table: table.name, rootPage, columns, unique: def.unique, origin: 'c', ...(def.where ? { where: def.where } : {}), sql };
 }
-
-export function buildIndexSchema(stmt: CreateIndexStmt, sql: string, table: TableSchema, rootPage: number): IndexSchema {
-  if (stmt.include?.length) throw new SmaltError('SMALT_UNSUPPORTED', 'INCLUDE columns are not supported yet');
-  const columns: IndexColumnSchema[] = stmt.columns.map((ic) => {
-    const plain = ic.expr.kind === 'column' || (ic.expr.kind === 'collate' && ic.expr.expr.kind === 'column');
-    if (!plain) {
-      // Expression column; validated and compiled by the database (Database.prepareIndex).
-      return { column: -1, expr: ic.expr.kind === 'collate' ? ic.expr.expr : ic.expr, desc: ic.desc, collation: toCollation(indexedColumnCollation(ic), Collation.Binary) };
-    }
-    const col = (ic.expr.kind === 'collate' ? ic.expr.expr : ic.expr) as { table?: string; name: string };
-    if (col.table && col.table.toLowerCase() !== table.name.toLowerCase()) throw new SmaltError('SMALT_ERROR', `no such column: ${col.table}.${col.name}`);
-    const name = col.name;
-    const index = findColumn(table, name);
-    if (index < 0) throw new SmaltError('SMALT_ERROR', `no such column: ${name}`);
-    return { column: index, desc: ic.desc, collation: toCollation(indexedColumnCollation(ic), table.columns[index].collation) };
-  });
-  return { name: stmt.name, table: table.name, rootPage, columns, unique: stmt.unique, origin: 'c', where: stmt.where, sql };
-}
-
-/** Value of a constant default (literal, or signed numeric literal); null otherwise. */
-export function literalValue(e: Expr | undefined): SqlValue {
-  if (!e) return null;
-  if (e.kind === 'literal') return e.value;
-  if (e.kind === 'unary' && (e.op === '-' || e.op === '+') && e.operand.kind === 'literal') {
-    const v = e.operand.value;
-    if (typeof v === 'number') return e.op === '-' ? -v : v;
-    if (typeof v === 'bigint') return e.op === '-' ? normalizeInt(-v) : v;
-  }
-  return null;
-}
-
-/** Whether a default is constant in SQLite's ALTER TABLE ADD COLUMN sense. */
-/**
- * CREATE TABLE only (stored definitions are not re-checked, so existing databases still open):
- * SQLite's rules for DEFAULT and CHECK expressions, and AUTOINCREMENT only on the column that
- * aliases the rowid.
- */
-export function checkNewTable(stmt: CreateTableStmt, table: TableSchema): void {
-  checkConstraintExprs(
-    stmt.columns,
-    stmt.constraints.flatMap((c) => (c.kind === 'check' ? [c.expr] : [])),
-  );
-  const on = stmt.columns.some((d) => d.constraints.some((c) => c.kind === 'primaryKey' && c.autoincrement)) || stmt.constraints.some((c) => c.kind === 'primaryKey' && c.autoincrement);
-  if (on && table.rowidAlias < 0) throw new SmaltError('SMALT_ERROR', 'AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY');
-}
-
-const isSubquery = (n: Record<string, unknown>): boolean => n.kind === 'subquery' || n.kind === 'exists' || n.kind === 'inSelect';
-
-/** SQLite's parse-time rules for a CHECK expression (`prefix` names the ALTER TABLE context). */
-export function checkCheckExpr(e: Expr, prefix = ''): void {
-  if (anyNode(e, isSubquery)) throw new SmaltError('SMALT_ERROR', `${prefix}subqueries prohibited in CHECK constraints`);
-  if (anyNode(e, (n) => n.kind === 'param')) throw new SmaltError('SMALT_ERROR', `${prefix}parameters prohibited in CHECK constraints`);
-}
-
-/** SQLite's parse-time rule for DEFAULT: no subqueries, column references or parameters (functions are allowed). */
-export function checkDefaultExpr(column: string, e: Expr): void {
-  if (anyNode(e, (n) => isSubquery(n) || n.kind === 'column' || n.kind === 'param')) throw new SmaltError('SMALT_ERROR', `default value of column [${column}] is not constant`);
-}
-
-/**
- * CREATE TABLE / ADD COLUMN only (stored definitions are not re-checked, so existing databases
- * still open): DEFAULT and CHECK expressions, in the order they appear, as SQLite checks them.
- */
-export function checkConstraintExprs(columns: ColumnDef[], tableChecks: Expr[], checkPrefix = ''): void {
-  for (const def of columns) {
-    for (const c of def.constraints) {
-      if (c.kind === 'default') checkDefaultExpr(def.name, c.expr);
-      else if (c.kind === 'check') checkCheckExpr(c.expr, checkPrefix);
-    }
-  }
-  for (const e of tableChecks) checkCheckExpr(e, checkPrefix);
-}
-
-export function isConstantDefault(e: Expr): boolean {
-  if (e.kind === 'literal') return true;
-  return e.kind === 'unary' && (e.op === '-' || e.op === '+') && e.operand.kind === 'literal' && (typeof e.operand.value === 'number' || typeof e.operand.value === 'bigint');
-}
-

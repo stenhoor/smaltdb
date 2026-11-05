@@ -245,7 +245,7 @@ export class ForeignKeys {
         const set = l.childCols
           .map((c) => {
             const col = child.columns[c];
-            const v = action === 'SET DEFAULT' && col.defaultExpr ? child.sql.slice(col.defaultExpr.pos, col.defaultExpr.end) : 'NULL';
+            const v = action === 'SET DEFAULT' && col.default ? col.default.text : 'NULL';
             return `${q(col.name)} = ${v}`;
           })
           .join(', ');

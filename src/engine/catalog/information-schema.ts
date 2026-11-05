@@ -51,7 +51,7 @@ function constraints(table: TableSchema): { name: string; type: string; columns:
     out.push({ name: fk.name ?? `${table.name}_${cols.join('_')}_fkey`, type: 'FOREIGN KEY', columns: cols, fk });
   });
   table.checks.forEach((c, n) => {
-    out.push({ name: c.name ?? `${table.name}_check${n + 1}`, type: 'CHECK', columns: [], check: table.sql.slice(c.expr.pos, c.expr.end) });
+    out.push({ name: c.name ?? `${table.name}_check${n + 1}`, type: 'CHECK', columns: [], check: c.text });
   });
   return out;
 }
@@ -113,7 +113,7 @@ export function informationSchema(name: string, cat: CatalogSnapshot): VirtualTa
                 x.name,
                 c.name,
                 n + 1,
-                c.defaultExpr ? x.sql.slice(c.defaultExpr.pos, c.defaultExpr.end) : null,
+                c.default ? c.default.text : null,
                 yesNo(!c.notNull),
                 c.declaredType || 'ANY',
                 ['BINARY', 'NOCASE', 'RTRIM'][c.collation] ?? null,
