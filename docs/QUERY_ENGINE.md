@@ -39,7 +39,7 @@ The engine validates them as it validates SQL's, then puts each query block in t
 (`exec/plan-normalize.ts`): identity projections where a builder left a layer out, and any other operation as a nested
 FROM item.
 
-Before binding, the front end merges simple views and FROM subqueries into the query (`exec/flatten.ts`, an AST
+Before binding, the front end merges simple views and FROM subqueries into the query (`sql/frontend/flatten.ts`, an AST
 rewrite). Materialized-view matching works on the bound plan (`exec/plan-mv-match.ts`), at any depth, including the
 inner sides the planner builds when it decorrelates a subquery. Languages bind against the logical catalog
 (`plan/bind-context.ts` `BindContext`); the planner plans against its physical environment (`PhysicalEnv`). A table's
@@ -79,7 +79,7 @@ schema version changes (any DDL, or a setting that changes planning).
 - Subquery decorrelation (`EXISTS`/`IN`/scalar subqueries become semi/anti/outer joins)
 - Outer-to-inner join conversion when null-rejecting predicates allow it
 - View and CTE inlining (non-recursive, single-reference CTEs)
-- **Subquery/view flattening** (implemented in M4, `src/engine/exec/flatten.ts`): a view or FROM subquery whose body is a plain
+- **Subquery/view flattening** (implemented in M4, `src/engine/sql/frontend/flatten.ts`): a view or FROM subquery whose body is a plain
   projection/filter/join over tables is merged into the outer query. Its tables are renamed to unique aliases, its WHERE
   is ANDed in (into the ON clause for a single-table LEFT JOIN source), and outer references are replaced by its column
   expressions. Anything else, or anything ambiguous, is planned as a sub-plan. `SMALT_NO_FLATTEN=1` disables it for tests.

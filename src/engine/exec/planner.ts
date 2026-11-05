@@ -12,16 +12,6 @@ function decorrelationDisabled(): boolean {
 }
 import { SmaltError } from '../errors.js';
 import { type IndexEval, type IndexSchema, type TableSchema, isColumnar, storageTypeFor } from '../catalog/schema.js';
-import type {
-  CallExpr,
-  Expr,
-  FromItem,
-  JoinType,
-  SelectCore,
-  SelectCoreSelect,
-  SelectStmt,
-  WindowSpec,
-} from '../sql/ast.js';
 import { type BTree, BTreeCursor } from '../storage/btree.js';
 import { KEY_AFTER_NULL, decodeKey, rowidSuffixStart } from '../storage/key-codec.js';
 import { RecordReader } from '../storage/record.js';
@@ -207,109 +197,19 @@ interface Source {
   externalTable?: boolean;
 }
 
-/** A CTE visible in a scope. `working` marks the self-reference inside a recursive step. */
-interface CteEntry {
-  select: SelectStmt;
-  columns?: string[];
-  recursive?: boolean;
-  working?: { scan: WorkingScan; regs: number[]; columns: ResultColumnInfo[] };
-}
-
 const TEMP_CATALOG = new Set(['sqlite_temp_schema', 'sqlite_temp_master']);
+
+/** How a FROM item joins the items before it. */
+type JoinType = 'INNER' | 'LEFT' | 'RIGHT' | 'FULL' | 'CROSS';
+
+function sameName(a: string, b: string): boolean {
+  return a.length === b.length && a.toLowerCase() === b.toLowerCase();
+}
 
 class Scope {
   sources: Source[] = [];
   correlated = false;
-  ctes = new Map<string, CteEntry>();
   constructor(readonly parent: Scope | null) {}
-
-  findCte(name: string): CteEntry | undefined {
-    const lower = name.toLowerCase();
-    for (let s: Scope | null = this; s; s = s.parent) {
-      const c = s.ctes.get(lower);
-      if (c) return c;
-    }
-    return undefined;
-  }
-}
-
-export function sameName(a: string, b: string): boolean {
-  return a.length === b.length && a.toLowerCase() === b.toLowerCase();
-}
-
-/** Structural AST equality ignoring source positions. */
-export function exprEquals(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) {
-    if (typeof a === 'string' && typeof b === 'string') return a === b;
-    return false;
-  }
-  if (a instanceof Uint8Array || b instanceof Uint8Array) {
-    return a instanceof Uint8Array && b instanceof Uint8Array && a.length === b.length && a.every((x, i) => x === b[i]);
-  }
-  if (Array.isArray(a)) return Array.isArray(b) && a.length === b.length && a.every((x, i) => exprEquals(x, b[i]));
-  const ka = Object.keys(a).filter((k) => k !== 'pos' && k !== 'end' && (a as Record<string, unknown>)[k] !== undefined);
-  const kb = Object.keys(b).filter((k) => k !== 'pos' && k !== 'end' && (b as Record<string, unknown>)[k] !== undefined);
-  if (ka.length !== kb.length) return false;
-  for (const k of ka) {
-    const va = (a as Record<string, unknown>)[k];
-    const vb = (b as Record<string, unknown>)[k];
-    // Identifiers compare case-insensitively.
-    if ((k === 'name' || k === 'table') && typeof va === 'string' && typeof vb === 'string') {
-      if (!sameName(va, vb)) return false;
-    } else if (!exprEquals(va, vb)) return false;
-  }
-  return true;
-}
-
-/** Visit an expression tree; `visit` returns false to skip children. Does not enter subqueries. */
-export function walk(e: Expr, visit: (e: Expr) => boolean | void): void {
-  if (visit(e) === false) return;
-  switch (e.kind) {
-    case 'unary':
-      walk(e.operand, visit);
-      break;
-    case 'binary':
-      walk(e.left, visit);
-      walk(e.right, visit);
-      break;
-    case 'between':
-      walk(e.expr, visit);
-      walk(e.low, visit);
-      walk(e.high, visit);
-      break;
-    case 'inList':
-      walk(e.expr, visit);
-      e.list.forEach((x) => walk(x, visit));
-      break;
-    case 'inSelect':
-      walk(e.expr, visit);
-      break;
-    case 'like':
-      walk(e.expr, visit);
-      walk(e.pattern, visit);
-      if (e.escape) walk(e.escape, visit);
-      break;
-    case 'isNull':
-    case 'collate':
-    case 'cast':
-      walk(e.expr, visit);
-      break;
-    case 'case':
-      if (e.base) walk(e.base, visit);
-      for (const w of e.whens) {
-        walk(w.when, visit);
-        walk(w.then, visit);
-      }
-      if (e.else) walk(e.else, visit);
-      break;
-    case 'call':
-      e.args.forEach((x) => walk(x, visit));
-      if (e.filter) walk(e.filter, visit);
-      break;
-    default:
-      break;
-  }
 }
 
 /** A Filter on a pool conjunct: compiled from its bound form (bound once, when the pool was built). */
@@ -356,23 +256,6 @@ function forEachSlot(e: BoundExpr, f: (reg: number) => void): void {
     default:
       return;
   }
-}
-
-/** A call that is an aggregate (not a window function, not scalar min/max of several arguments). */
-export function isAggregateCall(e: Expr): e is CallExpr {
-  return e.kind === 'call' && aggregateFunctions.has(e.name) && !((e.name === 'min' || e.name === 'max') && e.args.length > 1) && e.over === undefined;
-}
-
-export function containsAggregate(e: Expr | undefined): boolean {
-  if (!e || e.kind === 'column' || e.kind === 'literal' || e.kind === 'param') return false;
-  let found = false;
-  walk(e, (x) => {
-    if (isAggregateCall(x)) {
-      found = true;
-      return false;
-    }
-  });
-  return found;
 }
 
 interface ConjunctInfo {
@@ -468,21 +351,6 @@ export class Planner {
   // ================================================================ SELECT
 
   /** Resolve `OVER name` / `OVER (base ...)` against the core's WINDOW clause, like SQLite. */
-  private resolveWindowSpec(over: WindowSpec | string, core: SelectCoreSelect): WindowSpec {
-    const named = (name: string): WindowSpec => {
-      const w = core.windows.find((x) => sameName(x.name, name));
-      if (!w) throw new SmaltError('SMALT_ERROR', `no such window: ${name}`);
-      return w.spec.base ? this.resolveWindowSpec(w.spec, core) : w.spec;
-    };
-    if (typeof over === 'string') return named(over);
-    if (!over.base) return over;
-    const base = named(over.base);
-    if (over.partitionBy.length) throw new SmaltError('SMALT_ERROR', `cannot override PARTITION clause of window: ${over.base}`);
-    if (over.orderBy.length && base.orderBy.length) throw new SmaltError('SMALT_ERROR', `cannot override ORDER BY clause of window: ${over.base}`);
-    if (base.frame) throw new SmaltError('SMALT_ERROR', `cannot override frame specification of window: ${over.base}`);
-    return { ...over, base: undefined, partitionBy: base.partitionBy, orderBy: over.orderBy.length ? over.orderBy : base.orderBy };
-  }
-
   /**
    * Fuse `Filter* -> full TableScan` under an ungrouped aggregate into one generated function
    * (FusedScanAggregate). Returns null when the shape or the aggregates do not qualify.
@@ -1462,7 +1330,7 @@ export class Planner {
     const isInfoSchema = item.kind === 'table' && item.schema?.toLowerCase() === 'information_schema';
     // The TEMP catalog: temp.sqlite_schema / temp.sqlite_master, also named sqlite_temp_schema / sqlite_temp_master.
     const tempCatalog =
-      item.kind === 'table' && (item.schema === undefined ? !scope.findCte(item.name) && TEMP_CATALOG.has(item.name.toLowerCase()) : item.schema.toLowerCase() === 'temp' && (TEMP_CATALOG.has(item.name.toLowerCase()) || ['sqlite_schema', 'sqlite_master'].includes(item.name.toLowerCase())));
+      item.kind === 'table' && (item.schema === undefined ? TEMP_CATALOG.has(item.name.toLowerCase()) : item.schema.toLowerCase() === 'temp' && (TEMP_CATALOG.has(item.name.toLowerCase()) || ['sqlite_schema', 'sqlite_master'].includes(item.name.toLowerCase())));
     if (tempCatalog) {
       const vt = this.env.virtualTable?.('temp', 'sqlite_schema');
       if (vt) {
@@ -2157,7 +2025,6 @@ export class Planner {
     }
     if (item.kind !== 'table' || !this.env.externalTable) return undefined;
     if (item.schema && item.schema.toLowerCase() !== 'main') return undefined;
-    if (!item.schema && scope.findCte(item.name)) return undefined;
     if (this.env.getTable(item.name)) return undefined; // a TEMP table of the same name shadows it
     return this.env.externalTable(item.name);
   }
@@ -2997,70 +2864,6 @@ const collationId = (n: CollationName): Collation => COLLATION_IDS[n];
 
 export type { Scope };
 
-/** Whether a FROM tree (or a nested FROM subquery) names `name` as a table. */
-function fromReferences(f: FromItem | undefined, name: string): boolean {
-  if (!f) return false;
-  switch (f.kind) {
-    case 'table':
-      return !f.schema && sameName(f.name, name);
-    case 'join':
-      return fromReferences(f.left, name) || fromReferences(f.right, name);
-    case 'subquery':
-      return selectReferences(f.select, name);
-    default:
-      return false;
-  }
-}
-
-export function coreReferences(core: SelectCore, name: string): boolean {
-  return core.kind === 'select' && fromReferences(core.from, name);
-}
-
-/** Whether a SELECT reads table `name` in one of its FROM clauses (the recursion of a CTE). */
-export function selectReferences(s: SelectStmt, name: string): boolean {
-  if (s.with?.ctes.some((c) => sameName(c.name, name))) return false; // shadowed
-  return coreReferences(s.core, name) || s.compound.some((c) => coreReferences(c.core, name));
-}
-
-/** The first window function call (`f(...) OVER ...`) in `e`, if any. */
-export function firstWindowCall(e: Expr): CallExpr | undefined {
-  let found: CallExpr | undefined;
-  walk(e, (x) => {
-    if (found) return false;
-    if (x.kind === 'call' && x.over !== undefined) {
-      found = x;
-      return false;
-    }
-  });
-  return found;
-}
-
-/** The first aggregate call in `e`, if any. */
-export function firstAggregateCall(e: Expr): CallExpr | undefined {
-  let found: CallExpr | undefined;
-  walk(e, (x) => {
-    if (found) return false;
-    if (isAggregateCall(x)) {
-      found = x as CallExpr;
-      return false;
-    }
-  });
-  return found;
-}
-
-export function containsWindow(e: Expr | undefined): boolean {
-  if (!e || e.kind === 'column' || e.kind === 'literal' || e.kind === 'param') return false;
-  let found = false;
-  walk(e, (x) => {
-    if (x.kind === 'call' && x.over !== undefined) {
-      found = true;
-      return false;
-    }
-  });
-  return found;
-}
-
-/** Shape of an expression for matching against index definitions: no positions, no table qualifiers. */
 /** Aggregates whose result does not depend on input order (sum/avg of REAL up to rounding). */
 const ORDER_INSENSITIVE_AGGS = new Set([
   'count', 'sum', 'total', 'avg', 'min', 'max',

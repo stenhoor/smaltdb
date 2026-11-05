@@ -1,6 +1,7 @@
 /** Binding the parser's expressions to plan expressions (ADR 0014, step 3b): SQL's rules become explicit. */
 import { describe, expect, it } from 'vitest';
-import { type CompileScope, bindExpr, compilePlanExpr } from '../src/engine/exec/expr.js';
+import { compilePlanExpr } from '../src/engine/exec/expr.js';
+import { type CompileScope, bindExpr } from '../src/engine/sql/frontend/bind-expr.js';
 import type { Affinity, StaticType } from '../src/engine/exec/convert.js';
 import { parseOne } from '../src/engine/sql/parser.js';
 import type { Expr, SelectStmt } from '../src/engine/sql/ast.js';
