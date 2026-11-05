@@ -8,5 +8,6 @@ export default defineConfig({
   define: { __SMALTDB_VERSION__: JSON.stringify(version) },
   test: {
     include: ['test/**/*.test.ts'],
+    setupFiles: ['test/setup-sql.ts'],
   },
 });

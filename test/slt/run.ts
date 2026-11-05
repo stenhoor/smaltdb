@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { Database } from '../../src/engine/database.js';
+import '../../src/engine/sql/register.js';
 import type { SqlValue } from '../../src/engine/values.js';
 import { MemoryVfs } from '../../src/engine/vfs/memory.js';
 

@@ -3,13 +3,13 @@
  * the engine compiles from. Queries and writes become plans (select.ts), PRAGMA values plan expressions; transaction,
  * setting and maintenance statements name what they do in the engine's terms.
  */
-import { SmaltError } from '../../errors.js';
-import type { BindContext } from '../../plan/bind-context.js';
-import type { BoundQuery, BoundStatement } from '../../plan/bound.js';
+import { SmaltError } from '../../language-support.js';
+import type { BindContext } from '../../language-support.js';
+import type { BoundQuery, BoundStatement } from '../../language-support.js';
 import type { ParsedStatement, SelectStmt } from '../ast.js';
 import { toPlan, toValueExpr, toWritePlan } from './select.js';
 import { checkNewTable, toAlterAction, toIndexDef, toTableDef, withBoundChecks } from './ddl.js';
-import type { KeyDef, Source, TableDef } from '../../plan/schema.js';
+import type { KeyDef, Source, TableDef } from '../../language-support.js';
 
 const sql = (ps: ParsedStatement): Source => ({ language: 'sql', text: ps.text });
 
@@ -20,7 +20,7 @@ const rowidKey = (def: TableDef, k: KeyDef): boolean => k.columns.length === 1 &
  * `ps` bound against `catalog`. `received` sees every plan the binder makes before it goes into the bound statement
  * (the engine validates there).
  */
-export function bindStatement(ps: ParsedStatement, catalog: BindContext, received: <T extends { plan: import('../../plan/ops.js').PlanOp }>(fe: T) => T = (fe) => fe): BoundStatement {
+export function bindStatement(ps: ParsedStatement, catalog: BindContext, received: <T extends { plan: import('../../language-support.js').PlanOp }>(fe: T) => T = (fe) => fe): BoundStatement {
   const stmt = ps.stmt;
   const query = (s: SelectStmt): BoundQuery => {
     const fe = received(toPlan(s, ps.text, catalog));

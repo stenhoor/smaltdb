@@ -2,7 +2,7 @@
  * Helpers over SQL syntax trees (sql/ast.ts) that the SQL front end uses: structural equality, walking expressions,
  * finding aggregate and window calls, and whether a SELECT reads a table.
  */
-import { aggregateFunctions } from '../../exec/functions.js';
+import { aggregateFunctions } from '../../language-support.js';
 import type { CallExpr, Expr, FromItem, SelectCore, SelectStmt } from '../ast.js';
 
 export function sameName(a: string, b: string): boolean {

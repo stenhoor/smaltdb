@@ -3,18 +3,18 @@
  * with its names resolved, typed, and SQL's rules made explicit (comparison collations, affinity conversions, the
  * `sql.*` function for each operator). The engine compiles plan expressions (exec/expr.ts `compilePlanExpr`).
  */
-import { SmaltError } from '../../errors.js';
-import { storageTypeFor } from '../../catalog/schema.js';
+import { SmaltError } from '../../language-support.js';
+import { storageTypeFor } from '../../language-support.js';
 import type { CallExpr, ColumnExpr, Expr, SelectStmt } from '../ast.js';
-import { Collation, type SqlValue, collationByName } from '../../values.js';
-import { type Affinity, type StaticType, affinityOfStorage, applyNumericAffinity, staticTypeOfStorage } from '../../exec/convert.js';
-import { ARITHMETIC_FUNCTIONS, BITWISE_FUNCTIONS, COMPARISON_FUNCTIONS } from '../../exec/sql-functions.js';
-import { type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from '../../exec/functions.js';
-import { WINDOW_ARITY } from '../../exec/window.js';
-import { type SqlMeta, setMeta } from '../../exec/sql-meta.js';
-import { type BoundExpr, call, lit, param, typeOf } from '../../plan/expr.js';
-import type { PlanOp } from '../../plan/ops.js';
-import { CollSrc, type Compiled, NO_META, type SqlOperand, collationName, comparisonCollation, comparisonConverters, compilePlanExpr, metaOf, withMeta } from '../../exec/expr.js';
+import { Collation, type SqlValue, collationByName } from '../../language-support.js';
+import { type Affinity, type StaticType, affinityOfStorage, applyNumericAffinity, staticTypeOfStorage } from '../../language-support.js';
+import { ARITHMETIC_FUNCTIONS, BITWISE_FUNCTIONS, COMPARISON_FUNCTIONS } from '../../language-support.js';
+import { type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from '../../language-support.js';
+import { WINDOW_ARITY } from '../../language-support.js';
+import { type SqlMeta, setMeta } from '../../language-support.js';
+import { type BoundExpr, call, lit, param, typeOf } from '../../language-support.js';
+import type { PlanOp } from '../../language-support.js';
+import { CollSrc, type Compiled, NO_META, type SqlOperand, collationName, comparisonCollation, comparisonConverters, compilePlanExpr, metaOf, withMeta } from '../../language-support.js';
 
 export interface ColumnBinding {
   reg: number;

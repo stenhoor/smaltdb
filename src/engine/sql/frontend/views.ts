@@ -2,8 +2,8 @@
  * Views as the SQL front end reads them: the engine keeps a view as its source (plan/bind-context.ts `getView`), and
  * SQL parses that source where it reads the view, once per text.
  */
-import { SmaltError } from '../../errors.js';
-import type { Source } from '../../plan/schema.js';
+import { SmaltError } from '../../language-support.js';
+import type { Source } from '../../language-support.js';
 import type { CreateViewStmt, SelectStmt } from '../ast.js';
 import { parseOne } from '../parser.js';
 

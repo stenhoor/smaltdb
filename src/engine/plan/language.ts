@@ -4,7 +4,8 @@
  * the engine keeps views and materialized views as their language's source and asks the language for what it needs
  * of them.
  *
- * SQL is the only language so far (sql/language.ts); languages register with the engine in ADR 0015 step 9.
+ * Languages register with the engine (`registerLanguage`); engine code never imports one. smaltdb's entry points
+ * register SQL (sql/register.ts) until SQL is its own package (ADR 0015 step 9).
  */
 import type { TableSchema } from '../catalog/schema.js';
 import type { SqlValue } from '../values.js';
@@ -62,4 +63,16 @@ export interface SmaltLanguage {
   viewDefinition(source: Source): string;
   /** Edits the source texts kept beside definitions when ALTER TABLE changes them. */
   readonly sourceEditor: SourceEditor;
+}
+
+const registered = new Map<string, SmaltLanguage>();
+
+/** Makes `language` available to every database, by its name: statements, views and stored objects written in it. */
+export function registerLanguage(language: SmaltLanguage): void {
+  registered.set(language.name, language);
+}
+
+/** The language registered as `name`, if any. */
+export function registeredLanguage(name: string): SmaltLanguage | undefined {
+  return registered.get(name);
 }

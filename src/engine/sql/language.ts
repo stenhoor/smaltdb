@@ -2,10 +2,10 @@
  * SQL as a language of the engine (ADR 0015 section 3, plan/language.ts): views written in SQL bound to plans, the
  * names they read, their query text, and the source editor ALTER TABLE uses.
  */
-import type { LanguageStatement, ObjectReference, SmaltLanguage } from '../plan/language.js';
-import type { BindContext } from '../plan/bind-context.js';
-import type { BoundStatement } from '../plan/bound.js';
-import type { SqlValue } from '../values.js';
+import type { LanguageStatement, ObjectReference, SmaltLanguage } from '../language-support.js';
+import type { BindContext } from '../language-support.js';
+import type { BoundStatement } from '../language-support.js';
+import type { SqlValue } from '../language-support.js';
 import type { ParsedStatement, SelectStmt } from './ast.js';
 import { bindStatement } from './frontend/bind.js';
 import { bindStoredTableExprs } from './frontend/ddl.js';

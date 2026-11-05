@@ -12,10 +12,10 @@
  * resolves unambiguously, and the outer query does not reference it from a nested subquery. Anything
  * else is planned as before (a sub-plan), so declining to flatten is always correct.
  */
-import type { TableSchema } from '../../catalog/schema.js';
-import { findColumn } from '../../catalog/schema.js';
+import type { TableSchema } from '../../language-support.js';
+import { findColumn } from '../../language-support.js';
 import type { ColumnExpr, Expr, FromItem, JoinType, OrderingTerm, ResultColumn, SelectCoreSelect, SelectStmt, TableRef } from '../ast.js';
-import { aggregateFunctions } from '../../exec/functions.js';
+import { aggregateFunctions } from '../../language-support.js';
 import { and, anyNode as anyNodeIn } from '../ast-util.js';
 
 /** Whether any node of `e` satisfies `pred`, not looking inside nested SELECT statements. */

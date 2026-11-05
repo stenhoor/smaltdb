@@ -4,6 +4,7 @@
 // Run (ROUNDS, default 7):
 //   npx esbuild bench/micro/prepare.ts --bundle --platform=node --format=esm --outfile=.cache/prepare-bench.mjs && node .cache/prepare-bench.mjs
 import { Database } from '../../src/engine/database.js';
+import '../../src/engine/sql/register.js';
 import { MemoryVfs } from '../../src/engine/vfs/memory.js';
 
 const ROUNDS = Number(process.argv[2] ?? 7);

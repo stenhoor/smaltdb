@@ -23,6 +23,8 @@
  *   answers the queries it is given from a snapshot of the latest commit, straight to the client.
  */
 import { Database } from './database.js';
+// The default worker reads SQL: this entry point registers it (ADR 0015 step 9).
+import './sql/register.js';
 import { SmaltError, errorCode } from './errors.js';
 import { EngineServer, type PartialTask, type ReaderPool, defaultOpen } from './server.js';
 import type { SqlValue } from './values.js';
