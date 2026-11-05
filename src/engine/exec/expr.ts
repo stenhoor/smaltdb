@@ -124,23 +124,6 @@ function isNumericType(t: StaticType): boolean {
   return t === 'int' || t === 'real' || t === 'num';
 }
 
-/**
- * Compile an expression. It is bound to a plan expression once; arithmetic / comparison / logic roots are compiled
- * to generated JavaScript when allowed (see codegen.ts), everything else with the closure compiler.
- */
-export function compileExpr(e: Expr, scope: CompileScope): Compiled {
-  return compileWithPlan(e, scope).compiled;
-}
-
-/**
- * `compileExpr`, also returning the bound plan expression: operators keep it, so that pipeline fusion compiles it
- * again without binding names a second time.
- */
-export function compileWithPlan(e: Expr, scope: CompileScope): { compiled: Compiled; bound: BoundExpr } {
-  const bound = bindExpr(e, scope);
-  return { compiled: compileBoundExpr(bound, scope.funcCtx), bound };
-}
-
 /** Compile a bound expression: generated code for arithmetic / comparison / logic roots, otherwise closures. */
 export function compileBoundExpr(b: BoundExpr, ctx: FunctionContext): Compiled {
   if (!codegenEnabled() || !isCodegenRoot(b)) return compilePlanExpr(b, ctx);
@@ -168,8 +151,8 @@ export function boundMetadata(b: BoundExpr, ctx: FunctionContext): Pick<Compiled
 }
 
 /** How fused pipelines compile a node of a bound expression with the closure compiler. */
-export function pipelineCompiler(scope: CompileScope): (e: BoundExpr) => FallbackNode {
-  return (e) => compilePlanExpr(e, scope.funcCtx);
+export function pipelineCompiler(ctx: FunctionContext): (e: BoundExpr) => FallbackNode {
+  return (e) => compilePlanExpr(e, ctx);
 }
 
 /** True if a bound expression runs a subquery (fused pipelines leave those to the operators). */

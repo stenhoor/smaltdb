@@ -1,4 +1,5 @@
 import { SmaltError } from '../errors.js';
+import type { PlanExpr } from '../plan/expr.js';
 import type { ColumnConstraint, ColumnDef, ConflictAction, CreateIndexStmt, CreateTableStmt, Expr, FkAction, ForeignKeyClause, IndexedColumn } from '../sql/ast.js';
 import { anyNode } from '../sql/ast-util.js';
 import { RecordLayout, type StorageType } from '../storage/record.js';
@@ -50,6 +51,11 @@ export interface IndexEval {
   where?: (row: readonly SqlValue[], rowid: number | bigint) => boolean;
   /** Table columns the expressions and WHERE read (an UPDATE that changes none of them keeps the entry). */
   deps: number[];
+  /**
+   * The expressions as plan expressions over the table's row (column `i` is `#0.i`, the rowid `#0.n`): per index
+   * column (null for plain columns), and the WHERE. The planner matches queries against them.
+   */
+  plan: { cols: (PlanExpr | null)[]; where?: PlanExpr };
 }
 
 export interface IndexSchema {

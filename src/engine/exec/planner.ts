@@ -11,10 +11,9 @@ function decorrelationDisabled(): boolean {
   return decorrelateOff;
 }
 import { SmaltError } from '../errors.js';
-import { type TableSchema, isColumnar, storageTypeFor } from '../catalog/schema.js';
+import { type IndexEval, type IndexSchema, type TableSchema, isColumnar, storageTypeFor } from '../catalog/schema.js';
 import type {
   CallExpr,
-  ColumnExpr,
   Expr,
   FromItem,
   JoinType,
@@ -30,20 +29,15 @@ import { Collation, type SqlValue } from '../values.js';
 import { type Affinity, type StaticType, affinityOfStorage, hashKey, hashKeyMulti, staticTypeOfStorage, truthy } from './convert.js';
 import {
   CollSrc,
-  type ColumnBinding,
-  type CompileScope,
   type Compiled,
   type Fn,
-  bindExpr,
   boundMetadata,
   compileBoundExpr,
-  compileExpr,
   compilePlanExpr,
   comparisonCollation,
   pipelineCompiler,
   planHasSubquery,
   comparisonConverters,
-  conjuncts,
 } from './expr.js';
 import { type AggregateState, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type ColumnarHelpers, type FusedAggSpec, type FusedHelpers, type PipelineSource, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter } from './codegen.js';
@@ -204,8 +198,6 @@ interface Source {
   joinType: JoinType;
   /** The join condition's conjuncts, bound from the plan. */
   onBound?: BoundConjunct[];
-  /** Lower-cased column names merged by USING/NATURAL (hidden from unqualified lookup and *). */
-  hidden: Set<string>;
   position: number;
   /** Cached row-count estimate. */
   estRows?: number;
@@ -223,24 +215,11 @@ interface CteEntry {
   working?: { scan: WorkingScan; regs: number[]; columns: ResultColumnInfo[] };
 }
 
-const ROWID_NAMES = new Set(['rowid', 'oid', '_rowid_']);
 const TEMP_CATALOG = new Set(['sqlite_temp_schema', 'sqlite_temp_master']);
 
 class Scope {
   sources: Source[] = [];
   correlated = false;
-  /** Select-list aliases usable as a fallback in WHERE/GROUP BY/HAVING/ORDER BY. */
-  aliases: Map<string, Expr> | null = null;
-  /**
-   * Scope that alias expansions compile in. In an aggregate query this is the aggregate scope, so
-   * `HAVING s > 1` with `sum(a) AS s` refers to the aggregate (not a misuse of sum() per row).
-   */
-  aliasScope: CompileScope | null = null;
-  /**
-   * Called with the register of a column of this scope's sources that a nested subquery reads. In an
-   * aggregate query the aggregate must carry such columns to its output rows (like bare columns).
-   */
-  onOuterRef: ((reg: number) => void) | null = null;
   ctes = new Map<string, CteEntry>();
   constructor(readonly parent: Scope | null) {}
 
@@ -334,12 +313,12 @@ export function walk(e: Expr, visit: (e: Expr) => boolean | void): void {
 }
 
 /** A Filter on a pool conjunct: compiled from its bound form (bound once, when the pool was built). */
-function filterOnConjunct(child: Operator, c: ConjunctInfo, cs: CompileScope): Filter {
+function filterOnConjunct(child: Operator, c: ConjunctInfo, ctx: FunctionContext): Filter {
   if (!c.compilable) {
     const b = c.lazy!();
-    return new Filter(child, compileBoundExpr(b, cs.funcCtx).fn, b);
+    return new Filter(child, compileBoundExpr(b, ctx).fn, b);
   }
-  return new Filter(child, compileBoundExpr(c.bound, cs.funcCtx).fn, c.bound);
+  return new Filter(child, compileBoundExpr(c.bound, ctx).fn, c.bound);
 }
 
 /** The bound comparisons that can probe an index or the rowid, with their operators. */
@@ -563,7 +542,7 @@ export class Planner {
     if (!chain || !(chain.scan instanceof TableScan)) return src;
     const { scan, preds } = chain;
     const access = scan.access;
-    const cs = this.compileScope(scope);
+    const ctx = this.env.funcCtx;
     const helpers = this.fusedHelpers(access);
     const table = access.table!;
     const build = (cap: number) => {
@@ -574,7 +553,7 @@ export class Planner {
         outs.push({ reg: spec.decode[i + 1], type: t === 'INTEGER' ? 'int' : t === 'REAL' ? 'real' : 'any' });
       }
       for (const reg of spec.rowidRegs) outs.push({ reg, type: 'int' });
-      const fill = generateScanFilter(preds, outs, cap, () => access.loaderSpec(), helpers, pipelineCompiler(cs));
+      const fill = generateScanFilter(preds, outs, cap, () => access.loaderSpec(), helpers, pipelineCompiler(ctx));
       return { fill, regs: outs.map((o) => o.reg) };
     };
     return new FusedScanFilter(access, build, helpers.first, helpers.release);
@@ -586,7 +565,7 @@ export class Planner {
     const specs = this.fusedAggSpecs(aggs);
     if (!chain || !specs || groupExprs.some(planHasSubquery)) return null;
     const access = chain.scan.access;
-    const cs = this.compileScope(scope);
+    const ctx = this.env.funcCtx;
     const node = chain.scan;
     const spill = this.env.spill;
     // Group memory of the current run (reset at open): past the limit the fused loop gives up.
@@ -601,7 +580,7 @@ export class Planner {
     };
     const groupSpecs = groupExprs.map((expr, i) => ({ expr, collation: groupColls[i] }));
     const gen = (scan: TableScan | ColumnScan) =>
-      generateGroupAggregate(chain.preds, groupSpecs, specs, this.pipelineSource(scan), { ...helpers, ...(scan instanceof ColumnScan ? this.columnarHelpers(scan) : this.fusedHelpers(access)) }, pipelineCompiler(cs));
+      generateGroupAggregate(chain.preds, groupSpecs, specs, this.pipelineSource(scan), { ...helpers, ...(scan instanceof ColumnScan ? this.columnarHelpers(scan) : this.fusedHelpers(access)) }, pipelineCompiler(ctx));
     // A columnar table: one loop over the delta store's leaves, one over the segments, same groups.
     const build =
       node instanceof ColumnarTableScan
@@ -624,15 +603,15 @@ export class Planner {
     if (!chain || !specs) return null;
     const { scan: node, preds } = chain;
     const access = node.access;
-    const cs = this.compileScope(scope);
+    const ctx = this.env.funcCtx;
     if (node instanceof ColumnScan) {
-      const run = generateFusedAggregate(preds, specs, this.pipelineSource(node), this.columnarHelpers(node), pipelineCompiler(cs));
+      const run = generateFusedAggregate(preds, specs, this.pipelineSource(node), this.columnarHelpers(node), pipelineCompiler(ctx));
       return new FusedScanAggregate(access, aggs, run as (r: SqlValue[], states: AggregateState[]) => void, node.fusedLabel('aggregate'));
     }
     if (node instanceof ColumnarTableScan) {
       // The delta store's leaves, then the segments, stepping the same aggregate states.
-      const a = generateFusedAggregate(preds, specs, this.pipelineSource(node.delta), this.fusedHelpers(access), pipelineCompiler(cs));
-      const b = generateFusedAggregate(preds, specs, this.pipelineSource(node.segments), this.columnarHelpers(node.segments), pipelineCompiler(cs));
+      const a = generateFusedAggregate(preds, specs, this.pipelineSource(node.delta), this.fusedHelpers(access), pipelineCompiler(ctx));
+      const b = generateFusedAggregate(preds, specs, this.pipelineSource(node.segments), this.columnarHelpers(node.segments), pipelineCompiler(ctx));
       const run = (r: SqlValue[], states: AggregateState[]): void => {
         a(r, states);
         b(r, states);
@@ -659,7 +638,7 @@ export class Planner {
       release: (page) => pager.release(page as Frame),
       slow: (page, off, r) => access.loadCell(page, off, r),
     };
-    const run = generateFusedAggregate(preds, specs, { rows: () => access.loaderSpec() }, helpers, pipelineCompiler(cs));
+    const run = generateFusedAggregate(preds, specs, { rows: () => access.loaderSpec() }, helpers, pipelineCompiler(ctx));
     return new FusedScanAggregate(access, aggs, run as (r: SqlValue[], states: AggregateState[]) => void);
   }
 
@@ -774,10 +753,10 @@ export class Planner {
   }
 
   /** Expressions whose columns are registers: column `i` reads `regOf(i)` (for VALUES rows: none). */
-  compileAt(exprs: readonly BoundExpr[], regOf: (index: number) => number): Compiled[] {
+  compileAt(exprs: readonly BoundExpr[], regOf: (index: number) => number, ctx: FunctionContext = this.env.funcCtx): Compiled[] {
     const b = this.bindings(new Scope(null), null);
     const row: ColMap = (c) => slotFor(c, regOf(c.index));
-    return exprs.map((e) => compileBoundExpr(b.bind(e, row), this.env.funcCtx));
+    return exprs.map((e) => compileBoundExpr(b.bind(e, row), ctx));
   }
 
   /**
@@ -1345,8 +1324,8 @@ export class Planner {
     }
     if (!hasOuter) this.prunePartitions(scope, pool);
 
-    const cs = this.compileScope(scope);
-    const order = hasOuter ? scope.sources.map((_, i) => i) : this.joinOrder(scope, pool, cs);
+    const ctx = this.env.funcCtx;
+    const order = hasOuter ? scope.sources.map((_, i) => i) : this.joinOrder(scope, pool, ctx);
     const multi = scope.sources.length > 1;
     const placed = new Set<number>();
     let outerRows = 1;
@@ -1355,10 +1334,10 @@ export class Planner {
       const src = scope.sources[p];
       if (src.joinType === 'RIGHT' || src.joinType === 'FULL') {
         // The inner side is read whole (its rows must survive even without a match).
-        let leaf = this.bestStandalone(this.accessOptions(src, p, [], scope, cs)).build().leaf;
+        let leaf = this.bestStandalone(this.accessOptions(src, p, [], scope, ctx)).build().leaf;
         if (!src.sub) leaf = this.tryFuseScanFilter(leaf, scope);
         const on = this.leftOnInfos(src, scope);
-        const hash = this.hashKeys(on.filter((c) => c.deps !== null && c.deps.size > 1 && c.deps.has(p)), p, scope, cs);
+        const hash = this.hashKeys(on.filter((c) => c.deps !== null && c.deps.size > 1 && c.deps.has(p)), p, scope, ctx);
         const residual = on.filter((c) => !hash?.used.includes(c));
         const before = [...placed];
         root = new OuterJoin(
@@ -1367,7 +1346,7 @@ export class Planner {
           () => this.sourceRegs(src),
           () => before.flatMap((q) => this.sourceRegs(scope.sources[q])),
           src.joinType === 'FULL',
-          this.andAll(residual, cs),
+          this.andAll(residual, ctx),
           hash?.build,
           hash?.probe,
           hash?.colls,
@@ -1376,7 +1355,7 @@ export class Planner {
         outerRows = Math.max(outerRows, this.tableRows(src));
         for (const c of pool) {
           if (c.placed || c.deps === null || c.deps.size === 0 || (c.minStep ?? -1) > p || ![...c.deps].every((d) => placed.has(d))) continue;
-          root = filterOnConjunct(root, c, cs);
+          root = filterOnConjunct(root, c, ctx);
           c.placed = true;
         }
         continue;
@@ -1384,7 +1363,7 @@ export class Planner {
       const isLeft = src.joinType === 'LEFT';
       const onInfos: ConjunctInfo[] = isLeft ? this.leftOnInfos(src, scope) : [];
       const allowed = hasOuter ? pool.filter((c) => (c.minStep ?? -1) <= p) : pool;
-      const step = this.joinStep(src, placed, outerRows, isLeft ? onInfos : allowed, scope, cs);
+      const step = this.joinStep(src, placed, outerRows, isLeft ? onInfos : allowed, scope, ctx);
       const candidates = step.candidates;
       const access = step.option.build();
       if (!multi && access.scan) this.lastScan = access.scan;
@@ -1395,7 +1374,7 @@ export class Planner {
       let leaf = access.leaf;
       const local = candidates.filter((c) => c.deps!.size === 1 && !c.placed);
       for (const c of local) {
-        leaf = filterOnConjunct(leaf, c, cs);
+        leaf = filterOnConjunct(leaf, c, ctx);
         c.placed = true;
       }
       // In joins, standalone full scans of this source run as generated scan + filter pipelines.
@@ -1410,21 +1389,21 @@ export class Planner {
         const innerRegs = (): number[] => this.sourceRegs(src);
         const rest = isLeft ? onInfos.filter((c) => !c.placed) : [];
         if (method === 'inl') {
-          root = new NestedLoopJoin(root, leaf, isLeft, innerRegs, this.andAll(rest, cs));
+          root = new NestedLoopJoin(root, leaf, isLeft, innerRegs, this.andAll(rest, ctx));
           rest.forEach((c) => (c.placed = true));
         } else {
           const eqs = candidates.filter((c) => !c.placed && c.deps!.size > 1);
-          const hash = method === 'hash' ? this.hashKeys(eqs, p, scope, cs) : null;
+          const hash = method === 'hash' ? this.hashKeys(eqs, p, scope, ctx) : null;
           if (hash) {
             hash.used.forEach((c) => (c.placed = true));
             const residual = isLeft ? rest.filter((c) => !c.placed) : [];
             residual.forEach((c) => (c.placed = true));
             const correlated = scope.correlated;
-            root = new HashJoin(root, leaf, hash.build, hash.probe, hash.colls, innerRegs, isLeft, this.env.state, correlated, this.andAll(residual, cs));
+            root = new HashJoin(root, leaf, hash.build, hash.probe, hash.colls, innerRegs, isLeft, this.env.state, correlated, this.andAll(residual, ctx));
           } else {
             // Nested loop: materialize an uncorrelated inner side once instead of re-reading it per outer row.
             const inner = (src.sub && !src.sub.correlated) || (!src.sub && !scope.correlated) ? new Materialize(leaf, innerRegs, this.env.state, false) : leaf;
-            root = new NestedLoopJoin(root, inner, isLeft, innerRegs, this.andAll(rest, cs));
+            root = new NestedLoopJoin(root, inner, isLeft, innerRegs, this.andAll(rest, ctx));
             rest.forEach((c) => (c.placed = true));
           }
         }
@@ -1435,22 +1414,22 @@ export class Planner {
       // Remaining WHERE / inner-ON conjuncts whose dependencies are now all available.
       for (const c of pool) {
         if (c.placed || c.deps === null || c.deps.size === 0 || (c.minStep ?? -1) > p || ![...c.deps].every((d) => placed.has(d))) continue;
-        root = filterOnConjunct(root, c, cs);
+        root = filterOnConjunct(root, c, ctx);
         c.placed = true;
       }
     }
     // Constant / correlated-only / subquery conjuncts.
     for (const c of pool) {
       if (c.placed) continue;
-      root = filterOnConjunct(root!, c, cs);
+      root = filterOnConjunct(root!, c, ctx);
       c.placed = true;
     }
     return root!;
   }
 
-  private andAll(cs: ConjunctInfo[], scope: CompileScope): Fn | undefined {
-    if (cs.length === 0) return undefined;
-    const fns = cs.map((c) => compileBoundExpr(c.lazy ? c.lazy() : c.bound, scope.funcCtx).fn);
+  private andAll(conjs: ConjunctInfo[], ctx: FunctionContext): Fn | undefined {
+    if (conjs.length === 0) return undefined;
+    const fns = conjs.map((c) => compileBoundExpr(c.lazy ? c.lazy() : c.bound, ctx).fn);
     if (fns.length === 1) return fns[0];
     return (r) => {
       let sawNull = false;
@@ -1477,7 +1456,7 @@ export class Planner {
       const cols: SourceColumn[] = columns.map((c, i) => ({ name: c.name, reg: regs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '', index: i }));
       // Formats with pushdown (Parquet) read only the columns the statement uses (recorded as they resolve).
       if (ext.source.pushdown) ext.source.projection ??= new Set();
-      scope.sources.push({ name: (item as { alias?: string }).alias ?? (item as { name: string }).name, cols, rowidReg: -1, sub, lateral: false, joinType, hidden: new Set(), position, external: ext.source, externalTable: item.kind === 'table' });
+      scope.sources.push({ name: (item as { alias?: string }).alias ?? (item as { name: string }).name, cols, rowidReg: -1, sub, lateral: false, joinType, position, external: ext.source, externalTable: item.kind === 'table' });
       return;
     }
     const isInfoSchema = item.kind === 'table' && item.schema?.toLowerCase() === 'information_schema';
@@ -1491,7 +1470,7 @@ export class Planner {
         const root = new VirtualScan('temp.sqlite_schema', () => vt.rows([]), regs);
         const columns: ResultColumnInfo[] = vt.columns.map((c) => ({ name: c.name, type: c.type, collation: Collation.Binary, affinity: 'NONE' }));
         const cols: SourceColumn[] = columns.map((c, i) => ({ name: c.name, reg: regs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: '', index: i }));
-        scope.sources.push({ name: (item as { alias?: string }).alias ?? item.name, cols, rowidReg: -1, sub: { root, outRegs: regs, columns, correlated: false }, lateral: false, joinType, hidden: new Set(), position });
+        scope.sources.push({ name: (item as { alias?: string }).alias ?? item.name, cols, rowidReg: -1, sub: { root, outRegs: regs, columns, correlated: false }, lateral: false, joinType, position });
         return;
       }
     }
@@ -1517,7 +1496,7 @@ export class Planner {
       const sub: QueryPlan = { root, outRegs: regs, columns, correlated: correlated || lateral };
       if (correlated) scope.correlated = true;
       const cols: SourceColumn[] = columns.map((c, i) => ({ name: c.name, reg: regs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: '', index: i }));
-      scope.sources.push({ name: alias, cols, rowidReg: -1, sub, lateral, joinType, hidden: new Set(), position });
+      scope.sources.push({ name: alias, cols, rowidReg: -1, sub, lateral, joinType, position });
       return;
     }
     if (item.kind === 'nested') throw new SmaltError('SMALT_INTERNAL', 'nested plans are planned as sources');
@@ -1543,7 +1522,6 @@ export class Planner {
       cols,
       rowidReg: table.rowidAlias >= 0 ? base + table.rowidAlias : base + table.columns.length,
       joinType,
-      hidden: new Set(),
       position,
       indexedBy: item.indexedBy,
     };
@@ -1560,7 +1538,7 @@ export class Planner {
   private addPlannedSource(sub: QueryPlan, joinType: JoinType, scope: Scope, name: string, working: boolean): void {
     if (sub.correlated && !working) scope.correlated = true;
     const cols: SourceColumn[] = sub.columns.map((c, i) => ({ name: c.name, reg: sub.outRegs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '', index: i }));
-    scope.sources.push({ name, cols, rowidReg: -1, sub, joinType, hidden: new Set(), position: scope.sources.length });
+    scope.sources.push({ name, cols, rowidReg: -1, sub, joinType, position: scope.sources.length });
   }
 
   private sourceRegs(src: Source): number[] {
@@ -1600,22 +1578,34 @@ export class Planner {
     });
   }
 
-  /** An index's expression or WHERE predicate bound against `src` alone (cached per source). */
-  private indexBound(src: Source, e: Expr): BoundExpr {
+  /** An index's expressions as plan expressions over its table's row (bound when the index was loaded). */
+  private indexPlan(idx: IndexSchema): IndexEval['plan'] {
+    if (!idx.eval) throw new SmaltError('SMALT_INTERNAL', `index ${idx.name} has no bound expressions`);
+    return idx.eval.plan;
+  }
+
+  /**
+   * An index's expression or WHERE conjunct (over its table's row) bound to `src`'s registers (cached per source), for
+   * matching and costing only: it is never compiled, so it marks no column as read (an index-only scan stays possible).
+   */
+  private indexBound(src: Source, e: PlanExpr): BoundExpr {
     let m = this.indexBounds.get(src);
     if (!m) this.indexBounds.set(src, (m = new Map()));
     let b = m.get(e);
     if (b === undefined) {
-      const only = new Scope(null);
-      only.sources = [src];
-      const cs = this.compileScope(only);
-      b = bindExpr(e, { ...cs, planSubquery: () => ({ plan: { op: 'values', rows: [], types: [] }, column: { type: 'any', collation: Collation.Binary } }) });
+      const n = src.table!.columns.length;
+      b = rebind(e, (c) => {
+        if (c.index === n) return slotFor(c, src.rowidReg);
+        const sc = src.cols.find((x) => x.index === c.index);
+        if (!sc) throw new SmaltError('SMALT_INTERNAL', `index column ${c.index} is not a column of ${src.name}`);
+        return slotFor(c, sc.reg);
+      });
       m.set(e, b);
     }
     return b;
   }
 
-  private readonly indexBounds = new WeakMap<Source, Map<Expr, BoundExpr>>();
+  private readonly indexBounds = new WeakMap<Source, Map<PlanExpr, BoundExpr>>();
 
   /** Positions of the current-scope sources a bound expression reads. */
   private depsOf(b: BoundExpr, scope: Scope): Set<number> {
@@ -1693,7 +1683,7 @@ export class Planner {
   // ---------------------------------------------------------------- access paths
 
   /** Enumerate ways to read `src` using the given candidate conjuncts, with estimated costs. */
-  private accessOptions(src: Source, p: number, candidates: ConjunctInfo[], scope: Scope, cs: CompileScope): AccessOption[] {
+  private accessOptions(src: Source, p: number, candidates: ConjunctInfo[], scope: Scope, ctx: FunctionContext): AccessOption[] {
     if (src.sub) {
       const sub = src.sub;
       return [{ label: 'subquery', cost: SUBQUERY_ROWS * COST.scanRow, rows: SUBQUERY_ROWS, dependsOnOuter: sub.correlated, build: () => ({ leaf: sub.root, dependsOnOuter: sub.correlated }) }];
@@ -1745,10 +1735,9 @@ export class Planner {
         break;
       }
     }
-    const ctx = cs.funcCtx;
 
     const outerDep = (list: Probe[]): boolean => list.some((x) => x.deps.size > 0);
-    if (isColumnar(table)) return this.columnarOptions(src, table, access, probes, cs, N);
+    if (isColumnar(table)) return this.columnarOptions(src, table, access, probes, ctx, N);
     const options: AccessOption[] = [
       {
         label: 'scan',
@@ -1801,11 +1790,11 @@ export class Planner {
       if (idx.where) {
         // A partial index holds only rows matching its WHERE: usable when the query implies it.
         const have = new Set(candidates.map((c) => this.shapeKey(c.bound, src, scope)));
-        if (!conjuncts(idx.where).every((w) => have.has(this.shapeKey(this.indexBound(src, w), src, scope)))) continue;
+        if (!andParts(this.indexPlan(idx).where!).every((w) => have.has(this.shapeKey(this.indexBound(src, w), src, scope)))) continue;
       }
       const eqs: Probe[] = [];
       const converters: ((v: SqlValue) => SqlValue)[] = [];
-      const usable = (pr: Probe, ic: { column: number; collation: Collation; expr?: Expr }): ((v: SqlValue) => SqlValue) | null => {
+      const usable = (pr: Probe, ic: IndexSchema['columns'][number]): ((v: SqlValue) => SqlValue) | null => {
         // Costing only: compiling the probe must not make the scan decode its columns.
         this.dryCompile++;
         try {
@@ -1814,9 +1803,9 @@ export class Planner {
           this.dryCompile--;
         }
       };
-      const usableInner = (pr: Probe, ic: { column: number; collation: Collation; expr?: Expr }): ((v: SqlValue) => SqlValue) | null => {
+      const usableInner = (pr: Probe, ic: IndexSchema['columns'][number]): ((v: SqlValue) => SqlValue) | null => {
         if (ic.column < 0) {
-          if (pr.exprKey === undefined || pr.exprKey !== this.shapeKey(this.indexBound(src, ic.expr!), src, scope)) return null;
+          if (pr.exprKey === undefined || pr.exprKey !== this.shapeKey(this.indexBound(src, this.indexPlan(idx).cols[idx.columns.indexOf(ic)]!), src, scope)) return null;
         } else if (pr.col !== ic.column) return null;
         // The index's operand order (column, then value): collation and conversions as SQL derives them.
         const colC = boundMetadata(pr.colExpr, ctx);
@@ -1872,7 +1861,7 @@ export class Planner {
       }
       if (lo || hi) matches *= (k === 0 ? this.rangeFraction(idx, lo, hi) : undefined) ?? (lo && hi ? 0.25 : 0.33);
       // A partial index only holds rows matching its WHERE.
-      if (idx.where) for (const w of conjuncts(idx.where)) matches *= this.selectivityOf(this.indexBound(src, w), scope);
+      if (idx.where) for (const w of andParts(this.indexPlan(idx).where!)) matches *= this.selectivityOf(this.indexBound(src, w), scope);
       matches = Math.max(1, matches);
       const deps = outerDep([...eqs, ...(lo ? [lo] : []), ...(hi ? [hi] : [])]);
       consider(`index ${idx.name}`, COST.probe + matches * COST.fetch, matches, deps, () => {
@@ -1942,7 +1931,7 @@ export class Planner {
     table: TableSchema,
     access: TableAccess,
     probes: { op: string; other: BoundExpr; deps: Set<number>; col: number | 'rowid'; colExpr: BoundExpr }[],
-    cs: CompileScope,
+    ctx: FunctionContext,
     N: number,
   ): AccessOption[] {
     if (typeof src.indexedBy === 'string') throw new SmaltError('SMALT_ERROR', `no such index: ${src.indexedBy}`);
@@ -1956,8 +1945,8 @@ export class Planner {
       if (typeof col !== 'number' || (col < 0 && !(col === -1 && pr.col === 'rowid'))) continue;
       this.dryCompile++;
       try {
-        const colC = boundMetadata(pr.colExpr, cs.funcCtx);
-        const otherC = compileBoundExpr(pr.other, cs.funcCtx);
+        const colC = boundMetadata(pr.colExpr, ctx);
+        const otherC = compileBoundExpr(pr.other, ctx);
         zones.push({
           col,
           op: pr.op,
@@ -2263,7 +2252,7 @@ export class Planner {
     outerRows: number,
     pool: ConjunctInfo[],
     scope: Scope,
-    cs: CompileScope,
+    ctx: FunctionContext,
   ): { cost: number; rows: number; filtered: number; method: 'first' | 'inl' | 'hash' | 'nl'; option: AccessOption; candidates: ConjunctInfo[] } {
     const p = t.position;
     const avail = (c: ConjunctInfo): boolean => c.deps !== null && c.deps.has(p) && [...c.deps].every((d) => d === p || placed.has(d));
@@ -2274,7 +2263,7 @@ export class Planner {
     for (const c of local) filtered *= this.selectivityOf(c.bound, scope);
     let joinSel = 1;
     for (const c of joins) joinSel *= this.selectivityOf(c.bound, scope);
-    const opts = this.accessOptions(t, p, candidates, scope, cs);
+    const opts = this.accessOptions(t, p, candidates, scope, ctx);
     const standalone = this.bestStandalone(opts);
     if (placed.size === 0) {
       return { cost: standalone.cost, rows: Math.max(1, filtered), filtered: Math.max(1, filtered), method: 'first', option: standalone, candidates };
@@ -2303,7 +2292,7 @@ export class Planner {
    * subsets (greedy above 8 sources); LEFT-joined sources keep their position (and therefore
    * everything before them is joined first), which preserves outer-join semantics.
    */
-  private joinOrder(scope: Scope, pool: ConjunctInfo[], cs: CompileScope): number[] {
+  private joinOrder(scope: Scope, pool: ConjunctInfo[], ctx: FunctionContext): number[] {
     const n = scope.sources.length;
     if (n <= 1) return n === 1 ? [0] : [];
     const order: number[] = [];
@@ -2312,7 +2301,7 @@ export class Planner {
     let segment: number[] = [];
     const flush = (): void => {
       if (segment.length === 0) return;
-      const best = segment.length <= 8 ? this.orderSegmentDP(segment, placed, rows, pool, scope, cs) : this.orderSegmentGreedy(segment, placed, rows, pool, scope, cs);
+      const best = segment.length <= 8 ? this.orderSegmentDP(segment, placed, rows, pool, scope, ctx) : this.orderSegmentGreedy(segment, placed, rows, pool, scope, ctx);
       for (const p of best.order) {
         order.push(p);
         placed.add(p);
@@ -2325,7 +2314,7 @@ export class Planner {
       if (src.joinType === 'LEFT' || src.lateral) {
         // Fixed position: everything before it is joined first (outer-join semantics, lateral arguments).
         flush();
-        const step = this.joinStep(src, placed, rows, src.joinType === 'LEFT' ? this.leftOnInfos(src, scope) : pool, scope, cs);
+        const step = this.joinStep(src, placed, rows, src.joinType === 'LEFT' ? this.leftOnInfos(src, scope) : pool, scope, ctx);
         rows = src.joinType === 'LEFT' ? Math.max(rows, step.rows) : step.rows; // a left join never drops outer rows
         order.push(p);
         placed.add(p);
@@ -2347,7 +2336,7 @@ export class Planner {
     return { bound: b.bound, compilable: true, deps: this.depsOf(b.bound, scope), placed: false, lazy: undefined };
   }
 
-  private orderSegmentDP(segment: number[], prefix: Set<number>, prefixRows: number, pool: ConjunctInfo[], scope: Scope, cs: CompileScope): { order: number[]; rows: number } {
+  private orderSegmentDP(segment: number[], prefix: Set<number>, prefixRows: number, pool: ConjunctInfo[], scope: Scope, ctx: FunctionContext): { order: number[]; rows: number } {
     const m = segment.length;
     type St = { cost: number; rows: number; order: number[] };
     const best = new Array<St | undefined>(1 << m);
@@ -2359,7 +2348,7 @@ export class Planner {
       for (const p of cur.order) placed.add(p);
       for (let j = 0; j < m; j++) {
         if (mask & (1 << j)) continue;
-        const step = this.joinStep(scope.sources[segment[j]], placed, cur.rows, pool, scope, cs);
+        const step = this.joinStep(scope.sources[segment[j]], placed, cur.rows, pool, scope, ctx);
         // Avoid cross products while a connected choice exists: penalize joins without any join conjunct.
         const connected = placed.size === 0 || step.candidates.some((c) => c.deps!.size > 1);
         const cost = cur.cost + step.cost * (connected ? 1 : 4);
@@ -2370,7 +2359,7 @@ export class Planner {
     return best[(1 << m) - 1]!;
   }
 
-  private orderSegmentGreedy(segment: number[], prefix: Set<number>, prefixRows: number, pool: ConjunctInfo[], scope: Scope, cs: CompileScope): { order: number[]; rows: number } {
+  private orderSegmentGreedy(segment: number[], prefix: Set<number>, prefixRows: number, pool: ConjunctInfo[], scope: Scope, ctx: FunctionContext): { order: number[]; rows: number } {
     const left = new Set(segment);
     const placed = new Set(prefix);
     const order: number[] = [];
@@ -2379,7 +2368,7 @@ export class Planner {
       let pick = -1;
       let pickStep: ReturnType<Planner['joinStep']> | null = null;
       for (const p of left) {
-        const step = this.joinStep(scope.sources[p], placed, rows, pool, scope, cs);
+        const step = this.joinStep(scope.sources[p], placed, rows, pool, scope, ctx);
         if (!pickStep || step.cost < pickStep.cost) {
           pick = p;
           pickStep = step;
@@ -2398,7 +2387,7 @@ export class Planner {
     eqs: ConjunctInfo[],
     p: number,
     scope: Scope,
-    cs: CompileScope,
+    ctx: FunctionContext,
   ): { build: Fn[]; probe: Fn[]; colls: Collation[]; used: ConjunctInfo[] } | null {
     const build: Fn[] = [];
     const probe: Fn[] = [];
@@ -2421,8 +2410,8 @@ export class Planner {
         inner = right;
         outer = left;
       } else continue;
-      const ic = compileBoundExpr(inner, cs.funcCtx);
-      const oc = compileBoundExpr(outer, cs.funcCtx);
+      const ic = compileBoundExpr(inner, ctx);
+      const oc = compileBoundExpr(outer, ctx);
       // Use the comparison's own affinity/collation rules on both sides.
       const leftC = inner === left ? ic : oc;
       const rightC = inner === left ? oc : ic;
@@ -2437,107 +2426,6 @@ export class Planner {
       used.push(c);
     }
     return used.length ? { build, probe, colls, used } : null;
-  }
-
-  // ================================================================ expression scope
-
-  compileScope(scope: Scope): CompileScope {
-    return {
-      resolveColumn: (e, defer) => this.resolveColumn(e, scope, defer),
-      // Subqueries are bound by the SQL front end (ADR 0014); what the planner compiles itself has none.
-      scalarSubquery: noSubquery,
-      existsSubquery: noSubquery,
-      inSubquery: noSubquery,
-      funcCtx: this.env.funcCtx,
-    };
-  }
-
-  /** Create a fresh top-level scope (for DML and utility statements). */
-  newScope(parent: Scope | null = null): Scope {
-    return new Scope(parent);
-  }
-
-  private resolveColumn(e: ColumnExpr, scope: Scope, defer = false): ColumnBinding {
-    let depth = 0;
-    for (let s: Scope | null = scope; s; s = s.parent, depth++) {
-      const b = this.resolveIn(e, s, defer);
-      if (b) {
-        if (depth > 0) {
-          for (let t: Scope | null = scope; t && t !== s; t = t.parent) t.correlated = true;
-          if (b.reg >= 0) s.onOuterRef?.(b.reg);
-        }
-        return b;
-      }
-    }
-    // Fallback: a select-list alias (SQLite allows aliases in WHERE/GROUP BY/HAVING).
-    if (!e.table) {
-      const key = e.name.toLowerCase();
-      for (let s: Scope | null = scope; s; s = s.parent) {
-        const aliased = s.aliases?.get(key);
-        if (aliased && !this.expandingAliases.has(key)) {
-          this.expandingAliases.add(key);
-          try {
-            const c = compileExpr(aliased, s.aliasScope ?? this.compileScope(s));
-            return { reg: -1, type: c.type, collation: c.collation, affinity: c.affinity, compiled: c };
-          } finally {
-            this.expandingAliases.delete(key);
-          }
-        }
-      }
-    }
-    const name = e.table ? `${e.table}.${e.name}` : e.name;
-    // Like SQLite: a double-quoted name that resolves to nothing may have been meant as a string.
-    const quoted = !e.table && this.sqlText[e.pos] === '"';
-    throw new SmaltError('SMALT_ERROR', quoted ? `no such column: "${e.name}" - should this be a string literal in single-quotes?` : `no such column: ${name}`);
-  }
-
-  private readonly expandingAliases = new Set<string>();
-
-  /**
-   * Resolve `e` among the sources of `scope`. The column is marked as read (projection pushdown: the scan decodes
-   * it) at once, or with `defer` when the binding's `use` runs (from compiling). Trial compiles while costing
-   * (`dryCompile`) mark nothing.
-   */
-  private resolveIn(e: ColumnExpr, scope: Scope, defer = false): ColumnBinding | undefined {
-    const bind = (src: Source, c: SourceColumn): ColumnBinding => {
-      const use = (): void => {
-        if (this.dryCompile) return;
-        src.access?.use(c.index, c.reg);
-        src.external?.projection?.add(c.name.toLowerCase());
-      };
-      if (!defer) use();
-      return { reg: c.reg, type: c.type, collation: c.collation, affinity: c.affinity, ...(defer ? { use } : {}) };
-    };
-    const rowidOf = (src: Source): ColumnBinding => {
-      const use = (): void => {
-        if (!this.dryCompile) src.access!.useRowid(src.rowidReg);
-      };
-      if (!defer) use();
-      return { reg: src.rowidReg, type: 'int', collation: Collation.Binary, affinity: 'INTEGER', ...(defer ? { use } : {}) };
-    };
-    if (e.table) {
-      const src = scope.sources.find((s) => sameName(s.name, e.table!));
-      if (!src) return undefined;
-      const c = src.cols.find((c) => sameName(c.name, e.name));
-      if (c) return bind(src, c);
-      if (src.table && ROWID_NAMES.has(e.name.toLowerCase())) return rowidOf(src);
-      throw new SmaltError('SMALT_ERROR', `no such column: ${e.table}.${e.name}`);
-    }
-    let found: { src: Source; c: SourceColumn } | undefined;
-    for (const src of scope.sources) {
-      if (src.hidden.has(e.name.toLowerCase())) continue;
-      const c = src.cols.find((c) => sameName(c.name, e.name));
-      if (!c) continue;
-      if (found) throw new SmaltError('SMALT_ERROR', `ambiguous column name: ${e.name}`);
-      found = { src, c };
-    }
-    if (found) return bind(found.src, found.c);
-    if (ROWID_NAMES.has(e.name.toLowerCase())) {
-      const tables = scope.sources.filter((s) => s.table);
-      if (tables.length === 1) return rowidOf(tables[0]);
-      if (tables.length > 1) throw new SmaltError('SMALT_ERROR', `ambiguous column name: ${e.name}`);
-    }
-    return undefined;
   }
 
   // ---------------------------------------------------------------- subqueries
@@ -3106,11 +2994,6 @@ function splitBoundConjuncts(e: BoundExpr, out: BoundExpr[] = []): BoundExpr[] {
 
 const COLLATION_IDS: Readonly<Record<CollationName, Collation>> = { binary: Collation.Binary, nocase: Collation.NoCase, rtrim: Collation.RTrim };
 const collationId = (n: CollationName): Collation => COLLATION_IDS[n];
-
-/** Subqueries in an expression the planner compiles from the AST (none since ADR 0014's front end binds them). */
-function noSubquery(): never {
-  throw new SmaltError('SMALT_INTERNAL', 'subqueries are bound by the SQL front end');
-}
 
 export type { Scope };
 

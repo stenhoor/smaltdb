@@ -91,6 +91,14 @@ describe('expression and partial indexes', () => {
     expect(err("CREATE UNIQUE INDEX bad4 ON p(a % 2)")).toMatch(/UNIQUE constraint failed/);
   });
 
+  it('answer from the index alone while a partial index reads other columns', () => {
+    const d = Database.openFile(new MemoryVfs().openSync('x.db'));
+    d.exec(SETUP(2000));
+    d.exec('CREATE INDEX pa ON p(a * 2); CREATE INDEX pn ON p(name) WHERE a > 3');
+    // Matching the partial index's WHERE against the query reads nothing from the rows.
+    expect(plan(d, 'SELECT id FROM p WHERE a * 2 = 6')).toBe('SEARCH p USING COVERING INDEX pa (=?)');
+  });
+
   it('survive reopen, ALTER TABLE and ANALYZE', () => {
     const vfs = new MemoryVfs();
     let d = Database.openFile(vfs.openSync('y.db'), {}, vfs.openSync('y.db-wal'));
