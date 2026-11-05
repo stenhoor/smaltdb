@@ -25,8 +25,8 @@ import { type ExternalScan, type PhysicalEnv, Planner, type QueryPlan, Registers
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type PlanMorsels, planMorsels } from './exec/plan-morsel.js';
-import { toPlan, toValueExpr } from './sql/frontend/select.js';
-import { checkConstraintExprs, isConstantDefault, literalValue, tableStorage, toIndexDef, toTableDef, withBoundChecks } from './sql/frontend/ddl.js';
+import { toPlan } from './sql/frontend/select.js';
+import { bindStoredTableExprs, checkConstraintExprs, rememberTableStmt, isConstantDefault, literalValue, tableStorage, toIndexDef, toTableDef, withBoundChecks } from './sql/frontend/ddl.js';
 import { bindStatement } from './sql/frontend/bind.js';
 import type { BoundQuery, BoundStatement, BoundTransaction, BoundWrite } from './plan/bound.js';
 import type { SchemaOp, Source } from './plan/schema.js';
@@ -930,8 +930,10 @@ export class Database implements FunctionContext {
       }
       if (r.type !== 'table') continue;
       const stmt = parseOne(r.sql!).stmt as CreateTableStmt;
-      // CHECKs are bound where first used (a stored table opens even if one no longer binds).
-      const { table, implicitIndexes } = tableSchemaFromDef(toTableDef(stmt, r.sql!, this.bindContext()), r.sql!, r.rootpage);
+      // CHECKs and DEFAULTs are bound where first used: opening binds nothing, and a stored table opens even if one no
+      // longer binds.
+      const { table, implicitIndexes } = tableSchemaFromDef(toTableDef(stmt, r.sql!, undefined), r.sql!, r.rootpage);
+      rememberTableStmt(table, stmt);
       implicitIndexes.forEach((spec, i) => {
         const name = autoIndexName(table.name, i + 1);
         const root = autoRoots.get(name.toLowerCase());
@@ -3379,18 +3381,9 @@ export class Database implements FunctionContext {
     // A stored table's CHECKs, and DEFAULTs naming functions that did not exist, are bound where first used: from the
     // table's SQL, until the catalog stores definitions (ADR 0015 step 7). A failure is the binder's error.
     if (checks.some((c) => !c.expr) || defaults.some((d) => d && !d.expr)) {
-      const stmt = parseOne(table.sql).stmt as CreateTableStmt;
-      const ctx = this.bindContext();
-      const def = withBoundChecks(toTableDef(stmt, table.sql, ctx), stmt, table.sql, ctx);
-      checks = def.checks.map((c) => ({ ...c }));
-      defaults = table.columns.map((c, i) => {
-        const d = def.columns[i]?.default;
-        if (d && !d.expr) {
-          const e = stmt.columns[i].constraints.find((k) => k.kind === 'default') as { expr: Expr };
-          return { ...d, expr: toValueExpr(e.expr, table.sql, ctx) };
-        }
-        return d ?? c.default;
-      });
+      const b = bindStoredTableExprs(table, this.bindContext());
+      checks = checks.map((c, i) => (c.expr ? c : { ...c, expr: b.checks[i] }));
+      defaults = defaults.map((d, i) => (d && !d.expr ? { ...d, expr: b.defaults[i]! } : d));
     }
     const r = {
       version: this.schemaVersion,

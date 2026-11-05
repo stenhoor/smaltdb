@@ -14,6 +14,7 @@ import type { CollationName } from '../../plan/types.js';
 import { type SqlValue, normalizeInt } from '../../values.js';
 import type { ColumnConstraint, ColumnDef as SqlColumnDef, ConflictAction as SqlConflict, CreateIndexStmt, CreateTableStmt, Expr, ForeignKeyClause, IndexedColumn } from '../ast.js';
 import { anyNode } from '../ast-util.js';
+import { parseOne } from '../parser.js';
 import { toRowExpr, toValueExpr } from './select.js';
 
 const lower = (a: SqlConflict | undefined): ConflictAction | undefined => (a === undefined ? undefined : (a.toLowerCase() as ConflictAction));
@@ -196,6 +197,31 @@ export function withBoundChecks(def: TableDef, stmt: CreateTableStmt, text: stri
   const row = tableSchemaFromDef(def, text, 0).table;
   const exprs = [...stmt.columns.flatMap((c) => c.constraints.flatMap((k) => (k.kind === 'check' ? [k.expr] : []))), ...stmt.constraints.flatMap((k) => (k.kind === 'check' ? [k.expr] : []))];
   return { ...def, checks: def.checks.map((c, i) => ({ ...c, expr: toRowExpr(exprs[i], row, text, catalog) })) };
+}
+
+/** The parsed CREATE TABLE of each table object (SQL's own cache: the engine keeps no syntax trees). */
+const parsedTables = new WeakMap<TableSchema, CreateTableStmt>();
+
+/** Remember the statement a table was read from, so binding its expressions later parses nothing. */
+export function rememberTableStmt(table: TableSchema, stmt: CreateTableStmt): void {
+  parsedTables.set(table, stmt);
+}
+
+/**
+ * A stored table's CHECK and DEFAULT expressions bound over `table` (the table its definition gave): what opening left
+ * unbound, bound where first used. A failure is the binder's error.
+ */
+export function bindStoredTableExprs(table: TableSchema, catalog: BindContext): { checks: PlanExpr[]; defaults: (PlanExpr | null)[] } {
+  let stmt = parsedTables.get(table);
+  if (!stmt) parsedTables.set(table, (stmt = parseOne(table.sql).stmt as CreateTableStmt));
+  const checks = [...stmt.columns.flatMap((c) => c.constraints.flatMap((k) => (k.kind === 'check' ? [k.expr] : []))), ...stmt.constraints.flatMap((k) => (k.kind === 'check' ? [k.expr] : []))];
+  return {
+    checks: checks.map((e) => toRowExpr(e, table, table.sql, catalog)),
+    defaults: stmt.columns.map((c) => {
+      const d = c.constraints.find((k) => k.kind === 'default') as { expr: Expr } | undefined;
+      return d ? toValueExpr(d.expr, table.sql, catalog) : null;
+    }),
+  };
 }
 
 /**
