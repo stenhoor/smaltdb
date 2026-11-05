@@ -49,6 +49,7 @@ export default defineConfig({
       { text: 'Guide', link: '/guide/getting-started' },
       { text: 'SQL', link: '/reference/sql/' },
       { text: 'Functions', link: '/reference/functions/' },
+      { text: 'Engine', link: '/reference/engine/' },
       { text: 'API', link: '/reference/api/client' },
       { text: 'FAQ', link: '/guide/faq' },
       {
@@ -122,6 +123,17 @@ export default defineConfig({
           { text: 'Aggregate', link: '/reference/functions/aggregate' },
           { text: 'Window', link: '/reference/functions/window' },
           { text: 'Table-valued', link: '/reference/functions/table-valued' },
+        ],
+      },
+      {
+        text: 'Engine',
+        collapsed: true,
+        items: [
+          { text: 'Overview', link: '/reference/engine/' },
+          { text: 'The plan format', link: '/reference/engine/plans' },
+          { text: 'Running plans', link: '/reference/engine/running' },
+          { text: 'Schema definitions', link: '/reference/engine/schema' },
+          { text: 'Writing a language', link: '/reference/engine/languages' },
         ],
       },
       {
