@@ -27,8 +27,10 @@ writes become plans, and transactions, settings (PRAGMA) and maintenance (ANALYZ
 statements in the engine's terms (`plan/bound.ts`), which `Database.compile` dispatches on. DDL becomes schema
 operations (`plan/schema.ts`, `sql/frontend/ddl.ts`): tables and indexes as language-neutral definitions whose CHECK,
 DEFAULT and index expressions are plan expressions, views and materialized views as their language's source.
-ALTER TABLE still reaches the engine as SQL: it rewrites the stored SQL of every object, as SQLite does, until the
-catalog stores definitions (ADR 0015 step 7).
+The catalog stores these definitions, versioned, beside each object's source text (ADR 0015 step 7,
+`catalog/stored.ts`), so opening a database parses nothing; views are parsed where they are read. ALTER TABLE still
+reaches the engine as SQL: it rewrites the stored SQL of every object, as SQLite does, and the engine makes the
+definitions again from it, until ALTER TABLE becomes a schema operation (the second part of step 7).
 
 Before binding, the front end merges simple views and FROM subqueries into the query (`exec/flatten.ts`, an AST
 rewrite). Materialized-view matching works on the bound plan (`exec/plan-mv-match.ts`), at any depth, including the

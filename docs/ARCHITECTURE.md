@@ -41,7 +41,7 @@
 | **Rewrites** | View/subquery flattening rewrites the parser's output (`exec/flatten.ts`); materialized-view matching rewrites plans (`exec/plan-mv-match.ts`). |
 | **Planner** | The SQL front end (`sql/frontend/select.ts`) resolves names against the catalog, infers types, expands `*` and makes SQL's rules explicit in a positional plan ([ADR 0014](adr/0014-shared-plan-layer.md)); the physical planner (`exec/planner.ts`) decorrelates subqueries, chooses join order and access paths by cost, and builds operators. Writes and a few SELECTs still go from the AST to operators in one pass. See [QUERY_ENGINE.md](QUERY_ENGINE.md). |
 | **Executor** | Vectorized operators that process batches of about 1024 rows held in typed arrays. Expressions compile to specialized JS closures, or to generated code if CSP allows it **[Q-9]**. |
-| **Catalog** | System tables stored in the database itself. `information_schema` and `sqlite_schema` are views over the catalog. |
+| **Catalog** | System tables stored in the database itself, holding each object's language-neutral definition beside its source text ([STORAGE_FORMAT.md](STORAGE_FORMAT.md)): opening a database parses nothing. `information_schema` and `sqlite_schema` are views over the catalog. |
 | **Statistics** | Row counts, NDV sketches (HyperLogLog), histograms, and min/max per column. Updated by `ANALYZE` and incrementally on write. |
 | **Access methods** | Table B+tree (clustered on rowid or primary key), secondary index B+trees, and optional columnar segments **[Q-2]**. |
 | **Buffer pool** | Fixed-size page cache with a CLOCK-Pro or 2Q replacement policy. In "memory cached" mode the whole database is pinned. |
@@ -84,7 +84,7 @@ src/
     sql/              lexer, parser, AST
     exec/             planner, rewrites (flatten, plan-mv-match, plan-morsel), operators, expression
                       compiler, code generation, functions, window, spill, statistics, writes
-    catalog/          schema, ALTER, information_schema
+    catalog/          schema, stored definitions, ALTER, information_schema
     external/         external tables (the plugin host side)
     plan/             the shared plan layer (ADR 0014): plan operations and expressions
     database.ts       the engine's Database: statements, transactions, catalog loading
