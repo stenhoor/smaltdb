@@ -29,14 +29,15 @@ import { type ExternalScan, type PhysicalEnv, Planner, type QueryPlan, Registers
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type PlanMorsels, planMorsels } from './exec/plan-morsel.js';
-import { type FrontEndWrite, toPlan, toRowExpr, toValueExpr, toWritePlan } from './sql/frontend/select.js';
+import { toPlan, toRowExpr, toValueExpr } from './sql/frontend/select.js';
+import { bindStatement } from './sql/frontend/bind.js';
+import type { BoundQuery, BoundStatement, BoundTransaction, BoundWrite } from './plan/bound.js';
 import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import type { ReaderSettings } from '../shared/protocol.js';
 import type {
   AlterTableStmt,
-  RefreshStmt,
   ColumnDef,
   CreateIndexStmt,
   CreateTableStmt,
@@ -46,7 +47,6 @@ import type {
   DropStmt,
   Expr,
   ParsedStatement,
-  PragmaStmt,
   SelectStmt,
   Stmt,
 } from './sql/ast.js';
@@ -1030,9 +1030,10 @@ export class Database implements FunctionContext {
     this.checkOpen();
     const ps = parseOne(sql);
     if (ps.stmt.kind !== 'select') throw new MisuseError('planOf takes a SELECT statement');
-    const planner = new Planner(this.plannerDeps(this.rewritePolicy(ps.stmt)), new Registers(ps.paramCount));
+    const bound = bindStatement(ps, this.bindContext(), (fe) => this.received(fe)) as BoundQuery;
+    const planner = new Planner(this.plannerDeps(this.rewritePolicy(bound)), new Registers(ps.paramCount));
     planner.sqlText = ps.text;
-    const plan = this.planSelectStmt(ps.stmt, ps.text, planner);
+    const plan = this.planQuery(bound, planner);
     return { root: plan.root, columns: plan.columns.map((c) => ({ name: c.name, type: c.type })), subplans: planner.subplans, estimates: planner.estimates };
   }
 
@@ -1097,48 +1098,34 @@ export class Database implements FunctionContext {
     return p;
   }
 
-  /** @internal Compile a statement AST into a program for the current schema. */
+  /** A bound query planned: materialized-view matching under the statement's policy, then the physical planner. */
+  private planQuery(q: BoundQuery, planner: Planner): QueryPlan {
+    const rewrite = planner.env.rewritePlan;
+    const p = planner.planPlan(rewrite ? rewrite(q.plan) : q.plan, q.columns);
+    if (!p) throw new SmaltError('SMALT_INTERNAL', `the physical planner declined a query\n  in: ${planner.sqlText}`);
+    return p;
+  }
+
+  /**
+   * @internal Compile a statement into a program for the current schema: the language binds it (sql/frontend/bind.ts),
+   * and the engine dispatches on the bound statement (plan/bound.ts).
+   */
   compile(ps: ParsedStatement): Program {
-    const stmt = ps.stmt;
+    const bound = bindStatement(ps, this.bindContext(), (fe) => this.received(fe));
     const regs = new Registers(ps.paramCount);
-    const planner = new Planner(this.plannerDeps(this.rewritePolicy(stmt)), regs);
+    const planner = new Planner(this.plannerDeps(this.rewritePolicy(bound)), regs);
     planner.sqlText = ps.text;
     const done = (p: Omit<Program, 'regCount'>): Program => ({ ...p, regCount: regs.count, rowAssumptions: planner.rowAssumptions, externals: planner.finishExternals() });
-    switch (stmt.kind) {
-      case 'select': {
-        const plan = this.planSelectStmt(stmt, ps.text, planner);
+    switch (bound.kind) {
+      case 'query': {
+        const plan = this.planQuery(bound, planner);
         return done({ plan, readonly: true, columns: plan.columns.map((c) => c.name), columnTypes: plan.columns.map((c) => c.type) });
       }
-      case 'insert':
-      case 'update':
-      case 'delete':
-        return done(this.compileWrite(this.received(toWritePlan(stmt, ps.text, this.bindContext())), planner));
-      case 'createTable':
-        return done({ exec: () => this.createTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
-      case 'createIndex':
-        return done({ exec: () => this.createIndex(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
-      case 'alterTable':
-        return done({ exec: () => this.alterTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
-      case 'createConnection':
-        return done({ exec: () => this.createConnection(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
-      case 'createExternalTable':
-        return done({ exec: () => this.createExternalTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
-      case 'createView':
-        if (stmt.materialized) return done({ exec: () => this.createMatview(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
-        if (stmt.schema && !['main', 'temp'].includes(stmt.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
-        return done({ exec: () => this.createView(stmt, ps.text), readonly: false, columns: [], columnTypes: [] });
-      case 'drop':
-        return done({ exec: () => this.drop(stmt), readonly: false, columns: [], columnTypes: [] });
-      case 'begin':
-      case 'commit':
-      case 'rollback':
-      case 'savepoint':
-      case 'release':
-        return done({ exec: () => this.transactionControl(stmt), readonly: true, columns: [], columnTypes: [] });
+      case 'write':
+        return done(this.compileWrite(bound, planner));
       case 'explain': {
-        if (stmt.stmt.kind !== 'select') throw new SmaltError('SMALT_UNSUPPORTED', 'EXPLAIN is only supported for SELECT statements');
-        const plan = this.planSelectStmt(stmt.stmt as SelectStmt, ps.text, planner);
-        if (stmt.analyze) {
+        const plan = this.planQuery(bound.query, planner);
+        if (bound.mode === 'analyze') {
           const round = (x: number): number => Math.round(x * 1000) / 1000;
           return done({
             readonly: true,
@@ -1154,12 +1141,44 @@ export class Database implements FunctionContext {
           columnTypes: ['int', 'int', 'int', 'text'],
         });
       }
-      case 'pragma':
-        return done(this.compilePragma(stmt, planner));
-      case 'analyze':
-        return done({ exec: () => this.analyze(stmt.target, stmt.schema), readonly: false, columns: [], columnTypes: [] });
-      case 'refresh':
-        return done({ exec: () => this.refreshMatview(stmt), readonly: false, columns: [], columnTypes: [] });
+      case 'transaction':
+        return done({ exec: () => this.transactionControl(bound), readonly: true, columns: [], columnTypes: [] });
+      case 'setting':
+        return done(this.compilePragma(bound, planner));
+      case 'maintenance':
+        switch (bound.action) {
+          case 'analyze':
+            return done({ exec: () => this.analyze(bound.target, bound.schema), readonly: false, columns: [], columnTypes: [] });
+          case 'refresh':
+            return done({ exec: () => this.refreshMatview(bound), readonly: false, columns: [], columnTypes: [] });
+          default:
+            throw new SmaltError('SMALT_UNSUPPORTED', 'vacuum statements are not supported yet');
+        }
+      case 'schema':
+        return done(this.compileSchema(bound.sql));
+    }
+  }
+
+  /** DDL, from its SQL until schema operations (ADR 0015 step 6c). */
+  private compileSchema(ps: ParsedStatement): Omit<Program, 'regCount'> {
+    const stmt = ps.stmt;
+    switch (stmt.kind) {
+      case 'createTable':
+        return { exec: () => this.createTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
+      case 'createIndex':
+        return { exec: () => this.createIndex(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
+      case 'alterTable':
+        return { exec: () => this.alterTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
+      case 'createConnection':
+        return { exec: () => this.createConnection(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
+      case 'createExternalTable':
+        return { exec: () => this.createExternalTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
+      case 'createView':
+        if (stmt.materialized) return { exec: () => this.createMatview(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
+        if (stmt.schema && !['main', 'temp'].includes(stmt.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
+        return { exec: () => this.createView(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
+      case 'drop':
+        return { exec: () => this.drop(stmt), readonly: false, columns: [], columnTypes: [] };
       default:
         throw new SmaltError('SMALT_UNSUPPORTED', `${stmt.kind} statements are not supported yet`);
     }
@@ -1167,14 +1186,14 @@ export class Database implements FunctionContext {
 
   /**
    * Whether the SELECTs a statement plans (top level, subqueries, CTEs, views) may be answered from
-   * materialized views, and which tables' views are excluded. SELECT and EXPLAIN: yes. INSERT …
+   * materialized views, and which tables' views are excluded. Queries and EXPLAIN: yes. INSERT …
    * SELECT: yes, except views over the table being written (the statement changes it while it
    * reads) and when foreign keys may change other tables. UPDATE, DELETE and the rest: no.
    */
-  private rewritePolicy(stmt: Stmt): { exclude: string | null } | null {
+  private rewritePolicy(bound: BoundStatement): { exclude: string | null } | null {
     if (!this.matviewRewriteOn) return null;
-    if (stmt.kind === 'select' || (stmt.kind === 'explain' && stmt.stmt.kind === 'select')) return { exclude: null };
-    if (stmt.kind === 'insert' && stmt.source.kind === 'select' && !this.fkInvolvedNow(stmt.table)) return { exclude: stmt.table.toLowerCase() };
+    if (bound.kind === 'query' || bound.kind === 'explain') return { exclude: null };
+    if (bound.kind === 'write' && bound.plan.op === 'append' && bound.plan.input && bound.plan.input.op !== 'values' && !this.fkInvolvedNow(bound.plan.table)) return { exclude: bound.plan.table.toLowerCase() };
     return null;
   }
 
@@ -1219,9 +1238,9 @@ export class Database implements FunctionContext {
   /** The transaction was started by SAVEPOINT (releasing the outermost savepoint commits). */
   private txnFromSavepoint = false;
 
-  private transactionControl(stmt: Stmt): RunResult {
+  private transactionControl(stmt: BoundTransaction): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
-    switch (stmt.kind) {
+    switch (stmt.action) {
       case 'begin':
         if (!this.autocommit) throw new SmaltError('SMALT_ERROR', 'cannot start a transaction within a transaction');
         this.txnMem = this.snapshotMem();
@@ -1428,10 +1447,10 @@ export class Database implements FunctionContext {
   }
 
   /** REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]. */
-  private refreshMatview(stmt: RefreshStmt): RunResult {
+  private refreshMatview(stmt: Extract<BoundStatement, { action: 'refresh' }>): RunResult {
     if (stmt.schema && stmt.schema.toLowerCase() !== 'main') throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
-    const mv = this.tables.get(stmt.name.toLowerCase());
-    if (!mv?.matview) throw new SmaltError('SMALT_ERROR', `no such materialized view: ${stmt.name}`);
+    const mv = this.tables.get(stmt.view.toLowerCase());
+    if (!mv?.matview) throw new SmaltError('SMALT_ERROR', `no such materialized view: ${stmt.view}`);
     if (stmt.concurrently && !stmt.withData) throw new SmaltError('SMALT_ERROR', 'REFRESH ... CONCURRENTLY cannot be used with WITH NO DATA');
     if (stmt.ifChanged) {
       const changed = this.refreshDecisions.get(mv.name.toLowerCase());
@@ -3389,7 +3408,7 @@ export class Database implements FunctionContext {
   }
 
   /** A write plan's program (INSERT, UPDATE, DELETE), from the plan alone. */
-  private compileWrite(fe: FrontEndWrite & { source?: ResultColumnInfo[] }, planner: Planner): Omit<Program, 'regCount'> {
+  private compileWrite(fe: BoundWrite, planner: Planner): Omit<Program, 'regCount'> {
     const op = fe.plan;
     switch (op.op) {
       case 'append': {
@@ -3418,7 +3437,7 @@ export class Database implements FunctionContext {
     throw new SmaltError('SMALT_MISMATCH', 'datatype mismatch');
   }
 
-  private compileInsert(op: AppendOp, fe: FrontEndWrite & { source?: ResultColumnInfo[] }, table: TableSchema, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
+  private compileInsert(op: AppendOp, fe: BoundWrite, table: TableSchema, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
     const ncols = table.columns.length;
     // Where each value goes: a column, or -2 for the rowid of a table without an alias.
     const targets = op.columns.map((c) => (c === -1 ? -2 : c));
@@ -3536,7 +3555,7 @@ export class Database implements FunctionContext {
    * (defaults, CHECK) over the new row's registers, RETURNING, the ON CONFLICT clauses, and the rows (VALUES, or the
    * SELECT through the SELECT pipeline).
    */
-  private insertParts(appended: AppendOp, fe: FrontEndWrite & { source?: ResultColumnInfo[] }, table: TableSchema, planner: Planner): InsertParts {
+  private insertParts(appended: AppendOp, fe: BoundWrite, table: TableSchema, planner: Planner): InsertParts {
     const ncols = table.columns.length;
     const prefix = () => {
       const compiled = this.compileDefaults(table, planner);
@@ -3631,7 +3650,7 @@ export class Database implements FunctionContext {
     return undefined;
   }
 
-  private compileUpdate(op: UpdateOp, fe: FrontEndWrite, table: TableSchema, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
+  private compileUpdate(op: UpdateOp, fe: BoundWrite, table: TableSchema, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
     const { root, colRegs, rowidReg, sets, defaults, base, checkRowid, checks, ret } = this.updateParts(op, fe, table, planner);
     // The statement's OR action; without one, each constraint's ON CONFLICT action applies.
     const mode = conflictMode(op.onConflict);
@@ -3701,7 +3720,7 @@ export class Database implements FunctionContext {
     return { exec, returning: ret && { columns: ret.columns, types: ret.types } };
   }
 
-  private compileDelete(op: DeleteOp, fe: FrontEndWrite, table: TableSchema, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
+  private compileDelete(op: DeleteOp, fe: BoundWrite, table: TableSchema, planner: Planner): { exec: (r: SqlValue[], out?: SqlValue[][]) => RunResult; returning?: { columns: string[]; types: StaticType[] } } {
     const { root, rowidReg, oldBase, oldRowid, ret } = this.deleteParts(op, fe, planner);
     // Deleting every row without RETURNING truncates, unless foreign keys need to see every row.
     const truncate = !op.returning && wholeTable(op.input);
@@ -3745,7 +3764,7 @@ export class Database implements FunctionContext {
    * then what belongs to the table (defaults and CHECK over the new row's registers) and RETURNING, planned
    * through the plan layer (step 8b).
    */
-  private updateParts(op: UpdateOp, fe: FrontEndWrite, table: TableSchema, planner: Planner): UpdateParts {
+  private updateParts(op: UpdateOp, fe: BoundWrite, table: TableSchema, planner: Planner): UpdateParts {
     type Target = Pick<UpdateParts, 'root' | 'colRegs' | 'rowidReg' | 'sets'>;
     type Returning = (base: number, checkRowid: number) => UpdateParts['ret'];
     const finish = (t: Target, returning: Returning): UpdateParts => {
@@ -3780,7 +3799,7 @@ export class Database implements FunctionContext {
    * DELETE's target rows (the scan with its WHERE, reading the rowid) and its RETURNING over registers for the
    * deleted row, planned through the plan layer (step 8a).
    */
-  private deleteParts(op: DeleteOp, fe: FrontEndWrite, planner: Planner): DeleteParts {
+  private deleteParts(op: DeleteOp, fe: BoundWrite, planner: Planner): DeleteParts {
     const physical = (): DeleteParts | null => {
       const p = planner.planDelete(op);
       if (!p) return null;
@@ -3871,10 +3890,10 @@ export class Database implements FunctionContext {
     }
   }
 
-  private compilePragma(stmt: PragmaStmt, planner: Planner): Omit<Program, 'regCount'> {
+  private compilePragma(stmt: Extract<BoundStatement, { kind: 'setting' }>, planner: Planner): Omit<Program, 'regCount'> {
     const arg = (): string | undefined => {
       if (!stmt.value) return undefined;
-      const v = planner.compileAt([toValueExpr(stmt.value, planner.sqlText, this.bindContext())], () => -1)[0].fn([]);
+      const v = planner.compileAt([stmt.value], () => -1)[0].fn([]);
       return v === null ? undefined : String(v);
     };
     /** A boolean setting's value, SQLite's spellings: 1 / on / true / yes (anything else is off). */
