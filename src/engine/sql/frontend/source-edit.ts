@@ -362,6 +362,13 @@ export const sqlSourceEditor: SourceEditor = {
     const last = stmt.columns[stmt.columns.length - 1];
     return tableText.slice(0, last.end) + ', ' + columnText + tableText.slice(last.end);
   },
+  externalTable(name, columns, options) {
+    const q = (x: string): string => '"' + x.replace(/"/g, '""') + '"';
+    const literal = (v: unknown): string => (v === null ? 'NULL' : typeof v === 'string' ? `'${v.replace(/'/g, "''")}'` : String(v));
+    const cols = columns.map((c) => `${q(c.name)} ${c.declaredType}`).join(', ');
+    const opts = Object.entries(options).map(([k, v]) => `${quoteIdent(k)} = ${literal(v)}`).join(', ');
+    return `CREATE EXTERNAL TABLE ${q(name)} (${cols}) WITH (${opts})`;
+  },
   dropColumn(tableText, column) {
     // The column definition and the comma that separates it from its neighbour.
     const cols = (parseOne(tableText).stmt as CreateTableStmt).columns;

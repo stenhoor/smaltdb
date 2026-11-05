@@ -6,8 +6,11 @@
  *
  * SQL is the only language so far (sql/language.ts); languages register with the engine in ADR 0015 step 9.
  */
+import type { TableSchema } from '../catalog/schema.js';
+import type { SqlValue } from '../values.js';
 import type { BindContext } from './bind-context.js';
-import type { BoundQuery } from './bound.js';
+import type { BoundQuery, BoundStatement } from './bound.js';
+import type { PlanExpr } from './expr.js';
 import type { Source, SourceEditor } from './schema.js';
 
 /** A table or view a query names. */
@@ -16,9 +19,38 @@ export interface ObjectReference {
   readonly schema?: string;
 }
 
+/**
+ * A statement of a language, parsed and not yet bound: the engine binds it (again after schema changes) and runs what
+ * it binds to.
+ */
+export interface LanguageStatement {
+  /** The statement's source text. */
+  readonly text: string;
+  /** Its parameters: positions 1 … `paramCount`. */
+  readonly paramCount: number;
+  /** Parameters with names, by the name as written (SQL: `:min`, `$min`, `@min`), at their 1-based position. */
+  readonly paramNames: ReadonlyMap<string, number>;
+  /** The statement bound against the catalog. */
+  bind(ctx: BindContext): BoundStatement;
+  /**
+   * Table functions the statement calls with constant arguments (`read_csv('…')`): the engine fetches their data
+   * before binding, all together. Optional: other calls are found while binding.
+   */
+  externalCalls?(): readonly { readonly name: string; readonly args: readonly SqlValue[]; readonly named: Readonly<Record<string, SqlValue>> }[];
+}
+
 export interface SmaltLanguage {
   /** The language's name, as sources record it (`sql`). */
   readonly name: string;
+  /** Source text as its statements (a script), parsed. Throws the language's syntax error. */
+  parse(source: string): LanguageStatement[];
+  /** Source text that must hold exactly one statement. */
+  parseOne(source: string): LanguageStatement;
+  /**
+   * The CHECK and DEFAULT expressions of a stored table that its definition holds unbound (a DEFAULT naming a function
+   * that did not exist when the table was made), bound from the table's source where first used.
+   */
+  bindStoredExprs(table: TableSchema, ctx: BindContext): { checks: PlanExpr[]; defaults: (PlanExpr | null)[] };
   /** A stored view's or materialized view's query (its CREATE statement's source), bound where it is read. */
   bindView(source: Source, ctx: BindContext): BoundQuery;
   /**
