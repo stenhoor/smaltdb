@@ -4,7 +4,8 @@
  */
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
-import { buildTableSchema } from '../src/engine/catalog/schema.js';
+import { tableSchemaFromDef } from '../src/engine/catalog/schema.js';
+import { toTableDef } from '../src/engine/sql/frontend/ddl.js';
 import { Database } from '../src/engine/database.js';
 import type { CreateTableStmt } from '../src/engine/sql/ast.js';
 import { parseOne } from '../src/engine/sql/parser.js';
@@ -279,9 +280,9 @@ describe('CREATE TABLE / ADD COLUMN checks SQLite makes', () => {
   });
 
   it('stored definitions are not re-checked, so databases created before these checks still open', () => {
-    // The catalog loader builds schemas with buildTableSchema only; the new checks run on CREATE / ADD COLUMN.
+    // The catalog loader builds schemas from definitions only; the new checks run on CREATE / ADD COLUMN.
     for (const sql of ['CREATE TABLE a(x TEXT PRIMARY KEY AUTOINCREMENT)', 'CREATE TABLE c(x CHECK (x > (SELECT 1)), y DEFAULT (1 IN (SELECT 1)))']) {
-      expect(() => buildTableSchema(parseOne(sql).stmt as CreateTableStmt, sql, 2)).not.toThrow();
+      expect(() => tableSchemaFromDef(toTableDef(parseOne(sql).stmt as CreateTableStmt, sql, undefined), sql, 2)).not.toThrow();
     }
   });
 

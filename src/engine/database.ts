@@ -5,15 +5,11 @@ import {
   type TableSchema,
   storageTypeFor,
   autoIndexName,
-  buildIndexSchema,
-  buildTableSchema,
-  checkConstraintExprs,
-  checkNewTable,
+  indexSchemaFromDef,
+  tableSchemaFromDef,
   coerceForColumn,
   findColumn,
   isColumnar,
-  isConstantDefault,
-  literalValue,
 } from './catalog/schema.js';
 import { MisuseError, SmaltError } from './errors.js';
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
@@ -29,7 +25,8 @@ import { type ExternalScan, type PhysicalEnv, Planner, type QueryPlan, Registers
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type PlanMorsels, planMorsels } from './exec/plan-morsel.js';
-import { toPlan, toRowExpr, toValueExpr } from './sql/frontend/select.js';
+import { toPlan, toValueExpr } from './sql/frontend/select.js';
+import { checkConstraintExprs, checkNewTable, isConstantDefault, literalValue, tableStorage, toIndexDef, toTableDef, withBoundChecks } from './sql/frontend/ddl.js';
 import { bindStatement } from './sql/frontend/bind.js';
 import type { BoundQuery, BoundStatement, BoundTransaction, BoundWrite } from './plan/bound.js';
 import type { BindContext } from './plan/bind-context.js';
@@ -909,7 +906,7 @@ export class Database implements FunctionContext {
     this.externals.clear();
     this.catalog.clear();
     const catStmt = parseOne(CATALOG_SQL).stmt as CreateTableStmt;
-    this.catalogTable = { ...buildTableSchema(catStmt, CATALOG_SQL, this.pager.catalogRoot).table, system: true };
+    this.catalogTable = { ...tableSchemaFromDef(toTableDef(catStmt, CATALOG_SQL, undefined), CATALOG_SQL, this.pager.catalogRoot).table, system: true };
     const rows = this.scanCatalog();
     const autoRoots = new Map<string, number>();
     for (const r of rows) if (r.type === 'index' && r.sql === null) autoRoots.set(r.name.toLowerCase(), r.rootpage);
@@ -933,7 +930,8 @@ export class Database implements FunctionContext {
       }
       if (r.type !== 'table') continue;
       const stmt = parseOne(r.sql!).stmt as CreateTableStmt;
-      const { table, implicitIndexes } = buildTableSchema(stmt, r.sql!, r.rootpage);
+      // CHECKs are bound where first used (a stored table opens even if one no longer binds).
+      const { table, implicitIndexes } = tableSchemaFromDef(toTableDef(stmt, r.sql!, this.bindContext()), r.sql!, r.rootpage);
       implicitIndexes.forEach((spec, i) => {
         const name = autoIndexName(table.name, i + 1);
         const root = autoRoots.get(name.toLowerCase());
@@ -958,7 +956,7 @@ export class Database implements FunctionContext {
         root = mv?.indexRoots.get(r.name.toLowerCase()) ?? this.createTree(true);
         mv?.indexRoots.set(r.name.toLowerCase(), root);
       }
-      const idx = buildIndexSchema(stmt, r.sql, table, root);
+      const idx = indexSchemaFromDef(toIndexDef(stmt, r.sql, table, this.bindContext()), r.sql, table, root);
       this.prepareIndex(table, idx);
       table.indexes.push(idx);
       this.indexes.set(idx.name.toLowerCase(), idx);
@@ -1430,7 +1428,7 @@ export class Database implements FunctionContext {
       this.createTable(parseOne(Database.MATVIEW_SQL).stmt as CreateTableStmt, Database.MATVIEW_SQL, true);
     }
     const root = this.createTree(inMemory);
-    const { table } = buildTableSchema(parseOne(layout).stmt as CreateTableStmt, layout, root);
+    const { table } = tableSchemaFromDef(toTableDef(parseOne(layout).stmt as CreateTableStmt, layout, undefined), layout, root);
     table.matview = { sql, select: stmt.select, storage, populated: false, refreshedAt: null };
     // A memory-resident view's root is assigned at runtime: the catalog records a marker.
     this.addCatalogRow('matview', table.name, table.name, inMemory ? MEM_BASE : root, sql);
@@ -2256,7 +2254,7 @@ export class Database implements FunctionContext {
         fresh = mv.fresh;
         refreshedAt = mv.refreshedAt;
       }
-      const { table } = buildTableSchema(parseOne(m.layout).stmt as CreateTableStmt, m.layout, root);
+      const { table } = tableSchemaFromDef(toTableDef(parseOne(m.layout).stmt as CreateTableStmt, m.layout, undefined), m.layout, root);
       const storage = String(def.with?.storage ?? 'row').toLowerCase() as MatViewInfo['storage'];
       table.matview = { sql: r.sql!, select: def.select, storage, populated, refreshedAt, fresh };
       this.tables.set(table.name.toLowerCase(), table);
@@ -2667,8 +2665,7 @@ export class Database implements FunctionContext {
     if (!internal) this.checkNewName(stmt.name, 'table');
     this.dirtySchema = true;
     const root = BTree.create(this.pager);
-    const { table, implicitIndexes, conflictingOnConflict } = buildTableSchema(stmt, sql, root);
-    if (!internal) checkNewTable(stmt, table);
+    const { table, implicitIndexes, conflictingOnConflict } = this.newTableSchema(stmt, sql, root, internal);
     if (conflictingOnConflict) throw new SmaltError('SMALT_ERROR', 'conflicting ON CONFLICT clauses specified');
     if (columnar) {
       // Columnar tables are scanned, not probed: no secondary structures to keep in step.
@@ -2698,6 +2695,21 @@ export class Database implements FunctionContext {
   }
 
   /**
+   * The schema of a table CREATE TABLE makes: its definition (SQL's rules for DEFAULT and CHECK first, then the CHECKs
+   * bound, so a bad one fails here as in SQLite), and AUTOINCREMENT only on the column that aliases the rowid.
+   * `internal`: a system table the engine creates (no checks).
+   */
+  private newTableSchema(stmt: CreateTableStmt, sql: string, root: number, internal: boolean): ReturnType<typeof tableSchemaFromDef> {
+    if (internal) return tableSchemaFromDef(toTableDef(stmt, sql, undefined), sql, root);
+    let def = toTableDef(stmt, sql, this.bindContext());
+    checkNewTable(stmt);
+    def = withBoundChecks(def, stmt, sql, this.bindContext());
+    const r = tableSchemaFromDef(def, sql, root);
+    if (def.keys.some((k) => k.autoincrement) && r.table.rowidAlias < 0) throw new SmaltError('SMALT_ERROR', 'AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY');
+    return r;
+  }
+
+  /**
    * CREATE TEMP TABLE: lives in the memory store, outside the persisted catalog, for this
    * connection only (like SQLite's temp schema); it shadows a main table of the same name.
    */
@@ -2709,8 +2721,7 @@ export class Database implements FunctionContext {
       throw new SmaltError('SMALT_ERROR', `table ${stmt.name} already exists`);
     }
     if (lower.startsWith('smalt_') || lower.startsWith('sqlite_')) throw new SmaltError('SMALT_ERROR', `object name reserved for internal use: ${stmt.name}`);
-    const { table, implicitIndexes, conflictingOnConflict } = buildTableSchema(stmt, sql, this.createTree(true));
-    checkNewTable(stmt, table);
+    const { table, implicitIndexes, conflictingOnConflict } = this.newTableSchema(stmt, sql, this.createTree(true), false);
     if (conflictingOnConflict) throw new SmaltError('SMALT_ERROR', 'conflicting ON CONFLICT clauses specified');
     table.temp = true;
     implicitIndexes.forEach((spec, i) => {
@@ -2757,7 +2768,7 @@ export class Database implements FunctionContext {
     if (table.temp) this.memDirty = true;
     const memory = table.rootPage >= MEM_BASE;
     const root = this.createTree(memory);
-    const idx = buildIndexSchema(stmt, sql, table, root);
+    const idx = indexSchemaFromDef(toIndexDef(stmt, sql, table, this.bindContext()), sql, table, root);
     this.prepareIndex(table, idx);
     this.populateIndex(table, idx, root);
     table.indexes.push(idx);
@@ -2847,31 +2858,12 @@ export class Database implements FunctionContext {
     if (!idx.where && !idx.columns.some((c) => c.expr)) return;
     const n = table.columns.length;
     const planner = new Planner({ getTable: (x) => this.getTable(x), openTree: (root) => this.tree(root), funcCtx: this, state: this.state }, new Registers(n + 1));
-    const check = (e: Expr, what: string): void => {
-      const go = (x: unknown): void => {
-        if (Array.isArray(x)) return x.forEach(go);
-        if (typeof x !== 'object' || x === null || Object.getPrototypeOf(x) !== Object.prototype) return;
-        const o = x as Record<string, unknown>;
-        if ((o.kind === 'subquery' || o.kind === 'exists' || o.kind === 'inSelect') && 'select' in o) throw new SmaltError('SMALT_ERROR', `subqueries prohibited in ${what}`);
-        if (o.kind === 'param') throw new SmaltError('SMALT_ERROR', `parameters prohibited in ${what}`);
-        if (o.kind === 'call') {
-          const name = String(o.name);
-          const def = scalarFunctions.get(name);
-          if ((def && !def.deterministic && !def.pureDate) || name === 'current_time' || name === 'current_date' || name === 'current_timestamp') {
-            throw new SmaltError('SMALT_ERROR', `non-deterministic functions prohibited in ${what}`);
-          }
-        }
-        for (const k of Object.keys(o)) go(o[k]);
-      };
-      go(e);
+    // Bound by the language when the index was defined: plan expressions over the row (column i, the rowid at n).
+    const bound = (e: { expr?: PlanExpr }): PlanExpr => {
+      if (!e.expr) throw new SmaltError('SMALT_INTERNAL', `index ${idx.name} has an unbound expression`);
+      return e.expr;
     };
-    // Bound once, as plan expressions over the row (column i, then the rowid at n).
-    const text = idx.sql ?? '';
-    const bound = (e: Expr, what: string): PlanExpr => {
-      check(e, what);
-      return toRowExpr(e, table, text, this.bindContext());
-    };
-    const plan = { cols: idx.columns.map((c) => (c.expr ? bound(c.expr, 'index expressions') : null)), where: idx.where ? bound(idx.where, 'partial index WHERE clauses') : undefined };
+    const plan = { cols: idx.columns.map((c) => (c.expr ? bound(c.expr) : null)), where: idx.where ? bound(idx.where) : undefined };
     // Date functions may appear, but fail if they read the clock or time zone (as in SQLite).
     const pure = pureFunctionContext(this, 'an index');
     const compile = (e: PlanExpr): Fn => planner.compileAt([e], (i) => i, pure)[0].fn;
@@ -3118,7 +3110,8 @@ export class Database implements FunctionContext {
     for (const r of rows) {
       if (r.type !== 'table' || r.sql === null) continue;
       try {
-        const { table } = buildTableSchema(parseOne(r.sql).stmt as CreateTableStmt, r.sql, r.rootpage);
+        const stmt = parseOne(r.sql).stmt as CreateTableStmt;
+        const { table } = tableSchemaFromDef(withBoundChecks(toTableDef(stmt, r.sql, this.bindContext()), stmt, r.sql, this.bindContext()), r.sql, r.rootpage);
         const planner = new Planner({ getTable: (n) => this.getTable(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state }, new Registers(0));
         const base = planner.regs.alloc(table.columns.length);
         this.compileChecks(table, base, planner.regs.alloc(), planner);
@@ -3132,7 +3125,7 @@ export class Database implements FunctionContext {
       try {
         const t = built.get(r.tbl_name.toLowerCase());
         if (!t) throw new SmaltError('SMALT_ERROR', `no such table: ${r.tbl_name}`);
-        this.prepareIndex(t, buildIndexSchema(parseOne(r.sql).stmt as CreateIndexStmt, r.sql, t, r.rootpage));
+        this.prepareIndex(t, indexSchemaFromDef(toIndexDef(parseOne(r.sql).stmt as CreateIndexStmt, r.sql, t, this.bindContext()), r.sql, t, r.rootpage));
       } catch (e) {
         throw new SmaltError('SMALT_ERROR', `error in index ${r.name}${suffix}: ${(e as Error).message}`);
       }
@@ -3374,11 +3367,28 @@ export class Database implements FunctionContext {
   private tableExprs(table: TableSchema): { checks: { expr: PlanExpr; name: string }[]; defaults: (PlanExpr | null)[] } {
     const hit = this.tableExprCache.get(table);
     if (hit && hit.version === this.schemaVersion) return hit;
-    const ctx = this.bindContext();
+    let checks = table.checks;
+    let defaults = table.columns.map((c) => c.default);
+    // A stored table's CHECKs, and DEFAULTs naming functions that did not exist, are bound where first used: from the
+    // table's SQL, until the catalog stores definitions (ADR 0015 step 7). A failure is the binder's error.
+    if (checks.some((c) => !c.expr) || defaults.some((d) => d && !d.expr)) {
+      const stmt = parseOne(table.sql).stmt as CreateTableStmt;
+      const ctx = this.bindContext();
+      const def = withBoundChecks(toTableDef(stmt, table.sql, ctx), stmt, table.sql, ctx);
+      checks = def.checks.map((c) => ({ ...c }));
+      defaults = table.columns.map((c, i) => {
+        const d = def.columns[i]?.default;
+        if (d && !d.expr) {
+          const e = stmt.columns[i].constraints.find((k) => k.kind === 'default') as { expr: Expr };
+          return { ...d, expr: toValueExpr(e.expr, table.sql, ctx) };
+        }
+        return d ?? c.default;
+      });
+    }
     const r = {
       version: this.schemaVersion,
-      checks: table.checks.map((c) => ({ expr: toRowExpr(c.expr, table, table.sql, ctx), name: c.name ?? table.sql.slice(c.expr.pos, c.expr.end) })),
-      defaults: table.columns.map((c) => (c.defaultExpr ? toValueExpr(c.defaultExpr, table.sql, ctx) : null)),
+      checks: checks.map((c) => ({ expr: c.expr!, name: c.name ?? c.text })),
+      defaults: defaults.map((d) => d?.expr ?? null),
     };
     this.tableExprCache.set(table, r);
     return r;
@@ -3397,7 +3407,7 @@ export class Database implements FunctionContext {
 
   /** The table's column DEFAULTs (null where none). */
   private compileDefaults(table: TableSchema, planner: Planner): (Compiled | null)[] {
-    if (!table.columns.some((c) => c.defaultExpr)) return table.columns.map(() => null);
+    if (!table.columns.some((c) => c.default)) return table.columns.map(() => null);
     return this.tableExprs(table).defaults.map((e) => (e ? planner.compileAt([e], () => -1)[0] : null));
   }
 
@@ -3847,7 +3857,7 @@ export class Database implements FunctionContext {
             c.name,
             c.declaredType,
             c.declaredNotNull ? 1 : 0,
-            c.defaultExpr ? t.sql.slice(c.defaultExpr.pos, c.defaultExpr.end) : null,
+            c.default ? c.default.text : null,
             pkOrder.get(i) ?? 0,
             ...(xinfo ? [0] : []),
           ]);
@@ -4415,15 +4425,6 @@ interface MemView {
 interface MemSnapshot {
   temps: [string, TableSchema, IndexSchema[]][];
   views: [string, MemView][];
-}
-
-/** `CREATE TABLE … WITH (storage = 'row' | 'columnar')` (validates the options). */
-function tableStorage(stmt: CreateTableStmt): 'row' | 'columnar' {
-  const opts = stmt.with ?? {};
-  for (const k of Object.keys(opts)) if (k !== 'storage') throw new SmaltError('SMALT_ERROR', `unknown table option: ${k}`);
-  const storage = String(opts.storage ?? 'row').toLowerCase();
-  if (storage !== 'row' && storage !== 'columnar') throw new SmaltError('SMALT_ERROR', `storage must be 'row' or 'columnar'`);
-  return storage;
 }
 
 /** Snapshot of no memory objects (shared: restoring it creates fresh maps). */
