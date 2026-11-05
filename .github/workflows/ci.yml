@@ -55,13 +55,24 @@ jobs:
             .cache/packed/*-files
           key: packed-${{ hashFiles('packed.json') }}
       - run: node scripts/fetch-packed.mjs
-      # Playwright's browser downloads sometimes hang on the runners: keep them between runs, per Playwright version
-      # and browser, so most runs skip the download (the system packages, --with-deps, are still installed each run).
+      # Keep Playwright's browsers between runs, per Playwright version and browser, so most runs skip the download.
       - uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ env.PLAYWRIGHT_VERSION }}-${{ matrix.browser }}
       # Playwright is resolved globally (see test/browser/playwright.mjs) so local dev containers can use a preinstalled copy.
-      - run: npm install -g playwright@${{ env.PLAYWRIGHT_VERSION }} && npx playwright install --with-deps ${{ matrix.browser }}
+      - run: npm install -g playwright@${{ env.PLAYWRIGHT_VERSION }}
+        timeout-minutes: 5
+      # The browser's system packages (apt) sometimes hang on the runners, even with the browser cached: give each try
+      # 3 minutes, and try twice. (GNU timeout signals the whole process group, sudo and apt included.)
+      - name: Install the browser's system packages
+        run: |
+          for try in 1 2; do
+            timeout --kill-after=15 180 npx playwright install-deps ${{ matrix.browser }} && exit 0
+            echo "::warning::playwright install-deps did not finish (try $try)"
+          done
+          exit 1
+        timeout-minutes: 8
+      - run: npx playwright install ${{ matrix.browser }}
         timeout-minutes: 10
       - run: NODE_PATH=$(npm root -g) BROWSERS=${{ matrix.browser }} npm run test:browser
