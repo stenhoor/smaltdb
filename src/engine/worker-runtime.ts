@@ -81,7 +81,7 @@ export function serve(options: ServeOptions = {}): void {
         try {
           server.db!.refreshSnapshot();
           if (m.settings) server.db!.applyReaderSettings(m.settings);
-          msg = { type: 'partialDone', reader: init.reader, task: m.task, rows: server.db!.runPartial(m.sql, m.params as never, m.lo, m.hi) };
+          msg = { type: 'partialDone', reader: init.reader, task: m.task, rows: server.db!.runPartial(m) };
         } catch (err) {
           msg = { type: 'partialDone', reader: init.reader, task: m.task, error: err instanceof Error ? err.message : String(err) };
         }
@@ -127,7 +127,7 @@ export function serve(options: ServeOptions = {}): void {
       const id = this.nextTask++;
       r.job = { kind: 'partial', task: id }; // busy (and holds checkpoints back) until the partial is done
       this.partials.set(id, done);
-      r.w.postMessage({ type: 'partial', task: id, sql: task.sql, params: task.params, lo: task.lo, hi: task.hi, settings: task.settings } satisfies ReaderMessage);
+      r.w.postMessage({ type: 'partial', task: id, plan: task.plan, key: task.key, params: task.params, settings: task.settings } satisfies ReaderMessage);
       return true;
     }
 

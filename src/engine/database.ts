@@ -18,15 +18,17 @@ import {
 import { MisuseError, SmaltError } from './errors.js';
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
 import type { PlanOp } from './plan/ops.js';
-import { type PlanExpr, forEachCol } from './plan/expr.js';
+import { type EncodedPlan, decodePlan, encodePlan, planFromJSON, planToJSON } from './plan/codec.js';
+import { type ValidateCatalog, validatePlan } from './plan/validate.js';
+import { type PlanExpr, forEachCol, typeOf } from './plan/expr.js';
 import type { CollationName } from './plan/types.js';
 import { type Compiled, type Fn } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
-import { type ExternalScan, type PhysicalEnv, Planner, type QueryPlan, Registers } from './exec/planner.js';
+import { type ExternalScan, type PhysicalEnv, Planner, type QueryPlan, Registers, type ResultColumnInfo } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
-import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
+import { type PlanMorsels, planMorsels } from './exec/plan-morsel.js';
 import { toDeletePlan, toInsertPlan, toPlan, toRowExpr, toUpdatePlan, toValueExpr } from './sql/frontend/select.js';
 import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
@@ -182,6 +184,16 @@ interface Program {
   rows?: (r: SqlValue[]) => SqlValue[][];
   columns: string[];
   columnTypes: StaticType[];
+}
+
+let roundTrip: boolean | undefined;
+/** SMALT_PLAN_ROUNDTRIP=1 (tests): every plan goes through its JSON form before the engine plans it. */
+function roundTripOn(): boolean {
+  if (roundTrip === undefined) {
+    const g = globalThis as { process?: { env?: Record<string, string | undefined> } };
+    roundTrip = !!g.process?.env?.SMALT_PLAN_ROUNDTRIP;
+  }
+  return roundTrip;
 }
 
 /**
@@ -1028,6 +1040,19 @@ export class Database implements FunctionContext {
   }
 
   /** What the SQL front end (ADR 0014, step 5) reads of the catalog (it reads the database's state when called). */
+  /**
+   * A plan from a language as the engine receives it: validated (plan/validate.ts) before it is planned. With
+   * SMALT_PLAN_ROUNDTRIP=1 (tests) it goes through its JSON form first (plan/codec.ts), so the suites check that a
+   * decoded plan plans and runs as the original.
+   */
+  private received<T extends { plan: PlanOp }>(fe: T): T {
+    const r = roundTripOn() ? { ...fe, plan: planFromJSON(planToJSON(fe.plan)) } : fe;
+    validatePlan(r.plan, this.validateCatalog);
+    return r;
+  }
+
+  private readonly validateCatalog: ValidateCatalog = { tableColumns: (name, db) => this.getTable(name, db)?.columns.length };
+
   /** The logical catalog languages bind against (plan/bind-context.ts): the planner's tables, views and sources. */
   private bindContext(): BindContext {
     return (this.bindCtx ??= {
@@ -1067,7 +1092,7 @@ export class Database implements FunctionContext {
    * materialized-view matching on its plan under the statement's policy (exec/plan-mv-match.ts).
    */
   private planSelectStmt(stmt: SelectStmt, text: string, planner: Planner, catalog: BindContext = this.bindContext()): QueryPlan {
-    const fe = toPlan(stmt, text, catalog);
+    const fe = this.received(toPlan(stmt, text, catalog));
     const rewrite = planner.env.rewritePlan;
     const p = planner.planPlan(rewrite ? rewrite(fe.plan) : fe.plan, fe.columns);
     if (!p) throw new SmaltError('SMALT_INTERNAL', `the physical planner declined a query\n  in: ${text}`);
@@ -1736,7 +1761,7 @@ export class Database implements FunctionContext {
       if (m.plan?.version !== this.schemaVersion) {
         let bound: PlanOp | null;
         try {
-          bound = toPlan(m.select, m.sql, this.bindContext()).plan;
+          bound = this.received(toPlan(m.select, m.sql, this.bindContext())).plan;
         } catch {
           bound = null;
         }
@@ -1777,9 +1802,10 @@ export class Database implements FunctionContext {
   /** `PRAGMA parallel_aggregates`: whether large aggregates may run as morsels on parallel readers. */
   private parallelAggregates = true;
   private morselCache = new Map<string, MorselEntry | null>();
-  /** Partial rows being merged: the `smalt_partials()` source of the merge query. */
+  /** Partial rows being merged: the `smalt_partials()` source of the merge plan. */
   private morsel: { rows: SqlValue[][]; keys: number; width: number; types: StaticType[] } | null = null;
 
+  /** `sql` as partial aggregates over rowid ranges and their merge (exec/plan-morsel.ts), or null. */
   private morselQuery(sql: string): MorselEntry | null {
     const hit = this.morselCache.get(sql);
     if (hit !== undefined && (hit === null || hit.version === this.schemaVersion)) {
@@ -1792,19 +1818,13 @@ export class Database implements FunctionContext {
     try {
       const parsed = parseOne(sql);
       if (parsed.stmt.kind === 'select') {
-        const q = analyzeMorsels(parsed.stmt, parsed.text, (name) => {
-          const t = this.getTable(name);
+        const fe = this.received(toPlan(parsed.stmt, parsed.text, this.bindContext()));
+        const q = planMorsels(fe.plan, parsed.paramCount, (name, db) => {
+          const t = this.getTable(name, db);
           // Readers open the file: memory-resident objects and system tables stay on the owner.
-          if (!t || t.temp || t.system || t.rootPage >= MEM_BASE || (t.matview && !t.matview.populated)) return undefined;
-          return {
-            hasColumn: (c) => findColumn(t, c) >= 0,
-            binaryColumn: (c) => {
-              const i = findColumn(t, c);
-              return i >= 0 && (t.columns[i].collation ?? Collation.Binary) === Collation.Binary;
-            },
-          };
+          return !!t && !t.temp && !t.system && t.rootPage < MEM_BASE && !(t.matview && !t.matview.populated);
         });
-        if (q) entry = { version: this.schemaVersion, parsed, q };
+        if (q) entry = { version: this.schemaVersion, parsed, plan: fe.plan, columns: fe.columns, q, partial: encodePlan(q.partial), key: `${this.schemaVersion}:${sql}` };
       }
     } catch {
       entry = null; // let the normal path report the error
@@ -1852,7 +1872,7 @@ export class Database implements FunctionContext {
 
   /**
    * Morsel parallelism: when `sql` is an aggregate over one table of at least `minRows` rows whose
-   * aggregates merge exactly, rowid ranges for `parts` partial queries ({@link runPartial});
+   * aggregates merge exactly, rowid ranges for `parts` partial plans ({@link partialTask});
    * otherwise null (run it normally).
    */
   parallelSplit(sql: string, parts: number, minRows = 200_000): { lo: number; hi: number }[] | null {
@@ -1860,10 +1880,7 @@ export class Database implements FunctionContext {
     const m = this.morselQuery(sql);
     if (!m) return null;
     // A fresh materialized view answers it more cheaply than any split of the base table.
-    if (m.parsed.stmt.kind === 'select' && this.matviewRewriteOn) {
-      const plan = toPlan(m.parsed.stmt, m.parsed.text, this.bindContext()).plan;
-      if (this.matviewRewritePlan(plan) !== plan) return null;
-    }
+    if (this.matviewRewriteOn && this.matviewRewritePlan(m.plan) !== m.plan) return null;
     const t = this.getTable(m.q.table)!;
     const rows = this.liveRows(t);
     if (rows < minRows) return null;
@@ -1879,26 +1896,79 @@ export class Database implements FunctionContext {
     return out.length > 1 ? out : null;
   }
 
-  /** The partial aggregates of `sql` over rowids in [lo, hi) (one row per group). */
-  runPartial(sql: string, params: BindParams | undefined, lo: number, hi: number): SqlValue[][] {
+  /**
+   * What a reader needs to aggregate rowids [lo, hi) of `sql`: the partial plan (encoded, the same for every range),
+   * a key that names it, and its parameters (the query's, then lo and hi).
+   */
+  partialTask(sql: string, params: BindParams | undefined, lo: number, hi: number): { plan: EncodedPlan; key: string; params: SqlValue[] } {
     const m = this.morselQuery(sql);
     if (!m) throw new SmaltError('SMALT_ERROR', 'statement cannot run as partial aggregates');
-    return new Statement(this, { ...m.parsed, stmt: m.q.partial(lo, hi) }, sql).all(params) as SqlValue[][];
+    const values: SqlValue[] = new Array(m.parsed.paramCount + 2).fill(null);
+    bindParamValues(m.parsed, params, values);
+    values[m.parsed.paramCount] = lo;
+    values[m.parsed.paramCount + 1] = hi;
+    return { plan: m.partial, key: m.key, params: values };
   }
+
+  /**
+   * A reader: the partial aggregates a {@link partialTask} describes (one row per group). The plan is decoded,
+   * validated and planned once per `key` and schema, then run for each range.
+   */
+  runPartial(task: { plan: EncodedPlan; key: string; params: SqlValue[] }): SqlValue[][] {
+    let hit = this.partialPrograms.get(task.key);
+    if (!hit || hit.version !== this.schemaVersion) {
+      const plan = decodePlan(task.plan);
+      validatePlan(plan, this.validateCatalog);
+      const types = plan.op === 'project' ? plan.exprs.map(typeOf) : [];
+      hit = { version: this.schemaVersion, program: this.planProgram(plan, types.map((t, i) => ({ name: `c${i}`, type: t, collation: Collation.Binary, affinity: 'NONE' })), task.params.length) };
+      if (this.partialPrograms.size >= 16) this.partialPrograms.delete(this.partialPrograms.keys().next().value!);
+      this.partialPrograms.set(task.key, hit);
+    }
+    return this.runProgram(hit.program, task.params);
+  }
+
+  private readonly partialPrograms = new Map<string, { version: number; program: Program }>();
 
   /** Merge partial rows (from {@link runPartial} over every range) into the result of `sql`. */
   mergePartials(sql: string, params: BindParams | undefined, partials: SqlValue[][]): QueryResult {
     const m = this.morselQuery(sql);
     if (!m) throw new SmaltError('SMALT_ERROR', 'statement cannot run as partial aggregates');
-    // Partial column types and the merge statement are compiled once per query text and schema.
-    const types = (m.types ??= new Statement(this, { ...m.parsed, stmt: m.q.partial(0, 1) }, sql).columnTypes);
-    this.morsel = { rows: partials, keys: m.q.keyCount, width: m.q.width, types };
+    this.morsel = { rows: partials, keys: m.q.keyCount, width: m.q.types.length, types: m.q.types };
     try {
-      const st = (m.final ??= new Statement(this, { ...m.parsed, stmt: m.q.final }, sql));
-      return { columns: st.columns, rows: st.all(params) as SqlValue[][] };
+      const values: SqlValue[] = new Array(m.parsed.paramCount).fill(null);
+      bindParamValues(m.parsed, params, values);
+      const p = (m.merge ??= this.planProgram(m.q.merge, m.columns, m.parsed.paramCount));
+      return { columns: p.columns, rows: this.runProgram(p, values) };
     } finally {
       this.morsel = null;
     }
+  }
+
+  /** A read-only program for `plan` (validated), with `paramCount` parameters in its first registers. */
+  private planProgram(plan: PlanOp, columns: ResultColumnInfo[], paramCount: number): Program {
+    const regs = new Registers(paramCount);
+    const planner = new Planner(this.plannerDeps(), regs);
+    const qp = planner.planPlan(plan, columns);
+    if (!qp) throw new SmaltError('SMALT_INTERNAL', 'the physical planner declined a plan');
+    return { plan: qp, readonly: true, regCount: regs.count, columns: qp.columns.map((c) => c.name), columnTypes: qp.columns.map((c) => c.type) };
+  }
+
+  /** Run read-only program `p` with `params` in its first registers; its rows. */
+  private runProgram(p: Program, params: SqlValue[]): SqlValue[][] {
+    const regs: SqlValue[] = new Array(Math.max(p.regCount, params.length)).fill(null);
+    for (let i = 0; i < params.length; i++) regs[i] = params[i];
+    return this.execute(p, () => {
+      const root = p.plan!.root;
+      const out = p.plan!.outRegs;
+      const rows: SqlValue[][] = [];
+      try {
+        root.open(regs);
+        while (root.next()) rows.push(out.map((g) => regs[g]));
+      } finally {
+        root.close();
+      }
+      return rows;
+    });
   }
 
   /**
@@ -1911,12 +1981,13 @@ export class Database implements FunctionContext {
     return token.close;
   }
 
-  /** {@link parallelSplit} + {@link runPartial} + {@link mergePartials} in this thread (tests, fallback). */
+  /** {@link parallelSplit} + {@link partialTask} + {@link runPartial} + {@link mergePartials} in this thread (tests). */
   queryMorsels(sql: string, params?: BindParams, parts = 4, minRows = 0): QueryResult | null {
     const ranges = this.parallelSplit(sql, parts, minRows);
     if (!ranges) return null;
     const partials: SqlValue[][] = [];
-    for (const r of ranges) partials.push(...this.runPartial(sql, params, r.lo, r.hi));
+    // Each task as a reader receives it: a structured clone.
+    for (const r of ranges) partials.push(...this.runPartial(structuredClone(this.partialTask(sql, params, r.lo, r.hi))));
     return this.mergePartials(sql, params, partials);
   }
 
@@ -3494,7 +3565,7 @@ export class Database implements FunctionContext {
     };
     const physical = (): InsertParts | null => {
       const p = prefix();
-      const fe = toInsertPlan(stmt, table, targets.map((t) => (t === -2 ? -1 : t)), planner.sqlText, this.bindContext());
+      const fe = this.received(toInsertPlan(stmt, table, targets.map((t) => (t === -2 ? -1 : t)), planner.sqlText, this.bindContext()));
       // Materialized-view matching may answer the SELECT source (under the statement's policy).
       const rewrite = planner.env.rewritePlan;
       const op = rewrite ? rewrite(fe.plan) : fe.plan;
@@ -3706,7 +3777,7 @@ export class Database implements FunctionContext {
       return { ...t, defaults, base, checkRowid, checks, ret: returning(base, checkRowid) };
     };
     const physical = (): UpdateParts | null => {
-      const fe = toUpdatePlan(stmt, table, planner.sqlText, this.bindContext());
+      const fe = this.received(toUpdatePlan(stmt, table, planner.sqlText, this.bindContext()));
       const op = fe.plan;
       const p = op.op === 'update' ? planner.planUpdate(op) : null;
       if (!p || op.op !== 'update') return null;
@@ -3734,7 +3805,7 @@ export class Database implements FunctionContext {
    */
   private deleteParts(stmt: DeleteStmt, table: TableSchema, planner: Planner): DeleteParts {
     const physical = (): DeleteParts | null => {
-      const fe = toDeletePlan(stmt, table, planner.sqlText, this.bindContext());
+      const fe = this.received(toDeletePlan(stmt, table, planner.sqlText, this.bindContext()));
       const p = fe.plan.op === 'delete' ? planner.planDelete(fe.plan) : null;
       if (!p) return null;
       const ret = fe.returning && { columns: fe.returning.map((c) => c.name), types: fe.returning.map((c) => c.type), fns: p.returning! };
@@ -4118,28 +4189,8 @@ export class Statement {
   }
 
   private registers(params: BindParams | undefined): SqlValue[] {
-    const p = this.prog();
-    const regs: SqlValue[] = new Array(p.regCount).fill(null);
-    const n = this.parsed.paramCount;
-    if (params === undefined) {
-      if (n > 0) throw new SmaltError('SMALT_RANGE', `statement expects ${n} parameter(s)`);
-      return regs;
-    }
-    if (Array.isArray(params)) {
-      if (params.length !== n) throw new SmaltError('SMALT_RANGE', `statement expects ${n} parameter(s), got ${params.length}`);
-      for (let i = 0; i < n; i++) regs[i] = normalizeParam(params[i], i + 1);
-    } else {
-      const names = this.parsed.paramNames;
-      // `?` and `?NNN` slots have no name to look up: an object cannot bind them.
-      if (names.size !== n) throw new SmaltError('SMALT_RANGE', 'statement has positional parameters (? or ?NNN): bind them with an array, not an object');
-      const named = params as Record<string, SqlValue>;
-      for (const [name, slot] of names) {
-        const bare = name.slice(1);
-        const v = Object.prototype.hasOwnProperty.call(named, name) ? named[name] : named[bare];
-        if (v === undefined) throw new SmaltError('SMALT_RANGE', `missing value for parameter ${name}`);
-        regs[slot - 1] = normalizeParam(v, name);
-      }
-    }
+    const regs: SqlValue[] = new Array(this.prog().regCount).fill(null);
+    bindParamValues(this.parsed, params, regs);
     return regs;
   }
 
@@ -4186,6 +4237,30 @@ export class Statement {
     if (p.rows) return new RowCursor(this.db, null, this.db.execute(p, () => p.rows!(regs)), regs, p.columns);
     this.db.execute(p, () => undefined); // bump epoch
     return new RowCursor(this.db, p.plan!, null, regs, p.columns);
+  }
+}
+
+/** Write `params` for `parsed` into `regs[0..paramCount)` (positional, or by name). */
+function bindParamValues(parsed: ParsedStatement, params: BindParams | undefined, regs: SqlValue[]): void {
+  const n = parsed.paramCount;
+  if (params === undefined) {
+    if (n > 0) throw new SmaltError('SMALT_RANGE', `statement expects ${n} parameter(s)`);
+    return;
+  }
+  if (Array.isArray(params)) {
+    if (params.length !== n) throw new SmaltError('SMALT_RANGE', `statement expects ${n} parameter(s), got ${params.length}`);
+    for (let i = 0; i < n; i++) regs[i] = normalizeParam(params[i], i + 1);
+    return;
+  }
+  const names = parsed.paramNames;
+  // `?` and `?NNN` slots have no name to look up: an object cannot bind them.
+  if (names.size !== n) throw new SmaltError('SMALT_RANGE', 'statement has positional parameters (? or ?NNN): bind them with an array, not an object');
+  const named = params as Record<string, SqlValue>;
+  for (const [name, slot] of names) {
+    const bare = name.slice(1);
+    const v = Object.prototype.hasOwnProperty.call(named, name) ? named[name] : named[bare];
+    if (v === undefined) throw new SmaltError('SMALT_RANGE', `missing value for parameter ${name}`);
+    regs[slot - 1] = normalizeParam(v, name);
   }
 }
 
@@ -4363,9 +4438,14 @@ const EMPTY_MEM_SNAPSHOT: MemSnapshot = { temps: [], views: [] };
 interface MorselEntry {
   version: number;
   parsed: ParsedStatement;
-  q: MorselQuery;
-  types?: StaticType[];
-  final?: Statement;
+  /** The query's plan and result columns. */
+  plan: PlanOp;
+  columns: ResultColumnInfo[];
+  q: PlanMorsels;
+  /** The partial plan as readers receive it, and the key they cache its program by. */
+  partial: EncodedPlan;
+  key: string;
+  merge?: Program;
 }
 
 /** See `Database.insertParts`. */

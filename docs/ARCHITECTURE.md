@@ -82,7 +82,7 @@ src/
     vfs/              Vfs interface, MemoryVfs, OpfsVfs, capability detection
     storage/          pager, WAL, B-trees, key codec, record format, columnar segments, CRC-32C
     sql/              lexer, parser, AST
-    exec/             planner, rewrites (flatten, plan-mv-match, morsel), operators, expression
+    exec/             planner, rewrites (flatten, plan-mv-match, plan-morsel), operators, expression
                       compiler, code generation, functions, window, spill, statistics, writes
     catalog/          schema, ALTER, information_schema
     external/         external tables (the plugin host side)

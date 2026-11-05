@@ -36,7 +36,7 @@ class FakeReaders implements ReaderPool {
       if (fail) return done('reader failed', null);
       try {
         r.refreshSnapshot();
-        done(null, r.runPartial(task.sql, task.params as never, task.lo, task.hi));
+        done(null, r.runPartial(structuredClone(task)));
       } catch (e) {
         done(String(e), null);
       }

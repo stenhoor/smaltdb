@@ -6,34 +6,6 @@ import type { Expr } from './ast.js';
 
 const NO_POS = { pos: 0, end: 0 };
 
-/**
- * Structural key of an expression: equal keys mean equal expressions, positions ignored. Object
- * keys are sorted (nodes built in code and by the parser compare equal) and `undefined` fields are
- * skipped.
- * - `foldNames`: identifier names compare case-insensitively.
- * - `ignoreQualifiers`: `t.a` and `a` compare equal (drops `table` / `schema`).
- */
-export function exprKey(e: unknown, opts: { foldNames?: boolean; ignoreQualifiers?: boolean } = {}): string {
-  const canon = (v: unknown, key: string): unknown => {
-    if (typeof v === 'bigint') return `${v}n`;
-    if (v instanceof Uint8Array) return { bytes: [...v] };
-    if (Array.isArray(v)) return v.map((x) => canon(x, ''));
-    if (typeof v === 'string') return opts.foldNames && key === 'name' ? v.toLowerCase() : v;
-    if (v && typeof v === 'object') {
-      const out: Record<string, unknown> = {};
-      for (const k of Object.keys(v).sort()) {
-        const x = (v as Record<string, unknown>)[k];
-        if (k === 'pos' || k === 'end' || x === undefined) continue;
-        if (opts.ignoreQualifiers && (k === 'table' || k === 'schema')) continue;
-        out[k] = canon(x, k);
-      }
-      return out;
-    }
-    return v;
-  };
-  return JSON.stringify(canon(e, ''));
-}
-
 const isNode = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !(x instanceof Uint8Array) && Object.getPrototypeOf(x) === Object.prototype;
 
 /**

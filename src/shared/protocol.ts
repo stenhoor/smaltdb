@@ -69,8 +69,12 @@ export type ReaderMessage =
   | { type: 'init'; name: string; pageSize?: number; cacheSizeBytes?: number; reader: number; port: MessagePort; bus?: string; interrupt?: SharedArrayBuffer }
   /** `settings`: the owner's, for a query (credits and cancels for a running query carry none). */
   | { type: 'job'; session: string; req: Request; settings?: ReaderSettings }
-  /** Morsel parallelism: partial aggregates of `sql` over rowids [lo, hi), answered with 'partialDone'. */
-  | { type: 'partial'; task: number; sql: string; params?: unknown; lo: number; hi: number; settings?: ReaderSettings }
+  /**
+   * Morsel parallelism: partial aggregates of a plan over a rowid range, answered with 'partialDone'. `plan` is an
+   * encoded plan (engine/plan/codec.ts), the same for every range of a query; `key` names it (readers cache its
+   * program); `params` are the query's, then the range's first and last-plus-one rowid.
+   */
+  | { type: 'partial'; task: number; plan: { version: number; plan: unknown }; key: string; params: SqlValue[]; settings?: ReaderSettings }
   | { type: 'partialDone'; reader: number; task: number; rows?: SqlValue[][]; error?: string }
   | { type: 'ready'; reader: number }
   | { type: 'idle'; reader: number }
