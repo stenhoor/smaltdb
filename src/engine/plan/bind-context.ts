@@ -20,6 +20,11 @@ export interface BindContext {
    * external table, the catalog and system tables, a materialized view).
    */
   writeTarget(name: string, schema?: string): TableSchema;
+  /**
+   * The table CREATE INDEX indexes, by name: throws when there is none, or when it may not be indexed (a view, an
+   * external table, a columnar table, a TEMP index on a main table).
+   */
+  indexTarget(name: string, schema?: string): TableSchema;
   /** A view's definition, bound where the view is read. */
   getView?(name: string, schema?: string): { name: string; sql: string; columns?: string[]; select: SelectStmt } | undefined;
   /** True for an external table. */

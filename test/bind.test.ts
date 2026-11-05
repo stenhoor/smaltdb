@@ -29,7 +29,24 @@ describe('bind', () => {
     expect(bind('ANALYZE t')).toMatchObject({ kind: 'maintenance', action: 'analyze', target: 't' });
     expect(bind('VACUUM')).toEqual({ kind: 'maintenance', action: 'vacuum' });
     expect(bind('REFRESH MATERIALIZED VIEW m')).toMatchObject({ kind: 'maintenance', action: 'refresh', view: 'm', withData: true, ifChanged: false });
-    expect(bind('CREATE TABLE u(x)')).toMatchObject({ kind: 'schema' });
+    // DDL: schema operations, plain data (no syntax trees).
+    const ddl: [string, object][] = [
+      ["CREATE TABLE u(id INTEGER PRIMARY KEY AUTOINCREMENT, x TEXT NOT NULL DEFAULT 'a' COLLATE NOCASE, CHECK (length(x) < 5), UNIQUE (x))", { op: 'createTable', table: { name: 'u', storage: 'row', keys: [{ kind: 'primaryKey', autoincrement: true }, { kind: 'unique' }], checks: [{ text: 'length(x) < 5' }] } }],
+      ['CREATE UNIQUE INDEX ix ON t(a * 2) WHERE a > 0', { op: 'createIndex', index: { name: 'ix', table: 't', unique: true, columns: [{ column: -1, expr: { text: 'a * 2' } }], where: { text: 'a > 0' } } }],
+      ['CREATE VIEW v(c) AS SELECT a FROM t', { op: 'createView', name: 'v', columns: ['c'], materialized: false, source: { language: 'sql', text: 'CREATE VIEW v(c) AS SELECT a FROM t' } }],
+      ["CREATE MATERIALIZED VIEW mv WITH (storage = 'columnar') AS SELECT a FROM t WITH NO DATA", { op: 'createView', materialized: true, options: { storage: 'columnar' }, withData: false }],
+      ["CREATE CONNECTION c WITH (type = 'http')", { op: 'createConnection', name: 'c', options: { type: 'http' } }],
+      ["CREATE EXTERNAL TABLE e (a INT) WITH (location = 'x.csv')", { op: 'createExternalTable', name: 'e', columns: [{ name: 'a', declaredType: 'INT', constrained: false }], options: { location: 'x.csv' } }],
+      ['DROP TABLE IF EXISTS t', { op: 'drop', objectType: 'table', name: 't', ifExists: true }],
+    ];
+    const syntax = (o: unknown): boolean => !!o && typeof o === 'object' && ('pos' in (o as object) || Object.values(o as object).some(syntax));
+    for (const [q, op] of ddl) {
+      const b = bind(q);
+      expect(b, q).toMatchObject({ kind: 'schema', op });
+      expect(syntax(b), q).toBe(false);
+      expect(() => JSON.stringify(b), q).not.toThrow();
+    }
+    expect(bind('ALTER TABLE t ADD COLUMN z')).toMatchObject({ kind: 'schema', sql: {} });
     expect(() => bind('EXPLAIN DELETE FROM t')).toThrow('EXPLAIN is only supported for SELECT statements');
   });
 });

@@ -12,13 +12,14 @@
  * | `maintenance` | analyze, vacuum, refresh a materialized view |
  * | `schema` | a schema operation |
  *
- * `schema` still carries the SQL statement until DDL becomes language-neutral schema operations (ADR 0015 step 6c).
+ * `schema` carries a schema operation (plan/schema.ts); ALTER TABLE still carries its SQL.
  */
 import type { ResultColumnInfo } from '../exec/planner.js';
 import type { ParsedStatement } from '../sql/ast.js';
 import type { PlanExpr } from './expr.js';
 import type { PlanOp } from './ops.js';
 import type { PlanType } from './types.js';
+import type { SchemaOp } from './schema.js';
 
 /** A result column: name, type, declared type, collation and affinity. */
 export type BoundColumn = ResultColumnInfo;
@@ -62,5 +63,6 @@ export type BoundStatement =
       readonly withData: boolean;
       readonly ifChanged: boolean;
     }
-  /** DDL, still as SQL until schema operations (ADR 0015 step 6c). */
+  /** A schema operation; ALTER TABLE still as SQL until it becomes one. */
+  | { readonly kind: 'schema'; readonly op: SchemaOp }
   | { readonly kind: 'schema'; readonly sql: ParsedStatement };

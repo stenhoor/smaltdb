@@ -26,9 +26,10 @@ import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type PlanMorsels, planMorsels } from './exec/plan-morsel.js';
 import { toPlan, toValueExpr } from './sql/frontend/select.js';
-import { checkConstraintExprs, checkNewTable, isConstantDefault, literalValue, tableStorage, toIndexDef, toTableDef, withBoundChecks } from './sql/frontend/ddl.js';
+import { checkConstraintExprs, isConstantDefault, literalValue, tableStorage, toIndexDef, toTableDef, withBoundChecks } from './sql/frontend/ddl.js';
 import { bindStatement } from './sql/frontend/bind.js';
 import type { BoundQuery, BoundStatement, BoundTransaction, BoundWrite } from './plan/bound.js';
+import type { SchemaOp, Source } from './plan/schema.js';
 import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
@@ -41,7 +42,6 @@ import type {
   CreateViewStmt,
   CreateConnectionStmt,
   CreateExternalTableStmt,
-  DropStmt,
   Expr,
   ParsedStatement,
   SelectStmt,
@@ -1054,6 +1054,7 @@ export class Database implements FunctionContext {
     return (this.bindCtx ??= {
       getTable: (n, schema) => this.plannedTable(n, schema),
       writeTarget: (n, schema) => this.targetTable(n, schema),
+      indexTarget: (n, schema) => this.indexTarget(n, schema),
       getView: (n, schema) => this.getView(n, schema),
       isExternal: (n) => this.externals.has(n.toLowerCase()),
       externalColumns: (n) => this.externalTableScan(n)?.columns,
@@ -1071,7 +1072,7 @@ export class Database implements FunctionContext {
     const getTable = (n: string): TableSchema | undefined => this.getTable(n);
     return {
       env: { getTable, openTree: (root) => this.tree(root), funcCtx: this, state: this.state },
-      catalog: { getTable, writeTarget: (n, schema) => this.targetTable(n, schema), getView: (n) => this.getView(n), isExternal: (n) => this.externals.has(n.toLowerCase()), funcCtx: this },
+      catalog: { getTable, writeTarget: (n, schema) => this.targetTable(n, schema), indexTarget: (n, schema) => this.indexTarget(n, schema), getView: (n) => this.getView(n), isExternal: (n) => this.externals.has(n.toLowerCase()), funcCtx: this },
     };
   }
 
@@ -1153,33 +1154,36 @@ export class Database implements FunctionContext {
             throw new SmaltError('SMALT_UNSUPPORTED', 'vacuum statements are not supported yet');
         }
       case 'schema':
-        return done(this.compileSchema(bound.sql));
+        return done('op' in bound ? this.compileSchemaOp(bound.op) : this.compileSchema(bound.sql));
     }
   }
 
-  /** DDL, from its SQL until schema operations (ADR 0015 step 6c). */
+  /** A schema operation's program (plan/schema.ts). */
+  private compileSchemaOp(op: SchemaOp): Omit<Program, 'regCount'> {
+    const run = (f: () => RunResult): Omit<Program, 'regCount'> => ({ exec: f, readonly: false, columns: [], columnTypes: [] });
+    switch (op.op) {
+      case 'createTable':
+        return run(() => this.createTable(op));
+      case 'createIndex':
+        return run(() => this.createIndex(op));
+      case 'createConnection':
+        return run(() => this.createConnection(op));
+      case 'createExternalTable':
+        return run(() => this.createExternalTable(op));
+      case 'createView':
+        if (op.materialized) return run(() => this.createMatview(op));
+        if (op.schema && !['main', 'temp'].includes(op.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${op.schema}`);
+        return run(() => this.createView(op));
+      case 'drop':
+        return run(() => this.drop(op));
+    }
+  }
+
+  /** ALTER TABLE, from its SQL until it becomes a schema operation. */
   private compileSchema(ps: ParsedStatement): Omit<Program, 'regCount'> {
     const stmt = ps.stmt;
-    switch (stmt.kind) {
-      case 'createTable':
-        return { exec: () => this.createTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
-      case 'createIndex':
-        return { exec: () => this.createIndex(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
-      case 'alterTable':
-        return { exec: () => this.alterTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
-      case 'createConnection':
-        return { exec: () => this.createConnection(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
-      case 'createExternalTable':
-        return { exec: () => this.createExternalTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
-      case 'createView':
-        if (stmt.materialized) return { exec: () => this.createMatview(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
-        if (stmt.schema && !['main', 'temp'].includes(stmt.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
-        return { exec: () => this.createView(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
-      case 'drop':
-        return { exec: () => this.drop(stmt), readonly: false, columns: [], columnTypes: [] };
-      default:
-        throw new SmaltError('SMALT_UNSUPPORTED', `${stmt.kind} statements are not supported yet`);
-    }
+    if (stmt.kind === 'alterTable') return { exec: () => this.alterTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
+    throw new SmaltError('SMALT_UNSUPPORTED', `${stmt.kind} statements are not supported yet`);
   }
 
   /**
@@ -1405,13 +1409,15 @@ export class Database implements FunctionContext {
    * CREATE MATERIALIZED VIEW: the result columns become a table (types from the query), filled by
    * running the query unless `WITH NO DATA`.
    */
-  private createMatview(stmt: CreateViewStmt, sql: string): RunResult {
+  private createMatview(stmt: Extract<SchemaOp, { op: 'createView' }>): RunResult {
+    const sql = stmt.source.text;
+    const select = viewSelect(stmt.source);
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     if (stmt.temp || stmt.schema?.toLowerCase() === 'temp') throw new SmaltError('SMALT_ERROR', 'materialized views cannot be temporary');
     if (stmt.ifNotExists && this.catalog.get(stmt.name.toLowerCase())?.type === 'matview') return none;
-    const tempDep = this.tempDependency(stmt.select);
+    const tempDep = this.tempDependency(select);
     if (tempDep) throw new SmaltError('SMALT_ERROR', `materialized view ${stmt.name} cannot reference TEMP object ${tempDep}`);
-    const opts = stmt.with ?? {};
+    const opts = stmt.options ?? {};
     for (const k of Object.keys(opts)) if (!['storage', 'refresh', 'location', 'refresh_every', 'refresh_on_reconnect'].includes(k)) throw new SmaltError('SMALT_ERROR', `unknown materialized view option: ${k}`);
     if (opts.refresh_every !== undefined && opts.refresh_every !== null && !(Number(opts.refresh_every) > 0)) throw new SmaltError('SMALT_ERROR', 'refresh_every must be a positive number of seconds');
     const location = String(opts.location ?? 'file').toLowerCase();
@@ -1423,13 +1429,13 @@ export class Database implements FunctionContext {
     if (refresh !== 'manual') throw new SmaltError('SMALT_UNSUPPORTED', `refresh = '${refresh}' is not supported yet (only 'manual')`);
     this.checkNewName(stmt.name, 'materialized view');
     this.dirtySchema = true;
-    const layout = this.matviewLayout(stmt.name, stmt.select, sql, stmt.columns);
+    const layout = this.matviewLayout(stmt.name, select, sql, stmt.columns ? [...stmt.columns] : undefined);
     if (!this.tables.has('smalt_matview')) {
-      this.createTable(parseOne(Database.MATVIEW_SQL).stmt as CreateTableStmt, Database.MATVIEW_SQL, true);
+      this.createTable(systemTableOp(Database.MATVIEW_SQL), true);
     }
     const root = this.createTree(inMemory);
     const { table } = tableSchemaFromDef(toTableDef(parseOne(layout).stmt as CreateTableStmt, layout, undefined), layout, root);
-    table.matview = { sql, select: stmt.select, storage, populated: false, refreshedAt: null };
+    table.matview = { sql, select, storage, populated: false, refreshedAt: null };
     // A memory-resident view's root is assigned at runtime: the catalog records a marker.
     this.addCatalogRow('matview', table.name, table.name, inMemory ? MEM_BASE : root, sql);
     if (inMemory) {
@@ -1559,7 +1565,7 @@ export class Database implements FunctionContext {
     let t = this.tables.get('smalt_extcache');
     if (!t) {
       if (entries.length === 0) return;
-      this.createTable(parseOne(Database.EXTCACHE_SQL).stmt as CreateTableStmt, Database.EXTCACHE_SQL, true);
+      this.createTable(systemTableOp(Database.EXTCACHE_SQL), true);
       t = this.tables.get('smalt_extcache')!;
     }
     this.upsertMetaRow(t, name, entries.length ? () => [name, JSON.stringify(entries)] : null);
@@ -2371,7 +2377,7 @@ export class Database implements FunctionContext {
       else throw new SmaltError('SMALT_ERROR', `no such table or index: ${s ? `${schema}.` : ''}${target}`);
     }
     if (!this.tables.has('smalt_stat')) {
-      this.createTable(parseOne(Database.STAT_SQL).stmt as CreateTableStmt, Database.STAT_SQL, true);
+      this.createTable(systemTableOp(Database.STAT_SQL), true);
     }
     const stat = this.tables.get('smalt_stat')!;
     const w = new TableWriter(stat, this.pager, (root) => this.tree(root));
@@ -2470,7 +2476,8 @@ export class Database implements FunctionContext {
 
   // ---------------------------------------------------------------- connections and external tables (M8)
 
-  private createConnection(stmt: CreateConnectionStmt, sql: string): RunResult {
+  private createConnection(stmt: Extract<SchemaOp, { op: 'createConnection' }>): RunResult {
+    const sql = stmt.source.text;
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const lower = stmt.name.toLowerCase();
     if (this.connections.has(lower)) {
@@ -2478,15 +2485,15 @@ export class Database implements FunctionContext {
       throw new SmaltError('SMALT_ERROR', `connection ${stmt.name} already exists`);
     }
     // Types, their options and checks come from plugins (@smaltdb/external: http, s3, azure).
-    this.external.plugins.checkConnection(stmt.name, stmt.with);
+    this.external.plugins.checkConnection(stmt.name, stmt.options);
     this.dirtySchema = true;
     this.addCatalogRow('connection', stmt.name, stmt.name, 0, sql, connectionKey(stmt.name));
-    this.connections.set(lower, { name: stmt.name, options: stmt.with, sql });
+    this.connections.set(lower, { name: stmt.name, options: stmt.options, sql });
     this.schemaChanged();
     return none;
   }
 
-  private dropConnection(stmt: DropStmt): RunResult {
+  private dropConnection(stmt: Extract<SchemaOp, { op: 'drop' }>): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const c = this.connections.get(stmt.name.toLowerCase());
     if (!c) {
@@ -2519,29 +2526,30 @@ export class Database implements FunctionContext {
     return { key: `table:${def.name.toLowerCase()}`, label: def.name, location, format: fmt.name, pushdown: !!fmt.pushdown, options, connection: this.connectionOf(def.options, def.name), columns };
   }
 
-  private createExternalTable(stmt: CreateExternalTableStmt, sql: string): RunResult {
+  private createExternalTable(stmt: Extract<SchemaOp, { op: 'createExternalTable' }>): RunResult {
+    const sql = stmt.source.text;
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const lower = stmt.name.toLowerCase();
     if (stmt.ifNotExists && this.externals.has(lower)) return none;
     this.checkNewName(stmt.name, 'external');
     // A format whose plugin is missing first: the error names the plugin rather than one of its
     // options (other format errors, such as an unknown extension, come after the options check).
-    if (typeof stmt.with.location === 'string' && stmt.with.location !== '') {
+    if (typeof stmt.options.location === 'string' && stmt.options.location !== '') {
       try {
-        formatOf(stmt.with.location, stmt.with, stmt.name, this.external.plugins);
+        formatOf(stmt.options.location, stmt.options, stmt.name, this.external.plugins);
       } catch (e) {
         if (e instanceof SmaltError && e.code === 'SMALT_PLUGIN_MISSING') throw e;
       }
     }
-    checkReaderOptions(stmt.with, new Set(['location', 'connection', ...this.external.plugins.readerOptions()]), stmt.name);
+    checkReaderOptions(stmt.options, new Set(['location', 'connection', ...this.external.plugins.readerOptions()]), stmt.name);
     const seen = new Set<string>();
     for (const c of stmt.columns) {
-      if (c.constraints.length > 0) throw new SmaltError('SMALT_ERROR', `external table ${stmt.name}: columns cannot have constraints`);
+      if (c.constrained) throw new SmaltError('SMALT_ERROR', `external table ${stmt.name}: columns cannot have constraints`);
       if (seen.has(c.name.toLowerCase())) throw new SmaltError('SMALT_ERROR', `duplicate column name: ${c.name}`);
       seen.add(c.name.toLowerCase());
     }
-    let columns: ExternalColumn[] = stmt.columns.map((c) => ({ name: c.name, declType: c.type ?? '' }));
-    const source = this.externalSourceOf({ name: stmt.name, options: stmt.with }, columns.length ? columns : undefined);
+    let columns: ExternalColumn[] = stmt.columns.map((c) => ({ name: c.name, declType: c.declaredType }));
+    const source = this.externalSourceOf({ name: stmt.name, options: stmt.options }, columns.length ? columns : undefined);
     let text = sql;
     if (columns.length === 0) {
       // Columns inferred from the source now (fetched by the async API; Parquet: only its footer), and stored with the table.
@@ -2549,12 +2557,12 @@ export class Database implements FunctionContext {
       if (data.columns.length === 0) throw externalError(source, 'no columns found (the source is empty)');
       columns = data.columns.map((c) => ({ name: c.name, declType: c.declType || 'ANY' }));
       const cols = columns.map((c) => `${quoteIdent(c.name)} ${c.declType}`).join(', ');
-      const opts = Object.entries(stmt.with).map(([k, v]) => `${quoteIdentIfNeeded(k)} = ${sqlLiteral(v)}`).join(', ');
+      const opts = Object.entries(stmt.options).map(([k, v]) => `${quoteIdentIfNeeded(k)} = ${sqlLiteral(v)}`).join(', ');
       text = `CREATE EXTERNAL TABLE ${quoteIdent(stmt.name)} (${cols}) WITH (${opts})`;
     }
     this.dirtySchema = true;
     this.addCatalogRow('external', stmt.name, stmt.name, 0, text);
-    this.externals.set(lower, { name: stmt.name, columns, options: stmt.with, sql: text });
+    this.externals.set(lower, { name: stmt.name, columns, options: stmt.options, sql: text });
     this.objectChanged(stmt.name);
     this.schemaChanged();
     return none;
@@ -2622,11 +2630,14 @@ export class Database implements FunctionContext {
     return { key, label, location, format: fmt.name, pushdown: !!fmt.pushdown, options, connection: this.connectionOf(named, label) };
   }
 
-  private createView(stmt: CreateViewStmt, sql: string): RunResult {
+  private createView(stmt: Extract<SchemaOp, { op: 'createView' }>): RunResult {
+    const sql = stmt.source.text;
+    const select = viewSelect(stmt.source);
+    const columns = stmt.columns ? [...stmt.columns] : undefined;
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     if (stmt.temp && stmt.schema?.toLowerCase() === 'main') throw new SmaltError('SMALT_ERROR', 'temporary table name must be unqualified');
     // A view over TEMP objects is itself TEMP (as in SQLite); asked for in main, it is an error.
-    const tempDep = stmt.temp || stmt.schema?.toLowerCase() === 'temp' ? undefined : this.tempDependency(stmt.select);
+    const tempDep = stmt.temp || stmt.schema?.toLowerCase() === 'temp' ? undefined : this.tempDependency(select);
     if (tempDep && stmt.schema?.toLowerCase() === 'main') throw new SmaltError('SMALT_ERROR', `view ${stmt.name} cannot reference TEMP object ${tempDep}`);
     if (stmt.temp || stmt.schema?.toLowerCase() === 'temp' || tempDep) {
       const lower = stmt.name.toLowerCase();
@@ -2634,7 +2645,7 @@ export class Database implements FunctionContext {
         if (stmt.ifNotExists) return none;
         throw new SmaltError('SMALT_ERROR', `view ${stmt.name} already exists`);
       }
-      const view: ViewSchema = { name: stmt.name, sql, columns: stmt.columns, select: stmt.select };
+      const view: ViewSchema = { name: stmt.name, sql, columns, select };
       this.tempViews.set(lower, view);
       this.tempSeq.set(view, this.nextTempSeq++);
       this.schemaVersion++; // re-plan statements; nothing is stored
@@ -2645,34 +2656,35 @@ export class Database implements FunctionContext {
     this.dirtySchema = true;
     // Like SQLite, the body is not resolved until the view is used (it may reference tables created later).
     this.addCatalogRow('view', stmt.name, stmt.name, 0, sql);
-    this.views.set(stmt.name.toLowerCase(), { name: stmt.name, sql, columns: stmt.columns, select: stmt.select });
+    this.views.set(stmt.name.toLowerCase(), { name: stmt.name, sql, columns, select });
     this.objectChanged(stmt.name);
     this.schemaChanged();
     return none;
   }
 
-  private createTable(stmt: CreateTableStmt, sql: string, internal = false): RunResult {
+  private createTable(stmt: Extract<SchemaOp, { op: 'createTable' }>, internal = false): RunResult {
+    const sql = stmt.source.text;
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
-    const columnar = tableStorage(stmt) === 'columnar';
+    const columnar = stmt.table.storage === 'columnar';
     const schema = stmt.schema?.toLowerCase();
     if (schema !== undefined && schema !== 'main' && schema !== 'temp') throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
     if (stmt.temp && schema === 'main') throw new SmaltError('SMALT_ERROR', 'temporary table name must be unqualified');
     if (stmt.temp || schema === 'temp') {
       if (columnar) throw new SmaltError('SMALT_UNSUPPORTED', 'TEMP tables cannot be columnar');
-      return this.createTempTable(stmt, sql);
+      return this.createTempTable(stmt);
     }
-    if (stmt.ifNotExists && this.catalog.has(stmt.name.toLowerCase())) return none;
-    if (!internal) this.checkNewName(stmt.name, 'table');
+    if (stmt.ifNotExists && this.catalog.has(stmt.table.name.toLowerCase())) return none;
+    if (!internal) this.checkNewName(stmt.table.name, 'table');
     this.dirtySchema = true;
     const root = BTree.create(this.pager);
-    const { table, implicitIndexes, conflictingOnConflict } = this.newTableSchema(stmt, sql, root, internal);
+    const { table, implicitIndexes, conflictingOnConflict } = tableSchemaFromDef(stmt.table, sql, root);
     if (conflictingOnConflict) throw new SmaltError('SMALT_ERROR', 'conflicting ON CONFLICT clauses specified');
     if (columnar) {
       // Columnar tables are scanned, not probed: no secondary structures to keep in step.
       if (implicitIndexes.length > 0) throw new SmaltError('SMALT_UNSUPPORTED', 'columnar tables support no UNIQUE or PRIMARY KEY constraints other than INTEGER PRIMARY KEY');
       if (table.foreignKeys.length > 0) throw new SmaltError('SMALT_UNSUPPORTED', 'columnar tables cannot have foreign keys');
       if (!this.tables.has('smalt_columnar')) {
-        this.createTable(parseOne(Database.COLUMNAR_SQL).stmt as CreateTableStmt, Database.COLUMNAR_SQL, true);
+        this.createTable(systemTableOp(Database.COLUMNAR_SQL), true);
       }
       table.columnar = { segRoot: BTree.create(this.pager), delRoot: BTree.create(this.pager) };
       this.writeColumnarMeta(table.name, table.columnar);
@@ -2695,33 +2707,20 @@ export class Database implements FunctionContext {
   }
 
   /**
-   * The schema of a table CREATE TABLE makes: its definition (SQL's rules for DEFAULT and CHECK first, then the CHECKs
-   * bound, so a bad one fails here as in SQLite), and AUTOINCREMENT only on the column that aliases the rowid.
-   * `internal`: a system table the engine creates (no checks).
-   */
-  private newTableSchema(stmt: CreateTableStmt, sql: string, root: number, internal: boolean): ReturnType<typeof tableSchemaFromDef> {
-    if (internal) return tableSchemaFromDef(toTableDef(stmt, sql, undefined), sql, root);
-    let def = toTableDef(stmt, sql, this.bindContext());
-    checkNewTable(stmt);
-    def = withBoundChecks(def, stmt, sql, this.bindContext());
-    const r = tableSchemaFromDef(def, sql, root);
-    if (def.keys.some((k) => k.autoincrement) && r.table.rowidAlias < 0) throw new SmaltError('SMALT_ERROR', 'AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY');
-    return r;
-  }
-
-  /**
    * CREATE TEMP TABLE: lives in the memory store, outside the persisted catalog, for this
    * connection only (like SQLite's temp schema); it shadows a main table of the same name.
    */
-  private createTempTable(stmt: CreateTableStmt, sql: string): RunResult {
+  private createTempTable(stmt: Extract<SchemaOp, { op: 'createTable' }>): RunResult {
+    const sql = stmt.source.text;
+    const name = stmt.table.name;
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
-    const lower = stmt.name.toLowerCase();
+    const lower = name.toLowerCase();
     if (this.tempTables.has(lower)) {
       if (stmt.ifNotExists) return none;
-      throw new SmaltError('SMALT_ERROR', `table ${stmt.name} already exists`);
+      throw new SmaltError('SMALT_ERROR', `table ${name} already exists`);
     }
-    if (lower.startsWith('smalt_') || lower.startsWith('sqlite_')) throw new SmaltError('SMALT_ERROR', `object name reserved for internal use: ${stmt.name}`);
-    const { table, implicitIndexes, conflictingOnConflict } = this.newTableSchema(stmt, sql, this.createTree(true), false);
+    if (lower.startsWith('smalt_') || lower.startsWith('sqlite_')) throw new SmaltError('SMALT_ERROR', `object name reserved for internal use: ${name}`);
+    const { table, implicitIndexes, conflictingOnConflict } = tableSchemaFromDef(stmt.table, sql, this.createTree(true));
     if (conflictingOnConflict) throw new SmaltError('SMALT_ERROR', 'conflicting ON CONFLICT clauses specified');
     table.temp = true;
     implicitIndexes.forEach((spec, i) => {
@@ -2740,21 +2739,29 @@ export class Database implements FunctionContext {
     return none;
   }
 
-  private createIndex(stmt: CreateIndexStmt, sql: string): RunResult {
-    const none = { changes: 0, lastInsertRowid: this.lastRowid };
-    if (stmt.ifNotExists && this.catalog.has(stmt.name.toLowerCase())) return none;
+  /** The table CREATE INDEX indexes (BindContext.indexTarget): throws why there is none, or why it cannot be indexed. */
+  private indexTarget(name: string, schemaName?: string): TableSchema {
     // The qualifier names the index's schema, which must be its table's (as in SQLite).
-    const schema = stmt.schema?.toLowerCase();
-    if (schema !== undefined && schema !== 'main' && schema !== 'temp') throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
-    const table = schema === undefined ? this.tables.get(stmt.table.toLowerCase()) : this.getTable(stmt.table, schema);
+    const schema = schemaName?.toLowerCase();
+    if (schema !== undefined && schema !== 'main' && schema !== 'temp') throw new SmaltError('SMALT_ERROR', `unknown database ${schemaName}`);
+    const table = schema === undefined ? this.tables.get(name.toLowerCase()) : this.getTable(name, schema);
     if (!table) {
-      if (schema === 'temp' && this.getTable(stmt.table, 'main')) throw new SmaltError('SMALT_ERROR', `cannot create a TEMP index on non-TEMP table "${stmt.table}"`);
-      if (this.views.has(stmt.table.toLowerCase())) throw new SmaltError('SMALT_ERROR', 'views may not be indexed');
-      if (schema !== 'temp' && this.externals.has(stmt.table.toLowerCase())) throw new SmaltError('SMALT_ERROR', `table ${stmt.table} may not be indexed`);
-      throw new SmaltError('SMALT_ERROR', `no such table: ${schema === 'main' ? 'main.' : ''}${stmt.table}`);
+      if (schema === 'temp' && this.getTable(name, 'main')) throw new SmaltError('SMALT_ERROR', `cannot create a TEMP index on non-TEMP table "${name}"`);
+      if (this.views.has(name.toLowerCase())) throw new SmaltError('SMALT_ERROR', 'views may not be indexed');
+      if (schema !== 'temp' && this.externals.has(name.toLowerCase())) throw new SmaltError('SMALT_ERROR', `table ${name} may not be indexed`);
+      throw new SmaltError('SMALT_ERROR', `no such table: ${schema === 'main' ? 'main.' : ''}${name}`);
     }
     if (table.matview?.storage === 'columnar') throw new SmaltError('SMALT_ERROR', `columnar materialized view ${table.name} cannot be indexed (zone maps prune its scans)`);
     if (table.columnar) throw new SmaltError('SMALT_UNSUPPORTED', `columnar table ${table.name} cannot be indexed (zone maps prune its scans)`);
+    return table;
+  }
+
+  private createIndex(op: Extract<SchemaOp, { op: 'createIndex' }>): RunResult {
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    const stmt = op.index;
+    const sql = op.source.text;
+    if (op.ifNotExists && this.catalog.has(stmt.name.toLowerCase())) return none;
+    const table = this.indexTarget(stmt.table, op.schema);
     if (table.temp) {
       if (this.indexes.has(stmt.name.toLowerCase())) throw new SmaltError('SMALT_ERROR', `index ${stmt.name} already exists`);
     } else {
@@ -2768,7 +2775,7 @@ export class Database implements FunctionContext {
     if (table.temp) this.memDirty = true;
     const memory = table.rootPage >= MEM_BASE;
     const root = this.createTree(memory);
-    const idx = indexSchemaFromDef(toIndexDef(stmt, sql, table, this.bindContext()), sql, table, root);
+    const idx = indexSchemaFromDef(stmt, sql, table, root);
     this.prepareIndex(table, idx);
     this.populateIndex(table, idx, root);
     table.indexes.push(idx);
@@ -2905,7 +2912,7 @@ export class Database implements FunctionContext {
     }
   }
 
-  private drop(stmt: DropStmt): RunResult {
+  private drop(stmt: Extract<SchemaOp, { op: 'drop' }>): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const lower = stmt.name.toLowerCase();
     const existing = this.catalog.get(lower);
@@ -4506,4 +4513,18 @@ function scansTable(plan: unknown, name: string): boolean {
 /** Whether a delete's input is every row of its table (a scan, under projections only). */
 function wholeTable(op: PlanOp): boolean {
   return op.op === 'scan' || (op.op === 'project' && wholeTable(op.input));
+}
+
+/** A system table's CREATE TABLE as the schema operation the engine runs (nothing to bind: no CHECK or DEFAULT). */
+function systemTableOp(sql: string): Extract<SchemaOp, { op: 'createTable' }> {
+  return { op: 'createTable', table: toTableDef(parseOne(sql).stmt as CreateTableStmt, sql, undefined), temp: false, ifNotExists: false, source: { language: 'sql', text: sql } };
+}
+
+/**
+ * A view's query, from its source: views are kept as their language's source and bound where read (ADR 0015
+ * section 6); SQL is the only language until languages register with the engine (step 9).
+ */
+function viewSelect(source: Source): SelectStmt {
+  if (source.language !== 'sql') throw new SmaltError('SMALT_MISUSE', `view is written in ${source.language}, which is not registered`);
+  return (parseOne(source.text).stmt as CreateViewStmt).select;
 }

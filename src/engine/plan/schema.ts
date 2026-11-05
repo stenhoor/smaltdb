@@ -111,3 +111,39 @@ export interface Source {
   readonly language: string;
   readonly text: string;
 }
+
+/** What DROP removes. */
+export type DropObject = 'table' | 'index' | 'view' | 'materialized view' | 'trigger' | 'external table' | 'connection';
+
+/**
+ * A schema operation (ADR 0015 section 5): what a language's DDL becomes. Views and materialized views are kept as their
+ * language's source, bound where they are read (section 6).
+ */
+export type SchemaOp =
+  | { readonly op: 'createTable'; readonly table: TableDef; readonly schema?: string; readonly temp: boolean; readonly ifNotExists: boolean; readonly source: Source }
+  | { readonly op: 'createIndex'; readonly index: IndexDef; readonly schema?: string; readonly ifNotExists: boolean; readonly source: Source }
+  | {
+      readonly op: 'createView';
+      readonly name: string;
+      readonly schema?: string;
+      readonly temp: boolean;
+      readonly ifNotExists: boolean;
+      /** Result column names given with the view, if any. */
+      readonly columns?: readonly string[];
+      readonly materialized: boolean;
+      /** Materialized views: their options (storage, location, refresh policy), and whether to fill them now. */
+      readonly options?: Readonly<Record<string, SqlValue>>;
+      readonly withData?: boolean;
+      readonly source: Source;
+    }
+  | { readonly op: 'createConnection'; readonly name: string; readonly ifNotExists: boolean; readonly options: Readonly<Record<string, SqlValue>>; readonly source: Source }
+  | {
+      readonly op: 'createExternalTable';
+      readonly name: string;
+      readonly ifNotExists: boolean;
+      /** Declared columns (empty: inferred from the source when the table is created). */
+      readonly columns: readonly { readonly name: string; readonly declaredType: string; readonly constrained: boolean }[];
+      readonly options: Readonly<Record<string, SqlValue>>;
+      readonly source: Source;
+    }
+  | { readonly op: 'drop'; readonly objectType: DropObject; readonly name: string; readonly schema?: string; readonly ifExists: boolean };

@@ -8,6 +8,13 @@ import type { BindContext } from '../../plan/bind-context.js';
 import type { BoundQuery, BoundStatement } from '../../plan/bound.js';
 import type { ParsedStatement, SelectStmt } from '../ast.js';
 import { toPlan, toValueExpr, toWritePlan } from './select.js';
+import { checkNewTable, toIndexDef, toTableDef, withBoundChecks } from './ddl.js';
+import type { KeyDef, Source, TableDef } from '../../plan/schema.js';
+
+const sql = (ps: ParsedStatement): Source => ({ language: 'sql', text: ps.text });
+
+/** Whether `k` (a PRIMARY KEY) makes its column the rowid: a single ASC column declared exactly INTEGER. */
+const rowidKey = (def: TableDef, k: KeyDef): boolean => k.columns.length === 1 && !k.columns[0].desc && def.columns[k.columns[0].column].declaredType === 'INTEGER';
 
 /**
  * `ps` bound against `catalog`. `received` sees every plan the binder makes before it goes into the bound statement
@@ -48,6 +55,43 @@ export function bindStatement(ps: ParsedStatement, catalog: BindContext, receive
       return { kind: 'maintenance', action: 'vacuum' };
     case 'refresh':
       return { kind: 'maintenance', action: 'refresh', view: stmt.name, schema: stmt.schema, concurrently: stmt.concurrently, withData: stmt.withData, ifChanged: stmt.ifChanged === true };
+    case 'createTable': {
+      // SQL's rules for DEFAULT and CHECK first, then the CHECKs bound (a bad one fails here, as in SQLite).
+      let def = toTableDef(stmt, ps.text, catalog);
+      checkNewTable(stmt);
+      def = withBoundChecks(def, stmt, ps.text, catalog);
+      if (def.keys.some((k) => k.autoincrement) && !def.keys.some((k) => k.kind === 'primaryKey' && rowidKey(def, k))) throw new SmaltError('SMALT_ERROR', 'AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY');
+      return { kind: 'schema', op: { op: 'createTable', table: def, ...(stmt.schema !== undefined ? { schema: stmt.schema } : {}), temp: stmt.temp, ifNotExists: stmt.ifNotExists, source: sql(ps) } };
+    }
+    case 'createIndex': {
+      const table = catalog.indexTarget(stmt.table, stmt.schema);
+      return { kind: 'schema', op: { op: 'createIndex', index: toIndexDef(stmt, ps.text, table, catalog), ...(stmt.schema !== undefined ? { schema: stmt.schema } : {}), ifNotExists: stmt.ifNotExists, source: sql(ps) } };
+    }
+    case 'createView':
+      return {
+        kind: 'schema',
+        op: {
+          op: 'createView',
+          name: stmt.name,
+          ...(stmt.schema !== undefined ? { schema: stmt.schema } : {}),
+          temp: stmt.temp,
+          ifNotExists: stmt.ifNotExists,
+          ...(stmt.columns ? { columns: stmt.columns } : {}),
+          materialized: stmt.materialized,
+          ...(stmt.with ? { options: stmt.with } : {}),
+          ...(stmt.withData !== undefined ? { withData: stmt.withData } : {}),
+          source: sql(ps),
+        },
+      };
+    case 'createConnection':
+      return { kind: 'schema', op: { op: 'createConnection', name: stmt.name, ifNotExists: stmt.ifNotExists, options: stmt.with, source: sql(ps) } };
+    case 'createExternalTable':
+      return {
+        kind: 'schema',
+        op: { op: 'createExternalTable', name: stmt.name, ifNotExists: stmt.ifNotExists, columns: stmt.columns.map((c) => ({ name: c.name, declaredType: c.type ?? '', constrained: c.constraints.length > 0 })), options: stmt.with, source: sql(ps) },
+      };
+    case 'drop':
+      return { kind: 'schema', op: { op: 'drop', objectType: stmt.objectType, name: stmt.name, ...(stmt.schema !== undefined ? { schema: stmt.schema } : {}), ifExists: stmt.ifExists } };
     default:
       return { kind: 'schema', sql: ps };
   }
