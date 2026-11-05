@@ -129,6 +129,22 @@ export function decodeDataJSON(text: string): unknown {
   return decode(JSON.parse(text), true);
 }
 
+/**
+ * `x` as canonical JSON text: {@link encodeDataJSON}'s form with every object's keys sorted, so equal data gives equal
+ * text whatever order its fields were written in (statement caches key plans by it).
+ */
+export function canonicalJSON(x: unknown): string {
+  const sort = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(sort);
+    if (!v || typeof v !== 'object') return v;
+    const o = v as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(o).sort()) out[k] = sort(o[k]);
+    return out;
+  };
+  return JSON.stringify(sort(encode(x, true)));
+}
+
 /** `plan` as JSON text. */
 export function planToJSON(plan: PlanOp): string {
   return JSON.stringify({ version: PLAN_FORMAT_VERSION, plan: encode(plan, true) });

@@ -26,6 +26,7 @@ The [errors guide](../../guide/errors) shows how to handle them. This page lists
 | [`SMALT_PLUGIN_MISSING`](#smalt-plugin-missing) | A feature needs a plugin the engine does not have | After installing it |
 | [`SMALT_EXTERNAL`](#smalt-external) | Reading external data failed | Often |
 | [`SMALT_ASYNC_REQUIRED`](#smalt-async-required) | A synchronous engine call needs external data | Use the async method |
+| [`SMALT_PLAN`](#smalt-plan) | A plan given to the engine is not valid | No |
 | [`SMALT_CANTOPEN`](#smalt-cantopen) | A database file cannot be opened | No |
 | [`SMALT_NOTADB`](#smalt-notadb) | The file is not a smaltdb database | No |
 | [`SMALT_FORMAT`](#smalt-format) | The file has an unsupported format version | No |
@@ -292,6 +293,12 @@ A file cannot be opened: OPFS refused to open or create it, OPFS sync access han
 The file exists but does not start with the smaltdb file header. smaltdb does not read SQLite database files.
 
 **Remedy:** open a different name, or delete the file.
+
+## SMALT_PLAN
+
+A statement given as plan data ([`preparePlan`, `queryPlan`](./engine#plans)) is not a valid plan: an unknown operation or function, a column position its input does not have, a table that does not exist, a wrong number of arguments, parameters beyond the limit, or a plan nested deeper than 1000 levels. The message gives the path to the part that is wrong, such as `invalid plan at plan.input.pred.args[1]: …`. A plan with a newer format version than the engine reads is refused the same way.
+
+**Remedy:** fix the plan. Plans built by a language are valid; this error points at a bug in the code that built the plan.
 
 ## SMALT_FORMAT
 

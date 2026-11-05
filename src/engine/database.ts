@@ -15,7 +15,9 @@ import {
 import { MisuseError, SmaltError } from './errors.js';
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
 import type { ConflictAction, PlanOp } from './plan/ops.js';
-import { type EncodedPlan, decodeData, decodePlan, encodeData, encodePlan, planFromJSON, planToJSON } from './plan/codec.js';
+import { type EncodedPlan, canonicalJSON, decodeData, decodePlan, encodeData, encodePlan, planFromJSON, planToJSON } from './plan/codec.js';
+import { type PlanStatementInput, paramCount, toBoundStatement } from './plan/statement.js';
+import { normalizePlan, normalizeWrite } from './exec/plan-normalize.js';
 import { type ValidateCatalog, validatePlan } from './plan/validate.js';
 import { type PlanExpr, forEachCol, typeOf } from './plan/expr.js';
 import type { CollationName } from './plan/types.js';
@@ -528,6 +530,71 @@ export class Database implements FunctionContext {
     return this.cached(sql).run(params);
   }
 
+  // ---------------------------------------------------------------- plans (ADR 0014 section 4)
+
+  /**
+   * Compile a statement given as plan data: a query plan, or a bound statement (plan/statement.ts). Its plans are
+   * validated first; its parameters are positional.
+   */
+  preparePlan(stmt: PlanStatementInput): PlanStatement {
+    this.checkOpen();
+    const bound = normalizeBound(toBoundStatement(stmt, (plan) => this.receivedPlan(plan)));
+    return new PlanStatement(this, bound, paramCount(bound));
+  }
+
+  /** Run a query given as plan data and return all rows (statements are cached by the plan's canonical form). */
+  queryPlan(stmt: PlanStatementInput, params?: readonly SqlValue[]): QueryResult {
+    const st = this.cachedPlan(stmt);
+    return { columns: st.columns, rows: st.all(params as BindParams | undefined) };
+  }
+
+  /** `queryPlan` for a plan that may read external data: its sources are fetched first. */
+  async queryPlanAsync(stmt: PlanStatementInput, params?: readonly SqlValue[], options: { signal?: AbortSignal } = {}): Promise<QueryResult> {
+    const st = this.cachedPlan(stmt);
+    return this.withExternal(options.signal, st, () => ({ columns: st.columns, rows: st.all(params as BindParams | undefined) }));
+  }
+
+  /** A plan from outside the engine, as it is received: validated, giving its output width. */
+  private receivedPlan(plan: PlanOp): number {
+    const p = roundTripOn() ? planFromJSON(planToJSON(plan)) : plan;
+    return validatePlan(p, this.validateCatalog);
+  }
+
+  private cachedPlan(stmt: PlanStatementInput): PlanStatement {
+    this.checkOpen();
+    const key = canonicalJSON(stmt);
+    let st = this.planCache.get(key);
+    if (st) {
+      this.planCache.delete(key);
+      this.planCache.set(key, st);
+      return st;
+    }
+    st = this.preparePlan(stmt);
+    this.planCache.set(key, st);
+    if (this.planCache.size > this.cacheSize) this.planCache.delete(this.planCache.keys().next().value!);
+    return st;
+  }
+
+  private readonly planCache = new Map<string, PlanStatement>();
+
+  /** @internal Whether a plan statement reads memory-resident objects (as {@link usesMemoryObjects} for SQL). */
+  planUsesMemoryObjects(bound: BoundStatement): boolean {
+    if (bound.kind === 'setting') return true;
+    if (this.tempTables.size === 0 && this.memViews.size === 0) return false;
+    const walk = (x: unknown): boolean => {
+      if (Array.isArray(x)) return x.some(walk);
+      if (!x || typeof x !== 'object') return false;
+      const o = x as Record<string, unknown>;
+      if (o.op === 'scan' && typeof o.table === 'string') {
+        const t = this.getTable(o.table, o.db as 'main' | 'temp' | undefined);
+        if (t && (t.temp || t.rootPage >= MEM_BASE)) return true;
+      }
+      for (const k in o) if (walk(o[k])) return true;
+      return false;
+    };
+    return walk(bound);
+  }
+
   // ---------------------------------------------------------------- external data (M8)
 
   /**
@@ -578,7 +645,7 @@ export class Database implements FunctionContext {
    * attempt is atomic, so a retry starts from a clean state.
    */
   /** @internal (also used by the export functions) */
-  async withExternal<T>(signal: AbortSignal | undefined, st: Statement, run: () => T): Promise<T> {
+  async withExternal<T>(signal: AbortSignal | undefined, st: PreparedStatement, run: () => T): Promise<T> {
     const held = new Set<string>();
     const load = async (sources: ExternalSource[]): Promise<boolean> => {
       const need = sources.filter((s) => !held.has(s.key));
@@ -589,7 +656,7 @@ export class Database implements FunctionContext {
     try {
       // First round: every source known before running, fetched together. `read_csv('…')` calls with
       // constant arguments are found in the statement text (planning needs their columns).
-      const first = this.literalExternalSources(st.parsed.stmt);
+      const first = st instanceof Statement ? this.literalExternalSources(st.parsed.stmt) : [];
       try {
         first.push(...st.externalSources);
       } catch (e) {
@@ -1180,10 +1247,17 @@ export class Database implements FunctionContext {
    * and the engine dispatches on the bound statement (plan/bound.ts).
    */
   compile(ps: ParsedStatement): Program {
-    const bound = bindStatement(ps, this.bindContext(), (fe) => this.received(fe));
-    const regs = new Registers(ps.paramCount);
+    return this.compileBound(bindStatement(ps, this.bindContext(), (fe) => this.received(fe)), ps.paramCount, ps.text);
+  }
+
+  /**
+   * @internal A bound statement's program (its plans already received): the engine dispatches on its kind
+   * (plan/bound.ts). `text` names it in errors (its source, where there is one).
+   */
+  compileBound(bound: BoundStatement, paramCount: number, text: string): Program {
+    const regs = new Registers(paramCount);
     const planner = new Planner(this.plannerDeps(this.rewritePolicy(bound)), regs);
-    planner.sqlText = ps.text;
+    planner.sqlText = text;
     const done = (p: Omit<Program, 'regCount'>): Program => ({ ...p, regCount: regs.count, rowAssumptions: planner.rowAssumptions, externals: planner.finishExternals() });
     switch (bound.kind) {
       case 'query': {
@@ -4244,21 +4318,33 @@ function prefixHasNull(prefix: Uint8Array, cols: readonly KeyColumn[]): boolean 
 // ------------------------------------------------------------------ statements & cursors
 
 /** A prepared statement. Recompiles automatically after schema changes. */
-export class Statement {
+/**
+ * A compiled statement: recompiled when the schema changes or the tables it costed change size a lot. {@link Statement}
+ * holds SQL; {@link PlanStatement} a statement a language bound, given as plan data (`Database.preparePlan`).
+ */
+export abstract class PreparedStatement {
   private program: Program | null = null;
   private version = -1;
 
-  constructor(
-    readonly db: Database,
-    readonly parsed: ParsedStatement,
-    readonly sql: string,
-  ) {}
+  constructor(readonly db: Database) {}
 
   private checkedAt = '';
 
-  private prog(): Program {
+  /** The program for the current schema. */
+  protected abstract compileProgram(): Program;
+
+  /** Parameter values into the first registers. */
+  protected abstract bindParams(params: BindParams | undefined, regs: SqlValue[]): void;
+
+  /** Whether it reads memory-resident objects, for the current schema. */
+  protected abstract readsMemoryObjects(): boolean;
+
+  abstract get paramCount(): number;
+
+  /** @internal */
+  prog(): Program {
     if (this.program === null || this.version !== this.db.schemaVersion || this.statsDrifted(this.program)) {
-      this.program = this.db.compile(this.parsed);
+      this.program = this.compileProgram();
       this.version = this.db.schemaVersion;
       this.checkedAt = this.db.changeStamp();
     }
@@ -4304,18 +4390,14 @@ export class Statement {
   /** Reads TEMP tables or memory-resident views (parallel readers cannot see them). */
   get usesMemoryObjects(): boolean {
     // Memory objects come and go with DDL, which bumps the schema version.
-    if (this.memoryUse?.version !== this.db.schemaVersion) this.memoryUse = { version: this.db.schemaVersion, value: this.db.usesMemoryObjects(this.parsed) };
+    if (this.memoryUse?.version !== this.db.schemaVersion) this.memoryUse = { version: this.db.schemaVersion, value: this.readsMemoryObjects() };
     return this.memoryUse.value;
   }
   private memoryUse: { version: number; value: boolean } | null = null;
 
-  get paramCount(): number {
-    return this.parsed.paramCount;
-  }
-
   private registers(params: BindParams | undefined): SqlValue[] {
     const regs: SqlValue[] = new Array(this.prog().regCount).fill(null);
-    bindParamValues(this.parsed, params, regs);
+    this.bindParams(params, regs);
     return regs;
   }
 
@@ -4362,6 +4444,62 @@ export class Statement {
     if (p.rows) return new RowCursor(this.db, null, this.db.execute(p, () => p.rows!(regs)), regs, p.columns);
     this.db.execute(p, () => undefined); // bump epoch
     return new RowCursor(this.db, p.plan!, null, regs, p.columns);
+  }
+}
+
+/** A SQL statement. */
+export class Statement extends PreparedStatement {
+  constructor(
+    db: Database,
+    readonly parsed: ParsedStatement,
+    readonly sql: string,
+  ) {
+    super(db);
+  }
+
+  protected compileProgram(): Program {
+    return this.db.compile(this.parsed);
+  }
+
+  protected bindParams(params: BindParams | undefined, regs: SqlValue[]): void {
+    bindParamValues(this.parsed, params, regs);
+  }
+
+  protected readsMemoryObjects(): boolean {
+    return this.db.usesMemoryObjects(this.parsed);
+  }
+
+  get paramCount(): number {
+    return this.parsed.paramCount;
+  }
+}
+
+/** A statement given as plan data (`Database.preparePlan`): parameters are positional. */
+export class PlanStatement extends PreparedStatement {
+  /** @internal */
+  constructor(
+    db: Database,
+    /** The statement, validated and in the engine's terms. */
+    readonly bound: BoundStatement,
+    readonly paramCount: number,
+  ) {
+    super(db);
+  }
+
+  protected compileProgram(): Program {
+    return this.db.compileBound(this.bound, this.paramCount, '');
+  }
+
+  protected bindParams(params: BindParams | undefined, regs: SqlValue[]): void {
+    const n = this.paramCount;
+    if (params !== undefined && !Array.isArray(params)) throw new SmaltError('SMALT_RANGE', "a plan's parameters are positional: bind them with an array");
+    const values = (params ?? []) as readonly (SqlValue | boolean | undefined)[];
+    if (values.length !== n) throw new SmaltError('SMALT_RANGE', `statement expects ${n} parameter(s), got ${values.length}`);
+    for (let i = 0; i < n; i++) regs[i] = normalizeParam(values[i], i + 1);
+  }
+
+  protected readsMemoryObjects(): boolean {
+    return this.db.planUsesMemoryObjects(this.bound);
   }
 }
 
@@ -4714,4 +4852,18 @@ function remapIndexDef(name: string, m: (i: number) => number, defs: Map<string,
   if (d?.kind !== 'index') return;
   const i = d.index;
   change.defs.set(key, { ...d, index: { ...i, columns: i.columns.map((c) => ({ ...c, column: c.column < 0 ? c.column : m(c.column), ...(c.expr ? { expr: remapExpr(c.expr, m) } : {}) })), ...(i.where ? { where: remapExpr(i.where, m) } : {}) } });
+}
+
+/** A plan statement's plans in the layering the physical planner reads (exec/plan-normalize.ts). */
+function normalizeBound(b: BoundStatement): BoundStatement {
+  switch (b.kind) {
+    case 'query':
+      return { ...b, plan: normalizePlan(b.plan) };
+    case 'explain':
+      return { ...b, query: { ...b.query, plan: normalizePlan(b.query.plan) } };
+    case 'write':
+      return { ...b, plan: normalizeWrite(b.plan) };
+    default:
+      return b;
+  }
 }

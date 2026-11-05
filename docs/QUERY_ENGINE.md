@@ -33,6 +33,12 @@ schema operation too: the engine changes the stored definitions, and the languag
 them (`SourceEditor`; SQL's is `sql/frontend/source-edit.ts`), as SQLite edits its stored statements. Views, kept as
 source, are checked again after the change.
 
+Plans can also come from outside a language: `Database.preparePlan` / `queryPlan` take a statement as plan data
+(`plan/statement.ts`; the `plan` namespace of `smaltdb/engine` has the format's types and builders, ADR 0015 step 8).
+The engine validates them as it validates SQL's, then puts each query block in the layering the physical planner reads
+(`exec/plan-normalize.ts`): identity projections where a builder left a layer out, and any other operation as a nested
+FROM item.
+
 Before binding, the front end merges simple views and FROM subqueries into the query (`exec/flatten.ts`, an AST
 rewrite). Materialized-view matching works on the bound plan (`exec/plan-mv-match.ts`), at any depth, including the
 inner sides the planner builds when it decorrelates a subquery. Languages bind against the logical catalog
