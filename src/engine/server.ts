@@ -17,13 +17,16 @@
  * - **Sessions that disappear** (a closed tab) lose their queued work and streams; an open
  *   transaction is rolled back.
  */
-import { type BindParams, Database, RowCursor, type Statement } from './database.js';
+import { type BindParams, Database, type PreparedStatement, RowCursor, Statement } from './database.js';
+import { decodeDataJSON } from './plan/codec.js';
+import type { PlanStatementInput } from './plan/statement.js';
+import { PLAN_FORMAT_VERSION } from './plan/types.js';
 import { MisuseError, SmaltError, errorCode } from './errors.js';
 import { AsyncRequiredError } from './external/external.js';
 import { parse } from './sql/parser.js';
 import { type SmaltPlugin, askError } from './plugin.js';
 import type { Vfs } from './vfs/types.js';
-import { type ReaderSettings, type Request, type Response, encodeColumns } from '../shared/protocol.js';
+import { type ReaderSettings, type Request, type RequestBody, type Response, encodeColumns } from '../shared/protocol.js';
 import type { SqlValue } from './values.js';
 import type { EncodedPlan } from './plan/codec.js';
 
@@ -69,7 +72,7 @@ export interface ReaderPool {
    * Hand a read-only query to an idle reader; false when none is idle. The reader applies
    * `settings` (the owner's PRAGMA settings) before it runs the query.
    */
-  dispatch(session: string, req: Extract<Request, { op: 'query' }>, settings: ReaderSettings): boolean;
+  dispatch(session: string, req: Extract<Request, { op: 'query' | 'queryPlan' }>, settings: ReaderSettings): boolean;
   /** Route a credit or cancel for a query a reader is serving; false if none is. */
   forward(session: string, req: Request): boolean;
   /** Readers idle right now (morsel parallelism needs at least two). */
@@ -106,7 +109,7 @@ export class EngineServer {
   db: Database | null = null;
   private readonly queue: Job[] = [];
   private readonly streams: Stream[] = [];
-  private readonly statements = new Map<number, Statement>();
+  private readonly statements = new Map<number, PreparedStatement>();
   private nextStmt = 1;
   private txOwner: string | null = null;
   /** Sessions whose transaction a request of theirs ended (COMMIT or ROLLBACK), until they ask with 'endTransaction'. */
@@ -487,10 +490,25 @@ export class EngineServer {
       }
       case 'query': {
         const st = this.requireDb().prepare(req.sql);
-        if (this.readsExternal(st)) return this.queryExternal(session, req.sql, req);
+        if (this.readsExternal(st)) return this.queryExternal(session, st, req);
         if (this.toMorsels(session, st, req.sql, req)) return;
-        if (this.toReader(session, st, req.sql, req)) return;
+        if (this.toReader(session, st, req)) return;
         this.startStream(session, id, st.cursor(req.params as BindParams | undefined), req.batchSize ?? 4096, req.credit);
+        return;
+      }
+      case 'queryPlan': {
+        const st = this.requireDb().cachedPlan(planInput(req));
+        if (this.readsExternal(st)) return this.queryExternal(session, st, req);
+        if (this.toReader(session, st, req)) return;
+        this.startStream(session, id, st.cursor(req.params as BindParams | undefined), req.batchSize ?? 4096, req.credit);
+        return;
+      }
+      case 'preparePlan': {
+        const st = this.requireDb().preparePlan(planInput(req));
+        const sid = this.nextStmt++;
+        this.statements.set(sid, st);
+        const columns = this.readsExternal(st) ? this.columnsIfKnown(st) : st.columns;
+        this.send(session, { id, kind: 'ok', stmt: sid, columns, paramCount: st.paramCount });
         return;
       }
       case 'prepare': {
@@ -505,17 +523,23 @@ export class EngineServer {
       case 'stmtRun': {
         const st = this.statement(req.stmt);
         const d = this.requireDb();
-        const r = this.readsExternal(st)
-          ? await this.withAbort(session, id, (signal) => d.runAsync(st.sql, req.params as BindParams | undefined, { signal }))
-          : st.run(req.params as BindParams | undefined);
+        const params = req.params as BindParams | undefined;
+        const r = !this.readsExternal(st)
+          ? st.run(params)
+          : st instanceof Statement
+            ? await this.withAbort(session, id, (signal) => d.runAsync(st.sql, params, { signal }))
+            : await this.withAbort(session, id, (signal) => d.withExternal(signal, st, () => st.run(params)));
         this.send(session, { id, kind: 'ok', changes: r.changes, lastInsertRowid: r.lastInsertRowid });
         return;
       }
       case 'stmtQuery': {
         const st = this.statement(req.stmt);
-        if (this.readsExternal(st)) return this.queryExternal(session, st.sql, req);
-        if (this.toMorsels(session, st, st.sql, req)) return;
-        if (this.toReader(session, st, st.sql, req)) return;
+        if (this.readsExternal(st)) return this.queryExternal(session, st, req);
+        // Prepared plans run on the owner: readers and morsels take SQL text or a whole plan request.
+        if (st instanceof Statement) {
+          if (this.toMorsels(session, st, st.sql, req)) return;
+          if (this.toReader(session, st, { id: req.id, op: 'query', sql: st.sql, params: req.params, batchSize: req.batchSize, credit: req.credit })) return;
+        }
         this.startStream(session, id, st.cursor(req.params as BindParams | undefined), req.batchSize ?? 4096, req.credit);
         return;
       }
@@ -551,9 +575,8 @@ export class EngineServer {
    * Whether `st` reads external tables or `read_csv` / `read_json` (M8), or is `REFRESH … IF
    * CHANGED` (which checks its view's sources first): those run on the async path.
    */
-  private readsExternal(st: Statement): boolean {
-    const s = st.parsed.stmt;
-    if (s.kind === 'refresh' && s.ifChanged) return true;
+  private readsExternal(st: PreparedStatement): boolean {
+    if (st instanceof Statement && st.parsed.stmt.kind === 'refresh' && st.parsed.stmt.ifChanged) return true;
     try {
       return st.externalSources.length > 0;
     } catch (e) {
@@ -562,7 +585,7 @@ export class EngineServer {
     }
   }
 
-  private columnsIfKnown(st: Statement): string[] {
+  private columnsIfKnown(st: PreparedStatement): string[] {
     try {
       return st.columns;
     } catch (e) {
@@ -587,9 +610,13 @@ export class EngineServer {
    * and its rows stream like a merged morsel result (they hold no read cursor). Never on parallel
    * readers, which have neither the registered files nor the credentials.
    */
-  private async queryExternal(session: string, sql: string, req: { id: number; params?: unknown; batchSize?: number; credit?: number }): Promise<void> {
+  private async queryExternal(session: string, st: PreparedStatement, req: { id: number; params?: unknown; batchSize?: number; credit?: number }): Promise<void> {
     const d = this.requireDb();
-    const result = await this.withAbort(session, req.id, (signal) => d.queryAsync(sql, req.params as BindParams | undefined, { signal }));
+    const params = req.params as BindParams | undefined;
+    const result =
+      st instanceof Statement
+        ? await this.withAbort(session, req.id, (signal) => d.queryAsync(st.sql, params, { signal }))
+        : await this.withAbort(session, req.id, (signal) => d.withExternal(signal, st, () => ({ columns: st.columns, rows: st.all(params) })));
     this.startStream(session, req.id, new RowCursor(d, null, result.rows, [], result.columns), req.batchSize ?? 4096, req.credit);
   }
 
@@ -597,13 +624,13 @@ export class EngineServer {
    * Parallel readers: a read-only query outside any transaction runs on an idle reader worker's
    * snapshot of the latest commit (the reader answers the session directly).
    */
-  private toReader(session: string, st: Statement, sql: string, req: { id: number; params?: unknown; batchSize?: number; credit?: number }): boolean {
+  private toReader(session: string, st: PreparedStatement, req: { id: number } & ReaderRequest): boolean {
     const pool = this.options.readers;
     if (!pool || this.txOwner !== null || this.db?.inTransaction || !st.readonly || st.usesMemoryObjects) return false;
     // A reader pays for a snapshot refresh and a hand-off: worth it only when other requests are
     // waiting behind this one (concurrent demand). Alone, the owner answers fastest.
     if (this.queue.length === 0) return false;
-    return pool.dispatch(session, { op: 'query', id: req.id, sql, params: req.params as never, batchSize: req.batchSize, credit: req.credit }, this.db!.readerSettings);
+    return pool.dispatch(session, { ...req, id: req.id } as Extract<Request, { op: ReaderRequest['op'] }>, this.db!.readerSettings);
   }
 
   /**
@@ -673,7 +700,7 @@ export class EngineServer {
     return true;
   }
 
-  private statement(id: number): Statement {
+  private statement(id: number): PreparedStatement {
     const st = this.statements.get(id);
     if (!st) throw new SmaltError('SMALT_MISUSE', 'statement is finalized');
     return st;
@@ -759,5 +786,18 @@ function isScript(sql: string): boolean {
     return parse(sql).length > 1;
   } catch {
     return false;
+  }
+}
+
+/** A query a parallel reader can answer: SQL text, or a plan. */
+type ReaderRequest = Extract<RequestBody, { op: 'query' | 'queryPlan' }>;
+
+/** The statement a plan request carries, in this engine's plan format. */
+function planInput(req: { plan: string; planVersion: number }): PlanStatementInput {
+  if (req.planVersion !== PLAN_FORMAT_VERSION) throw new SmaltError('SMALT_PLAN', `plan format version ${String(req.planVersion)} is not supported (this engine reads version ${PLAN_FORMAT_VERSION})`);
+  try {
+    return decodeDataJSON(req.plan) as PlanStatementInput;
+  } catch {
+    throw new SmaltError('SMALT_PLAN', 'the plan is not valid JSON');
   }
 }

@@ -34,6 +34,12 @@ export type Request = { id: number } & (
   /** `credit`: batches to send before waiting for a 'credit' request (backpressure); omitted = all. */
   | { op: 'query'; sql: string; params?: Params; batchSize?: number; credit?: number }
   | { op: 'prepare'; sql: string }
+  /**
+   * A statement given as plan data (ADR 0014 section 4): `plan` is its JSON text (engine/plan/codec.ts
+   * `encodeDataJSON`), in plan format `planVersion`. Parameters are positional.
+   */
+  | { op: 'queryPlan'; plan: string; planVersion: number; params?: readonly (SqlValue | boolean | undefined)[]; batchSize?: number; credit?: number }
+  | { op: 'preparePlan'; plan: string; planVersion: number }
   | { op: 'stmtRun'; stmt: number; params?: Params }
   | { op: 'stmtQuery'; stmt: number; params?: Params; batchSize?: number; credit?: number }
   | { op: 'finalize'; stmt: number }

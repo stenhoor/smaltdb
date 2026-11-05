@@ -24,6 +24,7 @@ The guide explains the concepts: [databases](../../guide/databases), [queries](.
 | [`RunResult`](#runresult) | type | Result of `exec` and `run` |
 | [`ArrayResult`](#arrayresult), [`ColumnarResult`](#columnarresult) | type | Results in `'array'` and `'columnar'` row mode |
 | [`SqlValue`](#sqlvalue), [`Params`](#params) | type | Values and parameters |
+| `PlanStatementInput`, `PlanParams` | type | A statement as plan data and its parameters, for [`queryPlan`](#queryplan). The plan format's types, builders and codec are in `smaltdb/plan`. |
 
 Import and export, registered files and credentials come from [plugins](../../guide/plugins), not from `smaltdb`. Their helpers are listed under [Plugin helpers](#plugin-helpers).
 
@@ -117,6 +118,25 @@ Compiles one statement in the engine and resolves to a [`PreparedStatement`](#pr
 const byId = await db.prepare('SELECT * FROM people WHERE id = ?');
 const [person] = await byId.query([42]);
 await byId.finalize();
+```
+
+### queryPlan
+
+`db.queryPlan(stmt: PlanStatementInput, params?: PlanParams, options?: QueryOptions): Promise<…>`
+
+`db.preparePlan(stmt: PlanStatementInput): Promise<PreparedStatement>`
+
+Run, or prepare, a statement given as plan data instead of SQL: the engine's own description of a query or a write, which every language builds. The plan format is **experimental**: it may change in any release until smaltdf, its first user besides SQL, has proven it. Its types, builders and codec are in `smaltdb/plan`, a separate entry point so that pages which don't build plans don't load them; the [engine reference](./engine#plans) describes `PlanStatementInput` and the builders. Parameters are positional (`PlanParams` is an array). Results, options, transactions and parallel readers work as for [`query`](#query); a statement from `preparePlan` is an ordinary [`PreparedStatement`](#preparedstatement). The plan crosses to the engine worker as JSON, and the engine validates it: an invalid plan rejects with [`SMALT_PLAN`](./errors#smalt-plan).
+
+```ts
+import { open } from 'smaltdb';
+import * as p from 'smaltdb/plan';
+
+const db = await open('app');
+await db.exec("CREATE TABLE IF NOT EXISTS people(id INTEGER PRIMARY KEY, name TEXT); INSERT OR IGNORE INTO people VALUES (1, 'Ada'), (2, 'Lin')");
+// SELECT name FROM people WHERE id = ?
+const byId = p.project(p.filter(p.scan('people', [0, 1]), p.call('sql.eq', [p.col(0, 0, 'int'), p.param(0, 'int')], 'int')), [p.col(0, 1, 'text')]);
+const rows = await db.queryPlan<{ name: string }>({ kind: 'query', plan: byId, columns: [{ name: 'name', type: 'text' }] }, [2]); // [{ name: 'Lin' }]
 ```
 
 ### transaction
@@ -263,7 +283,7 @@ async function countRows(q: Queryable, table: 'people' | 'orders'): Promise<numb
 }
 ```
 
-`query` and `exec`, with the same signatures as on `Database`. `Database` and the [`Transaction`](#transaction-1) handle implement it, so functions that take a `Queryable` work inside and outside transactions.
+`query`, `exec` and `queryPlan`, with the same signatures as on `Database`. `Database` and the [`Transaction`](#transaction-1) handle implement it, so functions that take a `Queryable` work inside and outside transactions.
 
 ### Transaction
 

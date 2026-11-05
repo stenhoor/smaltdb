@@ -83,6 +83,11 @@ function testPlugin(log: string[] = []): SmaltPlugin {
       host.addMethod('sessions', () => [...sessions]);
       host.addMethod('real', (_ctx, [x]) => host.formatReal(Number(x)));
       host.addMethod('sum', async (ctx, [sql]) => (await ctx.query(String(sql))).rows);
+      // A plan as plain data, as a plugin gets it (JSON): no builders, nothing imported from smaltdb.
+      host.addMethod('planSum', async (ctx, [table]) => {
+        const r = await ctx.queryPlan!({ kind: 'query', plan: { op: 'aggregate', input: { op: 'scan', table: String(table), columns: [0] }, keys: [], aggs: [{ fn: 'sum', args: [{ k: 'col', input: 0, index: 0, depth: 0, type: 'any', collation: 'binary' }], star: false, distinct: false, collation: 'binary', type: 'any' }], carry: [] }, columns: [{ name: 'total', type: 'real' }] });
+        return { columns: r.columns, rows: r.rows, types: r.columnTypes };
+      });
       host.onSessionClosed((s) => void sessions.delete(s));
     },
   };
@@ -153,6 +158,8 @@ describe('plugins', () => {
     const db = Database.openMemory({ plugins: [testPlugin()] });
     db.exec('CREATE TABLE n(x REAL); INSERT INTO n VALUES (1), (2.5)');
     expect(await db.callPlugin('test-plugin', 'sum', ['SELECT sum(x) FROM n'])).toEqual([[3.5]]);
+    expect(await db.callPlugin('test-plugin', 'planSum', ['n'])).toEqual({ columns: ['total'], rows: [[3.5]], types: ['real'] });
+    expect(await code(db.callPlugin('test-plugin', 'planSum', ['nope']))).toBe('SMALT_PLAN');
     expect(await db.callPlugin('test-plugin', 'real', [2])).toBe('2.0');
     expect(await code(db.callPlugin('test-plugin', 'nope', []))).toBe('SMALT_MISUSE');
     await expect(db.callPlugin('@smaltdb/io', 'importCSV', [])).rejects.toMatchObject({ code: 'SMALT_PLUGIN_MISSING', message: 'importCSV(): import and export needs the @smaltdb/io plugin (install it and add it to the engine\'s plugins)' });

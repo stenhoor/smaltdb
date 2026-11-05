@@ -341,6 +341,7 @@ of `callPlugin`.
 | `session: string` | The calling client session (a tab), or `'local'` in-process. |
 | `signal?: AbortSignal` | Aborted when the call is cancelled, and in the engine worker also when the calling tab closes (its transaction is then rolled back). Check it after each `await`: work that goes on after it is aborted runs outside the transaction it was meant for. |
 | `query(sql, params?): Promise<{ columns: string[]; rows: SqlValue[][]; columnTypes: StaticType[] }>` | Run one statement that may read external data (its sources are fetched first). Returns its rows, column names, and the static type of each column: `'int'`, `'real'`, `'num'`, `'text'`, `'blob'`, `'null'` or `'any'`. |
+| `queryPlan?(stmt, params?): Promise<{ columns: string[]; rows: SqlValue[][]; columnTypes: StaticType[] }>` | Like `query`, for a statement given as plan data (see [plans](./engine#plans); the plan format is experimental). Parameters are positional. Optional: engines older than smaltdb 0.9.0 do not have it, so check for it before calling. |
 
 Through the worker client, `args` and the result cross to the engine worker with `postMessage`, so they must be values
 the browser can clone: no functions. In-process, they are passed as they are.

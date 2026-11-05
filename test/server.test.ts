@@ -4,6 +4,9 @@ import { EngineServer } from '../src/engine/server.js';
 import type { Request, Response } from '../src/shared/protocol.js';
 import { columnValue } from '../src/shared/protocol.js';
 import { pause, until } from './helpers/wait.js';
+import { plan as p } from '../src/engine/index.js';
+import { encodeDataJSON } from '../src/engine/plan/codec.js';
+import { PLAN_FORMAT_VERSION } from '../src/engine/plan/types.js';
 
 type Msg = { session: string; msg: Response };
 
@@ -48,6 +51,46 @@ describe('EngineServer', () => {
     const sq = t.send('tab-b', { op: 'stmtQuery', stmt, params: [2] });
     await until('the statement query', () => t.done('tab-b', sq));
     expect(t.rows('tab-b', sq)).toEqual([[2]]);
+  });
+
+  it('serves statements given as plan data: queries, prepared plans and writes', async () => {
+    const t = setup();
+    t.send('local', { op: 'exec', sql: 'CREATE TABLE t(a INT, b TEXT); INSERT INTO t VALUES (1, \'x\'), (2, \'y\'), (3, \'z\')' });
+    const wire = (stmt: unknown) => ({ plan: encodeDataJSON(stmt), planVersion: PLAN_FORMAT_VERSION });
+    const a = p.col(0, 0, 'int');
+    const big = p.filter(p.scan('t', [0, 1]), p.call('sql.gt', [a, p.param(0, 'int')], 'int'));
+    const q = t.send('tab-b', { op: 'queryPlan', ...wire({ kind: 'query', plan: big, columns: [{ name: 'a' }, { name: 'b' }] }), params: [1] });
+    await until('the plan query', () => t.done('tab-b', q));
+    expect(t.of('tab-b', q).find((m) => m.kind === 'columns')).toMatchObject({ columns: ['a', 'b'] });
+    expect(t.rows('tab-b', q)).toEqual([[2, 'y'], [3, 'z']]);
+    // Prepared: run as a statement, with a bigint parameter through JSON.
+    const pr = t.send('tab-b', { op: 'preparePlan', ...wire(big) });
+    await until('preparePlan', () => t.done('tab-b', pr));
+    expect(t.of('tab-b', pr)[0]).toMatchObject({ kind: 'ok', columns: ['column1', 'column2'], paramCount: 1 });
+    const stmt = (t.of('tab-b', pr)[0] as { stmt: number }).stmt;
+    const sq = t.send('tab-b', { op: 'stmtQuery', stmt, params: [2n] });
+    await until('the prepared plan', () => t.done('tab-b', sq));
+    expect(t.rows('tab-b', sq)).toEqual([[3, 'z']]);
+    const w = t.send('tab-b', { op: 'preparePlan', ...wire({ kind: 'write', plan: p.append('t', p.values([[p.param(0, 'int'), p.lit('w')]]), [0, 1]) }) });
+    await until('prepare the write', () => t.done('tab-b', w));
+    const run = t.send('tab-b', { op: 'stmtRun', stmt: (t.of('tab-b', w)[0] as { stmt: number }).stmt, params: [9] });
+    await until('the write', () => t.done('tab-b', run));
+    expect(t.of('tab-b', run)[0]).toMatchObject({ kind: 'ok', changes: 1 });
+    // Errors: another plan format, text that is not JSON, an invalid plan.
+    const bad = [
+      t.send('tab-b', { op: 'queryPlan', plan: encodeDataJSON(big), planVersion: PLAN_FORMAT_VERSION + 1, params: [1] }),
+      t.send('tab-b', { op: 'queryPlan', plan: '{', planVersion: PLAN_FORMAT_VERSION }),
+      t.send('tab-b', { op: 'queryPlan', ...wire(p.scan('nope', [0])) }),
+    ];
+    await until('the errors', () => bad.every((r) => t.done('tab-b', r)));
+    expect(bad.map((r) => t.of('tab-b', r)[0])).toEqual([
+      expect.objectContaining({ kind: 'error', code: 'SMALT_PLAN', message: expect.stringMatching(/plan format version 1 is not supported/) }),
+      expect.objectContaining({ kind: 'error', code: 'SMALT_PLAN', message: 'the plan is not valid JSON' }),
+      expect.objectContaining({ kind: 'error', code: 'SMALT_PLAN', message: expect.stringMatching(/nope/) }),
+    ]);
+    const c = t.send('local', { op: 'query', sql: 'SELECT count(*) FROM t' });
+    await until('count', () => t.done('local', c));
+    expect(t.rows('local', c)).toEqual([[4]]);
   });
 
   it('streams with credits and pauses without them', async () => {

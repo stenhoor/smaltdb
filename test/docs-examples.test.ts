@@ -250,6 +250,7 @@ describe('documentation TypeScript examples', () => {
           paths: {
             smaltdb: [join(root, 'src/client/index.ts')],
             'smaltdb/engine': [join(root, 'src/engine/index.ts')],
+            'smaltdb/plan': [join(root, 'src/engine/plan/portable.ts')],
             'smaltdb/worker-runtime': [join(root, 'src/engine/worker-runtime.ts')],
           },
         },

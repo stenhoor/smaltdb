@@ -3,9 +3,19 @@
  * See docs/API.md.
  */
 import type { SqlValue } from '../engine/values.js';
+import { encodeDataJSON } from '../engine/plan/codec.js';
+import type { PlanStatementInput } from '../engine/plan/statement.js';
+import { PLAN_FORMAT_VERSION } from '../engine/plan/types.js';
 import { type BusMessage, type Params, type Request, type RequestBody, type Response, type WireColumn, columnValue } from '../shared/protocol.js';
 
-export type { SqlValue, Params };
+/** A statement as plan data (the plan format is experimental): its types, builders and codec are in `smaltdb/plan`. */
+export type { SqlValue, Params, PlanStatementInput };
+
+/** A plan's parameters: positional. */
+export type PlanParams = readonly (SqlValue | boolean | undefined)[];
+
+/** A statement as plan data, as the worker protocol carries it. */
+const planRequest = (stmt: PlanStatementInput): { plan: string; planVersion: number } => ({ plan: encodeDataJSON(stmt), planVersion: PLAN_FORMAT_VERSION });
 
 export interface OpenOptions {
   /** 'opfs' (default) persists in the Origin Private File System; 'memory' is discarded on close. */
@@ -151,6 +161,8 @@ type QueryResultFor<M extends RowMode | undefined, T> = M extends 'array' ? Arra
 export interface Queryable {
   query<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(sql: string, params?: Params, options?: QueryOptions & { rowMode?: M }): Promise<QueryResultFor<M, T>>;
   exec(sql: string, params?: Params, options?: { signal?: AbortSignal }): Promise<RunResult>;
+  /** Run a statement given as plan data and return its rows (see Database.queryPlan). */
+  queryPlan<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(stmt: PlanStatementInput, params?: PlanParams, options?: QueryOptions & { rowMode?: M }): Promise<QueryResultFor<M, T>>;
 }
 
 /**
@@ -395,6 +407,28 @@ export class Database implements Queryable {
     return materialize(res.columns, res.batches, options.rowMode ?? 'object');
   }
 
+  /** @internal Unlocked plan query (used inside transactions). */
+  async rawQueryPlan(stmt: PlanStatementInput, params: PlanParams | undefined, options: QueryOptions): Promise<unknown> {
+    const res = (await this.request({ op: 'queryPlan', ...planRequest(stmt), params, batchSize: options.batchSize }, options.signal)) as { columns: string[]; batches: { length: number; cols: WireColumn[] }[] };
+    return materialize(res.columns, res.batches, options.rowMode ?? 'object');
+  }
+
+  /**
+   * Run a statement given as plan data instead of SQL (the plan format is experimental; see the `plan` export): a
+   * query plan, or a query, write or other statement as `PlanStatementInput` describes. Parameters are positional.
+   * Rows come back as `query` returns them; like `query`, it may run on a parallel reader.
+   */
+  queryPlan<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(stmt: PlanStatementInput, params?: PlanParams, options: QueryOptions & { rowMode?: M } = {}): Promise<QueryResultFor<M, T>> {
+    return this.afterTransaction(() => this.rawQueryPlan(stmt, params, options)) as Promise<QueryResultFor<M, T>>;
+  }
+
+  /** Prepare a statement given as plan data (see queryPlan). Its parameters are positional. */
+  async preparePlan(stmt: PlanStatementInput): Promise<PreparedStatement> {
+    const epoch = this.epoch;
+    const r = (await this.withLock(() => this.request({ op: 'preparePlan', ...planRequest(stmt) }))) as { stmt: number; columns: string[]; paramCount: number };
+    return new PreparedStatement(this, r.stmt, r.columns, r.paramCount, epoch);
+  }
+
   /** @internal */
   async rawExec(sql: string, params: Params | undefined, signal?: AbortSignal): Promise<RunResult> {
     const r = (await this.request({ op: 'exec', sql, params }, signal)) as { changes: number; lastInsertRowid: number | bigint };
@@ -591,6 +625,7 @@ export class Database implements Queryable {
     const ended = (): SmaltdbError => new SmaltdbError('SMALT_MISUSE', 'the transaction has ended: use tx only while the transaction callback runs');
     const tx: Transaction = {
       query: (sql, params, options = {}) => (active ? this.rawQuery(sql, params, options) : Promise.reject(ended())) as never,
+      queryPlan: (stmt, params, options = {}) => (active ? this.rawQueryPlan(stmt, params, options) : Promise.reject(ended())) as never,
       exec: (sql, params, options = {}) => (active ? this.rawExec(sql, params, options.signal) : Promise.reject(ended())),
       stream: (sql, params, options = {}) => (active ? this.openStream({ op: 'query', sql, params, batchSize: options.batchSize }, options) : failingIterator(ended())) as never,
       statement: (stmt) => {

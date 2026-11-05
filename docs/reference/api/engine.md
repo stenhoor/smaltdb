@@ -138,7 +138,7 @@ A statement can also be given as plan data instead of SQL: the engine's own desc
 
 The engine validates every plan before planning it: operations and functions must exist, with the right arguments, and every column position must be within its input. An invalid plan fails with [`SMALT_PLAN`](./errors#smalt-plan), whose message gives the path to the part that is wrong. Parameters are positional: a plan reads `param` 0, 1, …, and is run with an array of that many values.
 
-The `plan` namespace holds the format's types (`PlanOp`, `PlanExpr`, `PlanType`, …), the validator (`validatePlan`), the codec (`planToJSON`, `planFromJSON`, `encodePlan`, `decodePlan`) and builders that fill in the usual values:
+The `plan` namespace holds the format's types (`PlanOp`, `PlanExpr`, `PlanType`, …), the validator (`validatePlan`), the codec (`planToJSON`, `planFromJSON`, `encodePlan`, `decodePlan`) and builders that fill in the usual values. `smaltdb/plan` exports the same without the validator, for code that builds plans without the engine, such as a page that sends them to the [client](./client#queryplan):
 
 | Builders | |
 |---|---|
