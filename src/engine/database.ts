@@ -19,6 +19,7 @@ import { MisuseError, SmaltError } from './errors.js';
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
 import type { PlanOp } from './plan/ops.js';
 import { planFromJSON, planToJSON } from './plan/codec.js';
+import { type ValidateCatalog, validatePlan } from './plan/validate.js';
 import { type PlanExpr, forEachCol } from './plan/expr.js';
 import type { CollationName } from './plan/types.js';
 import { type Compiled, type Fn } from './exec/expr.js';
@@ -186,16 +187,13 @@ interface Program {
 }
 
 let roundTrip: boolean | undefined;
-/**
- * A plan from the front end as the engine receives it. With SMALT_PLAN_ROUNDTRIP=1 (tests), every plan goes through
- * its JSON form first (plan/codec.ts), so the suites check that a decoded plan plans and runs as the original.
- */
-function received<T extends { plan: PlanOp }>(fe: T): T {
+/** SMALT_PLAN_ROUNDTRIP=1 (tests): every plan goes through its JSON form before the engine plans it. */
+function roundTripOn(): boolean {
   if (roundTrip === undefined) {
     const g = globalThis as { process?: { env?: Record<string, string | undefined> } };
     roundTrip = !!g.process?.env?.SMALT_PLAN_ROUNDTRIP;
   }
-  return roundTrip ? { ...fe, plan: planFromJSON(planToJSON(fe.plan)) } : fe;
+  return roundTrip;
 }
 
 /**
@@ -1042,6 +1040,19 @@ export class Database implements FunctionContext {
   }
 
   /** What the SQL front end (ADR 0014, step 5) reads of the catalog (it reads the database's state when called). */
+  /**
+   * A plan from a language as the engine receives it: validated (plan/validate.ts) before it is planned. With
+   * SMALT_PLAN_ROUNDTRIP=1 (tests) it goes through its JSON form first (plan/codec.ts), so the suites check that a
+   * decoded plan plans and runs as the original.
+   */
+  private received<T extends { plan: PlanOp }>(fe: T): T {
+    const r = roundTripOn() ? { ...fe, plan: planFromJSON(planToJSON(fe.plan)) } : fe;
+    validatePlan(r.plan, this.validateCatalog);
+    return r;
+  }
+
+  private readonly validateCatalog: ValidateCatalog = { tableColumns: (name, db) => this.getTable(name, db)?.columns.length };
+
   /** The logical catalog languages bind against (plan/bind-context.ts): the planner's tables, views and sources. */
   private bindContext(): BindContext {
     return (this.bindCtx ??= {
@@ -1081,7 +1092,7 @@ export class Database implements FunctionContext {
    * materialized-view matching on its plan under the statement's policy (exec/plan-mv-match.ts).
    */
   private planSelectStmt(stmt: SelectStmt, text: string, planner: Planner, catalog: BindContext = this.bindContext()): QueryPlan {
-    const fe = received(toPlan(stmt, text, catalog));
+    const fe = this.received(toPlan(stmt, text, catalog));
     const rewrite = planner.env.rewritePlan;
     const p = planner.planPlan(rewrite ? rewrite(fe.plan) : fe.plan, fe.columns);
     if (!p) throw new SmaltError('SMALT_INTERNAL', `the physical planner declined a query\n  in: ${text}`);
@@ -1750,7 +1761,7 @@ export class Database implements FunctionContext {
       if (m.plan?.version !== this.schemaVersion) {
         let bound: PlanOp | null;
         try {
-          bound = received(toPlan(m.select, m.sql, this.bindContext())).plan;
+          bound = this.received(toPlan(m.select, m.sql, this.bindContext())).plan;
         } catch {
           bound = null;
         }
@@ -3508,7 +3519,7 @@ export class Database implements FunctionContext {
     };
     const physical = (): InsertParts | null => {
       const p = prefix();
-      const fe = received(toInsertPlan(stmt, table, targets.map((t) => (t === -2 ? -1 : t)), planner.sqlText, this.bindContext()));
+      const fe = this.received(toInsertPlan(stmt, table, targets.map((t) => (t === -2 ? -1 : t)), planner.sqlText, this.bindContext()));
       // Materialized-view matching may answer the SELECT source (under the statement's policy).
       const rewrite = planner.env.rewritePlan;
       const op = rewrite ? rewrite(fe.plan) : fe.plan;
@@ -3720,7 +3731,7 @@ export class Database implements FunctionContext {
       return { ...t, defaults, base, checkRowid, checks, ret: returning(base, checkRowid) };
     };
     const physical = (): UpdateParts | null => {
-      const fe = received(toUpdatePlan(stmt, table, planner.sqlText, this.bindContext()));
+      const fe = this.received(toUpdatePlan(stmt, table, planner.sqlText, this.bindContext()));
       const op = fe.plan;
       const p = op.op === 'update' ? planner.planUpdate(op) : null;
       if (!p || op.op !== 'update') return null;
@@ -3748,7 +3759,7 @@ export class Database implements FunctionContext {
    */
   private deleteParts(stmt: DeleteStmt, table: TableSchema, planner: Planner): DeleteParts {
     const physical = (): DeleteParts | null => {
-      const fe = received(toDeletePlan(stmt, table, planner.sqlText, this.bindContext()));
+      const fe = this.received(toDeletePlan(stmt, table, planner.sqlText, this.bindContext()));
       const p = fe.plan.op === 'delete' ? planner.planDelete(fe.plan) : null;
       if (!p) return null;
       const ret = fe.returning && { columns: fe.returning.map((c) => c.name), types: fe.returning.map((c) => c.type), fns: p.returning! };
