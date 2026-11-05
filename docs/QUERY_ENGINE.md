@@ -22,6 +22,11 @@ SQL text
     per next() call
 ```
 
+Every statement is bound before the engine compiles it (`sql/frontend/bind.ts`, ADR 0015 step 6): queries and
+writes become plans, and transactions, settings (PRAGMA) and maintenance (ANALYZE, VACUUM, REFRESH) become bound
+statements in the engine's terms (`plan/bound.ts`), which `Database.compile` dispatches on. DDL still reaches the
+engine as SQL until it becomes schema operations.
+
 Before binding, the front end merges simple views and FROM subqueries into the query (`exec/flatten.ts`, an AST
 rewrite). Materialized-view matching works on the bound plan (`exec/plan-mv-match.ts`), at any depth, including the
 inner sides the planner builds when it decorrelates a subquery. Languages bind against the logical catalog
