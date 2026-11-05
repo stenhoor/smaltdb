@@ -1585,8 +1585,8 @@ export class Planner {
   }
 
   /**
-   * An index's expression or WHERE conjunct (over its table's row) bound to `src`'s registers (cached per source). The
-   * columns it reads are marked as read, as when the source is scanned.
+   * An index's expression or WHERE conjunct (over its table's row) bound to `src`'s registers (cached per source), for
+   * matching and costing only: it is never compiled, so it marks no column as read (an index-only scan stays possible).
    */
   private indexBound(src: Source, e: PlanExpr): BoundExpr {
     let m = this.indexBounds.get(src);
@@ -1595,13 +1595,9 @@ export class Planner {
     if (b === undefined) {
       const n = src.table!.columns.length;
       b = rebind(e, (c) => {
-        if (c.index === n) {
-          if (!this.dryCompile) src.access?.useRowid(src.rowidReg);
-          return slotFor(c, src.rowidReg);
-        }
+        if (c.index === n) return slotFor(c, src.rowidReg);
         const sc = src.cols.find((x) => x.index === c.index);
         if (!sc) throw new SmaltError('SMALT_INTERNAL', `index column ${c.index} is not a column of ${src.name}`);
-        if (!this.dryCompile) src.access?.use(sc.index, sc.reg);
         return slotFor(c, sc.reg);
       });
       m.set(e, b);

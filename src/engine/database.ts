@@ -3285,22 +3285,37 @@ export class Database implements FunctionContext {
   }
 
   /**
-   * The table's CHECK constraints over a row in registers (`base + i`, the rowid in `rowidReg`), bound as plan
-   * expressions from the table's SQL. Unnamed checks are reported by their text.
+   * The table's CHECK constraints and column DEFAULTs as plan expressions, bound from the table's SQL once per schema
+   * version: CHECKs over the table's row (column `i` is `#0.i`, the rowid `#0.n`), DEFAULTs reading no columns.
    */
+  private tableExprs(table: TableSchema): { checks: { expr: PlanExpr; name: string }[]; defaults: (PlanExpr | null)[] } {
+    const hit = this.tableExprCache.get(table);
+    if (hit && hit.version === this.schemaVersion) return hit;
+    const ctx = this.bindContext();
+    const r = {
+      version: this.schemaVersion,
+      checks: table.checks.map((c) => ({ expr: toRowExpr(c.expr, table, table.sql, ctx), name: c.name ?? table.sql.slice(c.expr.pos, c.expr.end) })),
+      defaults: table.columns.map((c) => (c.defaultExpr ? toValueExpr(c.defaultExpr, table.sql, ctx) : null)),
+    };
+    this.tableExprCache.set(table, r);
+    return r;
+  }
+
+  private readonly tableExprCache = new WeakMap<TableSchema, { version: number; checks: { expr: PlanExpr; name: string }[]; defaults: (PlanExpr | null)[] }>();
+
+  /** The table's CHECK constraints over a row in registers (`base + i`, the rowid in `rowidReg`). */
   private compileChecks(table: TableSchema, base: number, rowidReg: number, planner: Planner): { fn: Fn; name: string }[] {
     if (!table.checks.length) return [];
     const n = table.columns.length;
     const pure = pureFunctionContext(this, 'a CHECK constraint');
-    return table.checks.map((c) => {
-      const e = toRowExpr(c.expr, table, table.sql, this.bindContext());
-      return { fn: planner.compileAt([e], (i) => (i < n ? base + i : rowidReg), pure)[0].fn, name: c.name ?? table.sql.slice(c.expr.pos, c.expr.end) };
-    });
+    const regOf = (i: number): number => (i < n ? base + i : rowidReg);
+    return this.tableExprs(table).checks.map((c) => ({ fn: planner.compileAt([c.expr], regOf, pure)[0].fn, name: c.name }));
   }
 
-  /** The table's column DEFAULTs (null where none), bound as plan expressions from the table's SQL. */
+  /** The table's column DEFAULTs (null where none). */
   private compileDefaults(table: TableSchema, planner: Planner): (Compiled | null)[] {
-    return table.columns.map((c) => (c.defaultExpr ? planner.compileAt([toValueExpr(c.defaultExpr, table.sql, this.bindContext())], () => -1)[0] : null));
+    if (!table.columns.some((c) => c.defaultExpr)) return table.columns.map(() => null);
+    return this.tableExprs(table).defaults.map((e) => (e ? planner.compileAt([e], () => -1)[0] : null));
   }
 
   /** Whether an INSERT may delete rows to resolve conflicts (OR REPLACE, or a constraint's ON CONFLICT REPLACE). */
