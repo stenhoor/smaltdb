@@ -809,22 +809,23 @@ export class Database implements FunctionContext {
   private readonly fk = new ForeignKeys({
     getTable: (n) => this.tables.get(n.toLowerCase()),
     allTables: () => [...this.tables.values()].filter((t) => !t.system),
-    query: (sql, params) => this.internal(sql, params) ?? [],
-    run: (sql, params) => void this.internal(sql, params),
+    run: (plan, params) => this.internalPlan(plan, params) ?? [],
+    defaultValue: (t, c) => this.tableExprs(t).defaults[c] ?? null,
   });
 
-  private internalPrograms = new Map<string, { version: number; prog: Program }>();
+  private internalPrograms = new WeakMap<PlanOp, { version: number; prog: Program }>();
 
   /**
    * Run an internal statement (foreign-key checks and actions) with positional parameters, inside
    * the current statement: no transaction handling, and changes() is not affected.
    */
-  private internal(sql: string, params: SqlValue[]): SqlValue[][] | null {
-    let c = this.internalPrograms.get(sql);
+  private internalPlan(plan: PlanOp, params: SqlValue[]): SqlValue[][] | null {
+    let c = this.internalPrograms.get(plan);
     if (!c || c.version !== this.schemaVersion) {
-      const ps = parseOne(sql);
-      c = { version: this.schemaVersion, prog: this.compile(ps) };
-      this.internalPrograms.set(sql, c);
+      const write = plan.op === 'append' || plan.op === 'update' || plan.op === 'delete';
+      const bound = normalizeBound(toBoundStatement(write ? { kind: 'write', plan } : plan, (x) => this.receivedPlan(x)));
+      c = { version: this.schemaVersion, prog: this.compileBound(bound, paramCount(bound), '') };
+      this.internalPrograms.set(plan, c);
     }
     const p = c.prog;
     const regs: SqlValue[] = new Array(p.regCount).fill(null);
@@ -1719,9 +1720,20 @@ export class Database implements FunctionContext {
     const lower = name.toLowerCase();
     const mem = this.memExtCache.get(lower);
     if (mem) return mem;
-    if (!this.tables.has('smalt_extcache')) return [];
-    const rows = this.query('SELECT sources FROM smalt_extcache WHERE lower(name) = ?', [lower]).rows;
-    return rows.length ? (JSON.parse(rows[0][0] as string) as ExternalCacheEntry[]) : [];
+    const t = this.tables.get('smalt_extcache');
+    if (!t) return [];
+    const reader = new RecordReader(t.layout, t.recordDefaults);
+    const c = this.tree(t.rootPage).cursor();
+    try {
+      for (let ok = c.first(); ok; ok = c.next()) {
+        c.loadValue();
+        reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+        if (String(reader.column(0)).toLowerCase() === lower) return JSON.parse(String(reader.column(1))) as ExternalCacheEntry[];
+      }
+    } finally {
+      c.close();
+    }
+    return [];
   }
 
   /**
@@ -3138,7 +3150,7 @@ export class Database implements FunctionContext {
       // Like SQLite, dropping a parent table first deletes its rows (applying foreign-key actions).
       if (this.fk.enabled && this.tables.size > 1 && [...this.tables.values()].some((t) => t !== table && t.foreignKeys.some((f) => f.table.toLowerCase() === lower))) {
         this.fk.sync(this.schemaVersion);
-        this.internal(`DELETE FROM main."${table.name.replace(/"/g, '""')}"`, []);
+        this.internalPlan({ op: 'delete', table: table.name, db: 'main', input: { op: 'scan', table: table.name, db: 'main', columns: [-1] }, rowid: 0 }, []);
       }
       this.dirtySchema = true;
       this.objectChanged(table.name);

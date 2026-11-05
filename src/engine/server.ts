@@ -265,7 +265,7 @@ export class EngineServer {
     }
     if (this.txOwner === session && this.db?.inTransaction) {
       try {
-        this.db.exec('ROLLBACK');
+        this.db.preparePlan({ kind: 'transaction', action: 'rollback' }).run();
       } catch {
         // already rolled back
       }
@@ -463,7 +463,7 @@ export class EngineServer {
         // The end of a client's db.transaction(): COMMIT / ROLLBACK, unless the callback already ended it.
         const d = this.requireDb();
         if (d.inTransaction) {
-          d.exec(req.commit ? 'COMMIT' : 'ROLLBACK');
+          d.preparePlan(req.commit ? { kind: 'transaction', action: 'commit' } : { kind: 'transaction', action: 'rollback' }).run();
           this.send(session, { id, kind: 'ok' });
           return;
         }
