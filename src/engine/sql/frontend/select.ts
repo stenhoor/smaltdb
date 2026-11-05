@@ -11,6 +11,7 @@ import { type ColumnBinding, type CompileScope, bindExpr as bindAst, conjuncts, 
 import { aggregateFunctions, scalarFunctions } from '../../exec/functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../../exec/window.js';
 import { flattenCore, flatteningDisabled } from './flatten.js';
+import { sqlView } from './views.js';
 import { aggregateCallName } from '../ast-util.js';
 import { containsAggregate, containsWindow, coreReferences, exprEquals, firstAggregateCall, firstWindowCall, sameName, selectReferences } from './ast-helpers.js';
 import { type BoundExpr, type PlanExpr, typeOf } from '../../plan/expr.js';
@@ -314,7 +315,7 @@ class FrontEnd {
     if (core.kind !== 'select' || !core.from || flatteningDisabled()) return { core, orderBy, changed: false };
     return flattenCore(core, orderBy, {
       getTable: (n, schema) => this.catalog.getTable(n, schema),
-      getView: (n, schema) => this.catalog.getView?.(n, schema),
+      getView: (n, schema) => sqlView(this.catalog.getView?.(n, schema)),
       isCte: (n) => scope?.findCte(n) !== undefined,
       text: this.text,
     });
@@ -1071,7 +1072,7 @@ class FrontEnd {
     }
     const view =
       item.kind === 'table' && (!item.schema || ['main', 'temp'].includes(item.schema.toLowerCase())) && !(!item.schema && scope.findCte(item.name)) && !this.catalog.getTable(item.name, item.schema)
-        ? this.catalog.getView?.(item.name, item.schema)
+        ? sqlView(this.catalog.getView?.(item.name, item.schema))
         : undefined;
     if (item.kind === 'subquery' || view || (item.kind === 'table' && !item.schema && scope.findCte(item.name))) {
       let names: string[] | undefined;
