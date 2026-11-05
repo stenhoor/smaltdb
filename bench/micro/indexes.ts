@@ -2,6 +2,7 @@
 //   npx tsx bench/micro/indexes.ts
 import sqliteInit from '@sqlite.org/sqlite-wasm';
 import { Database } from '../../src/engine/database.js';
+import '../../src/engine/sql/register.js';
 import { analyticRow } from '../browser/adapter.js';
 
 async function main(): Promise<void> {

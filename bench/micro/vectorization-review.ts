@@ -2,6 +2,7 @@
 // Run: npx esbuild bench/micro/vectorization-review.ts --bundle --platform=node --format=esm --outfile=.cache/vr.mjs --external:@sqlite.org/sqlite-wasm && node .cache/vr.mjs 1000000
 import sqliteInit from '@sqlite.org/sqlite-wasm';
 import { Database } from '../../src/engine/database.js';
+import '../../src/engine/sql/register.js';
 import { MemoryVfs } from '../../src/engine/vfs/memory.js';
 import { BTree } from '../../src/engine/storage/btree.js';
 const N = Number(process.argv[2] ?? 1_000_000);

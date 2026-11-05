@@ -3,6 +3,7 @@
 //   npx tsx bench/micro/m7-perf.ts
 // Each case reports the median of `reps` runs in ms.
 import { Database } from '../../src/engine/database.js';
+import '../../src/engine/sql/register.js';
 import { MemoryVfs } from '../../src/engine/vfs/memory.js';
 
 const reps = Number(process.env.REPS ?? 5);

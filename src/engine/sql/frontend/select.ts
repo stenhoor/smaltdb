@@ -3,23 +3,23 @@
  * columns by position: name resolution, view and CTE expansion, flattening, materialized-view matching and the
  * SQLite errors that go with them. Costing, access paths and operators are the physical planner's (exec/planner.ts).
  */
-import { type TableSchema, findColumn, storageTypeFor } from '../../catalog/schema.js';
-import { SmaltError } from '../../errors.js';
-import { type Affinity, type StaticType, affinityOfStorage, staticTypeOfStorage } from '../../exec/convert.js';
-import { CollSrc, boundMetadata, compileBoundExpr } from '../../exec/expr.js';
+import { type TableSchema, findColumn, storageTypeFor } from '../../language-support.js';
+import { SmaltError } from '../../language-support.js';
+import { type Affinity, type StaticType, affinityOfStorage, staticTypeOfStorage } from '../../language-support.js';
+import { CollSrc, boundMetadata, compileBoundExpr } from '../../language-support.js';
 import { type ColumnBinding, type CompileScope, bindExpr as bindAst, conjuncts, withCompiledMeta as withCompiledMetaBound } from './bind-expr.js';
-import { aggregateFunctions, scalarFunctions } from '../../exec/functions.js';
-import { NAVIGATION, RANKING, WINDOW_ARITY } from '../../exec/window.js';
+import { aggregateFunctions, scalarFunctions } from '../../language-support.js';
+import { NAVIGATION, RANKING, WINDOW_ARITY } from '../../language-support.js';
 import { flattenCore, flatteningDisabled } from './flatten.js';
 import { sqlView } from './views.js';
 import { aggregateCallName } from '../ast-util.js';
 import { containsAggregate, containsWindow, coreReferences, exprEquals, firstAggregateCall, firstWindowCall, sameName, selectReferences } from './ast-helpers.js';
-import { type BoundExpr, type PlanExpr, typeOf } from '../../plan/expr.js';
-import { getMeta, markFlattened, setMeta } from '../../exec/sql-meta.js';
-import type { AggCall, ConflictAction, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../plan/ops.js';
-import type { BindContext } from '../../plan/bind-context.js';
-import type { CollationName } from '../../plan/types.js';
-import { Collation, type SqlValue } from '../../values.js';
+import { type BoundExpr, type PlanExpr, typeOf } from '../../language-support.js';
+import { getMeta, markFlattened, setMeta } from '../../language-support.js';
+import type { AggCall, ConflictAction, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from '../../language-support.js';
+import type { BindContext } from '../../language-support.js';
+import type { CollationName } from '../../language-support.js';
+import { Collation, type SqlValue } from '../../language-support.js';
 import type { CallExpr, ColumnExpr, DeleteStmt, Expr, InsertStmt, UpdateStmt, UpsertClause, FrameBound, FromItem, JoinType, OrderingTerm, ResultColumn, SelectCore, SelectCoreSelect, SelectStmt, WindowSpec, WithClause } from '../ast.js';
 
 /**

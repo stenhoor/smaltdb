@@ -5,7 +5,7 @@
  *
  * Positions come from the AST (statement-relative) and the lexer's token boundaries.
  */
-import type { SourceEditor } from '../../plan/schema.js';
+import type { SourceEditor } from '../../language-support.js';
 import type { ColumnExpr, CreateTableStmt, Expr, FromItem, OrderingTerm, SelectCore, SelectStmt, Stmt } from '../ast.js';
 import { TK_ID, TK_NKW, TK_OP, TK_QID, type Tokens, isReservedKeyword, tokenize } from '../lexer.js';
 import { parseOne } from '../parser.js';

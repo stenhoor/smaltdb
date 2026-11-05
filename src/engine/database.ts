@@ -53,8 +53,7 @@ import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordEncoder, RecordReader } from './storage/record.js';
 import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec/stats.js';
 import { type CatalogSnapshot, informationSchema } from './catalog/information-schema.js';
-import { sqlLanguage } from './sql/language.js';
-import type { LanguageStatement, SmaltLanguage } from './plan/language.js';
+import { type LanguageStatement, type SmaltLanguage, registeredLanguage } from './plan/language.js';
 import { ForeignKeys } from './exec/fk.js';
 import { PluginRegistry, type SmaltPlugin } from './plugin.js';
 import { Collation, type SqlValue } from './values.js';
@@ -480,10 +479,11 @@ export class Database implements FunctionContext {
     return new Statement(this, this.sql.parseOne(sql), sql);
   }
 
-  /** SQL, the language of the string API (ADR 0015: languages register with the engine in step 9). */
+  /** SQL, the language of the string API: registered by smaltdb's entry points (sql/register.ts). */
   private get sql(): SmaltLanguage {
-    return this.languageOf('sql');
+    return (this.sqlLanguage ??= this.languageOf('sql'));
   }
+  private sqlLanguage: SmaltLanguage | undefined;
 
   /** @internal Whether `sql` holds more than one statement (false when it does not parse: running it reports that). */
   isScript(sql: string): boolean {
@@ -2477,9 +2477,9 @@ export class Database implements FunctionContext {
     return (m.deps ??= this.sourceDeps({ language: m.language, text: m.sql }));
   }
 
-  /** A registered language, by name (SQL only, until languages register: ADR 0015 step 9). */
+  /** A registered language, by name (plan/language.ts `registerLanguage`). */
   private languageOf(name: string): SmaltLanguage {
-    const l = LANGUAGES[name];
+    const l = registeredLanguage(name);
     if (!l) throw new SmaltError('SMALT_MISUSE', `this is written in ${name}, which is not registered`);
     return l;
   }
@@ -3297,7 +3297,7 @@ export class Database implements FunctionContext {
   /** The editor of an object's source text, by its language. */
   private sourceEditor(def: StoredDef | undefined): SourceEditor {
     const language = def && 'language' in def && def.language !== undefined ? def.language : 'sql';
-    const l = LANGUAGES[language];
+    const l = registeredLanguage(language);
     if (!l) throw new SmaltError('SMALT_MISUSE', `ALTER TABLE needs the ${language} language to edit its objects' source text`);
     return l.sourceEditor;
   }
@@ -4812,9 +4812,6 @@ interface AlterChange {
 }
 
 type TableDefOf = Extract<StoredDef, { kind: 'table' }>;
-
-/** The languages the engine reads: SQL's, until languages register with the engine (ADR 0015 step 9). */
-const LANGUAGES: Readonly<Record<string, SmaltLanguage>> = { sql: sqlLanguage };
 
 /** Whether a row expression (column `i` is `#0.i`) reads column `ci`. */
 function readsColumn(e: PlanExpr, ci: number): boolean {

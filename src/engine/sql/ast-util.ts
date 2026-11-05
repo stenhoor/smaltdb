@@ -1,7 +1,7 @@
 /**
  * Small AST helpers shared by the planner, flattening, morsel analysis and MV matching.
  */
-import { aggregateFunctions } from '../exec/functions.js';
+import { aggregateFunctions } from '../language-support.js';
 import type { Expr } from './ast.js';
 
 const NO_POS = { pos: 0, end: 0 };

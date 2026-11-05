@@ -7,8 +7,8 @@
  * `* / %`; `|| -> ->>`; prefix `~ + -` and postfix COLLATE.
  */
 import type * as A from './ast.js';
-import { SmaltError } from '../errors.js';
-import type { SqlValue } from '../values.js';
+import { SmaltError } from '../language-support.js';
+import type { SqlValue } from '../language-support.js';
 import {
   tokenize,
   TK_BLOB,

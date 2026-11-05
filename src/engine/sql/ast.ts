@@ -12,7 +12,7 @@
  * - `pos` is the 0-based offset of the node's first character in the source text; `end` is the
  *   offset just past its last character.
  */
-import type { SqlValue } from '../values.js';
+import type { SqlValue } from '../language-support.js';
 
 export interface Node {
   pos: number;

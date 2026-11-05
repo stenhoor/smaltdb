@@ -3,15 +3,15 @@
  * an `IndexDef`, with SQLite's rules for what they may contain. Expressions are bound to plan expressions over the
  * table's row; their text is kept beside them.
  */
-import { type IndexSchema, type TableSchema, storageTypeFor, tableSchemaFromDef } from '../../catalog/schema.js';
-import { SmaltError } from '../../errors.js';
-import { scalarFunctions } from '../../exec/functions.js';
-import type { BindContext } from '../../plan/bind-context.js';
-import type { PlanExpr } from '../../plan/expr.js';
-import type { ConflictAction } from '../../plan/ops.js';
-import type { AlterAction, CheckDef, ColumnDef, DefaultDef, DeferredError, ExprDef, ForeignKeyDef, IndexColumnDef, IndexDef, KeyColumnDef, KeyDef, TableDef } from '../../plan/schema.js';
-import type { CollationName } from '../../plan/types.js';
-import { type SqlValue, normalizeInt } from '../../values.js';
+import { type IndexSchema, type TableSchema, storageTypeFor, tableSchemaFromDef } from '../../language-support.js';
+import { SmaltError } from '../../language-support.js';
+import { scalarFunctions } from '../../language-support.js';
+import type { BindContext } from '../../language-support.js';
+import type { PlanExpr } from '../../language-support.js';
+import type { ConflictAction } from '../../language-support.js';
+import type { AlterAction, CheckDef, ColumnDef, DefaultDef, DeferredError, ExprDef, ForeignKeyDef, IndexColumnDef, IndexDef, KeyColumnDef, KeyDef, TableDef } from '../../language-support.js';
+import type { CollationName } from '../../language-support.js';
+import { type SqlValue, normalizeInt } from '../../language-support.js';
 import type { AlterTableStmt, ColumnConstraint, ColumnDef as SqlColumnDef, ConflictAction as SqlConflict, CreateIndexStmt, CreateTableStmt, Expr, ForeignKeyClause, IndexedColumn } from '../ast.js';
 import { anyNode } from '../ast-util.js';
 import { parseOne } from '../parser.js';
