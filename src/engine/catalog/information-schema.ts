@@ -8,7 +8,10 @@ import type { IndexSchema, TableSchema } from './schema.js';
 
 export interface CatalogSnapshot {
   tables: TableSchema[];
-  views: { name: string; sql: string; selectPos: number }[];
+  /** Views: name, CREATE VIEW text, and the text of its query alone (view_definition). */
+  /** The text of a view's or materialized view's query alone, from its source. */
+  definition(source: { language: string; text: string }): string;
+  views: { name: string; sql: string; definition: string }[];
   /** Result columns of a view (null when the view cannot be resolved, e.g. a dropped table). */
   viewColumns(name: string): { name: string; declType: string }[] | null;
   functions: { name: string; kind: 'FUNCTION' | 'AGGREGATE'; deterministic: boolean }[];
@@ -142,13 +145,13 @@ export function informationSchema(name: string, cat: CatalogSnapshot): VirtualTa
               // MANUAL, or the automatic policy: `EVERY 300 SECONDS`, `ON RECONNECT`, or both.
               const p = m.policy;
               const mode = [p?.every ? `EVERY ${p.every} SECONDS` : '', p?.onReconnect ? 'ON RECONNECT' : ''].filter(Boolean).join(', ') || 'MANUAL';
-              return [CATALOG, SCHEMA, x.name, m.sql.slice(m.select.pos, m.select.end), m.storage, x.rootPage >= 2 ** 30 ? 'memory' : 'file', mode, yesNo(m.populated), m.refreshedAt, yesNo(m.populated && m.fresh === true), m.lastRefreshError ?? null];
+              return [CATALOG, SCHEMA, x.name, cat.definition({ language: m.language, text: m.sql }), m.storage, x.rootPage >= 2 ** 30 ? 'memory' : 'file', mode, yesNo(m.populated), m.refreshedAt, yesNo(m.populated && m.fresh === true), m.lastRefreshError ?? null];
             }),
       };
     case 'views':
       return {
         columns: [t('table_catalog'), t('table_schema'), t('table_name'), t('view_definition'), t('check_option'), t('is_updatable'), t('is_insertable_into')],
-        rows: () => cat.views.map((v) => [CATALOG, SCHEMA, v.name, v.sql.slice(v.selectPos), 'NONE', 'NO', 'NO']),
+        rows: () => cat.views.map((v) => [CATALOG, SCHEMA, v.name, v.definition, 'NONE', 'NO', 'NO']),
       };
     case 'table_constraints':
       return {

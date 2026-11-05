@@ -4,13 +4,13 @@
  * statistics, spilling, execution state: exec/planner.ts `PhysicalEnv`) is not part of it.
  *
  * Still to change on the way to the language API (ADR 0015 order of work): tables are the engine's `TableSchema`
- * (which carries storage fields too), views carry SQL syntax trees, and functions are looked up through `funcCtx`.
+ * (which carries storage fields too), and functions are looked up through `funcCtx`.
  */
 import type { TableSchema } from '../catalog/schema.js';
 import type { StaticType } from '../exec/convert.js';
 import type { FunctionContext } from '../exec/functions.js';
-import type { SelectStmt } from '../sql/ast.js';
 import type { SqlValue } from '../values.js';
+import type { Source } from './schema.js';
 
 export interface BindContext {
   /** A table by name; `schema` 'main' / 'temp' picks that schema when a TEMP table shadows a main one. */
@@ -25,8 +25,8 @@ export interface BindContext {
    * external table, a columnar table, a TEMP index on a main table).
    */
   indexTarget(name: string, schema?: string): TableSchema;
-  /** A view's definition, bound where the view is read. */
-  getView?(name: string, schema?: string): { name: string; sql: string; columns?: string[]; select: SelectStmt } | undefined;
+  /** A view: its source in its language (bound where the view is read) and the column names given with it. */
+  getView?(name: string, schema?: string): { name: string; source: Source; columns?: readonly string[] } | undefined;
   /** True for an external table. */
   isExternal?(name: string): boolean;
   /** The columns of an external table. */

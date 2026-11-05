@@ -58,7 +58,9 @@ import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordEncoder, RecordReader } from './storage/record.js';
 import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec/stats.js';
 import { type CatalogSnapshot, informationSchema } from './catalog/information-schema.js';
-import { quoteIdent as quoteIdentIfNeeded, sqlSourceEditor } from './sql/frontend/source-edit.js';
+import { quoteIdent as quoteIdentIfNeeded } from './sql/frontend/source-edit.js';
+import { sqlLanguage } from './sql/language.js';
+import type { SmaltLanguage } from './plan/language.js';
 import { ForeignKeys } from './exec/fk.js';
 import { PluginRegistry, type SmaltPlugin } from './plugin.js';
 import { Collation, type SqlValue } from './values.js';
@@ -104,12 +106,11 @@ export interface DatabaseOptions extends PagerOptions {
 
 const CATALOG_NAMES = new Set(['smalt_schema', 'sqlite_schema', 'sqlite_master']);
 
-/** A view: its defining SELECT, expanded by the planner wherever the view is referenced. */
+/** A view: its source in its language, bound where the view is read (the SQL front end merges it into the query). */
 export interface ViewSchema {
   name: string;
-  sql: string;
+  source: Source;
   columns?: string[];
-  select: SelectStmt;
 }
 
 /** A compiled ON CONFLICT clause (target -1 = rowid, n = index position, null = any constraint). */
@@ -293,7 +294,7 @@ export class Database implements FunctionContext {
       while (pending.length > 0) {
         // Views over other pending memory views wait for those (dependency order, not catalog order).
         const waiting = new Set(pending.map((t) => t.name.toLowerCase()));
-        const ready = pending.filter((t) => ![...this.selectDeps(t.matview!.select)].some((d) => d !== t.name.toLowerCase() && waiting.has(d)));
+        const ready = pending.filter((t) => ![...this.matviewDeps(t.matview!)].some((d) => d !== t.name.toLowerCase() && waiting.has(d)));
         const batch = ready.length > 0 ? ready : pending; // a cycle: try the rest anyway
         for (const t of batch) {
           try {
@@ -381,7 +382,7 @@ export class Database implements FunctionContext {
         const v = this.getView(lower);
         if (v && !seen.has(lower)) {
           seen.add(lower);
-          if (walk(v.select)) return true;
+          if ([...this.sourceDeps(v.source)].some((d) => this.tempViews.has(d) || (this.tables.get(d)?.rootPage ?? 0) >= MEM_BASE)) return true;
         }
       }
       return Object.keys(o).some((k) => walk(o[k]));
@@ -899,7 +900,7 @@ export class Database implements FunctionContext {
       out.push([seq(t), ['table', t.name, t.name, page(t.rootPage), t.sql]]);
       for (const ix of t.indexes) out.push([seq(ix), ['index', ix.name, t.name, page(ix.rootPage), ix.sql ?? null]]);
     }
-    for (const v of this.tempViews.values()) out.push([seq(v), ['view', v.name, v.name, 0, v.sql]]);
+    for (const v of this.tempViews.values()) out.push([seq(v), ['view', v.name, v.name, 0, v.source.text]]);
     return out.sort((a, b) => a[0] - b[0]).map((x) => x[1]);
   }
 
@@ -907,15 +908,16 @@ export class Database implements FunctionContext {
     for (const t of this.tables.values()) if (t.matview) this.matviewPolicy(t.matview);
     return {
       tables: [...this.tables.values(), ...this.shadowedMain.values()],
-      views: [...this.views.values()].map((v) => ({ name: v.name, sql: v.sql, selectPos: v.select.pos })),
+      views: [...this.views.values()].map((v) => ({ name: v.name, sql: v.source.text, definition: this.languageOf(v.source.language).viewDefinition(v.source) })),
+      definition: (source) => this.languageOf(source.language).viewDefinition(source),
       viewColumns: (name) => {
         const v = this.views.get(name.toLowerCase());
         if (!v) return null;
         try {
           const { env, catalog } = this.viewCheckEnv();
           const planner = new Planner(env, new Registers(0));
-          planner.sqlText = v.sql;
-          const plan = this.planSelectStmt(v.select, v.sql, planner, catalog);
+          planner.sqlText = v.source.text;
+          const plan = this.planView(v.source, planner, catalog);
           return plan.columns.map((c, i) => ({ name: v.columns?.[i] ?? c.name, declType: c.declType ?? '' }));
         } catch {
           return null;
@@ -996,7 +998,7 @@ export class Database implements FunctionContext {
       }
       if (r.type === 'view') {
         const v = def(r.name.toLowerCase(), 'view');
-        this.views.set(r.name.toLowerCase(), lazyView(r.name, { language: v.language, text: r.sql! }, v.columns ? [...v.columns] : undefined));
+        this.views.set(r.name.toLowerCase(), { name: r.name, source: { language: v.language, text: r.sql! }, ...(v.columns ? { columns: [...v.columns] } : {}) });
         continue;
       }
       if (r.type !== 'table') continue;
@@ -1231,11 +1233,11 @@ export class Database implements FunctionContext {
    * A top-level SELECT through the plan layer (ADR 0014), against `catalog` (the planner's tables), with
    * materialized-view matching on its plan under the statement's policy (exec/plan-mv-match.ts).
    */
-  private planSelectStmt(stmt: SelectStmt, text: string, planner: Planner, catalog: BindContext = this.bindContext()): QueryPlan {
-    const fe = this.received(toPlan(stmt, text, catalog));
+  private planView(source: Source, planner: Planner, catalog: BindContext = this.bindContext()): QueryPlan {
+    const fe = this.received(this.languageOf(source.language).bindView(source, catalog));
     const rewrite = planner.env.rewritePlan;
     const p = planner.planPlan(rewrite ? rewrite(fe.plan) : fe.plan, fe.columns);
-    if (!p) throw new SmaltError('SMALT_INTERNAL', `the physical planner declined a query\n  in: ${text}`);
+    if (!p) throw new SmaltError('SMALT_INTERNAL', `the physical planner declined a query\n  in: ${source.text}`);
     return p;
   }
 
@@ -1551,11 +1553,10 @@ export class Database implements FunctionContext {
    */
   private createMatview(stmt: Extract<SchemaOp, { op: 'createView' }>): RunResult {
     const sql = stmt.source.text;
-    const select = viewSelect(stmt.source);
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     if (stmt.temp || stmt.schema?.toLowerCase() === 'temp') throw new SmaltError('SMALT_ERROR', 'materialized views cannot be temporary');
     if (stmt.ifNotExists && this.catalog.get(stmt.name.toLowerCase())?.type === 'matview') return none;
-    const tempDep = this.tempDependency(select);
+    const tempDep = this.tempDependency(stmt.source);
     if (tempDep) throw new SmaltError('SMALT_ERROR', `materialized view ${stmt.name} cannot reference TEMP object ${tempDep}`);
     const opts = stmt.options ?? {};
     for (const k of Object.keys(opts)) if (!['storage', 'refresh', 'location', 'refresh_every', 'refresh_on_reconnect'].includes(k)) throw new SmaltError('SMALT_ERROR', `unknown materialized view option: ${k}`);
@@ -1569,13 +1570,13 @@ export class Database implements FunctionContext {
     if (refresh !== 'manual') throw new SmaltError('SMALT_UNSUPPORTED', `refresh = '${refresh}' is not supported yet (only 'manual')`);
     this.checkNewName(stmt.name, 'materialized view');
     this.dirtySchema = true;
-    const layout = this.matviewLayout(stmt.name, select, sql, stmt.columns ? [...stmt.columns] : undefined);
+    const layout = this.matviewLayout(stmt.name, stmt.source, stmt.columns ? [...stmt.columns] : undefined);
     if (!this.tables.has('smalt_matview')) {
       this.createTable(systemTableOp('smalt_matview'), true);
     }
     const root = this.createTree(inMemory);
     const { table } = tableSchemaFromDef(layout, layoutSql(layout), root);
-    table.matview = { sql, select, storage, options: { ...opts }, populated: false, refreshedAt: null };
+    table.matview = { sql, language: stmt.source.language, storage, options: { ...opts }, populated: false, refreshedAt: null };
     // A memory-resident view's root is assigned at runtime: the catalog records a marker.
     this.addCatalogRow('matview', table.name, table.name, inMemory ? MEM_BASE : root, sql, undefined, { kind: 'matview', language: stmt.source.language, ...(stmt.columns ? { columns: stmt.columns } : {}), options: stmt.options ?? {} });
     if (inMemory) {
@@ -1641,7 +1642,7 @@ export class Database implements FunctionContext {
     let rowid = 0;
     let sources: ExternalSource[] = [];
     try {
-      sources = this.runSelect(info.select, info.sql, (r, outRegs) => {
+      sources = this.runQuery({ language: info.language, text: info.sql }, (r, outRegs) => {
         if (outRegs.length !== ncols) throw new SmaltError('SMALT_ERROR', `materialized view ${mv.name}: the query now returns ${outRegs.length} columns, the view has ${ncols}`);
         for (let i = 0; i < ncols; i++) {
           const v = r[outRegs[i]];
@@ -1808,10 +1809,10 @@ export class Database implements FunctionContext {
 
   /** The storage table definition (CREATE TABLE text) for a materialized view's query. */
   /** The table a materialized view's rows are stored in: a column per result column of its query. */
-  private matviewLayout(name: string, select: SelectStmt, sql: string, names?: string[]): TableDef {
+  private matviewLayout(name: string, source: Source, names?: string[]): TableDef {
     const planner = new Planner(this.plannerDeps(), new Registers(0));
-    planner.sqlText = sql;
-    const plan = this.planSelectStmt(select, sql, planner);
+    planner.sqlText = source.text;
+    const plan = this.planView(source, planner);
     if (names && names.length !== plan.columns.length) {
       throw new SmaltError('SMALT_ERROR', `materialized view ${name} has ${names.length} column names but its query returns ${plan.columns.length} columns`);
     }
@@ -1831,12 +1832,12 @@ export class Database implements FunctionContext {
 
 
   /** Run a query to completion; `emit` reads each result row from the registers `r[outRegs[i]]`. */
-  /** Run `select`, passing each row to `emit`; returns the external sources it read (M8). */
-  private runSelect(select: SelectStmt, sql: string, emit: (r: SqlValue[], outRegs: number[]) => void): ExternalSource[] {
+  /** Run a view's query, passing each row to `emit`; returns the external sources it read (M8). */
+  private runQuery(source: Source, emit: (r: SqlValue[], outRegs: number[]) => void): ExternalSource[] {
     const regs = new Registers(0);
     const planner = new Planner(this.plannerDeps(), regs);
-    planner.sqlText = sql;
-    const plan = this.planSelectStmt(select, sql, planner);
+    planner.sqlText = source.text;
+    const plan = this.planView(source, planner);
     const externals = planner.finishExternals();
     const r: SqlValue[] = new Array(regs.count).fill(null);
     const root = plan.root;
@@ -1909,7 +1910,7 @@ export class Database implements FunctionContext {
       const m = t.matview;
       if (!m?.populated || !m.fresh) continue;
       // A TEMP table or view shadowing something the view read: the query's names mean the temp object.
-      const deps = (m.deps ??= this.selectDeps(m.select));
+      const deps = this.matviewDeps(m);
       if ([...deps].some((d) => this.tempTables.has(d) || this.tempViews.has(d))) continue;
       // A view over the table the statement writes (INSERT … SELECT into its base table).
       if (exclude !== null && deps.has(exclude)) continue;
@@ -1919,7 +1920,7 @@ export class Database implements FunctionContext {
       if (m.plan?.version !== this.schemaVersion) {
         let bound: PlanOp | null;
         try {
-          bound = this.received(toPlan(m.select, m.sql, this.bindContext())).plan;
+          bound = this.received(this.languageOf(m.language).bindView({ language: m.language, text: m.sql }, this.bindContext())).plan;
         } catch {
           bound = null;
         }
@@ -2404,52 +2405,36 @@ export class Database implements FunctionContext {
       if (layout.kind !== 'table') throw new SmaltError('SMALT_CORRUPT', `layout of materialized view ${r.name} is not a table`);
       const { table } = tableSchemaFromDef(layout.table, layoutSql(layout.table), root);
       const storage = String(def.options.storage ?? 'row').toLowerCase() as MatViewInfo['storage'];
-      table.matview = lazyMatview({ sql: r.sql!, options: { ...def.options }, storage, populated, refreshedAt, fresh }, { language: def.language, text: r.sql! });
+      table.matview = { sql: r.sql!, language: def.language, options: { ...def.options }, storage, populated, refreshedAt, fresh };
       this.tables.set(table.name.toLowerCase(), table);
     }
   }
 
-  /**
-   * Tables and views a SELECT reads (lower-case names), through views. CTE references are
-   * excluded where the CTE is in scope: a CTE's name is visible to the CTEs after it and the
-   * statement body, and inside its own body only when it is RECURSIVE (otherwise `WITH t AS
-   * (SELECT * FROM t)` reads the table t).
-   */
-  private selectDeps(select: SelectStmt, seen = new Set<string>()): Set<string> {
+  /** Tables and views a view's query reads (lower-case names), through views: its language reads them from its source. */
+  private sourceDeps(source: Source, seen = new Set<string>()): Set<string> {
     const out = new Set<string>();
-    const visit = (x: unknown, ctes: ReadonlySet<string>): void => {
-      if (Array.isArray(x)) {
-        for (const y of x) visit(y, ctes);
-        return;
+    for (const r of this.languageOf(source.language).viewReferences(source)) {
+      const n = r.name.toLowerCase();
+      out.add(n);
+      const view = this.getView(n);
+      if (view && !seen.has(n)) {
+        seen.add(n);
+        for (const d of this.sourceDeps(view.source, seen)) out.add(d);
       }
-      if (typeof x !== 'object' || x === null || x instanceof Uint8Array) return;
-      const o = x as Record<string, unknown>;
-      if (o.kind === 'select' && 'core' in o && o.with) {
-        const w = o.with as { recursive: boolean; ctes: { name: string; select: SelectStmt }[] };
-        const inner = new Set(ctes);
-        if (w.recursive) for (const c of w.ctes) inner.add(c.name.toLowerCase());
-        for (const c of w.ctes) {
-          visit(c.select, inner);
-          inner.add(c.name.toLowerCase());
-        }
-        for (const [k, v] of Object.entries(o)) if (k !== 'with') visit(v, inner);
-        return;
-      }
-      if (o.kind === 'table' && typeof o.name === 'string') {
-        const n = o.name.toLowerCase();
-        if (o.schema || !ctes.has(n)) {
-          out.add(n);
-          const view = this.getView(n);
-          if (view && !seen.has(n)) {
-            seen.add(n);
-            for (const d of this.selectDeps(view.select, seen)) out.add(d);
-          }
-        }
-      }
-      for (const v of Object.values(o)) visit(v, ctes);
-    };
-    visit(select, new Set());
+    }
     return out;
+  }
+
+  /** What a materialized view reads (cached until the names it reads change). */
+  private matviewDeps(m: MatViewInfo): Set<string> {
+    return (m.deps ??= this.sourceDeps({ language: m.language, text: m.sql }));
+  }
+
+  /** A registered language, by name (SQL only, until languages register: ADR 0015 step 9). */
+  private languageOf(name: string): SmaltLanguage {
+    const l = LANGUAGES[name];
+    if (!l) throw new SmaltError('SMALT_MISUSE', `this is written in ${name}, which is not registered`);
+    return l;
   }
 
   /**
@@ -2483,7 +2468,7 @@ export class Database implements FunctionContext {
     let changed = false;
     for (const t of this.matviewTables()) {
       const m = t.matview!;
-      if (!m.fresh || !(m.deps ??= this.selectDeps(m.select)).has(lower)) continue;
+      if (!m.fresh || !this.matviewDeps(m).has(lower)) continue;
       m.fresh = false;
       this.writeMatviewMeta(t.name, { populated: m.populated, refreshedAt: m.refreshedAt, fresh: false });
       changed = true;
@@ -2609,10 +2594,10 @@ export class Database implements FunctionContext {
     if (existing) throw new SmaltError('SMALT_ERROR', `${label(existing.type === kind ? kind : existing.type)} ${name} already exists`);
   }
 
-  /** A TEMP table or view that `select` reads (directly or through views), if any. */
-  private tempDependency(select: SelectStmt): string | undefined {
+  /** A TEMP table or view that a view's query reads (directly or through views), if any. */
+  private tempDependency(source: Source): string | undefined {
     if (this.tempTables.size === 0 && this.tempViews.size === 0) return undefined;
-    return [...this.selectDeps(select)].find((d) => this.tempTables.has(d) || this.tempViews.has(d));
+    return [...this.sourceDeps(source)].find((d) => this.tempTables.has(d) || this.tempViews.has(d));
   }
 
   // ---------------------------------------------------------------- connections and external tables (M8)
@@ -2773,12 +2758,11 @@ export class Database implements FunctionContext {
 
   private createView(stmt: Extract<SchemaOp, { op: 'createView' }>): RunResult {
     const sql = stmt.source.text;
-    const select = viewSelect(stmt.source);
     const columns = stmt.columns ? [...stmt.columns] : undefined;
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     if (stmt.temp && stmt.schema?.toLowerCase() === 'main') throw new SmaltError('SMALT_ERROR', 'temporary table name must be unqualified');
     // A view over TEMP objects is itself TEMP (as in SQLite); asked for in main, it is an error.
-    const tempDep = stmt.temp || stmt.schema?.toLowerCase() === 'temp' ? undefined : this.tempDependency(select);
+    const tempDep = stmt.temp || stmt.schema?.toLowerCase() === 'temp' ? undefined : this.tempDependency(stmt.source);
     if (tempDep && stmt.schema?.toLowerCase() === 'main') throw new SmaltError('SMALT_ERROR', `view ${stmt.name} cannot reference TEMP object ${tempDep}`);
     if (stmt.temp || stmt.schema?.toLowerCase() === 'temp' || tempDep) {
       const lower = stmt.name.toLowerCase();
@@ -2786,7 +2770,7 @@ export class Database implements FunctionContext {
         if (stmt.ifNotExists) return none;
         throw new SmaltError('SMALT_ERROR', `view ${stmt.name} already exists`);
       }
-      const view: ViewSchema = { name: stmt.name, sql, columns, select };
+      const view: ViewSchema = { name: stmt.name, source: stmt.source, ...(columns ? { columns } : {}) };
       this.tempViews.set(lower, view);
       this.tempSeq.set(view, this.nextTempSeq++);
       this.schemaVersion++; // re-plan statements; nothing is stored
@@ -2797,7 +2781,7 @@ export class Database implements FunctionContext {
     this.dirtySchema = true;
     // Like SQLite, the body is not resolved until the view is used (it may reference tables created later).
     this.addCatalogRow('view', stmt.name, stmt.name, 0, sql, undefined, { kind: 'view', language: stmt.source.language, ...(columns ? { columns } : {}) });
-    this.views.set(stmt.name.toLowerCase(), { name: stmt.name, sql, columns, select });
+    this.views.set(stmt.name.toLowerCase(), { name: stmt.name, source: stmt.source, ...(columns ? { columns } : {}) });
     this.objectChanged(stmt.name);
     this.schemaChanged();
     return none;
@@ -3279,9 +3263,9 @@ export class Database implements FunctionContext {
   /** The editor of an object's source text, by its language. */
   private sourceEditor(def: StoredDef | undefined): SourceEditor {
     const language = def && 'language' in def && def.language !== undefined ? def.language : 'sql';
-    const editor = SOURCE_EDITORS[language];
-    if (!editor) throw new SmaltError('SMALT_MISUSE', `ALTER TABLE needs the ${language} language to edit its objects' source text`);
-    return editor;
+    const l = LANGUAGES[language];
+    if (!l) throw new SmaltError('SMALT_MISUSE', `ALTER TABLE needs the ${language} language to edit its objects' source text`);
+    return l.sourceEditor;
   }
 
   /** Column names per table, for resolving references while editing source text. */
@@ -3466,8 +3450,8 @@ export class Database implements FunctionContext {
       try {
         const { env, catalog } = this.viewCheckEnv();
         const planner = new Planner(env, new Registers(0));
-        planner.sqlText = v.sql;
-        this.planSelectStmt(v.select, v.sql, planner, catalog);
+        planner.sqlText = v.source.text;
+        this.planView(v.source, planner, catalog);
         this.viewWasValid.add(v.name.toLowerCase());
       } catch {
         /* already broken */
@@ -3481,8 +3465,8 @@ export class Database implements FunctionContext {
       try {
         const { env, catalog } = this.viewCheckEnv();
         const planner = new Planner(env, new Registers(0));
-        planner.sqlText = v.sql;
-        this.planSelectStmt(v.select, v.sql, planner, catalog);
+        planner.sqlText = v.source.text;
+        this.planView(v.source, planner, catalog);
       } catch (e) {
         // A view that was already broken (e.g. dangling) stays as it was, like SQLite.
         if (!this.viewWasValid.has(v.name.toLowerCase())) continue;
@@ -4776,39 +4760,11 @@ function systemTableOp(name: SystemTableName): Extract<SchemaOp, { op: 'createTa
   return { op: 'createTable', table: SYSTEM_TABLES[name], temp: false, ifNotExists: false, source: { language: 'sql', text: systemTableSql(name) } };
 }
 
-/**
- * A view's query, from its source: views are kept as their language's source and bound where read (ADR 0015
- * section 6); SQL is the only language until languages register with the engine (step 9).
- */
-function viewSelect(source: Source): SelectStmt {
-  if (source.language !== 'sql') throw new SmaltError('SMALT_MISUSE', `view is written in ${source.language}, which is not registered`);
-  return (parseOne(source.text).stmt as CreateViewStmt).select;
-}
-
 /** The CREATE TABLE text of a materialized view's storage table (as `sqlite_schema`-style display). */
 function layoutSql(def: TableDef): string {
   const q = (x: string): string => `"${x.replace(/"/g, '""')}"`;
   const coll = (c: CollationName): string => (c === 'nocase' ? ' COLLATE NOCASE' : c === 'rtrim' ? ' COLLATE RTRIM' : '');
   return `CREATE TABLE ${q(def.name)}(${def.columns.map((c) => `${q(c.name)} ${c.declaredType}${coll(c.collation)}`).join(', ')})`;
-}
-
-/** A view read from the catalog: its query parsed from its source where first used. */
-function lazyView(name: string, source: Source, columns: string[] | undefined): ViewSchema {
-  let select: SelectStmt | undefined;
-  return {
-    name,
-    sql: source.text,
-    columns,
-    get select(): SelectStmt {
-      return (select ??= viewSelect(source));
-    },
-  };
-}
-
-/** A materialized view read from the catalog: its query parsed from its source where first used. */
-function lazyMatview(info: Omit<MatViewInfo, 'select'>, source: Source): MatViewInfo {
-  let select: SelectStmt | undefined;
-  return Object.defineProperty(info, 'select', { get: () => (select ??= viewSelect(source)), enumerable: true, configurable: true }) as MatViewInfo;
 }
 
 /** What an ALTER TABLE changes: definitions by catalog key (null: removed), and catalog rows. */
@@ -4819,8 +4775,8 @@ interface AlterChange {
 
 type TableDefOf = Extract<StoredDef, { kind: 'table' }>;
 
-/** Source editors by language: SQL's, until languages register with the engine (ADR 0015 step 9). */
-const SOURCE_EDITORS: Readonly<Record<string, SourceEditor>> = { sql: sqlSourceEditor };
+/** The languages the engine reads: SQL's, until languages register with the engine (ADR 0015 step 9). */
+const LANGUAGES: Readonly<Record<string, SmaltLanguage>> = { sql: sqlLanguage };
 
 /** Whether a row expression (column `i` is `#0.i`) reads column `ci`. */
 function readsColumn(e: PlanExpr, ci: number): boolean {
