@@ -105,16 +105,20 @@ interior cell:  u32 child | u16 keyLen | key
 
 - **`smalt_schema(type, name, tbl_name, rootpage, sql)`** (root at header offset 40) lists every object, as SQLite's
   `sqlite_schema` does. `sql` is the object's source text, shown for display; the engine does not parse it to open.
-- **`smalt_definition(name, def)`** (root at header offset 44) holds one row per catalog object, keyed like the catalog
-  (the lowercased name; connections by `connection:` and their name). `def` is JSON text: `{"v": 1, "kind": …}` with the
-  object's language-neutral definition (`StoredDef`): a table's columns, keys, CHECKs and foreign keys, an index's
-  columns and partial WHERE, a view's or materialized view's language and column names, a connection's or external
-  table's options. CHECK, DEFAULT and index expressions are stored as plan expressions (with their SQL metadata as
-  `$sql` fields, `plan/codec.ts`) beside their text. Integers beyond JSON's range, blobs and non-finite reals are tagged
-  objects (`{"$bigint": "…"}`, `{"$blob": "hex"}`, `{"$real": "Infinity"}`). The table is not in the catalog, so
-  `sqlite_schema` does not list it. A definition of another version is refused with `SMALT_FORMAT`.
-- Opening reads both tables and parses nothing. A view's source, and a materialized view's query, are parsed by their
-  language where they are first read.
+- **`smalt_definition(name, def, exprs)`** (root at header offset 44) holds one row per catalog object, keyed like the
+  catalog (the lowercased name; connections by `connection:` and their name). `def` is JSON text: `{"v": 1, "kind": …}`
+  with the object's language-neutral definition (`StoredDef`): a table's columns, keys, CHECKs and foreign keys, an
+  index's columns and partial WHERE, a view's or materialized view's language and column names, a connection's or
+  external table's options. Fields with their usual value are left out (a column that may be NULL, BINARY collation,
+  ascending keys, no CHECKs, row storage, `NO ACTION`, …). A table's or index's plan expressions (CHECK, DEFAULT, index
+  columns, partial WHERE) are in `exprs`, a JSON array, with their SQL metadata as `$sql` fields (`plan/codec.ts`); the
+  definition refers to each by its position (`"x": 0`) beside its text. Integers beyond JSON's range, blobs and
+  non-finite reals are tagged objects (`{"$bigint": "…"}`, `{"$blob": "hex"}`, `{"$real": "Infinity"}`). The table is
+  not in the catalog, so `sqlite_schema` does not list it. A definition of another version is refused with
+  `SMALT_FORMAT`.
+- Opening reads both tables and parses nothing. Plan expressions stay JSON text until an expression is first used (an
+  index's are compiled then), and a view's source, or a materialized view's query, is parsed by its language where it
+  is first read.
 - The other system tables (`smalt_stat`, `smalt_matview`, `smalt_columnar`, `smalt_extcache`) are defined in code and
   listed in the catalog. A materialized view's layout in `smalt_matview.layout` is a stored table definition.
 

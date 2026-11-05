@@ -1,5 +1,6 @@
 import {
   ConstraintError,
+  type IndexEval,
   type IndexSchema,
   type MatViewInfo,
   type TableSchema,
@@ -30,7 +31,7 @@ import { bindStoredTableExprs, checkConstraintExprs, isConstantDefault, literalV
 import { bindStatement } from './sql/frontend/bind.js';
 import type { BoundQuery, BoundStatement, BoundTransaction, BoundWrite } from './plan/bound.js';
 import type { ColumnDef as ColumnDefinition, SchemaOp, Source, TableDef } from './plan/schema.js';
-import { SYSTEM_TABLES, type StoredDef, type SystemTableName, decodeDef, encodeDef, isSystemTable, systemTableSql } from './catalog/stored.js';
+import { SYSTEM_TABLES, type StoredDef, type StoredText, type SystemTableName, decodeDef, encodeDef, isSystemTable, systemTableSql } from './catalog/stored.js';
 import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
@@ -911,7 +912,7 @@ export class Database implements FunctionContext {
     const def = <K extends StoredDef['kind']>(key: string, kind: K): Extract<StoredDef, { kind: K }> => {
       const d = defs.get(key);
       if (!d) throw new SmaltError('SMALT_CORRUPT', `missing definition of ${key}`);
-      const v = decodeDef(d.def, key);
+      const v = decodeDef(d, key);
       if (v.kind !== kind) throw new SmaltError('SMALT_CORRUPT', `definition of ${key} is a ${v.kind}, not a ${kind}`);
       return v as Extract<StoredDef, { kind: K }>;
     };
@@ -965,7 +966,7 @@ export class Database implements FunctionContext {
         mv?.indexRoots.set(r.name.toLowerCase(), root);
       }
       const idx = indexSchemaFromDef(def(r.name.toLowerCase(), 'index').index, r.sql, table, root);
-      this.prepareIndex(table, idx);
+      this.prepareIndex(table, idx, true);
       table.indexes.push(idx);
       this.indexes.set(idx.name.toLowerCase(), idx);
     }
@@ -1028,12 +1029,12 @@ export class Database implements FunctionContext {
   private definitionRows = new Map<string, number | bigint>();
 
   /**
-   * The stored definitions (key -> JSON text). Their table is not in the catalog (`sqlite_schema` does not list it):
-   * its root is in the database header.
+   * The stored definitions by key, as text. Their table is not in the catalog (`sqlite_schema` does not list it): its
+   * root is in the database header.
    */
-  private scanDefinitions(): Map<string, { def: string }> {
+  private scanDefinitions(): Map<string, StoredText> {
     this.definitionRows = new Map();
-    const out = new Map<string, { def: string }>();
+    const out = new Map<string, StoredText>();
     const root = this.pager.definitionRoot;
     if (root === 0) return out;
     const reader = new RecordReader(this.definitionTable().layout);
@@ -1044,7 +1045,8 @@ export class Database implements FunctionContext {
         reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
         c.loadKey();
         const key = String(reader.column(0));
-        out.set(key, { def: String(reader.column(1)) });
+        const exprs = reader.column(2);
+        out.set(key, { def: String(reader.column(1)), exprs: exprs === null ? null : String(exprs) });
         this.definitionRows.set(key, readRowidKey(c.keyBytes, c.keyOffset));
       }
     } finally {
@@ -1064,20 +1066,31 @@ export class Database implements FunctionContext {
 
   /** Store an object's definition under its catalog key (replacing the one there). */
   private writeDefinition(key: string, def: StoredDef): void {
-    const w = new TableWriter(this.definitionTable(), this.pager, (root) => this.tree(root));
+    const w = this.definitionWriter();
     const old = this.definitionRows.get(key);
     if (old !== undefined) w.deleteRow(old);
     const rowid = w.newRowid();
-    w.writeRow([key, encodeDef(def)], rowid);
+    const text = encodeDef(def);
+    w.writeRow([key, text.def, text.exprs], rowid);
     this.definitionRows.set(key, rowid);
   }
 
   private deleteDefinition(key: string): void {
     const old = this.definitionRows.get(key);
     if (old === undefined) return;
-    new TableWriter(this.definitionTable(), this.pager, (root) => this.tree(root)).deleteRow(old);
+    this.definitionWriter().deleteRow(old);
     this.definitionRows.delete(key);
   }
+
+  /** A writer for the definitions table (kept: DDL writes a definition per object), its rowid cache cleared. */
+  private definitionWriter(): TableWriter {
+    const table = this.definitionTable();
+    if (this.defWriter?.table !== table) this.defWriter = new TableWriter(table, this.pager, (root) => this.tree(root));
+    this.defWriter.resetStatement();
+    return this.defWriter;
+  }
+
+  private defWriter: TableWriter | null = null;
 
 
   private schemaChanged(): void {
@@ -1506,7 +1519,7 @@ export class Database implements FunctionContext {
       this.memDirty = true;
     }
     this.tables.set(table.name.toLowerCase(), table);
-    this.writeMatviewMeta(table.name, { layout: encodeDef({ kind: 'table', table: layout }), populated: false, refreshedAt: null });
+    this.writeMatviewMeta(table.name, { layout: encodeDef({ kind: 'table', table: layout }).def, populated: false, refreshedAt: null });
     let changes = 0;
     if (stmt.withData !== false) changes = this.fillMatview(table);
     this.schemaChanged();
@@ -2323,7 +2336,7 @@ export class Database implements FunctionContext {
         fresh = mv.fresh;
         refreshedAt = mv.refreshedAt;
       }
-      const layout = decodeDef(m.layout, `${r.name} layout`);
+      const layout = decodeDef({ def: m.layout, exprs: null }, `${r.name} layout`);
       if (layout.kind !== 'table') throw new SmaltError('SMALT_CORRUPT', `layout of materialized view ${r.name} is not a table`);
       const { table } = tableSchemaFromDef(layout.table, layoutSql(layout.table), root);
       const storage = String(def.options.storage ?? 'row').toLowerCase() as MatViewInfo['storage'];
@@ -2924,9 +2937,29 @@ export class Database implements FunctionContext {
    * Validate and compile an index's expression columns and partial-index WHERE (like SQLite: no
    * subqueries, parameters or non-deterministic functions) into evaluators over a row.
    */
-  private prepareIndex(table: TableSchema, idx: IndexSchema): void {
-    idx.eval = undefined;
-    if (!idx.where && !idx.columns.some((c) => c.expr)) return;
+  /**
+   * Set up an index's evaluators (expression columns and partial WHERE). Opening a database compiles them where the
+   * index is first used (`lazy`); CREATE INDEX and ALTER TABLE compile them at once, so an error is theirs.
+   */
+  private prepareIndex(table: TableSchema, idx: IndexSchema, lazy = false): void {
+    if (!idx.where && !idx.columns.some((c) => c.expr)) {
+      idx.eval = undefined;
+      return;
+    }
+    if (!lazy) {
+      Object.defineProperty(idx, 'eval', { value: this.indexEval(table, idx), writable: true, enumerable: true, configurable: true });
+      return;
+    }
+    let ev: IndexEval | undefined;
+    Object.defineProperty(idx, 'eval', {
+      get: () => (ev ??= this.indexEval(table, idx)),
+      set: (v: IndexEval | undefined) => Object.defineProperty(idx, 'eval', { value: v, writable: true, enumerable: true, configurable: true }),
+      enumerable: true,
+      configurable: true,
+    });
+  }
+
+  private indexEval(table: TableSchema, idx: IndexSchema): IndexEval {
     const n = table.columns.length;
     const planner = new Planner({ getTable: (x) => this.getTable(x), openTree: (root) => this.tree(root), funcCtx: this, state: this.state }, new Registers(n + 1));
     // Bound by the language when the index was defined: plan expressions over the row (column i, the rowid at n).
@@ -2950,7 +2983,7 @@ export class Database implements FunctionContext {
     const deps = new Set<number>();
     for (const c of idx.columns) if (!c.expr) deps.add(c.column);
     for (const e of [...plan.cols, plan.where]) if (e) forEachCol(e, (c) => c.index < n && deps.add(c.index));
-    idx.eval = {
+    return {
       cols: cols.map((f) => (f ? (row: readonly SqlValue[], rowid: number | bigint) => f(load(row, rowid)) : null)),
       where: where ? (row, rowid) => truthy(where!(load(row, rowid))) === true : undefined,
       deps: [...deps],

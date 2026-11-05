@@ -3,7 +3,7 @@
  * versioned JSON beside its source text, and opening a database reads definitions instead of parsing SQL.
  */
 import { describe, expect, it } from 'vitest';
-import { decodeDef, encodeDef, DEFINITION_VERSION } from '../src/engine/catalog/stored.js';
+import { decodeDef, encodeDef, DEFINITION_VERSION, type StoredText } from '../src/engine/catalog/stored.js';
 import { Database } from '../src/engine/database.js';
 import type { BindContext } from '../src/engine/plan/bind-context.js';
 import { DH_FORMAT_MAJOR, FORMAT_MAJOR } from '../src/engine/storage/format.js';
@@ -84,8 +84,41 @@ describe('catalog storage', () => {
   it('refuses definitions of another version, and reports unreadable ones as corrupt', () => {
     const text = encodeDef({ kind: 'connection', options: { n: 1n } });
     expect(decodeDef(text, 'x')).toEqual({ kind: 'connection', options: { n: 1n } });
-    const newer = text.replace(`"v":${DEFINITION_VERSION}`, `"v":${DEFINITION_VERSION + 1}`);
-    expect(() => decodeDef(newer, 'x')).toThrow(expect.objectContaining({ code: 'SMALT_FORMAT' }));
-    expect(() => decodeDef('{', 'x')).toThrow(expect.objectContaining({ code: 'SMALT_CORRUPT' }));
+    const newer = text.def.replace(`"v":${DEFINITION_VERSION}`, `"v":${DEFINITION_VERSION + 1}`);
+    expect(() => decodeDef({ ...text, def: newer }, 'x')).toThrow(expect.objectContaining({ code: 'SMALT_FORMAT' }));
+    expect(() => decodeDef({ def: '{', exprs: null }, 'x')).toThrow(expect.objectContaining({ code: 'SMALT_CORRUPT' }));
+  });
+
+  it('stores definitions compactly, with plan expressions apart and decoded where first used', () => {
+    const d = open(new MemoryVfs());
+    d.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT NOT NULL CHECK (a > 0), b TEXT COLLATE NOCASE DEFAULT 'x', c REFERENCES t ON DELETE CASCADE)");
+    d.exec('CREATE INDEX ti ON t(b, a * 2 DESC) WHERE a > 1');
+    const defs = (d as unknown as { scanDefinitions(): Map<string, StoredText> }).scanDefinitions();
+    const t = defs.get('t')!;
+    expect(JSON.parse(t.def)).toEqual({
+      v: DEFINITION_VERSION,
+      kind: 'table',
+      table: {
+        name: 't',
+        columns: [
+          { name: 'id', type: 'INTEGER' },
+          { name: 'a', declaredType: 'INT', type: 'INTEGER', notNull: true },
+          { name: 'b', type: 'TEXT', collation: 'nocase', default: { text: "'x'", value: 'x', x: 0 } },
+          { name: 'c', declaredType: '', type: 'ANY' },
+        ],
+        keys: [{ kind: 'primaryKey', columns: [{ column: 0 }] }],
+        checks: [{ text: 'a > 0', x: 1 }],
+        foreignKeys: [{ columns: [3], table: 't', onDelete: 'CASCADE' }],
+      },
+    });
+    expect(JSON.parse(t.exprs!)).toHaveLength(2);
+    const i = decodeDef(defs.get('ti')!, 'ti');
+    expect(i).toMatchObject({ kind: 'index', index: { name: 'ti', table: 't', unique: false, columns: [{ column: 2, desc: false, collation: 'nocase' }, { column: -1, desc: true, collation: 'binary', expr: { text: 'a * 2' } }] } });
+    if (i.kind !== 'index') throw new Error('not an index');
+    expect(i.index.where?.expr).toMatchObject({ k: 'call', fn: 'sql.gt' });
+    // Encoding a decoded definition gives the same definition.
+    const same = (a: StoredText, b: StoredText): void => expect([JSON.parse(a.def), a.exprs && JSON.parse(a.exprs)]).toEqual([JSON.parse(b.def), b.exprs && JSON.parse(b.exprs)]);
+    same(encodeDef(decodeDef(t, 't')), t);
+    same(encodeDef(i), defs.get('ti')!);
   });
 });
