@@ -70,6 +70,10 @@
       "types": "./dist/types/engine/index.d.ts",
       "default": "./dist/engine.js"
     },
+    "./language": {
+      "types": "./dist/types/engine/language-support.d.ts",
+      "default": "./dist/language.js"
+    },
     "./worker-runtime": {
       "types": "./dist/types/engine/worker-runtime.d.ts",
       "default": "./dist/worker-runtime.js"

@@ -24,6 +24,7 @@ The SQL, the values, the parameters and the errors are the same as in the client
 | [`MemoryVfs`, `OpfsVfs`, `Vfs`, `VfsFile`, `OpenOptions`](#vfs) | Storage back ends |
 | [`SmaltError`, `CorruptionError`, `MisuseError`, `SqlSyntaxError`](#errors) | Error classes |
 | [`parse`, `parseOne`](#parsing) | The SQL parser |
+| [`registerLanguage`, `SmaltLanguage`, `LanguageStatement`, `ObjectReference`](#languages) | The language interface (experimental) |
 | [`detectCapabilities`, `Capabilities`](#detectcapabilities) | Browser feature detection |
 | [`PLUGIN_API_VERSION`, `SmaltPlugin`, `PluginHost`, `FormatReader`, …](#plugins) | The plugin interface, version 1. See [Writing plugins](./plugins). |
 | Types: `RunResult`, `QueryResult`, `BindParams`, `DatabaseOptions`, `SqlValue` | Described below |
@@ -297,6 +298,18 @@ twice, or when two plugins register the same format name or alias, table functio
 paths, or connection type or alias.
 
 The plugin interface is API version 1. It is not stable yet: it will be declared stable before the 0.9.0 release.
+
+## Languages
+
+A language turns its source text into plans; the engine never reads its syntax. SQL is the only language so far, and
+`smaltdb/engine` registers it. A language registers with `registerLanguage(language)`, which makes it available, by its
+name, to every database in the same engine: its statements, and the views and stored objects written in it.
+
+A language reaches the engine only through `smaltdb/language`: the language interface, the plan types, values and
+collations, type and affinity conversion, the function registry and schema lookups. `smaltdb/engine`,
+`smaltdb/worker-runtime` and `smaltdb/language` share one engine, so a language registered through one is the one the
+others read. Both the interface and `smaltdb/language` are experimental: they change as SQL moves to its own package
+([ADR 0015](../../adr/0015-smaltql.md)).
 
 ## Errors
 
