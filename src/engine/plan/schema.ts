@@ -193,4 +193,6 @@ export interface SourceEditor {
   addColumn(tableText: string, columnText: string): string;
   /** A table's statement without column `column` (its position). */
   dropColumn(tableText: string, column: number): string;
+  /** The statement of an external table whose columns were read from its source when it was created. */
+  externalTable(name: string, columns: readonly { readonly name: string; readonly declaredType: string }[], options: Readonly<Record<string, SqlValue>>): string;
 }

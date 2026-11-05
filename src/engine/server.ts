@@ -23,7 +23,6 @@ import type { PlanStatementInput } from './plan/statement.js';
 import { PLAN_FORMAT_VERSION } from './plan/types.js';
 import { MisuseError, SmaltError, errorCode } from './errors.js';
 import { AsyncRequiredError } from './external/external.js';
-import { parse } from './sql/parser.js';
 import { type SmaltPlugin, askError } from './plugin.js';
 import type { Vfs } from './vfs/types.js';
 import { type ReaderSettings, type Request, type RequestBody, type Response, encodeColumns } from '../shared/protocol.js';
@@ -265,7 +264,7 @@ export class EngineServer {
     }
     if (this.txOwner === session && this.db?.inTransaction) {
       try {
-        this.db.exec('ROLLBACK');
+        this.db.preparePlan({ kind: 'transaction', action: 'rollback' }).run();
       } catch {
         // already rolled back
       }
@@ -442,7 +441,7 @@ export class EngineServer {
             r = d.run(req.sql, req.params as BindParams); // cached statement: the common case
           } catch (e) {
             // Several statements: the same error as the engine's exec(sql, params).
-            if (e instanceof SmaltError && e.code === 'SMALT_SYNTAX' && isScript(req.sql)) throw new MisuseError('parameters can only be bound with a single statement');
+            if (e instanceof SmaltError && e.code === 'SMALT_SYNTAX' && d.isScript(req.sql)) throw new MisuseError('parameters can only be bound with a single statement');
             // It reads external data (M8), or is REFRESH … IF CHANGED: the attempt was rolled back;
             // fetch (or check the sources), then run it.
             if (!(e instanceof SmaltError && e.code === 'SMALT_ASYNC_REQUIRED')) throw e;
@@ -463,7 +462,7 @@ export class EngineServer {
         // The end of a client's db.transaction(): COMMIT / ROLLBACK, unless the callback already ended it.
         const d = this.requireDb();
         if (d.inTransaction) {
-          d.exec(req.commit ? 'COMMIT' : 'ROLLBACK');
+          d.preparePlan(req.commit ? { kind: 'transaction', action: 'commit' } : { kind: 'transaction', action: 'rollback' }).run();
           this.send(session, { id, kind: 'ok' });
           return;
         }
@@ -576,8 +575,9 @@ export class EngineServer {
    * CHANGED` (which checks its view's sources first): those run on the async path.
    */
   private readsExternal(st: PreparedStatement): boolean {
-    if (st instanceof Statement && st.parsed.stmt.kind === 'refresh' && st.parsed.stmt.ifChanged) return true;
     try {
+      const b = st.prog().bound;
+      if (b?.kind === 'maintenance' && b.action === 'refresh' && b.ifChanged) return true;
       return st.externalSources.length > 0;
     } catch (e) {
       if (e instanceof AsyncRequiredError) return true; // planning it needs the data
@@ -781,14 +781,6 @@ export function defaultOpen(vfs: () => Vfs, plugins: readonly SmaltPlugin[] = []
 }
 
 /** Whether `sql` parses as more than one statement. */
-function isScript(sql: string): boolean {
-  try {
-    return parse(sql).length > 1;
-  } catch {
-    return false;
-  }
-}
-
 /** A query a parallel reader can answer: SQL text, or a plan. */
 type ReaderRequest = Extract<RequestBody, { op: 'query' | 'queryPlan' }>;
 

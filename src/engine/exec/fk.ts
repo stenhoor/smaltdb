@@ -14,18 +14,35 @@
  */
 import { ConstraintError, type ForeignKeySchema, type TableSchema, findColumn } from '../catalog/schema.js';
 import { SmaltError } from '../errors.js';
+import { agg, aggregate, and, filter, limit, lit, param, project, remove, scan, update } from '../plan/build.js';
+import { call, col, type PlanExpr } from '../plan/expr.js';
+import type { PlanOp } from '../plan/ops.js';
 import type { SqlValue } from '../values.js';
+import { affinityOfStorage, applyNumericAffinity, staticTypeOfStorage } from './convert.js';
+import { CollSrc, type SqlOperand, collationName, comparisonCollation, comparisonConverters, withMeta } from './expr.js';
 
 export interface FkHost {
   getTable(name: string): TableSchema | undefined;
   allTables(): TableSchema[];
-  /** Run an internal read query with positional parameters. */
-  query(sql: string, params: SqlValue[]): SqlValue[][];
-  /** Run an internal DELETE/UPDATE with positional parameters. */
-  run(sql: string, params: SqlValue[]): void;
+  /**
+   * Run an internal query or write plan with positional parameters, inside the current statement: its rows (a
+   * write's: none). The same plan object is run many times: its program may be cached by identity.
+   */
+  run(plan: PlanOp, params: SqlValue[]): SqlValue[][];
+  /** A column's DEFAULT as a plan expression (SET DEFAULT), or null for none. */
+  defaultValue(t: TableSchema, column: number): PlanExpr | null;
 }
 
-const q = (name: string): string => '"' + name.replace(/"/g, '""') + '"';
+/** The plans a foreign key runs, built once per schema version. */
+interface LinkPlans {
+  parentHas: PlanOp;
+  childCount: PlanOp;
+  deleteChildren: PlanOp;
+  /** UPDATE child SET key = params[k..] (ON UPDATE CASCADE). */
+  rekeyChildren: PlanOp;
+  setNull: PlanOp;
+  setDefault: PlanOp;
+}
 
 /** A foreign key with both ends resolved to column positions. */
 interface Link {
@@ -35,6 +52,7 @@ interface Link {
   childCols: number[];
   parentCols: number[];
   deferred: boolean;
+  plans?: LinkPlans;
 }
 
 export class ForeignKeys {
@@ -114,16 +132,16 @@ export class ForeignKeys {
     return l;
   }
 
-  private where(t: TableSchema, cols: number[], from = 1): string {
-    return cols.map((c, i) => `${q(t.columns[c].name)} = ?${from + i}`).join(' AND ');
+  private plans(l: Link): LinkPlans {
+    return (l.plans ??= linkPlans(l, this.host));
   }
 
   private parentHas(l: Link, key: SqlValue[]): boolean {
-    return this.host.query(`SELECT 1 FROM ${q(l.parent.name)} WHERE ${this.where(l.parent, l.parentCols)} LIMIT 1`, key).length > 0;
+    return this.host.run(this.plans(l).parentHas, key).length > 0;
   }
 
   private childCount(l: Link, key: SqlValue[]): number {
-    return Number(this.host.query(`SELECT count(*) FROM ${q(l.child.name)} WHERE ${this.where(l.child, l.childCols)}`, key)[0][0]);
+    return Number(this.host.run(this.plans(l).childCount, key)[0][0]);
   }
 
   private add(l: Link, n: number): void {
@@ -229,29 +247,18 @@ export class ForeignKeys {
    * for ON UPDATE). The child-side checks of those writes resolve the violations counted above.
    */
   private applyAction(l: Link, key: SqlValue[], action: ForeignKeySchema['onDelete'], newKey: SqlValue[] | null): void {
-    const child = l.child;
-    const where = this.where(child, l.childCols);
+    const p = this.plans(l);
     switch (action) {
       case 'CASCADE':
-        if (newKey === null) this.host.run(`DELETE FROM ${q(child.name)} WHERE ${where}`, key);
-        else {
-          const k = key.length;
-          const set = l.childCols.map((c, i) => `${q(child.columns[c].name)} = ?${k + i + 1}`).join(', ');
-          this.host.run(`UPDATE ${q(child.name)} SET ${set} WHERE ${where}`, [...key, ...newKey]);
-        }
+        if (newKey === null) this.host.run(p.deleteChildren, key);
+        else this.host.run(p.rekeyChildren, [...key, ...newKey]);
         return;
       case 'SET NULL':
-      case 'SET DEFAULT': {
-        const set = l.childCols
-          .map((c) => {
-            const col = child.columns[c];
-            const v = action === 'SET DEFAULT' && col.default ? col.default.text : 'NULL';
-            return `${q(col.name)} = ${v}`;
-          })
-          .join(', ');
-        this.host.run(`UPDATE ${q(child.name)} SET ${set} WHERE ${where}`, key);
+        this.host.run(p.setNull, key);
         return;
-      }
+      case 'SET DEFAULT':
+        this.host.run(p.setDefault, key);
+        return;
       case 'RESTRICT':
         // Checked when its turn comes: an earlier action may already have removed the children.
         if (this.childCount(l, key) > 0) throw new ConstraintError('SMALT_CONSTRAINT_FOREIGNKEY', 'FOREIGN KEY constraint failed');
@@ -279,4 +286,50 @@ function sameValue(a: SqlValue, b: SqlValue): boolean {
   if (a instanceof Uint8Array && b instanceof Uint8Array) return a.length === b.length && a.every((x, i) => x === b[i]);
   // eslint-disable-next-line eqeqeq
   return (typeof a === 'number' || typeof a === 'bigint') && (typeof b === 'number' || typeof b === 'bigint') && a == b;
+}
+
+/**
+ * A table column as SQL reads it in a comparison: its static type, and its collation and affinity as SQL metadata
+ * (exec/sql-meta.ts), as the SQL front end binds a column reference.
+ */
+function columnRef(t: TableSchema, c: number, at: number): { e: PlanExpr; operand: SqlOperand } {
+  const cs = t.columns[c];
+  const type = cs.rowidAlias ? 'int' : staticTypeOfStorage(cs.type);
+  const affinity = affinityOfStorage(cs.type);
+  const e = withMeta(col(0, at, type, collationName(cs.collation)), { collation: cs.collation, collSrc: CollSrc.Column, affinity });
+  return { e, operand: { type, collation: cs.collation, collSrc: CollSrc.Column, affinity } };
+}
+
+/** `column = param` with SQL's comparison rules: the column's collation, its affinity applied to the parameter. */
+function keyEquals(t: TableSchema, c: number, at: number, paramIndex: number): PlanExpr {
+  const { e, operand } = columnRef(t, c, at);
+  const p = param(paramIndex);
+  const coll = comparisonCollation(operand, { type: 'any', collation: 0, collSrc: CollSrc.None, affinity: 'NONE' });
+  const [, conv] = comparisonConverters(operand, { type: 'any', collation: 0, collSrc: CollSrc.None, affinity: 'NONE' });
+  const right = conv === null ? p : call(conv === applyNumericAffinity ? 'sql.affinity_numeric' : 'sql.affinity_text', [p], 'any');
+  return call('sql.eq', [e, right], 'int', collationName(coll));
+}
+
+/** The rows of `t` whose `cols` equal parameters 0.., as a filter over a scan of `columns` of `t` (`at` maps). */
+function keyFilter(t: TableSchema, cols: number[], columns: number[]): PlanOp {
+  const conds = cols.map((c, i) => keyEquals(t, c, columns.indexOf(c), i));
+  return filter(scan(t.name, columns), conds.length === 1 ? conds[0] : and(...conds));
+}
+
+function linkPlans(l: Link, host: FkHost): LinkPlans {
+  const { child, parent } = l;
+  const n = child.columns.length;
+  const all = [...child.columns.keys(), -1];
+  const k = l.childCols.length;
+  const childUpdate = (value: (c: number, i: number) => PlanExpr): PlanOp => update(child.name, keyFilter(child, l.childCols, all), n, l.childCols.map((c, i) => ({ column: c, value: value(c, i) })));
+  return {
+    // SELECT 1 FROM parent WHERE key = ? LIMIT 1
+    parentHas: limit(project(keyFilter(parent, l.parentCols, l.parentCols), [lit(1)]), 1),
+    // SELECT count(*) FROM child WHERE key = ?
+    childCount: aggregate(keyFilter(child, l.childCols, l.childCols), [], [agg('count', [], 'int', { star: true })]),
+    deleteChildren: remove(child.name, keyFilter(child, l.childCols, [...l.childCols, -1]), k),
+    rekeyChildren: childUpdate((_c, i) => param(k + i)),
+    setNull: childUpdate(() => lit(null)),
+    setDefault: childUpdate((c) => host.defaultValue(child, c) ?? lit(null)),
+  };
 }

@@ -28,9 +28,6 @@ import { type ExternalScan, type PhysicalEnv, Planner, type QueryPlan, Registers
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type PlanMorsels, planMorsels } from './exec/plan-morsel.js';
-import { toPlan } from './sql/frontend/select.js';
-import { bindStoredTableExprs } from './sql/frontend/ddl.js';
-import { bindStatement } from './sql/frontend/bind.js';
 import type { BoundQuery, BoundStatement, BoundTransaction, BoundWrite } from './plan/bound.js';
 import type { AlterAction, ColumnDef as ColumnDefinition, ExprDef, SchemaOp, Source, SourceEditor, TableDef } from './plan/schema.js';
 import { SYSTEM_TABLES, type StoredDef, type StoredText, type SystemTableName, decodeDef, encodeDef, isSystemTable, systemTableSql } from './catalog/stored.js';
@@ -38,8 +35,6 @@ import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import type { ReaderSettings } from '../shared/protocol.js';
-import type { CreateViewStmt, ParsedStatement, SelectStmt, Stmt } from './sql/ast.js';
-import { parse, parseOne } from './sql/parser.js';
 import {
   AsyncRequiredError,
   type ConnectionInfo,
@@ -58,9 +53,8 @@ import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordEncoder, RecordReader } from './storage/record.js';
 import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec/stats.js';
 import { type CatalogSnapshot, informationSchema } from './catalog/information-schema.js';
-import { quoteIdent as quoteIdentIfNeeded } from './sql/frontend/source-edit.js';
 import { sqlLanguage } from './sql/language.js';
-import type { SmaltLanguage } from './plan/language.js';
+import type { LanguageStatement, SmaltLanguage } from './plan/language.js';
 import { ForeignKeys } from './exec/fk.js';
 import { PluginRegistry, type SmaltPlugin } from './plugin.js';
 import { Collation, type SqlValue } from './values.js';
@@ -142,8 +136,6 @@ interface ExternalCacheEntry {
 
 /** Catalog key of a connection (connections have their own namespace). */
 const connectionKey = (name: string): string => `\u0000connection:${name.toLowerCase()}`;
-const quoteIdent = (name: string): string => '"' + name.replace(/"/g, '""') + '"';
-const sqlLiteral = (v: SqlValue): string => (v === null ? 'NULL' : typeof v === 'string' ? `'${v.replace(/'/g, "''")}'` : String(v));
 
 
 interface CatalogEntry {
@@ -170,6 +162,10 @@ interface Program {
   rows?: (r: SqlValue[]) => SqlValue[][];
   columns: string[];
   columnTypes: StaticType[];
+  /** The bound statement it was compiled from (a language's statement or plan data). */
+  bound?: BoundStatement;
+  /** It reads memory-resident objects: TEMP tables and views, memory materialized views (seen while binding). */
+  memory?: boolean;
 }
 
 let roundTrip: boolean | undefined;
@@ -362,35 +358,6 @@ export class Database implements FunctionContext {
   }
 
   /**
-   * Whether a statement reads memory-resident objects (TEMP tables, memory materialized views),
-   * directly or through views: those exist only in this connection, so parallel readers cannot
-   * answer it. PRAGMAs count too: settings (work_mem, foreign_keys) belong to this connection.
-   */
-  usesMemoryObjects(parsed: ParsedStatement): boolean {
-    if (parsed.stmt.kind === 'pragma') return true;
-    if (this.tempTables.size === 0 && this.memViews.size === 0 && this.tempViews.size === 0) return false;
-    const seen = new Set<string>();
-    const walk = (x: unknown): boolean => {
-      if (Array.isArray(x)) return x.some(walk);
-      if (typeof x !== 'object' || x === null || Object.getPrototypeOf(x) !== Object.prototype) return false;
-      const o = x as Record<string, unknown>;
-      if (o.kind === 'table' && typeof o.name === 'string') {
-        const lower = o.name.toLowerCase();
-        const t = this.tables.get(lower);
-        if (t && t.rootPage >= MEM_BASE) return true;
-        if ((!o.schema || String(o.schema).toLowerCase() === 'temp') && this.tempViews.has(lower)) return true; // TEMP views exist in this connection only
-        const v = this.getView(lower);
-        if (v && !seen.has(lower)) {
-          seen.add(lower);
-          if ([...this.sourceDeps(v.source)].some((d) => this.tempViews.has(d) || (this.tables.get(d)?.rootPage ?? 0) >= MEM_BASE)) return true;
-        }
-      }
-      return Object.keys(o).some((k) => walk(o[k]));
-    };
-    return walk(parsed.stmt);
-  }
-
-  /**
    * @internal Changes when committed data changes, in the file or in the memory store (TEMP
    * tables): statements re-check their row-count assumptions when it moves.
    */
@@ -510,13 +477,27 @@ export class Database implements FunctionContext {
   /** Compile a single statement. */
   prepare(sql: string): Statement {
     this.checkOpen();
-    return new Statement(this, parseOne(sql), sql);
+    return new Statement(this, this.sql.parseOne(sql), sql);
+  }
+
+  /** SQL, the language of the string API (ADR 0015: languages register with the engine in step 9). */
+  private get sql(): SmaltLanguage {
+    return this.languageOf('sql');
+  }
+
+  /** @internal Whether `sql` holds more than one statement (false when it does not parse: running it reports that). */
+  isScript(sql: string): boolean {
+    try {
+      return this.sql.parse(sql).length > 1;
+    } catch {
+      return false;
+    }
   }
 
   /** Run one or more statements, discarding any rows. */
   exec(sql: string, params?: BindParams): void {
     this.checkOpen();
-    const stmts = parse(sql);
+    const stmts = this.sql.parse(sql);
     if (params !== undefined && stmts.length > 1) throw new MisuseError('parameters can only be bound with a single statement');
     for (const ps of stmts) new Statement(this, ps, ps.text).run(params);
   }
@@ -619,7 +600,7 @@ export class Database implements FunctionContext {
   /** `exec` for statements that may read external data (CREATE EXTERNAL TABLE, materialized views over it, …). */
   async execAsync(sql: string, params?: BindParams, options: { signal?: AbortSignal } = {}): Promise<void> {
     this.checkOpen();
-    const stmts = parse(sql);
+    const stmts = this.sql.parse(sql);
     if (params !== undefined && stmts.length > 1) throw new MisuseError('parameters can only be bound with a single statement');
     for (const ps of stmts) {
       const st = new Statement(this, ps, ps.text);
@@ -629,11 +610,11 @@ export class Database implements FunctionContext {
 
   /** `withExternal` for the async API; `REFRESH … IF CHANGED` first checks its view's sources. */
   private async runExternal<T>(signal: AbortSignal | undefined, st: Statement, run: () => T): Promise<T> {
-    const s = st.parsed.stmt;
-    if (s.kind !== 'refresh' || !s.ifChanged) return this.withExternal(signal, st, run);
+    const view = refreshIfChanged(st);
+    if (view === null) return this.withExternal(signal, st, run);
     // Revalidate the view's sources first (HEAD requests, stats): the refresh runs only if needed.
-    const key = s.name.toLowerCase();
-    this.refreshDecisions.set(key, await this.matviewChanged(s.name, signal));
+    const key = view.toLowerCase();
+    this.refreshDecisions.set(key, await this.matviewChanged(view, signal));
     try {
       return await this.withExternal(signal, st, run);
     } finally {
@@ -658,7 +639,7 @@ export class Database implements FunctionContext {
     try {
       // First round: every source known before running, fetched together. `read_csv('…')` calls with
       // constant arguments are found in the statement text (planning needs their columns).
-      const first = st instanceof Statement ? this.literalExternalSources(st.parsed.stmt) : [];
+      const first = st instanceof Statement ? this.literalExternalSources(st.parsed) : [];
       try {
         first.push(...st.externalSources);
       } catch (e) {
@@ -809,22 +790,23 @@ export class Database implements FunctionContext {
   private readonly fk = new ForeignKeys({
     getTable: (n) => this.tables.get(n.toLowerCase()),
     allTables: () => [...this.tables.values()].filter((t) => !t.system),
-    query: (sql, params) => this.internal(sql, params) ?? [],
-    run: (sql, params) => void this.internal(sql, params),
+    run: (plan, params) => this.internalPlan(plan, params) ?? [],
+    defaultValue: (t, c) => this.tableExprs(t).defaults[c] ?? null,
   });
 
-  private internalPrograms = new Map<string, { version: number; prog: Program }>();
+  private internalPrograms = new WeakMap<PlanOp, { version: number; prog: Program }>();
 
   /**
    * Run an internal statement (foreign-key checks and actions) with positional parameters, inside
    * the current statement: no transaction handling, and changes() is not affected.
    */
-  private internal(sql: string, params: SqlValue[]): SqlValue[][] | null {
-    let c = this.internalPrograms.get(sql);
+  private internalPlan(plan: PlanOp, params: SqlValue[]): SqlValue[][] | null {
+    let c = this.internalPrograms.get(plan);
     if (!c || c.version !== this.schemaVersion) {
-      const ps = parseOne(sql);
-      c = { version: this.schemaVersion, prog: this.compile(ps) };
-      this.internalPrograms.set(sql, c);
+      const write = plan.op === 'append' || plan.op === 'update' || plan.op === 'delete';
+      const bound = normalizeBound(toBoundStatement(write ? { kind: 'write', plan } : plan, (x) => this.receivedPlan(x)));
+      c = { version: this.schemaVersion, prog: this.compileBound(bound, paramCount(bound), '') };
+      this.internalPrograms.set(plan, c);
     }
     const p = c.prog;
     const regs: SqlValue[] = new Array(p.regCount).fill(null);
@@ -1170,9 +1152,10 @@ export class Database implements FunctionContext {
    */
   planOf(sql: string): { root: Operator; columns: { name: string; type: StaticType }[]; subplans: readonly { label: string; root: Operator }[]; estimates: WeakMap<Operator, number> } {
     this.checkOpen();
-    const ps = parseOne(sql);
-    if (ps.stmt.kind !== 'select') throw new MisuseError('planOf takes a SELECT statement');
-    const bound = bindStatement(ps, this.bindContext(), (fe) => this.received(fe)) as BoundQuery;
+    const ps = this.sql.parseOne(sql);
+    const b = this.receivedBound(ps.bind(this.bindContext()));
+    if (b.kind !== 'query') throw new MisuseError('planOf takes a SELECT statement');
+    const bound: BoundQuery = b;
     const planner = new Planner(this.plannerDeps(this.rewritePolicy(bound)), new Registers(ps.paramCount));
     planner.sqlText = ps.text;
     const plan = this.planQuery(bound, planner);
@@ -1253,8 +1236,61 @@ export class Database implements FunctionContext {
    * @internal Compile a statement into a program for the current schema: the language binds it (sql/frontend/bind.ts),
    * and the engine dispatches on the bound statement (plan/bound.ts).
    */
-  compile(ps: ParsedStatement): Program {
-    return this.compileBound(bindStatement(ps, this.bindContext(), (fe) => this.received(fe)), ps.paramCount, ps.text);
+  compile(ps: LanguageStatement): Program {
+    const reads = this.recordingContext();
+    const bound = this.receivedBound(ps.bind(reads.ctx));
+    const p = this.compileBound(bound, ps.paramCount, ps.text);
+    // Settings (work_mem, foreign_keys) belong to this connection.
+    return { ...p, bound, memory: reads.memory() || bound.kind === 'setting' };
+  }
+
+  /**
+   * The catalog a statement binds against, noting whether its language looked up memory-resident objects (TEMP
+   * tables and views, memory materialized views): parallel readers cannot see those. A lookup is noted before it may
+   * fail (a memory view a reader never filled), so a statement that does not bind is still placed.
+   */
+  private recordingContext(): { ctx: BindContext; memory: () => boolean } {
+    let memory = false;
+    const base = this.bindContext();
+    const note = (n: string, schema: string | undefined): void => {
+      const t = this.getTable(n, schema);
+      if (t && (t.temp || t.rootPage >= MEM_BASE)) memory = true;
+    };
+    const ctx: BindContext = {
+      ...base,
+      getTable: (n, schema) => (note(n, schema), base.getTable(n, schema)),
+      writeTarget: (n, schema) => (note(n, schema), base.writeTarget(n, schema)),
+      getView: (n, schema) => {
+        const v = base.getView?.(n, schema);
+        if (v && this.tempViews.get(v.name.toLowerCase()) === v) memory = true;
+        return v;
+      },
+    };
+    return { ctx, memory: () => memory };
+  }
+
+  /** @internal Whether a statement that does not compile reads memory-resident objects (as far as binding got). */
+  bindsMemoryObjects(ps: LanguageStatement): boolean {
+    const reads = this.recordingContext();
+    try {
+      ps.bind(reads.ctx);
+    } catch {
+      // as far as it got
+    }
+    return reads.memory();
+  }
+
+  /** A bound statement's plans as the engine receives them (see {@link received}). */
+  private receivedBound(b: BoundStatement): BoundStatement {
+    switch (b.kind) {
+      case 'query':
+      case 'write':
+        return this.received(b);
+      case 'explain':
+        return { ...b, query: this.received(b.query) };
+      default:
+        return b;
+    }
   }
 
   /**
@@ -1719,9 +1755,20 @@ export class Database implements FunctionContext {
     const lower = name.toLowerCase();
     const mem = this.memExtCache.get(lower);
     if (mem) return mem;
-    if (!this.tables.has('smalt_extcache')) return [];
-    const rows = this.query('SELECT sources FROM smalt_extcache WHERE lower(name) = ?', [lower]).rows;
-    return rows.length ? (JSON.parse(rows[0][0] as string) as ExternalCacheEntry[]) : [];
+    const t = this.tables.get('smalt_extcache');
+    if (!t) return [];
+    const reader = new RecordReader(t.layout, t.recordDefaults);
+    const c = this.tree(t.rootPage).cursor();
+    try {
+      for (let ok = c.first(); ok; ok = c.next()) {
+        c.loadValue();
+        reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+        if (String(reader.column(0)).toLowerCase() === lower) return JSON.parse(String(reader.column(1))) as ExternalCacheEntry[];
+      }
+    } finally {
+      c.close();
+    }
+    return [];
   }
 
   /**
@@ -1975,9 +2022,9 @@ export class Database implements FunctionContext {
     }
     let entry: MorselEntry | null = null;
     try {
-      const parsed = parseOne(sql);
-      if (parsed.stmt.kind === 'select') {
-        const fe = this.received(toPlan(parsed.stmt, parsed.text, this.bindContext()));
+      const parsed = this.sql.parseOne(sql);
+      const fe = this.receivedBound(parsed.bind(this.bindContext()));
+      if (fe.kind === 'query') {
         const q = planMorsels(fe.plan, parsed.paramCount, (name, db) => {
           const t = this.getTable(name, db);
           // Readers open the file: memory-resident objects and system tables stay on the owner.
@@ -2682,9 +2729,7 @@ export class Database implements FunctionContext {
       const data = this.external.data(schemaSourceOf(source));
       if (data.columns.length === 0) throw externalError(source, 'no columns found (the source is empty)');
       columns = data.columns.map((c) => ({ name: c.name, declType: c.declType || 'ANY' }));
-      const cols = columns.map((c) => `${quoteIdent(c.name)} ${c.declType}`).join(', ');
-      const opts = Object.entries(stmt.options).map(([k, v]) => `${quoteIdentIfNeeded(k)} = ${sqlLiteral(v)}`).join(', ');
-      text = `CREATE EXTERNAL TABLE ${quoteIdent(stmt.name)} (${cols}) WITH (${opts})`;
+      text = this.languageOf(stmt.source.language).sourceEditor.externalTable(stmt.name, columns.map((c) => ({ name: c.name, declaredType: c.declType })), stmt.options);
     }
     this.dirtySchema = true;
     this.addCatalogRow('external', stmt.name, stmt.name, 0, text, undefined, { kind: 'external', columns: columns.map((c) => ({ name: c.name, declaredType: c.declType })), options: stmt.options });
@@ -2719,27 +2764,16 @@ export class Database implements FunctionContext {
    * `read_csv` / `read_json` calls with literal arguments in `stmt` (not inside views): fetched up
    * front with the statement's other sources, instead of one by one as planning reaches them.
    */
-  private literalExternalSources(stmt: Stmt): ExternalSource[] {
+  private literalExternalSources(stmt: LanguageStatement): ExternalSource[] {
     const out: ExternalSource[] = [];
-    const lit = (e: { kind: string; value?: SqlValue }): boolean => e.kind === 'literal';
-    const walk = (x: unknown): void => {
-      if (Array.isArray(x)) return x.forEach(walk);
-      if (typeof x !== 'object' || x === null || Object.getPrototypeOf(x) !== Object.prototype) return;
-      const o = x as Record<string, unknown>;
-      if (o.kind === 'function' && this.external.plugins.isExternalFunction(o.name as string)) {
-        const f = o as unknown as { name: string; args: { kind: string; value?: SqlValue }[]; named?: Record<string, { kind: string; value?: SqlValue }> };
-        const named = Object.entries(f.named ?? {});
-        if (f.args.every(lit) && named.every(([, e]) => lit(e))) {
-          try {
-            out.push(schemaSourceOf(this.externalFunctionSource(f.name, f.args.map((a) => a.value!), Object.fromEntries(named.map(([k, e]) => [k, e.value!])))));
-          } catch {
-            // Planning reports it.
-          }
-        }
+    for (const f of stmt.externalCalls?.() ?? []) {
+      if (!this.external.plugins.isExternalFunction(f.name)) continue;
+      try {
+        out.push(schemaSourceOf(this.externalFunctionSource(f.name, [...f.args], { ...f.named })));
+      } catch {
+        // Planning reports it.
       }
-      for (const k of Object.keys(o)) walk(o[k]);
-    };
-    walk(stmt);
+    }
     return out;
   }
 
@@ -3138,7 +3172,7 @@ export class Database implements FunctionContext {
       // Like SQLite, dropping a parent table first deletes its rows (applying foreign-key actions).
       if (this.fk.enabled && this.tables.size > 1 && [...this.tables.values()].some((t) => t !== table && t.foreignKeys.some((f) => f.table.toLowerCase() === lower))) {
         this.fk.sync(this.schemaVersion);
-        this.internal(`DELETE FROM main."${table.name.replace(/"/g, '""')}"`, []);
+        this.internalPlan({ op: 'delete', table: table.name, db: 'main', input: { op: 'scan', table: table.name, db: 'main', columns: [-1] }, rowid: 0 }, []);
       }
       this.dirtySchema = true;
       this.objectChanged(table.name);
@@ -3564,7 +3598,7 @@ export class Database implements FunctionContext {
     // Stored definitions hold bound expressions; a DEFAULT naming a function that did not exist when the table was
     // made is bound where first used, from the table's source. A failure is the binder's error.
     if (checks.some((c) => !c.expr) || defaults.some((d) => d && !d.expr)) {
-      const b = bindStoredTableExprs(table, this.bindContext());
+      const b = this.sql.bindStoredExprs(table, this.bindContext());
       checks = checks.map((c, i) => (c.expr ? c : { ...c, expr: b.checks[i] }));
       defaults = defaults.map((d, i) => (d && !d.expr ? { ...d, expr: b.defaults[i]! } : d));
     }
@@ -4440,7 +4474,7 @@ export abstract class PreparedStatement {
 export class Statement extends PreparedStatement {
   constructor(
     db: Database,
-    readonly parsed: ParsedStatement,
+    readonly parsed: LanguageStatement,
     readonly sql: string,
   ) {
     super(db);
@@ -4455,7 +4489,11 @@ export class Statement extends PreparedStatement {
   }
 
   protected readsMemoryObjects(): boolean {
-    return this.db.usesMemoryObjects(this.parsed);
+    try {
+      return this.prog().memory === true;
+    } catch {
+      return this.db.bindsMemoryObjects(this.parsed);
+    }
   }
 
   get paramCount(): number {
@@ -4493,7 +4531,7 @@ export class PlanStatement extends PreparedStatement {
 }
 
 /** Write `params` for `parsed` into `regs[0..paramCount)` (positional, or by name). */
-function bindParamValues(parsed: ParsedStatement, params: BindParams | undefined, regs: SqlValue[]): void {
+function bindParamValues(parsed: Pick<LanguageStatement, 'paramCount' | 'paramNames'>, params: BindParams | undefined, regs: SqlValue[]): void {
   const n = parsed.paramCount;
   if (params === undefined) {
     if (n > 0) throw new SmaltError('SMALT_RANGE', `statement expects ${n} parameter(s)`);
@@ -4680,7 +4718,7 @@ const EMPTY_MEM_SNAPSHOT: MemSnapshot = { temps: [], views: [] };
 /** A query analyzed for morsel execution, with its compiled merge statement (per schema version). */
 interface MorselEntry {
   version: number;
-  parsed: ParsedStatement;
+  parsed: LanguageStatement;
   /** The query's plan and result columns. */
   plan: PlanOp;
   columns: ResultColumnInfo[];
@@ -4827,4 +4865,15 @@ function normalizeBound(b: BoundStatement): BoundStatement {
     default:
       return b;
   }
+}
+
+/** The materialized view a `REFRESH … IF CHANGED` statement refreshes, or null for any other statement. */
+function refreshIfChanged(st: PreparedStatement): string | null {
+  let b: BoundStatement | undefined;
+  try {
+    b = st.prog().bound;
+  } catch {
+    return null; // not a refresh: running it reports the error
+  }
+  return b?.kind === 'maintenance' && b.action === 'refresh' && b.ifChanged ? b.view : null;
 }
