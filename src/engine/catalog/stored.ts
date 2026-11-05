@@ -21,8 +21,9 @@ export const DEFINITION_VERSION = 1;
 
 /** An object's stored definition, by catalog type. */
 export type StoredDef =
-  | { readonly kind: 'table'; readonly table: TableDef }
-  | { readonly kind: 'index'; readonly index: IndexDef }
+  /** `language`: the language of the object's source text (absent: SQL). */
+  | { readonly kind: 'table'; readonly table: TableDef; readonly language?: string }
+  | { readonly kind: 'index'; readonly index: IndexDef; readonly language?: string }
   | { readonly kind: 'view'; readonly language: string; readonly columns?: readonly string[] }
   /** A materialized view; the table its rows are stored in is in `smalt_matview` (its layout). */
   | { readonly kind: 'matview'; readonly language: string; readonly columns?: readonly string[]; readonly options: Readonly<Record<string, SqlValue>> }
@@ -45,8 +46,10 @@ export function encodeDef(def: StoredDef): StoredText {
     return { ...rest, x: exprs.length - 1 };
   };
   let body: unknown;
-  if (def.kind === 'table') body = { kind: 'table', table: compactTable(def.table, store) };
-  else if (def.kind === 'index') body = { kind: 'index', index: compactIndex(def.index, store) };
+  const language = def.kind === 'table' || def.kind === 'index' ? def.language : undefined;
+  const lang = language !== undefined && language !== 'sql' ? { language } : {};
+  if (def.kind === 'table') body = { kind: 'table', table: compactTable(def.table, store), ...lang };
+  else if (def.kind === 'index') body = { kind: 'index', index: compactIndex(def.index, store), ...lang };
   else body = def;
   return { def: encodeDataJSON({ v: DEFINITION_VERSION, ...(body as object) }), exprs: exprs.length ? encodeDataJSON(exprs) : null };
 }
@@ -75,7 +78,8 @@ export function decodeDef(text: StoredText, name: string): StoredDef {
       enumerable: true,
     });
   };
-  return raw.kind === 'table' ? { kind: 'table', table: expandTable(raw.table as Compact, load) } : { kind: 'index', index: expandIndex(raw.index as Compact, load) };
+  const lang = typeof raw.language === 'string' ? { language: raw.language } : {};
+  return raw.kind === 'table' ? { kind: 'table', table: expandTable(raw.table as Compact, load), ...lang } : { kind: 'index', index: expandIndex(raw.index as Compact, load), ...lang };
 }
 
 /** An expression as stored: its text and the position of its plan expression in `exprs`. */

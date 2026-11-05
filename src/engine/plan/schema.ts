@@ -56,6 +56,8 @@ export interface KeyDef {
   readonly onConflict?: ConflictAction;
   /** PRIMARY KEY … AUTOINCREMENT. */
   readonly autoincrement?: boolean;
+  /** Declared as a constraint of this column (dropped with it); absent for a table constraint. */
+  readonly ofColumn?: number;
 }
 
 export type FkAction = 'SET NULL' | 'SET DEFAULT' | 'CASCADE' | 'RESTRICT' | 'NO ACTION';
@@ -74,10 +76,14 @@ export interface ForeignKeyDef {
   readonly deferrable: boolean;
   /** Declared DEFERRABLE, with either INITIALLY clause. */
   readonly isDeferrable: boolean;
+  /** Declared as a constraint of this column (dropped with it); absent for a table constraint. */
+  readonly ofColumn?: number;
 }
 
 export interface CheckDef extends ExprDef {
   readonly name?: string;
+  /** Declared as a constraint of this column (dropped with it); absent for a table constraint. */
+  readonly ofColumn?: number;
 }
 
 export interface TableDef {
@@ -117,7 +123,8 @@ export type DropObject = 'table' | 'index' | 'view' | 'materialized view' | 'tri
 
 /**
  * A schema operation (ADR 0015 section 5): what a language's DDL becomes. Views and materialized views are kept as their
- * language's source, bound where they are read (section 6).
+ * language's source, bound where they are read (section 6). ALTER TABLE changes the stored definitions; the source
+ * texts shown beside them are edited by their language ({@link SourceEditor}).
  */
 export type SchemaOp =
   | { readonly op: 'createTable'; readonly table: TableDef; readonly schema?: string; readonly temp: boolean; readonly ifNotExists: boolean; readonly source: Source }
@@ -146,4 +153,44 @@ export type SchemaOp =
       readonly options: Readonly<Record<string, SqlValue>>;
       readonly source: Source;
     }
-  | { readonly op: 'drop'; readonly objectType: DropObject; readonly name: string; readonly schema?: string; readonly ifExists: boolean };
+  | { readonly op: 'drop'; readonly objectType: DropObject; readonly name: string; readonly schema?: string; readonly ifExists: boolean }
+  | { readonly op: 'alterTable'; readonly table: string; readonly schema?: string; readonly action: AlterAction; readonly source: Source };
+
+/** A language's statement check that the engine reports after its own (which come first, as SQLite orders them). */
+export interface DeferredError {
+  readonly code: string;
+  readonly message: string;
+}
+
+/** What ALTER TABLE changes. */
+export type AlterAction =
+  | { readonly kind: 'renameTable'; readonly newName: string }
+  | { readonly kind: 'renameColumn'; readonly column: string; readonly newName: string }
+  | {
+      readonly kind: 'addColumn';
+      /** The new column, its constraints (CHECKs over the new row, foreign keys on it) and its source text. */
+      readonly column: ColumnDef;
+      readonly checks: readonly CheckDef[];
+      readonly foreignKeys: readonly ForeignKeyDef[];
+      readonly text: string;
+      /** The column cannot be added (a key, a generated column, a non-constant default, …). */
+      readonly invalid?: DeferredError;
+    }
+  | { readonly kind: 'dropColumn'; readonly column: string };
+
+/**
+ * How a language edits its source texts when ALTER TABLE changes a definition, so that what `sqlite_schema` shows stays
+ * in step (SQLite edits the stored statements in place, keeping their formatting).
+ */
+export interface SourceEditor {
+  /** `text` (a stored statement) with references to table `oldName` renamed. */
+  renameTable(text: string, oldName: string, newName: string, columnsOf: (table: string) => ReadonlySet<string> | undefined): string;
+  /** `text` (a stored statement) with references to column `oldName` of `table` renamed. */
+  renameColumn(text: string, table: string, oldName: string, newName: string, columnsOf: (table: string) => ReadonlySet<string> | undefined): string;
+  /** An expression of `table` (a CHECK, an index key or WHERE) with column `oldName` renamed. */
+  renameColumnInExpr(text: string, table: string, oldName: string, newName: string): string;
+  /** A table's statement with a column added (`columnText`, as the ALTER statement wrote it). */
+  addColumn(tableText: string, columnText: string): string;
+  /** A table's statement without column `column` (its position). */
+  dropColumn(tableText: string, column: number): string;
+}

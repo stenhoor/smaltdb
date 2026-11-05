@@ -113,9 +113,12 @@ interior cell:  u32 child | u16 keyLen | key
   ascending keys, no CHECKs, row storage, `NO ACTION`, …). A table's or index's plan expressions (CHECK, DEFAULT, index
   columns, partial WHERE) are in `exprs`, a JSON array, with their SQL metadata as `$sql` fields (`plan/codec.ts`); the
   definition refers to each by its position (`"x": 0`) beside its text. Integers beyond JSON's range, blobs and
-  non-finite reals are tagged objects (`{"$bigint": "…"}`, `{"$blob": "hex"}`, `{"$real": "Infinity"}`). The table is
-  not in the catalog, so `sqlite_schema` does not list it. A definition of another version is refused with
-  `SMALT_FORMAT`.
+  non-finite reals are tagged objects (`{"$bigint": "…"}`, `{"$blob": "hex"}`, `{"$real": "Infinity"}`). A key, CHECK
+  or foreign key declared on a column records it (`"ofColumn": 2`): DROP COLUMN drops it with the column. A table or
+  index whose source is not SQL records its language (`"language"`). The table is not in the catalog, so
+  `sqlite_schema` does not list it. A definition of another version is refused with `SMALT_FORMAT`.
+- ALTER TABLE changes the definitions (names, positions, the expressions' column numbers) and has the source's
+  language edit the texts shown beside them, as SQLite edits its stored statements.
 - Opening reads both tables and parses nothing. Plan expressions stay JSON text until an expression is first used (an
   index's are compiled then), and a view's source, or a materialized view's query, is parsed by its language where it
   is first read.

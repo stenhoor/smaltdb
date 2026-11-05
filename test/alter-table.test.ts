@@ -135,3 +135,67 @@ describe('ALTER TABLE', () => {
     expect(d.query('PRAGMA integrity_check').rows).toEqual([['ok']]);
   });
 });
+
+describe('ALTER TABLE changes stored definitions', () => {
+  const reopen = (vfs: MemoryVfs): Database => Database.openFile(vfs.openSync('d.db'), {}, vfs.openSync('d.db-wal'));
+  const checks = (d: Database, table: string): unknown =>
+    (d as unknown as { bindContext(): { getTable(n: string): { checks: { text: string; name?: string }[] } } }).bindContext().getTable(table)!.checks.map((c) => c.name ?? c.text);
+
+  it('DROP COLUMN moves later columns, the rowid and expressions over them', () => {
+    const vfs = new MemoryVfs();
+    let d = reopen(vfs);
+    d.exec('CREATE TABLE t(a, b CHECK (b > 0), c, d, CHECK (d > c), CHECK (rowid < 100))');
+    d.exec('CREATE INDEX td ON t(d * 2) WHERE c IS NOT NULL');
+    d.exec('INSERT INTO t VALUES (1, 2, 3, 4), (5, 6, 7, 8)');
+    d.exec('ALTER TABLE t DROP COLUMN b');
+    expect(checks(d, 't')).toEqual(['d > c', 'rowid < 100']);
+    expect(() => d.exec('INSERT INTO t VALUES (1, 9, 2)')).toThrow(/CHECK constraint failed: d > c/);
+    expect(() => d.exec('INSERT INTO t(rowid, a, c, d) VALUES (200, 1, 2, 3)')).toThrow(/CHECK constraint failed: rowid < 100/);
+    d.exec('INSERT INTO t VALUES (9, 1, 2)');
+    expect(d.query('SELECT a FROM t INDEXED BY td WHERE d * 2 = 16 AND c IS NOT NULL').rows).toEqual([[5]]);
+    d.close();
+    d = reopen(vfs);
+    expect(d.query('SELECT * FROM t ORDER BY a').rows).toEqual([[1, 3, 4], [5, 7, 8], [9, 1, 2]]);
+    expect(d.query('SELECT a FROM t INDEXED BY td WHERE d * 2 = 4 AND c IS NOT NULL').rows).toEqual([[9]]);
+    expect(() => d.exec('INSERT INTO t VALUES (1, 9, 2)')).toThrow(/CHECK constraint failed: d > c/);
+    expect(d.query('PRAGMA integrity_check').rows).toEqual([['ok']]);
+  });
+
+  it('ADD COLUMN binds its CHECK over the new row, and RENAME COLUMN renames expression texts', () => {
+    const vfs = new MemoryVfs();
+    let d = reopen(vfs);
+    d.exec('CREATE TABLE t(a, b, CHECK (rowid > 0))');
+    d.exec('CREATE INDEX ta ON t(a + b)');
+    d.exec('INSERT INTO t VALUES (1, 2)');
+    d.exec('ALTER TABLE t ADD COLUMN c INT DEFAULT 7 CHECK (c > a)');
+    expect(() => d.exec('INSERT INTO t VALUES (9, 1, 3)')).toThrow(/CHECK constraint failed: c > a/);
+    d.exec('ALTER TABLE t RENAME COLUMN a TO x');
+    expect(checks(d, 't')).toEqual(['rowid > 0', 'c > x']);
+    expect(d.query("SELECT sql FROM sqlite_schema WHERE name = 'ta'").rows).toEqual([['CREATE INDEX ta ON t(x + b)']]);
+    d.close();
+    d = reopen(vfs);
+    expect(d.query('SELECT x, b, c FROM t').rows).toEqual([[1, 2, 7]]);
+    expect(() => d.exec('INSERT INTO t VALUES (9, 1, 3)')).toThrow(/CHECK constraint failed: c > x/);
+    expect(d.query('SELECT x FROM t INDEXED BY ta WHERE x + b = 3').rows).toEqual([[1]]);
+    expect(d.query("SELECT sql FROM sqlite_schema WHERE name = 't'").rows).toEqual([['CREATE TABLE t(x, b, c INT DEFAULT 7 CHECK (c > x), CHECK (rowid > 0))']]);
+  });
+
+  it('RENAME TO moves definitions, automatic indexes and foreign keys', () => {
+    const vfs = new MemoryVfs();
+    let d = reopen(vfs);
+    d.exec('PRAGMA foreign_keys = ON');
+    d.exec('CREATE TABLE p(id INTEGER PRIMARY KEY, code TEXT UNIQUE)');
+    d.exec('CREATE TABLE c(pid REFERENCES p(id) ON DELETE CASCADE)');
+    d.exec("INSERT INTO p VALUES (1, 'a'); INSERT INTO c VALUES (1)");
+    d.exec('ALTER TABLE p RENAME TO q');
+    d.close();
+    d = reopen(vfs);
+    d.exec('PRAGMA foreign_keys = ON');
+    expect(d.query("SELECT name FROM sqlite_schema WHERE tbl_name = 'q' ORDER BY name").rows).toEqual([['q'], ['smalt_autoindex_q_1']]);
+    expect(() => d.exec("INSERT INTO q VALUES (2, 'a')")).toThrow(/UNIQUE/);
+    expect(() => d.exec('INSERT INTO c VALUES (5)')).toThrow(/FOREIGN KEY/);
+    d.exec('DELETE FROM q WHERE id = 1');
+    expect(d.query('SELECT count(*) FROM c').rows).toEqual([[0]]);
+    expect(d.query('PRAGMA integrity_check').rows).toEqual([['ok']]);
+  });
+});

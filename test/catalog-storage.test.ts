@@ -106,9 +106,9 @@ describe('catalog storage', () => {
           { name: 'b', type: 'TEXT', collation: 'nocase', default: { text: "'x'", value: 'x', x: 0 } },
           { name: 'c', declaredType: '', type: 'ANY' },
         ],
-        keys: [{ kind: 'primaryKey', columns: [{ column: 0 }] }],
-        checks: [{ text: 'a > 0', x: 1 }],
-        foreignKeys: [{ columns: [3], table: 't', onDelete: 'CASCADE' }],
+        keys: [{ kind: 'primaryKey', columns: [{ column: 0 }], ofColumn: 0 }],
+        checks: [{ text: 'a > 0', x: 1, ofColumn: 1 }],
+        foreignKeys: [{ columns: [3], table: 't', onDelete: 'CASCADE', ofColumn: 3 }],
       },
     });
     expect(JSON.parse(t.exprs!)).toHaveLength(2);

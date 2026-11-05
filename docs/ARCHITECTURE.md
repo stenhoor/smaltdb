@@ -81,10 +81,10 @@ src/
   engine/
     vfs/              Vfs interface, MemoryVfs, OpfsVfs, capability detection
     storage/          pager, WAL, B-trees, key codec, record format, columnar segments, CRC-32C
-    sql/              lexer, parser, AST
+    sql/              lexer, parser, AST; frontend/: binding to plans, DDL, source editing for ALTER
     exec/             planner, rewrites (flatten, plan-mv-match, plan-morsel), operators, expression
                       compiler, code generation, functions, window, spill, statistics, writes
-    catalog/          schema, stored definitions, ALTER, information_schema
+    catalog/          schema, stored definitions, information_schema
     external/         external tables (the plugin host side)
     plan/             the shared plan layer (ADR 0014): plan operations and expressions
     database.ts       the engine's Database: statements, transactions, catalog loading

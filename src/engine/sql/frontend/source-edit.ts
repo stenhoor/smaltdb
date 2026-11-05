@@ -1,13 +1,14 @@
 /**
- * SQL text rewriting for ALTER TABLE ... RENAME (table or column), like SQLite: the stored CREATE
- * statements of the table, its indexes, other tables' foreign keys and views are edited in place
- * (only the affected identifier tokens change; formatting and comments are kept).
+ * SQL's source editor (plan/schema.ts `SourceEditor`): ALTER TABLE changes stored definitions, and this keeps the SQL
+ * shown beside them in step, like SQLite: the stored CREATE statements of the table, its indexes, other tables' foreign
+ * keys and views are edited in place (only the affected identifier tokens change; formatting and comments are kept).
  *
  * Positions come from the AST (statement-relative) and the lexer's token boundaries.
  */
-import type { ColumnExpr, Expr, FromItem, OrderingTerm, SelectCore, SelectStmt, Stmt } from '../sql/ast.js';
-import { TK_ID, TK_NKW, TK_OP, TK_QID, type Tokens, isReservedKeyword, tokenize } from '../sql/lexer.js';
-import { parseOne } from '../sql/parser.js';
+import type { SourceEditor } from '../../plan/schema.js';
+import type { ColumnExpr, CreateTableStmt, Expr, FromItem, OrderingTerm, SelectCore, SelectStmt, Stmt } from '../ast.js';
+import { TK_ID, TK_NKW, TK_OP, TK_QID, type Tokens, isReservedKeyword, tokenize } from '../lexer.js';
+import { parseOne } from '../parser.js';
 
 export interface Edit {
   start: number;
@@ -336,3 +337,34 @@ export function renameColumnEdits(sql: string, table: string, oldCol: string, ne
   }
   return edits;
 }
+
+// ------------------------------------------------------------------ the editor
+
+const lookup = (columnsOf: (table: string) => ReadonlySet<string> | undefined): SchemaLookup => ({
+  tableColumns: (name) => {
+    const cols = columnsOf(name);
+    return cols ? new Set(cols) : undefined;
+  },
+});
+
+export const sqlSourceEditor: SourceEditor = {
+  renameTable: (text, oldName, newName, columnsOf) => applyEdits(text, renameTableEdits(text, oldName, newName, lookup(columnsOf))),
+  renameColumn: (text, table, oldName, newName, columnsOf) => applyEdits(text, renameColumnEdits(text, table, oldName, newName, lookup(columnsOf))),
+  renameColumnInExpr(text, table, oldName, newName) {
+    // The expression as a CHECK of the table: its column references are the table's.
+    const prefix = `CREATE TABLE ${quoteIdent(table, true)}(" " CHECK (`;
+    const edits = renameColumnEdits(`${prefix}${text}))`, table, oldName, newName, { tableColumns: () => undefined });
+    const inside = edits.filter((e) => e.start >= prefix.length && e.end <= prefix.length + text.length);
+    return applyEdits(text, inside.map((e) => ({ ...e, start: e.start - prefix.length, end: e.end - prefix.length })));
+  },
+  addColumn(tableText, columnText) {
+    const stmt = parseOne(tableText).stmt as CreateTableStmt;
+    const last = stmt.columns[stmt.columns.length - 1];
+    return tableText.slice(0, last.end) + ', ' + columnText + tableText.slice(last.end);
+  },
+  dropColumn(tableText, column) {
+    // The column definition and the comma that separates it from its neighbour.
+    const cols = (parseOne(tableText).stmt as CreateTableStmt).columns;
+    return column > 0 ? tableText.slice(0, cols[column - 1].end) + tableText.slice(cols[column].end) : tableText.slice(0, cols[0].pos) + tableText.slice(cols[1].pos);
+  },
+};

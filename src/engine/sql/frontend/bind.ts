@@ -8,7 +8,7 @@ import type { BindContext } from '../../plan/bind-context.js';
 import type { BoundQuery, BoundStatement } from '../../plan/bound.js';
 import type { ParsedStatement, SelectStmt } from '../ast.js';
 import { toPlan, toValueExpr, toWritePlan } from './select.js';
-import { checkNewTable, toIndexDef, toTableDef, withBoundChecks } from './ddl.js';
+import { checkNewTable, toAlterAction, toIndexDef, toTableDef, withBoundChecks } from './ddl.js';
 import type { KeyDef, Source, TableDef } from '../../plan/schema.js';
 
 const sql = (ps: ParsedStatement): Source => ({ language: 'sql', text: ps.text });
@@ -92,7 +92,7 @@ export function bindStatement(ps: ParsedStatement, catalog: BindContext, receive
       };
     case 'drop':
       return { kind: 'schema', op: { op: 'drop', objectType: stmt.objectType, name: stmt.name, ...(stmt.schema !== undefined ? { schema: stmt.schema } : {}), ifExists: stmt.ifExists } };
-    default:
-      return { kind: 'schema', sql: ps };
+    case 'alterTable':
+      return { kind: 'schema', op: { op: 'alterTable', table: stmt.table, ...(stmt.schema !== undefined ? { schema: stmt.schema } : {}), action: toAlterAction(stmt, ps.text, catalog), source: sql(ps) } };
   }
 }

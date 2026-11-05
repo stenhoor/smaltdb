@@ -28,9 +28,10 @@ statements in the engine's terms (`plan/bound.ts`), which `Database.compile` dis
 operations (`plan/schema.ts`, `sql/frontend/ddl.ts`): tables and indexes as language-neutral definitions whose CHECK,
 DEFAULT and index expressions are plan expressions, views and materialized views as their language's source.
 The catalog stores these definitions, versioned, beside each object's source text (ADR 0015 step 7,
-`catalog/stored.ts`), so opening a database parses nothing; views are parsed where they are read. ALTER TABLE still
-reaches the engine as SQL: it rewrites the stored SQL of every object, as SQLite does, and the engine makes the
-definitions again from it, until ALTER TABLE becomes a schema operation (the second part of step 7).
+`catalog/stored.ts`), so opening a database parses nothing; views are parsed where they are read. ALTER TABLE is a
+schema operation too: the engine changes the stored definitions, and the language edits the source texts shown beside
+them (`SourceEditor`; SQL's is `sql/frontend/source-edit.ts`), as SQLite edits its stored statements. Views, kept as
+source, are checked again after the change.
 
 Before binding, the front end merges simple views and FROM subqueries into the query (`exec/flatten.ts`, an AST
 rewrite). Materialized-view matching works on the bound plan (`exec/plan-mv-match.ts`), at any depth, including the

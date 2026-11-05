@@ -15,7 +15,7 @@ import {
 import { MisuseError, SmaltError } from './errors.js';
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
 import type { ConflictAction, PlanOp } from './plan/ops.js';
-import { type EncodedPlan, decodePlan, encodePlan, planFromJSON, planToJSON } from './plan/codec.js';
+import { type EncodedPlan, decodeData, decodePlan, encodeData, encodePlan, planFromJSON, planToJSON } from './plan/codec.js';
 import { type ValidateCatalog, validatePlan } from './plan/validate.js';
 import { type PlanExpr, forEachCol, typeOf } from './plan/expr.js';
 import type { CollationName } from './plan/types.js';
@@ -27,26 +27,16 @@ import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type PlanMorsels, planMorsels } from './exec/plan-morsel.js';
 import { toPlan } from './sql/frontend/select.js';
-import { bindStoredTableExprs, checkConstraintExprs, isConstantDefault, literalValue, toIndexDef, toTableDef, withBoundChecks } from './sql/frontend/ddl.js';
+import { bindStoredTableExprs } from './sql/frontend/ddl.js';
 import { bindStatement } from './sql/frontend/bind.js';
 import type { BoundQuery, BoundStatement, BoundTransaction, BoundWrite } from './plan/bound.js';
-import type { ColumnDef as ColumnDefinition, SchemaOp, Source, TableDef } from './plan/schema.js';
+import type { AlterAction, ColumnDef as ColumnDefinition, ExprDef, SchemaOp, Source, SourceEditor, TableDef } from './plan/schema.js';
 import { SYSTEM_TABLES, type StoredDef, type StoredText, type SystemTableName, decodeDef, encodeDef, isSystemTable, systemTableSql } from './catalog/stored.js';
 import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import type { ReaderSettings } from '../shared/protocol.js';
-import type {
-  AlterTableStmt,
-  ColumnDef,
-  CreateIndexStmt,
-  CreateTableStmt,
-  CreateViewStmt,
-  Expr,
-  ParsedStatement,
-  SelectStmt,
-  Stmt,
-} from './sql/ast.js';
+import type { CreateViewStmt, ParsedStatement, SelectStmt, Stmt } from './sql/ast.js';
 import { parse, parseOne } from './sql/parser.js';
 import {
   AsyncRequiredError,
@@ -66,7 +56,7 @@ import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordEncoder, RecordReader } from './storage/record.js';
 import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec/stats.js';
 import { type CatalogSnapshot, informationSchema } from './catalog/information-schema.js';
-import { type SchemaLookup, applyEdits, quoteIdent as quoteIdentIfNeeded, renameColumnEdits, renameTableEdits } from './catalog/alter.js';
+import { quoteIdent as quoteIdentIfNeeded, sqlSourceEditor } from './sql/frontend/source-edit.js';
 import { ForeignKeys } from './exec/fk.js';
 import { PluginRegistry, type SmaltPlugin } from './plugin.js';
 import { Collation, type SqlValue } from './values.js';
@@ -1234,7 +1224,7 @@ export class Database implements FunctionContext {
             throw new SmaltError('SMALT_UNSUPPORTED', 'vacuum statements are not supported yet');
         }
       case 'schema':
-        return done('op' in bound ? this.compileSchemaOp(bound.op) : this.compileSchema(bound.sql));
+        return done(this.compileSchemaOp(bound.op));
     }
   }
 
@@ -1256,14 +1246,9 @@ export class Database implements FunctionContext {
         return run(() => this.createView(op));
       case 'drop':
         return run(() => this.drop(op));
+      case 'alterTable':
+        return run(() => this.alterTable(op));
     }
-  }
-
-  /** ALTER TABLE, from its SQL until it becomes a schema operation. */
-  private compileSchema(ps: ParsedStatement): Omit<Program, 'regCount'> {
-    const stmt = ps.stmt;
-    if (stmt.kind === 'alterTable') return { exec: () => this.alterTable(stmt, ps.text), readonly: false, columns: [], columnTypes: [] };
-    throw new SmaltError('SMALT_UNSUPPORTED', `${stmt.kind} statements are not supported yet`);
   }
 
   /**
@@ -2769,7 +2754,7 @@ export class Database implements FunctionContext {
     for (const fk of table.foreignKeys) {
       if (this.tables.get(fk.table.toLowerCase())?.columnar) throw new SmaltError('SMALT_UNSUPPORTED', `foreign keys cannot reference columnar table ${fk.table}`);
     }
-    this.addCatalogRow('table', table.name, table.name, root, sql, undefined, internal ? undefined : { kind: 'table', table: stmt.table });
+    this.addCatalogRow('table', table.name, table.name, root, sql, undefined, internal ? undefined : { kind: 'table', table: stmt.table, language: stmt.source.language });
     implicitIndexes.forEach((spec, i) => {
       const name = autoIndexName(table.name, i + 1);
       const iroot = BTree.create(this.pager);
@@ -2868,7 +2853,7 @@ export class Database implements FunctionContext {
       mv.indexRoots.set(idx.name.toLowerCase(), root);
       this.memDirty = true;
     }
-    this.addCatalogRow('index', idx.name, table.name, memory ? MEM_BASE : root, sql, undefined, { kind: 'index', index: stmt });
+    this.addCatalogRow('index', idx.name, table.name, memory ? MEM_BASE : root, sql, undefined, { kind: 'index', index: stmt, language: op.source.language });
     this.schemaChanged();
     return none;
   }
@@ -3143,180 +3128,149 @@ export class Database implements FunctionContext {
 
   // ---------------------------------------------------------------- ALTER TABLE
 
-  private alterTable(stmt: AlterTableStmt, sql: string): RunResult {
+  /**
+   * ALTER TABLE (ADR 0015 step 7): the change is made to the stored definitions; the source texts shown beside them
+   * (`sqlite_schema.sql`, expression texts) are edited by their language's {@link SourceEditor}, as SQLite edits its
+   * stored statements. Views, kept as source, are checked again afterwards.
+   */
+  private alterTable(op: Extract<SchemaOp, { op: 'alterTable' }>): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
-    if (stmt.schema && !['main', 'temp'].includes(stmt.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
-    const lower = stmt.table.toLowerCase();
+    if (op.schema && !['main', 'temp'].includes(op.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${op.schema}`);
+    const lower = op.table.toLowerCase();
+    const a = op.action;
     if (CATALOG_NAMES.has(lower) || lower.startsWith('smalt_') || lower.startsWith('sqlite_')) {
-      throw new SmaltError('SMALT_ERROR', `table ${CATALOG_NAMES.has(lower) ? 'sqlite_master' : stmt.table} may not be altered`);
+      throw new SmaltError('SMALT_ERROR', `table ${CATALOG_NAMES.has(lower) ? 'sqlite_master' : op.table} may not be altered`);
     }
     if (this.views.has(lower)) {
-      throw new SmaltError('SMALT_ERROR', stmt.action.kind === 'addColumn' ? 'Cannot add a column to a view' : `view ${stmt.table} may not be altered`);
+      throw new SmaltError('SMALT_ERROR', a.kind === 'addColumn' ? 'Cannot add a column to a view' : `view ${op.table} may not be altered`);
     }
-    const table = this.getTable(lower, stmt.schema);
-    if (!table && stmt.schema?.toLowerCase() !== 'temp' && this.externals.has(lower)) throw new SmaltError('SMALT_ERROR', `table ${stmt.table} may not be altered`);
-    if (!table) throw new SmaltError('SMALT_ERROR', `no such table: ${stmt.schema ? `${stmt.schema}.` : ''}${stmt.table}`);
-    // TEMP tables have no catalog rows for ALTER to rewrite (main.t reaches a shadowed main table).
+    const table = this.getTable(lower, op.schema);
+    if (!table && op.schema?.toLowerCase() !== 'temp' && this.externals.has(lower)) throw new SmaltError('SMALT_ERROR', `table ${op.table} may not be altered`);
+    if (!table) throw new SmaltError('SMALT_ERROR', `no such table: ${op.schema ? `${op.schema}.` : ''}${op.table}`);
+    // TEMP tables have no stored definitions (main.t reaches a shadowed main table).
     if (table.temp) throw new SmaltError('SMALT_UNSUPPORTED', `ALTER TABLE is not supported for TEMP table ${table.name}`);
     if (table.matview) throw new SmaltError('SMALT_ERROR', `materialized view ${table.name} may not be altered`);
     if (table.columnar) throw new SmaltError('SMALT_UNSUPPORTED', `ALTER TABLE is not supported for columnar table ${table.name} yet`);
-    this.objectChanged(table.name);
-    if (stmt.action.kind === 'renameTable') this.objectChanged(stmt.action.newName);
-    this.dirtySchema = true;
-    const a = stmt.action;
+    const defs = this.storedDefinitions();
+    const own = defs.get(table.name.toLowerCase());
+    if (own?.kind !== 'table') throw new SmaltError('SMALT_CORRUPT', `missing definition of table ${table.name}`);
+    const change: AlterChange = { defs: new Map(), rows: () => null };
+    let viewSuffix = '';
     switch (a.kind) {
       case 'renameTable':
-        this.renameTable(table, a.newName);
+        this.renameTableDefs(table, a.newName, defs, change);
         break;
       case 'renameColumn':
-        this.renameColumn(table, a.column, a.newName);
+        this.renameColumnDefs(table, own, a.column, a.newName, defs, change);
         break;
       case 'addColumn':
-        this.addColumn(table, a.column, sql);
+        this.addColumnDefs(table, own, a, defs, change);
         break;
       case 'dropColumn':
-        this.dropColumn(table, a.column);
+        this.dropColumnDefs(table, own, a.column, defs, change);
+        viewSuffix = ' after drop column';
         break;
     }
+    this.objectChanged(table.name);
+    if (a.kind === 'renameTable') this.objectChanged(a.newName);
+    this.dirtySchema = true;
+    this.noteValidViews();
+    this.rewriteCatalog(change.rows);
+    for (const [key, d] of change.defs) {
+      if (d) this.writeDefinition(key, d);
+      else this.deleteDefinition(key);
+    }
+    if (a.kind !== 'renameColumn') this.deleteStats(table.name);
+    const oldTable = table;
+    this.loadSchema();
+    this.checkViewsAfterAlter(viewSuffix);
+    if (a.kind === 'dropColumn') this.rewriteRowsWithout(oldTable, findColumn(oldTable, a.column));
+    // ADD COLUMN: existing rows keep their shorter records, and readers fill in the new column's constant default.
     this.schemaChanged();
     return none;
   }
 
-  /** Column names per table, for resolving references while rewriting SQL text. */
-  private schemaLookup(): SchemaLookup {
-    return {
-      tableColumns: (name) => {
-        const t = this.tables.get(name.toLowerCase());
-        return t ? new Set(t.columns.map((c) => c.name.toLowerCase())) : undefined;
-      },
+  /** Every stored definition, by catalog key. */
+  private storedDefinitions(): Map<string, StoredDef> {
+    const out = new Map<string, StoredDef>();
+    for (const [key, text] of this.scanDefinitions()) out.set(key, decodeDef(text, key));
+    return out;
+  }
+
+  /** The editor of an object's source text, by its language. */
+  private sourceEditor(def: StoredDef | undefined): SourceEditor {
+    const language = def && 'language' in def && def.language !== undefined ? def.language : 'sql';
+    const editor = SOURCE_EDITORS[language];
+    if (!editor) throw new SmaltError('SMALT_MISUSE', `ALTER TABLE needs the ${language} language to edit its objects' source text`);
+    return editor;
+  }
+
+  /** Column names per table, for resolving references while editing source text. */
+  private columnsOf = (name: string): ReadonlySet<string> | undefined => {
+    const t = this.tables.get(name.toLowerCase());
+    return t ? new Set(t.columns.map((c) => c.name.toLowerCase())) : undefined;
+  };
+
+  /** The catalog key of a catalog row. */
+  private static rowKey(row: { type: string; name: string }): string {
+    return row.type === 'connection' ? connectionKey(row.name) : row.name.toLowerCase();
+  }
+
+  private renameTableDefs(table: TableSchema, newName: string, defs: Map<string, StoredDef>, change: AlterChange): void {
+    const lowerNew = newName.toLowerCase();
+    if (lowerNew.startsWith('smalt_') || lowerNew.startsWith('sqlite_')) throw new SmaltError('SMALT_ERROR', `object name reserved for internal use: ${newName}`);
+    if (this.catalog.has(lowerNew) && lowerNew !== table.name.toLowerCase()) {
+      throw new SmaltError('SMALT_ERROR', `there is already another table or index with this name: ${newName}`);
+    }
+    const old = table.name;
+    const isOld = (n: string): boolean => n.toLowerCase() === old.toLowerCase();
+    const autoPrefix = `smalt_autoindex_${old}_`.toLowerCase();
+    const newKey = (key: string): string => (key === old.toLowerCase() ? lowerNew : key.startsWith(autoPrefix) ? autoIndexName(newName, Number(key.slice(autoPrefix.length))).toLowerCase() : key);
+    // Definitions: the table's name, its indexes' table, foreign keys that reference it; automatic indexes move.
+    for (const [key, d] of defs) {
+      let next: StoredDef | null = null;
+      if (d.kind === 'table') {
+        const fks = d.table.foreignKeys.map((f) => (isOld(f.table) ? { ...f, table: newName } : f));
+        if (key === old.toLowerCase() || fks.some((f, i) => f !== d.table.foreignKeys[i])) next = { ...d, table: { ...d.table, ...(key === old.toLowerCase() ? { name: newName } : {}), foreignKeys: fks } };
+      } else if (d.kind === 'index' && isOld(d.index.table)) {
+        next = { ...d, index: { ...d.index, table: newName, ...(key.startsWith(autoPrefix) ? { name: autoIndexName(newName, Number(key.slice(autoPrefix.length))) } : {}) } };
+      }
+      const k = newKey(key);
+      if (k !== key) change.defs.set(key, null);
+      if (next || k !== key) change.defs.set(k, next ?? d);
+    }
+    change.rows = (row) => {
+      const ownRow = isOld(row.tbl_name);
+      const sql = row.sql === null ? null : this.sourceEditor(defs.get(Database.rowKey(row))).renameTable(row.sql, old, newName, this.columnsOf);
+      const name = row.type === 'table' && ownRow ? newName : row.type === 'index' && row.name.toLowerCase().startsWith(autoPrefix) ? autoIndexName(newName, Number(row.name.slice(autoPrefix.length))) : undefined;
+      if (sql === row.sql && !ownRow) return null;
+      return { name, tbl_name: ownRow ? newName : undefined, sql };
     };
   }
 
-  /** Rewrite catalog rows; `f` returns the new (type, name, tbl_name, sql) or null to keep a row. */
-  private rewriteCatalog(f: (row: { type: string; name: string; tbl_name: string; rootpage: number; sql: string | null }) => { name?: string; tbl_name?: string; sql?: string | null } | null): void {
-    const w = this.catalogWriter();
-    for (const row of this.scanCatalog()) {
-      const change = f(row);
-      if (!change) continue;
-      const next = [row.type, change.name ?? row.name, change.tbl_name ?? row.tbl_name, row.rootpage, change.sql === undefined ? row.sql : change.sql];
-      w.deleteRow(row.rowid);
-      w.writeRow(next, row.rowid);
-    }
-  }
-
-  /**
-   * Reload the schema from the (rewritten) catalog and check every object still resolves, reporting
-   * the first failure the way SQLite does ("error in view v after drop column: ...").
-   */
-  private validateAfterAlter(suffix: string, viewSuffix = suffix): void {
-    const rows = this.scanCatalog();
-    const built = new Map<string, TableSchema>();
-    // ALTER rewrote the tables' and indexes' SQL: their definitions are made again from it.
-    const defs = new Map<string, StoredDef>();
-    for (const r of rows) {
-      if (r.type !== 'table' || r.sql === null) continue;
-      try {
-        if (isSystemTable(r.name)) continue;
-        const stmt = parseOne(r.sql).stmt as CreateTableStmt;
-        const tdef = withBoundChecks(toTableDef(stmt, r.sql, this.bindContext()), stmt, r.sql, this.bindContext());
-        const { table } = tableSchemaFromDef(tdef, r.sql, r.rootpage);
-        defs.set(r.name.toLowerCase(), { kind: 'table', table: tdef });
-        const planner = new Planner({ getTable: (n) => this.getTable(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state }, new Registers(0));
-        const base = planner.regs.alloc(table.columns.length);
-        this.compileChecks(table, base, planner.regs.alloc(), planner);
-        built.set(r.name.toLowerCase(), table);
-      } catch (e) {
-        throw new SmaltError('SMALT_ERROR', `error in table ${r.name}${suffix}: ${(e as Error).message}`);
-      }
-    }
-    for (const r of rows) {
-      if (r.type !== 'index' || r.sql === null) continue;
-      try {
-        const t = built.get(r.tbl_name.toLowerCase());
-        if (!t) throw new SmaltError('SMALT_ERROR', `no such table: ${r.tbl_name}`);
-        const idef = toIndexDef(parseOne(r.sql).stmt as CreateIndexStmt, r.sql, t, this.bindContext());
-        this.prepareIndex(t, indexSchemaFromDef(idef, r.sql, t, r.rootpage));
-        defs.set(r.name.toLowerCase(), { kind: 'index', index: idef });
-      } catch (e) {
-        throw new SmaltError('SMALT_ERROR', `error in index ${r.name}${suffix}: ${(e as Error).message}`);
-      }
-    }
-    for (const [key, d] of defs) this.writeDefinition(key, d);
-    // A renamed table's and index's definitions move to their new names.
-    const keys = new Set(rows.map((r) => (r.type === 'connection' ? connectionKey(r.name) : r.name.toLowerCase())));
-    for (const key of [...this.definitionRows.keys()]) if (!keys.has(key)) this.deleteDefinition(key);
-    this.loadSchema();
-    for (const v of this.views.values()) {
-      try {
-        const { env, catalog } = this.viewCheckEnv();
-        const planner = new Planner(env, new Registers(0));
-        planner.sqlText = v.sql;
-        this.planSelectStmt(v.select, v.sql, planner, catalog);
-      } catch (e) {
-        // A view that was already broken (e.g. dangling) stays as it was, like SQLite.
-        if (!this.viewWasValid.has(v.name.toLowerCase())) continue;
-        throw new SmaltError('SMALT_ERROR', `error in view ${v.name}${viewSuffix}: ${(e as Error).message}`);
-      }
-    }
-  }
-
-  /** Views that plan successfully right now (only those must keep working after an ALTER). */
-  private viewWasValid = new Set<string>();
-  private noteValidViews(): void {
-    this.viewWasValid = new Set();
-    for (const v of this.views.values()) {
-      try {
-        const { env, catalog } = this.viewCheckEnv();
-        const planner = new Planner(env, new Registers(0));
-        planner.sqlText = v.sql;
-        this.planSelectStmt(v.select, v.sql, planner, catalog);
-        this.viewWasValid.add(v.name.toLowerCase());
-      } catch {
-        /* already broken */
-      }
-    }
-  }
-
-  private renameTable(table: TableSchema, newName: string): void {
-    const lower = newName.toLowerCase();
-    if (lower.startsWith('smalt_') || lower.startsWith('sqlite_')) throw new SmaltError('SMALT_ERROR', `object name reserved for internal use: ${newName}`);
-    if (this.catalog.has(lower) && lower !== table.name.toLowerCase()) {
-      throw new SmaltError('SMALT_ERROR', `there is already another table or index with this name: ${newName}`);
-    }
-    this.noteValidViews();
-    const old = table.name;
-    const lookup = this.schemaLookup();
-    const autoPrefix = `smalt_autoindex_${old}_`.toLowerCase();
-    this.rewriteCatalog((row) => {
-      const ownRow = row.tbl_name.toLowerCase() === old.toLowerCase();
-      const sql = row.sql === null ? null : applyEdits(row.sql, renameTableEdits(row.sql, old, newName, lookup));
-      const name =
-        row.type === 'table' && ownRow
-          ? newName
-          : row.type === 'index' && row.name.toLowerCase().startsWith(autoPrefix)
-            ? autoIndexName(newName, Number(row.name.slice(autoPrefix.length)))
-            : undefined;
-      if (sql === row.sql && !ownRow) return null;
-      return { name, tbl_name: ownRow ? newName : undefined, sql };
-    });
-    this.deleteStats(old);
-    this.validateAfterAlter('', '');
-  }
-
-  private renameColumn(table: TableSchema, column: string, newName: string): void {
+  private renameColumnDefs(table: TableSchema, own: TableDefOf, column: string, newName: string, defs: Map<string, StoredDef>, change: AlterChange): void {
     const ci = findColumn(table, column);
     if (ci < 0) throw new SmaltError('SMALT_ERROR', `no such column: "${column}"`);
     const dup = findColumn(table, newName);
     if (dup >= 0 && dup !== ci) throw new SmaltError('SMALT_ERROR', `error in table ${table.name} after rename: duplicate column name: ${newName}`);
-    this.noteValidViews();
-    const lookup = this.schemaLookup();
-    const colName = table.columns[ci].name;
-    this.rewriteCatalog((row) => {
-      if (row.sql === null) return null;
-      const edits = renameColumnEdits(row.sql, table.name, colName, newName, lookup);
-      return edits.length ? { sql: applyEdits(row.sql, edits) } : null;
-    });
-    this.validateAfterAlter(' after rename', '');
+    const old = table.columns[ci].name;
+    const editor = this.sourceEditor(own);
+    const isTable = (n: string): boolean => n.toLowerCase() === table.name.toLowerCase();
+    const text = <E extends ExprDef>(e: E): E => withText(e, editor.renameColumnInExpr(e.text, table.name, old, newName));
+    for (const [key, d] of defs) {
+      if (d.kind === 'table') {
+        const t = d.table;
+        const mine = key === table.name.toLowerCase();
+        const fks = t.foreignKeys.map((f) => (isTable(f.table) && f.refColumns?.some((c) => c.toLowerCase() === old.toLowerCase()) ? { ...f, refColumns: f.refColumns.map((c) => (c.toLowerCase() === old.toLowerCase() ? newName : c)) } : f));
+        if (!mine && fks.every((f, i) => f === t.foreignKeys[i])) continue;
+        change.defs.set(key, { ...d, table: { ...t, foreignKeys: fks, ...(mine ? { columns: t.columns.map((c, i) => (i === ci ? { ...c, name: newName } : c)), checks: t.checks.map(text) } : {}) } });
+      } else if (d.kind === 'index' && isTable(d.index.table)) {
+        const i = d.index;
+        if (!i.where && !i.columns.some((c) => c.expr)) continue;
+        change.defs.set(key, { ...d, index: { ...i, columns: i.columns.map((c) => (c.expr ? { ...c, expr: text(c.expr) } : c)), ...(i.where ? { where: text(i.where) } : {}) } });
+      }
+    }
+    change.rows = (row) => (row.sql === null ? null : { sql: this.sourceEditor(defs.get(Database.rowKey(row))).renameColumn(row.sql, table.name, old, newName, this.columnsOf) });
   }
 
   private hasRows(table: TableSchema): boolean {
@@ -3328,52 +3282,68 @@ export class Database implements FunctionContext {
     }
   }
 
-  private addColumn(table: TableSchema, def: ColumnDef, alterSql: string): void {
-    if (findColumn(table, def.name) >= 0) throw new SmaltError('SMALT_ERROR', `duplicate column name: ${def.name}`);
-    const cons = def.constraints;
-    if (cons.some((c) => c.kind === 'primaryKey')) throw new SmaltError('SMALT_ERROR', 'Cannot add a PRIMARY KEY column');
-    if (cons.some((c) => c.kind === 'unique')) throw new SmaltError('SMALT_ERROR', 'Cannot add a UNIQUE column');
-    if (cons.some((c) => c.kind === 'generated')) throw new SmaltError('SMALT_UNSUPPORTED', 'generated columns are not supported yet');
-    checkConstraintExprs([def], [], `error in table ${table.name} after add column: `);
-    const dflt = cons.find((c) => c.kind === 'default') as { expr: Expr } | undefined;
+  private addColumnDefs(table: TableSchema, own: TableDefOf, a: Extract<AlterAction, { kind: 'addColumn' }>, defs: Map<string, StoredDef>, change: AlterChange): void {
+    if (findColumn(table, a.column.name) >= 0) throw new SmaltError('SMALT_ERROR', `duplicate column name: ${a.column.name}`);
+    if (a.invalid) throw new SmaltError(a.invalid.code, a.invalid.message);
     // As in SQLite: with foreign keys on, existing rows would get a default that may reference nothing.
-    const nonNullDefault = dflt !== undefined && !(dflt.expr.kind === 'literal' && dflt.expr.value === null);
-    if (this.fk.enabled && nonNullDefault && cons.some((c) => c.kind === 'references') && this.hasRows(table)) {
+    if (this.fk.enabled && a.foreignKeys.length > 0 && a.column.default !== undefined && a.column.default.value !== null && this.hasRows(table)) {
       throw new SmaltError('SMALT_ERROR', 'Cannot add a REFERENCES column with non-NULL default value');
     }
-    if (dflt && !isConstantDefault(dflt.expr)) throw new SmaltError('SMALT_ERROR', 'Cannot add a column with non-constant default');
-    if (cons.some((c) => c.kind === 'notNull') && literalValue(dflt?.expr) === null) {
-      throw new SmaltError('SMALT_ERROR', 'Cannot add a NOT NULL column with default value NULL');
-    }
-    this.noteValidViews();
-    const stmt = parseOne(table.sql).stmt as CreateTableStmt;
-    const lastDef = stmt.columns[stmt.columns.length - 1];
-    const defText = alterSql.slice(def.pos, def.end);
-    const sql = table.sql.slice(0, lastDef.end) + ', ' + defText + table.sql.slice(lastDef.end);
-    this.rewriteCatalog((row) => (row.type === 'table' && row.name.toLowerCase() === table.name.toLowerCase() ? { sql } : null));
-    this.deleteStats(table.name);
-    this.validateAfterAlter('');
-    // Existing rows keep their shorter records: readers fill in the new column's constant default.
+    const t = own.table;
+    const n = t.columns.length;
+    // The rowid follows the columns: expressions that read it move one place.
+    const m = (i: number): number => (i === n ? n + 1 : i);
+    const key = table.name.toLowerCase();
+    change.defs.set(key, { ...own, table: { ...t, columns: [...t.columns, a.column], checks: [...t.checks.map((c) => remapExpr(c, m)), ...a.checks], foreignKeys: [...t.foreignKeys, ...a.foreignKeys] } });
+    for (const idx of table.indexes) remapIndexDef(idx.name, m, defs, change);
+    const sql = this.sourceEditor(own).addColumn(table.sql, a.text);
+    change.rows = (row) => (row.type === 'table' && row.name.toLowerCase() === key ? { sql } : null);
   }
 
-  private dropColumn(table: TableSchema, column: string): void {
+  private dropColumnDefs(table: TableSchema, own: TableDefOf, column: string, defs: Map<string, StoredDef>, change: AlterChange): void {
     const ci = findColumn(table, column);
     if (ci < 0) throw new SmaltError('SMALT_ERROR', `no such column: "${column}"`);
-    const col = table.columns[ci];
-    const stmt = parseOne(table.sql).stmt as CreateTableStmt;
-    const def = stmt.columns[ci];
-    if (col.primaryKey) throw new SmaltError('SMALT_ERROR', `cannot drop PRIMARY KEY column: "${col.name}"`);
-    if (def.constraints.some((c) => c.kind === 'unique')) throw new SmaltError('SMALT_ERROR', `cannot drop UNIQUE column: "${col.name}"`);
-    if (table.columns.length === 1) throw new SmaltError('SMALT_ERROR', `cannot drop column "${col.name}": no other columns exist`);
-    this.noteValidViews();
-    // Remove the column definition and the comma that separates it from its neighbour.
-    const sql =
-      ci > 0 ? table.sql.slice(0, stmt.columns[ci - 1].end) + table.sql.slice(def.end) : table.sql.slice(0, def.pos) + table.sql.slice(stmt.columns[1].pos);
-    const oldTable = table;
-    this.rewriteCatalog((row) => (row.type === 'table' && row.name.toLowerCase() === table.name.toLowerCase() ? { sql } : null));
-    this.deleteStats(table.name);
-    this.validateAfterAlter(' after drop column');
-    // Rewrite every row without the column (index entries do not depend on record layout).
+    const t = own.table;
+    const col = t.columns[ci];
+    if (table.columns[ci].primaryKey) throw new SmaltError('SMALT_ERROR', `cannot drop PRIMARY KEY column: "${col.name}"`);
+    if (t.keys.some((k) => k.kind === 'unique' && k.ofColumn === ci)) throw new SmaltError('SMALT_ERROR', `cannot drop UNIQUE column: "${col.name}"`);
+    if (t.columns.length === 1) throw new SmaltError('SMALT_ERROR', `cannot drop column "${col.name}": no other columns exist`);
+    // What still names the column is an error, as SQLite finds it checking the edited schema: the table's own
+    // constraints (those of the column itself go with it), then indexes on the table.
+    const inTable = (msg: string): SmaltError => new SmaltError('SMALT_ERROR', `error in table ${table.name} after drop column: ${msg}`);
+    if (t.keys.some((k) => k.ofColumn !== ci && k.columns.some((c) => c.column === ci))) throw inTable(`no such column: ${col.name}`);
+    if (t.foreignKeys.some((f) => f.ofColumn !== ci && f.columns.includes(ci))) throw inTable(`unknown column "${col.name}" in foreign key definition`);
+    if (t.checks.some((c) => c.ofColumn !== ci && c.expr && readsColumn(c.expr, ci))) throw inTable(`no such column: ${col.name}`);
+    for (const row of this.scanCatalog()) {
+      if (row.type !== 'index' || row.tbl_name.toLowerCase() !== table.name.toLowerCase()) continue;
+      const d = defs.get(row.name.toLowerCase());
+      if (d?.kind !== 'index') continue;
+      const i = d.index;
+      if (i.columns.some((c) => c.column === ci || (c.expr?.expr && readsColumn(c.expr.expr, ci))) || (i.where?.expr && readsColumn(i.where.expr, ci))) {
+        throw new SmaltError('SMALT_ERROR', `error in index ${i.name} after drop column: no such column: ${col.name}`);
+      }
+    }
+    // The column's own constraints go with it; later columns (and the rowid) move one place.
+    const m = (i: number): number => (i > ci ? i - 1 : i);
+    const ofColumn = <C extends { ofColumn?: number }>(c: C): C => (c.ofColumn === undefined ? c : { ...c, ofColumn: m(c.ofColumn) });
+    const key = table.name.toLowerCase();
+    change.defs.set(key, {
+      ...own,
+      table: {
+        ...t,
+        columns: t.columns.filter((_, i) => i !== ci),
+        keys: t.keys.map((k) => ofColumn({ ...k, columns: k.columns.map((c) => ({ ...c, column: m(c.column) })) })),
+        checks: t.checks.filter((c) => c.ofColumn !== ci).map((c) => ofColumn(remapExpr(c, m))),
+        foreignKeys: t.foreignKeys.filter((f) => f.ofColumn !== ci).map((f) => ofColumn({ ...f, columns: f.columns.map(m) })),
+      },
+    });
+    for (const idx of table.indexes) remapIndexDef(idx.name, m, defs, change);
+    const sql = this.sourceEditor(own).dropColumn(table.sql, ci);
+    change.rows = (row) => (row.type === 'table' && row.name.toLowerCase() === key ? { sql } : null);
+  }
+
+  /** Rewrite every row of `oldTable` without column `ci`, in the table's new layout (index entries keep their keys). */
+  private rewriteRowsWithout(oldTable: TableSchema, ci: number): void {
     const newTable = this.tables.get(oldTable.name.toLowerCase())!;
     const reader = new RecordReader(oldTable.layout, oldTable.recordDefaults);
     const rows: { rowid: number | bigint; row: SqlValue[] }[] = [];
@@ -3394,6 +3364,51 @@ export class Database implements FunctionContext {
     for (const r of rows) {
       if (newTable.rowidAlias >= 0) r.row[newTable.rowidAlias] = r.rowid;
       w.rewriteRecord(r.row, r.rowid);
+    }
+  }
+
+  /** Rewrite catalog rows; `f` returns the new (name, tbl_name, sql) or null to keep a row. */
+  private rewriteCatalog(f: AlterChange['rows']): void {
+    const w = this.catalogWriter();
+    for (const row of this.scanCatalog()) {
+      const change = f(row);
+      if (!change) continue;
+      const next = [row.type, change.name ?? row.name, change.tbl_name ?? row.tbl_name, row.rootpage, change.sql === undefined ? row.sql : change.sql];
+      w.deleteRow(row.rowid);
+      w.writeRow(next, row.rowid);
+    }
+  }
+
+  /** Views that plan successfully right now (only those must keep working after an ALTER). */
+  private viewWasValid = new Set<string>();
+  private noteValidViews(): void {
+    this.viewWasValid = new Set();
+    for (const v of this.views.values()) {
+      try {
+        const { env, catalog } = this.viewCheckEnv();
+        const planner = new Planner(env, new Registers(0));
+        planner.sqlText = v.sql;
+        this.planSelectStmt(v.select, v.sql, planner, catalog);
+        this.viewWasValid.add(v.name.toLowerCase());
+      } catch {
+        /* already broken */
+      }
+    }
+  }
+
+  /** Views that planned before the ALTER must still plan, reported the way SQLite does ("error in view v …"). */
+  private checkViewsAfterAlter(suffix: string): void {
+    for (const v of this.views.values()) {
+      try {
+        const { env, catalog } = this.viewCheckEnv();
+        const planner = new Planner(env, new Registers(0));
+        planner.sqlText = v.sql;
+        this.planSelectStmt(v.select, v.sql, planner, catalog);
+      } catch (e) {
+        // A view that was already broken (e.g. dangling) stays as it was, like SQLite.
+        if (!this.viewWasValid.has(v.name.toLowerCase())) continue;
+        throw new SmaltError('SMALT_ERROR', `error in view ${v.name}${suffix}: ${(e as Error).message}`);
+      }
     }
   }
 
@@ -4651,4 +4666,52 @@ function lazyView(name: string, source: Source, columns: string[] | undefined): 
 function lazyMatview(info: Omit<MatViewInfo, 'select'>, source: Source): MatViewInfo {
   let select: SelectStmt | undefined;
   return Object.defineProperty(info, 'select', { get: () => (select ??= viewSelect(source)), enumerable: true, configurable: true }) as MatViewInfo;
+}
+
+/** What an ALTER TABLE changes: definitions by catalog key (null: removed), and catalog rows. */
+interface AlterChange {
+  defs: Map<string, StoredDef | null>;
+  rows: (row: { type: string; name: string; tbl_name: string; rootpage: number; sql: string | null }) => { name?: string; tbl_name?: string; sql?: string | null } | null;
+}
+
+type TableDefOf = Extract<StoredDef, { kind: 'table' }>;
+
+/** Source editors by language: SQL's, until languages register with the engine (ADR 0015 step 9). */
+const SOURCE_EDITORS: Readonly<Record<string, SourceEditor>> = { sql: sqlSourceEditor };
+
+/** Whether a row expression (column `i` is `#0.i`) reads column `ci`. */
+function readsColumn(e: PlanExpr, ci: number): boolean {
+  let found = false;
+  forEachCol(e, (c) => {
+    if (c.input === 0 && c.depth === 0 && c.index === ci) found = true;
+  });
+  return found;
+}
+
+/** `e` with its row's columns renumbered by `m` (expressions over a table's row: CHECK, index keys and WHERE). */
+function remapExpr<E extends ExprDef>(e: E, m: (i: number) => number): E {
+  if (!e.expr) return e;
+  const walk = (x: unknown): unknown => {
+    if (Array.isArray(x)) return x.map(walk);
+    if (!x || typeof x !== 'object' || x instanceof Uint8Array) return x;
+    const o = x as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const k in o) out[k] = walk(o[k]);
+    if (o.k === 'col' && o.input === 0 && o.depth === 0) out.index = m(o.index as number);
+    return out;
+  };
+  return { ...e, expr: decodeData(walk(encodeData(e.expr))) as PlanExpr };
+}
+
+function withText<E extends ExprDef>(e: E, text: string): E {
+  return text === e.text ? e : { ...e, text };
+}
+
+/** An index's definition with its table's columns renumbered by `m`. */
+function remapIndexDef(name: string, m: (i: number) => number, defs: Map<string, StoredDef>, change: AlterChange): void {
+  const key = name.toLowerCase();
+  const d = defs.get(key);
+  if (d?.kind !== 'index') return;
+  const i = d.index;
+  change.defs.set(key, { ...d, index: { ...i, columns: i.columns.map((c) => ({ ...c, column: c.column < 0 ? c.column : m(c.column), ...(c.expr ? { expr: remapExpr(c.expr, m) } : {}) })), ...(i.where ? { where: remapExpr(i.where, m) } : {}) } });
 }

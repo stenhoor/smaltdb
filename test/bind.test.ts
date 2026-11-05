@@ -38,6 +38,14 @@ describe('bind', () => {
       ["CREATE CONNECTION c WITH (type = 'http')", { op: 'createConnection', name: 'c', options: { type: 'http' } }],
       ["CREATE EXTERNAL TABLE e (a INT) WITH (location = 'x.csv')", { op: 'createExternalTable', name: 'e', columns: [{ name: 'a', declaredType: 'INT', constrained: false }], options: { location: 'x.csv' } }],
       ['DROP TABLE IF EXISTS t', { op: 'drop', objectType: 'table', name: 't', ifExists: true }],
+      ['ALTER TABLE t RENAME TO t2', { op: 'alterTable', table: 't', action: { kind: 'renameTable', newName: 't2' } }],
+      ['ALTER TABLE t RENAME COLUMN a TO b', { op: 'alterTable', table: 't', action: { kind: 'renameColumn', column: 'a', newName: 'b' } }],
+      ['ALTER TABLE t DROP COLUMN a', { op: 'alterTable', table: 't', action: { kind: 'dropColumn', column: 'a' } }],
+      [
+        'ALTER TABLE t ADD COLUMN z INT DEFAULT 3 CHECK (z > a) REFERENCES t',
+        { op: 'alterTable', table: 't', action: { kind: 'addColumn', column: { name: 'z', type: 'INTEGER', default: { text: '3', value: 3 } }, checks: [{ text: 'z > a', expr: { k: 'call' } }], foreignKeys: [{ table: 't' }], text: 'z INT DEFAULT 3 CHECK (z > a) REFERENCES t' } },
+      ],
+      ['ALTER TABLE t ADD COLUMN z UNIQUE', { op: 'alterTable', action: { kind: 'addColumn', invalid: { code: 'SMALT_ERROR', message: 'Cannot add a UNIQUE column' } } }],
     ];
     const syntax = (o: unknown): boolean => !!o && typeof o === 'object' && ('pos' in (o as object) || Object.values(o as object).some(syntax));
     for (const [q, op] of ddl) {
@@ -46,7 +54,6 @@ describe('bind', () => {
       expect(syntax(b), q).toBe(false);
       expect(() => JSON.stringify(b), q).not.toThrow();
     }
-    expect(bind('ALTER TABLE t ADD COLUMN z')).toMatchObject({ kind: 'schema', sql: {} });
     expect(() => bind('EXPLAIN DELETE FROM t')).toThrow('EXPLAIN is only supported for SELECT statements');
   });
 });
