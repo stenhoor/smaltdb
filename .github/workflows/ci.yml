@@ -30,15 +30,24 @@ jobs:
 
   browser:
     runs-on: ubuntu-latest
-    # A run takes 1-2 minutes; a hung browser download or test would otherwise hold the job for GitHub's 6 hours.
+    # A run takes 1-2 minutes; a stuck step would otherwise hold the job for GitHub's 6 hours.
     timeout-minutes: 20
+    # Playwright's image has its browsers and their system packages installed: no apt and no browser download here (the
+    # runners' Ubuntu mirror was slow enough to stall jobs for many minutes). The image's version is the pinned
+    # Playwright's, PLAYWRIGHT_VERSION below: raise both together, on purpose. As the runner's user, as Playwright's docs
+    # set it up.
+    container:
+      image: mcr.microsoft.com/playwright:v1.64.1-noble
+      options: --user 1001
     strategy:
       fail-fast: false
       matrix:
         browser: [chromium, firefox, webkit]
     env:
-      # Pinned so a new release can't break CI unannounced (1.65.0 was published without its playwright-core); raise it on purpose.
+      # Pinned so a new release can't break CI unannounced (1.65.0 was published without its playwright-core).
       PLAYWRIGHT_VERSION: 1.64.1
+      # Global installs where the runner's user can write.
+      NPM_CONFIG_PREFIX: /tmp/npm-global
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -55,24 +64,8 @@ jobs:
             .cache/packed/*-files
           key: packed-${{ hashFiles('packed.json') }}
       - run: node scripts/fetch-packed.mjs
-      # Keep Playwright's browsers between runs, per Playwright version and browser, so most runs skip the download.
-      - uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ env.PLAYWRIGHT_VERSION }}-${{ matrix.browser }}
-      # Playwright is resolved globally (see test/browser/playwright.mjs) so local dev containers can use a preinstalled copy.
+      # Playwright is resolved globally (see test/browser/playwright.mjs) so local dev containers can use a preinstalled
+      # copy; it finds the image's browsers.
       - run: npm install -g playwright@${{ env.PLAYWRIGHT_VERSION }}
         timeout-minutes: 5
-      # The browser's system packages (apt) sometimes hang on the runners, even with the browser cached: give each try
-      # 3 minutes, and try twice. (GNU timeout signals the whole process group, sudo and apt included.)
-      - name: Install the browser's system packages
-        run: |
-          for try in 1 2; do
-            timeout --kill-after=15 180 npx playwright install-deps ${{ matrix.browser }} && exit 0
-            echo "::warning::playwright install-deps did not finish (try $try)"
-          done
-          exit 1
-        timeout-minutes: 8
-      - run: npx playwright install ${{ matrix.browser }}
-        timeout-minutes: 10
       - run: NODE_PATH=$(npm root -g) BROWSERS=${{ matrix.browser }} npm run test:browser
