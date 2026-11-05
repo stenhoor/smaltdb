@@ -323,7 +323,8 @@ Each step is its own PR. Every suite and benchmark gate (section 10) stays green
 6. **Bound statements and `bind()`:** `database.ts` dispatches on bound statements; DDL becomes schema operations;
    transactions, settings and maintenance become bound kinds (couplings 2 and 9).
 7. **Language-neutral catalog storage,** and opening without a parser (coupling 3). This is its own file format
-   change.
+   change. ALTER TABLE becomes a schema operation here: with definitions stored, it changes a definition instead of
+   rewriting stored SQL text (step 6 left it as SQL for that reason).
 8. **The public plan API:** `preparePlan` / `queryPlan` in-process, over the worker protocol and in `MethodContext`
    (coupling 10; ADR 0014 step 9), with smaltql's needs (section 3).
 9. **The boundary, then the move:**
