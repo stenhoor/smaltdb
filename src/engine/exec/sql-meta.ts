@@ -4,7 +4,6 @@
  */
 import type { BoundExpr } from '../plan/expr.js';
 import type { PlanOp } from '../plan/ops.js';
-import type { SelectStmt } from '../sql/ast.js';
 import type { Collation } from '../values.js';
 import type { Affinity } from './convert.js';
 
@@ -44,19 +43,3 @@ export const markFlattened = (op: PlanOp): void => {
 
 export const isFlattened = (op: PlanOp): boolean => (op as { [FLATTENED]?: true })[FLATTENED] === true;
 
-/** A subquery's SQL, kept on its plan: decorrelation plans SQL derived from it (exec/planner.ts `decorrelationSql`). */
-export interface SubquerySql {
-  select: SelectStmt;
-  /** The text `select`'s positions refer to. */
-  text: string;
-  /** Whether a name means a CTE where the subquery is. */
-  isCte: (name: string) => boolean;
-}
-
-const SUBQUERY_SQL: unique symbol = Symbol('subquerySql');
-
-export const setSubquerySql = (op: PlanOp, sql: SubquerySql): void => {
-  (op as { [SUBQUERY_SQL]?: SubquerySql })[SUBQUERY_SQL] = sql;
-};
-
-export const subquerySql = (op: PlanOp): SubquerySql | undefined => (op as { [SUBQUERY_SQL]?: SubquerySql })[SUBQUERY_SQL];
