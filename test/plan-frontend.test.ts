@@ -4,8 +4,9 @@ import { Database } from '../src/engine/database.js';
 import { parseOne } from '../src/engine/sql/parser.js';
 import type { SelectStmt } from '../src/engine/sql/ast.js';
 import type { BindContext } from '../src/engine/plan/bind-context.js';
-import { toPlan } from '../src/engine/sql/frontend/select.js';
-import { printPlan } from '../src/engine/plan/print.js';
+import { toPlan, toRowExpr, toValueExpr } from '../src/engine/sql/frontend/select.js';
+import { printExpr, printPlan } from '../src/engine/plan/print.js';
+import type { CreateTableStmt } from '../src/engine/sql/ast.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
 
 async function setup(): Promise<{ db: Database; catalog: BindContext }> {
@@ -132,5 +133,22 @@ describe('plans are plain data', () => {
   it('read the clock with a call', async () => {
     const { catalog } = await setup();
     expect(plan(catalog, 'SELECT CURRENT_DATE, CURRENT_TIMESTAMP')!.text).toBe('project sql.current_date(), sql.current_timestamp()\n  values ()');
+  });
+  it('bind CHECK, DEFAULT and index expressions over the table row (ADR 0015 step 4)', async () => {
+    const db = await Database.open(new MemoryVfs(), 'db');
+    const sql = "CREATE TABLE p(id INTEGER PRIMARY KEY, a INT CHECK (a > 0), s TEXT DEFAULT (upper('x')), CHECK (length(s) < id))";
+    db.exec(sql);
+    db.exec('CREATE INDEX pa ON p(a * 2) WHERE s IS NOT NULL AND rowid > 1');
+    const catalog = (db as unknown as { bindContext(): BindContext }).bindContext();
+    const t = catalog.getTable('p')!;
+    const def = (parseOne(sql).stmt as CreateTableStmt).columns[2].constraints.find((c) => c.kind === 'default') as { expr: Parameters<typeof toValueExpr>[0] };
+    // Column i is #0.i; the rowid (and its alias) is #0.n.
+    expect(t.checks.map((c) => printExpr(toRowExpr(c.expr, t, t.sql, catalog)))).toEqual(['sql.gt(#0.1, sql.affinity_numeric(0))', 'sql.lt(sql.affinity_numeric(length(#0.2)), #0.0)']);
+    expect(printExpr(toValueExpr(def.expr, sql, catalog))).toBe("upper('x')");
+    const ev = t.indexes.find((i) => i.name === 'pa')!.eval!;
+    expect(ev.plan.cols.map((e) => e && printExpr(e))).toEqual(['sql.mul(#0.1, 2)']);
+    expect(printExpr(ev.plan.where!)).toBe('(#0.2 is not null and sql.gt(#0.3, sql.affinity_numeric(1)))');
+    expect(offending(ev.plan)).toEqual([]);
+    expect(() => JSON.stringify(ev.plan)).not.toThrow();
   });
 });

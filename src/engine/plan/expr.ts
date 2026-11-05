@@ -101,3 +101,34 @@ function literalType(v: SqlValue): PlanType {
       return 'blob';
   }
 }
+
+/** Calls `f` for each column reference of `e` (not those inside nested plans). */
+export function forEachCol(e: BoundExpr, f: (c: ColExpr) => void): void {
+  switch (e.k) {
+    case 'col':
+      f(e);
+      return;
+    case 'call':
+    case 'and':
+    case 'or':
+      for (const a of e.args) forEachCol(a, f);
+      return;
+    case 'cast':
+    case 'not':
+    case 'isNull':
+      forEachCol(e.arg, f);
+      return;
+    case 'case':
+      for (const w of e.whens) {
+        forEachCol(w.when, f);
+        forEachCol(w.then, f);
+      }
+      forEachCol(e.else, f);
+      return;
+    case 'inSubquery':
+      forEachCol(e.probe, f);
+      return;
+    default:
+      return;
+  }
+}

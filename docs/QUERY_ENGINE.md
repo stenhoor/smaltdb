@@ -25,7 +25,10 @@ SQL text
 Before binding, the front end merges simple views and FROM subqueries into the query (`exec/flatten.ts`, an AST
 rewrite). Materialized-view matching works on the bound plan (`exec/plan-mv-match.ts`), at any depth, including the
 inner sides the planner builds when it decorrelates a subquery. Languages bind against the logical catalog
-(`plan/bind-context.ts` `BindContext`); the planner plans against its physical environment (`PhysicalEnv`). Every SELECT, INSERT, UPDATE and DELETE goes through the plan layer, and so do the queries
+(`plan/bind-context.ts` `BindContext`); the planner plans against its physical environment (`PhysicalEnv`). A table's
+own expressions (CHECK, DEFAULT, index keys and partial-index WHERE) are bound by the front end too, as plan
+expressions over the table's row (`toRowExpr`, `toValueExpr`), and compiled like every other plan expression: the
+engine has one expression compiler (`compileBoundExpr`). Every SELECT, INSERT, UPDATE and DELETE goes through the plan layer, and so do the queries
 the engine plans for itself (materialized-view layout and refresh, view checks after DDL). The planner's AST path
 (`Planner.planSelect` and the write compile functions in `database.ts`) has been deleted.
 

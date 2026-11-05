@@ -18,15 +18,16 @@ import {
 import { MisuseError, SmaltError } from './errors.js';
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
 import type { PlanOp } from './plan/ops.js';
+import { type PlanExpr, forEachCol } from './plan/expr.js';
 import type { CollationName } from './plan/types.js';
-import { type CompileScope, type Compiled, type Fn, compileExpr } from './exec/expr.js';
+import { type Compiled, type Fn } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
 import { type ExternalScan, type PhysicalEnv, Planner, type QueryPlan, Registers } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type MorselQuery, analyzeMorsels } from './exec/morsel.js';
-import { toDeletePlan, toInsertPlan, toPlan, toUpdatePlan } from './sql/frontend/select.js';
+import { toDeletePlan, toInsertPlan, toPlan, toRowExpr, toUpdatePlan, toValueExpr } from './sql/frontend/select.js';
 import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
@@ -2763,8 +2764,6 @@ export class Database implements FunctionContext {
     if (!idx.where && !idx.columns.some((c) => c.expr)) return;
     const n = table.columns.length;
     const planner = new Planner({ getTable: (x) => this.getTable(x), openTree: (root) => this.tree(root), funcCtx: this, state: this.state }, new Registers(n + 1));
-    // Date functions may appear, but fail if they read the clock or time zone (as in SQLite).
-    const scope = { ...this.rowScope(table, undefined, 0, n, planner), funcCtx: pureFunctionContext(this, 'an index') };
     const check = (e: Expr, what: string): void => {
       const go = (x: unknown): void => {
         if (Array.isArray(x)) return x.forEach(go);
@@ -2783,16 +2782,18 @@ export class Database implements FunctionContext {
       };
       go(e);
     };
-    const cols = idx.columns.map((c) => {
-      if (!c.expr) return null;
-      check(c.expr, 'index expressions');
-      return compileExpr(c.expr, scope).fn;
-    });
-    let where: Fn | undefined;
-    if (idx.where) {
-      check(idx.where, 'partial index WHERE clauses');
-      where = compileExpr(idx.where, scope).fn;
-    }
+    // Bound once, as plan expressions over the row (column i, then the rowid at n).
+    const text = idx.sql ?? '';
+    const bound = (e: Expr, what: string): PlanExpr => {
+      check(e, what);
+      return toRowExpr(e, table, text, this.bindContext());
+    };
+    const plan = { cols: idx.columns.map((c) => (c.expr ? bound(c.expr, 'index expressions') : null)), where: idx.where ? bound(idx.where, 'partial index WHERE clauses') : undefined };
+    // Date functions may appear, but fail if they read the clock or time zone (as in SQLite).
+    const pure = pureFunctionContext(this, 'an index');
+    const compile = (e: PlanExpr): Fn => planner.compileAt([e], (i) => i, pure)[0].fn;
+    const cols = plan.cols.map((e) => (e ? compile(e) : null));
+    const where = plan.where ? compile(plan.where) : undefined;
     const regs: SqlValue[] = new Array(Math.max(planner.regs.count, n + 1)).fill(null);
     const load = (row: readonly SqlValue[], rowid: number | bigint): SqlValue[] => {
       for (let i = 0; i < n; i++) regs[i] = row[i];
@@ -2801,25 +2802,13 @@ export class Database implements FunctionContext {
     };
     // Columns read by the index (plain columns, expression and WHERE references).
     const deps = new Set<number>();
-    const walk = (x: unknown): void => {
-      if (Array.isArray(x)) return x.forEach(walk);
-      if (typeof x !== 'object' || x === null || Object.getPrototypeOf(x) !== Object.prototype) return;
-      const o = x as Record<string, unknown>;
-      if (o.kind === 'column' && typeof o.name === 'string') {
-        const ci = findColumn(table, o.name);
-        if (ci >= 0) deps.add(ci);
-      }
-      for (const k of Object.keys(o)) walk(o[k]);
-    };
-    for (const c of idx.columns) {
-      if (c.expr) walk(c.expr);
-      else deps.add(c.column);
-    }
-    if (idx.where) walk(idx.where);
+    for (const c of idx.columns) if (!c.expr) deps.add(c.column);
+    for (const e of [...plan.cols, plan.where]) if (e) forEachCol(e, (c) => c.index < n && deps.add(c.index));
     idx.eval = {
       cols: cols.map((f) => (f ? (row: readonly SqlValue[], rowid: number | bigint) => f(load(row, rowid)) : null)),
       where: where ? (row, rowid) => truthy(where!(load(row, rowid))) === true : undefined,
       deps: [...deps],
+      plan,
     };
   }
 
@@ -3049,7 +3038,7 @@ export class Database implements FunctionContext {
         const { table } = buildTableSchema(parseOne(r.sql).stmt as CreateTableStmt, r.sql, r.rootpage);
         const planner = new Planner({ getTable: (n) => this.getTable(n), openTree: (root) => this.tree(root), funcCtx: this, state: this.state }, new Registers(0));
         const base = planner.regs.alloc(table.columns.length);
-        this.compileChecks(table, this.rowScope(table, undefined, base, planner.regs.alloc(), planner), '');
+        this.compileChecks(table, base, planner.regs.alloc(), planner);
         built.set(r.name.toLowerCase(), table);
       } catch (e) {
         throw new SmaltError('SMALT_ERROR', `error in table ${r.name}${suffix}: ${(e as Error).message}`);
@@ -3257,48 +3246,6 @@ export class Database implements FunctionContext {
     return t;
   }
 
-  /** Compile scope where the table's columns read registers `regs[i]` and the rowid `rowidReg`. */
-  private rowScope(table: TableSchema, alias: string | undefined, base: number, rowidReg: number, planner: Planner): CompileScope {
-    return this.rowsScope([{ table, names: [alias ?? table.name, table.name], base, rowidReg }], planner);
-  }
-
-  /**
-   * Scope over one or more single-row sources held in registers (the target row of a write,
-   * `excluded` in upserts). Unqualified names resolve to the first source that has the column.
-   */
-  private rowsScope(sources: { table: TableSchema; names: string[]; base: number; rowidReg: number }[], planner: Planner): CompileScope {
-    const outer = planner.compileScope(planner.newScope());
-    const bind = (src: (typeof sources)[number], name: string): ReturnType<CompileScope['resolveColumn']> | null => {
-      const i = findColumn(src.table, name);
-      if (i >= 0) {
-        const c = src.table.columns[i];
-        const type: StaticType = c.rowidAlias ? 'int' : c.type === 'INTEGER' ? 'int' : c.type === 'REAL' ? 'real' : c.type === 'TEXT' ? 'text' : c.type === 'BLOB' ? 'blob' : 'any';
-        const aff = c.type === 'ANY' || c.type === 'BLOB' ? 'BLOB' : c.type;
-        return { reg: src.base + i, type, collation: c.collation, affinity: aff as 'INTEGER' };
-      }
-      if (['rowid', 'oid', '_rowid_'].includes(name.toLowerCase())) return { reg: src.rowidReg, type: 'int', collation: 0, affinity: 'INTEGER' };
-      return null;
-    };
-    return {
-      ...outer,
-      resolveColumn: (e) => {
-        if (e.table) {
-          const q = e.table.toLowerCase();
-          const src = sources.find((x) => x.names.some((n) => n.toLowerCase() === q));
-          if (!src) throw new SmaltError('SMALT_ERROR', `no such column: ${e.table}.${e.name}`);
-          const b = bind(src, e.name);
-          if (!b) throw new SmaltError('SMALT_ERROR', `no such column: ${e.table}.${e.name}`);
-          return b;
-        }
-        for (const src of sources) {
-          const b = bind(src, e.name);
-          if (b) return b;
-        }
-        throw new SmaltError('SMALT_ERROR', `no such column: ${e.name}`);
-      },
-    };
-  }
-
   private validateRow(
     table: TableSchema,
     row: SqlValue[],
@@ -3337,11 +3284,23 @@ export class Database implements FunctionContext {
     return true;
   }
 
-  private compileChecks(table: TableSchema, scope: CompileScope, sql: string): { fn: Fn; name: string }[] {
-    // Unnamed checks are reported by their text, which lives in the table's SQL (not the statement's).
-    void sql;
-    const checkScope = { ...scope, funcCtx: pureFunctionContext(scope.funcCtx, 'a CHECK constraint') };
-    return table.checks.map((c) => ({ fn: compileExpr(c.expr, checkScope).fn, name: c.name ?? table.sql.slice(c.expr.pos, c.expr.end) }));
+  /**
+   * The table's CHECK constraints over a row in registers (`base + i`, the rowid in `rowidReg`), bound as plan
+   * expressions from the table's SQL. Unnamed checks are reported by their text.
+   */
+  private compileChecks(table: TableSchema, base: number, rowidReg: number, planner: Planner): { fn: Fn; name: string }[] {
+    if (!table.checks.length) return [];
+    const n = table.columns.length;
+    const pure = pureFunctionContext(this, 'a CHECK constraint');
+    return table.checks.map((c) => {
+      const e = toRowExpr(c.expr, table, table.sql, this.bindContext());
+      return { fn: planner.compileAt([e], (i) => (i < n ? base + i : rowidReg), pure)[0].fn, name: c.name ?? table.sql.slice(c.expr.pos, c.expr.end) };
+    });
+  }
+
+  /** The table's column DEFAULTs (null where none), bound as plan expressions from the table's SQL. */
+  private compileDefaults(table: TableSchema, planner: Planner): (Compiled | null)[] {
+    return table.columns.map((c) => (c.defaultExpr ? planner.compileAt([toValueExpr(c.defaultExpr, table.sql, this.bindContext())], () => -1)[0] : null));
   }
 
   /** Whether an INSERT may delete rows to resolve conflicts (OR REPLACE, or a constraint's ON CONFLICT REPLACE). */
@@ -3510,14 +3469,13 @@ export class Database implements FunctionContext {
   private insertParts(stmt: InsertStmt, table: TableSchema, targets: number[], planner: Planner): InsertParts {
     const ncols = table.columns.length;
     const prefix = () => {
-      const emptyScope = planner.compileScope(planner.newScope());
-      const defaults: (Fn | null)[] = table.columns.map((c) => (c.defaultExpr ? compileExpr(c.defaultExpr, emptyScope).fn : null));
-      const defaultReal = table.columns.map((c) => (c.defaultExpr ? compileExpr(c.defaultExpr, emptyScope).type === 'real' : false));
+      const compiled = this.compileDefaults(table, planner);
+      const defaults: (Fn | null)[] = compiled.map((c) => c?.fn ?? null);
+      const defaultReal = compiled.map((c) => c?.type === 'real');
       const base = planner.regs.alloc(ncols);
       const rowidReg = planner.regs.alloc();
-      const rowScope = this.rowScope(table, stmt.alias, base, rowidReg, planner);
-      const checks = this.compileChecks(table, rowScope, planner.sqlText);
-      return { emptyScope, defaults, defaultReal, base, rowidReg, rowScope, checks };
+      const checks = this.compileChecks(table, base, rowidReg, planner);
+      return { defaults, defaultReal, base, rowidReg, checks };
     };
     const physical = (): InsertParts | null => {
       const p = prefix();
@@ -3724,15 +3682,13 @@ export class Database implements FunctionContext {
    */
   private updateParts(stmt: UpdateStmt, table: TableSchema, planner: Planner): UpdateParts {
     type Target = Pick<UpdateParts, 'root' | 'colRegs' | 'rowidReg' | 'sets'>;
-    type Returning = (base: number, checkRowid: number, newRowScope: CompileScope) => UpdateParts['ret'];
+    type Returning = (base: number, checkRowid: number) => UpdateParts['ret'];
     const finish = (t: Target, returning: Returning): UpdateParts => {
-      const emptyScope = planner.compileScope(planner.newScope());
-      const defaults: (Fn | null)[] = table.columns.map((c) => (c.defaultExpr ? compileExpr(c.defaultExpr, emptyScope).fn : null));
+      const defaults: (Fn | null)[] = this.compileDefaults(table, planner).map((c) => c?.fn ?? null);
       const base = planner.regs.alloc(table.columns.length);
       const checkRowid = planner.regs.alloc();
-      const newRowScope = this.rowScope(table, stmt.alias, base, checkRowid, planner);
-      const checks = this.compileChecks(table, newRowScope, planner.sqlText);
-      return { ...t, defaults, base, checkRowid, checks, ret: returning(base, checkRowid, newRowScope) };
+      const checks = this.compileChecks(table, base, checkRowid, planner);
+      return { ...t, defaults, base, checkRowid, checks, ret: returning(base, checkRowid) };
     };
     const physical = (): UpdateParts | null => {
       const fe = toUpdatePlan(stmt, table, planner.sqlText, this.bindContext());
@@ -3856,7 +3812,7 @@ export class Database implements FunctionContext {
   private compilePragma(stmt: PragmaStmt, planner: Planner): Omit<Program, 'regCount'> {
     const arg = (): string | undefined => {
       if (!stmt.value) return undefined;
-      const v = compileExpr(stmt.value, planner.compileScope(planner.newScope())).fn([]);
+      const v = planner.compileAt([toValueExpr(stmt.value, planner.sqlText, this.bindContext())], () => -1)[0].fn([]);
       return v === null ? undefined : String(v);
     };
     /** A boolean setting's value, SQLite's spellings: 1 / on / true / yes (anything else is off). */

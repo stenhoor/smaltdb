@@ -119,6 +119,20 @@ export function toInsertPlan(
 }
 
 /**
+ * A table's own expression (a CHECK constraint, an index key or a partial-index WHERE) bound over one row of `table`
+ * (ADR 0015 step 4): column `i` is `#0.i`, the rowid `#0.n` (n: the column count). `text`: the SQL the expression's
+ * positions refer to (the table's or index's definition).
+ */
+export function toRowExpr(e: Expr, table: TableSchema, text: string, catalog: BindContext): PlanExpr {
+  return new FrontEnd(catalog, text).rowExpr(e, table);
+}
+
+/** An expression that reads no columns: a column DEFAULT, a PRAGMA value. */
+export function toValueExpr(e: Expr, text: string, catalog: BindContext): PlanExpr {
+  return new FrontEnd(catalog, text).valueExpr(e);
+}
+
+/**
  * The constraint an ON CONFLICT clause (`n`th of `count`) targets: an index of `table`, -1 for its INTEGER PRIMARY
  * KEY, null for any; throws SQLite's errors.
  */
@@ -408,6 +422,14 @@ class FrontEnd {
       columns.push({ name: rc.alias ?? (rc.expr.kind === 'column' ? rc.expr.name : this.text.slice(rc.expr.pos, rc.expr.end)), type: boundMetadata(b, this.catalog.funcCtx).type });
     }
     return { exprs, columns };
+  }
+
+  rowExpr(e: Expr, table: TableSchema): PlanExpr {
+    return this.resolveExpr(bindExpr(e, this.rowScope([{ table, names: [table.name], offset: 0 }])));
+  }
+
+  valueExpr(e: Expr): PlanExpr {
+    return this.resolveExpr(bindExpr(e, this.compileScope(new FeScope(null))));
   }
 
   /**
