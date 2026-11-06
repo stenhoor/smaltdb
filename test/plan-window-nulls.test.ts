@@ -21,9 +21,9 @@ const ALL: WindowFrame = { unit: 'ROWS', start: { kind: 'unboundedPreceding' }, 
 const UPTO: WindowFrame = { unit: 'ROWS', start: { kind: 'unboundedPreceding' }, end: { kind: 'currentRow' }, exclude: 'NO OTHERS' };
 const call = (fn: string, args: PlanExpr[], ignoreNulls = true): WindowCall => ({ fn, args, star: false, type: 'int', collation: 'binary', ignoreNulls });
 /** Each row's id with the window call's value, by id, partitioned by g. */
-function run(d: Database, c: WindowCall, frame = ALL): unknown[][] {
+function run(d: Database, c: WindowCall, frame = ALL): unknown[] {
   const w = { op: 'window', input: p.scan('t', [0, 1, 2]), partition: [{ expr: p.col(0, 1, 'text'), collation: 'binary' }], order: [p.asc(p.col(0, 0, 'int'))], frame, calls: [c] } as unknown as PlanOp;
-  return d.queryPlan(p.sort(p.project(w, [p.col(0, 0, 'int'), p.col(0, 3, 'int')]), [p.asc(p.col(0, 0, 'int'))])).rows.map((r) => r[1] as unknown[]);
+  return d.queryPlan(p.sort(p.project(w, [p.col(0, 0, 'int'), p.col(0, 3, 'int')]), [p.asc(p.col(0, 0, 'int'))])).rows.map((r) => r[1]);
 }
 
 describe('ignoreNulls', () => {
