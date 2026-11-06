@@ -449,7 +449,16 @@ class Validator {
         optEx(o.frame.start.offset, reading(), 'frame.start.offset');
         optEx(o.frame.end.offset, reading(), 'frame.end.offset');
         const calls = this.list(o.calls, 'calls');
-        for (let i = 0; i < calls.length; i++) this.under('calls', i, () => (this.object(calls[i]), this.aggCall(calls[i] as never, scopes, d, true)));
+        for (let i = 0; i < calls.length; i++)
+          this.under('calls', i, () => {
+            this.object(calls[i]);
+            this.aggCall(calls[i] as never, scopes, d, true);
+            const c = calls[i] as { fn: string; ignoreNulls?: unknown };
+            if (c.ignoreNulls !== undefined) {
+              if (typeof c.ignoreNulls !== 'boolean') this.fail('expected true or false', 'ignoreNulls');
+              if (c.ignoreNulls && !NAVIGATION_FUNCTIONS.has(c.fn)) this.fail(`${c.fn} does not ignore NULLs (only lag, lead, first_value, last_value and nth_value do)`, 'ignoreNulls');
+            }
+          });
         return w + o.calls.length;
       }
       case 'delete': {
@@ -888,5 +897,6 @@ export function validateSchemaOp(op: unknown, catalog: ValidateCatalog): void {
 const PATH: (string | number)[] = new Array<string | number>(2 * MAX_PLAN_DEPTH + 8).fill('');
 
 const CONFLICT_ACTIONS = new Set(['rollback', 'abort', 'fail', 'ignore', 'replace']);
+const NAVIGATION_FUNCTIONS = new Set(['lag', 'lead', 'first_value', 'last_value', 'nth_value']);
 const JOIN_KINDS = new Set(['inner', 'left', 'right', 'full', 'semi', 'anti', 'cross', 'asof']);
 const SETOP_KINDS = new Set(['union', 'unionAll', 'intersect', 'except']);

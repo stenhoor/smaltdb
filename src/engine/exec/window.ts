@@ -34,6 +34,8 @@ export interface WindowCall {
   outReg: number;
   /** Aggregate functions over the frame. */
   agg?: { def: AggregateFunction; argTypes: StaticType[]; collation: Collation; star: boolean };
+  /** Navigation functions: count only rows whose value is not NULL. */
+  ignoreNulls?: boolean;
 }
 
 export interface WindowDef {
@@ -370,6 +372,27 @@ export class Window implements Operator {
           }
           case 'lag':
           case 'lead':
+            if (call.ignoreNulls) {
+              // The sorted positions of the partition's non-NULL values, and how many come before each row.
+              const present: number[] = [];
+              const before = new Int32Array(pe - ps + 1);
+              for (let i = ps; i < pe; i++) {
+                before[i - ps] = present.length;
+                if (arg(i, 0) !== null) present.push(i);
+              }
+              for (let i = ps; i < pe; i++) {
+                const off = arity > 1 ? toInt(arg(i, 1)) : 1;
+                if (off === null) {
+                  res[idx[i]] = null;
+                  continue;
+                }
+                // lag: the off-th non-NULL value before row i; lead: the off-th after it (the row itself excluded).
+                const after = before[i - ps] + (arg(i, 0) !== null ? 1 : 0);
+                const k = call.kind === 'lag' ? before[i - ps] - off : after + off - 1;
+                res[idx[i]] = off > 0 && k >= 0 && k < present.length ? arg(present[k], 0) : off === 0 ? arg(i, 0) : arity > 2 ? arg(i, 2) : null;
+              }
+              return;
+            }
             for (let i = ps; i < pe; i++) {
               const off = arity > 1 ? toInt(arg(i, 1)) : 1;
               if (off === null) {
@@ -394,7 +417,24 @@ export class Window implements Operator {
                 want = k;
               }
               let val: SqlValue = null;
-              if (noExclusion) {
+              const counts = (j: number): boolean => (noExclusion || inFrame(i, j)) && (!call.ignoreNulls || arg(j, 0) !== null);
+              if (call.ignoreNulls) {
+                if (call.kind === 'last_value') {
+                  for (let j = fe - 1; j >= fs; j--) {
+                    if (!counts(j)) continue;
+                    val = arg(j, 0);
+                    break;
+                  }
+                } else {
+                  let seen = 0;
+                  for (let j = fs; j < fe; j++) {
+                    if (counts(j) && ++seen === want) {
+                      val = arg(j, 0);
+                      break;
+                    }
+                  }
+                }
+              } else if (noExclusion) {
                 // Every row of [fs, fe) is in the frame: the value is at a known position.
                 if (call.kind === 'last_value') val = fe > fs ? arg(fe - 1, 0) : null;
                 else val = fs + want - 1 < fe ? arg(fs + want - 1, 0) : null;

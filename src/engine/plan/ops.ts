@@ -62,6 +62,12 @@ export interface WindowCall {
   readonly filter?: PlanExpr;
   readonly type: PlanType;
   readonly collation: CollationName;
+  /**
+   * Navigation functions (`lag`, `lead`, `first_value`, `last_value`, `nth_value`): count only rows whose value is not
+   * NULL (ADR 0016 section 5). `lag(x, 2)` is then the second earlier non-NULL `x`; `first_value(x)` the frame's first
+   * non-NULL `x`.
+   */
+  readonly ignoreNulls?: boolean;
 }
 
 export type JoinKind = 'inner' | 'left' | 'right' | 'full' | 'semi' | 'anti' | 'cross' | 'asof';

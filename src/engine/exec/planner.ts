@@ -918,6 +918,7 @@ export class Planner {
           filter: call.filter ? compile(bind(call.filter, outSlot)).fn : undefined,
           outReg: reg,
           agg: aggDef && !builtin ? { def: aggDef, argTypes: args.map((x) => x.type), collation: args[0]?.collSrc ? args[0].collation : Collation.Binary, star: call.star } : undefined,
+          ...(call.ignoreNulls ? { ignoreNulls: true } : {}),
         });
         return reg;
       };

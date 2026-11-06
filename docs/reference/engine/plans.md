@@ -140,7 +140,10 @@ also over no input rows.
 keys) and `frame` (`{ unit: 'ROWS' | 'RANGE' | 'GROUPS', start, end, exclude }`, each bound
 `{ kind, offset? }` with `kind` `unboundedPreceding`, `preceding`, `currentRow`, `following` or `unboundedFollowing`).
 A call (`WindowCall`) is a ranking function (`row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`),
-a navigation function (`lag`, `lead`, `first_value`, `last_value`, `nth_value`) or an aggregate over the frame.
+a navigation function (`lag`, `lead`, `first_value`, `last_value`, `nth_value`) or an aggregate over the frame. A
+navigation call with `ignoreNulls: true` counts only rows whose value is not NULL: `lag(x, 2)` is the second earlier
+non-NULL `x` (its default when there is none), and `first_value`, `last_value` and `nth_value` skip NULLs in the
+frame.
 
 **Writes.** `append` assigns its input's columns to the table's `columns` (-1 the rowid; the others take their
 defaults). `update` and `delete` take the target rows from `input`, the rowid in its column `rowid`; `update`'s `sets`
