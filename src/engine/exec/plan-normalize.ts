@@ -51,7 +51,8 @@ function rewriteSemiJoins(x: unknown): unknown {
   const op = (out ?? o) as unknown as PlanOp;
   if (op.op !== 'join' || (op.kind !== 'semi' && op.kind !== 'anti')) return op;
   const [left, right] = op.inputs;
-  const inner: PlanOp = op.on ? { op: 'filter', input: right, pred: correlated(op.on, 0) } : right;
+  // In the layering the planner reads: a write's input is not normalized past its own operation.
+  const inner = block(op.on ? { op: 'filter', input: right, pred: correlated(op.on, 0) } : right);
   const exists: PlanExpr = { k: 'subquery', mode: 'exists', plan: inner, type: 'int', collation: 'binary' };
   const pred: PlanExpr = op.kind === 'semi' ? exists : { k: 'not', arg: exists };
   return { op: 'filter', input: left, pred, ...(op.origin !== undefined ? { origin: op.origin } : {}) };
@@ -86,7 +87,8 @@ function correlated(e: PlanExpr, depth: number): PlanExpr {
 }
 
 /** A write's plan with its input normalized (an `append`'s rows; `update` and `delete` read their targets as given). */
-export function normalizeWrite(op: PlanOp): PlanOp {
+export function normalizeWrite(plan: PlanOp): PlanOp {
+  const op = semiJoins(plan);
   return op.op === 'append' && op.input ? { ...op, input: block(op.input) } : op;
 }
 

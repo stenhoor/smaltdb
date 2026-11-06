@@ -144,4 +144,15 @@ describe('semi and anti joins keep the left order', () => {
     const inAgg = p.aggregate(p.limit(p.scan('r', [0, 1]), 20), [], [p.agg('sum', [{ k: 'subquery', mode: 'scalar', plan: perRow, type: 'int', collation: 'binary' }], 'int')]);
     expect(d.queryPlan(inAgg).rows).toEqual([[expected.reduce((s, r) => s + r[1], 0)]]);
   });
+
+  it('in the input of a write', () => {
+    const w = Database.openMemory();
+    w.exec('CREATE TABLE l(id INTEGER PRIMARY KEY, k INT); CREATE TABLE r(k INT); INSERT INTO l VALUES (1, 1), (2, 2), (3, 3), (4, 4); INSERT INTO r VALUES (2), (4)');
+    const matched = (kind: 'semi' | 'anti') => p.join(kind, p.scan('l', [-1, 1]), p.scan('r', [0]), p.call('cmp_eq', [p.col(0, 1, 'int'), p.col(1, 0, 'int')], 'int'));
+    expect(w.queryPlan({ kind: 'write', plan: p.remove('l', matched('semi'), 0) }).changes).toBe(2);
+    expect(w.queryPlan(p.scan('l', [0])).rows).toEqual([[1], [3]]);
+    const copied = p.append('r', p.project(matched('anti'), [p.col(0, 1, 'int')]), [0]);
+    expect(w.queryPlan({ kind: 'write', plan: copied }).changes).toBe(2);
+    expect(w.queryPlan(p.scan('r', [0])).rows).toEqual([[2], [4], [1], [3]]);
+  });
 });
