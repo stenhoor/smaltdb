@@ -107,7 +107,14 @@ export type PlanOp = OpMeaning & (
   | { readonly op: 'values'; readonly rows: readonly (readonly PlanExpr[])[]; readonly types: readonly PlanType[] }
   | { readonly op: 'filter'; readonly input: PlanOp; readonly pred: PlanExpr }
   | { readonly op: 'project'; readonly input: PlanOp; readonly exprs: readonly PlanExpr[] }
-  | { readonly op: 'limit'; readonly input: PlanOp; readonly count: PlanExpr; readonly offset?: PlanExpr }
+  | {
+      readonly op: 'limit';
+      readonly input: PlanOp;
+      readonly count: PlanExpr;
+      readonly offset?: PlanExpr;
+      /** Count the rows and the offset from the end: the last `count` rows before the last `offset`, in input order. */
+      readonly fromEnd?: true;
+    }
   | {
       readonly op: 'join';
       readonly kind: JoinKind;
@@ -134,6 +141,10 @@ export type PlanOp = OpMeaning & (
       readonly collations: readonly CollationName[];
       /** Give the distinct rows in the order of their first occurrence (ADR 0016 section 4). */
       readonly ordered?: 'first';
+      /** The columns that decide which rows are duplicates (default: all of them). */
+      readonly on?: readonly number[];
+      /** Which row of each set of duplicates to keep, by input order; the kept rows come in input order. */
+      readonly keep?: 'first' | 'last';
     }
   /**
    * DELETE: deletes the rows of `table` whose rowids `input` gives in its column `rowid`. `returning` reads each

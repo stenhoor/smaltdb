@@ -52,10 +52,14 @@ function rewriteAll(x: unknown): unknown {
   switch (op.op) {
     case 'join':
       return op.kind === 'semi' || op.kind === 'anti' ? semiJoin(op) : op.ordered ? orderedJoin(op) : op;
-    case 'aggregate':
-      return op.ordered ? orderedGroups(op) : op;
+    case 'aggregate': {
+      const positioned = firstLast(op);
+      return positioned.ordered ? orderedGroups(positioned) : positioned;
+    }
     case 'distinct':
-      return op.ordered ? orderedGroups(distinctGroups(op)) : op;
+      return op.on || op.keep ? keptRows(op) : op.ordered ? orderedGroups(distinctGroups(op)) : op;
+    case 'limit':
+      return op.fromEnd ? fromEnd(op) : op;
     default:
       return op;
   }
@@ -105,6 +109,47 @@ function orderedJoin(op: Op<'join'>): PlanOp {
     { expr: column(l + 1 + r, 'int'), desc: false, nullsFirst: true, collation: 'binary' },
   ];
   return { op: 'project', input: { op: 'sort', input: joined, keys }, exprs: [...range(0, l), ...range(l + 1, l + 1 + r)] };
+}
+
+const call = (fn: string, args: PlanExpr[] = [], star = false): WindowCall => ({ fn, args, star, collation: 'binary', type: 'int' });
+const cmp = (fn: string, a: PlanExpr, b: PlanExpr): PlanExpr => ({ k: 'call', fn, args: [a, b], type: 'int' });
+const minus = (a: PlanExpr, b: PlanExpr): PlanExpr => ({ k: 'call', fn: 'sub', args: [a, b], type: 'int' });
+const EVERY_ROW: Op<'window'>['frame'] = { ...WHOLE, end: { kind: 'unboundedFollowing' } };
+
+/** `first` and `last` calls by input order: the input numbered, and each call given the row's number as its last key. */
+function firstLast(op: Op<'aggregate'>): Op<'aggregate'> {
+  if (!op.aggs.some((a) => a.fn === 'first' || a.fn === 'last')) return op;
+  const pos = column(planWidth(op.input), 'int');
+  const aggs = op.aggs.map((a) => (a.fn === 'first' || a.fn === 'last' ? { ...a, args: [...a.args, pos] } : a));
+  return { ...op, input: numbered(op.input), aggs };
+}
+
+/** The last `count` rows before the last `offset`: the input numbered and counted, and the rows in that range kept. */
+function fromEnd(op: Op<'limit'>): PlanOp {
+  const w = planWidth(op.input);
+  const pos = column(w, 'int');
+  const end = minus(column(w + 1, 'int'), op.offset ?? { k: 'lit', value: 0, type: 'int' });
+  // A negative count, as in a limit from the start, takes every row.
+  const after: PlanExpr = { k: 'or', args: [cmp('cmp_lt', op.count, { k: 'lit', value: 0, type: 'int' }), cmp('cmp_gt', pos, minus(end, op.count))] };
+  const counted: PlanOp = { op: 'window', input: op.input, partition: [], order: [], frame: EVERY_ROW, calls: [ROW_NUMBER, call('count', [], true)] };
+  const kept: PlanOp = { op: 'filter', input: counted, pred: { k: 'and', args: [cmp('cmp_le', pos, end), after] } };
+  return { op: 'project', input: kept, exprs: range(0, w) };
+}
+
+/**
+ * A distinct that keeps one row of each set of duplicates, by the columns `on`: the input numbered, each set's first
+ * and last numbers taken over its rows, and the row with the one asked for kept (the first without `keep`). The kept
+ * rows come in input order, or with `ordered: 'first'` in the order of each set's first row.
+ */
+function keptRows(op: Op<'distinct'>): PlanOp {
+  const w = planWidth(op.input);
+  const on = op.on ?? op.collations.map((_c, i) => i);
+  const partition = on.map((i) => ({ expr: column(i), collation: op.collations[i] }));
+  const pos = column(w, 'int');
+  const sets: PlanOp = { op: 'window', input: numbered(op.input), partition, order: [], frame: EVERY_ROW, calls: [call('min', [pos]), call('max', [pos])] };
+  let kept: PlanOp = { op: 'filter', input: sets, pred: cmp('cmp_eq', pos, column(op.keep === 'last' ? w + 2 : w + 1, 'int')) };
+  if (op.ordered) kept = { op: 'sort', input: kept, keys: [{ expr: column(w + 1, 'int'), desc: false, nullsFirst: false, collation: 'binary' }] };
+  return { op: 'project', input: kept, exprs: range(0, w) };
 }
 
 /** A distinct as an aggregate grouped by every column, with no aggregate calls. */

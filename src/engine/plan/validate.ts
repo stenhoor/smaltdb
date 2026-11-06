@@ -278,6 +278,7 @@ class Validator {
         const scopes = reading(w);
         ex(o.count, scopes, 'count');
         optEx(o.offset, scopes, 'offset');
+        if (o.fromEnd !== undefined && o.fromEnd !== true) this.fail('expected true', 'fromEnd');
         return w;
       }
       case 'join': {
@@ -328,6 +329,15 @@ class Validator {
         if (this.list(o.collations, 'collations').length !== w) this.fail(`expected ${w} collations`, 'collations');
         collations(o.collations, 'collations');
         orderedFirst(o.ordered);
+        if (o.on !== undefined) {
+          const on = this.list(o.on, 'on');
+          if (on.length === 0) this.fail('expected at least one column', 'on');
+          for (let i = 0; i < on.length; i++) {
+            if (!Number.isInteger(on[i]) || (on[i] as number) < 0 || (on[i] as number) >= w) this.fail(`no column ${String(on[i])}`, 'on', i);
+            if (on.indexOf(on[i]) !== i) this.fail(`column ${String(on[i])} is listed twice`, 'on', i);
+          }
+        }
+        if (o.keep !== undefined && o.keep !== 'first' && o.keep !== 'last') this.fail("expected 'first' or 'last'", 'keep');
         return w;
       }
       case 'window': {

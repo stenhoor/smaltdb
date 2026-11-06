@@ -247,3 +247,92 @@ describe('order on request', () => {
     expect(bad({ ...p.distinct(scan, 2), collations: ['binary'] } as unknown as PlanOp)).toMatch(/expected 2 collations/);
   });
 });
+
+describe('order-aware operations', () => {
+  const d = Database.openMemory();
+  d.exec("CREATE TABLE s(id INTEGER PRIMARY KEY, g TEXT, v INT, at INT)");
+  d.exec('BEGIN');
+  // Groups a, b, c; v repeats within groups; at is a key that is not the input order.
+  const S = ids(600).map((i) => [i, ['a', 'b', 'c', 'A'][i % 4], (i * 13) % 50, (i * 7919) % 1000] as [number, string, number, number]);
+  for (const r of S) d.exec(`INSERT INTO s VALUES (${r[0]}, '${r[1]}', ${r[2]}, ${r[3]})`);
+  d.exec('COMMIT; ANALYZE');
+  // The input in an order of its own: v descending, ties by id.
+  const input = p.sort(p.scan('s', [0, 1, 2, 3]), [p.desc(p.col(0, 2, 'int'))]);
+  const rows = stableSorted(S.map((r) => [...r] as (number | string)[]), (r) => r[2] as number, true);
+  const groups = ['a', 'b', 'c', 'A'];
+  const of = (g: string) => rows.filter((r) => r[1] === g);
+  const g = p.col(0, 1, 'text');
+  const id = p.col(0, 0, 'int');
+  const at = p.col(0, 3, 'int');
+
+  it('first and last by input order, and by an order key', () => {
+    const plan = p.aggregate(input, [g], [p.agg('first', [id], 'int'), p.agg('last', [id], 'int'), p.agg('first', [id, at], 'int'), p.agg('last', [id, at], 'int')], { ordered: 'first' });
+    const byAt = (r: (number | string)[][], last: boolean) => [...r].sort((x, y) => (last ? -1 : 1) * ((x[3] as number) - (y[3] as number)))[0][0];
+    const expected = [...new Set(rows.map((r) => r[1]))].map((k) => {
+      const m = of(k as string);
+      return [k, m[0][0], m[m.length - 1][0], byAt(m, false), byAt(m, true)];
+    });
+    expect(d.queryPlan(plan).rows).toEqual(expected);
+    // Ties in the key go by input order: first takes the earliest row, last the latest.
+    const tied = d.queryPlan(p.aggregate(input, [g], [p.agg('first', [id, p.lit(0)], 'int'), p.agg('last', [id, p.lit(0)], 'int')], { ordered: 'first' })).rows;
+    expect(tied).toEqual(expected.map((r) => [r[0], r[1], r[2]]));
+    // Without keys, over a sorted input, and rows whose key is null skipped.
+    expect(d.queryPlan(p.aggregate(input, [], [p.agg('first', [id], 'int'), p.agg('last', [id], 'int')])).rows).toEqual([[rows[0][0], rows[rows.length - 1][0]]]);
+    const keyed = { k: 'case', whens: [{ when: p.call('cmp_lt', [id, p.lit(300)], 'int'), then: p.lit(null) }], else: at, type: 'int' } as PlanExpr;
+    const firstAfter300 = [...rows].filter((r) => (r[0] as number) >= 300).sort((x, y) => (x[3] as number) - (y[3] as number))[0][0];
+    expect(d.queryPlan(p.aggregate(input, [], [p.agg('first', [id, keyed], 'int')])).rows).toEqual([[firstAfter300]]);
+  });
+
+  it('limit from the end: the last rows, in input order', () => {
+    const idsOf = (plan: PlanOp) => d.queryPlan(plan).rows.map((r) => r[0]);
+    const all = rows.map((r) => r[0]);
+    expect(idsOf(p.limit(input, 5, undefined, { fromEnd: true }))).toEqual(all.slice(-5));
+    expect(idsOf(p.limit(input, 5, 10, { fromEnd: true }))).toEqual(all.slice(-15, -10));
+    expect(idsOf(p.limit(input, 1000, 0, { fromEnd: true }))).toEqual(all);
+    expect(idsOf(p.limit(input, 0, undefined, { fromEnd: true }))).toEqual([]);
+    expect(idsOf(p.limit(input, -1, 595, { fromEnd: true }))).toEqual(all.slice(0, 5));
+    // With parameters, and under other operations.
+    expect(d.queryPlan(p.limit(input, p.param(0, 'int'), p.param(1, 'int'), { fromEnd: true }), [3, 1]).rows.map((r) => r[0])).toEqual(all.slice(-4, -1));
+    expect(d.queryPlan(p.aggregate(p.limit(input, 7, undefined, { fromEnd: true }), [], [p.agg('count', [], 'int', { star: true })])).rows).toEqual([[7]]);
+  });
+
+  it('distinct keeping the first or last row of each set of duplicates', () => {
+    const keep = (k: 'first' | 'last', options: { ordered?: 'first' } = {}) => d.queryPlan(p.distinct(input, 4, undefined, { on: [1], keep: k, ...options })).rows;
+    const firsts = groups.map((x) => of(x)[0]);
+    const lasts = groups.map((x) => of(x)[of(x).length - 1]);
+    const inInputOrder = (picked: (number | string)[][]) => rows.filter((r) => picked.includes(r));
+    expect(keep('first')).toEqual(inInputOrder(firsts));
+    expect(keep('last')).toEqual(inInputOrder(lasts));
+    // With ordered: 'first', in the order of each set's first row.
+    const setOrder = [...new Set(rows.map((r) => r[1]))];
+    expect(keep('last', { ordered: 'first' })).toEqual(setOrder.map((x) => lasts[groups.indexOf(x as string)]));
+    // By the columns' collations: a and A are one set under nocase.
+    const folded = d.queryPlan(p.distinct(input, 4, ['binary', 'nocase', 'binary', 'binary'], { on: [1], keep: 'first' })).rows;
+    const firstOfFolded = (x: string) => rows.find((r) => (r[1] as string).toLowerCase() === x)!;
+    expect(folded).toEqual(inInputOrder(['a', 'b', 'c'].map(firstOfFolded)));
+    // Over every column, keeping the first: the distinct rows in the order of their first occurrence.
+    const pairs = p.project(input, [p.col(0, 1, 'text'), p.call('mod', [p.col(0, 2, 'int'), p.lit(3)], 'int')]);
+    const seen = new Set<string>();
+    const expected = rows.map((r) => [r[1], (r[2] as number) % 3]).filter((r) => (seen.has(JSON.stringify(r)) ? false : (seen.add(JSON.stringify(r)), true)));
+    expect(d.queryPlan(p.distinct(pairs, 2, undefined, { keep: 'first' })).rows).toEqual(expected);
+  });
+
+  it('the validator checks them', () => {
+    const catalog = { tableColumns: (t: string) => (t === 's' ? 4 : undefined) };
+    const bad = (plan: PlanOp) => {
+      try {
+        p.validatePlan(plan, catalog as never);
+      } catch (e) {
+        return (e as Error).message;
+      }
+      return 'valid';
+    };
+    const scan = p.scan('s', [0, 1]);
+    expect(bad({ ...p.limit(scan, 1), fromEnd: 1 } as unknown as PlanOp)).toMatch(/fromEnd: expected true/);
+    expect(bad(p.distinct(scan, 2, undefined, { on: [2] }))).toMatch(/no column 2/);
+    expect(bad(p.distinct(scan, 2, undefined, { on: [1, 1] }))).toMatch(/listed twice/);
+    expect(bad(p.distinct(scan, 2, undefined, { on: [] }))).toMatch(/at least one column/);
+    expect(bad({ ...p.distinct(scan, 2), keep: 'any' } as unknown as PlanOp)).toMatch(/keep: expected 'first' or 'last'/);
+    expect(bad(p.aggregate(scan, [], [p.agg('first', [], 'int')]))).not.toBe('valid');
+  });
+});
