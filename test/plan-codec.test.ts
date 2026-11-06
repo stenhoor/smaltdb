@@ -46,7 +46,7 @@ describe('plan codec', () => {
   it('JSON and structured-clone forms decode to the same plan, SQL metadata included', async () => {
     const { catalog } = await setup();
     for (const q of QUERIES) {
-      const plan = (sqlLanguage.parseOne(q).bind(catalog) as { plan: PlanOp }).plan;
+      const plan = (sqlLanguage.parseOne!(q).bind(catalog) as { plan: PlanOp }).plan;
       const viaJson = planFromJSON(planToJSON(plan));
       const viaClone = decodePlan(structuredClone(encodePlan(plan)));
       for (const d of [viaJson, viaClone]) {

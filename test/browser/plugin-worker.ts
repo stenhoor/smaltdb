@@ -7,6 +7,6 @@ import { defineWorker } from '../../src/engine/worker-runtime.js';
 // SQL as given to defineWorker, marked so the page can tell it is the language this worker registered: it reads
 // smalt_worker_language() as the string 'defineWorker'.
 const mark = (text: string): string => text.replaceAll('smalt_worker_language()', "'defineWorker'");
-const sql = { ...sqlLanguage, parse: (text: string) => sqlLanguage.parse(mark(text)), parseOne: (text: string) => sqlLanguage.parseOne(mark(text)) };
+const sql = { ...sqlLanguage, parse: (text: string) => sqlLanguage.parse!(mark(text)), parseOne: (text: string) => sqlLanguage.parseOne!(mark(text)) };
 
 defineWorker({ languages: [sql], plugins: [external, io] });

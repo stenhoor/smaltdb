@@ -36,7 +36,7 @@ describe('plan validator', () => {
       'SELECT * FROM t, pragma_table_info(t.s) WHERE t.a = 1',
       'SELECT a FROM t UNION SELECT x FROM u',
     ]) {
-      const plan = (sqlLanguage.parseOne(q).bind(ctx) as { plan: PlanOp }).plan;
+      const plan = (sqlLanguage.parseOne!(q).bind(ctx) as { plan: PlanOp }).plan;
       expect(() => validatePlan(plan, live), q).not.toThrow();
     }
   });
