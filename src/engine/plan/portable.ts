@@ -32,3 +32,18 @@ export type {
 export type { PlanColumn, PlanQuery, PlanWrite, PlanStatementInput } from './statement.js';
 export { MAX_PARAMS } from './statement.js';
 export { encodePlan, decodePlan, planToJSON, planFromJSON, type EncodedPlan } from './codec.js';
+export {
+  type Catalog,
+  type CatalogColumn,
+  type CatalogData,
+  type CatalogFunction,
+  type CatalogIndex,
+  type CatalogKey,
+  type CatalogSettings,
+  type CatalogTable,
+  type CatalogView,
+  affinityOfStorage,
+  declaredType,
+  planTypeOfStorage,
+  storageTypeFor,
+} from './catalog.js';

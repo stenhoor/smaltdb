@@ -542,6 +542,9 @@ export class EngineServer {
         this.startStream(session, id, st.cursor(req.params as BindParams | undefined), req.batchSize ?? 4096, req.credit);
         return;
       }
+      case 'catalog':
+        this.send(session, { id, kind: 'ok', value: this.requireDb().catalog.snapshot() });
+        return;
       case 'finalize':
         this.statements.delete(req.stmt);
         this.send(session, { id, kind: 'ok' });

@@ -182,22 +182,8 @@ export function autoIndexName(table: string, n: number): string {
   return `smalt_autoindex_${table}_${n}`;
 }
 
-/**
- * Map a declared column type to a storage type (smaltdb tables are STRICT by default).
- * Uses SQLite's affinity rules so familiar type names work: *INT* -> INTEGER; *CHAR*, *CLOB*,
- * *TEXT* -> TEXT; *BLOB* -> BLOB; *REAL*, *FLOA*, *DOUB* -> REAL; ANY or no type -> ANY;
- * anything else (NUMERIC, DECIMAL, BOOLEAN, DATE, ...) -> NUMERIC.
- */
-export function storageTypeFor(declared: string | undefined): StorageType {
-  if (!declared) return 'ANY';
-  const t = declared.toUpperCase();
-  if (t === 'ANY') return 'ANY';
-  if (t.includes('INT')) return 'INTEGER';
-  if (t.includes('CHAR') || t.includes('CLOB') || t.includes('TEXT')) return 'TEXT';
-  if (t.includes('BLOB')) return 'BLOB';
-  if (t.includes('REAL') || t.includes('FLOA') || t.includes('DOUB')) return 'REAL';
-  return 'NUMERIC';
-}
+/** Map a declared column type to a storage type: plan/catalog.ts, where every language reads it. */
+export { storageTypeFor } from '../plan/catalog.js';
 
 const INT_RE = /^\s*[+-]?\d+\s*$/;
 const NUM_RE = /^\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?\s*$/;

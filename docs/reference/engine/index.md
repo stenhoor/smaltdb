@@ -77,4 +77,5 @@ console.log(db.queryPlan({ kind: 'query', plan: query, columns: [{ name: 'name',
 - [Running plans](./running): building them, running them in-process and through the client, validation, parameters,
   writes, and other statements.
 - [Schema definitions](./schema): tables, indexes, views and the rest, as data.
+- [The catalog](./catalog): tables, views, functions and settings in plan terms, in process and on the client.
 - [Writing a language](./languages): the language interface, registration and workers.
