@@ -884,6 +884,42 @@ class GroupConcatState implements AggregateState {
 
 export { MinMaxState };
 
+/**
+ * `first` / `last` (ADR 0016 section 4): the value of the first or last row, `(value)` in the order the rows arrive,
+ * `(value, key)` at the smallest or largest key (rows without a key skipped), `(value, key, tie)` breaking ties by a
+ * second key. Plans from outside a language get each row's input position as the last key (exec/plan-normalize.ts),
+ * so the result is by input order whatever order the aggregate reads its rows in.
+ */
+class FirstLastState implements AggregateState {
+  private best: SqlValue = null;
+  private keys: SqlValue[] | null = null;
+  constructor(
+    private readonly last: boolean,
+    private readonly collation: Collation,
+  ) {}
+  step(args: SqlValue[]): void {
+    if (args.length === 1) {
+      if (!this.last && this.keys) return;
+      this.best = args[0];
+      this.keys = [];
+      return;
+    }
+    const keys = args.slice(1);
+    if (keys.includes(null)) return;
+    if (this.keys) {
+      let c = 0;
+      for (let i = 0; i < keys.length && c === 0; i++) c = compareValues(keys[i], this.keys[i], i === 0 ? this.collation : Collation.Binary);
+      // On a tie, first keeps the earlier row and last takes the later one.
+      if (this.last ? c < 0 : c >= 0) return;
+    }
+    this.best = args[0];
+    this.keys = keys;
+  }
+  final(): SqlValue {
+    return this.best;
+  }
+}
+
 export const aggregateFunctions = new Map<string, AggregateFunction>([
   ['count', { minArgs: 0, maxArgs: 1, resultType: () => 'int', create: (t) => new CountState(t.length === 0) }],
   [
@@ -899,6 +935,8 @@ export const aggregateFunctions = new Map<string, AggregateFunction>([
   ['avg', { minArgs: 1, maxArgs: 1, resultType: () => 'real', create: (t) => new SumState('avg', t[0] === 'real') }],
   ['min', { minArgs: 1, maxArgs: 1, resultType: (t) => t[0], create: (_t, c) => new MinMaxState(1, c) }],
   ['max', { minArgs: 1, maxArgs: 1, resultType: (t) => t[0], create: (_t, c) => new MinMaxState(-1, c) }],
+  ['first', { minArgs: 1, maxArgs: 3, resultType: (t) => t[0], create: (_t, c) => new FirstLastState(false, c) }],
+  ['last', { minArgs: 1, maxArgs: 3, resultType: (t) => t[0], create: (_t, c) => new FirstLastState(true, c) }],
   ['group_concat', { minArgs: 1, maxArgs: 2, resultType: () => 'text', create: (t) => new GroupConcatState(t[0] === 'real', t.length > 1, t[1] === 'real') }],
   ['string_agg', { minArgs: 2, maxArgs: 2, resultType: () => 'text', create: (t) => new GroupConcatState(t[0] === 'real', true, t[1] === 'real') }],
 ]);
