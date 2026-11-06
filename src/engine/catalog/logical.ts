@@ -3,11 +3,11 @@
  * function metadata from the registries, and the engine's help for building plans (result types, expression types,
  * constant evaluation).
  */
-import { boundMetadata, compilePlanExpr } from '../exec/expr.js';
+import { CollSrc, boundMetadata, compilePlanExpr } from '../exec/expr.js';
 import { type CompiledArg, type FunctionContext, aggregateFunctions, scalarFunctions } from '../exec/functions.js';
 import { SQL_ALIASES, SQL_FUNCTIONS, canonicalName } from '../exec/sql-functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../exec/window.js';
-import type { Catalog, CatalogData, CatalogFunction, CatalogKey, CatalogSettings, CatalogTable, CatalogView } from '../plan/catalog.js';
+import type { Catalog, CatalogData, CatalogFunction, CatalogKey, CatalogSettings, CatalogTable, CatalogView, FunctionCatalog } from '../plan/catalog.js';
 import { declaredType, planTypeOfStorage } from '../plan/catalog.js';
 import { type BoundExpr, typeOf } from '../plan/expr.js';
 import type { Source } from '../plan/schema.js';
@@ -121,7 +121,16 @@ function describeFunctions(ctx: FunctionContext): CatalogFunction[] {
   }
   for (const [name, f] of scalarFunctions) {
     if (SQL_FUNCTIONS.has(name)) continue;
-    out.push({ name, kind: 'scalar', minArgs: f.minArgs, maxArgs: f.maxArgs < 0 ? null : f.maxArgs, deterministic: f.deterministic && !f.pureDate, result: resultOf(name, f.minArgs, ctx), traits: traitData(f.traits) });
+    out.push({
+      name,
+      kind: 'scalar',
+      minArgs: f.minArgs,
+      maxArgs: f.maxArgs < 0 ? null : f.maxArgs,
+      deterministic: f.deterministic && !f.pureDate,
+      ...(f.pureDate ? { dateTime: true as const } : {}),
+      result: resultOf(name, f.minArgs, ctx),
+      traits: traitData(f.traits),
+    });
   }
   for (const [name, f] of aggregateFunctions) {
     out.push({ name, kind: 'aggregate', minArgs: f.minArgs, maxArgs: f.maxArgs < 0 ? null : f.maxArgs, deterministic: true, result: resultOf(name, f.minArgs, ctx), traits: {} });
@@ -185,34 +194,97 @@ function compilable(e: BoundExpr): boolean {
   }
 }
 
-/** `e` with its columns read from a register of their written type: what the closure compiler compiles alone. */
+/**
+ * `e` with its columns read from a register of their written type: what the closure compiler compiles alone. `e`
+ * itself when it has no columns (the binder's expressions read registers already).
+ */
 function asRegisters(e: BoundExpr): BoundExpr {
   switch (e.k) {
     case 'col':
-      return { k: 'slot', reg: 0, type: e.type };
+      // A register of the column's type, with its meaning fields.
+      return { k: 'slot', reg: 0, type: e.type, ...(e.carries ? { carries: e.carries } : {}), ...(e.affinity ? { affinity: e.affinity } : {}) };
     case 'call':
-      return { ...e, args: e.args.map(asRegisters) };
     case 'and':
-    case 'or':
-      return { ...e, args: e.args.map(asRegisters) };
+    case 'or': {
+      const args = mapSame(e.args, asRegisters);
+      return args === e.args ? e : ({ ...e, args } as BoundExpr);
+    }
     case 'cast':
     case 'not':
-    case 'isNull':
-      return { ...e, arg: asRegisters(e.arg) } as BoundExpr;
-    case 'case':
-      return { ...e, whens: e.whens.map((w) => ({ when: asRegisters(w.when), then: asRegisters(w.then) })), else: asRegisters(e.else) };
+    case 'isNull': {
+      const arg = asRegisters(e.arg);
+      return arg === e.arg ? e : ({ ...e, arg } as BoundExpr);
+    }
+    case 'case': {
+      const whens = mapSame(e.whens, (w) => {
+        const when = asRegisters(w.when);
+        const then = asRegisters(w.then);
+        return when === w.when && then === w.then ? w : { when, then };
+      });
+      const els = asRegisters(e.else);
+      return whens === e.whens && els === e.else ? e : { ...e, whens, else: els };
+    }
     default:
       return e;
   }
 }
 
+/** `xs` mapped by `f`, or `xs` itself when `f` changed none of them. */
+function mapSame<T>(xs: readonly T[], f: (x: T) => T): readonly T[] {
+  let out: T[] | null = null;
+  for (let i = 0; i < xs.length; i++) {
+    const y = f(xs[i]);
+    if (out === null && y !== xs[i]) out = xs.slice(0, i);
+    if (out !== null) out.push(y);
+  }
+  return out ?? xs;
+}
+
+const NO_DATABASE: FunctionContext = {
+  lastInsertRowid: () => 0,
+  changes: () => 0,
+  totalChanges: () => 0,
+  now: () => Date.now(),
+};
+
+/**
+ * The engine's functions as a catalog (`Catalog.functions`, `function`, `resultType`), the same for every database:
+ * what a language reads where it has no database at hand (smaltdb/language).
+ */
+export const engineFunctions: FunctionCatalog = (() => {
+  let functions: CatalogFunction[] | null = null;
+  let registered = -1;
+  let byName = new Map<string, CatalogFunction[]>();
+  const fns = (): CatalogFunction[] => {
+    // Plugins register functions as they load: rebuild when the registries have grown.
+    const count = SQL_FUNCTIONS.size + scalarFunctions.size + aggregateFunctions.size;
+    if (functions === null || registered !== count) {
+      registered = count;
+      functions = describeFunctions(NO_DATABASE);
+      byName = new Map();
+      for (const f of functions) byName.set(f.name, [...(byName.get(f.name) ?? []), f]);
+      for (const [alias, name] of Object.entries(SQL_ALIASES)) if (byName.has(name)) byName.set(alias, byName.get(name)!);
+    }
+    return functions;
+  };
+  return {
+    functions: () => [...fns()],
+    function: (name, kind) => {
+      fns();
+      const all = byName.get(name.toLowerCase()) ?? byName.get(name) ?? [];
+      return kind ? all.find((f) => f.kind === kind) : KINDS.map((k) => all.find((f) => f.kind === k)).find((f) => f !== undefined);
+    },
+    resultType: (name, args) => {
+      const norm = args.map((a) => (typeof a === 'string' ? { type: a, collation: Collation.Binary } : { type: a.type, collation: COLLATION_IDS[a.collation ?? 'binary'] ?? Collation.Binary }));
+      return resultTypeOf(name, norm, NO_DATABASE);
+    },
+  };
+})();
+
 export function logicalCatalog(host: CatalogHost): Catalog {
   let version = -1;
   let tables: CatalogTable[] = [];
   let views: CatalogView[] = [];
-  let functions: CatalogFunction[] | null = null;
-  let registered = -1;
-  let byName = new Map<string, CatalogFunction[]>();
   const fresh = (): void => {
     const v = host.schemaVersion();
     if (v === version) return;
@@ -221,18 +293,6 @@ export function logicalCatalog(host: CatalogHost): Catalog {
     // TEMP first: the one a name finds when it shadows a main table.
     tables = [...described.filter((t) => t.schema === 'temp'), ...described.filter((t) => t.schema === 'main'), ...host.externals().map(describeExternal)];
     views = host.views().map((x) => ({ name: x.name, schema: x.temp ? 'temp' : 'main', language: x.source.language, text: x.source.text, ...(x.columns ? { columns: [...x.columns] } : {}) }));
-  };
-  const fns = (): CatalogFunction[] => {
-    // Plugins register functions as they load: rebuild when the registries have grown.
-    const count = SQL_FUNCTIONS.size + scalarFunctions.size + aggregateFunctions.size;
-    if (functions === null || registered !== count) {
-      registered = count;
-      functions = describeFunctions(host.funcCtx);
-      byName = new Map();
-      for (const f of functions) byName.set(f.name, [...(byName.get(f.name) ?? []), f]);
-      for (const [alias, name] of Object.entries(SQL_ALIASES)) if (byName.has(name)) byName.set(alias, byName.get(name)!);
-    }
-    return functions;
   };
   const find = <T extends { name: string; schema: 'main' | 'temp' }>(xs: readonly T[], name: string, schema?: 'main' | 'temp'): T | undefined => {
     const lower = name.toLowerCase();
@@ -243,21 +303,23 @@ export function logicalCatalog(host: CatalogHost): Catalog {
     table: (name, schema) => (fresh(), find(tables, name, schema)),
     views: () => (fresh(), [...views]),
     view: (name, schema) => (fresh(), find(views, name, schema)),
-    functions: () => [...fns()],
-    function: (name, kind) => {
-      fns();
-      const all = byName.get(name.toLowerCase()) ?? byName.get(name) ?? [];
-      return kind ? all.find((f) => f.kind === kind) : KINDS.map((k) => all.find((f) => f.kind === k)).find((f) => f !== undefined);
-    },
+    functions: engineFunctions.functions,
+    function: engineFunctions.function,
     settings: () => host.settings(),
-    snapshot: (): CatalogData => (fresh(), { tables: [...tables], views: [...views], functions: [...fns()], settings: host.settings() }),
-    resultType: (name, args) => {
-      const norm = args.map((a) => (typeof a === 'string' ? { type: a, collation: Collation.Binary } : { type: a.type, collation: COLLATION_IDS[a.collation ?? 'binary'] ?? Collation.Binary }));
-      return resultTypeOf(name, norm, host.funcCtx);
-    },
+    snapshot: (): CatalogData => (fresh(), { tables: [...tables], views: [...views], functions: engineFunctions.functions(), settings: host.settings() }),
+    resultType: engineFunctions.resultType,
     typeOf: (expr) => {
       if (!compilable(expr)) return typeOf(expr);
       return boundMetadata(asRegisters(expr), host.funcCtx).type;
+    },
+    describe: (expr) => {
+      if (!compilable(expr)) return { type: typeOf(expr), ...(expr.carries ? { carries: expr.carries } : {}), ...(expr.affinity ? { affinity: expr.affinity } : {}) };
+      const m = boundMetadata(asRegisters(expr), host.funcCtx);
+      return {
+        type: m.type,
+        ...(m.collSrc !== CollSrc.None ? { carries: { collation: COLLATION_NAMES[m.collation], from: m.collSrc === CollSrc.Explicit ? ('explicit' as const) : ('column' as const) } } : {}),
+        ...(m.affinity !== 'NONE' ? { affinity: m.affinity } : {}),
+      };
     },
     constant: (expr) => {
       if (!onlyConstants(expr)) return null;

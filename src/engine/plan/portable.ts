@@ -42,6 +42,7 @@ export {
   type CatalogSettings,
   type CatalogTable,
   type CatalogView,
+  type FunctionCatalog,
   affinityOfStorage,
   declaredType,
   planTypeOfStorage,

@@ -8,6 +8,7 @@ import { Database, plan as p } from '../src/engine/index.js';
 import { EngineServer } from '../src/engine/server.js';
 import type { BindContext } from '../src/engine/plan/bind-context.js';
 import type { CatalogData } from '../src/engine/plan/catalog.js';
+import { engineFunctions } from '../src/engine/language-support.js';
 import type { Request, Response } from '../src/shared/protocol.js';
 import { until } from './helpers/wait.js';
 
@@ -91,7 +92,8 @@ describe('functions', () => {
     expect(c.function('upper')!.operation).toBeUndefined();
     expect(c.function('coalesce')!.maxArgs).toBeNull();
     expect(c.function('random')!.deterministic).toBe(false);
-    expect(c.function('date')!.deterministic).toBe(false); // reads the clock without arguments
+    expect(c.function('date')).toMatchObject({ deterministic: false, dateTime: true }); // reads the clock for 'now'
+    expect(c.function('random')!.dateTime).toBeUndefined();
     expect(c.function('sum')).toMatchObject({ kind: 'aggregate', minArgs: 1, maxArgs: 1 });
     expect(c.function('row_number')).toMatchObject({ kind: 'window', minArgs: 0, maxArgs: 0, result: 'int' });
     expect(c.function('cume_dist')!.result).toBe('real');
@@ -105,6 +107,12 @@ describe('functions', () => {
     expect(c.function('max')!.kind).toBe('scalar');
     expect(c.function('max', 'aggregate')).toMatchObject({ kind: 'aggregate', maxArgs: 1 });
     expect(c.function('upper', 'aggregate')).toBeUndefined();
+  });
+
+  it('are the same for every database, and without one (smaltdb/language engineFunctions)', () => {
+    expect(engineFunctions.functions()).toEqual(c.functions());
+    expect(engineFunctions.function('max', 'aggregate')).toEqual(c.function('max', 'aggregate'));
+    expect(engineFunctions.resultType('div_float', ['int', 'int'])).toBe('real');
   });
 
   it('gives result types for argument types', () => {
@@ -134,6 +142,15 @@ describe('help for building plans', () => {
     expect(c.typeOf(p.call('div_float', [p.col(0, 0, 'int'), p.lit(2)], 'any'))).toBe('real');
     expect(c.typeOf(p.col(0, 0, 'text'))).toBe('text');
     expect(c.typeOf(p.scalar(p.values([[p.lit(1)]]), 'int'))).toBe('int');
+  });
+
+  it('describes an expression as the engine computes it: type, collation and affinity', () => {
+    const name = { ...p.col(0, 1, 'text'), carries: { collation: 'nocase', from: 'column' }, affinity: 'TEXT' } as const;
+    expect(c.describe(name)).toEqual({ type: 'text', carries: { collation: 'nocase', from: 'column' }, affinity: 'TEXT' });
+    // A cast keeps its operand's collation; a function's result carries none.
+    expect(c.describe(p.cast('cast_text', name, 'text'))).toEqual({ type: 'text', carries: { collation: 'nocase', from: 'column' } });
+    expect(c.describe(p.call('upper', [name], 'any'))).toEqual({ type: 'text' });
+    expect(c.describe(p.lit(1))).toEqual({ type: 'int' });
   });
 
   it('reports the settings, and follows them', () => {

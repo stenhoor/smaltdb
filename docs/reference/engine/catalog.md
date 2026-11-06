@@ -34,7 +34,9 @@ language, bound where it is read.
 
 ## Functions
 
-`functions()` lists every function a plan can call, and `function(name, kind?)` finds one. A former `sql.*` name finds
+`functions()` lists every function a plan can call, and `function(name, kind?)` finds one. They are the same for every
+database: a language reads them where it has no database at hand from `engineFunctions` in `smaltdb/language`
+(`functions`, `function` and `resultType`). A former `sql.*` name finds
 its operation. A name can have one function of each kind: `min` and `max` are a scalar of several arguments and an
 aggregate.
 
@@ -43,6 +45,7 @@ aggregate.
 | `kind` | `scalar` (in a `call`), `aggregate` (in an aggregate or a window) or `window` (in a window only) |
 | `minArgs`, `maxArgs` | how many arguments it takes; `maxArgs` null for any number |
 | `deterministic` | the same arguments always give the same result: false for `random()` and for anything that reads the clock or time zone |
+| `dateTime` | set on the date and time functions: deterministic unless an argument asks for the current time (`'now'`), so allowed in index expressions and CHECK constraints, where reading the clock fails when it runs |
 | `result` | the result type when nothing is known of the arguments |
 | `operation` | set on the engine's own [operations](./plans#functions), with the former names they answer to (`aliases`) |
 | `traits` | what the planner and code generation know of it: `compare`, `offset`, `inList`, `pattern`, … |
@@ -61,6 +64,7 @@ In process, the catalog also answers what a language needs to know while it buil
 |---|---|
 | `resultType(name, args)` | function `name`'s result type for arguments of these plan types (or `{ type, collation }`) |
 | `typeOf(expr)` | the type the engine computes for an expression, which can be narrower than the type written on it |
+| `describe(expr)` | `{ type, carries?, affinity? }`: the type and the [meaning fields](./plans#expressions) the engine computes, given on the expression or passed up from what it is made of (a cast keeps its operand's collation) |
 | `constant(expr)` | `{ value }` when the expression depends on nothing but constants, else null |
 
 Declared column types map to storage and plan types by `declaredType(text)` (`storageTypeFor`, `planTypeOfStorage`
