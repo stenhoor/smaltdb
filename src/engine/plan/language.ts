@@ -8,6 +8,7 @@
  * The engine carries none: SQL is smaltql's, which registers itself (`import 'smaltql/register'`) or through a worker
  * entry (`defineWorker({ languages })`), ADR 0015.
  */
+import type { ErrorToWord } from '../errors.js';
 import type { CatalogTable } from './catalog.js';
 import type { SqlValue } from '../values.js';
 import type { BindContext } from './bind-context.js';
@@ -53,6 +54,12 @@ export interface SmaltLanguage {
    * that did not exist when the table was made), bound from the table's source (`table.source`) where first used.
    */
   bindTableExprs(table: CatalogTable, ctx: BindContext): { checks: PlanExpr[]; defaults: (PlanExpr | null)[] };
+  /**
+   * The message for an error a statement written in this language raised, from its code, the engine's message and its
+   * fields (`constraint`, `table`, `columns`, `name`, `origin`); undefined keeps the engine's message (ADR 0016
+   * section 10).
+   */
+  errorMessage?(error: ErrorToWord): string | undefined;
   /** A stored view's or materialized view's query (its CREATE statement's source), bound where it is read. */
   bindView(source: Source, ctx: BindContext): BoundQuery;
   /**

@@ -35,6 +35,7 @@ A language is a `SmaltLanguage`:
 | `viewReferences(source)` | The tables and views a view's query names, directly, read from its source without binding (a view may name tables that do not exist yet). The engine follows them for dependencies, TEMP checks and refresh order. |
 | `viewDefinition(source)` | The text of a view's query alone, for `information_schema.views`. |
 | `bindTableExprs(table, ctx)` | The CHECK and DEFAULT expressions a stored table holds unbound, bound from its source (`table` as [the catalog](./catalog) describes it, its text in `table.source`). |
+| `errorMessage(error)` | Optional. The message for an error a statement written in the language raised, from its `code`, the engine's `message` and its [fields](../api/errors) (`constraint`, `table`, `columns`, `name`, `origin`): undefined keeps the engine's message. Each language words errors for its users; SQL's wording is SQLite's. |
 | `sourceEditor` | Edits the source texts kept beside definitions when ALTER TABLE renames a table or a column, adds or drops a column, and writes an external table's statement once its columns are known. |
 
 A `LanguageStatement` (from `parse`) is `{ text, paramCount, paramNames, bind(ctx), externalCalls?() }`: `bind` gives a

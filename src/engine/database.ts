@@ -12,7 +12,7 @@ import {
   findColumn,
   isColumnar,
 } from './catalog/schema.js';
-import { MisuseError, SmaltError, withDetails } from './errors.js';
+import { MisuseError, SmaltError, withDetails, wordError } from './errors.js';
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
 import type { ConflictAction, PlanOp } from './plan/ops.js';
 import { type EncodedPlan, canonicalJSON, decodeData, decodePlan, encodeData, encodePlan, planFromJSON, planToJSON } from './plan/codec.js';
@@ -174,6 +174,8 @@ interface Program {
   bound?: BoundStatement;
   /** It reads memory-resident objects: TEMP tables and views, memory materialized views (seen while binding). */
   memory?: boolean;
+  /** The language of the statement's source: it words the statement's errors (ADR 0016 section 10). */
+  language?: SmaltLanguage;
 }
 
 let roundTrip: boolean | undefined;
@@ -1295,8 +1297,8 @@ export class Database implements FunctionContext {
     const reads = this.recordingContext();
     const bound = this.receivedBound(ps.bind(reads.ctx));
     const p = this.compileBound(bound, ps.paramCount, ps.text);
-    // Settings (work_mem, foreign_keys) belong to this connection.
-    return { ...p, bound, memory: reads.memory() || bound.kind === 'setting' };
+    // Settings (work_mem, foreign_keys) belong to this connection. Statements given as text are SQL.
+    return { ...p, bound, memory: reads.memory() || bound.kind === 'setting', language: this.sql };
   }
 
   /**
@@ -1559,6 +1561,18 @@ export class Database implements FunctionContext {
 
   /** @internal Run a write/utility program inside statement + (auto)transaction boundaries. */
   execute<T>(program: Program, body: () => T): T {
+    if (program.language?.errorMessage) {
+      const lang = program.language;
+      try {
+        return this.executeOuter(program, body);
+      } catch (err) {
+        throw wordError(err, lang);
+      }
+    }
+    return this.executeOuter(program, body);
+  }
+
+  private executeOuter<T>(program: Program, body: () => T): T {
     if (program.readonly && this.executeDepth === 0) return this.executeInner(program, body);
     this.executeDepth++;
     try {
