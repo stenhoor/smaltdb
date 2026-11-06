@@ -2,6 +2,7 @@ import type { BoundExpr } from '../plan/expr.js';
 import type { CollationName } from '../plan/types.js';
 import type { SqlValue } from '../values.js';
 import { isOpaque } from './sql-meta.js';
+import { type InlineForm, traitsOf, withoutComparisonConversion } from './traits.js';
 import { type StaticType, truthy } from './convert.js';
 import { type InlineMath, type MathFunction, inlineMath, roundingType } from './math.js';
 
@@ -65,9 +66,19 @@ function orNull(a: string, b: string): string {
   return `(${a} || ${b})`;
 }
 
-/** The arithmetic and comparison functions generated inline, with their JavaScript operators. */
-const ARITH: Readonly<Record<string, string>> = { 'sql.add': '+', 'sql.sub': '-', 'sql.mul': '*', 'sql.div': '/', 'sql.mod': '%' };
-const CMP: Readonly<Record<string, string>> = { 'sql.eq': '=', 'sql.ne': '!=', 'sql.lt': '<', 'sql.le': '<=', 'sql.gt': '>', 'sql.ge': '>=' };
+/** The arithmetic and comparison forms generated inline (a function's `inline` trait), by operator. */
+const ARITH_FORMS = new Set<InlineForm>(['+', '-', '*', '/', '%']);
+const CMP_FORMS = new Set<InlineForm>(['=', '!=', '<', '<=', '>', '>=']);
+/** A call's inline arithmetic operator, if it has one. */
+const arithOf = (fn: string): string | undefined => {
+  const f = traitsOf(fn).inline;
+  return f !== undefined && ARITH_FORMS.has(f) ? f : undefined;
+};
+/** A call's inline comparison operator, if it has one. */
+const cmpOf = (fn: string): string | undefined => {
+  const f = traitsOf(fn).inline;
+  return f !== undefined && CMP_FORMS.has(f) ? f : undefined;
+};
 const utf8Encoder = new TextEncoder();
 
 /**
@@ -75,7 +86,7 @@ const utf8Encoder = new TextEncoder();
  * operands (where the conversions change nothing) or on text under BINARY with neither operand converting to a
  * number (checked by `binaryTextOperands`), so they compare the operands themselves.
  */
-const unconverted = (x: BoundExpr): BoundExpr => (x.k === 'call' && (x.fn === 'sql.affinity_numeric' || x.fn === 'sql.affinity_text') ? x.args[0] : x);
+const unconverted = (x: BoundExpr): BoundExpr => withoutComparisonConversion(x);
 const isNum = (t: StaticType): boolean => t === 'int' || t === 'real' || t === 'num';
 
 let enabled: boolean | undefined;
@@ -101,7 +112,7 @@ export function isCodegenRoot(e: BoundExpr): boolean {
   if (isOpaque(e)) return false;
   switch (e.k) {
     case 'call':
-      return e.fn in ARITH || e.fn in CMP || e.fn === 'sql.neg' || mathCall(e) !== undefined;
+      return traitsOf(e.fn).inline !== undefined || mathCall(e) !== undefined;
     case 'and':
     case 'or':
     case 'not':
@@ -220,9 +231,9 @@ class Emitter {
         return { v: 'n' + v, type: 'int' };
       }
       case 'call': {
-        const arith = ARITH[e.fn];
+        const arith = arithOf(e.fn);
         if (arith !== undefined) return this.arith(arith, this.gen(e.args[0]), this.divisor(arith, e.args[1]) ?? this.gen(e.args[1]));
-        const cmp = CMP[e.fn];
+        const cmp = cmpOf(e.fn);
         if (cmp !== undefined) {
           // Numeric comparisons only; anything involving text/affinity/collation uses the closure compiler.
           const left = unconverted(e.args[0]);
@@ -247,7 +258,7 @@ class Emitter {
           }
           return this.viaFallback(e);
         }
-        if (e.fn === 'sql.neg') {
+        if (traitsOf(e.fn).inline === 'neg') {
           const a = this.gen(e.args[0]);
           const v = this.tmp();
           this.lines.push(
@@ -666,7 +677,7 @@ class Pipeline {
   }
 
   private textEqualityConjunct(p: BoundExpr): { reg: number; bytes: Uint8Array } | null {
-    if (p.k !== 'call' || p.fn !== 'sql.eq' || isOpaque(p)) return null;
+    if (p.k !== 'call' || traitsOf(p.fn).compare !== '=' || isOpaque(p)) return null;
     const left = unconverted(p.args[0]);
     const right = unconverted(p.args[1]);
     for (const [col, lit] of [

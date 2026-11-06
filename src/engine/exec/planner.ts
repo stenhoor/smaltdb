@@ -33,6 +33,7 @@ import { type AggregateState, type FunctionContext, aggregateFunctions, scalarFu
 import { type ColumnarHelpers, type FusedAggSpec, type FusedHelpers, type PipelineSource, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter } from './codegen.js';
 import { CODEGEN_HELPERS_FOR_FUSION } from './expr.js';
 import { getMeta, isFlattened, isOpaque, setMeta } from './sql-meta.js';
+import { type CompareOp, traitsOf, withoutComparisonConversion } from './traits.js';
 import { printExpr } from '../plan/print.js';
 import type { Frame } from '../storage/pager.js';
 import { PH_RIGHT } from '../storage/format.js';
@@ -221,11 +222,20 @@ function filterOnConjunct(child: Operator, c: ConjunctInfo, ctx: FunctionContext
   return new Filter(child, compileBoundExpr(c.bound, ctx).fn, c.bound);
 }
 
-/** The bound comparisons that can probe an index or the rowid, with their operators. */
-const PROBE_OPS: Readonly<Record<string, string>> = { 'sql.eq': '=', 'sql.lt': '<', 'sql.le': '<=', 'sql.gt': '>', 'sql.ge': '>=', 'sql.is': 'IS' };
+/** The comparison operators that can probe an index or the rowid (from a function's `compare` trait). */
+const PROBE_OPS = new Set<CompareOp>(['=', '<', '<=', '>', '>=', 'IS']);
 
-/** The operand of a bound comparison, without the affinity conversion SQL applies to it. */
-const unconvertedOperand = <E extends BoundExpr>(x: E): E => (x.k === 'call' && (x.fn === 'sql.affinity_numeric' || x.fn === 'sql.affinity_text') ? (x.args[0] as E) : x);
+/** The operator a call can probe an index or the rowid with (its `compare` trait), if any. */
+const probeOp = (fn: string): CompareOp | undefined => {
+  const op = traitsOf(fn).compare;
+  return op !== undefined && PROBE_OPS.has(op) ? op : undefined;
+};
+
+/** True for an equality comparison of two operands (an equi-join). */
+const isEquality = (e: BoundExpr): e is Extract<BoundExpr, { k: 'call' }> => e.k === 'call' && traitsOf(e.fn).compare === '=' && !isOpaque(e);
+
+/** The operand of a bound comparison, without the comparison-only conversion around it (SQL's affinity). */
+const unconvertedOperand = <E extends BoundExpr>(x: E): E => withoutComparisonConversion(x);
 
 /** Visit the register slots of a bound expression (not inside compiled nodes or nested plans). */
 function forEachSlot(e: BoundExpr, f: (reg: number) => void): void {
@@ -1022,7 +1032,7 @@ export class Planner {
       const sd = sideOf(c);
       if (sd === 'inner' || sd === 'none') rest.push(c);
       else if (sd === 'outer') guards.push(c);
-      else if (sd === 'mixed' && c.k === 'call' && c.fn === 'sql.eq' && !isOpaque(c)) {
+      else if (sd === 'mixed' && isEquality(c)) {
         const [x, y] = c.args.map(unconvertedOperand);
         const l = sideOf(x);
         const r = sideOf(y);
@@ -1520,29 +1530,23 @@ export class Planner {
         else if (c?.col === 'rowid') s = 0;
         return e.not ? 1 - s : s;
       }
-      case 'call':
-        switch (e.fn) {
-          case 'sql.eq':
-          case 'sql.is': {
-            const l = this.colRefOf(e.args[0], scope);
-            const r = this.colRefOf(e.args[1], scope);
-            if (l && r && l.src !== r.src) return 1 / Math.max(this.ndv(l.src, l.col), this.ndv(r.src, r.col));
-            const c = l ?? r;
-            return c ? 1 / this.ndv(c.src, c.col) : 0.33;
-          }
-          case 'sql.ne':
-          case 'sql.is_not':
-            return 0.9;
-          case 'sql.in_list': {
-            const c = this.colRefOf(e.args[0], scope);
-            return c ? Math.min(1, (e.args.length - 1) / this.ndv(c.src, c.col)) : 0.33;
-          }
-          case 'sql.like':
-          case 'sql.glob':
-            return 0.25;
-          default:
-            return 0.33;
+      case 'call': {
+        const t = traitsOf(e.fn);
+        if (t.compare === '=' || t.compare === 'IS') {
+          const l = this.colRefOf(e.args[0], scope);
+          const r = this.colRefOf(e.args[1], scope);
+          if (l && r && l.src !== r.src) return 1 / Math.max(this.ndv(l.src, l.col), this.ndv(r.src, r.col));
+          const c = l ?? r;
+          return c ? 1 / this.ndv(c.src, c.col) : 0.33;
         }
+        if (t.compare === '!=' || t.compare === 'IS NOT') return 0.9;
+        if (t.inList) {
+          const c = this.colRefOf(e.args[0], scope);
+          return c ? Math.min(1, (e.args.length - 1) / this.ndv(c.src, c.col)) : 0.33;
+        }
+        if (t.pattern) return 0.25;
+        return 0.33;
+      }
       default:
         return 0.33;
     }
@@ -1568,7 +1572,7 @@ export class Planner {
       if (!c.compilable) continue;
       const e = c.bound;
       if (e.k !== 'call' || isOpaque(e)) continue;
-      if (e.fn === 'sql.in_list') {
+      if (traitsOf(e.fn).inList) {
         const col = this.columnOfBound(e.args[0], src, scope);
         const list = e.args.slice(1);
         if (col === 'rowid' && list.length > 0) {
@@ -1583,7 +1587,7 @@ export class Planner {
         }
         continue;
       }
-      const sqlOp = PROBE_OPS[e.fn];
+      const sqlOp = probeOp(e.fn);
       if (sqlOp === undefined) continue;
       for (const flip of [false, true]) {
         const colSide = unconvertedOperand(e.args[flip ? 1 : 0]);
@@ -1969,8 +1973,9 @@ export class Planner {
     };
     const flip: Record<string, string> = { '=': '=', '<': '>', '<=': '>=', '>': '<', '>=': '<=' };
     const tests: { col: string; op: string; value: SqlValue }[][] = []; // AND of ORs
-    if (e.k === 'call' && !isOpaque(e) && PROBE_OPS[e.fn] !== undefined && PROBE_OPS[e.fn] in flip) {
-      const op = PROBE_OPS[e.fn];
+    const zoneOp = e.k === 'call' && !isOpaque(e) ? probeOp(e.fn) : undefined;
+    if (e.k === 'call' && zoneOp !== undefined && zoneOp in flip) {
+      const op: string = zoneOp;
       // The operands as written: zone maps compare the constant itself.
       const left = unconvertedOperand(e.args[0]);
       const right = unconvertedOperand(e.args[1]);
@@ -1978,7 +1983,7 @@ export class Planner {
       const r = colName(right);
       if (l && constant(right) !== undefined) tests.push([{ col: l, op, value: constant(right)! }]);
       else if (r && constant(left) !== undefined) tests.push([{ col: r, op: flip[op], value: constant(left)! }]);
-    } else if (e.k === 'call' && !isOpaque(e) && e.fn === 'sql.in_list') {
+    } else if (e.k === 'call' && !isOpaque(e) && traitsOf(e.fn).inList) {
       const col = colName(e.args[0]);
       const values = e.args.slice(1).map(constant);
       if (col && values.length > 0 && values.every((v) => v !== undefined)) tests.push(values.map((v) => ({ col, op: '=', value: v! })));
@@ -2046,10 +2051,11 @@ export class Planner {
     const num = (e: BoundExpr): number | undefined => (e.k === 'lit' && !isOpaque(e) && typeof e.value === 'number' ? e.value : undefined);
     const linear = (e: BoundExpr): { base: string; off: number } | undefined => {
       if (e.k === 'lit' && !isOpaque(e)) return typeof e.value === 'number' ? { base: '', off: e.value } : undefined;
-      if (e.k === 'call' && !isOpaque(e) && e.fn === 'sql.neg' && num(e.args[0]) !== undefined) return { base: '', off: -num(e.args[0])! };
-      if (e.k === 'call' && !isOpaque(e) && (e.fn === 'sql.add' || e.fn === 'sql.sub') && num(e.args[1]) !== undefined) {
+      if (e.k === 'call' && !isOpaque(e) && traitsOf(e.fn).negation && num(e.args[0]) !== undefined) return { base: '', off: -num(e.args[0])! };
+      const sign = e.k === 'call' && !isOpaque(e) ? traitsOf(e.fn).offset : undefined;
+      if (e.k === 'call' && sign !== undefined && num(e.args[1]) !== undefined) {
         const inner = linear(e.args[0]);
-        const d = e.fn === 'sql.add' ? num(e.args[1])! : -num(e.args[1])!;
+        const d = sign * num(e.args[1])!;
         return inner ? { base: inner.base, off: inner.off + d } : { base: printExpr(e.args[0]), off: d };
       }
       return { base: printExpr(e), off: 0 };
@@ -2146,7 +2152,7 @@ export class Planner {
       const c = outerRows * o.cost;
       if (c < best.cost) best = { cost: c, method: 'inl', option: o };
     }
-    const hasEquiJoin = joins.some((c) => c.bound.k === 'call' && c.bound.fn === 'sql.eq' && !isOpaque(c.bound));
+    const hasEquiJoin = joins.some((c) => isEquality(c.bound));
     if (hasEquiJoin) {
       const c = standalone.cost + filtered * COST.hashBuild + outerRows * COST.hashProbe;
       if (c < best.cost) best = { cost: c, method: 'hash', option: standalone };
@@ -2262,7 +2268,7 @@ export class Planner {
     const used: ConjunctInfo[] = [];
     for (const c of eqs) {
       const e = c.bound;
-      if (!c.compilable || e.k !== 'call' || e.fn !== 'sql.eq' || isOpaque(e)) continue;
+      if (!c.compilable || e.k !== 'call' || !isEquality(e)) continue;
       // The operands themselves; the comparison's affinity conversions apply to the hash keys below.
       const left = unconvertedOperand(e.args[0]);
       const right = unconvertedOperand(e.args[1]);

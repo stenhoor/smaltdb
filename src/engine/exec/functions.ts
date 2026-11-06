@@ -68,6 +68,8 @@ export interface ScalarFunction {
    */
   pureDate?: boolean;
   compile(args: CompiledArg[], ctx: FunctionContext): { fn: Fn; type: StaticType };
+  /** What the planner and code generation know about it (exec/traits.ts). */
+  readonly traits?: import('./traits.js').FnTraits;
   /**
    * The result type for these argument types, the same as `compile` gives, without compiling (binding types an
    * expression before it is compiled). Absent: the binder compiles once to find out.
