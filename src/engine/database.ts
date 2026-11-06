@@ -36,7 +36,8 @@ import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import type { ReaderSettings } from '../shared/protocol.js';
 import { describeTable, logicalCatalog } from './catalog/logical.js';
-import type { Catalog, CatalogTable } from './plan/catalog.js';
+import { outputTypes } from './plan/output.js';
+import { type Catalog, type CatalogTable, planTypeOfStorage } from './plan/catalog.js';
 import {
   AsyncRequiredError,
   type ConnectionInfo,
@@ -69,6 +70,12 @@ export interface RunResult {
 export interface QueryResult {
   columns: string[];
   rows: SqlValue[][];
+  /** Each column's plan type ('any' where it is not known before the statement runs). */
+  columnTypes?: StaticType[];
+  /** A write's rows changed, as `run` gives it (its RETURNING rows are `rows`). */
+  changes?: number;
+  /** A write's last inserted rowid, as `run` gives it. */
+  lastInsertRowid?: number | bigint;
 }
 
 /** Parameters: positional array (slot 1 = index 0) or named object (`{ a: 1 }` matches `:a`, `@a`, `$a`). */
@@ -522,21 +529,20 @@ export class Database implements FunctionContext {
    */
   preparePlan(stmt: PlanStatementInput): PlanStatement {
     this.checkOpen();
-    const bound = normalizeBound(toBoundStatement(stmt, (plan) => this.receivedPlan(plan)));
+    const bound = normalizeBound(toBoundStatement(stmt, (plan) => this.receivedPlan(plan), (plan) => outputTypes(plan, (t, db) => this.getTable(t, db)?.columns.map((c) => planTypeOfStorage(c.type)))));
     if (bound.kind === 'schema') validateSchemaOp(bound.op, this.validateCatalog);
     return new PlanStatement(this, bound, paramCount(bound));
   }
 
   /** Run a query given as plan data and return all rows (statements are cached by the plan's canonical form). */
   queryPlan(stmt: PlanStatementInput, params?: readonly SqlValue[]): QueryResult {
-    const st = this.cachedPlan(stmt);
-    return { columns: st.columns, rows: st.all(params as BindParams | undefined) };
+    return this.cachedPlan(stmt).result(params as BindParams | undefined);
   }
 
   /** `queryPlan` for a plan that may read external data: its sources are fetched first. */
   async queryPlanAsync(stmt: PlanStatementInput, params?: readonly SqlValue[], options: { signal?: AbortSignal } = {}): Promise<QueryResult> {
     const st = this.cachedPlan(stmt);
-    return this.withExternal(options.signal, st, () => ({ columns: st.columns, rows: st.all(params as BindParams | undefined) }));
+    return this.withExternal(options.signal, st, () => st.result(params as BindParams | undefined));
   }
 
   /** A plan from outside the engine, as it is received: validated, giving its output width. */
@@ -4508,17 +4514,37 @@ export abstract class PreparedStatement {
     }
   }
 
+  /**
+   * Execute and return every row with the column names and types; a write also gives its `changes` and
+   * `lastInsertRowid`.
+   */
+  result(params?: BindParams): QueryResult {
+    const c = this.cursor(params);
+    try {
+      const rows: SqlValue[][] = [];
+      for (let row = c.next(); row !== null; row = c.next()) rows.push(row);
+      return { columns: c.columns, columnTypes: c.columnTypes, rows, ...(c.run ?? {}) };
+    } finally {
+      c.close();
+    }
+  }
+
   /** Execute and return a cursor over the result rows. */
   cursor(params?: BindParams): RowCursor {
     const p = this.prog();
     const regs = this.registers(params);
     if (p.exec) {
-      this.db.execute(p, () => p.exec!(regs));
-      return new RowCursor(this.db, null, [], regs, p.columns);
+      const run = this.db.execute(p, () => p.exec!(regs));
+      return new RowCursor(this.db, null, [], regs, p.columns, p.columnTypes, p.readonly ? null : run);
     }
-    if (p.rows) return new RowCursor(this.db, null, this.db.execute(p, () => p.rows!(regs)), regs, p.columns);
+    if (p.rows) {
+      const rows = this.db.execute(p, () => p.rows!(regs));
+      // A write with RETURNING: its counts, as `run` would give them.
+      const run = p.readonly ? null : { changes: this.db.changes(), lastInsertRowid: this.db.lastInsertRowid() };
+      return new RowCursor(this.db, null, rows, regs, p.columns, p.columnTypes, run);
+    }
     this.db.execute(p, () => undefined); // bump epoch
-    return new RowCursor(this.db, p.plan!, null, regs, p.columns);
+    return new RowCursor(this.db, p.plan!, null, regs, p.columns, p.columnTypes);
   }
 }
 
@@ -4637,6 +4663,10 @@ export class RowCursor {
     readonly fixedRows: SqlValue[][] | null,
     readonly regs: SqlValue[],
     readonly columns: string[],
+    /** Each column's plan type ('any' where unknown). */
+    readonly columnTypes: StaticType[] = columns.map(() => 'any'),
+    /** A write's counts (null for a query). */
+    readonly run: RunResult | null = null,
   ) {
     if (plan) {
       try {

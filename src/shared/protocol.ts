@@ -3,6 +3,7 @@
  * worker. See docs/WORKER_MODEL.md §5. Results travel as columnar batches; numeric columns use
  * transferable Float64Arrays.
  */
+import type { PlanType } from '../engine/plan/types.js';
 import type { SqlValue } from '../engine/values.js';
 
 /**
@@ -107,11 +108,12 @@ export type WireColumn =
 export type Response =
   /** A plugin asks this session's handler for plugin `plugin` a question (e.g. fresh credentials); answered with 'pluginReply'. */
   | { id: 0; kind: 'pluginAsk'; request: number; plugin: string; message: unknown }
-  | { id: number; kind: 'ok'; changes?: number; lastInsertRowid?: number | bigint; stmt?: number; columns?: string[]; paramCount?: number; capabilities?: unknown; value?: unknown; ended?: 'commit' | 'rollback' }
+  | { id: number; kind: 'ok'; changes?: number; lastInsertRowid?: number | bigint; stmt?: number; columns?: string[]; columnTypes?: PlanType[]; paramCount?: number; capabilities?: unknown; value?: unknown; ended?: 'commit' | 'rollback' }
   /** `reader`: which parallel reader worker serves the result (absent: the owner). */
-  | { id: number; kind: 'columns'; columns: string[]; reader?: number; /** Merged from this many morsels (parallel readers). */ morsels?: number }
+  | { id: number; kind: 'columns'; columns: string[]; /** Each column's plan type. */ types?: PlanType[]; reader?: number; /** Merged from this many morsels (parallel readers). */ morsels?: number }
   | { id: number; kind: 'batch'; length: number; cols: WireColumn[] }
-  | { id: number; kind: 'done' }
+  /** The end of a result; a write's counts, when the statement was a write. */
+  | { id: number; kind: 'done'; changes?: number; lastInsertRowid?: number | bigint }
   | { id: number; kind: 'error'; code: string; message: string }
   /** A direct channel from a parallel reader worker to this client (results bypass the owner). */
   | { id: 0; kind: 'port'; port: MessagePort };

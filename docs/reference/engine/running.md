@@ -9,9 +9,9 @@ A `PlanStatementInput` is one of:
 
 | Form | Runs |
 |---|---|
-| A plan operation | A query whose result columns are named `column1`, `column2`, … and typed `any` |
+| A plan operation | A query whose result columns are named `column1`, `column2`, … and typed from the plan |
 | `{ kind: 'query', plan, columns? }` | A query and its result columns |
-| `{ kind: 'write', plan, returning?, source? }` | An `append`, `update` or `delete` plan; `returning` names and types its RETURNING values |
+| `{ kind: 'write', plan, returning?, source? }` | An `append`, `update` or `delete` plan; `returning` names and types its RETURNING values (without it, they are named `column1`, … and typed from the plan) |
 | `{ kind: 'explain', mode: 'plan' \| 'analyze', query }` | The query's physical plan, or the plan with run-time counts |
 | `{ kind: 'transaction', … }` | `begin` (with `mode` `deferred`, `immediate` or `exclusive`), `commit`, `rollback` (to an optional `savepoint`), `savepoint`, `release` |
 | `{ kind: 'setting', name, value? }` | Read a setting, or set it (`value` an expression over constants and parameters), as SQL's PRAGMA |
@@ -19,14 +19,16 @@ A `PlanStatementInput` is one of:
 | `{ kind: 'schema', op }` | A [schema operation](./schema) |
 
 A query's `columns` describe its result, each `{ name, type?, declaredType?, collation?, affinity? }`; there must be one
-per output column of the plan. `type` defaults to `any`, `collation` to `binary` and `affinity` to `NONE`.
+per output column of the plan. `type` defaults to the type the plan gives the column (the types written on its
+expressions, a source's or `values`' types, a scanned table's column types), `collation` to `binary` and `affinity`
+to `NONE`.
 
 ## In-process
 
 | `Database` method | |
 |---|---|
 | `preparePlan(stmt): PlanStatement` | Compile a statement. A `PlanStatement` has the members of a [`Statement`](../api/engine#statement) (`run`, `all`, `cursor`, `columns`, `columnTypes`, `readonly`, `paramCount`), without `sql`. It compiles again by itself after schema changes. |
-| `queryPlan(stmt, params?): QueryResult` | Run a statement and return `{ columns, rows }` (a write: its RETURNING rows). Compiled plans are cached by their canonical form, so running the same plan again, built anew or read from JSON, plans it once. |
+| `queryPlan(stmt, params?): QueryResult` | Run a statement and return `{ columns, columnTypes, rows }`. A write's `rows` are its RETURNING rows, and it also gives `changes` and `lastInsertRowid`, as `run` does. Compiled plans are cached by their canonical form, so running the same plan again, built anew or read from JSON, plans it once. |
 | `queryPlanAsync(stmt, params?, options?)` | `queryPlan` for a plan that reads external data: fetches it first. |
 
 ```ts
@@ -49,10 +51,15 @@ console.log(removed.rows); // [['plum']]
 
 ## Through the client
 
-In a page, the client runs plans in the engine's worker: `db.queryPlan(stmt, params?, options?)` and
-`db.preparePlan(stmt)` (see [the client reference](https://stenhoor.github.io/smaltql/reference/api/client#queryplan)). Build them with `smaltdb/plan`, the plan
+In a page, the client runs plans in the engine's worker: `db.queryPlan(stmt, params?, options?)`,
+`db.streamPlan(stmt, params?, options?)` (in batches, as `stream`) and `db.preparePlan(stmt)` (see [the client
+reference](https://stenhoor.github.io/smaltql/reference/api/client#queryplan)). Build them with `smaltdb/plan`, the plan
 format without the engine, so that pages which don't build plans don't load it. The plan crosses to the worker as JSON;
 results, options, transactions and parallel readers work as for SQL queries.
+
+Results carry each column's plan type: `columnTypes` on `rowMode: 'array'` and `'columnar'` results and on prepared
+statements. A write run with `queryPlan` gives `changes` and `lastInsertRowid` on its result, beside any RETURNING rows;
+they are not enumerable, so the rows compare and serialize as before.
 
 ```ts
 import { open } from 'smaltdb';

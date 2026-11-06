@@ -24,15 +24,15 @@ describe('plan API', () => {
     // SELECT name, n * 2 FROM t WHERE n > ? ORDER BY n DESC LIMIT 2
     const q = p.limit(p.sort(p.project(p.filter(p.scan('t', [0, 1, 2]), p.call('sql.gt', [n, p.param(0, 'int')], 'int')), [name, p.call('sql.mul', [n, p.lit(2)], 'int'), n]), [p.desc(p.col(0, 2, 'int'))]), 2);
     const r = d.queryPlan({ kind: 'query', plan: p.project(q, [p.col(0, 0, 'text'), p.col(0, 1, 'int')]), columns: [{ name: 'name', type: 'text' }, { name: 'twice', type: 'int' }] }, [15]);
-    expect(r).toEqual({ columns: ['name', 'twice'], rows: [['c', 60], ['b', 40]] });
+    expect(r).toEqual({ columns: ['name', 'twice'], columnTypes: ['text', 'int'], rows: [['c', 60], ['b', 40]] });
     expect(d.query('SELECT name, n * 2 FROM t WHERE n > ? ORDER BY n DESC LIMIT 2', [15]).rows).toEqual(r.rows);
   });
 
-  it('names the columns of a bare plan column1, column2, …', () => {
+  it('names the columns of a bare plan column1, column2, …, typed from the plan', () => {
     const d = db();
     const st = d.preparePlan(p.project(p.scan('t', [0, 1]), [id, name]));
     expect(st.columns).toEqual(['column1', 'column2']);
-    expect(st.columnTypes).toEqual(['any', 'any']);
+    expect(st.columnTypes).toEqual(['int', 'text']);
     expect(st.all()).toHaveLength(4);
     expect(() => d.preparePlan({ kind: 'query', plan: p.scan('t', [0]), columns: [{ name: 'a' }, { name: 'b' }] })).toThrow(/produces 1 column\(s\), but 2 are described/);
   });

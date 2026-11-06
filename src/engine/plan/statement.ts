@@ -65,19 +65,22 @@ function resultColumn(c: PlanColumn | undefined, i: number): ResultColumnInfo {
  * `input` as the engine's bound statement. `width(plan)` validates a plan and gives its output width (the number of
  * columns it produces); a query's columns must match it.
  */
-export function toBoundStatement(stmt: PlanStatementInput, width: (plan: PlanOp) => number): BoundStatement {
+export function toBoundStatement(stmt: PlanStatementInput, width: (plan: PlanOp) => number, types: (plan: PlanOp) => readonly PlanType[] = () => []): BoundStatement {
   let input = stmt;
   if (!input || typeof input !== 'object') throw new SmaltError('SMALT_PLAN', 'a plan statement must be an object');
-  if (typeof (input as { op?: unknown }).op === 'string') return toBoundStatement({ kind: 'query', plan: input as PlanOp }, width);
+  if (typeof (input as { op?: unknown }).op === 'string') return toBoundStatement({ kind: 'query', plan: input as PlanOp }, width, types);
   input = input as Exclude<PlanStatementInput, PlanOp>;
   switch (input.kind) {
     case 'query':
-      return query(input, width);
+      return query(input, width, types);
     case 'explain':
-      return { kind: 'explain', mode: input.mode, query: query(input.query, width) };
+      return { kind: 'explain', mode: input.mode, query: query(input.query, width, types) };
     case 'write': {
       width(input.plan);
-      return { kind: 'write', plan: input.plan, ...(input.returning ? { returning: input.returning.map((r) => ({ name: r.name, type: r.type })) } : {}), ...(input.source ? { source: input.source.map(resultColumn) } : {}) };
+      // RETURNING columns not described are named as a query's are, and typed from the plan.
+      const exprs = (input.plan as { returning?: readonly unknown[] }).returning;
+      const returning = input.returning ?? (exprs?.length ? types(input.plan).map((type, i) => ({ name: `column${i + 1}`, type })) : undefined);
+      return { kind: 'write', plan: input.plan, ...(returning ? { returning: returning.map((r) => ({ name: r.name, type: r.type })) } : {}), ...(input.source ? { source: input.source.map(resultColumn) } : {}) };
     }
     case 'transaction':
     case 'setting':
@@ -89,11 +92,13 @@ export function toBoundStatement(stmt: PlanStatementInput, width: (plan: PlanOp)
   }
 }
 
-function query(q: PlanQuery, width: (plan: PlanOp) => number): BoundQuery {
+function query(q: PlanQuery, width: (plan: PlanOp) => number, types: (plan: PlanOp) => readonly PlanType[]): BoundQuery {
   if (!q || q.kind !== 'query') throw new SmaltError('SMALT_PLAN', 'EXPLAIN takes a query');
   const n = width(q.plan);
   if (q.columns && q.columns.length !== n) throw new SmaltError('SMALT_PLAN', `the plan produces ${n} column(s), but ${q.columns.length} are described`);
-  return { kind: 'query', plan: q.plan, columns: Array.from({ length: n }, (_, i) => resultColumn(q.columns?.[i], i)) };
+  // A column described without a type (or not described) has the type the plan gives it.
+  const planned = q.columns?.every((c) => c.type !== undefined) ? [] : types(q.plan);
+  return { kind: 'query', plan: q.plan, columns: Array.from({ length: n }, (_, i) => resultColumn(q.columns?.[i]?.type === undefined && planned[i] !== undefined ? { name: q.columns?.[i]?.name ?? `column${i + 1}`, ...q.columns?.[i], type: planned[i] } : q.columns?.[i], i)) };
 }
 
 /** The number of positional parameters a statement reads: one more than the highest `param` index in it. */

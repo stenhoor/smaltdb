@@ -6,7 +6,7 @@ import type { SqlValue } from '../engine/values.js';
 import { encodeDataJSON } from '../engine/plan/codec.js';
 import type { CatalogData } from '../engine/plan/catalog.js';
 import type { PlanStatementInput } from '../engine/plan/statement.js';
-import { PLAN_FORMAT_VERSION } from '../engine/plan/types.js';
+import { PLAN_FORMAT_VERSION, type PlanType } from '../engine/plan/types.js';
 import { type BusMessage, type Params, type Request, type RequestBody, type Response, type WireColumn, columnValue } from '../shared/protocol.js';
 
 /** A statement as plan data (the plan format is experimental): its types, builders and codec are in `smaltdb/plan`. */
@@ -63,14 +63,18 @@ export interface RunResult {
   lastInsertRowid: number | bigint;
 }
 
-/** Result of a query in 'array' mode: rows plus column names. */
+/** Result of a query in 'array' mode: rows plus column names and plan types. */
 export interface ArrayResult extends Array<SqlValue[]> {
   columns: string[];
+  /** Each column's plan type ('any' where it is not known before the statement runs). */
+  columnTypes: PlanType[];
 }
 
 /** Result of a query in 'columnar' mode. */
 export interface ColumnarResult {
   columns: string[];
+  /** Each column's plan type ('any' where it is not known before the statement runs). */
+  columnTypes: PlanType[];
   length: number;
   /** One entry per column: a Float64Array (numeric columns without NULLs) or a value array. */
   data: Record<string, Float64Array | SqlValue[]>;
@@ -90,6 +94,7 @@ interface Pending {
   resolve: (v: unknown) => void;
   reject: (e: unknown) => void;
   columns?: string[];
+  types?: PlanType[];
   batches?: { length: number; cols: WireColumn[] }[];
   /** Streams: called per message instead of collecting batches. */
   onMessage?: (msg: Response) => void;
@@ -162,8 +167,8 @@ type QueryResultFor<M extends RowMode | undefined, T> = M extends 'array' ? Arra
 export interface Queryable {
   query<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(sql: string, params?: Params, options?: QueryOptions & { rowMode?: M }): Promise<QueryResultFor<M, T>>;
   exec(sql: string, params?: Params, options?: { signal?: AbortSignal }): Promise<RunResult>;
-  /** Run a statement given as plan data and return its rows (see Database.queryPlan). */
-  queryPlan<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(stmt: PlanStatementInput, params?: PlanParams, options?: QueryOptions & { rowMode?: M }): Promise<QueryResultFor<M, T>>;
+  /** Run a statement given as plan data and return its rows, and a write's counts (see Database.queryPlan). */
+  queryPlan<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(stmt: PlanStatementInput, params?: PlanParams, options?: QueryOptions & { rowMode?: M }): Promise<QueryResultFor<M, T> & Partial<RunResult>>;
 }
 
 /**
@@ -173,6 +178,8 @@ export interface Queryable {
 export interface Transaction extends Queryable {
   /** Stream a query's result inside the transaction (see Database.stream). */
   stream<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(sql: string, params?: Params, options?: StreamOptions & { rowMode?: M }): AsyncIterableIterator<QueryResultFor<M, T>>;
+  /** Stream a statement given as plan data inside the transaction (see Database.streamPlan). */
+  streamPlan<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(stmt: PlanStatementInput, params?: PlanParams, options?: StreamOptions & { rowMode?: M }): AsyncIterableIterator<QueryResultFor<M, T>>;
   /** Run a statement prepared with `db.prepare()` (before the transaction) inside the transaction. */
   statement(stmt: PreparedStatement): TransactionStatement;
 }
@@ -180,6 +187,7 @@ export interface Transaction extends Queryable {
 /** A prepared statement used through a transaction handle: `tx.statement(stmt)`. */
 export interface TransactionStatement {
   readonly columns: string[];
+  readonly columnTypes: PlanType[];
   readonly paramCount: number;
   query<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params, options?: QueryOptions & { rowMode?: M }): Promise<QueryResultFor<M, T>>;
   stream<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params, options?: StreamOptions & { rowMode?: M }): AsyncIterableIterator<QueryResultFor<M, T>>;
@@ -350,6 +358,7 @@ export class Database implements Queryable {
         break;
       case 'columns':
         p.columns = msg.columns;
+        p.types = msg.types;
         p.batches = [];
         break;
       case 'batch':
@@ -357,7 +366,7 @@ export class Database implements Queryable {
         break;
       case 'done':
         this.pending.delete(msg.id);
-        p.resolve({ columns: p.columns!, batches: p.batches! });
+        p.resolve({ columns: p.columns!, types: p.types, batches: p.batches!, ...(msg.changes !== undefined ? { run: { changes: msg.changes, lastInsertRowid: msg.lastInsertRowid! } } : {}) } satisfies Collected);
         break;
     }
   }
@@ -404,23 +413,29 @@ export class Database implements Queryable {
 
   /** @internal Unlocked query (used inside transactions). */
   async rawQuery(sql: string, params: Params | undefined, options: QueryOptions): Promise<unknown> {
-    const res = (await this.request({ op: 'query', sql, params, batchSize: options.batchSize }, options.signal)) as { columns: string[]; batches: { length: number; cols: WireColumn[] }[] };
-    return materialize(res.columns, res.batches, options.rowMode ?? 'object');
+    const res = (await this.request({ op: 'query', sql, params, batchSize: options.batchSize }, options.signal)) as Collected;
+    return materialize(res, options.rowMode ?? 'object');
   }
 
   /** @internal Unlocked plan query (used inside transactions). */
   async rawQueryPlan(stmt: PlanStatementInput, params: PlanParams | undefined, options: QueryOptions): Promise<unknown> {
-    const res = (await this.request({ op: 'queryPlan', ...planRequest(stmt), params, batchSize: options.batchSize }, options.signal)) as { columns: string[]; batches: { length: number; cols: WireColumn[] }[] };
-    return materialize(res.columns, res.batches, options.rowMode ?? 'object');
+    const res = (await this.request({ op: 'queryPlan', ...planRequest(stmt), params, batchSize: options.batchSize }, options.signal)) as Collected;
+    return materialize(res, options.rowMode ?? 'object');
   }
 
   /**
    * Run a statement given as plan data instead of SQL (the plan format is experimental; see the `plan` export): a
    * query plan, or a query, write or other statement as `PlanStatementInput` describes. Parameters are positional.
-   * Rows come back as `query` returns them; like `query`, it may run on a parallel reader.
+   * Rows come back as `query` returns them; like `query`, it may run on a parallel reader. A write's result (its
+   * RETURNING rows, if any) also has `changes` and `lastInsertRowid`, as `run` gives them.
    */
-  queryPlan<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(stmt: PlanStatementInput, params?: PlanParams, options: QueryOptions & { rowMode?: M } = {}): Promise<QueryResultFor<M, T>> {
-    return this.afterTransaction(() => this.rawQueryPlan(stmt, params, options)) as Promise<QueryResultFor<M, T>>;
+  queryPlan<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(stmt: PlanStatementInput, params?: PlanParams, options: QueryOptions & { rowMode?: M } = {}): Promise<QueryResultFor<M, T> & Partial<RunResult>> {
+    return this.afterTransaction(() => this.rawQueryPlan(stmt, params, options)) as Promise<QueryResultFor<M, T> & Partial<RunResult>>;
+  }
+
+  /** Stream a statement given as plan data in batches, as `stream` streams SQL (see `queryPlan`). */
+  streamPlan<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(stmt: PlanStatementInput, params?: PlanParams, options: StreamOptions & { rowMode?: M } = {}): AsyncIterableIterator<QueryResultFor<M, T>> {
+    return this.openStream({ op: 'queryPlan', ...planRequest(stmt), params, batchSize: options.batchSize } as RequestBody, options, true) as AsyncIterableIterator<QueryResultFor<M, T>>;
   }
 
   /**
@@ -435,8 +450,8 @@ export class Database implements Queryable {
   /** Prepare a statement given as plan data (see queryPlan). Its parameters are positional. */
   async preparePlan(stmt: PlanStatementInput): Promise<PreparedStatement> {
     const epoch = this.epoch;
-    const r = (await this.withLock(() => this.request({ op: 'preparePlan', ...planRequest(stmt) }))) as { stmt: number; columns: string[]; paramCount: number };
-    return new PreparedStatement(this, r.stmt, r.columns, r.paramCount, epoch);
+    const r = (await this.withLock(() => this.request({ op: 'preparePlan', ...planRequest(stmt) }))) as { stmt: number; columns: string[]; columnTypes?: PlanType[]; paramCount: number };
+    return new PreparedStatement(this, r.stmt, r.columns, r.paramCount, epoch, r.columnTypes ?? r.columns.map(() => 'any'));
   }
 
   /** @internal */
@@ -489,6 +504,7 @@ export class Database implements Queryable {
     const mode = options.rowMode ?? 'object';
     const ready: unknown[] = [];
     let columns: string[] = [];
+    let types: PlanType[] | undefined;
     let finished = false;
     let failure: unknown = null;
     let wake: (() => void) | null = null;
@@ -500,8 +516,10 @@ export class Database implements Queryable {
     const start = (): void => {
       if (finished) return; // closed before it started
       const req = this.request({ ...body, credit: hwm } as RequestBody, options.signal, (msg) => {
-        if (msg.kind === 'columns') columns = msg.columns;
-        else if (msg.kind === 'batch') ready.push(materialize(columns, [{ length: msg.length, cols: msg.cols }], mode));
+        if (msg.kind === 'columns') {
+          columns = msg.columns;
+          types = msg.types;
+        } else if (msg.kind === 'batch') ready.push(materialize({ columns, types, batches: [{ length: msg.length, cols: msg.cols }] }, mode));
         else if (msg.kind === 'done') finished = true;
         else if (msg.kind === 'error') {
           finished = true;
@@ -606,8 +624,8 @@ export class Database implements Queryable {
   /** Prepare a statement for repeated execution. */
   async prepare(sql: string): Promise<PreparedStatement> {
     const epoch = this.epoch;
-    const r = (await this.withLock(() => this.request({ op: 'prepare', sql }))) as { stmt: number; columns: string[]; paramCount: number };
-    return new PreparedStatement(this, r.stmt, r.columns, r.paramCount, epoch);
+    const r = (await this.withLock(() => this.request({ op: 'prepare', sql }))) as { stmt: number; columns: string[]; columnTypes?: PlanType[]; paramCount: number };
+    return new PreparedStatement(this, r.stmt, r.columns, r.paramCount, epoch, r.columnTypes ?? r.columns.map(() => 'any'));
   }
 
   /**
@@ -638,10 +656,12 @@ export class Database implements Queryable {
       queryPlan: (stmt, params, options = {}) => (active ? this.rawQueryPlan(stmt, params, options) : Promise.reject(ended())) as never,
       exec: (sql, params, options = {}) => (active ? this.rawExec(sql, params, options.signal) : Promise.reject(ended())),
       stream: (sql, params, options = {}) => (active ? this.openStream({ op: 'query', sql, params, batchSize: options.batchSize }, options) : failingIterator(ended())) as never,
+      streamPlan: (stmt, params, options = {}) => (active ? this.openStream({ op: 'queryPlan', ...planRequest(stmt), params, batchSize: options.batchSize } as RequestBody, options) : failingIterator(ended())) as never,
       statement: (stmt) => {
         if (stmt.db !== this) throw new SmaltdbError('SMALT_MISUSE', 'the statement was prepared on another Database');
         return {
           columns: stmt.columns,
+          columnTypes: stmt.columnTypes,
           paramCount: stmt.paramCount,
           query: (params, options = {}) => (active ? stmt.rawQuery(params, options) : Promise.reject(ended())) as never,
           stream: (params, options = {}) => (active ? stmt.rawStream(params, options) : failingIterator(ended())) as never,
@@ -692,6 +712,8 @@ export class PreparedStatement {
     readonly columns: string[],
     readonly paramCount: number,
     private readonly epoch: number,
+    /** Each result column's plan type ('any' where it is not known before the statement runs). */
+    readonly columnTypes: PlanType[] = columns.map(() => 'any'),
   ) {}
 
   /** Statement ids belong to the tab that owned the engine when they were prepared. */
@@ -720,8 +742,8 @@ export class PreparedStatement {
   /** @internal Unlocked query (inside a transaction). */
   async rawQuery(params: Params | undefined, options: QueryOptions): Promise<unknown> {
     this.check();
-    const res = (await this.db.request({ op: 'stmtQuery', stmt: this.id, params, batchSize: options.batchSize }, options.signal)) as { columns: string[]; batches: { length: number; cols: WireColumn[] }[] };
-    return materialize(res.columns, res.batches, options.rowMode ?? 'object');
+    const res = (await this.db.request({ op: 'stmtQuery', stmt: this.id, params, batchSize: options.batchSize }, options.signal)) as Collected;
+    return materialize(res, options.rowMode ?? 'object');
   }
 
   /** @internal */
@@ -753,7 +775,28 @@ function failingIterator(err: unknown): AsyncIterableIterator<never> {
   return it;
 }
 
-function materialize(columns: string[], batches: { length: number; cols: WireColumn[] }[], mode: RowMode): unknown {
+/** A whole result as the worker sent it: columns, their types, batches, and a write's counts. */
+interface Collected {
+  columns: string[];
+  types?: PlanType[];
+  batches: { length: number; cols: WireColumn[] }[];
+  run?: RunResult;
+}
+
+/**
+ * `res` in `mode`. A write's counts are `changes` and `lastInsertRowid` on the result, not enumerable, so rows compare
+ * and serialize as before.
+ */
+function materialize(res: Collected, mode: RowMode): unknown {
+  const out = materializeRows(res.columns, res.types ?? res.columns.map(() => 'any'), res.batches, mode);
+  if (res.run) {
+    Object.defineProperty(out, 'changes', { value: res.run.changes, enumerable: false });
+    Object.defineProperty(out, 'lastInsertRowid', { value: res.run.lastInsertRowid, enumerable: false });
+  }
+  return out;
+}
+
+function materializeRows(columns: string[], columnTypes: PlanType[], batches: { length: number; cols: WireColumn[] }[], mode: RowMode): unknown {
   const width = columns.length;
   if (mode === 'columnar') {
     let length = 0;
@@ -783,7 +826,7 @@ function materialize(columns: string[], batches: { length: number; cols: WireCol
         data[columns[c]] = out;
       }
     }
-    return { columns, length, data } satisfies ColumnarResult;
+    return { columns, columnTypes, length, data } satisfies ColumnarResult;
   }
   const rows: unknown[] = [];
   const make = mode === 'object' ? rowFactory(columns) : null;
@@ -801,6 +844,9 @@ function materialize(columns: string[], batches: { length: number; cols: WireCol
       }
     }
   }
-  if (mode === 'array') (rows as unknown as ArrayResult).columns = columns;
+  if (mode === 'array') {
+    (rows as unknown as ArrayResult).columns = columns;
+    (rows as unknown as ArrayResult).columnTypes = columnTypes;
+  }
   return rows;
 }
