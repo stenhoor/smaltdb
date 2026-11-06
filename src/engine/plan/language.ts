@@ -53,11 +53,6 @@ export interface SmaltLanguage {
    * that did not exist when the table was made), bound from the table's source (`table.source`) where first used.
    */
   bindTableExprs(table: CatalogTable, ctx: BindContext): { checks: PlanExpr[]; defaults: (PlanExpr | null)[] };
-  /**
-   * The engine no longer calls this (it calls `bindTableExprs`). Kept optional, and ignored, until languages that
-   * still define it have dropped it (ADR 0016 section 7).
-   */
-  bindStoredExprs?(...args: never[]): unknown;
   /** A stored view's or materialized view's query (its CREATE statement's source), bound where it is read. */
   bindView(source: Source, ctx: BindContext): BoundQuery;
   /**
