@@ -27,6 +27,8 @@ export class SmaltError extends Error {
   columns?: readonly string[];
   /** {@link ErrorDetails} `name` (`name` itself is the error class's name). */
   constraintName?: string;
+  /** A language has worded the message (it is worded once, by the outermost statement). */
+  worded?: boolean;
   constructor(
     readonly code: string,
     message: string,
@@ -49,6 +51,21 @@ export function withDetails<E>(err: E, details: ErrorDetails): E {
   if (details.table !== undefined && err.table === undefined) err.table = details.table;
   if (details.columns !== undefined && err.columns === undefined) err.columns = details.columns;
   if (details.name !== undefined && err.constraintName === undefined) err.constraintName = details.name;
+  return err;
+}
+
+/** What a language reads to word an error for its users: its code, the engine's message and its fields. */
+export interface ErrorToWord extends ErrorDetails {
+  readonly code: string;
+  readonly message: string;
+}
+
+/** `err` with its message as `language` words it (where the language has a wording for it). Returns `err`. */
+export function wordError<E>(err: E, language: { errorMessage?(e: ErrorToWord): string | undefined }): E {
+  if (!(err instanceof SmaltError) || !language.errorMessage || err.worded) return err;
+  err.worded = true;
+  const m = language.errorMessage({ code: err.code, message: err.message, ...errorDetails(err) });
+  if (m !== undefined) err.message = m;
   return err;
 }
 
