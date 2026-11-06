@@ -21,7 +21,7 @@ async function setup() {
 describe('write plans', () => {
   it('carry the target, columns and conflict action the front end resolved', async () => {
     const { db, write } = await setup();
-    const tables = { tableColumns: (n: string) => (db as unknown as { bindContext(): BindContext }).bindContext().getTable(n)?.columns.length };
+    const tables = { tableColumns: (n: string) => db.getTable(n)?.columns.length };
     const ins = write("INSERT OR REPLACE INTO t(b, id) VALUES ('q', 9)").plan;
     expect(ins).toMatchObject({ op: 'append', table: 't', db: 'main', columns: [2, 0], onConflict: 'replace' });
     expect(write("INSERT INTO r(rowid, a) VALUES (5, 1)").plan).toMatchObject({ op: 'append', table: 'r', columns: [-1, 0] });

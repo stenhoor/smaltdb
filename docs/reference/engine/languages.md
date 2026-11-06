@@ -34,8 +34,7 @@ A language is a `SmaltLanguage`:
 | `bindView(source, ctx)` | A view's or materialized view's query (its source), bound against the catalog: a `{ kind: 'query', plan, columns }`. |
 | `viewReferences(source)` | The tables and views a view's query names, directly, read from its source without binding (a view may name tables that do not exist yet). The engine follows them for dependencies, TEMP checks and refresh order. |
 | `viewDefinition(source)` | The text of a view's query alone, for `information_schema.views`. |
-| `bindTableExprs(table, ctx)` | The CHECK and DEFAULT expressions a stored table holds unbound, bound from its source (`table` as [the catalog](./catalog) describes it, its text in `table.source`). Optional while languages move to it from `bindStoredExprs`, which takes the engine's `TableSchema`. |
-| `bindStoredExprs(table, ctx)` | The same, for the engine's `TableSchema`. Being replaced by `bindTableExprs`. |
+| `bindTableExprs(table, ctx)` | The CHECK and DEFAULT expressions a stored table holds unbound, bound from its source (`table` as [the catalog](./catalog) describes it, its text in `table.source`). |
 | `sourceEditor` | Edits the source texts kept beside definitions when ALTER TABLE renames a table or a column, adds or drops a column, and writes an external table's statement once its columns are known. |
 
 A `LanguageStatement` (from `parse`) is `{ text, paramCount, paramNames, bind(ctx), externalCalls?() }`: `bind` gives a
@@ -46,8 +45,7 @@ descriptions. The engine binds a statement again when the schema changes.
 
 - `table(name, schema?)`: a table, materialized view or system table as [the catalog](./catalog) describes it;
   `writeTable` and `indexTable` give the table a statement writes or indexes, and throw for objects that may not be
-  written or indexed. (`getTable`, `writeTarget` and `indexTarget` give the engine's `TableSchema` instead, and are
-  being replaced by them.)
+  written or indexed.
 - `getView`, external tables and table functions, and virtual tables (`information_schema.*`).
 - `catalog`: [the catalog](./catalog), with function metadata and the engine's help for building plans.
 
@@ -89,7 +87,7 @@ const dotted: SmaltLanguage = {
   },
   viewReferences: (source) => [{ name: source.text.split('.')[0] }],
   viewDefinition: (source) => source.text,
-  bindStoredExprs: () => ({ checks: [], defaults: [] }),
+  bindTableExprs: () => ({ checks: [], defaults: [] }),
   sourceEditor: { renameTable: unchanged, renameColumn: unchanged, renameColumnInExpr: unchanged, addColumn: unchanged, dropColumn: unchanged, externalTable: () => '' },
 };
 registerLanguage(dotted);

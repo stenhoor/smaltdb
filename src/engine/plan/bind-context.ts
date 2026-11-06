@@ -2,11 +2,8 @@
  * The logical catalog a language binds against (ADR 0015 section 3): names, columns and their types, views, external
  * sources and functions. Read-only, and the same for every language. The planner's physical environment (trees,
  * statistics, spilling, execution state: exec/planner.ts `PhysicalEnv`) is not part of it.
- *
- * `getTable`, `writeTarget` and `indexTarget` give the engine's `TableSchema` and are being replaced by `table`,
- * `writeTable` and `indexTable`, which give the catalog's description (ADR 0016 section 7).
+ * Tables are described as the catalog describes them (ADR 0016 section 7).
  */
-import type { TableSchema } from '../catalog/schema.js';
 import type { StaticType } from '../exec/convert.js';
 import type { FunctionContext } from '../exec/functions.js';
 import type { SqlValue } from '../values.js';
@@ -19,22 +16,16 @@ export interface BindContext {
    * picks that schema when a TEMP table shadows a main one.
    */
   table(name: string, schema?: string): CatalogTable | undefined;
-  /** The table a statement writes (see `writeTarget`), as the catalog describes it. */
-  writeTable(name: string, schema?: string): CatalogTable;
-  /** The table CREATE INDEX indexes (see `indexTarget`), as the catalog describes it. */
-  indexTable(name: string, schema?: string): CatalogTable;
-  /** A table by name, as the engine stores it. Being replaced by `table` (ADR 0016 section 7). */
-  getTable(name: string, schema?: string): TableSchema | undefined;
   /**
    * The table a statement writes, by name: throws when there is none, or when it may not be written (a view, an
    * external table, the catalog and system tables, a materialized view).
    */
-  writeTarget(name: string, schema?: string): TableSchema;
+  writeTable(name: string, schema?: string): CatalogTable;
   /**
    * The table CREATE INDEX indexes, by name: throws when there is none, or when it may not be indexed (a view, an
    * external table, a columnar table, a TEMP index on a main table).
    */
-  indexTarget(name: string, schema?: string): TableSchema;
+  indexTable(name: string, schema?: string): CatalogTable;
   /** A view: its source in its language (bound where the view is read) and the column names given with it. */
   getView?(name: string, schema?: string): { name: string; source: Source; columns?: readonly string[] } | undefined;
   /** True for an external table. */
