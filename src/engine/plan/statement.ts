@@ -79,8 +79,13 @@ export function toBoundStatement(stmt: PlanStatementInput, width: (plan: PlanOp)
       width(input.plan);
       return { kind: 'write', plan: input.plan, ...(input.returning ? { returning: input.returning.map((r) => ({ name: r.name, type: r.type })) } : {}), ...(input.source ? { source: input.source.map(resultColumn) } : {}) };
     }
-    default:
+    case 'transaction':
+    case 'setting':
+    case 'maintenance':
+    case 'schema':
       return input;
+    default:
+      throw new SmaltError('SMALT_PLAN', `unknown statement kind ${JSON.stringify((input as { kind?: unknown }).kind)}`);
   }
 }
 
