@@ -10,17 +10,85 @@
  */
 import { type PlanExpr, typeOf } from '../plan/expr.js';
 import type { PlanOp } from '../plan/ops.js';
+import { SmaltError } from '../errors.js';
 import { planWidth } from './planner.js';
 
 type Op<K extends PlanOp['op']> = Extract<PlanOp, { op: K }>;
 
 /** `op` as a query block the planner reads. */
 export function normalizePlan(op: PlanOp): PlanOp {
-  return block(op);
+  return block(semiJoins(op));
+}
+
+/**
+ * `op` with its semi and anti joins as filters: `semi(L, R, on)` is L where some row of R matches (`exists`), `anti`
+ * where none does. A filter keeps L's order (ADR 0016 section 4), and the planner decorrelates the subquery into a hash
+ * semi-join where it can. Plans are plain data, so this walks every field (inputs, and plans nested in any expression)
+ * and copies only what changes: a plan without such joins comes back as it was.
+ */
+function semiJoins(op: PlanOp): PlanOp {
+  return rewriteSemiJoins(op) as PlanOp;
+}
+
+function rewriteSemiJoins(x: unknown): unknown {
+  if (x === null || typeof x !== 'object') return x;
+  if (Array.isArray(x)) {
+    let out: unknown[] | undefined;
+    for (let i = 0; i < x.length; i++) {
+      const r = rewriteSemiJoins(x[i]);
+      if (r !== x[i]) (out ??= x.slice())[i] = r;
+    }
+    return out ?? x;
+  }
+  const o = x as Record<string, unknown>;
+  if (o.k === 'native') return x;
+  let out: Record<string, unknown> | undefined;
+  for (const key in o) {
+    if (key === 'origin') continue; // a caller's data, whatever its shape
+    const r = rewriteSemiJoins(o[key]);
+    if (r !== o[key]) (out ??= { ...o })[key] = r;
+  }
+  const op = (out ?? o) as unknown as PlanOp;
+  if (op.op !== 'join' || (op.kind !== 'semi' && op.kind !== 'anti')) return op;
+  const [left, right] = op.inputs;
+  // In the layering the planner reads: a write's input is not normalized past its own operation.
+  const inner = block(op.on ? { op: 'filter', input: right, pred: correlated(op.on, 0) } : right);
+  const exists: PlanExpr = { k: 'subquery', mode: 'exists', plan: inner, type: 'int', collation: 'binary' };
+  const pred: PlanExpr = op.kind === 'semi' ? exists : { k: 'not', arg: exists };
+  return { op: 'filter', input: left, pred, ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+}
+
+/**
+ * A join condition read from inside a subquery over the join's right input: the left input's columns one evaluation
+ * out, the right input's the subquery's own, and references further out one further.
+ */
+function correlated(e: PlanExpr, depth: number): PlanExpr {
+  switch (e.k) {
+    case 'col':
+      if (e.depth > depth) return { ...e, depth: e.depth + 1 };
+      if (e.depth < depth) return e;
+      return e.input === 0 ? { ...e, depth: e.depth + 1 } : { ...e, input: 0 };
+    case 'call':
+    case 'and':
+    case 'or':
+      return { ...e, args: e.args.map((a) => correlated(a, depth)) };
+    case 'cast':
+    case 'not':
+    case 'isNull':
+      return { ...e, arg: correlated(e.arg, depth) };
+    case 'case':
+      return { ...e, whens: e.whens.map((w) => ({ when: correlated(w.when, depth), then: correlated(w.then, depth) })), else: correlated(e.else, depth) };
+    case 'subquery':
+    case 'inSubquery':
+      throw new SmaltError('SMALT_UNSUPPORTED', 'a semi or anti join whose condition holds a subquery is not supported yet');
+    default:
+      return e;
+  }
 }
 
 /** A write's plan with its input normalized (an `append`'s rows; `update` and `delete` read their targets as given). */
-export function normalizeWrite(op: PlanOp): PlanOp {
+export function normalizeWrite(plan: PlanOp): PlanOp {
+  const op = semiJoins(plan);
   return op.op === 'append' && op.input ? { ...op, input: block(op.input) } : op;
 }
 
