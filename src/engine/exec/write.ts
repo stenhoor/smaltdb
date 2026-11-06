@@ -1,5 +1,5 @@
 import { ConstraintError, type IndexSchema, type TableSchema } from '../catalog/schema.js';
-import { type ErrorDetails, SmaltError } from '../errors.js';
+import { type ErrorDetails, SmaltError, constraintMessage } from '../errors.js';
 import { BTree } from '../storage/btree.js';
 import { KeyEncoder, ROWID_KEY_SIZE, readIndexRowid, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
 import { RecordEncoder, RecordReader } from '../storage/record.js';
@@ -202,15 +202,10 @@ export class TableWriter {
     }
   }
 
-  private conflictMessage(idx: IndexSchema | null): string {
-    const t = this.table;
-    if (idx === null) {
-      const name = t.rowidAlias >= 0 ? t.columns[t.rowidAlias].name : 'rowid';
-      return `UNIQUE constraint failed: ${t.name}.${name}`;
-    }
-    // Like SQLite, expression indexes are named rather than listed by column.
-    if (idx.columns.some((c) => c.column < 0)) return `UNIQUE constraint failed: index '${idx.name}'`;
-    return `UNIQUE constraint failed: ${idx.columns.map((c) => `${t.name}.${t.columns[c.column].name}`).join(', ')}`;
+  /** A uniqueness conflict on `idx` (null: the rowid). */
+  private conflict(idx: IndexSchema | null, mode: ConflictMode): ConstraintError {
+    const details = this.conflictDetails(idx);
+    return constraintError(this.conflictCode(idx), constraintMessage(details), mode, details);
   }
 
   /** The fields of a uniqueness conflict on `idx` (null: the rowid). */
@@ -244,7 +239,7 @@ export class TableWriter {
         const other = this.uniqueConflict(i, row, except, rowid);
         if (other === null) break;
         if (mode === 'IGNORE') return false;
-        if (mode !== 'REPLACE') throw constraintError(this.conflictCode(idx), this.conflictMessage(idx), mode, this.conflictDetails(idx));
+        if (mode !== 'REPLACE') throw this.conflict(idx, mode);
         this.deleteRow(other, undefined, false, true);
       }
     }
@@ -257,7 +252,7 @@ export class TableWriter {
     if ((except === null || rowid != except) && this.rowExists(rowid)) {
       if (mode === 'IGNORE') return false;
       if (mode === 'REPLACE') this.deleteRow(rowid, undefined, false, true);
-      else throw constraintError(this.conflictCode(null), this.conflictMessage(null), mode, this.conflictDetails(null));
+      else throw this.conflict(null, mode);
     }
     return true;
   }

@@ -13,7 +13,7 @@
  *   outstanding violations of matching children.
  */
 import { ConstraintError, type ForeignKeySchema, type TableSchema, findColumn } from '../catalog/schema.js';
-import { SmaltError } from '../errors.js';
+import { type ErrorDetails, constraintMessage, SmaltError } from '../errors.js';
 import { agg, aggregate, and, filter, limit, lit, param, project, remove, scan, update } from '../plan/build.js';
 import { call, col, type PlanExpr } from '../plan/expr.js';
 import type { PlanOp } from '../plan/ops.js';
@@ -261,7 +261,7 @@ export class ForeignKeys {
         return;
       case 'RESTRICT':
         // Checked when its turn comes: an earlier action may already have removed the children.
-        if (this.childCount(l, key) > 0) throw new ConstraintError('SMALT_CONSTRAINT_FOREIGNKEY', 'FOREIGN KEY constraint failed', { constraint: 'foreignKey', table: l.child.name, columns: l.childCols.map((c) => l.child.columns[c].name) });
+        if (this.childCount(l, key) > 0) throw fkError({ constraint: 'foreignKey', table: l.child.name, columns: l.childCols.map((c) => l.child.columns[c].name) });
         return;
       default:
         // NO ACTION: the counted violations stand unless fixed before the statement ends.
@@ -274,11 +274,11 @@ export class ForeignKeys {
     const n = this.stmt;
     this.stmt = 0;
     // Counted across the statement: which key is not known.
-    if (n > 0) throw new ConstraintError('SMALT_CONSTRAINT_FOREIGNKEY', 'FOREIGN KEY constraint failed', { constraint: 'foreignKey' });
+    if (n > 0) throw fkError({ constraint: 'foreignKey' });
   }
 
   checkCommit(): void {
-    if (this.deferred > 0) throw new ConstraintError('SMALT_CONSTRAINT_FOREIGNKEY', 'FOREIGN KEY constraint failed', { constraint: 'foreignKey' });
+    if (this.deferred > 0) throw fkError({ constraint: 'foreignKey' });
   }
 }
 
@@ -333,4 +333,9 @@ function linkPlans(l: Link, host: FkHost): LinkPlans {
     setNull: childUpdate(() => lit(null)),
     setDefault: childUpdate((c) => host.defaultValue(child, c) ?? lit(null)),
   };
+}
+
+/** A foreign key violation, worded by the engine (a language words it for its users). */
+function fkError(details: ErrorDetails): ConstraintError {
+  return new ConstraintError('SMALT_CONSTRAINT_FOREIGNKEY', constraintMessage(details), details);
 }

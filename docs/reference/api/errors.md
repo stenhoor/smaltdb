@@ -15,6 +15,10 @@ it for its users ([ADR 0016](../../adr/0016-plan-api-for-every-language.md), sec
 | `columns` | The columns it covers (none for an index on expressions; a foreign key counted across a statement names none) |
 | `constraintName` | The constraint's name, or its index's |
 
+The message is worded by the language a statement was written in: SQL words constraint failures as SQLite does
+(`NOT NULL constraint failed: t.a`). A statement given as plan data has no language, and gets the engine's wording
+(`t.a must not be null`, `duplicate key in t (b, c)`, `check positive failed on t`).
+
 | Code | Meaning | Retry? |
 |---|---|---|
 | [`SMALT_ERROR`](#smalt-error) | General SQL error: unknown table or column, misuse of a statement, bad data in an import | No |
