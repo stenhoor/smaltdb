@@ -112,7 +112,7 @@ describe('plan API', () => {
     d.preparePlan({ kind: 'write', plan: p.append('u', p.values([[p.lit(1)], [p.lit(2)]]), [0]) }).run();
     d.preparePlan({ kind: 'transaction', action: 'rollback' }).run();
     expect(d.query('SELECT count(*) FROM u').rows).toEqual([[0]]);
-    expect(() => d.preparePlan({ kind: 'write', plan: p.append('u', p.values([[p.lit(null)]]), [0]) }).run()).toThrow(/NOT NULL constraint failed: u.x/);
+    expect(() => d.preparePlan({ kind: 'write', plan: p.append('u', p.values([[p.lit(null)]]), [0]) }).run()).toThrow(/u\.x must not be null/);
   });
 
   it('caches plans by their canonical form, and replans after schema changes', () => {

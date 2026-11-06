@@ -12,7 +12,7 @@ import {
   findColumn,
   isColumnar,
 } from './catalog/schema.js';
-import { MisuseError, SmaltError, withDetails, wordError } from './errors.js';
+import { MisuseError, SmaltError, constraintMessage, withDetails, wordError } from './errors.js';
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
 import type { ConflictAction, PlanOp } from './plan/ops.js';
 import { type EncodedPlan, canonicalJSON, decodeData, decodePlan, encodeData, encodePlan, planFromJSON, planToJSON } from './plan/codec.js';
@@ -3155,12 +3155,8 @@ export class Database implements FunctionContext {
         if (prev && prefix.length === prev.length && prefix.every((b, i) => b === prev![i]) && !prefixHasNull(prefix, idx.columns)) {
           const exprIndex = idx.columns.some((ic) => ic.column < 0);
           const columns = exprIndex ? [] : idx.columns.map((ic) => table.columns[ic.column].name);
-          throw new ConstraintError('SMALT_CONSTRAINT_UNIQUE', exprIndex ? `UNIQUE constraint failed: index '${idx.name}'` : `UNIQUE constraint failed: ${columns.map((c) => `${table.name}.${c}`).join(', ')}`, {
-            constraint: 'unique',
-            table: table.name,
-            columns,
-            name: idx.name,
-          });
+          const details = { constraint: 'unique' as const, table: table.name, columns, name: idx.name };
+          throw new ConstraintError('SMALT_CONSTRAINT_UNIQUE', constraintMessage(exprIndex ? { ...details, columns: [] } : details), details);
         }
         prev = prefix.slice();
       }
@@ -3646,7 +3642,10 @@ export class Database implements FunctionContext {
         const mode = override ?? col.notNullConflict ?? 'ABORT';
         if (mode === 'IGNORE') return false;
         if (mode === 'REPLACE' && defaults[i]) v = coerceForColumn(defaults[i]!(regs), col, table.name);
-        if (v === null) throw constraintError('SMALT_CONSTRAINT_NOTNULL', `NOT NULL constraint failed: ${table.name}.${col.name}`, mode, { constraint: 'notNull', table: table.name, columns: [col.name] });
+        if (v === null) {
+          const details = { constraint: 'notNull' as const, table: table.name, columns: [col.name] };
+          throw constraintError('SMALT_CONSTRAINT_NOTNULL', constraintMessage(details), mode, details);
+        }
       }
       row[i] = v;
     }
@@ -3658,7 +3657,8 @@ export class Database implements FunctionContext {
         const v = c.fn(regs);
         if (v !== null && truthy(v) === false) {
           if (mode === 'IGNORE') return false;
-          throw constraintError('SMALT_CONSTRAINT_CHECK', `CHECK constraint failed: ${c.name}`, mode, { constraint: 'check', table: table.name, name: c.name });
+          const details = { constraint: 'check' as const, table: table.name, name: c.name };
+          throw constraintError('SMALT_CONSTRAINT_CHECK', constraintMessage(details), mode, details);
         }
       }
     }

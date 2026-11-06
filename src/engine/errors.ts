@@ -54,6 +54,28 @@ export function withDetails<E>(err: E, details: ErrorDetails): E {
   return err;
 }
 
+/**
+ * The engine's own wording of a constraint failure, from its fields. A language words it for its users instead
+ * (`SmaltLanguage.errorMessage`: SQL as SQLite does); plans keep these words.
+ */
+export function constraintMessage(d: ErrorDetails): string {
+  const cols = d.columns && d.columns.length > 0 ? ` (${d.columns.join(', ')})` : '';
+  switch (d.constraint) {
+    case 'notNull':
+      return `${d.table}.${d.columns?.[0]} must not be null`;
+    case 'unique':
+      return cols ? `duplicate key in ${d.table}${cols}` : `duplicate key in index ${d.name}`;
+    case 'primaryKey':
+      return `duplicate primary key in ${d.table}${cols}`;
+    case 'check':
+      return `check ${d.name} failed on ${d.table}`;
+    case 'foreignKey':
+      return d.table ? `foreign key from ${d.table}${cols} violated` : 'foreign key violated';
+    default:
+      return 'constraint failed';
+  }
+}
+
 /** What a language reads to word an error for its users: its code, the engine's message and its fields. */
 export interface ErrorToWord extends ErrorDetails {
   readonly code: string;
