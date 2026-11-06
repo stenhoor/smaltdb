@@ -8,7 +8,7 @@
  *
  * SQL's plans have this layering already and are not normalized.
  */
-import { type PlanExpr, typeOf } from '../plan/expr.js';
+import { lit, type PlanExpr, typeOf } from '../plan/expr.js';
 import type { AggCall, PlanOp, SortKey, WindowCall } from '../plan/ops.js';
 import { SmaltError } from '../errors.js';
 import { planWidth } from './planner.js';
@@ -60,6 +60,9 @@ function rewriteAll(x: unknown): unknown {
       return op.on || op.keep ? keptRows(op) : op.ordered ? orderedGroups(distinctGroups(op)) : op;
     case 'limit':
       return op.fromEnd ? fromEnd(op) : op;
+    case 'pivot':
+      // Its rewrite is an aggregate, which may be ordered: rewritten in turn.
+      return rewriteAll(pivotGroups(op));
     case 'unpivot':
       // Its rewrite is an ordered join: rewritten in turn.
       return rewriteAll(unpivotRows(op));
@@ -153,6 +156,15 @@ function keptRows(op: Op<'distinct'>): PlanOp {
   let kept: PlanOp = { op: 'filter', input: sets, pred: cmp('cmp_eq', pos, column(op.keep === 'last' ? w + 2 : w + 1, 'int')) };
   if (op.ordered) kept = { op: 'sort', input: kept, keys: [{ expr: column(w + 1, 'int'), desc: false, nullsFirst: false, collation: 'binary' }] };
   return { op: 'project', input: kept, exprs: range(0, w) };
+}
+
+/** A pivot as an aggregate whose calls each read the rows of one value of `on` (a filter beside the call's own). */
+function pivotGroups(op: Op<'pivot'>): PlanOp {
+  const aggs = op.values.flatMap((v) => {
+    const match: PlanExpr = v === null ? { k: 'isNull', arg: op.on, not: false } : { k: 'call', fn: 'cmp_eq', args: [op.on, lit(v)], type: 'int', collation: op.collation };
+    return op.aggs.map((a) => ({ ...a, filter: a.filter ? { k: 'and' as const, args: [a.filter, match] } : match }));
+  });
+  return { op: 'aggregate', input: op.input, keys: op.keys, aggs, carry: [], ...(op.ordered ? { ordered: op.ordered } : {}), ...(op.origin !== undefined ? { origin: op.origin } : {}) };
 }
 
 /**

@@ -154,6 +154,20 @@ export type PlanOp = OpMeaning & (
       readonly ordered?: 'first';
     }
   | {
+      readonly op: 'pivot';
+      readonly input: PlanOp;
+      /** The columns that group rows: one output row per group. */
+      readonly keys: readonly { readonly expr: PlanExpr; readonly collation: CollationName }[];
+      /** The column whose values become output columns, and the collation it is compared by. */
+      readonly on: PlanExpr;
+      readonly collation: CollationName;
+      /** The values of `on` that become columns, in order (dynamic pivot reads them first, then builds this). */
+      readonly values: readonly SqlValue[];
+      /** The aggregates computed over each group's rows with each value: one output column per value and call. */
+      readonly aggs: readonly AggCall[];
+      readonly ordered?: 'first';
+    }
+  | {
       readonly op: 'unpivot';
       readonly input: PlanOp;
       /** Input columns kept on every output row. */

@@ -2579,6 +2579,8 @@ export function planWidth(op: PlanOp): number {
       return planWidth(op.input);
     case 'unpivot':
       return op.keep.length + 2;
+    case 'pivot':
+      return op.keys.length + op.values.length * op.aggs.length;
     case 'aggregate':
       return op.keys.length + op.aggs.length + op.carry.length;
     case 'window':

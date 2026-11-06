@@ -94,6 +94,21 @@ export const aggregate = (input: PlanOp, keys: readonly PlanExpr[], aggs: readon
   ...(options.ordered ? { ordered: options.ordered } : {}),
 });
 /**
+ * Values of `on` as columns (a wide form): one row per group of `keys`, then for each of `values` and each of `aggs`
+ * the aggregate over the group's rows whose `on` is that value.
+ */
+export const pivot = (input: PlanOp, keys: readonly PlanExpr[], on: PlanExpr, values: readonly SqlValue[], aggs: readonly AggCall[], options: { collations?: readonly CollationName[]; collation?: CollationName; ordered?: 'first' } = {}): Op<'pivot'> => ({
+  op: 'pivot',
+  input,
+  keys: keys.map((e, i) => ({ expr: e, collation: options.collations?.[i] ?? 'binary' })),
+  on,
+  collation: options.collation ?? 'binary',
+  values,
+  aggs,
+  ...(options.ordered ? { ordered: options.ordered } : {}),
+});
+
+/**
  * `input`'s `columns` as rows (a long form): each input row gives one row per column, in input order and then the
  * columns' order, with the `keep` columns, the column's name (from `names`) and its value (of `type`).
  */

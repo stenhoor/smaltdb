@@ -39,6 +39,8 @@ export function outputTypes(op: PlanOp, tableTypes: TableTypes): PlanType[] {
       const right = outputTypes(op.inputs[1], tableTypes);
       return left.map((t, i) => (t === right[i] ? t : 'any'));
     }
+    case 'pivot':
+      return [...op.keys.map((k) => typeOf(k.expr)), ...op.values.flatMap(() => op.aggs.map((a) => a.type))];
     case 'unpivot': {
       const t = outputTypes(op.input, tableTypes);
       return [...op.keep.map((i) => t[i]), 'text', op.type];

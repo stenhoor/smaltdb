@@ -48,6 +48,7 @@ Each operation's output columns, in order:
 | `project` | `input`, `exprs` | one column per expression |
 | `sort` | `input`, `keys` | its input's |
 | `limit` | `input`, `count`, `offset?`, `fromEnd?` (`true`) | its input's |
+| `pivot` | `input`, `keys`, `on`, `collation`, `values`, `aggs`, `ordered?` | its keys, then one column per value and aggregate call (value by value) |
 | `unpivot` | `input`, `keep` (columns kept), `columns` (columns that become rows), `names` (one per column), `type` (of the values) | the kept columns, then each row's column name (`text`), then its value |
 | `distinct` | `input`, `collations` (one per column), `ordered?` (`'first'`), `on?`, `keep?` (`'first'` / `'last'`) | its input's |
 | `join` | `kind`, `inputs` (left, right), `on?`, `ordered?` (`true`) | the left input's, then the right's (`semi` / `anti`: the left's only) |
@@ -104,6 +105,10 @@ import { plan as p } from 'smaltdb/engine';
 
 const fruit = p.fromColumns([new Int32Array([1, 2, 3]), ['apple', 'pear', 'plum'], new Float64Array([1.5, 0.5, 2])], ['int', 'text', 'real']);
 ```
+
+**Pivot.** A `pivot` turns values of `on` into columns: one row per group of `keys` (as `aggregate` groups), then for
+each of `values`, in order, each of `aggs` over the group's rows whose `on` equals that value by `collation` (a NULL
+value matches NULL). The values are given in the plan: a dynamic pivot reads them first, then builds the plan.
 
 **Unpivot.** An `unpivot` turns columns into rows: each input row gives one row per column in `columns`, in input
 order and then the columns' order, holding the `keep` columns, the column's name from `names`, and its value. NULL
@@ -217,7 +222,7 @@ NULLs first). They check nothing: the engine validates every plan it is given, b
 |---|---|
 | Expressions | `col(input, index, type, collation?, depth?)`, `lit(value, type?)`, `value(v)`, `param(index, type?)`, `call(fn, args, type, collation?)`, `cast(fn, arg, to)`, `and(...)`, `or(...)`, `not(x)`, `isNull(x)`, `isNotNull(x)`, `caseWhen(whens, type, otherwise?)`, `scalar(plan, type, collation?)`, `exists(plan)`, `inPlan(probe, plan, collation?)` |
 | Sort keys, aggregates | `asc(expr, options?)`, `desc(expr, options?)`, `agg(fn, args, type, options?)` |
-| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `unpivot(input, keep, columns, names, type?)`, `setop(kind, left, right, width)` |
+| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `pivot(input, keys, on, values, aggs, options?)`, `unpivot(input, keep, columns, names, type?)`, `setop(kind, left, right, width)` |
 | Writes | `append(table, input, columns, options?)`, `update(table, input, rowid, sets, options?)`, `remove(table, input, rowid, options?)` |
 
 `window`, `source`, `iterate` and `working` have no builder yet: write them as objects.

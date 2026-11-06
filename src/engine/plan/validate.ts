@@ -354,6 +354,32 @@ class Validator {
         orderedFirst(o.ordered);
         return o.keys.length + o.aggs.length + o.carry.length;
       }
+      case 'pivot': {
+        const w = sub(o.input, 'input');
+        const scopes = reading(w);
+        const keys = this.list(o.keys, 'keys');
+        for (let i = 0; i < keys.length; i++) {
+          const k = keys[i] as { expr: PlanExpr; collation: unknown };
+          this.under('keys', i, () => {
+            if (!k || typeof k !== 'object') this.fail('expected a key');
+            this.exprAt(k.expr, scopes, d, 'expr', undefined);
+            this.collation(k.collation, 'collation');
+          });
+        }
+        ex(o.on, scopes, 'on');
+        this.collation(o.collation, 'collation');
+        const values = this.list(o.values, 'values');
+        if (values.length === 0) this.fail('expected at least one value', 'values');
+        for (let i = 0; i < values.length; i++) {
+          const v = values[i];
+          if (!(v === null || typeof v === 'number' || typeof v === 'bigint' || typeof v === 'string' || v instanceof Uint8Array)) this.fail('expected a value', 'values', i);
+        }
+        const aggs = this.list(o.aggs, 'aggs');
+        if (aggs.length === 0) this.fail('expected at least one aggregate', 'aggs');
+        for (let i = 0; i < aggs.length; i++) this.under('aggs', i, () => (this.object(aggs[i]), this.aggCall(aggs[i] as never, scopes, d, false)));
+        orderedFirst(o.ordered);
+        return keys.length + values.length * aggs.length;
+      }
       case 'unpivot': {
         const w = sub(o.input, 'input');
         const index = (l: readonly unknown[], field: string): void => {
