@@ -24,6 +24,7 @@ export function outputTypes(op: PlanOp, tableTypes: TableTypes): PlanType[] {
     case 'iterate':
       return outputTypes(op.init, tableTypes);
     case 'filter':
+    case 'sample':
     case 'sort':
     case 'limit':
     case 'distinct':

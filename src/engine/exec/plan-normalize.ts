@@ -61,6 +61,9 @@ function rewriteAll(x: unknown): unknown {
       return op.on || op.keep ? keptRows(op) : op.ordered ? orderedGroups(distinctGroups(op)) : op;
     case 'limit':
       return op.fromEnd ? fromEnd(op) : op;
+    case 'sample':
+      // Its rewrite holds windows and, with replacement, an ordered join: rewritten in turn.
+      return rewriteAll(sampleRows(op));
     case 'pivot':
       // Its rewrite is an aggregate, which may be ordered: rewritten in turn.
       return rewriteAll(pivotGroups(op));
@@ -157,6 +160,49 @@ function keptRows(op: Op<'distinct'>): PlanOp {
   let kept: PlanOp = { op: 'filter', input: sets, pred: cmp('cmp_eq', pos, column(op.keep === 'last' ? w + 2 : w + 1, 'int')) };
   if (op.ordered) kept = { op: 'sort', input: kept, keys: [{ expr: column(w + 1, 'int'), desc: false, nullsFirst: false, collation: 'binary' }] };
   return { op: 'project', input: kept, exprs: range(0, w) };
+}
+
+/** Ids for the `iterate` operations rewrites make (above any a plan is likely to use). */
+let rewriteIterates = 2 ** 30;
+
+/**
+ * A sample. Without replacement: the input numbered and counted, ranked by a value fixed by the seed and each row's
+ * position (`random_at`), the first `count` (or `fraction` × the count) kept, and the input order restored. With it:
+ * that many draws (an `iterate` counting them), each the row at a position fixed by the seed and the draw's number,
+ * joined in the order drawn.
+ */
+function sampleRows(op: Op<'sample'>): PlanOp {
+  const w = planWidth(op.input);
+  const at = (e: PlanExpr): PlanExpr => ({ k: 'call', fn: 'random_at', args: [{ k: 'lit', value: op.seed, type: 'int' }, e], type: 'real' });
+  const mul = (a: PlanExpr, b: PlanExpr): PlanExpr => ({ k: 'call', fn: 'mul', args: [a, b], type: 'any' });
+  const add1 = (e: PlanExpr): PlanExpr => ({ k: 'call', fn: 'add', args: [e, { k: 'lit', value: 1, type: 'int' }], type: 'any' });
+  const pos = column(w, 'int');
+  if (!op.replace) {
+    const counted: PlanOp = { op: 'window', input: op.input, partition: [], order: [], frame: EVERY_ROW, calls: [ROW_NUMBER, call('count', [], true)] };
+    const ranked: PlanOp = { op: 'window', input: counted, partition: [], order: [{ expr: at(pos), desc: false, nullsFirst: false, collation: 'binary' }], frame: WHOLE, calls: [ROW_NUMBER] };
+    const n = op.count ?? mul(op.fraction!, column(w + 1, 'int'));
+    const kept: PlanOp = { op: 'filter', input: ranked, pred: cmp('cmp_le', column(w + 2, 'int'), n) };
+    const inOrder: PlanOp = { op: 'sort', input: kept, keys: [{ expr: pos, desc: false, nullsFirst: false, collation: 'binary' }] };
+    return { op: 'project', input: inOrder, exprs: range(0, w), ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+  }
+  const total: PlanExpr = { k: 'subquery', mode: 'scalar', plan: { op: 'aggregate', input: op.input, keys: [], aggs: [{ fn: 'count', args: [], star: true, distinct: false, collation: 'binary', type: 'int' }], carry: [] }, type: 'int', collation: 'binary' };
+  const n = op.count ?? mul(op.fraction!, total);
+  const id = rewriteIterates++;
+  const zero: PlanExpr = { k: 'lit', value: 0, type: 'int' };
+  const draws: PlanOp = {
+    op: 'iterate',
+    id,
+    name: 'sample',
+    init: { op: 'filter', input: { op: 'values', rows: [[zero]], types: ['int'] }, pred: cmp('cmp_lt', zero, n) },
+    steps: [{ op: 'filter', input: { op: 'project', input: { op: 'working', id, types: ['int'] }, exprs: [add1(column(0, 'int'))] }, pred: cmp('cmp_lt', column(0, 'int'), n) }],
+    distinct: false,
+    collations: ['binary'],
+  };
+  // Each draw: its number, and the position of the row it takes (1 … the count).
+  const targets: PlanOp = { op: 'project', input: draws, exprs: [column(0, 'int'), add1({ k: 'call', fn: 'floor', args: [mul(at(column(0, 'int')), total)], type: 'any' })] };
+  const on = cmp('cmp_eq', column(1, 'int'), { k: 'col', input: 1, index: w, depth: 0, type: 'int', collation: 'binary' });
+  const joined: PlanOp = { op: 'join', kind: 'inner', inputs: [targets, numbered(op.input)], on, ordered: true };
+  return { op: 'project', input: joined, exprs: range(2, 2 + w), ...(op.origin !== undefined ? { origin: op.origin } : {}) };
 }
 
 /** A pivot as an aggregate whose calls each read the rows of one value of `on` (a filter beside the call's own). */

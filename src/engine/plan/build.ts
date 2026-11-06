@@ -106,6 +106,18 @@ export const aggregate = (input: PlanOp, keys: readonly PlanExpr[], aggs: readon
   ...(options.ordered ? { ordered: options.ordered } : {}),
 });
 /**
+ * Rows drawn from `input` at random, fixed by `seed`: `count` of them or a `fraction` of its rows. Without replacement
+ * the rows keep their input order; with it they come in the order drawn.
+ */
+export const sample = (input: PlanOp, size: { count: PlanExpr | number } | { fraction: PlanExpr | number }, options: { replace?: boolean; seed?: number } = {}): Op<'sample'> => ({
+  op: 'sample',
+  input,
+  ...('count' in size ? { count: expr(size.count) } : { fraction: expr(size.fraction) }),
+  replace: options.replace ?? false,
+  seed: options.seed ?? 0,
+});
+
+/**
  * Values of `on` as columns (a wide form): one row per group of `keys`, then for each of `values` and each of `aggs`
  * the aggregate over the group's rows whose `on` is that value.
  */

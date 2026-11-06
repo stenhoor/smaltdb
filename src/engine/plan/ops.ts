@@ -170,6 +170,17 @@ export type PlanOp = OpMeaning & (
       readonly ordered?: 'first';
     }
   | {
+      readonly op: 'sample';
+      readonly input: PlanOp;
+      /** How many rows: `count`, or `fraction` of the input's (expressions over no columns); exactly one. */
+      readonly count?: PlanExpr;
+      readonly fraction?: PlanExpr;
+      /** With replacement a row may be drawn more than once, and rows come in the order drawn. */
+      readonly replace: boolean;
+      /** The same seed gives the same rows from the same input. */
+      readonly seed: number;
+    }
+  | {
       readonly op: 'pivot';
       readonly input: PlanOp;
       /** The columns that group rows: one output row per group. */

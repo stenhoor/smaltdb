@@ -2573,6 +2573,7 @@ export function planWidth(op: PlanOp): number {
     case 'project':
       return op.exprs.length;
     case 'filter':
+    case 'sample':
     case 'sort':
     case 'limit':
     case 'distinct':

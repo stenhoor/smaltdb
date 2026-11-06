@@ -48,6 +48,7 @@ Each operation's output columns, in order:
 | `project` | `input`, `exprs` | one column per expression |
 | `sort` | `input`, `keys` | its input's |
 | `limit` | `input`, `count`, `offset?`, `fromEnd?` (`true`) | its input's |
+| `sample` | `input`, `count?` or `fraction?`, `replace`, `seed` | its input's |
 | `pivot` | `input`, `keys`, `on`, `collation`, `values`, `aggs`, `ordered?` | its keys, then one column per value and aggregate call (value by value) |
 | `unpivot` | `input`, `keep` (columns kept), `columns` (columns that become rows), `names` (one per column), `type` (of the values) | the kept columns, then each row's column name (`text`), then its value |
 | `distinct` | `input`, `collations` (one per column), `ordered?` (`'first'`), `on?`, `keep?` (`'first'` / `'last'`) | its input's |
@@ -113,6 +114,11 @@ import { plan as p } from 'smaltdb/engine';
 
 const fruit = p.fromColumns([new Int32Array([1, 2, 3]), ['apple', 'pear', 'plum'], new Float64Array([1.5, 0.5, 2])], ['int', 'text', 'real']);
 ```
+
+**Sample.** A `sample` draws rows at random, fixed by its integer `seed`: `count` rows, or a `fraction` of the input's
+(expressions over no columns; exactly one of them). Without `replace`, it takes that many distinct rows (all of them
+when there are fewer) and keeps their input order. With `replace`, it makes that many draws, each any row, and gives
+the rows in the order drawn.
 
 **Pivot.** A `pivot` turns values of `on` into columns: one row per group of `keys` (as `aggregate` groups), then for
 each of `values`, in order, each of `aggs` over the group's rows whose `on` equals that value by `collation` (a NULL
@@ -211,6 +217,7 @@ picks the one it means. smaltdf, for example, divides with `div_float` where SQL
 | `mod_floor` | 2 | The remainder of `div_floor`, with the sign of the divisor (`-7, 2` gives `1`). By zero is NULL |
 | `round_half_even` | 1 or 2 | `x` rounded to `digits` places (default 0) with halves to even, decided on the exact binary value (`0.125` gives `0.12`, `2.675` gives `2.67`). REAL |
 | `round_half_away` | 1 or 2 | The same with halves away from zero: `round` |
+| `random_at` | 2 | A value in [0, 1) fixed by an integer `seed` and `index`: the same arguments always give the same value (`sample` ranks rows by it) |
 | `lower_unicode`, `upper_unicode` | 1 | Case mapping of every script (`straße` gives `STRASSE`); `lower` and `upper` map ASCII only |
 | `regex_match` | 2 or 3 | Whether `text` matches `pattern`: 1, 0 or NULL |
 | `regex_find` | 2 or 3 | The first match of `pattern` in `text`, or NULL |
@@ -230,7 +237,7 @@ NULLs first). They check nothing: the engine validates every plan it is given, b
 |---|---|
 | Expressions | `col(input, index, type, collation?, depth?)`, `lit(value, type?)`, `value(v)`, `param(index, type?)`, `call(fn, args, type, collation?)`, `cast(fn, arg, to)`, `and(...)`, `or(...)`, `not(x)`, `isNull(x)`, `isNotNull(x)`, `caseWhen(whens, type, otherwise?)`, `scalar(plan, type, collation?)`, `exists(plan)`, `inPlan(probe, plan, collation?)` |
 | Sort keys, aggregates | `asc(expr, options?)`, `desc(expr, options?)`, `agg(fn, args, type, options?)` |
-| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `asofJoin(left, right, leftKey, rightKey, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `pivot(input, keys, on, values, aggs, options?)`, `unpivot(input, keep, columns, names, type?)`, `setop(kind, left, right, width)` |
+| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `asofJoin(left, right, leftKey, rightKey, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `sample(input, { count } or { fraction }, options?)`, `pivot(input, keys, on, values, aggs, options?)`, `unpivot(input, keep, columns, names, type?)`, `setop(kind, left, right, width)` |
 | Writes | `append(table, input, columns, options?)`, `update(table, input, rowid, sets, options?)`, `remove(table, input, rowid, options?)` |
 
 `window`, `source`, `iterate` and `working` have no builder yet: write them as objects.

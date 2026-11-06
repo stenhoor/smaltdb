@@ -452,6 +452,21 @@ const IIF: ScalarFunction = {
   },
 };
 
+/** 32 bits mixed from two integers (murmur3's finalizer over their combination). */
+function mix32(a: number, b: number): number {
+  let x = Math.imul((a | 0) ^ 0x9e3779b9, 0x85ebca6b) ^ (b | 0);
+  x = Math.imul(x ^ (x >>> 16), 0x7feb352d);
+  x = Math.imul(x ^ (x >>> 15), 0x846ca68b);
+  return (x ^ (x >>> 16)) >>> 0;
+}
+
+/** A value in [0, 1) with 53 random bits, from `seed` and `index` alone. */
+export function randomAt(seed: number, index: number): number {
+  const hi = mix32(seed, index) >>> 5; // 27 bits
+  const lo = mix32(index ^ 0x632be5ab, seed + Math.floor(index / 2 ** 32)) >>> 6; // 26 bits
+  return (hi * 2 ** 26 + lo) / 2 ** 53;
+}
+
 export const scalarFunctions = new Map<string, ScalarFunction>([
   [
     'abs',
@@ -640,6 +655,8 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
     }),
   ],
   ['random', simple(0, 0, 'int', () => randomInt64(), false)],
+  // A value in [0, 1) fixed by its seed and index (ADR 0016 section 5: sample): the same arguments give the same value.
+  ['random_at', simple(2, 2, 'real', ([seed, index]) => (seed === null || index === null ? null : randomAt(Number(seed), Number(index))))],
   [
     'randomblob',
     simple(1, 1, 'blob', ([n]) => {

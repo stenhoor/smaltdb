@@ -365,6 +365,15 @@ class Validator {
         orderedFirst(o.ordered);
         return o.keys.length + o.aggs.length + o.carry.length;
       }
+      case 'sample': {
+        const w = sub(o.input, 'input');
+        if ((o.count === undefined) === (o.fraction === undefined)) this.fail('expected a count or a fraction (one of them)');
+        optEx(o.count, reading(), 'count');
+        optEx(o.fraction, reading(), 'fraction');
+        if (typeof o.replace !== 'boolean') this.fail('expected true or false', 'replace');
+        if (!Number.isInteger(o.seed)) this.fail('expected an integer seed', 'seed');
+        return w;
+      }
       case 'pivot': {
         const w = sub(o.input, 'input');
         const scopes = reading(w);
