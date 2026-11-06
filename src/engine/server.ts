@@ -20,7 +20,7 @@
 import { type BindParams, Database, type PreparedStatement, RowCursor, Statement } from './database.js';
 import { decodeDataJSON } from './plan/codec.js';
 import type { PlanStatementInput } from './plan/statement.js';
-import { PLAN_FORMAT_VERSION } from './plan/types.js';
+import { PLAN_FORMAT_VERSION, type PlanType as StaticType } from './plan/types.js';
 import { MisuseError, SmaltError, errorCode } from './errors.js';
 import { AsyncRequiredError } from './external/external.js';
 import { type SmaltPlugin, askError } from './plugin.js';
@@ -507,7 +507,7 @@ export class EngineServer {
         const sid = this.nextStmt++;
         this.statements.set(sid, st);
         const columns = this.readsExternal(st) ? this.columnsIfKnown(st) : st.columns;
-        this.send(session, { id, kind: 'ok', stmt: sid, columns, paramCount: st.paramCount });
+        this.send(session, { id, kind: 'ok', stmt: sid, columns, columnTypes: this.typesIfKnown(st, columns), paramCount: st.paramCount });
         return;
       }
       case 'prepare': {
@@ -516,7 +516,7 @@ export class EngineServer {
         this.statements.set(sid, st);
         // A `read_csv` call's columns are known only once the file has been read (at the first run).
         const columns = this.readsExternal(st) ? this.columnsIfKnown(st) : st.columns;
-        this.send(session, { id, kind: 'ok', stmt: sid, columns, paramCount: st.paramCount });
+        this.send(session, { id, kind: 'ok', stmt: sid, columns, columnTypes: this.typesIfKnown(st, columns), paramCount: st.paramCount });
         return;
       }
       case 'stmtRun': {
@@ -597,6 +597,21 @@ export class EngineServer {
     }
   }
 
+  /** Its column types, or `any` for each column when they are not known before it runs (external data). */
+  private typesOr(st: PreparedStatement, columns: string[]): StaticType[] {
+    try {
+      return st.columnTypes;
+    } catch (e) {
+      if (e instanceof AsyncRequiredError) return columns.map(() => 'any');
+      throw e;
+    }
+  }
+
+  /** Its column types, when its columns are known (`columns` from {@link columnsIfKnown}). */
+  private typesIfKnown(st: PreparedStatement, columns: string[]): StaticType[] {
+    return columns.length === 0 ? [] : st.columnTypes;
+  }
+
   /** Run `fn` with an AbortSignal that a 'cancel' for this request triggers. */
   private async withAbort<T>(session: string, id: number, fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
     const controller = new AbortController();
@@ -619,8 +634,8 @@ export class EngineServer {
     const result =
       st instanceof Statement
         ? await this.withAbort(session, req.id, (signal) => d.queryAsync(st.sql, params, { signal }))
-        : await this.withAbort(session, req.id, (signal) => d.withExternal(signal, st, () => ({ columns: st.columns, rows: st.all(params) })));
-    this.startStream(session, req.id, new RowCursor(d, null, result.rows, [], result.columns), req.batchSize ?? 4096, req.credit);
+        : await this.withAbort(session, req.id, (signal) => d.withExternal(signal, st, () => st.result(params)));
+    this.startStream(session, req.id, new RowCursor(d, null, result.rows, [], result.columns, result.columnTypes ?? this.typesOr(st, result.columns)), req.batchSize ?? 4096, req.credit);
   }
 
   /**
@@ -678,7 +693,7 @@ export class EngineServer {
             // Precomputed rows: the stream holds no reads, so writes need not wait for its client.
             const result = db.mergePartials(sql, req.params as BindParams | undefined, partials.flat());
             this.morselQueries++;
-            this.startStream(session, req.id, new RowCursor(db, null, result.rows, [], result.columns), req.batchSize ?? 4096, req.credit, ranges.length);
+            this.startStream(session, req.id, new RowCursor(db, null, result.rows, [], result.columns, st.columnTypes), req.batchSize ?? 4096, req.credit, ranges.length);
           } catch (err) {
             this.fail(session, req.id, err);
           }
@@ -710,7 +725,8 @@ export class EngineServer {
   }
 
   private startStream(session: string, id: number, cursor: RowCursor, batchSize: number, credit: number | undefined, morsels?: number): void {
-    this.send(session, morsels ? { id, kind: 'columns', columns: cursor.columns, morsels } : { id, kind: 'columns', columns: cursor.columns });
+    const types = cursor.columnTypes;
+    this.send(session, morsels ? { id, kind: 'columns', columns: cursor.columns, types, morsels } : { id, kind: 'columns', columns: cursor.columns, types });
     const s: Stream = { session, id, cursor, batchSize, credit: credit ?? Infinity, holdsReads: cursor.plan !== null };
     this.streams.push(s);
     this.watch(session);
@@ -739,7 +755,8 @@ export class EngineServer {
     }
     if (n < s.batchSize) {
       this.endStream(s);
-      this.send(s.session, { id: s.id, kind: 'done' });
+      const run = s.cursor.run;
+      this.send(s.session, run ? { id: s.id, kind: 'done', changes: run.changes, lastInsertRowid: run.lastInsertRowid } : { id: s.id, kind: 'done' });
     }
   }
 
