@@ -278,6 +278,121 @@ function round(x: SqlValue, nV: SqlValue): SqlValue {
   return Number(v.toFixed(n));
 }
 
+// ------------------------------------------------------------------ operations for other languages (ADR 0016)
+
+/** A numeric argument: NULL stays NULL, text and blobs convert by their numeric prefix (as the other functions do). */
+function numArg(x: SqlValue): number | bigint | null {
+  if (x === null) return null;
+  return typeof x === 'number' || typeof x === 'bigint' ? x : toNumeric(x);
+}
+
+const isInt = (v: number | bigint, t: StaticType): boolean => typeof v === 'bigint' || (t !== 'real' && Number.isSafeInteger(v));
+
+/** The type of an operation on two numbers: INTEGER for two integers, REAL if either is REAL, else either. */
+const twoNumberType = (args: readonly { type: StaticType }[]): StaticType =>
+  args[0].type === 'int' && args[1].type === 'int' ? 'int' : args[0].type === 'real' || args[1].type === 'real' ? 'real' : 'num';
+
+/** x / y as a float always (7 / 2 = 3.5); y = 0 gives ±Infinity, and 0 / 0 gives NULL until NaN is a value (ADR 0016 §3). */
+function divFloat(x: SqlValue, y: SqlValue): SqlValue {
+  const a = numArg(x);
+  const b = numArg(y);
+  if (a === null || b === null) return null;
+  const r = Number(a) / Number(b);
+  return Number.isNaN(r) ? null : r;
+}
+
+/** x / y rounded toward negative infinity: an integer for two integers (-7 // 2 = -4); y = 0 gives NULL. */
+function divFloor(x: SqlValue, y: SqlValue, types: readonly { type: StaticType }[]): SqlValue {
+  const a = numArg(x);
+  const b = numArg(y);
+  if (a === null || b === null) return null;
+  if (isInt(a, types[0].type) && isInt(b, types[1].type)) {
+    const p = BigInt(a);
+    const q = BigInt(b);
+    if (q === 0n) return null;
+    let d = p / q;
+    if (p % q !== 0n && p < 0n !== q < 0n) d -= 1n;
+    return d >= -(2n ** 63n) && d < 2n ** 63n ? normalizeInt(d) : Number(d);
+  }
+  if (Number(b) === 0) return null;
+  const r = Math.floor(Number(a) / Number(b));
+  return Number.isNaN(r) ? null : r;
+}
+
+/** The remainder of floor division, with the sign of the divisor (-7 mod 2 = 1); y = 0 gives NULL. */
+function modFloor(x: SqlValue, y: SqlValue, types: readonly { type: StaticType }[]): SqlValue {
+  const a = numArg(x);
+  const b = numArg(y);
+  if (a === null || b === null) return null;
+  if (isInt(a, types[0].type) && isInt(b, types[1].type)) {
+    const p = BigInt(a);
+    const q = BigInt(b);
+    if (q === 0n) return null;
+    let r = p % q;
+    if (r !== 0n && r < 0n !== q < 0n) r += q;
+    return normalizeInt(r);
+  }
+  const fb = Number(b);
+  if (fb === 0) return null;
+  let r = Number(a) % fb;
+  if (r !== 0 && r < 0 !== fb < 0) r += fb;
+  return Number.isNaN(r) ? null : r;
+}
+
+/** `v` rounded to `n` decimal places with halves to even, decided on the exact binary value (0.125 → 0.12, 2.675 → 2.67). */
+function roundHalfEvenValue(v: number, n: number): number {
+  if (!Number.isFinite(v) || v === 0) return v;
+  // v = m * 2^e exactly, with m an integer.
+  const view = new DataView(new ArrayBuffer(8));
+  view.setFloat64(0, Math.abs(v));
+  const bits = view.getBigUint64(0);
+  const rawExp = Number((bits >> 52n) & 0x7ffn);
+  const frac = bits & ((1n << 52n) - 1n);
+  const m = rawExp === 0 ? frac : frac | (1n << 52n);
+  const e = (rawExp === 0 ? 1 : rawExp) - 1075;
+  if (e >= 0) return v; // an integer: nothing after the decimal point
+  const num = m * 10n ** BigInt(n);
+  const den = 1n << BigInt(-e);
+  let q = num / den;
+  const r2 = (num % den) * 2n;
+  if (r2 > den || (r2 === den && q % 2n === 1n)) q += 1n;
+  const out = Number(`${q}e-${n}`);
+  return v < 0 ? -out : out;
+}
+
+function roundHalfEven(x: SqlValue, nV: SqlValue | undefined): SqlValue {
+  if (x === null || nV === null) return null;
+  const n = nV === undefined ? 0 : Math.max(0, Math.min(30, toInt(nV)));
+  return roundHalfEvenValue(Number(toNumeric(x)), n);
+}
+
+/** Compiled regular expressions by pattern and flags (most recently used kept). */
+const REGEXPS = new Map<string, RegExp>();
+const ALLOWED_FLAGS = /^[imsx]*$/;
+
+/** `pattern` (JavaScript syntax, Unicode mode) with `flags` among i, m, s; `global` for replace-all. */
+function regex(pattern: SqlValue, flags: SqlValue | undefined, global: boolean): RegExp {
+  const p = toText(pattern)!;
+  const f = flags === undefined || flags === null ? '' : toText(flags)!;
+  if (!ALLOWED_FLAGS.test(f) || f.includes('x')) throw new SmaltError('SMALT_ERROR', `invalid regular expression flags: ${JSON.stringify(f)} (allowed: i, m, s)`);
+  const key = `${global ? 'g' : ''}${f}/${p}`;
+  let re = REGEXPS.get(key);
+  if (re === undefined) {
+    try {
+      re = new RegExp(p, `u${global ? 'g' : ''}${f}`);
+    } catch (err) {
+      throw new SmaltError('SMALT_ERROR', `invalid regular expression ${JSON.stringify(p)}: ${(err as Error).message}`);
+    }
+    if (REGEXPS.size >= 256) REGEXPS.delete(REGEXPS.keys().next().value!);
+    REGEXPS.set(key, re);
+  } else {
+    REGEXPS.delete(key);
+    REGEXPS.set(key, re);
+  }
+  re.lastIndex = 0;
+  return re;
+}
+
 function printf(args: SqlValue[], types: CompiledArg[]): SqlValue {
   if (args.length === 0) return null;
   return sqlPrintf(args[0], args, types.map((t) => isRealType(t.type)));
@@ -443,6 +558,22 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
     }),
   ],
   ['round', simple(1, 2, 'real', (v) => round(v[0], v.length > 1 ? v[1] : undefined as unknown as SqlValue))],
+  // Operations for languages whose meaning differs from SQLite's (ADR 0016 section 1), named for what they do.
+  ['round_half_away', simple(1, 2, 'real', (v) => round(v[0], v.length > 1 ? v[1] : undefined as unknown as SqlValue))],
+  ['round_half_even', simple(1, 2, 'real', (v) => roundHalfEven(v[0], v.length > 1 ? v[1] : undefined))],
+  ['div_float', simple(2, 2, 'real', ([x, y]) => divFloat(x, y))],
+  ['div_floor', simple(2, 2, twoNumberType, ([x, y], args) => divFloor(x, y, args))],
+  ['mod_floor', simple(2, 2, twoNumberType, ([x, y], args) => modFloor(x, y, args))],
+  ['lower_unicode', simple(1, 1, 'text', ([x], args) => (x === null ? null : toText(x, isRealType(args[0].type))!.toLowerCase()))],
+  ['upper_unicode', simple(1, 1, 'text', ([x], args) => (x === null ? null : toText(x, isRealType(args[0].type))!.toUpperCase()))],
+  ['regex_match', simple(2, 3, 'int', (v) => (v[0] === null || v[1] === null ? null : regex(v[1], v[2], false).test(toText(v[0])!) ? 1 : 0))],
+  ['regex_find', simple(2, 3, 'text', (v) => {
+    if (v[0] === null || v[1] === null) return null;
+    const m = regex(v[1], v[2], false).exec(toText(v[0])!);
+    return m === null ? null : m[0];
+  })],
+  ['regex_replace', simple(3, 4, 'text', (v) => (v[0] === null || v[1] === null || v[2] === null ? null : toText(v[0])!.replace(regex(v[1], v[3], false), toText(v[2])!)))],
+  ['regex_replace_all', simple(3, 4, 'text', (v) => (v[0] === null || v[1] === null || v[2] === null ? null : toText(v[0])!.replace(regex(v[1], v[3], true), toText(v[2])!)))],
   [
     'typeof',
     {
