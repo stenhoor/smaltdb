@@ -62,6 +62,15 @@ Each operation's output columns, in order:
 **Joins.** `kind` is `inner`, `left`, `right`, `full`, `cross`, `semi` (left rows with a match) or `anti` (left rows
 without one). The condition reads input 0 (the left side) and input 1 (the right side).
 
+**Order.** These operations keep an order, whatever plan the engine picks:
+
+- `sort` is stable: rows with equal keys keep their input order, also as a top-N under a `limit` and when the sort
+  spills to disk.
+- `filter`, `project` and `limit` keep their input's order, and so does a `window` without its own `order`.
+- `semi` and `anti` joins keep the left input's order.
+
+The order of other operations' output is not defined, and the engine is free to choose it.
+
 **Sort keys** (`SortKey`) are `{ expr, desc, nullsFirst, collation }`.
 
 **Aggregates.** `keys` are `{ expr, collation }`. Each call (`AggCall`) is

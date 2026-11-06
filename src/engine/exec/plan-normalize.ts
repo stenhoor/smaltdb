@@ -10,13 +10,112 @@
  */
 import { type PlanExpr, typeOf } from '../plan/expr.js';
 import type { PlanOp } from '../plan/ops.js';
+import { SmaltError } from '../errors.js';
 import { planWidth } from './planner.js';
 
 type Op<K extends PlanOp['op']> = Extract<PlanOp, { op: K }>;
 
 /** `op` as a query block the planner reads. */
 export function normalizePlan(op: PlanOp): PlanOp {
-  return block(op);
+  return block(semiJoins(op));
+}
+
+/**
+ * `op` with its semi and anti joins as filters: `semi(L, R, on)` is L where some row of R matches (`exists`), `anti`
+ * where none does. A filter keeps L's order (ADR 0016 section 4), and the planner decorrelates the subquery into a hash
+ * semi-join where it can.
+ */
+function semiJoins(op: PlanOp): PlanOp {
+  const kids = mapInputs(op, semiJoins);
+  if (kids.op !== 'join' || (kids.kind !== 'semi' && kids.kind !== 'anti')) return kids;
+  const [left, right] = kids.inputs;
+  const inner: PlanOp = kids.on ? { op: 'filter', input: right, pred: correlated(kids.on, 0) } : right;
+  const exists: PlanExpr = { k: 'subquery', mode: 'exists', plan: inner, type: 'int', collation: 'binary' };
+  const pred: PlanExpr = kids.kind === 'semi' ? exists : { k: 'not', arg: exists };
+  return { op: 'filter', input: left, pred, ...(kids.origin !== undefined ? { origin: kids.origin } : {}) };
+}
+
+/**
+ * A join condition read from inside a subquery over the join's right input: the left input's columns one evaluation
+ * out, the right input's the subquery's own, and references further out one further.
+ */
+function correlated(e: PlanExpr, depth: number): PlanExpr {
+  switch (e.k) {
+    case 'col':
+      if (e.depth > depth) return { ...e, depth: e.depth + 1 };
+      if (e.depth < depth) return e;
+      return e.input === 0 ? { ...e, depth: e.depth + 1 } : { ...e, input: 0 };
+    case 'call':
+    case 'and':
+    case 'or':
+      return { ...e, args: e.args.map((a) => correlated(a, depth)) };
+    case 'cast':
+    case 'not':
+    case 'isNull':
+      return { ...e, arg: correlated(e.arg, depth) };
+    case 'case':
+      return { ...e, whens: e.whens.map((w) => ({ when: correlated(w.when, depth), then: correlated(w.then, depth) })), else: correlated(e.else, depth) };
+    case 'subquery':
+    case 'inSubquery':
+      throw new SmaltError('SMALT_UNSUPPORTED', 'a semi or anti join whose condition holds a subquery is not supported yet');
+    default:
+      return e;
+  }
+}
+
+/** `op` with `f` applied to its input operations, and to the plans nested in its expressions. */
+function mapInputs(op: PlanOp, f: (x: PlanOp) => PlanOp): PlanOp {
+  const ex = (e: PlanExpr): PlanExpr => mapPlans(e, f);
+  switch (op.op) {
+    case 'filter':
+      return { ...op, input: f(op.input), pred: ex(op.pred) };
+    case 'project':
+      return { ...op, input: f(op.input), exprs: op.exprs.map(ex) };
+    case 'sort':
+      return { ...op, input: f(op.input), keys: op.keys.map((k) => ({ ...k, expr: ex(k.expr) })) };
+    case 'limit':
+    case 'distinct':
+      return { ...op, input: f(op.input) };
+    case 'aggregate':
+      return { ...op, input: f(op.input) };
+    case 'window':
+      return { ...op, input: f(op.input) };
+    case 'join':
+      return { ...op, inputs: [f(op.inputs[0]), f(op.inputs[1])], ...(op.on ? { on: ex(op.on) } : {}) };
+    case 'setop':
+      return { ...op, inputs: [f(op.inputs[0]), f(op.inputs[1])] };
+    case 'iterate':
+      return { ...op, init: f(op.init), steps: op.steps.map(f) };
+    case 'append':
+      return op.input ? { ...op, input: f(op.input) } : op;
+    case 'update':
+    case 'delete':
+      return { ...op, input: f(op.input) };
+    default:
+      return op;
+  }
+}
+
+/** `e` with `f` applied to the plans nested in it. */
+function mapPlans(e: PlanExpr, f: (x: PlanOp) => PlanOp): PlanExpr {
+  switch (e.k) {
+    case 'subquery':
+      return { ...e, plan: f(e.plan) };
+    case 'inSubquery':
+      return { ...e, probe: mapPlans(e.probe, f), plan: f(e.plan) };
+    case 'call':
+    case 'and':
+    case 'or':
+      return { ...e, args: e.args.map((a) => mapPlans(a, f)) };
+    case 'cast':
+    case 'not':
+    case 'isNull':
+      return { ...e, arg: mapPlans(e.arg, f) };
+    case 'case':
+      return { ...e, whens: e.whens.map((w) => ({ when: mapPlans(w.when, f), then: mapPlans(w.then, f) })), else: mapPlans(e.else, f) };
+    default:
+      return e;
+  }
 }
 
 /** A write's plan with its input normalized (an `append`'s rows; `update` and `delete` read their targets as given). */
