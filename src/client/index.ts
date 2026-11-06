@@ -4,6 +4,7 @@
  */
 import type { SqlValue } from '../engine/values.js';
 import { encodeDataJSON } from '../engine/plan/codec.js';
+import type { ErrorDetails } from '../engine/errors.js';
 import type { CatalogData } from '../engine/plan/catalog.js';
 import type { PlanStatementInput } from '../engine/plan/statement.js';
 import { PLAN_FORMAT_VERSION, type PlanType } from '../engine/plan/types.js';
@@ -81,12 +82,30 @@ export interface ColumnarResult {
 }
 
 export class SmaltdbError extends Error {
+  /** The `origin` of the plan node the error arose in, as the language that built the plan gave it. */
+  readonly origin?: unknown;
+  /** For a constraint: which one failed (`notNull`, `unique`, `primaryKey`, `check`, `foreignKey`, `datatype`). */
+  readonly constraint?: ErrorDetails['constraint'];
+  /** For a constraint: the table it is on. */
+  readonly table?: string;
+  /** For a constraint: the columns it covers. */
+  readonly columns?: readonly string[];
+  /** For a constraint: its name or its index's, where it has one. */
+  readonly constraintName?: string;
   constructor(
     readonly code: string,
     message: string,
+    details?: ErrorDetails,
   ) {
     super(message);
     this.name = 'SmaltdbError';
+    if (details) {
+      if (details.origin !== undefined) this.origin = details.origin;
+      if (details.constraint !== undefined) this.constraint = details.constraint;
+      if (details.table !== undefined) this.table = details.table;
+      if (details.columns !== undefined) this.columns = details.columns;
+      if (details.name !== undefined) this.constraintName = details.name;
+    }
   }
 }
 
@@ -354,7 +373,7 @@ export class Database implements Queryable {
         break;
       case 'error':
         this.pending.delete(msg.id);
-        p.reject(new SmaltdbError(msg.code, msg.message));
+        p.reject(new SmaltdbError(msg.code, msg.message, msg.details));
         break;
       case 'columns':
         p.columns = msg.columns;
@@ -523,7 +542,7 @@ export class Database implements Queryable {
         else if (msg.kind === 'done') finished = true;
         else if (msg.kind === 'error') {
           finished = true;
-          failure = new SmaltdbError(msg.code, msg.message);
+          failure = new SmaltdbError(msg.code, msg.message, msg.details);
         }
         notify();
       });

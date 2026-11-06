@@ -12,7 +12,7 @@ import {
   findColumn,
   isColumnar,
 } from './catalog/schema.js';
-import { MisuseError, SmaltError } from './errors.js';
+import { MisuseError, SmaltError, withDetails } from './errors.js';
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
 import type { ConflictAction, PlanOp } from './plan/ops.js';
 import { type EncodedPlan, canonicalJSON, decodeData, decodePlan, encodeData, encodePlan, planFromJSON, planToJSON } from './plan/codec.js';
@@ -3139,7 +3139,14 @@ export class Database implements FunctionContext {
         const k = c.key();
         const prefix = k.subarray(0, rowidSuffixStart(k, k.length));
         if (prev && prefix.length === prev.length && prefix.every((b, i) => b === prev![i]) && !prefixHasNull(prefix, idx.columns)) {
-          throw new ConstraintError('SMALT_CONSTRAINT_UNIQUE', idx.columns.some((ic) => ic.column < 0) ? `UNIQUE constraint failed: index '${idx.name}'` : `UNIQUE constraint failed: ${idx.columns.map((ic) => `${table.name}.${table.columns[ic.column].name}`).join(', ')}`);
+          const exprIndex = idx.columns.some((ic) => ic.column < 0);
+          const columns = exprIndex ? [] : idx.columns.map((ic) => table.columns[ic.column].name);
+          throw new ConstraintError('SMALT_CONSTRAINT_UNIQUE', exprIndex ? `UNIQUE constraint failed: index '${idx.name}'` : `UNIQUE constraint failed: ${columns.map((c) => `${table.name}.${c}`).join(', ')}`, {
+            constraint: 'unique',
+            table: table.name,
+            columns,
+            name: idx.name,
+          });
         }
         prev = prefix.slice();
       }
@@ -3625,7 +3632,7 @@ export class Database implements FunctionContext {
         const mode = override ?? col.notNullConflict ?? 'ABORT';
         if (mode === 'IGNORE') return false;
         if (mode === 'REPLACE' && defaults[i]) v = coerceForColumn(defaults[i]!(regs), col, table.name);
-        if (v === null) throw constraintError('SMALT_CONSTRAINT_NOTNULL', `NOT NULL constraint failed: ${table.name}.${col.name}`, mode);
+        if (v === null) throw constraintError('SMALT_CONSTRAINT_NOTNULL', `NOT NULL constraint failed: ${table.name}.${col.name}`, mode, { constraint: 'notNull', table: table.name, columns: [col.name] });
       }
       row[i] = v;
     }
@@ -3637,7 +3644,7 @@ export class Database implements FunctionContext {
         const v = c.fn(regs);
         if (v !== null && truthy(v) === false) {
           if (mode === 'IGNORE') return false;
-          throw constraintError('SMALT_CONSTRAINT_CHECK', `CHECK constraint failed: ${c.name}`, mode);
+          throw constraintError('SMALT_CONSTRAINT_CHECK', `CHECK constraint failed: ${c.name}`, mode, { constraint: 'check', table: table.name, name: c.name });
         }
       }
     }
@@ -3692,8 +3699,26 @@ export class Database implements FunctionContext {
     return table.pkConflict === 'REPLACE' || table.indexes.some((i) => i.onConflict === 'REPLACE') || table.columns.some((c) => c.notNullConflict === 'REPLACE');
   }
 
-  /** A write plan's program (INSERT, UPDATE, DELETE), from the plan alone. */
+  /**
+   * A write plan's program (INSERT, UPDATE, DELETE), from the plan alone. An operation with an `origin` gives it to the
+   * errors that arise while it runs (its constraint failures among them) that no inner node gave one.
+   */
   private compileWrite(fe: BoundWrite, planner: Planner): Omit<Program, 'regCount'> {
+    const p = this.compileWriteOp(fe, planner);
+    const origin = fe.plan.origin;
+    if (origin === undefined) return p;
+    const details = { origin };
+    const guard = <A extends unknown[], R>(f: (...a: A) => R) => (...a: A): R => {
+      try {
+        return f(...a);
+      } catch (err) {
+        throw withDetails(err, details);
+      }
+    };
+    return { ...p, ...(p.exec ? { exec: guard(p.exec) } : {}), ...(p.rows ? { rows: guard(p.rows) } : {}) };
+  }
+
+  private compileWriteOp(fe: BoundWrite, planner: Planner): Omit<Program, 'regCount'> {
     const op = fe.plan;
     switch (op.op) {
       case 'append': {

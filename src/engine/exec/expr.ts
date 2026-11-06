@@ -1,4 +1,4 @@
-import { SmaltError } from '../errors.js';
+import { SmaltError, withDetails } from '../errors.js';
 import { storageTypeFor } from '../catalog/schema.js';
 import { Collation, type SqlValue, collationByName } from '../values.js';
 import {
@@ -74,7 +74,21 @@ export function compileBoundExpr(b: BoundExpr, ctx: FunctionContext): Compiled {
     if (c.constant || c.reg !== undefined) return c;
   }
   const g = generate(b, CODEGEN_HELPERS, (x) => compilePlanExpr(x, ctx));
-  return { fn: g.fn, type: g.type, collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
+  // Generated code compiles the nodes it does not inline with compilePlanExpr, which gives their origins; the root's
+  // is given here.
+  const fn = b.origin === undefined ? g.fn : guarded(g.fn, { origin: b.origin });
+  return { fn, type: g.type, collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
+}
+
+/** `f`, giving `details` to the errors it raises that have none of their own. */
+function guarded(f: Fn, details: { origin: unknown }): Fn {
+  return (r) => {
+    try {
+      return f(r);
+    } catch (err) {
+      throw withDetails(err, details);
+    }
+  };
 }
 
 /**
@@ -142,8 +156,29 @@ export const metaOf = (e: BoundExpr): SqlMeta => getMeta(e) ?? NO_META;
 
 const AFFINITY_CALLS = new Set(['affinity_numeric', 'affinity_text']);
 
-/** Compile a bound expression to a closure, with its SQL metadata. */
+/**
+ * Compile a bound expression to a closure, with its SQL metadata. A node with an `origin` gives it to the errors that
+ * arise in it, while it is compiled and when it runs, unless a node inside it gave its own (ADR 0016 section 10).
+ */
 export function compilePlanExpr(e: BoundExpr, ctx: FunctionContext): Compiled {
+  if (e.origin !== undefined) return withOrigin(e, ctx);
+  return compileWithMeta(e, ctx);
+}
+
+function withOrigin(e: BoundExpr, ctx: FunctionContext): Compiled {
+  const details = { origin: e.origin };
+  let c: Compiled;
+  try {
+    c = compileWithMeta(e, ctx);
+  } catch (err) {
+    throw withDetails(err, details);
+  }
+  // A constant or a register read raises nothing when it runs.
+  if (c.constant || c.reg !== undefined) return c;
+  return { ...c, fn: guarded(c.fn, details) };
+}
+
+function compileWithMeta(e: BoundExpr, ctx: FunctionContext): Compiled {
   const c = compileBound(e, ctx);
   const m = getMeta(e);
   if (m === undefined) return c;

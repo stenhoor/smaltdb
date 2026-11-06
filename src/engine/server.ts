@@ -21,7 +21,7 @@ import { type BindParams, Database, type PreparedStatement, RowCursor, Statement
 import { decodeDataJSON } from './plan/codec.js';
 import type { PlanStatementInput } from './plan/statement.js';
 import { PLAN_FORMAT_VERSION, type PlanType as StaticType } from './plan/types.js';
-import { MisuseError, SmaltError, errorCode } from './errors.js';
+import { MisuseError, SmaltError, errorCode, errorDetails } from './errors.js';
 import { AsyncRequiredError } from './external/external.js';
 import { type SmaltPlugin, askError } from './plugin.js';
 import type { Vfs } from './vfs/types.js';
@@ -310,7 +310,8 @@ export class EngineServer {
   private fail(session: string, id: number, err: unknown): void {
     const code = errorCode(err);
     // Some engines (WebKit) raise DOMExceptions with an empty message: keep the name then.
-    this.send(session, { id, kind: 'error', code, message: err instanceof Error ? err.message || err.name : String(err) });
+    const details = errorDetails(err);
+    this.send(session, { id, kind: 'error', code, message: err instanceof Error ? err.message || err.name : String(err), ...(details ? { details } : {}) });
   }
 
   private kick(): void {

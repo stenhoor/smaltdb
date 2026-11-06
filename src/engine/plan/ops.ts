@@ -14,7 +14,7 @@
  * Writing operations (`append`, `update`, `delete`), windows, recursion and external sources arrive with the later
  * steps of the ADR's order of work.
  */
-import type { PlanExpr } from './expr.js';
+import type { PlanExpr, PlanOrigin } from './expr.js';
 import type { CollationName, PlanType } from './types.js';
 
 export interface SortKey {
@@ -67,6 +67,8 @@ export type ConflictAction = 'rollback' | 'abort' | 'fail' | 'ignore' | 'replace
  */
 export interface OpMeaning {
   readonly decorrelate?: false;
+  /** Where the operation came from, as an expression's `origin` (plan/expr.ts): given back on its errors. */
+  readonly origin?: PlanOrigin;
 }
 
 export type PlanOp = OpMeaning & (
