@@ -105,6 +105,8 @@ export interface TableSchema {
   recordDefaults: SqlValue[];
   /** System tables cannot be modified by user DML. */
   system?: boolean;
+  /** The language of its source `sql` (absent: SQL). */
+  language?: string;
   /** Statistics from ANALYZE (absent until analyzed). */
   stats?: import('../exec/stats.js').TableStats;
   /** Set for materialized views: the table holds the view's stored rows. */

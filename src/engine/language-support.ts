@@ -8,7 +8,7 @@
  */
 export type { BindContext } from './plan/bind-context.js';
 export type { Catalog, CatalogData, CatalogFunction, CatalogTable, FunctionCatalog } from './plan/catalog.js';
-export { engineFunctions } from './catalog/logical.js';
+export { describeTableDef, engineFunctions } from './catalog/logical.js';
 export type { BoundQuery, BoundStatement } from './plan/bound.js';
 export { type BoundExpr, type PlanExpr, call, lit, param, typeOf } from './plan/expr.js';
 export { type LanguageStatement, type ObjectReference, type SmaltLanguage, registerLanguage } from './plan/language.js';
@@ -21,7 +21,7 @@ export { Collation, type SqlValue, collationByName, normalizeInt } from './value
 
 export { type IndexSchema, type TableSchema, findColumn, storageTypeFor, tableSchemaFromDef } from './catalog/schema.js';
 export { type Affinity, type StaticType, affinityOfStorage, applyNumericAffinity, staticTypeOfStorage } from './exec/convert.js';
-export { CollSrc, type Compiled, NO_META, type SqlOperand, collationName, comparisonCollation, comparisonConverters, metaOf } from './exec/expr.js';
+export { CollSrc, type Compiled, type ComparisonOperand, NO_META, type SqlOperand, collationName, comparisonCollation, comparisonConverters, comparisonRule, metaOf } from './exec/expr.js';
 export type { Fn } from './exec/functions.js';
 export { ARITHMETIC_FUNCTIONS, BITWISE_FUNCTIONS, COMPARISON_FUNCTIONS } from './exec/sql-functions.js';
 export { type SqlMeta, getMeta } from './exec/sql-meta.js';

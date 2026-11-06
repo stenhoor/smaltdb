@@ -35,8 +35,8 @@ import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import type { ReaderSettings } from '../shared/protocol.js';
-import { logicalCatalog } from './catalog/logical.js';
-import type { Catalog } from './plan/catalog.js';
+import { describeTable, logicalCatalog } from './catalog/logical.js';
+import type { Catalog, CatalogTable } from './plan/catalog.js';
 import {
   AsyncRequiredError,
   type ConnectionInfo,
@@ -1004,10 +1004,12 @@ export class Database implements FunctionContext {
         continue;
       }
       if (r.type !== 'table') continue;
-      const t = isSystemTable(r.name) ? SYSTEM_TABLES[r.name.toLowerCase() as SystemTableName] : def(r.name.toLowerCase(), 'table').table;
+      const stored = isSystemTable(r.name) ? undefined : def(r.name.toLowerCase(), 'table');
+      const t = stored ? stored.table : SYSTEM_TABLES[r.name.toLowerCase() as SystemTableName];
       if (t.storage === 'columnar') columnarTables.add(r.name.toLowerCase());
       const { table, implicitIndexes } = tableSchemaFromDef(t, r.sql!, r.rootpage);
       if (isSystemTable(r.name)) table.system = true;
+      if (stored?.language !== undefined && stored.language !== 'sql') table.language = stored.language;
       implicitIndexes.forEach((spec, i) => {
         const name = autoIndexName(table.name, i + 1);
         const root = autoRoots.get(name.toLowerCase());
@@ -1205,6 +1207,9 @@ export class Database implements FunctionContext {
   /** The logical catalog languages bind against (plan/bind-context.ts): the planner's tables, views and sources. */
   private bindContext(): BindContext {
     return (this.bindCtx ??= {
+      table: (n, schema) => this.described(this.plannedTable(n, schema)),
+      writeTable: (n, schema) => this.described(this.targetTable(n, schema))!,
+      indexTable: (n, schema) => this.described(this.indexTarget(n, schema))!,
       getTable: (n, schema) => this.plannedTable(n, schema),
       writeTarget: (n, schema) => this.targetTable(n, schema),
       indexTarget: (n, schema) => this.indexTarget(n, schema),
@@ -1221,12 +1226,29 @@ export class Database implements FunctionContext {
 
   private bindCtx: BindContext | null = null;
 
+  /** `t` as the catalog describes it, kept while the schema is unchanged (CREATE INDEX changes a table in place). */
+  private described(t: TableSchema | undefined): CatalogTable | undefined {
+    if (!t) return undefined;
+    const hit = this.descriptions.get(t);
+    if (hit && hit.version === this.schemaVersion && hit.indexes === t.indexes.length) return hit.table;
+    const table = describeTable(t);
+    this.descriptions.set(t, { version: this.schemaVersion, indexes: t.indexes.length, table });
+    return table;
+  }
+
+  private readonly descriptions = new WeakMap<TableSchema, { version: number; indexes: number; table: CatalogTable }>();
+
   /** The environment that checks a view still plans after a schema change: tables and views only, no sources. */
   private viewCheckEnv(): { env: PhysicalEnv; catalog: BindContext } {
     const getTable = (n: string): TableSchema | undefined => this.getTable(n);
     return {
       env: { getTable, openTree: (root) => this.tree(root), funcCtx: this, state: this.state },
-      catalog: { getTable, writeTarget: (n, schema) => this.targetTable(n, schema), indexTarget: (n, schema) => this.indexTarget(n, schema), getView: (n) => this.getView(n), isExternal: (n) => this.externals.has(n.toLowerCase()), catalog: this.catalog, funcCtx: this },
+      catalog: {
+        getTable,
+        table: (n) => this.described(getTable(n)),
+        writeTable: (n, schema) => this.described(this.targetTable(n, schema))!,
+        indexTable: (n, schema) => this.described(this.indexTarget(n, schema))!,
+        writeTarget: (n, schema) => this.targetTable(n, schema), indexTarget: (n, schema) => this.indexTarget(n, schema), getView: (n) => this.getView(n), isExternal: (n) => this.externals.has(n.toLowerCase()), catalog: this.catalog, funcCtx: this },
     };
   }
 
@@ -1285,6 +1307,8 @@ export class Database implements FunctionContext {
     };
     const ctx: BindContext = {
       ...base,
+      table: (n, schema) => (note(n, schema), base.table(n, schema)),
+      writeTable: (n, schema) => (note(n, schema), base.writeTable(n, schema)),
       getTable: (n, schema) => (note(n, schema), base.getTable(n, schema)),
       writeTarget: (n, schema) => (note(n, schema), base.writeTarget(n, schema)),
       getView: (n, schema) => {
@@ -2865,6 +2889,7 @@ export class Database implements FunctionContext {
     const root = BTree.create(this.pager);
     const { table, implicitIndexes, conflictingOnConflict } = tableSchemaFromDef(stmt.table, sql, root);
     if (conflictingOnConflict) throw new SmaltError('SMALT_ERROR', 'conflicting ON CONFLICT clauses specified');
+    if (stmt.source.language !== 'sql') table.language = stmt.source.language;
     if (columnar) {
       // Columnar tables are scanned, not probed: no secondary structures to keep in step.
       if (implicitIndexes.length > 0) throw new SmaltError('SMALT_UNSUPPORTED', 'columnar tables support no UNIQUE or PRIMARY KEY constraints other than INTEGER PRIMARY KEY');
@@ -2909,6 +2934,7 @@ export class Database implements FunctionContext {
     const { table, implicitIndexes, conflictingOnConflict } = tableSchemaFromDef(stmt.table, sql, this.createTree(true));
     if (conflictingOnConflict) throw new SmaltError('SMALT_ERROR', 'conflicting ON CONFLICT clauses specified');
     table.temp = true;
+    if (stmt.source.language !== 'sql') table.language = stmt.source.language;
     implicitIndexes.forEach((spec, i) => {
       const name = autoIndexName(table.name, i + 1);
       table.indexes.push({ name, table: table.name, rootPage: this.createTree(true), columns: spec.columns, unique: true, origin: spec.origin, constraintName: spec.constraintName, onConflict: spec.onConflict });
@@ -3625,7 +3651,8 @@ export class Database implements FunctionContext {
     // Stored definitions hold bound expressions; a DEFAULT naming a function that did not exist when the table was
     // made is bound where first used, from the table's source. A failure is the binder's error.
     if (checks.some((c) => !c.expr) || defaults.some((d) => d && !d.expr)) {
-      const b = this.sql.bindStoredExprs(table, this.bindContext());
+      const lang = this.languageOf(table.language ?? 'sql');
+      const b = lang.bindTableExprs ? lang.bindTableExprs(this.described(table)!, this.bindContext()) : lang.bindStoredExprs(table, this.bindContext());
       checks = checks.map((c, i) => (c.expr ? c : { ...c, expr: b.checks[i] }));
       defaults = defaults.map((d, i) => (d && !d.expr ? { ...d, expr: b.defaults[i]! } : d));
     }

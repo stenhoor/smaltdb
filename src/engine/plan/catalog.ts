@@ -8,7 +8,7 @@
  */
 import type { SqlValue } from '../values.js';
 import type { BoundExpr, ExprMeaning } from './expr.js';
-import type { StorageType } from './schema.js';
+import type { Source, StorageType } from './schema.js';
 import type { CollationName, PlanType } from './types.js';
 
 /** A column of a table, a materialized view or an external table. */
@@ -43,9 +43,12 @@ export interface CatalogIndex {
   readonly partial: boolean;
 }
 
-/** Something a plan reads by name with a `scan` (tables, materialized views) or a `source` (external tables). */
+/**
+ * Something a plan reads by name with a `scan` (tables, materialized views, and the engine's system tables while a
+ * language binds) or a `source` (external tables).
+ */
 export interface CatalogTable {
-  readonly kind: 'table' | 'materializedView' | 'external';
+  readonly kind: 'table' | 'materializedView' | 'external' | 'system';
   readonly name: string;
   readonly schema: 'main' | 'temp';
   readonly columns: readonly CatalogColumn[];
@@ -55,6 +58,8 @@ export interface CatalogTable {
   readonly storage: 'row' | 'columnar';
   /** Values must match the column types (no conversion on write). */
   readonly strict: boolean;
+  /** Its definition, in the language it was written in. */
+  readonly source: Source;
 }
 
 /** A view: its language and source text, bound where it is read. */

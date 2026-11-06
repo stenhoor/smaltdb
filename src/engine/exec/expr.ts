@@ -16,7 +16,7 @@ import { type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, sc
 import { type CodegenHelpers, type FallbackNode, codegenEnabled, generate, generatedType, isCodegenRoot } from './codegen.js';
 import { WINDOW_ARITY } from './window.js';
 import { type SqlMeta, getMeta, setMeta } from './sql-meta.js';
-import { type BoundExpr, call, lit, param, typeOf } from '../plan/expr.js';
+import { type BoundExpr, type ExprMeaning, call, lit, param, typeOf } from '../plan/expr.js';
 import type { CollationName } from '../plan/types.js';
 import type { PlanOp } from '../plan/ops.js';
 import { decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
@@ -353,6 +353,33 @@ export function comparisonConverters(a: SqlOperand, b: SqlOperand): [((v: SqlVal
     ca = (v) => applyTextAffinity(v, real);
   }
   return [ca, cb];
+}
+
+/** An operand of a comparison, in plan terms: its type and its meaning fields (plan/expr.ts `ExprMeaning`). */
+export interface ComparisonOperand {
+  readonly type: StaticType;
+  readonly carries?: ExprMeaning['carries'];
+  readonly affinity?: ExprMeaning['affinity'];
+}
+
+/**
+ * How the engine compares `a` with `b` when they carry these meaning fields (SQLite's rules, which `affinity` and
+ * `carries` describe): the collation the comparison uses (an explicit one first, then a column's, the left operand
+ * before the right), and the conversion to apply to each side first (`affinity_numeric` or `affinity_text`), or null.
+ * A language that writes `affinity` and `carries` builds its comparisons with this, as the engine reads them.
+ */
+export function comparisonRule(a: ComparisonOperand, b: ComparisonOperand): { collation: CollationName; left: 'affinity_numeric' | 'affinity_text' | null; right: 'affinity_numeric' | 'affinity_text' | null } {
+  const operand = (x: ComparisonOperand): SqlOperand => ({
+    type: x.type,
+    collation: x.carries ? collationId(x.carries.collation) : Collation.Binary,
+    collSrc: x.carries ? (x.carries.from === 'explicit' ? CollSrc.Explicit : CollSrc.Column) : CollSrc.None,
+    affinity: x.affinity ?? 'NONE',
+  });
+  const oa = operand(a);
+  const ob = operand(b);
+  const [ca, cb] = comparisonConverters(oa, ob);
+  const name = (c: ((v: SqlValue) => SqlValue) | null): 'affinity_numeric' | 'affinity_text' | null => (c === null ? null : c === applyNumericAffinity ? 'affinity_numeric' : 'affinity_text');
+  return { collation: collationName(comparisonCollation(oa, ob)), left: name(ca), right: name(cb) };
 }
 
 /** A two-argument `sql.*` function with no front-end options; the result has no affinity or collation. */

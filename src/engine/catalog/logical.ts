@@ -10,16 +10,16 @@ import { NAVIGATION, RANKING, WINDOW_ARITY } from '../exec/window.js';
 import type { Catalog, CatalogData, CatalogFunction, CatalogKey, CatalogSettings, CatalogTable, CatalogView, FunctionCatalog } from '../plan/catalog.js';
 import { declaredType, planTypeOfStorage } from '../plan/catalog.js';
 import { type BoundExpr, typeOf } from '../plan/expr.js';
-import type { Source } from '../plan/schema.js';
+import type { Source, TableDef } from '../plan/schema.js';
 import type { CollationName, PlanType } from '../plan/types.js';
 import { Collation, type SqlValue } from '../values.js';
-import { type TableSchema, isColumnar } from './schema.js';
+import { type TableSchema, isColumnar, tableSchemaFromDef } from './schema.js';
 
 /** What the catalog reads of the database. */
 export interface CatalogHost {
   /** Tables and materialized views, main and temp, without the system tables. */
   tables(): readonly TableSchema[];
-  externals(): readonly { name: string; columns: readonly { name: string; declType: string }[] }[];
+  externals(): readonly { name: string; sql: string; columns: readonly { name: string; declType: string }[] }[];
   views(): readonly { name: string; source: Source; columns?: readonly string[]; temp: boolean }[];
   settings(): CatalogSettings;
   /** Changes whenever the schema does: descriptions are kept until then. */
@@ -30,14 +30,15 @@ export interface CatalogHost {
 const COLLATION_NAMES: readonly CollationName[] = ['binary', 'nocase', 'rtrim'];
 const COLLATION_IDS: Readonly<Record<string, Collation>> = { binary: Collation.Binary, nocase: Collation.NoCase, rtrim: Collation.RTrim };
 
-function describeTable(t: TableSchema): CatalogTable {
+/** A table as the catalog describes it. */
+export function describeTable(t: TableSchema): CatalogTable {
   const keys: CatalogKey[] = [];
   const pk = t.indexes.find((ix) => ix.origin === 'pk');
   if (pk) keys.push({ kind: 'primaryKey', columns: pk.columns.map((c) => c.column) });
   else if (t.rowidAlias >= 0) keys.push({ kind: 'primaryKey', columns: [t.rowidAlias] });
   for (const ix of t.indexes) if (ix.origin === 'u') keys.push({ kind: 'unique', columns: ix.columns.map((c) => c.column) });
   return {
-    kind: t.matview ? 'materializedView' : 'table',
+    kind: t.system ? 'system' : t.matview ? 'materializedView' : 'table',
     name: t.name,
     schema: t.temp ? 'temp' : 'main',
     columns: t.columns.map((c) => ({
@@ -59,10 +60,27 @@ function describeTable(t: TableSchema): CatalogTable {
     })),
     storage: isColumnar(t) ? 'columnar' : 'row',
     strict: t.strict,
+    source: { language: t.matview?.language ?? t.language ?? 'sql', text: t.matview?.sql ?? t.sql },
   };
 }
 
-function describeExternal(x: { name: string; columns: readonly { name: string; declType: string }[] }): CatalogTable {
+/**
+ * `def`, a table definition, described as the catalog will describe the table `CREATE TABLE` makes of it: the same
+ * columns, rowid, keys and storage (the engine's own reading of the definition).
+ */
+export function describeTableDef(def: TableDef, source: Source, schema: 'main' | 'temp' = 'main'): CatalogTable {
+  const { table } = tableSchemaFromDef(def, source.text, 0);
+  const d = describeTable({ ...table, ...(source.language !== 'sql' ? { language: source.language } : {}) });
+  // The key indexes are made with the table: its keys come from the definition.
+  const pk = def.keys.find((k) => k.kind === 'primaryKey');
+  const keys: CatalogKey[] = [
+    ...(pk ? [{ kind: 'primaryKey' as const, columns: pk.columns.map((c) => c.column) }] : []),
+    ...def.keys.filter((k) => k.kind === 'unique').map((k) => ({ kind: 'unique' as const, columns: k.columns.map((c) => c.column) })),
+  ];
+  return { ...d, keys, schema, storage: def.storage };
+}
+
+function describeExternal(x: { name: string; sql: string; columns: readonly { name: string; declType: string }[] }): CatalogTable {
   return {
     kind: 'external',
     name: x.name,
@@ -75,6 +93,8 @@ function describeExternal(x: { name: string; columns: readonly { name: string; d
     indexes: [],
     storage: 'row',
     strict: false,
+    // External tables are stored as SQL text (written by the creating language's source editor).
+    source: { language: 'sql', text: x.sql },
   };
 }
 

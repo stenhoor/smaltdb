@@ -3,18 +3,27 @@
  * sources and functions. Read-only, and the same for every language. The planner's physical environment (trees,
  * statistics, spilling, execution state: exec/planner.ts `PhysicalEnv`) is not part of it.
  *
- * Still to change on the way to the language API (ADR 0015 order of work): tables are the engine's `TableSchema`
- * (which carries storage fields too), and functions are looked up through `funcCtx`.
+ * `getTable`, `writeTarget` and `indexTarget` give the engine's `TableSchema` and are being replaced by `table`,
+ * `writeTable` and `indexTable`, which give the catalog's description (ADR 0016 section 7).
  */
 import type { TableSchema } from '../catalog/schema.js';
 import type { StaticType } from '../exec/convert.js';
 import type { FunctionContext } from '../exec/functions.js';
 import type { SqlValue } from '../values.js';
-import type { Catalog } from './catalog.js';
+import type { Catalog, CatalogTable } from './catalog.js';
 import type { Source } from './schema.js';
 
 export interface BindContext {
-  /** A table by name; `schema` 'main' / 'temp' picks that schema when a TEMP table shadows a main one. */
+  /**
+   * A table (or materialized view, or system table) by name, as the catalog describes it; `schema` 'main' / 'temp'
+   * picks that schema when a TEMP table shadows a main one.
+   */
+  table(name: string, schema?: string): CatalogTable | undefined;
+  /** The table a statement writes (see `writeTarget`), as the catalog describes it. */
+  writeTable(name: string, schema?: string): CatalogTable;
+  /** The table CREATE INDEX indexes (see `indexTarget`), as the catalog describes it. */
+  indexTable(name: string, schema?: string): CatalogTable;
+  /** A table by name, as the engine stores it. Being replaced by `table` (ADR 0016 section 7). */
   getTable(name: string, schema?: string): TableSchema | undefined;
   /**
    * The table a statement writes, by name: throws when there is none, or when it may not be written (a view, an

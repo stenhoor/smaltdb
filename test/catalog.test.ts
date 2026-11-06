@@ -8,7 +8,8 @@ import { Database, plan as p } from '../src/engine/index.js';
 import { EngineServer } from '../src/engine/server.js';
 import type { BindContext } from '../src/engine/plan/bind-context.js';
 import type { CatalogData } from '../src/engine/plan/catalog.js';
-import { engineFunctions } from '../src/engine/language-support.js';
+import { comparisonRule, describeTableDef, engineFunctions } from '../src/engine/language-support.js';
+import type { TableDef } from '../src/engine/plan/schema.js';
 import type { Request, Response } from '../src/shared/protocol.js';
 import { until } from './helpers/wait.js';
 
@@ -178,5 +179,71 @@ describe('the same catalog everywhere', () => {
     expect(reply.kind).toBe('ok');
     expect(reply.value.tables.map((t) => t.name).sort()).toEqual(['c', 'mv', 'pair', 't']);
     expect(reply.value.functions.find((f) => f.name === 'cmp_eq')!.traits).toEqual({ compare: '=', inline: '=' });
+  });
+});
+
+describe('tables while binding', () => {
+  it('BindContext gives tables as the catalog describes them, system tables included, refusing what may not be written or indexed', () => {
+    const d = db();
+    const ctx = (d as unknown as { bindContext(): BindContext }).bindContext();
+    expect(ctx.table('t')).toEqual(d.catalog.table('t'));
+    expect(ctx.table('t')!.source).toEqual({ language: 'sql', text: expect.stringMatching(/^CREATE TABLE t\(/) });
+    expect(ctx.table('sqlite_schema')!.kind).toBe('system');
+    expect(ctx.writeTable('t').name).toBe('t');
+    expect(() => ctx.writeTable('v')).toThrow(/cannot modify v because it is a view/);
+    expect(() => ctx.writeTable('sqlite_schema')).toThrow();
+    expect(ctx.indexTable('t').name).toBe('t');
+    expect(() => ctx.indexTable('c')).toThrow(/columnar/);
+    expect(d.catalog.table('mv')!.source).toEqual({ language: 'sql', text: expect.stringMatching(/SELECT count\(\*\)/) });
+  });
+
+  it('counts a TEMP table found with table() or writeTable() as a memory object the statement reads', () => {
+    const d = db();
+    d.exec('CREATE TEMP TABLE scratch(a INT)');
+    const binding = (lookup: (ctx: BindContext) => unknown) => ({ text: '', paramCount: 0, paramNames: [], bind: (ctx: BindContext) => (lookup(ctx), { kind: 'transaction' }) }) as never;
+    expect(d.bindsMemoryObjects(binding((ctx) => ctx.table('scratch')))).toBe(true);
+    expect(d.bindsMemoryObjects(binding((ctx) => ctx.writeTable('scratch')))).toBe(true);
+    expect(d.bindsMemoryObjects(binding((ctx) => ctx.table('t')))).toBe(false);
+  });
+
+  it('follows CREATE INDEX on a table it described', () => {
+    const d = db();
+    const ctx = (d as unknown as { bindContext(): BindContext }).bindContext();
+    expect(ctx.table('pair')!.indexes.map((i) => i.name)).not.toContain('pair_b');
+    d.exec('CREATE INDEX pair_b ON pair(b)');
+    expect(ctx.table('pair')!.indexes.map((i) => i.name)).toContain('pair_b');
+  });
+
+  it('describes a table definition as CREATE TABLE will make it', () => {
+    const col = (name: string, type: string, more: object = {}) => ({ name, declaredType: type, type: p.declaredType(type).storageType, notNull: false, collation: 'binary', ...more });
+    const defs: TableDef[] = [
+      { name: 'a', columns: [col('id', 'INTEGER'), col('s', 'TEXT', { collation: 'nocase', notNull: true })], keys: [{ kind: 'primaryKey', columns: [{ column: 0, desc: false, collation: 'binary' }] }], checks: [], foreignKeys: [], storage: 'row' },
+      { name: 'b', columns: [col('x', 'INT'), col('y', 'VARCHAR(4)')], keys: [{ kind: 'primaryKey', columns: [{ column: 0, desc: false, collation: 'binary' }, { column: 1, desc: false, collation: 'binary' }] }, { kind: 'unique', columns: [{ column: 1, desc: false, collation: 'binary' }] }], checks: [], foreignKeys: [], storage: 'row' },
+      { name: 'c', columns: [col('n', ''), col('r', 'REAL', { default: { text: '0', value: 0, expr: p.lit(0) } })], keys: [], checks: [], foreignKeys: [], storage: 'columnar' },
+    ] as TableDef[];
+    const d = Database.openMemory();
+    for (const def of defs) {
+      const source = { language: 'plan', text: def.name };
+      d.queryPlan({ kind: 'schema', op: { op: 'createTable', temp: false, ifNotExists: false, table: def, source } } as never);
+      const made = d.catalog.table(def.name)!;
+      const { indexes: _a, ...described } = describeTableDef(def, source);
+      const { indexes: _b, ...actual } = made;
+      expect(described, def.name).toEqual(actual);
+    }
+  });
+});
+
+describe('comparison rules', () => {
+  it('give the collation and the conversions a comparison of these operands uses', () => {
+    const intCol = { type: 'int' as const, affinity: 'INTEGER' as const, carries: { collation: 'binary' as const, from: 'column' as const } };
+    const textCol = { type: 'text' as const, affinity: 'TEXT' as const, carries: { collation: 'nocase' as const, from: 'column' as const } };
+    const textLit = { type: 'text' as const };
+    expect(comparisonRule(intCol, textLit)).toEqual({ collation: 'binary', left: null, right: 'affinity_numeric' });
+    expect(comparisonRule(textLit, intCol)).toEqual({ collation: 'binary', left: 'affinity_numeric', right: null });
+    expect(comparisonRule(textCol, { type: 'int' })).toEqual({ collation: 'nocase', left: null, right: 'affinity_text' });
+    expect(comparisonRule(intCol, textCol)).toEqual({ collation: 'binary', left: null, right: 'affinity_numeric' });
+    // An explicit collation wins; TEXT affinity still converts an operand with none.
+    expect(comparisonRule(textCol, { type: 'text', carries: { collation: 'rtrim', from: 'explicit' } })).toEqual({ collation: 'rtrim', left: null, right: 'affinity_text' });
+    expect(comparisonRule(textLit, textLit)).toEqual({ collation: 'binary', left: null, right: null });
   });
 });
