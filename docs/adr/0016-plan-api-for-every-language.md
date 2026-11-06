@@ -1,6 +1,6 @@
 # ADR 0016: The plan API for every language: what smaltdf needs that SQL never asked for
 
-- **Status:** proposed (draft for the owner's review)
+- **Status:** accepted (#102; owner's decisions below, 2026-11-06)
 - **Date:** 2026-11-06
 - **Builds on:** [ADR 0014](0014-shared-plan-layer.md) (shared plan layer), [ADR 0015](0015-smaltql.md) (smaltql and
   the language API)
@@ -234,15 +234,15 @@ Each step is its own PR, with the gates of ADR 0015 §10:
 smaltdf builds on each step as it lands. ADR 0015 step 10 (smaltdf on plans) can start after step 6 with what then
 exists.
 
-## Questions for the owner
+## Owner's decisions (2026-11-06)
 
-1. **Names:** the behaviour-naming scheme in section 1, or another (for example a family prefix per behaviour)?
-2. **Order:** guarantees as in section 4, the cheap ones always and the costly ones on request, or ordered semantics
-   everywhere at some cost?
-3. **Views from smaltdf:** stored as smaltdf's own serialized source and bound late (section 6), or another form?
-4. **Types and the file format:** group `bool` with the next file-format change, or a format change of its own?
-5. **Priority:** the order of work above, or smaltdf-facing steps (catalog, results, order) before the refactors
-   (traits, names, meaning in the plan)?
+1. **Names:** behaviour names, as section 1 proposes (`div_trunc`, `div_float`, `div_floor`, `mod_trunc`, `mod_floor`,
+   `round_half_away`, `round_half_even`, `cmp_eq` …, `eq_strict` …), with the `sql.*` names as aliases until smaltql
+   has moved.
+2. **Order:** the cheap guarantees always, the costly ones on request, as section 4 proposes.
+3. **Views from smaltdf:** stored as smaltdf's own serialized source and bound late by name (section 6).
+4. **Types and the file format:** `bool` is grouped with the next file-format change (section 3).
+5. **Priority:** the order of work as written.
 
 ## Alternatives considered
 
