@@ -12,35 +12,8 @@ export type StaticType = 'int' | 'real' | 'num' | 'text' | 'blob' | 'null' | 'an
 /** Column affinity used for comparisons (SQLite rules). */
 export type Affinity = 'INTEGER' | 'REAL' | 'NUMERIC' | 'TEXT' | 'BLOB' | 'NONE';
 
-export function affinityOfStorage(t: StorageType): Affinity {
-  switch (t) {
-    case 'INTEGER':
-      return 'INTEGER';
-    case 'REAL':
-      return 'REAL';
-    case 'TEXT':
-      return 'TEXT';
-    case 'NUMERIC':
-      return 'NUMERIC';
-    default:
-      return 'BLOB';
-  }
-}
-
-export function staticTypeOfStorage(t: StorageType): StaticType {
-  switch (t) {
-    case 'INTEGER':
-      return 'int';
-    case 'REAL':
-      return 'real';
-    case 'TEXT':
-      return 'text';
-    case 'BLOB':
-      return 'blob';
-    default:
-      return 'any';
-  }
-}
+/** Re-exported from the plan layer, where every language reads them (plan/catalog.ts). */
+export { affinityOfStorage, planTypeOfStorage as staticTypeOfStorage } from '../plan/catalog.js';
 
 const I64_MIN = -(2n ** 63n);
 const I64_MAX = 2n ** 63n - 1n;

@@ -35,6 +35,8 @@ import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import type { ReaderSettings } from '../shared/protocol.js';
+import { logicalCatalog } from './catalog/logical.js';
+import type { Catalog } from './plan/catalog.js';
 import {
   AsyncRequiredError,
   type ConnectionInfo,
@@ -188,7 +190,7 @@ export class Database implements FunctionContext {
   readonly pager: Pager;
   private readonly tables = new Map<string, TableSchema>();
   private readonly indexes = new Map<string, IndexSchema>();
-  private readonly catalog = new Map<string, CatalogEntry>();
+  private readonly catalogEntries = new Map<string, CatalogEntry>();
   private readonly views = new Map<string, ViewSchema>();
   /** M8: connections and external tables (lower-cased names). */
   private readonly connections = new Map<string, ConnectionInfo & { sql: string }>();
@@ -945,13 +947,30 @@ export class Database implements FunctionContext {
     return [...this.tables.values()].map((t) => t.name);
   }
 
+  /**
+   * The logical catalog (ADR 0016 section 7): tables, views and functions described in plan terms, the settings that
+   * change what a statement means, and the engine's help for building plans.
+   */
+  get catalog(): Catalog {
+    return (this.logical ??= logicalCatalog({
+      tables: () => [...this.tables.values(), ...this.shadowedMain.values()].filter((t) => !t.system && !/^(smalt|sqlite)_/i.test(t.name)),
+      externals: () => [...this.externals.values()],
+      views: () => [...[...this.tempViews.values()].map((v) => ({ ...v, temp: true })), ...[...this.views.values()].map((v) => ({ ...v, temp: false }))],
+      settings: () => ({ foreignKeys: this.fk.enabled, workMem: this.spill.workMem, matviewRewrite: this.matviewRewriteOn, parallelAggregates: this.parallelAggregates }),
+      schemaVersion: () => this.schemaVersion,
+      funcCtx: this,
+    }));
+  }
+
+  private logical: Catalog | null = null;
+
   private loadSchema(): void {
     this.tables.clear();
     this.indexes.clear();
     this.views.clear();
     this.connections.clear();
     this.externals.clear();
-    this.catalog.clear();
+    this.catalogEntries.clear();
     this.catalogTable = { ...tableSchemaFromDef(SYSTEM_TABLES.smalt_schema, systemTableSql('smalt_schema'), this.pager.catalogRoot).table, system: true };
     // Opening parses nothing: objects are read from their stored definitions (catalog/stored.ts).
     const rows = this.scanCatalog();
@@ -969,11 +988,11 @@ export class Database implements FunctionContext {
     for (const r of rows) {
       if (r.type === 'connection') {
         const c = def(connectionKey(r.name), 'connection');
-        this.catalog.set(connectionKey(r.name), { type: 'connection', name: r.name, rowid: r.rowid });
+        this.catalogEntries.set(connectionKey(r.name), { type: 'connection', name: r.name, rowid: r.rowid });
         this.connections.set(r.name.toLowerCase(), { name: r.name, options: { ...c.options }, sql: r.sql! });
         continue;
       }
-      this.catalog.set(r.name.toLowerCase(), { type: r.type as CatalogEntry['type'], name: r.name, rowid: r.rowid });
+      this.catalogEntries.set(r.name.toLowerCase(), { type: r.type as CatalogEntry['type'], name: r.name, rowid: r.rowid });
       if (r.type === 'external') {
         const x = def(r.name.toLowerCase(), 'external');
         this.externals.set(r.name.toLowerCase(), { name: r.name, columns: x.columns.map((c) => ({ name: c.name, declType: c.declaredType })), options: { ...x.options }, sql: r.sql! });
@@ -1060,15 +1079,15 @@ export class Database implements FunctionContext {
     const w = this.catalogWriter();
     const rowid = w.newRowid();
     w.writeRow([type, name, tblName, root, sql], rowid);
-    this.catalog.set(key, { type: type as CatalogEntry['type'], name, rowid });
+    this.catalogEntries.set(key, { type: type as CatalogEntry['type'], name, rowid });
     if (def) this.writeDefinition(key, def);
   }
 
   private removeCatalogRow(name: string, key = name.toLowerCase()): void {
-    const e = this.catalog.get(key);
+    const e = this.catalogEntries.get(key);
     if (!e) return;
     this.catalogWriter().deleteRow(e.rowid);
-    this.catalog.delete(key);
+    this.catalogEntries.delete(key);
     this.deleteDefinition(key);
   }
 
@@ -1195,6 +1214,7 @@ export class Database implements FunctionContext {
       externalFunctionColumns: (n, args, named) => this.externalFunctionScan(n, args, named)?.columns,
       isExternalFunction: (n) => this.external.plugins.isExternalFunction(n),
       virtualTable: (schema, n) => this.virtualTable(schema, n),
+      catalog: this.catalog,
       funcCtx: this,
     });
   }
@@ -1206,7 +1226,7 @@ export class Database implements FunctionContext {
     const getTable = (n: string): TableSchema | undefined => this.getTable(n);
     return {
       env: { getTable, openTree: (root) => this.tree(root), funcCtx: this, state: this.state },
-      catalog: { getTable, writeTarget: (n, schema) => this.targetTable(n, schema), indexTarget: (n, schema) => this.indexTarget(n, schema), getView: (n) => this.getView(n), isExternal: (n) => this.externals.has(n.toLowerCase()), funcCtx: this },
+      catalog: { getTable, writeTarget: (n, schema) => this.targetTable(n, schema), indexTarget: (n, schema) => this.indexTarget(n, schema), getView: (n) => this.getView(n), isExternal: (n) => this.externals.has(n.toLowerCase()), catalog: this.catalog, funcCtx: this },
     };
   }
 
@@ -1598,7 +1618,7 @@ export class Database implements FunctionContext {
     const sql = stmt.source.text;
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     if (stmt.temp || stmt.schema?.toLowerCase() === 'temp') throw new SmaltError('SMALT_ERROR', 'materialized views cannot be temporary');
-    if (stmt.ifNotExists && this.catalog.get(stmt.name.toLowerCase())?.type === 'matview') return none;
+    if (stmt.ifNotExists && this.catalogEntries.get(stmt.name.toLowerCase())?.type === 'matview') return none;
     const tempDep = this.tempDependency(stmt.source);
     if (tempDep) throw new SmaltError('SMALT_ERROR', `materialized view ${stmt.name} cannot reference TEMP object ${tempDep}`);
     const opts = stmt.options ?? {};
@@ -1854,7 +1874,7 @@ export class Database implements FunctionContext {
   }
 
   private setCatalogRoot(name: string, root: number): void {
-    const e = this.catalog.get(name.toLowerCase())!;
+    const e = this.catalogEntries.get(name.toLowerCase())!;
     const w = this.catalogWriter();
     const row = w.readRow(e.rowid)!;
     row[3] = root;
@@ -2643,7 +2663,7 @@ export class Database implements FunctionContext {
   private checkNewName(name: string, kind: string): void {
     const lower = name.toLowerCase();
     if (lower.startsWith('smalt_') || lower.startsWith('sqlite_')) throw new SmaltError('SMALT_ERROR', `object name reserved for internal use: ${name}`);
-    const existing = this.catalog.get(lower);
+    const existing = this.catalogEntries.get(lower);
     const label = (t: string): string => (t === 'external' ? 'external table' : t === 'matview' ? 'materialized view' : t);
     if (existing) throw new SmaltError('SMALT_ERROR', `${label(existing.type === kind ? kind : existing.type)} ${name} already exists`);
   }
@@ -2817,7 +2837,7 @@ export class Database implements FunctionContext {
       this.schemaVersion++; // re-plan statements; nothing is stored
       return none;
     }
-    if (stmt.ifNotExists && this.catalog.get(stmt.name.toLowerCase())?.type === 'view') return none;
+    if (stmt.ifNotExists && this.catalogEntries.get(stmt.name.toLowerCase())?.type === 'view') return none;
     this.checkNewName(stmt.name, 'view');
     this.dirtySchema = true;
     // Like SQLite, the body is not resolved until the view is used (it may reference tables created later).
@@ -2839,7 +2859,7 @@ export class Database implements FunctionContext {
       if (columnar) throw new SmaltError('SMALT_UNSUPPORTED', 'TEMP tables cannot be columnar');
       return this.createTempTable(stmt);
     }
-    if (stmt.ifNotExists && this.catalog.has(stmt.table.name.toLowerCase())) return none;
+    if (stmt.ifNotExists && this.catalogEntries.has(stmt.table.name.toLowerCase())) return none;
     if (!internal) this.checkNewName(stmt.table.name, 'table');
     this.dirtySchema = true;
     const root = BTree.create(this.pager);
@@ -2926,7 +2946,7 @@ export class Database implements FunctionContext {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const stmt = op.index;
     const sql = op.source.text;
-    if (op.ifNotExists && this.catalog.has(stmt.name.toLowerCase())) return none;
+    if (op.ifNotExists && this.catalogEntries.has(stmt.name.toLowerCase())) return none;
     const table = this.indexTarget(stmt.table, op.schema);
     if (table.temp) {
       if (this.indexes.has(stmt.name.toLowerCase())) throw new SmaltError('SMALT_ERROR', `index ${stmt.name} already exists`);
@@ -3101,7 +3121,7 @@ export class Database implements FunctionContext {
   private drop(stmt: Extract<SchemaOp, { op: 'drop' }>): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const lower = stmt.name.toLowerCase();
-    const existing = this.catalog.get(lower);
+    const existing = this.catalogEntries.get(lower);
     const kindOf = (t: CatalogEntry['type']): string => (t === 'matview' ? 'materialized view' : t === 'external' ? 'external table' : t);
     if (stmt.objectType === 'connection') return this.dropConnection(stmt);
     if (existing && stmt.objectType !== 'index' && existing.type !== 'index' && kindOf(existing.type) !== stmt.objectType) {
@@ -3323,7 +3343,7 @@ export class Database implements FunctionContext {
   private renameTableDefs(table: TableSchema, newName: string, defs: Map<string, StoredDef>, change: AlterChange): void {
     const lowerNew = newName.toLowerCase();
     if (lowerNew.startsWith('smalt_') || lowerNew.startsWith('sqlite_')) throw new SmaltError('SMALT_ERROR', `object name reserved for internal use: ${newName}`);
-    if (this.catalog.has(lowerNew) && lowerNew !== table.name.toLowerCase()) {
+    if (this.catalogEntries.has(lowerNew) && lowerNew !== table.name.toLowerCase()) {
       throw new SmaltError('SMALT_ERROR', `there is already another table or index with this name: ${newName}`);
     }
     const old = table.name;

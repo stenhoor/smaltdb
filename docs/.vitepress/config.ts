@@ -66,6 +66,7 @@ export default defineConfig({
           { text: 'The plan format', link: '/reference/engine/plans' },
           { text: 'Running plans', link: '/reference/engine/running' },
           { text: 'Schema definitions', link: '/reference/engine/schema' },
+          { text: 'The catalog', link: '/reference/engine/catalog' },
           { text: 'Writing a language', link: '/reference/engine/languages' },
         ],
       },

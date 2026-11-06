@@ -43,6 +43,8 @@ export type Request = { id: number } & (
   | { op: 'stmtRun'; stmt: number; params?: Params }
   | { op: 'stmtQuery'; stmt: number; params?: Params; batchSize?: number; credit?: number }
   | { op: 'finalize'; stmt: number }
+  /** The logical catalog as plain data (engine/plan/catalog.ts `CatalogData`), in the reply's `value`. */
+  | { op: 'catalog' }
   /**
    * End this session's transaction (db.transaction()): COMMIT (`commit`) or ROLLBACK. If a request of
    * the session already ended it, the reply's `ended` says how instead.

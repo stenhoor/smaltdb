@@ -10,6 +10,7 @@ import type { TableSchema } from '../catalog/schema.js';
 import type { StaticType } from '../exec/convert.js';
 import type { FunctionContext } from '../exec/functions.js';
 import type { SqlValue } from '../values.js';
+import type { Catalog } from './catalog.js';
 import type { Source } from './schema.js';
 
 export interface BindContext {
@@ -37,5 +38,7 @@ export interface BindContext {
   isExternalFunction?(name: string): boolean;
   /** Virtual tables: `information_schema.<name>`, the TEMP catalog, table-valued functions (schema undefined). */
   virtualTable?(schema: string | undefined, name: string): { columns: { name: string; type: StaticType }[] } | undefined;
+  /** The logical catalog: tables and functions in plan terms, result types and constant evaluation (plan/catalog.ts). */
+  catalog: Catalog;
   funcCtx: FunctionContext;
 }

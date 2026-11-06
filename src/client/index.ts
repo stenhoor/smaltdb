@@ -4,6 +4,7 @@
  */
 import type { SqlValue } from '../engine/values.js';
 import { encodeDataJSON } from '../engine/plan/codec.js';
+import type { CatalogData } from '../engine/plan/catalog.js';
 import type { PlanStatementInput } from '../engine/plan/statement.js';
 import { PLAN_FORMAT_VERSION } from '../engine/plan/types.js';
 import { type BusMessage, type Params, type Request, type RequestBody, type Response, type WireColumn, columnValue } from '../shared/protocol.js';
@@ -420,6 +421,15 @@ export class Database implements Queryable {
    */
   queryPlan<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(stmt: PlanStatementInput, params?: PlanParams, options: QueryOptions & { rowMode?: M } = {}): Promise<QueryResultFor<M, T>> {
     return this.afterTransaction(() => this.rawQueryPlan(stmt, params, options)) as Promise<QueryResultFor<M, T>>;
+  }
+
+  /**
+   * The logical catalog as plain data (ADR 0016 section 7): tables, materialized views and external tables with their
+   * columns in plan terms, views, functions with their metadata, and settings. A copy taken now: read it again after
+   * a schema change.
+   */
+  async catalog(): Promise<CatalogData> {
+    return ((await this.request({ op: 'catalog' })) as { value: CatalogData }).value;
   }
 
   /** Prepare a statement given as plan data (see queryPlan). Its parameters are positional. */
