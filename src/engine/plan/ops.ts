@@ -61,7 +61,15 @@ export type JoinKind = 'inner' | 'left' | 'right' | 'full' | 'semi' | 'anti' | '
  */
 export type ConflictAction = 'rollback' | 'abort' | 'fail' | 'ignore' | 'replace';
 
-export type PlanOp =
+/**
+ * `decorrelate: false` on an operation: the planner does not decorrelate the subqueries of this plan (SQL marks a
+ * SELECT whose views or FROM subqueries it merged, as decorrelation reads a subquery as it was written).
+ */
+export interface OpMeaning {
+  readonly decorrelate?: false;
+}
+
+export type PlanOp = OpMeaning & (
   /**
    * Rows of a table: `columns` lists table column indexes, -1 for the rowid. `db` names the schema when the query
    * did or the table is TEMP; `indexedBy` is SQL's INDEXED BY name, or null for NOT INDEXED.
@@ -160,4 +168,5 @@ export type PlanOp =
       readonly order: readonly SortKey[];
       readonly frame: WindowFrame;
       readonly calls: readonly WindowCall[];
-    };
+    }
+);

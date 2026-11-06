@@ -84,7 +84,7 @@ describe('EngineServer', () => {
     ];
     await until('the errors', () => bad.every((r) => t.done('tab-b', r)));
     expect(bad.map((r) => t.of('tab-b', r)[0])).toEqual([
-      expect.objectContaining({ kind: 'error', code: 'SMALT_PLAN', message: expect.stringMatching(/plan format version 1 is not supported/) }),
+      expect.objectContaining({ kind: 'error', code: 'SMALT_PLAN', message: expect.stringMatching(new RegExp(`plan format version ${PLAN_FORMAT_VERSION + 1} is not supported`)) }),
       expect.objectContaining({ kind: 'error', code: 'SMALT_PLAN', message: 'the plan is not valid JSON' }),
       expect.objectContaining({ kind: 'error', code: 'SMALT_PLAN', message: expect.stringMatching(/nope/) }),
     ]);

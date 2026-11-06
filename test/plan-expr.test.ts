@@ -18,7 +18,7 @@ describe('plan expressions', () => {
     expect(printExpr({ k: 'and', args: [lit(1), { k: 'isNull', arg: lit(null), not: true }] })).toBe('(1 and NULL is not null)');
     expect(typeOf(lit(1.5))).toBe('real');
     expect(typeOf(lit(2n))).toBe('int');
-    expect(PLAN_FORMAT_VERSION).toBe(0);
+    expect(PLAN_FORMAT_VERSION).toBe(1); // 1: meaning fields replace version 0's $sql / $flattened (ADR 0016 section 2)
   });
 });
 
