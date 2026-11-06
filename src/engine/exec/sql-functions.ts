@@ -8,6 +8,7 @@
  * comparison, which operand converts by affinity, the probe's affinity for IN) arrives in `SqlCompileOptions`, so
  * these closures are the ones the closure compiler always built: moving them here changes no result and no closure.
  */
+import type { FnTraits } from './traits.js';
 import { SmaltError } from '../errors.js';
 import { Collation, type SqlValue, compareValues, normalizeInt } from '../values.js';
 import {
@@ -55,6 +56,8 @@ export interface SqlFunction {
   /** Number of arguments, or [min, max] (max -1: any number). */
   readonly arity: number | readonly [number, number];
   compile(args: SqlArg[], options: SqlCompileOptions): { fn: Fn; type: StaticType };
+  /** What the planner and code generation know about it (exec/traits.ts). */
+  readonly traits?: FnTraits;
 }
 
 const I64_MIN = -(2n ** 63n);
@@ -534,18 +537,43 @@ function inListFn(args: SqlArg[], options: SqlCompileOptions): Fn {
 
 // ------------------------------------------------------------------ the registry
 
-const fixed = (name: string, arity: SqlFunction['arity'], compile: SqlFunction['compile']): [string, SqlFunction] => [name, { name, arity, compile }];
+const fixed = (name: string, arity: SqlFunction['arity'], compile: SqlFunction['compile'], traits?: FnTraits): [string, SqlFunction] => [name, traits ? { name, arity, compile, traits } : { name, arity, compile }];
+
+/** The traits of SQL's comparison operators: all compare in SQLite's value order; IS / IS NOT are not inlined. */
+const COMPARISON_TRAITS: Readonly<Record<string, FnTraits>> = {
+  '=': { compare: '=', inline: '=' },
+  '!=': { compare: '!=', inline: '!=' },
+  '<': { compare: '<', inline: '<' },
+  '<=': { compare: '<=', inline: '<=' },
+  '>': { compare: '>', inline: '>' },
+  '>=': { compare: '>=', inline: '>=' },
+  IS: { compare: 'IS' },
+  'IS NOT': { compare: 'IS NOT' },
+};
+
+const ARITHMETIC_TRAITS: Readonly<Record<string, FnTraits>> = {
+  '+': { inline: '+', offset: 1 },
+  '-': { inline: '-', offset: -1 },
+  '*': { inline: '*' },
+  '/': { inline: '/' },
+  '%': { inline: '%' },
+};
 
 export const SQL_FUNCTIONS: ReadonlyMap<string, SqlFunction> = new Map<string, SqlFunction>([
   ...Object.entries(COMPARISON_FUNCTIONS).map(([op, name]) =>
-    fixed(name, 2, (args, o) => ({ fn: comparisonFn(op, args[0], args[1], o.collation ?? Collation.Binary), type: 'int' })),
+    fixed(name, 2, (args, o) => ({ fn: comparisonFn(op, args[0], args[1], o.collation ?? Collation.Binary), type: 'int' }), COMPARISON_TRAITS[op]),
   ),
-  ...Object.entries(ARITHMETIC_FUNCTIONS).map(([op, name]) => fixed(name, 2, (args) => arithmeticFn(op, args[0], args[1]))),
+  ...Object.entries(ARITHMETIC_FUNCTIONS).map(([op, name]) => fixed(name, 2, (args) => arithmeticFn(op, args[0], args[1]), ARITHMETIC_TRAITS[op])),
   ...Object.entries(BITWISE_FUNCTIONS).map(([op, name]) => fixed(name, 2, (args) => ({ fn: bitwiseFn(op, args[0], args[1]), type: 'int' }))),
-  fixed('sql.neg', 1, ([x]) => {
-    const f = x.fn;
-    return { fn: (r) => negate(f(r)), type: isNumericType(x.type) ? x.type : 'num' };
-  }),
+  fixed(
+    'sql.neg',
+    1,
+    ([x]) => {
+      const f = x.fn;
+      return { fn: (r) => negate(f(r)), type: isNumericType(x.type) ? x.type : 'num' };
+    },
+    { inline: 'neg', negation: true },
+  ),
   fixed('sql.bitnot', 1, ([x]) => {
     const f = x.fn;
     return {
@@ -584,9 +612,9 @@ export const SQL_FUNCTIONS: ReadonlyMap<string, SqlFunction> = new Map<string, S
       type: 'text',
     };
   }),
-  fixed('sql.like', [2, 3], (args, o) => ({ fn: likeFn(false, args, o.negated ?? false), type: 'int' })),
-  fixed('sql.glob', [2, 3], (args, o) => ({ fn: likeFn(true, args, o.negated ?? false), type: 'int' })),
-  fixed('sql.in_list', [1, -1], (args, o) => ({ fn: inListFn(args, o), type: 'int' })),
+  fixed('sql.like', [2, 3], (args, o) => ({ fn: likeFn(false, args, o.negated ?? false), type: 'int' }), { pattern: true }),
+  fixed('sql.glob', [2, 3], (args, o) => ({ fn: likeFn(true, args, o.negated ?? false), type: 'int' }), { pattern: true }),
+  fixed('sql.in_list', [1, -1], (args, o) => ({ fn: inListFn(args, o), type: 'int' }), { inList: true }),
   fixed('sql.cast_integer', 1, ([x]) => {
     const f = x.fn;
     return { fn: (r) => castToInteger(f(r)), type: 'int' };
@@ -610,15 +638,25 @@ export const SQL_FUNCTIONS: ReadonlyMap<string, SqlFunction> = new Map<string, S
     return { fn: (r) => castToNumeric(f(r)), type: 'num' };
   }),
   // The affinity conversions SQLite applies to a comparison operand (§4.2), as values in their own right.
-  fixed('sql.affinity_numeric', 1, ([x]) => {
-    const f = x.fn;
-    return { fn: (r) => applyNumericAffinity(f(r)), type: x.type };
-  }),
-  fixed('sql.affinity_text', 1, ([x]) => {
-    const f = x.fn;
-    const real = x.type === 'real';
-    return { fn: (r) => applyTextAffinity(f(r), real), type: x.type };
-  }),
+  fixed(
+    'sql.affinity_numeric',
+    1,
+    ([x]) => {
+      const f = x.fn;
+      return { fn: (r) => applyNumericAffinity(f(r)), type: x.type };
+    },
+    { comparisonConversion: true },
+  ),
+  fixed(
+    'sql.affinity_text',
+    1,
+    ([x]) => {
+      const f = x.fn;
+      const real = x.type === 'real';
+      return { fn: (r) => applyTextAffinity(f(r), real), type: x.type };
+    },
+    { comparisonConversion: true },
+  ),
 ]);
 
 /** The named function `name`; throws for a name the registry doesn't have (a bug in a front end). */
