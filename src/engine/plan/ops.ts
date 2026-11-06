@@ -64,7 +64,21 @@ export interface WindowCall {
   readonly collation: CollationName;
 }
 
-export type JoinKind = 'inner' | 'left' | 'right' | 'full' | 'semi' | 'anti' | 'cross';
+export type JoinKind = 'inner' | 'left' | 'right' | 'full' | 'semi' | 'anti' | 'cross' | 'asof';
+
+/**
+ * An as-of join's match (ADR 0016 section 5): each left row takes the right row whose key is nearest its own in
+ * `direction` (`backward`: the largest right key at or below the left's; `forward`: the smallest at or above; `nearest`:
+ * the closest, ties to the smaller key), within `tolerance` when given, among the right rows the join's `on` matches.
+ */
+export interface AsofMatch {
+  /** The left row's key (over input 0) and the right row's (over input 1). */
+  readonly left: PlanExpr;
+  readonly right: PlanExpr;
+  readonly direction: 'backward' | 'forward' | 'nearest';
+  /** The largest distance between the keys, an expression over no columns. */
+  readonly tolerance?: PlanExpr;
+}
 
 /**
  * What a write does when a row violates a constraint, for the whole statement (SQL's `INSERT OR …` / `UPDATE OR …`).
@@ -140,6 +154,8 @@ export type PlanOp = OpMeaning & (
       readonly on?: PlanExpr;
       /** Keep the left input's order, and for each left row its matches in the right input's order (ADR 0016 section 4). */
       readonly ordered?: true;
+      /** An `asof` join's match: required for that kind, and for no other. */
+      readonly asof?: AsofMatch;
     }
   | { readonly op: 'setop'; readonly kind: 'union' | 'unionAll' | 'intersect' | 'except'; readonly inputs: readonly [PlanOp, PlanOp]; readonly collations: readonly CollationName[] }
   | { readonly op: 'sort'; readonly input: PlanOp; readonly keys: readonly SortKey[] }

@@ -51,7 +51,7 @@ Each operation's output columns, in order:
 | `pivot` | `input`, `keys`, `on`, `collation`, `values`, `aggs`, `ordered?` | its keys, then one column per value and aggregate call (value by value) |
 | `unpivot` | `input`, `keep` (columns kept), `columns` (columns that become rows), `names` (one per column), `type` (of the values) | the kept columns, then each row's column name (`text`), then its value |
 | `distinct` | `input`, `collations` (one per column), `ordered?` (`'first'`), `on?`, `keep?` (`'first'` / `'last'`) | its input's |
-| `join` | `kind`, `inputs` (left, right), `on?`, `ordered?` (`true`) | the left input's, then the right's (`semi` / `anti`: the left's only) |
+| `join` | `kind`, `inputs` (left, right), `on?`, `ordered?` (`true`), `asof?` (kind `asof`) | the left input's, then the right's (`semi` / `anti`: the left's only) |
 | `aggregate` | `input`, `keys`, `aggs`, `carry`, `ordered?` (`'first'`) | its keys, then one per aggregate call, then the carried columns |
 | `window` | `input`, `partition`, `order`, `frame`, `calls` | its input's, then one per window call |
 | `setop` | `kind` (`union` / `unionAll` / `intersect` / `except`), `inputs`, `collations` | the first input's |
@@ -61,8 +61,16 @@ Each operation's output columns, in order:
 | `update` | `table`, `db`, `input`, `rowid`, `sets`, `from`, `onConflict?`, `returning?` | the RETURNING rows |
 | `delete` | `table`, `db`, `input`, `rowid`, `returning?` | the RETURNING rows |
 
-**Joins.** `kind` is `inner`, `left`, `right`, `full`, `cross`, `semi` (left rows with a match) or `anti` (left rows
-without one). The condition reads input 0 (the left side) and input 1 (the right side).
+**Joins.** `kind` is `inner`, `left`, `right`, `full`, `cross`, `semi` (left rows with a match), `anti` (left rows
+without one) or `asof`. The condition reads input 0 (the left side) and input 1 (the right side).
+
+**As-of joins.** A join of kind `asof` gives each left row, in left order, the right row whose key is nearest its own,
+or NULLs when none is. `asof` is `{ left, right, direction, tolerance? }`: the left row's key (over input 0), the right
+row's (over input 1), and `direction`: `backward` takes the largest right key at or below the left's, `forward` the
+smallest at or above, `nearest` the closest (ties to the smaller key). `tolerance`, an expression over no columns, is
+the largest distance allowed. `on` limits the candidates (for example, the same symbol). The engine runs it as a join
+under these conditions, ranked per left row: with an equality in `on` it uses that to find candidates; without one,
+it compares every pair of rows.
 
 **Order.** These operations keep an order, whatever plan the engine picks:
 
@@ -222,7 +230,7 @@ NULLs first). They check nothing: the engine validates every plan it is given, b
 |---|---|
 | Expressions | `col(input, index, type, collation?, depth?)`, `lit(value, type?)`, `value(v)`, `param(index, type?)`, `call(fn, args, type, collation?)`, `cast(fn, arg, to)`, `and(...)`, `or(...)`, `not(x)`, `isNull(x)`, `isNotNull(x)`, `caseWhen(whens, type, otherwise?)`, `scalar(plan, type, collation?)`, `exists(plan)`, `inPlan(probe, plan, collation?)` |
 | Sort keys, aggregates | `asc(expr, options?)`, `desc(expr, options?)`, `agg(fn, args, type, options?)` |
-| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `pivot(input, keys, on, values, aggs, options?)`, `unpivot(input, keep, columns, names, type?)`, `setop(kind, left, right, width)` |
+| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `asofJoin(left, right, leftKey, rightKey, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `pivot(input, keys, on, values, aggs, options?)`, `unpivot(input, keep, columns, names, type?)`, `setop(kind, left, right, width)` |
 | Writes | `append(table, input, columns, options?)`, `update(table, input, rowid, sets, options?)`, `remove(table, input, rowid, options?)` |
 
 `window`, `source`, `iterate` and `working` have no builder yet: write them as objects.

@@ -2598,7 +2598,8 @@ export function planWidth(op: PlanOp): number {
   }
 }
 
-const JOIN_TYPES: Readonly<Record<JoinKind, JoinType>> = { inner: 'INNER', cross: 'INNER', left: 'LEFT', right: 'RIGHT', full: 'FULL', semi: 'INNER', anti: 'INNER' };
+// asof: rewritten as a left join before planning (exec/plan-normalize.ts).
+const JOIN_TYPES: Readonly<Record<JoinKind, JoinType>> = { inner: 'INNER', cross: 'INNER', left: 'LEFT', right: 'RIGHT', full: 'FULL', semi: 'INNER', anti: 'INNER', asof: 'LEFT' };
 
 /** The FROM item the planner registers for a plan's table or source (named by position: names are resolved). */
 /**

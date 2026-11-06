@@ -51,6 +51,7 @@ function rewriteAll(x: unknown): unknown {
   const op = (out ?? o) as unknown as PlanOp;
   switch (op.op) {
     case 'join':
+      if (op.kind === 'asof') return rewriteAll(asofJoin(op));
       return op.kind === 'semi' || op.kind === 'anti' ? semiJoin(op) : op.ordered ? orderedJoin(op) : op;
     case 'aggregate': {
       const positioned = firstLast(op);
@@ -182,6 +183,71 @@ function unpivotRows(op: Op<'unpivot'>): PlanOp {
     type: op.type,
   };
   return { op: 'project', input: crossed, exprs: [...op.keep.map((i) => column(i)), column(w + 1, 'text'), value], ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+}
+
+/**
+ * An as-of join as the left input (numbered) left-joined to the right rows its match allows, the best of them per left
+ * row ranked by a window (closest key first), the left order restored, and the numbers dropped.
+ */
+function asofJoin(op: Op<'join'>): PlanOp {
+  const m = op.asof!;
+  const [left, right] = op.inputs;
+  const l = planWidth(left);
+  const r = planWidth(right);
+  const lk = m.left;
+  const rk = m.right;
+  const conds: PlanExpr[] = [];
+  if (op.on) conds.push(op.on);
+  const distance = (a: PlanExpr, b: PlanExpr): PlanExpr => minus(a, b);
+  if (m.direction === 'backward') conds.push(cmp('cmp_le', rk, lk));
+  if (m.direction === 'forward') conds.push(cmp('cmp_ge', rk, lk));
+  if (m.direction === 'nearest') conds.push({ k: 'isNull', arg: minus(lk, rk), not: true });
+  if (m.tolerance) {
+    const gap: PlanExpr = m.direction === 'backward' ? distance(lk, rk) : m.direction === 'forward' ? distance(rk, lk) : { k: 'call', fn: 'abs', args: [minus(lk, rk)], type: 'any' };
+    conds.push(cmp('cmp_le', gap, m.tolerance));
+  }
+  // The joined row: the left columns, its number (at l), then the right columns (from l + 1).
+  const joined: PlanOp = { op: 'join', kind: 'left', inputs: [numbered(left), right], on: conds.length === 1 ? conds[0] : { k: 'and', args: conds } };
+  const shiftRight = (e: PlanExpr): PlanExpr => joinedColumns(e, l + 1);
+  const lkJ = joinedColumns(lk, l + 1);
+  const rkJ = shiftRight(rk);
+  const order: SortKey[] =
+    m.direction === 'backward'
+      ? [{ expr: rkJ, desc: true, nullsFirst: false, collation: 'binary' }]
+      : m.direction === 'forward'
+        ? [{ expr: rkJ, desc: false, nullsFirst: false, collation: 'binary' }]
+        : [
+            { expr: { k: 'call', fn: 'abs', args: [minus(lkJ, rkJ)], type: 'any' }, desc: false, nullsFirst: false, collation: 'binary' },
+            { expr: rkJ, desc: false, nullsFirst: false, collation: 'binary' },
+          ];
+  const width = l + 1 + r;
+  const ranked: PlanOp = { op: 'window', input: joined, partition: [{ expr: column(l, 'int'), collation: 'binary' }], order, frame: WHOLE, calls: [ROW_NUMBER] };
+  const best: PlanOp = { op: 'filter', input: ranked, pred: cmp('cmp_eq', column(width, 'int'), { k: 'lit', value: 1, type: 'int' }) };
+  const inOrder: PlanOp = { op: 'sort', input: best, keys: [{ expr: column(l, 'int'), desc: false, nullsFirst: false, collation: 'binary' }] };
+  return { op: 'project', input: inOrder, exprs: [...range(0, l), ...range(l + 1, l + 1 + r)], ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+}
+
+/** A join expression (input 0 the left, 1 the right) over the joined row: the right's columns from `at`. */
+function joinedColumns(e: PlanExpr, at: number): PlanExpr {
+  switch (e.k) {
+    case 'col':
+      return e.depth === 0 && e.input === 1 ? { ...e, input: 0, index: e.index + at } : e;
+    case 'call':
+    case 'and':
+    case 'or':
+      return { ...e, args: e.args.map((a) => joinedColumns(a, at)) };
+    case 'cast':
+    case 'not':
+    case 'isNull':
+      return { ...e, arg: joinedColumns(e.arg, at) };
+    case 'case':
+      return { ...e, whens: e.whens.map((w) => ({ when: joinedColumns(w.when, at), then: joinedColumns(w.then, at) })), else: joinedColumns(e.else, at) };
+    case 'subquery':
+    case 'inSubquery':
+      throw new SmaltError('SMALT_UNSUPPORTED', 'an asof join whose keys hold a subquery is not supported yet');
+    default:
+      return e;
+  }
 }
 
 /** A distinct as an aggregate grouped by every column, with no aggregate calls. */

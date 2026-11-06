@@ -84,6 +84,18 @@ export const join = (kind: JoinKind, left: PlanOp, right: PlanOp, on?: PlanExpr,
   ...(on ? { on } : {}),
   ...(options.ordered ? { ordered: true as const } : {}),
 });
+/**
+ * An as-of join: each left row, in left order, with the right row whose `rightKey` is nearest its `leftKey` in
+ * `direction` (within `tolerance`) among those `on` matches, or NULLs when none does. Keys read input 0 (left) and 1.
+ */
+export const asofJoin = (left: PlanOp, right: PlanOp, leftKey: PlanExpr, rightKey: PlanExpr, options: { direction?: 'backward' | 'forward' | 'nearest'; tolerance?: PlanExpr | number; on?: PlanExpr } = {}): Op<'join'> => ({
+  op: 'join',
+  kind: 'asof',
+  inputs: [left, right],
+  ...(options.on ? { on: options.on } : {}),
+  asof: { left: leftKey, right: rightKey, direction: options.direction ?? 'backward', ...(options.tolerance !== undefined ? { tolerance: expr(options.tolerance) } : {}) },
+});
+
 /** Rows grouped by `keys`: outputs the keys, then the aggregates, then the carried columns. */
 export const aggregate = (input: PlanOp, keys: readonly PlanExpr[], aggs: readonly AggCall[], options: { collations?: readonly CollationName[]; carry?: readonly PlanExpr[]; ordered?: 'first' } = {}): Op<'aggregate'> => ({
   op: 'aggregate',

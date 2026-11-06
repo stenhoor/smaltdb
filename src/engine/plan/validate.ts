@@ -319,6 +319,17 @@ class Validator {
         if (!JOIN_KINDS.has(o.kind)) this.fail(`unknown join kind ${JSON.stringify(o.kind)}`, 'kind');
         optEx(o.on, reading(l, r), 'on');
         if (o.ordered !== undefined && o.ordered !== true) this.fail('expected true', 'ordered');
+        if ((o.kind === 'asof') !== (o.asof !== undefined)) this.fail(o.kind === 'asof' ? 'an asof join needs its match { left, right, direction }' : 'only an asof join has a match', 'asof');
+        if (o.asof) {
+          const m = o.asof;
+          this.under('asof', undefined, () => {
+            if (!m || typeof m !== 'object') this.fail('expected { left, right, direction, tolerance? }');
+            ex(m.left, reading(l, r), 'left');
+            ex(m.right, reading(l, r), 'right');
+            if (m.direction !== 'backward' && m.direction !== 'forward' && m.direction !== 'nearest') this.fail(`unknown direction ${JSON.stringify(m.direction)}`, 'direction');
+            optEx(m.tolerance, reading(), 'tolerance');
+          });
+        }
         return o.kind === 'semi' || o.kind === 'anti' ? l : l + r;
       }
       case 'setop': {
@@ -868,5 +879,5 @@ export function validateSchemaOp(op: unknown, catalog: ValidateCatalog): void {
 const PATH: (string | number)[] = new Array<string | number>(2 * MAX_PLAN_DEPTH + 8).fill('');
 
 const CONFLICT_ACTIONS = new Set(['rollback', 'abort', 'fail', 'ignore', 'replace']);
-const JOIN_KINDS = new Set(['inner', 'left', 'right', 'full', 'semi', 'anti', 'cross']);
+const JOIN_KINDS = new Set(['inner', 'left', 'right', 'full', 'semi', 'anti', 'cross', 'asof']);
 const SETOP_KINDS = new Set(['union', 'unionAll', 'intersect', 'except']);
