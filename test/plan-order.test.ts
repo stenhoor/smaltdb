@@ -140,5 +140,8 @@ describe('semi and anti joins keep the left order', () => {
     const q = p.project(p.limit(p.scan('r', [0, 1]), 20), [p.col(0, 0, 'int'), { k: 'subquery', mode: 'scalar', plan: perRow, type: 'int', collation: 'binary' }]);
     const expected = ids(20).map((i) => [i, ids(2000).filter((j) => lk(j) === (i * 31) % 200).length]);
     expect(d.queryPlan(q).rows).toEqual(expected);
+    // Nested in an aggregate call's argument.
+    const inAgg = p.aggregate(p.limit(p.scan('r', [0, 1]), 20), [], [p.agg('sum', [{ k: 'subquery', mode: 'scalar', plan: perRow, type: 'int', collation: 'binary' }], 'int')]);
+    expect(d.queryPlan(inAgg).rows).toEqual([[expected.reduce((s, r) => s + r[1], 0)]]);
   });
 });

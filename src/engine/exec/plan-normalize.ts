@@ -23,16 +23,38 @@ export function normalizePlan(op: PlanOp): PlanOp {
 /**
  * `op` with its semi and anti joins as filters: `semi(L, R, on)` is L where some row of R matches (`exists`), `anti`
  * where none does. A filter keeps L's order (ADR 0016 section 4), and the planner decorrelates the subquery into a hash
- * semi-join where it can.
+ * semi-join where it can. Plans are plain data, so this walks every field (inputs, and plans nested in any expression)
+ * and copies only what changes: a plan without such joins comes back as it was.
  */
 function semiJoins(op: PlanOp): PlanOp {
-  const kids = mapInputs(op, semiJoins);
-  if (kids.op !== 'join' || (kids.kind !== 'semi' && kids.kind !== 'anti')) return kids;
-  const [left, right] = kids.inputs;
-  const inner: PlanOp = kids.on ? { op: 'filter', input: right, pred: correlated(kids.on, 0) } : right;
+  return rewriteSemiJoins(op) as PlanOp;
+}
+
+function rewriteSemiJoins(x: unknown): unknown {
+  if (x === null || typeof x !== 'object') return x;
+  if (Array.isArray(x)) {
+    let out: unknown[] | undefined;
+    for (let i = 0; i < x.length; i++) {
+      const r = rewriteSemiJoins(x[i]);
+      if (r !== x[i]) (out ??= x.slice())[i] = r;
+    }
+    return out ?? x;
+  }
+  const o = x as Record<string, unknown>;
+  if (o.k === 'native') return x;
+  let out: Record<string, unknown> | undefined;
+  for (const key in o) {
+    if (key === 'origin') continue; // a caller's data, whatever its shape
+    const r = rewriteSemiJoins(o[key]);
+    if (r !== o[key]) (out ??= { ...o })[key] = r;
+  }
+  const op = (out ?? o) as unknown as PlanOp;
+  if (op.op !== 'join' || (op.kind !== 'semi' && op.kind !== 'anti')) return op;
+  const [left, right] = op.inputs;
+  const inner: PlanOp = op.on ? { op: 'filter', input: right, pred: correlated(op.on, 0) } : right;
   const exists: PlanExpr = { k: 'subquery', mode: 'exists', plan: inner, type: 'int', collation: 'binary' };
-  const pred: PlanExpr = kids.kind === 'semi' ? exists : { k: 'not', arg: exists };
-  return { op: 'filter', input: left, pred, ...(kids.origin !== undefined ? { origin: kids.origin } : {}) };
+  const pred: PlanExpr = op.kind === 'semi' ? exists : { k: 'not', arg: exists };
+  return { op: 'filter', input: left, pred, ...(op.origin !== undefined ? { origin: op.origin } : {}) };
 }
 
 /**
@@ -58,61 +80,6 @@ function correlated(e: PlanExpr, depth: number): PlanExpr {
     case 'subquery':
     case 'inSubquery':
       throw new SmaltError('SMALT_UNSUPPORTED', 'a semi or anti join whose condition holds a subquery is not supported yet');
-    default:
-      return e;
-  }
-}
-
-/** `op` with `f` applied to its input operations, and to the plans nested in its expressions. */
-function mapInputs(op: PlanOp, f: (x: PlanOp) => PlanOp): PlanOp {
-  const ex = (e: PlanExpr): PlanExpr => mapPlans(e, f);
-  switch (op.op) {
-    case 'filter':
-      return { ...op, input: f(op.input), pred: ex(op.pred) };
-    case 'project':
-      return { ...op, input: f(op.input), exprs: op.exprs.map(ex) };
-    case 'sort':
-      return { ...op, input: f(op.input), keys: op.keys.map((k) => ({ ...k, expr: ex(k.expr) })) };
-    case 'limit':
-    case 'distinct':
-      return { ...op, input: f(op.input) };
-    case 'aggregate':
-      return { ...op, input: f(op.input) };
-    case 'window':
-      return { ...op, input: f(op.input) };
-    case 'join':
-      return { ...op, inputs: [f(op.inputs[0]), f(op.inputs[1])], ...(op.on ? { on: ex(op.on) } : {}) };
-    case 'setop':
-      return { ...op, inputs: [f(op.inputs[0]), f(op.inputs[1])] };
-    case 'iterate':
-      return { ...op, init: f(op.init), steps: op.steps.map(f) };
-    case 'append':
-      return op.input ? { ...op, input: f(op.input) } : op;
-    case 'update':
-    case 'delete':
-      return { ...op, input: f(op.input) };
-    default:
-      return op;
-  }
-}
-
-/** `e` with `f` applied to the plans nested in it. */
-function mapPlans(e: PlanExpr, f: (x: PlanOp) => PlanOp): PlanExpr {
-  switch (e.k) {
-    case 'subquery':
-      return { ...e, plan: f(e.plan) };
-    case 'inSubquery':
-      return { ...e, probe: mapPlans(e.probe, f), plan: f(e.plan) };
-    case 'call':
-    case 'and':
-    case 'or':
-      return { ...e, args: e.args.map((a) => mapPlans(a, f)) };
-    case 'cast':
-    case 'not':
-    case 'isNull':
-      return { ...e, arg: mapPlans(e.arg, f) };
-    case 'case':
-      return { ...e, whens: e.whens.map((w) => ({ when: mapPlans(w.when, f), then: mapPlans(w.then, f) })), else: mapPlans(e.else, f) };
     default:
       return e;
   }
