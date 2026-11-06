@@ -47,10 +47,10 @@ Each operation's output columns, in order:
 | `filter` | `input`, `pred` | its input's |
 | `project` | `input`, `exprs` | one column per expression |
 | `sort` | `input`, `keys` | its input's |
-| `limit` | `input`, `count`, `offset?` | its input's |
-| `distinct` | `input`, `collations` (one per column) | its input's |
-| `join` | `kind`, `inputs` (left, right), `on?` | the left input's, then the right's (`semi` / `anti`: the left's only) |
-| `aggregate` | `input`, `keys`, `aggs`, `carry` | its keys, then one per aggregate call, then the carried columns |
+| `limit` | `input`, `count`, `offset?`, `fromEnd?` (`true`) | its input's |
+| `distinct` | `input`, `collations` (one per column), `ordered?` (`'first'`), `on?`, `keep?` (`'first'` / `'last'`) | its input's |
+| `join` | `kind`, `inputs` (left, right), `on?`, `ordered?` (`true`) | the left input's, then the right's (`semi` / `anti`: the left's only) |
+| `aggregate` | `input`, `keys`, `aggs`, `carry`, `ordered?` (`'first'`) | its keys, then one per aggregate call, then the carried columns |
 | `window` | `input`, `partition`, `order`, `frame`, `calls` | its input's, then one per window call |
 | `setop` | `kind` (`union` / `unionAll` / `intersect` / `except`), `inputs`, `collations` | the first input's |
 | `iterate` | `id`, `name`, `init`, `steps`, `distinct`, `collations`, `order?`, `limit?`, `offset?` | `init`'s: its rows, then each step's until a step gives none (a recursive query) |
@@ -69,13 +69,32 @@ without one). The condition reads input 0 (the left side) and input 1 (the right
 - `filter`, `project` and `limit` keep their input's order, and so does a `window` without its own `order`.
 - `semi` and `anti` joins keep the left input's order.
 
-The order of other operations' output is not defined, and the engine is free to choose it.
+Other operations keep an order when the plan asks, since keeping it costs time:
+
+- A `join` with `ordered: true` gives the left input's order, and for each left row its matches in the right input's
+  order. A left join's unmatched left rows keep their place; a right or full join's unmatched right rows come last, in
+  the right input's order.
+- An `aggregate` or a `distinct` with `ordered: 'first'` gives its groups in the order of each group's first row.
+
+Without these, the order of other operations' output is not defined, and the engine is free to choose it.
+
+These operations are defined by order:
+
+- `first` and `last` aggregates give the value of a group's first or last row: `first(value)` by input order,
+  `first(value, key)` at the row with the smallest key (`last`: the largest), skipping rows whose key is NULL, with
+  ties by input order. A third argument is a second key.
+- A `limit` with `fromEnd: true` counts from the end: the last `count` rows before the last `offset` rows, in input
+  order. A negative `count` takes every row, as it does from the start.
+- A `distinct` with `on` (column indexes) treats rows as duplicates when those columns are equal, by their
+  collations, and keeps one row of each set: the first by input order, or the last with `keep: 'last'`. `keep` without
+  `on` compares every column. The kept rows come in input order, or with `ordered: 'first'` in the order of each set's
+  first row.
 
 **Sort keys** (`SortKey`) are `{ expr, desc, nullsFirst, collation }`.
 
 **Aggregates.** `keys` are `{ expr, collation }`. Each call (`AggCall`) is
 `{ fn, args, star, distinct, filter?, collation, type }`: `fn` names an aggregate function (`count`, `sum`, `avg`,
-`min`, `max`, `group_concat`, `total`, and the [others](https://stenhoor.github.io/smaltql/reference/functions/aggregate)); `star` is `count(*)`. `carry` passes
+`min`, `max`, `first`, `last`, `group_concat`, `total`, and the [others](https://stenhoor.github.io/smaltql/reference/functions/aggregate)); `star` is `count(*)`. `carry` passes
 input columns through, taken from one row of each group (SQL's bare columns). With no keys, an aggregate gives one row,
 also over no input rows.
 
@@ -179,7 +198,7 @@ NULLs first). They check nothing: the engine validates every plan it is given, b
 |---|---|
 | Expressions | `col(input, index, type, collation?, depth?)`, `lit(value, type?)`, `value(v)`, `param(index, type?)`, `call(fn, args, type, collation?)`, `cast(fn, arg, to)`, `and(...)`, `or(...)`, `not(x)`, `isNull(x)`, `isNotNull(x)`, `caseWhen(whens, type, otherwise?)`, `scalar(plan, type, collation?)`, `exists(plan)`, `inPlan(probe, plan, collation?)` |
 | Sort keys, aggregates | `asc(expr, options?)`, `desc(expr, options?)`, `agg(fn, args, type, options?)` |
-| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `filter`, `project`, `sort`, `limit(input, count, offset?)`, `join(kind, left, right, on?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width)`, `setop(kind, left, right, width)` |
+| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `setop(kind, left, right, width)` |
 | Writes | `append(table, input, columns, options?)`, `update(table, input, rowid, sets, options?)`, `remove(table, input, rowid, options?)` |
 
 `window`, `source`, `iterate` and `working` have no builder yet: write them as objects.
