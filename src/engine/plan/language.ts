@@ -9,6 +9,7 @@
  * entry (`defineWorker({ languages })`), ADR 0015.
  */
 import type { TableSchema } from '../catalog/schema.js';
+import type { CatalogTable } from './catalog.js';
 import type { SqlValue } from '../values.js';
 import type { BindContext } from './bind-context.js';
 import type { BoundQuery, BoundStatement } from './bound.js';
@@ -53,6 +54,11 @@ export interface SmaltLanguage {
    * that did not exist when the table was made), bound from the table's source where first used.
    */
   bindStoredExprs(table: TableSchema, ctx: BindContext): { checks: PlanExpr[]; defaults: (PlanExpr | null)[] };
+  /**
+   * `bindStoredExprs` for a table as the catalog describes it (its source text in `table.source`). Preferred when a
+   * language has it; `bindStoredExprs` is being replaced by it (ADR 0016 section 7).
+   */
+  bindTableExprs?(table: CatalogTable, ctx: BindContext): { checks: PlanExpr[]; defaults: (PlanExpr | null)[] };
   /** A stored view's or materialized view's query (its CREATE statement's source), bound where it is read. */
   bindView(source: Source, ctx: BindContext): BoundQuery;
   /**

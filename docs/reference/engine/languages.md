@@ -34,17 +34,27 @@ A language is a `SmaltLanguage`:
 | `bindView(source, ctx)` | A view's or materialized view's query (its source), bound against the catalog: a `{ kind: 'query', plan, columns }`. |
 | `viewReferences(source)` | The tables and views a view's query names, directly, read from its source without binding (a view may name tables that do not exist yet). The engine follows them for dependencies, TEMP checks and refresh order. |
 | `viewDefinition(source)` | The text of a view's query alone, for `information_schema.views`. |
-| `bindStoredExprs(table, ctx)` | The CHECK and DEFAULT expressions a stored table holds unbound, bound from its source. |
+| `bindTableExprs(table, ctx)` | The CHECK and DEFAULT expressions a stored table holds unbound, bound from its source (`table` as [the catalog](./catalog) describes it, its text in `table.source`). Optional while languages move to it from `bindStoredExprs`, which takes the engine's `TableSchema`. |
+| `bindStoredExprs(table, ctx)` | The same, for the engine's `TableSchema`. Being replaced by `bindTableExprs`. |
 | `sourceEditor` | Edits the source texts kept beside definitions when ALTER TABLE renames a table or a column, adds or drops a column, and writes an external table's statement once its columns are known. |
 
 A `LanguageStatement` (from `parse`) is `{ text, paramCount, paramNames, bind(ctx), externalCalls?() }`: `bind` gives a
 bound statement, the `PlanStatementInput` forms of [running plans](./running#statements) with the engine's column
 descriptions. The engine binds a statement again when the schema changes.
 
-`ctx` is the `BindContext`, the catalog as a language sees it: `getTable(name, schema?)` (a table's columns, types,
-collations, keys), `getView`, `writeTarget` and `indexTarget` (which throw for objects that may not be written or
-indexed), external tables and table functions, virtual tables (`information_schema.*`), and `funcCtx` for function
-lookups.
+`ctx` is the `BindContext`, the catalog as a language sees it:
+
+- `table(name, schema?)`: a table, materialized view or system table as [the catalog](./catalog) describes it;
+  `writeTable` and `indexTable` give the table a statement writes or indexes, and throw for objects that may not be
+  written or indexed. (`getTable`, `writeTarget` and `indexTarget` give the engine's `TableSchema` instead, and are
+  being replaced by them.)
+- `getView`, external tables and table functions, and virtual tables (`information_schema.*`).
+- `catalog`: [the catalog](./catalog), with function metadata and the engine's help for building plans.
+
+`smaltdb/language` also has `describeTableDef(def, source)`, a table definition described as the catalog will
+describe the table it makes, and `comparisonRule(a, b)`: for two operands' types and [meaning
+fields](./plans#expressions), the collation a comparison of them uses and the conversion (`affinity_numeric`,
+`affinity_text`) to apply to each side first, as the engine reads `carries` and `affinity`.
 
 ## Views
 
@@ -74,7 +84,7 @@ const dotted: SmaltLanguage = {
   },
   bindView(source, ctx) {
     const [table, column] = source.text.split('.');
-    const index = ctx.getTable(table)!.columns.findIndex((c) => c.name === column);
+    const index = ctx.table(table)!.columns.findIndex((c) => c.name === column);
     return { kind: 'query', plan: p.project(p.scan(table, [index]), [p.col(0, 0, 'any')]), columns: [{ name: column, type: 'any', collation: Collation.Binary, affinity: 'NONE' }] };
   },
   viewReferences: (source) => [{ name: source.text.split('.')[0] }],

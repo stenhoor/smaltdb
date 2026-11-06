@@ -21,13 +21,14 @@ first, when it shadows a main one; `schema` picks `main` or `temp`). Each `Catal
 
 | Field | |
 |---|---|
-| `kind` | `table`, `materializedView` or `external` |
+| `kind` | `table`, `materializedView` or `external`; while a language binds, also `system` for the engine's own tables |
 | `name`, `schema` | its name, and `main` or `temp` |
 | `columns` | `{ name, type, storageType, declaredType, collation, notNull, rowid, hasDefault }`, in position order: `type` is the plan type of its values, `rowid` marks an integer primary key |
 | `keys` | the primary key, then unique constraints, as column positions |
 | `indexes` | `{ name, columns, unique, partial }`, `column` -1 for an indexed expression |
 | `storage` | `row` or `columnar` |
 | `strict` | values must match the column types |
+| `source` | `{ language, text }`: its definition, in the language it was written in |
 
 `views()` and `view(name, schema?)` give `{ name, schema, language, text, columns? }`: a view is source text in its
 language, bound where it is read.
