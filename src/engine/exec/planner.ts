@@ -542,7 +542,7 @@ export class Planner {
   // ================================================================ physical planner (ADR 0014, step 6b)
 
   /**
-   * Operators for a plan of the SQL front end (sql/frontend/select.ts) that reads one table or no FROM: the same
+   * Operators for a plan of the SQL front end (smaltql's frontend/select.ts) that reads one table or no FROM: the same
    * operators, registers and fusion as `planCore` builds for the statement. Null for shapes it does not handle yet
    * (joins, nested plans, windows, compounds, VALUES, other sources); the caller then plans the statement's AST.
    * Plans are checked before anything is allocated, so a null leaves the planner as it was.

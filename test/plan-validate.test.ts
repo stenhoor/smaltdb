@@ -1,10 +1,8 @@
 /** The plan validator (ADR 0015 step 5, plan/validate.ts): plans from an untrusted builder are checked first. */
 import { describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
-import { parseOne } from '../src/engine/sql/parser.js';
-import type { SelectStmt } from '../src/engine/sql/ast.js';
+import { sqlLanguage } from 'smaltql';
 import type { BindContext } from '../src/engine/plan/bind-context.js';
-import { toPlan } from '../src/engine/sql/frontend/select.js';
 import { type ValidateCatalog, MAX_PLAN_DEPTH, validatePlan } from '../src/engine/plan/validate.js';
 import type { PlanOp } from '../src/engine/plan/ops.js';
 import type { PlanExpr } from '../src/engine/plan/expr.js';
@@ -38,7 +36,7 @@ describe('plan validator', () => {
       'SELECT * FROM t, pragma_table_info(t.s) WHERE t.a = 1',
       'SELECT a FROM t UNION SELECT x FROM u',
     ]) {
-      const plan = toPlan(parseOne(q).stmt as SelectStmt, q, ctx).plan;
+      const plan = (sqlLanguage.parseOne(q).bind(ctx) as { plan: PlanOp }).plan;
       expect(() => validatePlan(plan, live), q).not.toThrow();
     }
   });

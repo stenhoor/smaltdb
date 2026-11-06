@@ -13,6 +13,7 @@
 // Each repetition runs every engine once in a fresh Node process (engine order rotates per repetition).
 import { execFileSync, execSync } from 'node:child_process';
 import { build } from 'esbuild';
+import { selfAliasPlugin } from '../../scripts/self-alias.mjs';
 import { mkdirSync } from 'node:fs';
 import os from 'node:os';
 import { report } from '../lib/report.mjs';
@@ -48,6 +49,8 @@ await build({
   target: 'es2022',
   outfile: bundle,
   external: ['node:sqlite', '@sqlite.org/sqlite-wasm'],
+  // SQL is smaltql's (packed.json), on this checkout's engine.
+  plugins: [selfAliasPlugin],
   logLevel: 'warning',
 });
 

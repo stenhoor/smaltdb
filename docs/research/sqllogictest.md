@@ -1,6 +1,6 @@
 # sqllogictest pass rate
 
-- Runner: `npm run slt` ([test/slt/run.ts](../../test/slt/run.ts)); `-- --save` writes `bench/results/slt-<date>.json`.
+- Runner: `npm run slt` ([test/slt/run.ts](https://github.com/stenhoor/smaltql/blob/main/test/slt/run.ts)); `-- --save` writes `bench/results/slt-<date>.json`.
 - Corpus: [SQLite's sqllogictest](https://sqlite.org/sqllogictest) (public domain), read from a GitHub mirror and
   cached in `.cache/slt` on first use.
 - The runner behaves like SQLite's own driver. It skips records marked `skipif sqlite` or `onlyif <other>`, prints

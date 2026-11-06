@@ -1,11 +1,10 @@
 /** Writes compile from their plans alone (ADR 0015 step 6a): the front end resolves the target, columns and conflict action. */
 import { describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
-import { parseOne } from '../src/engine/sql/parser.js';
-import type { InsertStmt, UpdateStmt, DeleteStmt } from '../src/engine/sql/ast.js';
+import { sqlLanguage } from 'smaltql';
 import type { BindContext } from '../src/engine/plan/bind-context.js';
-import { toWritePlan } from '../src/engine/sql/frontend/select.js';
 import { validatePlan } from '../src/engine/plan/validate.js';
+import type { PlanOp } from '../src/engine/plan/ops.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
 
 async function setup() {
@@ -15,7 +14,7 @@ async function setup() {
     CREATE VIEW va AS SELECT a, count(*) AS n FROM t GROUP BY a;
     INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y'), (3, 10, 'z')`);
   const catalog = (db as unknown as { bindContext(): BindContext }).bindContext();
-  const write = (sql: string) => toWritePlan(parseOne(sql).stmt as InsertStmt | UpdateStmt | DeleteStmt, sql, catalog);
+  const write = (sql: string) => sqlLanguage.parseOne(sql).bind(catalog) as { plan: PlanOp };
   return { db, catalog, write };
 }
 

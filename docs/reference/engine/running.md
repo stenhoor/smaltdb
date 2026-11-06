@@ -31,6 +31,7 @@ per output column of the plan. `type` defaults to `any`, `collation` to `binary`
 
 ```ts
 import { Database, plan as p } from 'smaltdb/engine';
+import 'smaltql/register';
 
 const db = Database.openMemory();
 db.exec("CREATE TABLE fruit(id INTEGER PRIMARY KEY, name TEXT, qty INT); INSERT INTO fruit(name, qty) VALUES ('apple', 3), ('pear', 5), ('plum', 7)");
@@ -49,7 +50,7 @@ console.log(removed.rows); // [['plum']]
 ## Through the client
 
 In a page, the client runs plans in the engine's worker: `db.queryPlan(stmt, params?, options?)` and
-`db.preparePlan(stmt)` (see [the client reference](../api/client#queryplan)). Build them with `smaltdb/plan`, the plan
+`db.preparePlan(stmt)` (see [the client reference](https://stenhoor.github.io/smaltql/reference/api/client#queryplan)). Build them with `smaltdb/plan`, the plan
 format without the engine, so that pages which don't build plans don't load it. The plan crosses to the worker as JSON;
 results, options, transactions and parallel readers work as for SQL queries.
 
@@ -84,6 +85,7 @@ is wrong:
 
 ```ts
 import { Database, plan as p } from 'smaltdb/engine';
+import 'smaltql/register';
 
 const db = Database.openMemory();
 db.exec('CREATE TABLE fruit(id INTEGER PRIMARY KEY, name TEXT, qty INT)');

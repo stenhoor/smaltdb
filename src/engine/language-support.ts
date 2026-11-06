@@ -2,7 +2,7 @@
  * What a language reaches in the engine (ADR 0015 step 9): the language interface and the plan API, and the engine's
  * own semantics a language binds against: values and collations, type and affinity conversion, the function registry,
  * window functions, schema lookups, and the SQL metadata that code generation reads beside a plan (exec/sql-meta.ts).
- * The SQL language (sql/) imports the engine only through this module; test/boundary.test.ts checks that.
+ * Published as `smaltdb/language`; a language (smaltql) imports the engine only through it.
  */
 export type { BindContext } from './plan/bind-context.js';
 export type { BoundQuery, BoundStatement } from './plan/bound.js';

@@ -1,9 +1,10 @@
 # Engine API
 
-`smaltdb/engine` is the database engine without the worker and the client. It runs in the current thread and its core API is **synchronous**: `query()` returns rows, not a promise. Use it in Node (tests, scripts, tools), or inside a worker you manage yourself. In a web page, use the [client](./client) instead: it keeps the engine off the main thread.
+`smaltdb/engine` is the database engine without the worker and the client. It runs in the current thread and its core API is **synchronous**: `query()` returns rows, not a promise. Use it in Node (tests, scripts, tools), or inside a worker you manage yourself. In a web page, use the [client](https://stenhoor.github.io/smaltql/reference/api/client) instead: it keeps the engine off the main thread.
 
 ```ts
 import { Database } from 'smaltdb/engine';
+import 'smaltql/register';
 
 const db = Database.openMemory();
 db.exec('CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)');
@@ -12,7 +13,7 @@ const { columns, rows } = db.query('SELECT a, b FROM t'); // ['a', 'b'], [[1, 'x
 db.close();
 ```
 
-The SQL, the values, the parameters and the errors are the same as in the client. Results differ: the engine returns `{ columns, rows }` with rows as value arrays.
+The engine carries no language: the text methods (`exec`, `query`, `run`, `prepare`) run SQL from [smaltql](https://stenhoor.github.io/smaltql/), registered with `import 'smaltql/register'`, and without it they fail with `SMALT_MISUSE`. Statements given as [plans](../engine/) need no language. The SQL, the values, the parameters and the errors are the same as in the client. Results differ: the engine returns `{ columns, rows }` with rows as value arrays.
 
 ## Exports
 
@@ -23,7 +24,6 @@ The SQL, the values, the parameters and the errors are the same as in the client
 | [`plan`](#plans), `PlanStatementInput`, `PlanColumn` | The plan format: types, builders, validator and codec (experimental) |
 | [`MemoryVfs`, `OpfsVfs`, `Vfs`, `VfsFile`, `OpenOptions`](#vfs) | Storage back ends |
 | [`SmaltError`, `CorruptionError`, `MisuseError`, `SqlSyntaxError`](#errors) | Error classes |
-| [`parse`, `parseOne`](#parsing) | The SQL parser |
 | [`registerLanguage`, `SmaltLanguage`, `LanguageStatement`, `ObjectReference`](#languages) | The language interface (experimental) |
 | [`detectCapabilities`, `Capabilities`](#detectcapabilities) | Browser feature detection |
 | [`PLUGIN_API_VERSION`, `SmaltPlugin`, `PluginHost`, `FormatReader`, …](#plugins) | The plugin interface, version 1. See [Writing plugins](./plugins). |
@@ -42,6 +42,7 @@ The SQL, the values, the parameters and the errors are the same as in the client
 
 ```ts
 import { Database, MemoryVfs } from 'smaltdb/engine';
+import 'smaltql/register';
 
 const vfs = new MemoryVfs();
 const db = await Database.open(vfs, 'app.db');
@@ -66,7 +67,7 @@ console.log(again.query('SELECT a FROM t').rows); // [['kept']]
 | `verifyChecksums` | `boolean` | `true` | Check page checksums on every read from storage. |
 | `walAutoCheckpointBytes` | `number` | 4 MiB | Copy the write-ahead log into the database file once it reaches this size. |
 | `readAheadBytes` | `number` | 64 KiB | On a cache miss, read this aligned extent around the page in one call (`0` disables). |
-| `plugins` | `readonly SmaltPlugin[]` | none | [Plugins](../../guide/plugins) to install, e.g. `[io, external]` from `@smaltdb/io` and `@smaltdb/external`. |
+| `plugins` | `readonly SmaltPlugin[]` | none | [Plugins](https://stenhoor.github.io/smaltql/guide/plugins) to install, e.g. `[io, external]` from `@smaltdb/io` and `@smaltdb/external`. |
 | `sharedHandles` | `boolean` | `false` | Open OPFS files with `readwrite-unsafe` handles so other workers can open them too. You must then make sure only one connection writes. |
 
 ### Running SQL
@@ -86,13 +87,13 @@ console.log(again.query('SELECT a FROM t').rows); // [['kept']]
 
 `query` and `run` keep compiled statements in a cache keyed by the SQL text (see `statementCacheSize`); `exec` compiles each time.
 
-`BindParams` is `readonly (SqlValue | boolean | undefined)[] | Readonly<Record<string, SqlValue | boolean>>`, the same as the client's [`Params`](./client#params). `QueryResult` is `{ columns: string[]; rows: SqlValue[][] }`.
+`BindParams` is `readonly (SqlValue | boolean | undefined)[] | Readonly<Record<string, SqlValue | boolean>>`, the same as the client's [`Params`](https://stenhoor.github.io/smaltql/reference/api/client#params). `QueryResult` is `{ columns: string[]; rows: SqlValue[][] }`.
 
 Engine calls are synchronous: a long query blocks the thread until it finishes. There is no `signal`. A host can install an interrupt check with `setInterruptCheck(fn)`, which the engine calls every few hundred page reads; `fn` stops the statement by throwing a `SmaltError` with code `SMALT_INTERRUPT`, and must reset its own trigger before it throws.
 
 ### External data
 
-Statements that read [external data](../../guide/external-data) (`read_csv`, `read_json`, `read_parquet`, external tables, materialized views over them) need their sources fetched first, which is asynchronous. The synchronous methods throw `SMALT_ASYNC_REQUIRED` for them; use the async variants, which work for any statement:
+Statements that read [external data](https://stenhoor.github.io/smaltql/guide/external-data) (`read_csv`, `read_json`, `read_parquet`, external tables, materialized views over them) need their sources fetched first, which is asynchronous. The synchronous methods throw `SMALT_ASYNC_REQUIRED` for them; use the async variants, which work for any statement:
 
 | Method | Description |
 |---|---|
@@ -104,7 +105,7 @@ The three async methods also run `REFRESH MATERIALIZED VIEW … IF CHANGED`, whi
 
 `signal` aborts the fetches; the call then rejects with `SMALT_INTERRUPT`.
 
-Formats and sources come from [plugins](../../guide/plugins): `@smaltdb/io` (CSV, TSV, JSON), `@smaltdb/parquet` (Parquet) and `@smaltdb/external` (registered files, URLs, S3, Azure and local paths). Without them, these statements fail with `SMALT_PLUGIN_MISSING`. Files are registered with `registerFile(db, name, file)` from `@smaltdb/external/client`, which takes the engine `Database` as it takes the client's:
+Formats and sources come from [plugins](https://stenhoor.github.io/smaltql/guide/plugins): `@smaltdb/io` (CSV, TSV, JSON), `@smaltdb/parquet` (Parquet) and `@smaltdb/external` (registered files, URLs, S3, Azure and local paths). Without them, these statements fail with `SMALT_PLUGIN_MISSING`. Files are registered with `registerFile(db, name, file)` from `@smaltdb/external/client`, which takes the engine `Database` as it takes the client's:
 
 ```ts
 import { Database } from 'smaltdb/engine';
@@ -118,7 +119,7 @@ const { rows } = await db.queryAsync("SELECT id, price FROM read_csv('file:price
 console.log(rows); // [[2, 12]]
 ```
 
-`registerCredentials(db, name, provider)` and `setFetch(db, fn)` from `@smaltdb/external/client` work the same way; with the in-process engine, functions in a credentials provider are called in this thread. See the [client's plugin helpers](./client#plugin-helpers).
+`registerCredentials(db, name, provider)` and `setFetch(db, fn)` from `@smaltdb/external/client` work the same way; with the in-process engine, functions in a credentials provider are called in this thread. See the [client's plugin helpers](https://stenhoor.github.io/smaltql/reference/api/client#plugin-helpers).
 
 ## Plans
 
@@ -149,6 +150,7 @@ A compiled statement, from `db.prepare()`. It compiles again by itself after sch
 
 ```ts
 import { Database } from 'smaltdb/engine';
+import 'smaltql/register';
 
 const db = Database.openMemory();
 db.exec('CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)');
@@ -177,6 +179,7 @@ While a cursor over table data is open, writes on the same database throw `SMALT
 
 ```ts
 import { Database } from 'smaltdb/engine';
+import 'smaltql/register';
 
 const db = Database.openMemory();
 db.exec('CREATE TABLE t(a); INSERT INTO t VALUES (1), (2), (3)');
@@ -205,7 +208,7 @@ await importCSV(db, 'people', 'name,age\nAnn,31\n', { create: true });
 console.log(await exportCSV(db, 'SELECT name, age FROM people')); // 'name,age\nAnn,31\n'
 ```
 
-Exports over external data fetch their sources first. The options and output rules are in [import and export](../../guide/import-export).
+Exports over external data fetch their sources first. The options and output rules are in [import and export](https://stenhoor.github.io/smaltql/guide/import-export).
 
 ## VFS
 
@@ -239,7 +242,7 @@ export type { Vfs, VfsFile, OpenOptions };
 
 ## Plugins
 
-`DatabaseOptions.plugins` installs [plugins](../../guide/plugins) into this engine instance. In the browser, plugins
+`DatabaseOptions.plugins` installs [plugins](https://stenhoor.github.io/smaltql/guide/plugins) into this engine instance. In the browser, plugins
 are installed in the engine worker with `serve({ plugins })` from `smaltdb/worker-runtime`.
 
 <!-- docs:plugin @smaltdb/parquet -->
@@ -274,12 +277,12 @@ A language turns its source text into plans; the engine never reads its syntax. 
 
 ## Errors
 
-Engine methods throw `SmaltError` (or a subclass) with the same `code` and `message` the client's [`SmaltdbError`](./client#smaltdberror) carries. The codes are listed in [error codes](./errors).
+Engine methods throw `SmaltError` (or a subclass) with the same `code` and `message` the client's [`SmaltdbError`](https://stenhoor.github.io/smaltql/reference/api/client#smaltdberror) carries. The codes are listed in [error codes](./errors).
 
 | Class | Code |
 |---|---|
 | `SmaltError` | Any; the base class. |
-| `SqlSyntaxError` | `SMALT_SYNTAX`. Also has `line` and `column` (1-based), `position` (0-based offset into the SQL) and `reason` (the message without the location). |
+| `SqlSyntaxError` (from `smaltql`) | `SMALT_SYNTAX`. Also has `line` and `column` (1-based), `position` (0-based offset into the SQL) and `reason` (the message without the location). |
 | `MisuseError` | `SMALT_MISUSE` |
 | `CorruptionError` | `SMALT_CORRUPT` |
 
@@ -288,7 +291,9 @@ Other codes are thrown as plain `SmaltError` objects (or an internal subclass): 
 Errors from [plugins](./plugins#errors), such as `@smaltdb/io`'s import errors from `callPlugin` or the `@smaltdb/io/client` helpers, are not `SmaltError`s: a plugin cannot create one. They carry a `code` that starts with `SMALT_` all the same, so check `e.code`; `e instanceof SmaltError` is false for them.
 
 ```ts
-import { Database, SmaltError, SqlSyntaxError } from 'smaltdb/engine';
+import { Database, SmaltError } from 'smaltdb/engine';
+import { SqlSyntaxError } from 'smaltql';
+import 'smaltql/register';
 
 const db = Database.openMemory();
 try {
@@ -301,13 +306,7 @@ try {
 
 ## Parsing
 
-`parse(sql: string)` splits a script into statements and parses each one, throwing `SqlSyntaxError` on the first error. Each result has `text` (the statement's source, without the `;`) and `paramCount`, among other fields. `parseOne(sql)` parses exactly one statement. The rest of the parse tree is internal and may change.
-
-```ts
-import { parse } from 'smaltdb/engine';
-
-console.log(parse('SELECT 1; SELECT ?2').map((s) => [s.text, s.paramCount])); // [['SELECT 1', 0], ['SELECT ?2', 2]]
-```
+The SQL parser is smaltql's: `parse`, `parseOne` and `SqlSyntaxError` are exported from `smaltql`.
 
 ## detectCapabilities
 

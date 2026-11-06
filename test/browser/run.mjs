@@ -1,6 +1,7 @@
 // Runs the OPFS integration test in a real browser via Playwright: `npm run test:browser`.
 // Uses the pre-installed Chromium; set BROWSERS=chromium,firefox,webkit when those are installed.
 import { build } from 'esbuild';
+import { selfAliasPlugin } from '../../scripts/self-alias.mjs';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,12 +14,13 @@ const out = '.cache/browser-test';
 mkdirSync(out, { recursive: true });
 await build({ entryPoints: ['test/browser/opfs-worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/opfs-worker.js`, logLevel: 'warning' });
 // The plugins (ADR 0012) come from their pinned packages in node_modules (scripts/fetch-packed.mjs).
-await build({ entryPoints: ['test/browser/client-test.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/client-test.js`, logLevel: 'warning' });
-await build({ entryPoints: ['test/browser/tab-test.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/tab-test.js`, logLevel: 'warning' });
-await build({ entryPoints: ['src/engine/worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/smaltdb-worker.js`, logLevel: 'warning' });
+await build({ entryPoints: ['test/browser/client-test.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/client-test.js`, logLevel: 'warning', plugins: [selfAliasPlugin] });
+await build({ entryPoints: ['test/browser/tab-test.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/tab-test.js`, logLevel: 'warning', plugins: [selfAliasPlugin] });
+// SQL comes from smaltql (packed.json), on this checkout's engine.
+await build({ entryPoints: ['test/browser/sql-worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/sql-worker.js`, logLevel: 'warning', plugins: [selfAliasPlugin] });
 // A worker entry with plugins, as applications write it (ADR 0012); the client test reads external data and CSV through it.
 // Parquet, and hosts that compress responses (issue #32), are tested in the browser by stenhoor/smaltdb-parquet.
-await build({ entryPoints: ['test/browser/plugin-worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/plugin-worker.js`, logLevel: 'warning' });
+await build({ entryPoints: ['test/browser/plugin-worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/plugin-worker.js`, logLevel: 'warning', plugins: [selfAliasPlugin] });
 // External data (M8): a CSV the client test reads over HTTP from this server.
 writeFileSync(`${out}/prices.csv`, 'id,name,price\n1,apple,1.5\n2,"pear, green",2\n3,plum,\n');
 writeFileSync(`${out}/tab.html`, '<!doctype html><meta charset="utf-8"><title>smaltdb tab</title><script type="module" src="./tab-test.js"></script>');

@@ -11,6 +11,7 @@
 // that only claims a difference when the min/max ranges do not overlap.
 import { execSync } from 'node:child_process';
 import { build } from 'esbuild';
+import { selfAliasPlugin } from '../../scripts/self-alias.mjs';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import { report } from '../lib/report.mjs';
@@ -34,7 +35,7 @@ const save = process.argv.includes('--save');
 
 const out = '.cache/bench-browser';
 mkdirSync(out, { recursive: true });
-await build({ entryPoints: ['bench/browser/worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/worker.js`, logLevel: 'warning' });
+await build({ entryPoints: ['bench/browser/worker.ts'], bundle: true, format: 'esm', target: 'es2022', outfile: `${out}/worker.js`, logLevel: 'warning', plugins: [selfAliasPlugin] });
 writeFileSync(`${out}/index.html`, `<!doctype html><meta charset="utf-8"><title>smaltdb bench</title><script type="module">
   window.runEngine = (msg) => new Promise((resolve) => {
     const w = new Worker('./worker.js', { type: 'module' });

@@ -3,7 +3,7 @@
 A plugin adds features to the engine: file formats, table functions that read them, sources that external data is
 read from, connection types, and methods that the application calls. smaltdb's own optional features are plugins:
 `@smaltdb/io`, `@smaltdb/external` and `@smaltdb/parquet` ([ADR 0012](../../adr/0012-plugins)). The
-[plugins guide](../../guide/plugins) shows how to install them.
+[plugins guide](https://stenhoor.github.io/smaltql/guide/plugins) shows how to install them.
 
 This page describes the plugin interface, **API version 1**. It is stable: within version 1 it only gains
 additions, so a plugin written for it keeps working when you upgrade smaltdb. See
@@ -363,7 +363,7 @@ Client `Database` (`smaltdb`):
 | Option | Description |
 |---|---|
 | `lock` | Wait for earlier `exec` calls and transactions of this `Database`, and hold off later ones, as `exec` does. Use it for methods that write or read the database. Such a call inside a `db.transaction()` callback waits for the transaction, so it never finishes. |
-| `replay` | A key under which this tab stores the call. When this tab takes over a shared database ([multi-tab access](../../guide/databases#multi-tab-access)), or the owning tab changes, it sends its stored calls again to the new engine worker. A later call with the same key replaces the stored one. Use it for state that lives in the worker, such as registered files. |
+| `replay` | A key under which this tab stores the call. When this tab takes over a shared database ([multi-tab access](https://stenhoor.github.io/smaltql/guide/databases#multi-tab-access)), or the owning tab changes, it sends its stored calls again to the new engine worker. A later call with the same key replaces the stored one. Use it for state that lives in the worker, such as registered files. |
 | `dropReplay` | With `replay`: remove the stored call. The call itself is still sent. |
 | `signal` | Cancels the call. A call still waiting for its turn rejects with `SMALT_INTERRUPT`. A running call has `ctx.signal` aborted: a method that stops then, rejecting with the signal's `AbortError` (or an error with code `SMALT_INTERRUPT`), rejects with `SMALT_INTERRUPT`. A method that ignores the signal runs to completion, and the call settles with its result or error. |
 
@@ -406,7 +406,7 @@ does with `ctx.session`.
 you don't know like `'failed'`.
 
 In the engine worker, `ask` sends the question to the session it is given. Work the engine does by itself, such as a
-[refresh policy](../../guide/views-and-materialized-views#refresh-policies), has no calling session, but sources do
+[refresh policy](https://stenhoor.github.io/smaltql/guide/views-and-materialized-views#refresh-policies), has no calling session, but sources do
 not get one anyway: a source asks the session it remembered, so during a refresh the question goes to the tab that
 registered the state (`@smaltdb/external` asks the tab that registered the credentials). If that tab has closed,
 `ask` fails with `'closed'`; drop its state in `onSessionClosed` so it is not asked at all.

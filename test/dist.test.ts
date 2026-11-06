@@ -25,8 +25,9 @@ describe('dist', () => {
     expect(language.SmaltError).toBe(engine.SmaltError);
 
     const { Database } = engine as unknown as { Database: { openMemory(): Db } };
-    expect(Database.openMemory().prepare('SELECT 1').all()).toEqual([[1]]);
-    // A language registered through language.js replaces the SQL engine.js registered: the registry is shared.
+    // The engine carries no language: a database reads text only once one is registered.
+    expect(() => Database.openMemory().prepare('SELECT 1')).toThrow('not registered');
+    // A language registered through language.js is the one engine.js reads: the registry is shared.
     const registerLanguage = language.registerLanguage as (l: unknown) => void;
     registerLanguage({
       name: 'sql',

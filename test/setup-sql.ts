@@ -1,2 +1,5 @@
-// Tests open databases from src/engine/database.ts directly: register SQL as smaltdb's entry points do.
-import '../src/engine/sql/register.js';
+// smaltdb carries no language: the tests' databases read SQL from smaltql (ADR 0015), pinned in packed.json.
+import { sqlLanguage } from 'smaltql';
+import { registerLanguage } from '../src/engine/plan/language.js';
+
+registerLanguage(sqlLanguage);

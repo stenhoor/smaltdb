@@ -28,7 +28,7 @@ import external from '@smaltdb/external';
 import { registerFile } from '@smaltdb/external/client';
 import io from '@smaltdb/io';
 import { Database } from '../src/engine/database.js';
-import { parse } from '../src/engine/sql/parser.js';
+import { parse } from 'smaltql';
 import type { SqlValue } from '../src/engine/values.js';
 
 const DOCS = 'docs';
@@ -251,6 +251,7 @@ describe('documentation TypeScript examples', () => {
             smaltdb: [join(root, 'src/client/index.ts')],
             'smaltdb/engine': [join(root, 'src/engine/index.ts')],
             'smaltdb/plan': [join(root, 'src/engine/plan/portable.ts')],
+            'smaltdb/language': [join(root, 'src/engine/language-support.ts')],
             'smaltdb/worker-runtime': [join(root, 'src/engine/worker-runtime.ts')],
           },
         },

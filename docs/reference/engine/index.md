@@ -27,7 +27,7 @@ any release until a second language besides SQL has proven them ([ADR 0014](../.
 |---|---|
 | `smaltdb/engine` | The synchronous engine for Node or a worker of your own: `Database`, the `plan` namespace (builders, validator, codec), `registerLanguage`. |
 | `smaltdb/plan` | The plan format alone (types, builders, codec), for code that builds plans without the engine, such as a page that sends them to a worker. |
-| `smaltdb` | The client for pages: `open()` and an asynchronous `Database` whose engine runs in a worker. It runs plans with [`queryPlan`](../api/client#queryplan). |
+| `smaltdb` | The client for pages: `open()` and an asynchronous `Database` whose engine runs in a worker. It runs plans with [`queryPlan`](https://stenhoor.github.io/smaltql/reference/api/client#queryplan). |
 | `smaltdb/worker-runtime` | `defineWorker({ languages, plugins })`: an engine worker entry. |
 | `smaltdb/language` | What a language reaches in the engine (the language interface, plan types, values, conversions, functions, catalog lookups). |
 

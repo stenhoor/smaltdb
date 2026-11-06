@@ -5,10 +5,8 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { tableSchemaFromDef } from '../src/engine/catalog/schema.js';
-import { toTableDef } from '../src/engine/sql/frontend/ddl.js';
 import { Database } from '../src/engine/database.js';
-import type { CreateTableStmt } from '../src/engine/sql/ast.js';
-import { parseOne } from '../src/engine/sql/parser.js';
+import type { TableDef } from '../src/engine/plan/schema.js';
 import { EngineServer } from '../src/engine/server.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
 import type { Request, Response } from '../src/shared/protocol.js';
@@ -280,10 +278,13 @@ describe('CREATE TABLE / ADD COLUMN checks SQLite makes', () => {
   });
 
   it('stored definitions are not re-checked, so databases created before these checks still open', () => {
-    // The catalog loader builds schemas from definitions only; the new checks run on CREATE / ADD COLUMN.
-    for (const sql of ['CREATE TABLE a(x TEXT PRIMARY KEY AUTOINCREMENT)', 'CREATE TABLE c(x CHECK (x > (SELECT 1)), y DEFAULT (1 IN (SELECT 1)))']) {
-      expect(() => tableSchemaFromDef(toTableDef(parseOne(sql).stmt as CreateTableStmt, sql, undefined), sql, 2)).not.toThrow();
-    }
+    // The catalog loader builds schemas from definitions only; the new checks run on CREATE / ADD COLUMN. These are the
+    // definitions an older version stored for tables the checks now refuse.
+    const column = (name: string, type: 'TEXT' | 'ANY' = 'ANY') => ({ name, declaredType: type === 'TEXT' ? 'TEXT' : '', type, notNull: false, collation: 'binary' as const });
+    const a: TableDef = { name: 'a', storage: 'row', columns: [column('x', 'TEXT')], keys: [{ kind: 'primaryKey', columns: [{ column: 0, desc: false, collation: 'binary' }], autoincrement: true }], checks: [], foreignKeys: [] };
+    const c: TableDef = { name: 'c', storage: 'row', columns: [column('x'), { ...column('y'), default: { text: '(1 IN (SELECT 1))', value: null } }], keys: [], checks: [{ text: 'x > (SELECT 1)', ofColumn: 0 }], foreignKeys: [] };
+    expect(() => tableSchemaFromDef(a, 'CREATE TABLE a(x TEXT PRIMARY KEY AUTOINCREMENT)', 2)).not.toThrow();
+    expect(() => tableSchemaFromDef(c, 'CREATE TABLE c(x CHECK (x > (SELECT 1)), y DEFAULT (1 IN (SELECT 1)))', 2)).not.toThrow();
   });
 
   it('ADD COLUMN … REFERENCES with a non-NULL default fails when foreign keys are on and the table has rows', async () => {

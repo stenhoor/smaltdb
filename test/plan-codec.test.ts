@@ -1,10 +1,8 @@
 /** Plans as data (ADR 0015 step 5, plan/codec.ts): JSON and structured-clone forms decode to the same plan. */
 import { describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
-import { parseOne } from '../src/engine/sql/parser.js';
-import type { SelectStmt } from '../src/engine/sql/ast.js';
+import { sqlLanguage } from 'smaltql';
 import type { BindContext } from '../src/engine/plan/bind-context.js';
-import { toPlan } from '../src/engine/sql/frontend/select.js';
 import { decodePlan, encodePlan, planFromJSON, planToJSON } from '../src/engine/plan/codec.js';
 import { printPlan } from '../src/engine/plan/print.js';
 import { getMeta, isFlattened } from '../src/engine/exec/sql-meta.js';
@@ -48,7 +46,7 @@ describe('plan codec', () => {
   it('JSON and structured-clone forms decode to the same plan, SQL metadata included', async () => {
     const { catalog } = await setup();
     for (const q of QUERIES) {
-      const plan = toPlan(parseOne(q).stmt as SelectStmt, q, catalog).plan;
+      const plan = (sqlLanguage.parseOne(q).bind(catalog) as { plan: PlanOp }).plan;
       const viaJson = planFromJSON(planToJSON(plan));
       const viaClone = decodePlan(structuredClone(encodePlan(plan)));
       for (const d of [viaJson, viaClone]) {

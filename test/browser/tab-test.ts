@@ -5,7 +5,7 @@ import { type Database, open } from '../../src/client/index.js';
 let db: Database | null = null;
 const api = {
   async open(name: string): Promise<boolean> {
-    db = await open(name, { worker: new URL('./smaltdb-worker.js', location.href) });
+    db = await open(name, { worker: new URL('./sql-worker.js', location.href) });
     return db.isLeader;
   },
   isLeader: (): boolean => db!.isLeader,

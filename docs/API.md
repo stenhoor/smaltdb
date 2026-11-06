@@ -1,6 +1,6 @@
 # Public API
 
-> Status: design notes, partly historical. The current API is in the [client](reference/api/client.md) and
+> Status: design notes, partly historical. The current API is in the [client](https://stenhoor.github.io/smaltql/reference/api/client) and
 > [engine](reference/api/engine.md) references. Since ADR 0012, import/export and registered files and credentials are
 > plugin helpers (`@smaltdb/io`, `@smaltdb/external`), not `db` methods.
 
