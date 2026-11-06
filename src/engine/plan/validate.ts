@@ -91,6 +91,20 @@ class Validator {
     }
     if (e.affinity !== undefined && !AFFINITIES.has(e.affinity)) this.fail(`unknown affinity ${JSON.stringify(e.affinity)}`, 'affinity');
     if (e.inline !== undefined && e.inline !== false) this.fail('inline is false or absent', 'inline');
+    if (e.origin !== undefined) this.origin(e.origin);
+  }
+
+  /** An `origin`: plain data (JSON values), as the codec carries it. */
+  private origin(x: unknown): void {
+    const plain = (v: unknown, depth: number): boolean => {
+      if (depth > 32) return false;
+      if (v === null || typeof v === 'string' || typeof v === 'boolean') return true;
+      if (typeof v === 'number') return Number.isFinite(v);
+      if (Array.isArray(v)) return v.every((y) => plain(y, depth + 1));
+      if (typeof v === 'object' && Object.getPrototypeOf(v) === Object.prototype) return Object.values(v as object).every((y) => plain(y, depth + 1));
+      return false;
+    };
+    if (!plain(x, 0)) this.fail('expected plain data: strings, finite numbers, booleans, null, arrays and objects of them', 'origin');
   }
 
   /** `x` must be an object (an element of a list, a nested structure). */
@@ -139,6 +153,7 @@ class Validator {
     if (depth > MAX_PLAN_DEPTH) this.fail(`nested more than ${MAX_PLAN_DEPTH} deep`);
     if (!o || typeof o !== 'object') this.fail('expected an operation');
     if (o.decorrelate !== undefined && o.decorrelate !== false) this.fail('decorrelate is false or absent', 'decorrelate');
+    if (o.origin !== undefined) this.origin(o.origin);
     const d = depth + 1;
     const sub = (x: PlanOp, field: string, i?: number, lat: number | null = null): number => this.under(field, i, () => this.op(x, outer, d, lat));
     /** The scopes of expressions reading inputs of widths `ws`. */

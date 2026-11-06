@@ -23,7 +23,15 @@ export interface ExprMeaning {
   readonly carries?: { readonly collation: CollationName; readonly from: 'explicit' | 'column' };
   readonly affinity?: 'INTEGER' | 'REAL' | 'NUMERIC' | 'TEXT' | 'BLOB';
   readonly inline?: false;
+  /**
+   * Where the node came from, in the language that built the plan (a SQL text span, a smaltdf call site): plain data
+   * the engine never reads, given back on errors that arise in the node (ADR 0016 section 10).
+   */
+  readonly origin?: PlanOrigin;
 }
+
+/** A node's origin: plain data (JSON values), defined by the language. */
+export type PlanOrigin = string | number | boolean | null | readonly PlanOrigin[] | { readonly [key: string]: PlanOrigin };
 
 /** A nested plan (the operation tree of a subquery). */
 export type NestedPlan = PlanOp;

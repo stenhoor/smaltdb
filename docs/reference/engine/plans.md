@@ -109,6 +109,7 @@ conversion on its calls needs none of them.
 | `affinity` | expressions | `INTEGER`, `REAL`, `NUMERIC`, `TEXT` or `BLOB`: the conversion a comparison applies to the other operand (SQLite's column affinity). `TEXT` turns a number on the other side into text; a numeric affinity turns numeric text into a number. |
 | `inline` | expressions | `false`: code generation leaves this expression whole to the general evaluator. Results are the same either way. |
 | `decorrelate` | operations | `false`: the planner does not rewrite correlated subqueries of this operation into joins. Results are the same either way. |
+| `origin` | expressions and operations | Where the node came from in the language that built the plan (a SQL text span, a call site): plain data the engine never reads. An error that arises in an expression carries the origin of the innermost node around it that has one; an error while a write runs (a constraint failure) carries the write's. See [error fields](../api/errors). |
 
 ## Functions
 

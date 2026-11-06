@@ -1,5 +1,5 @@
 import { ConstraintError, type IndexSchema, type TableSchema } from '../catalog/schema.js';
-import { SmaltError } from '../errors.js';
+import { type ErrorDetails, SmaltError } from '../errors.js';
 import { BTree } from '../storage/btree.js';
 import { KeyEncoder, ROWID_KEY_SIZE, readIndexRowid, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
 import { RecordEncoder, RecordReader } from '../storage/record.js';
@@ -12,8 +12,8 @@ const I64_MAX = 2n ** 63n - 1n;
 const EMPTY = new Uint8Array(0);
 
 /** A constraint failure under conflict action `mode` (ROLLBACK also ends the transaction). */
-export function constraintError(code: string, message: string, mode: ConflictMode): ConstraintError {
-  const e = new ConstraintError(code, message);
+export function constraintError(code: string, message: string, mode: ConflictMode, details?: ErrorDetails): ConstraintError {
+  const e = new ConstraintError(code, message, details);
   e.rollback = mode === 'ROLLBACK';
   return e;
 }
@@ -213,6 +213,15 @@ export class TableWriter {
     return `UNIQUE constraint failed: ${idx.columns.map((c) => `${t.name}.${t.columns[c.column].name}`).join(', ')}`;
   }
 
+  /** The fields of a uniqueness conflict on `idx` (null: the rowid). */
+  private conflictDetails(idx: IndexSchema | null): ErrorDetails {
+    const t = this.table;
+    const constraint = idx === null || idx.origin === 'pk' ? 'primaryKey' : 'unique';
+    if (idx === null) return { constraint, table: t.name, columns: [t.rowidAlias >= 0 ? t.columns[t.rowidAlias].name : 'rowid'] };
+    const columns = idx.columns.some((c) => c.column < 0) ? [] : idx.columns.map((c) => t.columns[c.column].name);
+    return { constraint, table: t.name, columns, name: idx.constraintName ?? idx.name };
+  }
+
   private conflictCode(idx: IndexSchema | null): string {
     return idx === null || idx.origin === 'pk' ? 'SMALT_CONSTRAINT_PRIMARYKEY' : 'SMALT_CONSTRAINT_UNIQUE';
   }
@@ -235,7 +244,7 @@ export class TableWriter {
         const other = this.uniqueConflict(i, row, except, rowid);
         if (other === null) break;
         if (mode === 'IGNORE') return false;
-        if (mode !== 'REPLACE') throw constraintError(this.conflictCode(idx), this.conflictMessage(idx), mode);
+        if (mode !== 'REPLACE') throw constraintError(this.conflictCode(idx), this.conflictMessage(idx), mode, this.conflictDetails(idx));
         this.deleteRow(other, undefined, false, true);
       }
     }
@@ -248,7 +257,7 @@ export class TableWriter {
     if ((except === null || rowid != except) && this.rowExists(rowid)) {
       if (mode === 'IGNORE') return false;
       if (mode === 'REPLACE') this.deleteRow(rowid, undefined, false, true);
-      else throw constraintError(this.conflictCode(null), this.conflictMessage(null), mode);
+      else throw constraintError(this.conflictCode(null), this.conflictMessage(null), mode, this.conflictDetails(null));
     }
     return true;
   }

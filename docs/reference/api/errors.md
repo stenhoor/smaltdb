@@ -4,6 +4,17 @@ Every error smaltdb raises carries a `code`. In the client it is a [`SmaltdbErro
 
 The [errors guide](https://stenhoor.github.io/smaltql/guide/errors) shows how to handle them. This page lists every code the engine and client raise, what causes it, and what to do.
 
+Besides `code` and `message`, an error carries what it is about as fields, so a language or an application can word
+it for its users ([ADR 0016](../../adr/0016-plan-api-for-every-language.md), section 10):
+
+| Field | |
+|---|---|
+| `origin` | The `origin` of the [plan node](../engine/plans#expressions) it arose in, the innermost one that has an origin, as the language that built the plan gave it (a SQL text span, a call site) |
+| `constraint` | For a constraint failure: `notNull`, `unique`, `primaryKey`, `check`, `foreignKey` or `datatype` |
+| `table` | The table the constraint is on |
+| `columns` | The columns it covers (none for an index on expressions; a foreign key counted across a statement names none) |
+| `constraintName` | The constraint's name, or its index's |
+
 | Code | Meaning | Retry? |
 |---|---|---|
 | [`SMALT_ERROR`](#smalt-error) | General SQL error: unknown table or column, misuse of a statement, bad data in an import | No |

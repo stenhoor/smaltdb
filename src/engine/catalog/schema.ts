@@ -1,4 +1,4 @@
-import { SmaltError } from '../errors.js';
+import { type ErrorDetails, SmaltError } from '../errors.js';
 import type { PlanExpr } from '../plan/expr.js';
 import type { ConflictAction as PlanConflict } from '../plan/ops.js';
 import type { CheckDef, DefaultDef, ExprDef, FkAction, IndexDef, TableDef } from '../plan/schema.js';
@@ -16,8 +16,8 @@ const upper = (a: PlanConflict | undefined): ConflictAction | undefined => (a ==
 export class ConstraintError extends SmaltError {
   /** Raised under the ROLLBACK conflict resolution: the whole transaction is rolled back. */
   rollback = false;
-  constructor(code: string, message: string) {
-    super(code, message);
+  constructor(code: string, message: string, details?: ErrorDetails) {
+    super(code, message, details);
     this.name = 'ConstraintError';
   }
 }
@@ -281,10 +281,11 @@ export function coerceForColumn(v: SqlValue, col: ColumnSchema, table: string, i
     case 'ANY':
       return v;
   }
-  throw new ConstraintError(
-    'SMALT_CONSTRAINT_DATATYPE',
-    `cannot store ${typeName(v)} value in ${col.type} column ${table}.${col.name}`,
-  );
+  throw new ConstraintError('SMALT_CONSTRAINT_DATATYPE', `cannot store ${typeName(v)} value in ${col.type} column ${table}.${col.name}`, {
+    constraint: 'datatype',
+    table,
+    columns: [col.name],
+  });
 }
 
 export function findColumn(table: TableSchema, name: string): number {

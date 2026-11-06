@@ -261,7 +261,7 @@ export class ForeignKeys {
         return;
       case 'RESTRICT':
         // Checked when its turn comes: an earlier action may already have removed the children.
-        if (this.childCount(l, key) > 0) throw new ConstraintError('SMALT_CONSTRAINT_FOREIGNKEY', 'FOREIGN KEY constraint failed');
+        if (this.childCount(l, key) > 0) throw new ConstraintError('SMALT_CONSTRAINT_FOREIGNKEY', 'FOREIGN KEY constraint failed', { constraint: 'foreignKey', table: l.child.name, columns: l.childCols.map((c) => l.child.columns[c].name) });
         return;
       default:
         // NO ACTION: the counted violations stand unless fixed before the statement ends.
@@ -273,11 +273,12 @@ export class ForeignKeys {
   checkStatement(): void {
     const n = this.stmt;
     this.stmt = 0;
-    if (n > 0) throw new ConstraintError('SMALT_CONSTRAINT_FOREIGNKEY', 'FOREIGN KEY constraint failed');
+    // Counted across the statement: which key is not known.
+    if (n > 0) throw new ConstraintError('SMALT_CONSTRAINT_FOREIGNKEY', 'FOREIGN KEY constraint failed', { constraint: 'foreignKey' });
   }
 
   checkCommit(): void {
-    if (this.deferred > 0) throw new ConstraintError('SMALT_CONSTRAINT_FOREIGNKEY', 'FOREIGN KEY constraint failed');
+    if (this.deferred > 0) throw new ConstraintError('SMALT_CONSTRAINT_FOREIGNKEY', 'FOREIGN KEY constraint failed', { constraint: 'foreignKey' });
   }
 }
 

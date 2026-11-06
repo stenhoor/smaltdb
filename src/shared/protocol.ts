@@ -3,6 +3,7 @@
  * worker. See docs/WORKER_MODEL.md §5. Results travel as columnar batches; numeric columns use
  * transferable Float64Arrays.
  */
+import type { ErrorDetails } from '../engine/errors.js';
 import type { PlanType } from '../engine/plan/types.js';
 import type { SqlValue } from '../engine/values.js';
 
@@ -114,7 +115,8 @@ export type Response =
   | { id: number; kind: 'batch'; length: number; cols: WireColumn[] }
   /** The end of a result; a write's counts, when the statement was a write. */
   | { id: number; kind: 'done'; changes?: number; lastInsertRowid?: number | bigint }
-  | { id: number; kind: 'error'; code: string; message: string }
+  /** `details`: what the error is about, as fields (engine/errors.ts `ErrorDetails`). */
+  | { id: number; kind: 'error'; code: string; message: string; details?: ErrorDetails }
   /** A direct channel from a parallel reader worker to this client (results bypass the owner). */
   | { id: 0; kind: 'port'; port: MessagePort };
 

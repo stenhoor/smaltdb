@@ -16,7 +16,7 @@ export type { AggCall, ConflictAction, JoinKind, PlanOp, SortKey, WindowCall, Wi
 export type { AlterAction, CheckDef, ColumnDef, DefaultDef, DeferredError, ExprDef, ForeignKeyDef, IndexColumnDef, IndexDef, KeyColumnDef, KeyDef, Source, SourceEditor, TableDef } from './plan/schema.js';
 export type { CollationName } from './plan/types.js';
 
-export { SmaltError } from './errors.js';
+export { type ErrorDetails, SmaltError, withDetails } from './errors.js';
 export { Collation, type SqlValue, collationByName, normalizeInt } from './values.js';
 
 export { storageTypeFor } from './plan/catalog.js';
