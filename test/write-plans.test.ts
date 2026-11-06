@@ -14,7 +14,7 @@ async function setup() {
     CREATE VIEW va AS SELECT a, count(*) AS n FROM t GROUP BY a;
     INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y'), (3, 10, 'z')`);
   const catalog = (db as unknown as { bindContext(): BindContext }).bindContext();
-  const write = (sql: string) => sqlLanguage.parseOne(sql).bind(catalog) as { plan: PlanOp };
+  const write = (sql: string) => sqlLanguage.parseOne!(sql).bind(catalog) as { plan: PlanOp };
   return { db, catalog, write };
 }
 

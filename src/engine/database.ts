@@ -56,7 +56,7 @@ import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordEncoder, RecordReader } from './storage/record.js';
 import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec/stats.js';
 import { type CatalogSnapshot, informationSchema } from './catalog/information-schema.js';
-import { type LanguageStatement, type SmaltLanguage, registeredLanguage } from './plan/language.js';
+import { type LanguageStatement, type SmaltLanguage, languagePart, registeredLanguage } from './plan/language.js';
 import { ForeignKeys } from './exec/fk.js';
 import { PluginRegistry, type SmaltPlugin } from './plugin.js';
 import { Collation, type SqlValue } from './values.js';
@@ -487,7 +487,7 @@ export class Database implements FunctionContext {
   /** Compile a single statement. */
   prepare(sql: string): Statement {
     this.checkOpen();
-    return new Statement(this, this.sql.parseOne(sql), sql);
+    return new Statement(this, this.parseOneSql(sql), sql);
   }
 
   /** SQL, the language of the string API: registered by smaltql (`import 'smaltql/register'`, or a worker's `defineWorker`). */
@@ -496,10 +496,20 @@ export class Database implements FunctionContext {
   }
   private sqlLanguage: SmaltLanguage | undefined;
 
+  /** SQL text as its statements. */
+  private parseSql(sql: string): LanguageStatement[] {
+    return languagePart(this.sql, 'parse')(sql);
+  }
+
+  /** SQL text holding exactly one statement. */
+  private parseOneSql(sql: string): LanguageStatement {
+    return languagePart(this.sql, 'parseOne')(sql);
+  }
+
   /** @internal Whether `sql` holds more than one statement (false when it does not parse: running it reports that). */
   isScript(sql: string): boolean {
     try {
-      return this.sql.parse(sql).length > 1;
+      return this.parseSql(sql).length > 1;
     } catch {
       return false;
     }
@@ -508,7 +518,7 @@ export class Database implements FunctionContext {
   /** Run one or more statements, discarding any rows. */
   exec(sql: string, params?: BindParams): void {
     this.checkOpen();
-    const stmts = this.sql.parse(sql);
+    const stmts = this.parseSql(sql);
     if (params !== undefined && stmts.length > 1) throw new MisuseError('parameters can only be bound with a single statement');
     for (const ps of stmts) new Statement(this, ps, ps.text).run(params);
   }
@@ -611,7 +621,7 @@ export class Database implements FunctionContext {
   /** `exec` for statements that may read external data (CREATE EXTERNAL TABLE, materialized views over it, …). */
   async execAsync(sql: string, params?: BindParams, options: { signal?: AbortSignal } = {}): Promise<void> {
     this.checkOpen();
-    const stmts = this.sql.parse(sql);
+    const stmts = this.parseSql(sql);
     if (params !== undefined && stmts.length > 1) throw new MisuseError('parameters can only be bound with a single statement');
     for (const ps of stmts) {
       const st = new Statement(this, ps, ps.text);
@@ -901,8 +911,8 @@ export class Database implements FunctionContext {
     for (const t of this.tables.values()) if (t.matview) this.matviewPolicy(t.matview);
     return {
       tables: [...this.tables.values(), ...this.shadowedMain.values()],
-      views: [...this.views.values()].map((v) => ({ name: v.name, sql: v.source.text, definition: this.languageOf(v.source.language).viewDefinition(v.source) })),
-      definition: (source) => this.languageOf(source.language).viewDefinition(source),
+      views: [...this.views.values()].map((v) => ({ name: v.name, sql: v.source.text, definition: languagePart(this.languageOf(v.source.language), 'viewDefinition')(v.source) })),
+      definition: (source) => languagePart(this.languageOf(source.language), 'viewDefinition')(source),
       viewColumns: (name) => {
         const v = this.views.get(name.toLowerCase());
         if (!v) return null;
@@ -1183,7 +1193,7 @@ export class Database implements FunctionContext {
    */
   planOf(sql: string): { root: Operator; columns: { name: string; type: StaticType }[]; subplans: readonly { label: string; root: Operator }[]; estimates: WeakMap<Operator, number> } {
     this.checkOpen();
-    const ps = this.sql.parseOne(sql);
+    const ps = this.parseOneSql(sql);
     const b = this.receivedBound(ps.bind(this.bindContext()));
     if (b.kind !== 'query') throw new MisuseError('planOf takes a SELECT statement');
     const bound: BoundQuery = b;
@@ -1206,12 +1216,79 @@ export class Database implements FunctionContext {
   }
 
   private readonly validateCatalog: ValidateCatalog = {
-    tableColumns: (name, db) => this.getTable(name, db)?.columns.length,
+    tableColumns: (name, db) => this.getTable(name, db)?.columns.length ?? this.viewWidth(name, db),
     sourceColumns: (kind, name, schema) => {
       if (kind === 'external' || (kind === 'function' && this.external.plugins.isExternalFunction(name))) return 'data';
       return this.virtualTable(kind === 'virtual' ? schema : undefined, name)?.columns.length;
     },
   };
+
+  /** The number of columns of view `name`: its declared column names, or its query's columns, bound by its language. */
+  private viewWidth(name: string, schema?: string): number | undefined {
+    const v = this.getView(name, schema);
+    if (!v) return undefined;
+    return v.columns?.length ?? languagePart(this.languageOf(v.source.language), 'bindView')(v.source, this.bindContext()).columns.length;
+  }
+
+  /**
+   * `plan` with each `scan` of a view replaced by the view's query, bound by its language now (views are bound late, by
+   * name: ADR 0016 section 6), and the scanned columns taken from it. A view's query may itself scan views.
+   */
+  private expandViews(plan: PlanOp, depth = 0): PlanOp {
+    const walk = (x: unknown): unknown => {
+      if (x === null || typeof x !== 'object') return x;
+      if (Array.isArray(x)) {
+        let out: unknown[] | undefined;
+        for (let i = 0; i < x.length; i++) {
+          const r = walk(x[i]);
+          if (r !== x[i]) (out ??= x.slice())[i] = r;
+        }
+        return out ?? x;
+      }
+      const o = x as Record<string, unknown>;
+      if (o.k === 'native') return x;
+      if (o.op === 'scan') return this.viewScan(o as unknown as Extract<PlanOp, { op: 'scan' }>, depth) ?? x;
+      let out: Record<string, unknown> | undefined;
+      for (const key in o) {
+        if (key === 'origin') continue;
+        const r = walk(o[key]);
+        if (r !== o[key]) (out ??= { ...o })[key] = r;
+      }
+      return out ?? x;
+    };
+    return walk(plan) as PlanOp;
+  }
+
+  /** `b` with the views its plans scan expanded (`expandViews`); as it is when there are none. */
+  private boundWithViews(b: BoundStatement): BoundStatement {
+    if (this.views.size === 0 && this.tempViews.size === 0) return b;
+    switch (b.kind) {
+      case 'query':
+      case 'write': {
+        const plan = this.expandViews(b.plan);
+        return plan === b.plan ? b : ({ ...b, plan } as BoundStatement);
+      }
+      case 'explain': {
+        const plan = this.expandViews(b.query.plan);
+        return plan === b.query.plan ? b : { ...b, query: { ...b.query, plan } };
+      }
+      default:
+        return b;
+    }
+  }
+
+  /** A `scan` of a view as the view's query (null: it scans a table). */
+  private viewScan(scan: Extract<PlanOp, { op: 'scan' }>, depth: number): PlanOp | null {
+    if (this.getTable(scan.table, scan.db)) return null;
+    const v = this.getView(scan.table, scan.db);
+    if (!v) return null;
+    if (depth > 64) throw new SmaltError('SMALT_ERROR', `view ${v.name} reads itself, or views nested too deeply`);
+    if (scan.columns.some((c) => c < 0)) throw new SmaltError('SMALT_ERROR', `view ${v.name} has no rowid`);
+    const bound = this.received(languagePart(this.languageOf(v.source.language), 'bindView')(v.source, this.bindContext()));
+    const query = this.expandViews(bound.plan, depth + 1);
+    const exprs = scan.columns.map((c): PlanExpr => ({ k: 'col', input: 0, index: c, depth: 0, type: 'any', collation: 'binary' }));
+    return normalizePlan({ op: 'project', input: query, exprs, ...(scan.origin !== undefined ? { origin: scan.origin } : {}) });
+  }
 
   /** The logical catalog languages bind against (plan/bind-context.ts): the planner's tables, views and sources. */
   private bindContext(): BindContext {
@@ -1275,7 +1352,7 @@ export class Database implements FunctionContext {
    * materialized-view matching on its plan under the statement's policy (exec/plan-mv-match.ts).
    */
   private planView(source: Source, planner: Planner, catalog: BindContext = this.bindContext()): QueryPlan {
-    const fe = this.received(this.languageOf(source.language).bindView(source, catalog));
+    const fe = this.received(languagePart(this.languageOf(source.language), 'bindView')(source, catalog));
     const rewrite = planner.env.rewritePlan;
     const p = planner.planPlan(rewrite ? rewrite(fe.plan) : fe.plan, fe.columns);
     if (!p) throw new SmaltError('SMALT_INTERNAL', `the physical planner declined a query\n  in: ${source.text}`);
@@ -1355,7 +1432,8 @@ export class Database implements FunctionContext {
    * @internal A bound statement's program (its plans already received): the engine dispatches on its kind
    * (plan/bound.ts). `text` names it in errors (its source, where there is one).
    */
-  compileBound(bound: BoundStatement, paramCount: number, text: string): Program {
+  compileBound(given: BoundStatement, paramCount: number, text: string): Program {
+    const bound = this.boundWithViews(given);
     const regs = new Registers(paramCount);
     const planner = new Planner(this.plannerDeps(this.rewritePolicy(bound)), regs);
     planner.sqlText = text;
@@ -2037,7 +2115,7 @@ export class Database implements FunctionContext {
       if (m.plan?.version !== this.schemaVersion) {
         let bound: PlanOp | null;
         try {
-          bound = this.received(this.languageOf(m.language).bindView({ language: m.language, text: m.sql }, this.bindContext())).plan;
+          bound = this.received(languagePart(this.languageOf(m.language), 'bindView')({ language: m.language, text: m.sql }, this.bindContext())).plan;
         } catch {
           bound = null;
         }
@@ -2092,7 +2170,7 @@ export class Database implements FunctionContext {
     }
     let entry: MorselEntry | null = null;
     try {
-      const parsed = this.sql.parseOne(sql);
+      const parsed = this.parseOneSql(sql);
       const fe = this.receivedBound(parsed.bind(this.bindContext()));
       if (fe.kind === 'query') {
         const q = planMorsels(fe.plan, parsed.paramCount, (name, db) => {
@@ -2530,7 +2608,7 @@ export class Database implements FunctionContext {
   /** Tables and views a view's query reads (lower-case names), through views: its language reads them from its source. */
   private sourceDeps(source: Source, seen = new Set<string>()): Set<string> {
     const out = new Set<string>();
-    for (const r of this.languageOf(source.language).viewReferences(source)) {
+    for (const r of languagePart(this.languageOf(source.language), 'viewReferences')(source)) {
       const n = r.name.toLowerCase();
       out.add(n);
       const view = this.getView(n);
@@ -2800,7 +2878,7 @@ export class Database implements FunctionContext {
       const data = this.external.data(schemaSourceOf(source));
       if (data.columns.length === 0) throw externalError(source, 'no columns found (the source is empty)');
       columns = data.columns.map((c) => ({ name: c.name, declType: c.declType || 'ANY' }));
-      if (stmt.source) text = this.languageOf(stmt.source.language).sourceEditor.externalTable(stmt.name, columns.map((c) => ({ name: c.name, declaredType: c.declType })), stmt.options);
+      if (stmt.source) text = languagePart(this.languageOf(stmt.source.language), 'sourceEditor').externalTable(stmt.name, columns.map((c) => ({ name: c.name, declaredType: c.declType })), stmt.options);
     }
     const stored: StoredDef = { kind: 'external', columns: columns.map((c) => ({ name: c.name, declaredType: c.declType })), options: stmt.options, ...described };
     text ??= describeDefinition(stored);
@@ -3389,7 +3467,7 @@ export class Database implements FunctionContext {
     const language = def && 'language' in def && def.language !== undefined ? def.language : 'sql';
     const l = registeredLanguage(language);
     if (!l) throw new SmaltError('SMALT_MISUSE', `ALTER TABLE needs the ${language} language to edit its objects' source text`);
-    return l.sourceEditor;
+    return languagePart(l, 'sourceEditor');
   }
 
   /** Column names per table, for resolving references while editing source text. */
@@ -3696,7 +3774,7 @@ export class Database implements FunctionContext {
     // made is bound where first used, from the table's source. A failure is the binder's error.
     if (checks.some((c) => !c.expr) || defaults.some((d) => d && !d.expr)) {
       const lang = this.languageOf(table.language ?? 'sql');
-      const b = lang.bindTableExprs(this.described(table)!, this.bindContext());
+      const b = languagePart(lang, 'bindTableExprs')(this.described(table)!, this.bindContext());
       checks = checks.map((c, i) => (c.expr ? c : { ...c, expr: b.checks[i] }));
       defaults = defaults.map((d, i) => (d && !d.expr ? { ...d, expr: b.defaults[i]! } : d));
     }

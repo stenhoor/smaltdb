@@ -25,7 +25,7 @@ function setup(): { db: Database; catalog: BindContext } {
   return { db, catalog: (db as unknown as { bindContext(): BindContext }).bindContext() };
 }
 
-const bind = (catalog: BindContext, q: string): PlanOp => (sqlLanguage.parseOne(q).bind(catalog) as { plan: PlanOp }).plan;
+const bind = (catalog: BindContext, q: string): PlanOp => (sqlLanguage.parseOne!(q).bind(catalog) as { plan: PlanOp }).plan;
 const json = (plan: PlanOp): string => planToJSON(plan);
 
 /** Every `key` field anywhere in `x`. */
