@@ -448,12 +448,19 @@ class Validator {
     const conflict = (x: unknown, field: string): void => {
       if (x !== undefined && !CONFLICT_ACTIONS.has(x as string)) this.fail(`unknown conflict action ${JSON.stringify(x)}`, field);
     };
+    // Without source text, a definition's expressions must be bound: nothing could bind them later.
+    let unbound = false;
+    const optSource = (x: unknown): void => {
+      if (x === undefined) unbound = true;
+      else source(x);
+    };
     /** An expression of a definition over `width` columns (and the rowid when `rowid`). */
     const exprDef = (x: unknown, width: number, rowid: boolean, field: string, i?: number): void =>
       this.under(field, i, () => {
         if (!x || typeof x !== 'object') this.fail('expected { text, expr? }');
         const d = x as { text?: unknown; expr?: PlanExpr };
         str(d.text, 'text', false);
+        if (d.expr === undefined && unbound) this.fail('a definition without source text needs its bound expression', 'expr');
         if (d.expr !== undefined) this.exprAt(d.expr, [[rowid ? width + 1 : width]], 1, 'expr', undefined);
       });
     const columnIndex = (c: unknown, width: number, field: string, i?: number): void => {
@@ -510,7 +517,7 @@ class Validator {
         schema(o.schema);
         bool(o.temp, 'temp');
         bool(o.ifNotExists, 'ifNotExists');
-        source(o.source);
+        optSource(o.source);
         this.under('table', undefined, () => {
           const t = o.table as Record<string, unknown>;
           if (!t || typeof t !== 'object') this.fail('expected a table definition');
@@ -554,7 +561,7 @@ class Validator {
       case 'createIndex': {
         schema(o.schema);
         bool(o.ifNotExists, 'ifNotExists');
-        source(o.source);
+        optSource(o.source);
         this.under('index', undefined, () => {
           const ix = o.index as Record<string, unknown>;
           if (!ix || typeof ix !== 'object') this.fail('expected an index definition');
@@ -607,7 +614,7 @@ class Validator {
               bool(c.constrained, 'constrained');
             });
         }
-        source(o.source);
+        optSource(o.source);
         return;
       }
       case 'drop': {
@@ -620,7 +627,7 @@ class Validator {
       case 'alterTable': {
         str(o.table, 'table');
         schema(o.schema);
-        source(o.source);
+        optSource(o.source);
         const width = this.tableWidth(o.table, o.schema);
         this.under('action', undefined, () => {
           const a = o.action as Record<string, unknown>;

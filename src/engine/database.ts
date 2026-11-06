@@ -30,7 +30,7 @@ import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from '.
 import { type PlanMorsels, planMorsels } from './exec/plan-morsel.js';
 import type { BoundQuery, BoundStatement, BoundTransaction, BoundWrite } from './plan/bound.js';
 import type { AlterAction, ColumnDef as ColumnDefinition, ExprDef, SchemaOp, Source, SourceEditor, TableDef } from './plan/schema.js';
-import { SYSTEM_TABLES, type StoredDef, type StoredText, type SystemTableName, decodeDef, encodeDef, isSystemTable, systemTableSql } from './catalog/stored.js';
+import { SYSTEM_TABLES, type StoredDef, type StoredText, type SystemTableName, decodeDef, describeDefinition, encodeDef, isDescribed, isSystemTable, systemTableSql } from './catalog/stored.js';
 import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
@@ -1018,6 +1018,7 @@ export class Database implements FunctionContext {
       const { table, implicitIndexes } = tableSchemaFromDef(t, r.sql!, r.rootpage);
       if (isSystemTable(r.name)) table.system = true;
       if (stored?.language !== undefined && stored.language !== 'sql') table.language = stored.language;
+      if (isDescribed(stored)) table.described = true;
       implicitIndexes.forEach((spec, i) => {
         const name = autoIndexName(table.name, i + 1);
         const root = autoRoots.get(name.toLowerCase());
@@ -2719,7 +2720,8 @@ export class Database implements FunctionContext {
   // ---------------------------------------------------------------- connections and external tables (M8)
 
   private createConnection(stmt: Extract<SchemaOp, { op: 'createConnection' }>): RunResult {
-    const sql = stmt.source.text;
+    const stored: StoredDef = { kind: 'connection', options: stmt.options, ...(stmt.source ? {} : { described: true as const }) };
+    const sql = stmt.source?.text ?? describeDefinition(stored);
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const lower = stmt.name.toLowerCase();
     if (this.connections.has(lower)) {
@@ -2729,7 +2731,7 @@ export class Database implements FunctionContext {
     // Types, their options and checks come from plugins (@smaltdb/external: http, s3, azure).
     this.external.plugins.checkConnection(stmt.name, stmt.options);
     this.dirtySchema = true;
-    this.addCatalogRow('connection', stmt.name, stmt.name, 0, sql, connectionKey(stmt.name), { kind: 'connection', options: stmt.options });
+    this.addCatalogRow('connection', stmt.name, stmt.name, 0, sql, connectionKey(stmt.name), stored);
     this.connections.set(lower, { name: stmt.name, options: stmt.options, sql });
     this.schemaChanged();
     return none;
@@ -2769,7 +2771,7 @@ export class Database implements FunctionContext {
   }
 
   private createExternalTable(stmt: Extract<SchemaOp, { op: 'createExternalTable' }>): RunResult {
-    const sql = stmt.source.text;
+    const described = stmt.source ? {} : { described: true as const };
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const lower = stmt.name.toLowerCase();
     if (stmt.ifNotExists && this.externals.has(lower)) return none;
@@ -2792,16 +2794,18 @@ export class Database implements FunctionContext {
     }
     let columns: ExternalColumn[] = stmt.columns.map((c) => ({ name: c.name, declType: c.declaredType }));
     const source = this.externalSourceOf({ name: stmt.name, options: stmt.options }, columns.length ? columns : undefined);
-    let text = sql;
+    let text: string | undefined = stmt.source?.text;
     if (columns.length === 0) {
       // Columns inferred from the source now (fetched by the async API; Parquet: only its footer), and stored with the table.
       const data = this.external.data(schemaSourceOf(source));
       if (data.columns.length === 0) throw externalError(source, 'no columns found (the source is empty)');
       columns = data.columns.map((c) => ({ name: c.name, declType: c.declType || 'ANY' }));
-      text = this.languageOf(stmt.source.language).sourceEditor.externalTable(stmt.name, columns.map((c) => ({ name: c.name, declaredType: c.declType })), stmt.options);
+      if (stmt.source) text = this.languageOf(stmt.source.language).sourceEditor.externalTable(stmt.name, columns.map((c) => ({ name: c.name, declaredType: c.declType })), stmt.options);
     }
+    const stored: StoredDef = { kind: 'external', columns: columns.map((c) => ({ name: c.name, declaredType: c.declType })), options: stmt.options, ...described };
+    text ??= describeDefinition(stored);
     this.dirtySchema = true;
-    this.addCatalogRow('external', stmt.name, stmt.name, 0, text, undefined, { kind: 'external', columns: columns.map((c) => ({ name: c.name, declaredType: c.declType })), options: stmt.options });
+    this.addCatalogRow('external', stmt.name, stmt.name, 0, text, undefined, stored);
     this.externals.set(lower, { name: stmt.name, columns, options: stmt.options, sql: text });
     this.objectChanged(stmt.name);
     this.schemaChanged();
@@ -2891,7 +2895,8 @@ export class Database implements FunctionContext {
   }
 
   private createTable(stmt: Extract<SchemaOp, { op: 'createTable' }>, internal = false): RunResult {
-    const sql = stmt.source.text;
+    const stored: TableDefOf = { kind: 'table', table: stmt.table, ...sourceFields(stmt.source) };
+    const sql = stmt.source?.text ?? describeDefinition(stored);
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const columnar = stmt.table.storage === 'columnar';
     const schema = stmt.schema?.toLowerCase();
@@ -2907,7 +2912,7 @@ export class Database implements FunctionContext {
     const root = BTree.create(this.pager);
     const { table, implicitIndexes, conflictingOnConflict } = tableSchemaFromDef(stmt.table, sql, root);
     if (conflictingOnConflict) throw new SmaltError('SMALT_ERROR', 'conflicting ON CONFLICT clauses specified');
-    if (stmt.source.language !== 'sql') table.language = stmt.source.language;
+    sourceOf(table, stmt.source);
     if (columnar) {
       // Columnar tables are scanned, not probed: no secondary structures to keep in step.
       if (implicitIndexes.length > 0) throw new SmaltError('SMALT_UNSUPPORTED', 'columnar tables support no UNIQUE or PRIMARY KEY constraints other than INTEGER PRIMARY KEY');
@@ -2921,7 +2926,7 @@ export class Database implements FunctionContext {
     for (const fk of table.foreignKeys) {
       if (this.tables.get(fk.table.toLowerCase())?.columnar) throw new SmaltError('SMALT_UNSUPPORTED', `foreign keys cannot reference columnar table ${fk.table}`);
     }
-    this.addCatalogRow('table', table.name, table.name, root, sql, undefined, internal ? undefined : { kind: 'table', table: stmt.table, language: stmt.source.language });
+    this.addCatalogRow('table', table.name, table.name, root, sql, undefined, internal ? undefined : stored);
     implicitIndexes.forEach((spec, i) => {
       const name = autoIndexName(table.name, i + 1);
       const iroot = BTree.create(this.pager);
@@ -2940,7 +2945,7 @@ export class Database implements FunctionContext {
    * connection only (like SQLite's temp schema); it shadows a main table of the same name.
    */
   private createTempTable(stmt: Extract<SchemaOp, { op: 'createTable' }>): RunResult {
-    const sql = stmt.source.text;
+    const sql = stmt.source?.text ?? describeDefinition({ kind: 'table', table: stmt.table, described: true });
     const name = stmt.table.name;
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const lower = name.toLowerCase();
@@ -2952,7 +2957,7 @@ export class Database implements FunctionContext {
     const { table, implicitIndexes, conflictingOnConflict } = tableSchemaFromDef(stmt.table, sql, this.createTree(true));
     if (conflictingOnConflict) throw new SmaltError('SMALT_ERROR', 'conflicting ON CONFLICT clauses specified');
     table.temp = true;
-    if (stmt.source.language !== 'sql') table.language = stmt.source.language;
+    sourceOf(table, stmt.source);
     implicitIndexes.forEach((spec, i) => {
       const name = autoIndexName(table.name, i + 1);
       table.indexes.push({ name, table: table.name, rootPage: this.createTree(true), columns: spec.columns, unique: true, origin: spec.origin, constraintName: spec.constraintName, onConflict: spec.onConflict });
@@ -2989,7 +2994,8 @@ export class Database implements FunctionContext {
   private createIndex(op: Extract<SchemaOp, { op: 'createIndex' }>): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const stmt = op.index;
-    const sql = op.source.text;
+    const stored: StoredDef = { kind: 'index', index: stmt, ...sourceFields(op.source) };
+    const sql = op.source?.text ?? describeDefinition(stored);
     if (op.ifNotExists && this.catalogEntries.has(stmt.name.toLowerCase())) return none;
     const table = this.indexTarget(stmt.table, op.schema);
     if (table.temp) {
@@ -3021,7 +3027,7 @@ export class Database implements FunctionContext {
       mv.indexRoots.set(idx.name.toLowerCase(), root);
       this.memDirty = true;
     }
-    this.addCatalogRow('index', idx.name, table.name, memory ? MEM_BASE : root, sql, undefined, { kind: 'index', index: stmt, language: op.source.language });
+    this.addCatalogRow('index', idx.name, table.name, memory ? MEM_BASE : root, sql, undefined, stored);
     this.schemaChanged();
     return none;
   }
@@ -3346,7 +3352,15 @@ export class Database implements FunctionContext {
     if (a.kind === 'renameTable') this.objectChanged(a.newName);
     this.dirtySchema = true;
     this.noteValidViews();
-    this.rewriteCatalog(change.rows);
+    const rows = change.rows;
+    this.rewriteCatalog((row) => {
+      const r = rows(row);
+      // Objects defined without source text: their description, of their new definition.
+      const d = change.defs.get(Database.rowKey({ type: row.type, name: r?.name ?? row.name })) ?? defs.get(Database.rowKey(row));
+      if (!isDescribed(d ?? undefined)) return r;
+      const sql = describeDefinition(d!);
+      return sql === row.sql && !r ? null : { ...r, sql };
+    });
     for (const [key, d] of change.defs) {
       if (d) this.writeDefinition(key, d);
       else this.deleteDefinition(key);
@@ -3370,6 +3384,8 @@ export class Database implements FunctionContext {
 
   /** The editor of an object's source text, by its language. */
   private sourceEditor(def: StoredDef | undefined): SourceEditor {
+    // An object defined without source text: its catalog text is described again from its new definition (alterTable).
+    if (isDescribed(def)) return UNCHANGED_TEXT;
     const language = def && 'language' in def && def.language !== undefined ? def.language : 'sql';
     const l = registeredLanguage(language);
     if (!l) throw new SmaltError('SMALT_MISUSE', `ALTER TABLE needs the ${language} language to edit its objects' source text`);
@@ -3456,6 +3472,9 @@ export class Database implements FunctionContext {
   private addColumnDefs(table: TableSchema, own: TableDefOf, a: Extract<AlterAction, { kind: 'addColumn' }>, defs: Map<string, StoredDef>, change: AlterChange): void {
     if (findColumn(table, a.column.name) >= 0) throw new SmaltError('SMALT_ERROR', `duplicate column name: ${a.column.name}`);
     if (a.invalid) throw new SmaltError(a.invalid.code, a.invalid.message);
+    if (isDescribed(own) && ((a.column.default && !a.column.default.expr) || a.checks.some((c) => !c.expr))) {
+      throw new SmaltError('SMALT_ERROR', `table ${table.name} was defined without source text: a column added to it needs its bound expressions`);
+    }
     // As in SQLite: with foreign keys on, existing rows would get a default that may reference nothing.
     if (this.fk.enabled && a.foreignKeys.length > 0 && a.column.default !== undefined && a.column.default.value !== null && this.hasRows(table)) {
       throw new SmaltError('SMALT_ERROR', 'Cannot add a REFERENCES column with non-NULL default value');
@@ -4925,6 +4944,27 @@ function layoutSql(def: TableDef): string {
   const coll = (c: CollationName): string => (c === 'nocase' ? ' COLLATE NOCASE' : c === 'rtrim' ? ' COLLATE RTRIM' : '');
   return `CREATE TABLE ${q(def.name)}(${def.columns.map((c) => `${q(c.name)} ${c.declaredType}${coll(c.collation)}`).join(', ')})`;
 }
+
+/** A definition's language, or that it has no source text (ADR 0016 section 6). */
+function sourceFields(source: Source | undefined): { language?: string; described?: true } {
+  return source ? { language: source.language } : { described: true };
+}
+
+/** Records on `table` its source's language (SQL is the default), or that it has none. */
+function sourceOf(table: TableSchema, source: Source | undefined): void {
+  if (!source) table.described = true;
+  else if (source.language !== 'sql') table.language = source.language;
+}
+
+/** The editor of an object defined without source text: it has none to edit (alterTable describes it again). */
+const UNCHANGED_TEXT: SourceEditor = {
+  renameTable: (text) => text,
+  renameColumn: (text) => text,
+  renameColumnInExpr: (text) => text,
+  addColumn: (text) => text,
+  dropColumn: (text) => text,
+  externalTable: () => '',
+};
 
 /** What an ALTER TABLE changes: definitions by catalog key (null: removed), and catalog rows. */
 interface AlterChange {

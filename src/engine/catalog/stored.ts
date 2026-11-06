@@ -21,14 +21,36 @@ export const DEFINITION_VERSION = 1;
 
 /** An object's stored definition, by catalog type. */
 export type StoredDef =
-  /** `language`: the language of the object's source text (absent: SQL). */
-  | { readonly kind: 'table'; readonly table: TableDef; readonly language?: string }
-  | { readonly kind: 'index'; readonly index: IndexDef; readonly language?: string }
+  /**
+   * `language`: the language of the object's source text (absent: SQL). `described`: the object was defined without
+   * source text (ADR 0016 section 6), and its catalog text is the engine's description of the definition.
+   */
+  | { readonly kind: 'table'; readonly table: TableDef; readonly language?: string; readonly described?: true }
+  | { readonly kind: 'index'; readonly index: IndexDef; readonly language?: string; readonly described?: true }
   | { readonly kind: 'view'; readonly language: string; readonly columns?: readonly string[] }
   /** A materialized view; the table its rows are stored in is in `smalt_matview` (its layout). */
   | { readonly kind: 'matview'; readonly language: string; readonly columns?: readonly string[]; readonly options: Readonly<Record<string, SqlValue>> }
-  | { readonly kind: 'connection'; readonly options: Readonly<Record<string, SqlValue>> }
-  | { readonly kind: 'external'; readonly columns: readonly { readonly name: string; readonly declaredType: string }[]; readonly options: Readonly<Record<string, SqlValue>> };
+  | { readonly kind: 'connection'; readonly options: Readonly<Record<string, SqlValue>>; readonly described?: true }
+  | { readonly kind: 'external'; readonly columns: readonly { readonly name: string; readonly declaredType: string }[]; readonly options: Readonly<Record<string, SqlValue>>; readonly described?: true };
+
+/** Whether `def` was defined without source text: its catalog text is {@link describeDefinition}'s. */
+export function isDescribed(def: StoredDef | undefined): boolean {
+  return def !== undefined && 'described' in def && def.described === true;
+}
+
+/**
+ * The catalog text of an object defined without source text: its definition as JSON, with each expression as its text,
+ * in the compact form the catalog stores. It describes the object in no language's syntax.
+ */
+export function describeDefinition(def: StoredDef): string {
+  const text = (e: ExprDef): StoredExprDef => {
+    const { expr: _e, ...rest } = e;
+    return rest;
+  };
+  const { described: _d, ...rest } = def as StoredDef & { described?: true };
+  const body = rest.kind === 'table' ? { ...rest, table: compactTable(rest.table, text) } : rest.kind === 'index' ? { ...rest, index: compactIndex(rest.index, text) } : rest;
+  return encodeDataJSON(body);
+}
 
 /** A definition as stored: its JSON text, and its plan expressions' (null when it has none). */
 export interface StoredText {
@@ -47,7 +69,7 @@ export function encodeDef(def: StoredDef): StoredText {
   };
   let body: unknown;
   const language = def.kind === 'table' || def.kind === 'index' ? def.language : undefined;
-  const lang = language !== undefined && language !== 'sql' ? { language } : {};
+  const lang = { ...(language !== undefined && language !== 'sql' ? { language } : {}), ...(isDescribed(def) ? { described: true } : {}) };
   if (def.kind === 'table') body = { kind: 'table', table: compactTable(def.table, store), ...lang };
   else if (def.kind === 'index') body = { kind: 'index', index: compactIndex(def.index, store), ...lang };
   else body = def;
@@ -78,7 +100,7 @@ export function decodeDef(text: StoredText, name: string): StoredDef {
       enumerable: true,
     });
   };
-  const lang = typeof raw.language === 'string' ? { language: raw.language } : {};
+  const lang = { ...(typeof raw.language === 'string' ? { language: raw.language } : {}), ...(raw.described === true ? { described: true as const } : {}) };
   return raw.kind === 'table' ? { kind: 'table', table: expandTable(raw.table as Compact, load), ...lang } : { kind: 'index', index: expandIndex(raw.index as Compact, load), ...lang };
 }
 

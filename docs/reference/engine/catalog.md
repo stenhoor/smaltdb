@@ -28,7 +28,7 @@ first, when it shadows a main one; `schema` picks `main` or `temp`). Each `Catal
 | `indexes` | `{ name, columns, unique, partial }`, `column` -1 for an indexed expression |
 | `storage` | `row` or `columnar` |
 | `strict` | values must match the column types |
-| `source` | `{ language, text }`: its definition, in the language it was written in |
+| `source` | `{ language, text }`: its definition, in the language it was written in; absent for a table [defined without source text](./schema#definitions-without-source-text) |
 
 `views()` and `view(name, schema?)` give `{ name, schema, language, text, columns? }`: a view is source text in its
 language, bound where it is read.

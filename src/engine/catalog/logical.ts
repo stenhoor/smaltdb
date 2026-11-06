@@ -60,7 +60,7 @@ export function describeTable(t: TableSchema): CatalogTable {
     })),
     storage: isColumnar(t) ? 'columnar' : 'row',
     strict: t.strict,
-    source: { language: t.matview?.language ?? t.language ?? 'sql', text: t.matview?.sql ?? t.sql },
+    ...(t.described && !t.matview ? {} : { source: { language: t.matview?.language ?? t.language ?? 'sql', text: t.matview?.sql ?? t.sql } }),
   };
 }
 
@@ -68,9 +68,9 @@ export function describeTable(t: TableSchema): CatalogTable {
  * `def`, a table definition, described as the catalog will describe the table `CREATE TABLE` makes of it: the same
  * columns, rowid, keys and storage (the engine's own reading of the definition).
  */
-export function describeTableDef(def: TableDef, source: Source, schema: 'main' | 'temp' = 'main'): CatalogTable {
-  const { table } = tableSchemaFromDef(def, source.text, 0);
-  const d = describeTable({ ...table, ...(source.language !== 'sql' ? { language: source.language } : {}) });
+export function describeTableDef(def: TableDef, source?: Source, schema: 'main' | 'temp' = 'main'): CatalogTable {
+  const { table } = tableSchemaFromDef(def, source?.text ?? '', 0);
+  const d = describeTable({ ...table, ...(source ? (source.language !== 'sql' ? { language: source.language } : {}) : { described: true }) });
   // The key indexes are made with the table: its keys come from the definition.
   const pk = def.keys.find((k) => k.kind === 'primaryKey');
   const keys: CatalogKey[] = [
