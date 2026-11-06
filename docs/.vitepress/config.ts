@@ -122,7 +122,7 @@ export default defineConfig({
           { text: '0013 Plugin API v1', link: '/adr/0013-plugin-api-v1' },
           { text: '0014 Shared plan layer (proposed)', link: '/adr/0014-shared-plan-layer' },
           { text: '0015 smaltql and the language API', link: '/adr/0015-smaltql' },
-          { text: '0016 Plan API for every language (proposed)', link: '/adr/0016-plan-api-for-every-language' },
+          { text: '0016 Plan API for every language', link: '/adr/0016-plan-api-for-every-language' },
         ],
       },
       {
