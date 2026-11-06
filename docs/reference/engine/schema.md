@@ -4,21 +4,22 @@ DDL reaches the engine as data: a statement `{ kind: 'schema', op }` whose `op` 
 The engine keeps every object's definition in this language-neutral form, stored in the database as versioned JSON, so
 opening a database parses nothing ([storage format](../../STORAGE_FORMAT.md)).
 
-Each operation also carries its **source** (`{ language, text }`): the statement as its language wrote it. The engine
+An operation may carry its **source** (`{ language, text }`): the statement as its language wrote it. The engine
 stores it beside the definition, for display (`sqlite_schema.sql`, `information_schema`), and asks that language to edit
-it when ALTER TABLE changes the definition.
+it when ALTER TABLE changes the definition. Views need one; every other operation can leave it out (see
+[definitions without source text](#definitions-without-source-text)).
 
 ## Operations
 
 | `op` | Fields |
 |---|---|
-| `createTable` | `table` (a `TableDef`), `schema?`, `temp`, `ifNotExists`, `source` |
-| `createIndex` | `index` (an `IndexDef`), `schema?`, `ifNotExists`, `source` |
+| `createTable` | `table` (a `TableDef`), `schema?`, `temp`, `ifNotExists`, `source?` |
+| `createIndex` | `index` (an `IndexDef`), `schema?`, `ifNotExists`, `source?` |
 | `createView` | `name`, `schema?`, `temp`, `ifNotExists`, `columns?` (result column names), `materialized`, `options?` and `withData?` (materialized views), `source` |
-| `createConnection` | `name`, `ifNotExists`, `options`, `source` |
-| `createExternalTable` | `name`, `ifNotExists`, `columns` (empty: read from the source), `options`, `source` |
+| `createConnection` | `name`, `ifNotExists`, `options`, `source?` |
+| `createExternalTable` | `name`, `ifNotExists`, `columns` (empty: read from the source), `options`, `source?` |
 | `drop` | `objectType` (`table`, `index`, `view`, `materialized view`, `trigger`, `external table`, `connection`), `name`, `schema?`, `ifExists` |
-| `alterTable` | `table`, `schema?`, `action` (`renameTable`, `renameColumn`, `addColumn`, `dropColumn`), `source` |
+| `alterTable` | `table`, `schema?`, `action` (`renameTable`, `renameColumn`, `addColumn`, `dropColumn`), `source?` |
 
 A view is kept as its language's source, not as a plan: it is bound by its language where it is read, so it follows
 later changes to the tables it reads (see [writing a language](./languages#views)).
@@ -69,6 +70,36 @@ db.exec('CREATE TABLE fruit(id INTEGER PRIMARY KEY, name TEXT, qty INT)');
 // CREATE INDEX fruit_name ON fruit(name COLLATE NOCASE)
 const index: plan.IndexDef = { name: 'fruit_name', table: 'fruit', unique: false, columns: [{ column: 1, desc: false, collation: 'nocase' }] };
 db.preparePlan({ kind: 'schema', op: { op: 'createIndex', index, ifNotExists: false, source: { language: 'sql', text: 'CREATE INDEX fruit_name ON fruit(name COLLATE NOCASE)' } } }).run();
+```
+
+## Definitions without source text
+
+Without `source`, the engine stores the definition alone. Where the source text would be shown (`sqlite_schema.sql`,
+`information_schema`), it shows a neutral description instead: the definition as JSON, with each expression as its
+`text`. The catalog's table has no `source`. ALTER TABLE changes the definition and describes it again, without asking
+any language; other objects' source texts are still edited by their own languages (a SQL view over the table follows a
+renamed column).
+
+Such a definition's expressions must be bound (`expr` on every CHECK, DEFAULT and index expression): there is no text to
+bind them from later, so the validator refuses an expression without one, and so does ALTER TABLE ADD COLUMN on such a
+table. Each expression's `text` is kept for display.
+
+```ts
+import { Database, plan } from 'smaltdb/engine';
+
+const db = Database.openMemory();
+const table: plan.TableDef = {
+  name: 'stock',
+  columns: [
+    { name: 'id', declaredType: 'INTEGER', type: 'INTEGER', notNull: false, collation: 'binary' },
+    { name: 'qty', declaredType: 'INTEGER', type: 'INTEGER', notNull: true, collation: 'binary', default: { text: '0', expr: plan.lit(0), value: 0 } },
+  ],
+  keys: [{ kind: 'primaryKey', columns: [{ column: 0, desc: false, collation: 'binary' }] }],
+  checks: [{ text: 'qty >= 0', expr: plan.call('cmp_ge', [plan.col(0, 1, 'int'), plan.lit(0)], 'int') }],
+  foreignKeys: [],
+  storage: 'row',
+};
+db.preparePlan({ kind: 'schema', op: { op: 'createTable', table, temp: false, ifNotExists: false } }).run();
 ```
 
 ## Sources and languages

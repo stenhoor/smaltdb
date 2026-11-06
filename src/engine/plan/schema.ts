@@ -125,10 +125,15 @@ export type DropObject = 'table' | 'index' | 'view' | 'materialized view' | 'tri
  * A schema operation (ADR 0015 section 5): what a language's DDL becomes. Views and materialized views are kept as their
  * language's source, bound where they are read (section 6). ALTER TABLE changes the stored definitions; the source
  * texts shown beside them are edited by their language ({@link SourceEditor}).
+ *
+ * `source` is optional except on views (ADR 0016 section 6). Without it the engine stores the definition alone, shows
+ * a neutral description of it where the source text would be (the definition as JSON), and ALTER TABLE changes the
+ * definition without asking any language. Such a definition's expressions must be bound (`expr`): there is no text to
+ * bind them from later.
  */
 export type SchemaOp =
-  | { readonly op: 'createTable'; readonly table: TableDef; readonly schema?: string; readonly temp: boolean; readonly ifNotExists: boolean; readonly source: Source }
-  | { readonly op: 'createIndex'; readonly index: IndexDef; readonly schema?: string; readonly ifNotExists: boolean; readonly source: Source }
+  | { readonly op: 'createTable'; readonly table: TableDef; readonly schema?: string; readonly temp: boolean; readonly ifNotExists: boolean; readonly source?: Source }
+  | { readonly op: 'createIndex'; readonly index: IndexDef; readonly schema?: string; readonly ifNotExists: boolean; readonly source?: Source }
   | {
       readonly op: 'createView';
       readonly name: string;
@@ -143,7 +148,7 @@ export type SchemaOp =
       readonly withData?: boolean;
       readonly source: Source;
     }
-  | { readonly op: 'createConnection'; readonly name: string; readonly ifNotExists: boolean; readonly options: Readonly<Record<string, SqlValue>>; readonly source: Source }
+  | { readonly op: 'createConnection'; readonly name: string; readonly ifNotExists: boolean; readonly options: Readonly<Record<string, SqlValue>>; readonly source?: Source }
   | {
       readonly op: 'createExternalTable';
       readonly name: string;
@@ -151,10 +156,10 @@ export type SchemaOp =
       /** Declared columns (empty: inferred from the source when the table is created). */
       readonly columns: readonly { readonly name: string; readonly declaredType: string; readonly constrained: boolean }[];
       readonly options: Readonly<Record<string, SqlValue>>;
-      readonly source: Source;
+      readonly source?: Source;
     }
   | { readonly op: 'drop'; readonly objectType: DropObject; readonly name: string; readonly schema?: string; readonly ifExists: boolean }
-  | { readonly op: 'alterTable'; readonly table: string; readonly schema?: string; readonly action: AlterAction; readonly source: Source };
+  | { readonly op: 'alterTable'; readonly table: string; readonly schema?: string; readonly action: AlterAction; readonly source?: Source };
 
 /** A language's statement check that the engine reports after its own (which come first, as SQLite orders them). */
 export interface DeferredError {

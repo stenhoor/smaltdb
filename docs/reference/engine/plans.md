@@ -41,7 +41,7 @@ Each operation's output columns, in order:
 
 | Operation | Fields | Output |
 |---|---|---|
-| `scan` | `table`, `columns` (table column indexes, -1 the rowid), `db?` (`main` / `temp`), `indexedBy?` | the listed columns |
+| `scan` | `table`, `columns` (table column indexes, -1 the rowid), `db?` (`main` / `temp`), `indexedBy?` | the listed columns. `table` may name a view: its query, bound by its language when the plan is compiled ([views](./languages#views)) |
 | `values` | `rows` (expressions over no columns), `types` | one column per value |
 | `source` | `kind` (`function` / `virtual` / `external`), `name`, `schema?`, `args`, `named?`, `types` | the source's columns (a table function, `information_schema.*`, an external table) |
 | `filter` | `input`, `pred` | its input's |

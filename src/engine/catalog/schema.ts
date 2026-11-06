@@ -107,6 +107,8 @@ export interface TableSchema {
   system?: boolean;
   /** The language of its source `sql` (absent: SQL). */
   language?: string;
+  /** Defined without source text (ADR 0016 section 6): its catalog text describes the definition. */
+  described?: boolean;
   /** Statistics from ANALYZE (absent until analyzed). */
   stats?: import('../exec/stats.js').TableStats;
   /** Set for materialized views: the table holds the view's stored rows. */

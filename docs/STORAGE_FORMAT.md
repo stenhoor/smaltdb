@@ -115,10 +115,13 @@ interior cell:  u32 child | u16 keyLen | key
   definition refers to each by its position (`"x": 0`) beside its text. Integers beyond JSON's range, blobs and
   non-finite reals are tagged objects (`{"$bigint": "…"}`, `{"$blob": "hex"}`, `{"$real": "Infinity"}`). A key, CHECK
   or foreign key declared on a column records it (`"ofColumn": 2`): DROP COLUMN drops it with the column. A table or
-  index whose source is not SQL records its language (`"language"`). The table is not in the catalog, so
+  index whose source is not SQL records its language (`"language"`). An object defined without source text records
+  `"described": true`, and its `smalt_schema.sql` is the engine's description of the definition (the definition as JSON,
+  each expression as its text) rather than a language's statement. The table is not in the catalog, so
   `sqlite_schema` does not list it. A definition of another version is refused with `SMALT_FORMAT`.
 - ALTER TABLE changes the definitions (names, positions, the expressions' column numbers) and has the source's
-  language edit the texts shown beside them, as SQLite edits its stored statements.
+  language edit the texts shown beside them, as SQLite edits its stored statements. A described object's text is
+  described again from its new definition.
 - Opening reads both tables and parses nothing. Plan expressions stay JSON text until an expression is first used (an
   index's are compiled then), and a view's source, or a materialized view's query, is parsed by its language where it
   is first read.

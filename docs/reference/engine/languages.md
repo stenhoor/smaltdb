@@ -25,7 +25,11 @@ every database in the engine. That is what lets the engine keep objects written 
 
 ## The interface
 
-A language is a `SmaltLanguage`:
+A language is a `SmaltLanguage`. Besides its `name`, it provides the parts it uses: text it binds (`parse`,
+`parseOne`), the objects it stores (`bindView`, `viewReferences`, `viewDefinition`, `bindTableExprs`, `sourceEditor`),
+and words for errors (`errorMessage`). A language that writes no text has no parser; one whose views are its own
+serialized source, not text it parses, provides the stored-object part alone. Using a part a language lacks is a
+`SMALT_MISUSE` error that names both (`the dotted language does not edit its objects' source text`).
 
 | Member | |
 |---|---|
@@ -34,9 +38,9 @@ A language is a `SmaltLanguage`:
 | `bindView(source, ctx)` | A view's or materialized view's query (its source), bound against the catalog: a `{ kind: 'query', plan, columns }`. |
 | `viewReferences(source)` | The tables and views a view's query names, directly, read from its source without binding (a view may name tables that do not exist yet). The engine follows them for dependencies, TEMP checks and refresh order. |
 | `viewDefinition(source)` | The text of a view's query alone, for `information_schema.views`. |
-| `bindTableExprs(table, ctx)` | The CHECK and DEFAULT expressions a stored table holds unbound, bound from its source (`table` as [the catalog](./catalog) describes it, its text in `table.source`). |
+| `bindTableExprs(table, ctx)` | The CHECK and DEFAULT expressions a stored table holds unbound, bound from its source (`table` as [the catalog](./catalog) describes it, its text in `table.source`). Needed only by a language whose tables keep expressions unbound. |
 | `errorMessage(error)` | Optional. The message for an error a statement written in the language raised, from its `code`, the engine's `message` and its [fields](../api/errors) (`constraint`, `table`, `columns`, `name`, `origin`): undefined keeps the engine's message. Each language words errors for its users; SQL's wording is SQLite's. |
-| `sourceEditor` | Edits the source texts kept beside definitions when ALTER TABLE renames a table or a column, adds or drops a column, and writes an external table's statement once its columns are known. |
+| `sourceEditor` | Edits the source texts kept beside definitions when ALTER TABLE renames a table or a column, adds or drops a column, and writes an external table's statement once its columns are known. ALTER TABLE edits every object's text, each with its own language's editor. Objects [defined without source text](./schema#definitions-without-source-text) need none. |
 
 A `LanguageStatement` (from `parse`) is `{ text, paramCount, paramNames, bind(ctx), externalCalls?() }`: `bind` gives a
 bound statement, the `PlanStatementInput` forms of [running plans](./running#statements) with the engine's column
@@ -50,7 +54,7 @@ descriptions. The engine binds a statement again when the schema changes.
 - `getView`, external tables and table functions, and virtual tables (`information_schema.*`).
 - `catalog`: [the catalog](./catalog), with function metadata and the engine's help for building plans.
 
-`smaltdb/language` also has `describeTableDef(def, source)`, a table definition described as the catalog will
+`smaltdb/language` also has `describeTableDef(def, source?)`, a table definition described as the catalog will
 describe the table it makes, and `comparisonRule(a, b)`: for two operands' types and [meaning
 fields](./plans#expressions), the collation a comparison of them uses and the conversion (`affinity_numeric`,
 `affinity_text`) to apply to each side first, as the engine reads `carries` and `affinity`.
@@ -58,29 +62,25 @@ fields](./plans#expressions), the collation a comparison of them uses and the co
 ## Views
 
 A view stays in its language: `bindView` binds it where it is read, so a view follows later changes to the tables it
-reads. Two limits apply today:
+reads. A plan reads a view as it reads a table, with `scan` naming it: the engine binds the view with its language when
+it compiles the plan (again after the schema changes), and the columns `scan` lists are the view's. A view has no
+rowid (`-1`).
 
-- The plan `bindView` returns must be in the shape the planner reads: a projection over the query's core, as SQL builds
-  it (see [plan shapes](./plans#plan-shapes)). The engine rearranges plans given to `preparePlan` and `queryPlan`, but
-  not yet those of views.
-- SQL reads views written in SQL only. A view in another language is read through a materialized view, whose rows the
-  engine fills by binding it with its language.
+- SQL reads views written in SQL only, since it reads a view by parsing its text. A view in another language is read by
+  plans, or through a materialized view, whose rows the engine fills by binding it with its language.
+- The plan `bindView` returns for a materialized view must be in the shape the planner reads: a projection over the
+  query's core, as SQL builds it (see [plan shapes](./plans#plan-shapes)). Views read by `scan` are rearranged as plans
+  given to `preparePlan` are.
 
-An example: a language whose whole syntax is `table.column`, meaning that column of that table.
+An example: a language whose whole syntax is `table.column`, meaning that column of that table. It parses no
+statements and edits no text: it provides views alone.
 
 ```ts
 import { Collation, Database, plan as p, registerLanguage, type SmaltLanguage } from 'smaltdb/engine';
 import 'smaltql/register';
 
-const unchanged = (text: string): string => text;
 const dotted: SmaltLanguage = {
   name: 'dotted',
-  parse: () => {
-    throw new Error('dotted statements run as plans');
-  },
-  parseOne: () => {
-    throw new Error('dotted statements run as plans');
-  },
   bindView(source, ctx) {
     const [table, column] = source.text.split('.');
     const index = ctx.table(table)!.columns.findIndex((c) => c.name === column);
@@ -88,16 +88,19 @@ const dotted: SmaltLanguage = {
   },
   viewReferences: (source) => [{ name: source.text.split('.')[0] }],
   viewDefinition: (source) => source.text,
-  bindTableExprs: () => ({ checks: [], defaults: [] }),
-  sourceEditor: { renameTable: unchanged, renameColumn: unchanged, renameColumnInExpr: unchanged, addColumn: unchanged, dropColumn: unchanged, externalTable: () => '' },
 };
 registerLanguage(dotted);
 
 const db = Database.openMemory();
 db.exec("CREATE TABLE fruit(id INTEGER PRIMARY KEY, name TEXT); INSERT INTO fruit(name) VALUES ('apple'), ('pear')");
-db.preparePlan({ kind: 'schema', op: { op: 'createView', name: 'names', temp: false, ifNotExists: false, materialized: true, source: { language: 'dotted', text: 'fruit.name' } } }).run();
-db.exec("INSERT INTO fruit(name) VALUES ('plum'); REFRESH MATERIALIZED VIEW names");
-console.log(db.query('SELECT * FROM names ORDER BY 1').rows); // [['apple'], ['pear'], ['plum']]
+const view = (name: string, materialized: boolean) => ({ op: 'createView' as const, name, temp: false, ifNotExists: false, materialized, source: { language: 'dotted', text: 'fruit.name' } });
+// A view, read by a plan.
+db.preparePlan({ kind: 'schema', op: view('names', false) }).run();
+console.log(db.queryPlan(p.scan('names', [0])).rows); // [['apple'], ['pear']]
+// A materialized view, which SQL reads too.
+db.preparePlan({ kind: 'schema', op: view('stored_names', true) }).run();
+db.exec("INSERT INTO fruit(name) VALUES ('plum'); REFRESH MATERIALIZED VIEW stored_names");
+console.log(db.query('SELECT * FROM stored_names ORDER BY 1').rows); // [['apple'], ['pear'], ['plum']]
 ```
 
 ## Workers

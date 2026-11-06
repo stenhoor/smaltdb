@@ -58,8 +58,8 @@ export interface CatalogTable {
   readonly storage: 'row' | 'columnar';
   /** Values must match the column types (no conversion on write). */
   readonly strict: boolean;
-  /** Its definition, in the language it was written in. */
-  readonly source: Source;
+  /** Its definition, in the language it was written in; absent for a table defined without source text (ADR 0016 section 6). */
+  readonly source?: Source;
 }
 
 /** A view: its language and source text, bound where it is read. */
