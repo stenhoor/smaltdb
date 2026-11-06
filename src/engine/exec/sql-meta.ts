@@ -57,7 +57,7 @@ export const getMeta = (e: BoundExpr): SqlMeta | undefined => {
   ];
 };
 
-/** Writes `m` as `e`'s meaning fields (what SQL's front end calls; languages may set the fields directly). */
+/** Writes `m` as `e`'s meaning fields: the engine's own rewrites and version-0 decoding (languages write the fields). */
 export const setMeta = (e: BoundExpr, m: SqlMeta): void => {
   const x = e as { -readonly [K in keyof ExprMeaning]: ExprMeaning[K] };
   // `delete` only what is there: deleting puts an object in V8's slow dictionary mode.
