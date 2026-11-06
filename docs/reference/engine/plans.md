@@ -129,6 +129,24 @@ former `sql.*` name, which stays as an alias until smaltql uses the behaviour na
 | `affinity_numeric`, `affinity_text` | `sql.affinity_*` | 1 | The conversion SQLite applies to a comparison operand of that affinity |
 | `current_date`, `current_time`, `current_timestamp` | `sql.current_*` | 0 | The statement's date and time as text |
 
+**Operations for other meanings** are named functions for the meanings other languages give their syntax: a language
+picks the one it means. smaltdf, for example, divides with `div_float` where SQL divides with `div_trunc`.
+
+| Function | Arguments | Meaning |
+|---|---|---|
+| `div_float` | 2 | Division as floats always (`7 / 2 = 3.5`). A non-zero value divided by zero is `Infinity` or `-Infinity`; `0 / 0` is NULL, until NaN is a value |
+| `div_floor` | 2 | Division rounded toward negative infinity (`-7, 2` gives `-4`): an integer for two integers, else REAL. Division by zero is NULL |
+| `mod_floor` | 2 | The remainder of `div_floor`, with the sign of the divisor (`-7, 2` gives `1`). By zero is NULL |
+| `round_half_even` | 1 or 2 | `x` rounded to `digits` places (default 0) with halves to even, decided on the exact binary value (`0.125` gives `0.12`, `2.675` gives `2.67`). REAL |
+| `round_half_away` | 1 or 2 | The same with halves away from zero: `round` |
+| `lower_unicode`, `upper_unicode` | 1 | Case mapping of every script (`straße` gives `STRASSE`); `lower` and `upper` map ASCII only |
+| `regex_match` | 2 or 3 | Whether `text` matches `pattern`: 1, 0 or NULL |
+| `regex_find` | 2 or 3 | The first match of `pattern` in `text`, or NULL |
+| `regex_replace`, `regex_replace_all` | 3 or 4 | `text` with the first match, or every match, of `pattern` replaced by `replacement` (`$1`, `$&`) |
+
+Patterns are JavaScript regular expressions in Unicode mode; the optional last argument gives flags among `i`, `m` and
+`s`. `length` counts code points. These operations are not inlined by code generation yet.
+
 **Aggregate and window functions** are named the same way (`sum`, `rank`, …) in `AggCall` and `WindowCall`.
 
 ## Builders
