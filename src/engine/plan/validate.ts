@@ -203,6 +203,9 @@ class Validator {
       exprs(r, reading(n + 1), 'returning');
       return r.length;
     };
+    const orderedFirst = (v: unknown): void => {
+      if (v !== undefined && v !== 'first') this.fail("expected 'first'", 'ordered');
+    };
     switch (o.op) {
       case 'scan': {
         const n = this.tableWidth(o.table, o.db);
@@ -284,6 +287,7 @@ class Validator {
         const r = sub(ins[1] as PlanOp, 'inputs', 1, l);
         if (!JOIN_KINDS.has(o.kind)) this.fail(`unknown join kind ${JSON.stringify(o.kind)}`, 'kind');
         optEx(o.on, reading(l, r), 'on');
+        if (o.ordered !== undefined && o.ordered !== true) this.fail('expected true', 'ordered');
         return o.kind === 'semi' || o.kind === 'anti' ? l : l + r;
       }
       case 'setop': {
@@ -316,11 +320,14 @@ class Validator {
         const aggs = this.list(o.aggs, 'aggs');
         for (let i = 0; i < aggs.length; i++) this.under('aggs', i, () => (this.object(aggs[i]), this.aggCall(aggs[i] as never, scopes, d, false)));
         exprs(o.carry, scopes, 'carry');
+        orderedFirst(o.ordered);
         return o.keys.length + o.aggs.length + o.carry.length;
       }
       case 'distinct': {
         const w = sub(o.input, 'input');
+        if (this.list(o.collations, 'collations').length !== w) this.fail(`expected ${w} collations`, 'collations');
         collations(o.collations, 'collations');
+        orderedFirst(o.ordered);
         return w;
       }
       case 'window': {

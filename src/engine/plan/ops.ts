@@ -108,7 +108,14 @@ export type PlanOp = OpMeaning & (
   | { readonly op: 'filter'; readonly input: PlanOp; readonly pred: PlanExpr }
   | { readonly op: 'project'; readonly input: PlanOp; readonly exprs: readonly PlanExpr[] }
   | { readonly op: 'limit'; readonly input: PlanOp; readonly count: PlanExpr; readonly offset?: PlanExpr }
-  | { readonly op: 'join'; readonly kind: JoinKind; readonly inputs: readonly [PlanOp, PlanOp]; readonly on?: PlanExpr }
+  | {
+      readonly op: 'join';
+      readonly kind: JoinKind;
+      readonly inputs: readonly [PlanOp, PlanOp];
+      readonly on?: PlanExpr;
+      /** Keep the left input's order, and for each left row its matches in the right input's order (ADR 0016 section 4). */
+      readonly ordered?: true;
+    }
   | { readonly op: 'setop'; readonly kind: 'union' | 'unionAll' | 'intersect' | 'except'; readonly inputs: readonly [PlanOp, PlanOp]; readonly collations: readonly CollationName[] }
   | { readonly op: 'sort'; readonly input: PlanOp; readonly keys: readonly SortKey[] }
   | {
@@ -118,8 +125,16 @@ export type PlanOp = OpMeaning & (
       readonly aggs: readonly AggCall[];
       /** SQL's bare columns: input columns carried to the output, from the row SQLite picks (#46, decision 4). */
       readonly carry: readonly PlanExpr[];
+      /** Give the groups in the order of their first row (ADR 0016 section 4). */
+      readonly ordered?: 'first';
     }
-  | { readonly op: 'distinct'; readonly input: PlanOp; readonly collations: readonly CollationName[] }
+  | {
+      readonly op: 'distinct';
+      readonly input: PlanOp;
+      readonly collations: readonly CollationName[];
+      /** Give the distinct rows in the order of their first occurrence (ADR 0016 section 4). */
+      readonly ordered?: 'first';
+    }
   /**
    * DELETE: deletes the rows of `table` whose rowids `input` gives in its column `rowid`. `returning` reads each
    * deleted row: the table's columns, then its rowid. Outputs the RETURNING rows.

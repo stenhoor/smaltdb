@@ -68,17 +68,29 @@ export const project = (input: PlanOp, exprs: readonly PlanExpr[]): Op<'project'
 export const limit = (input: PlanOp, count: PlanExpr | number, offset?: PlanExpr | number): Op<'limit'> => ({ op: 'limit', input, count: expr(count), ...(offset !== undefined ? { offset: expr(offset) } : {}) });
 export const sort = (input: PlanOp, keys: readonly SortKey[]): Op<'sort'> => ({ op: 'sort', input, keys });
 /** A join; its condition reads input 0 (left) and input 1 (right). */
-export const join = (kind: JoinKind, left: PlanOp, right: PlanOp, on?: PlanExpr): Op<'join'> => ({ op: 'join', kind, inputs: [left, right], ...(on ? { on } : {}) });
+export const join = (kind: JoinKind, left: PlanOp, right: PlanOp, on?: PlanExpr, options: { ordered?: boolean } = {}): Op<'join'> => ({
+  op: 'join',
+  kind,
+  inputs: [left, right],
+  ...(on ? { on } : {}),
+  ...(options.ordered ? { ordered: true as const } : {}),
+});
 /** Rows grouped by `keys`: outputs the keys, then the aggregates, then the carried columns. */
-export const aggregate = (input: PlanOp, keys: readonly PlanExpr[], aggs: readonly AggCall[], options: { collations?: readonly CollationName[]; carry?: readonly PlanExpr[] } = {}): Op<'aggregate'> => ({
+export const aggregate = (input: PlanOp, keys: readonly PlanExpr[], aggs: readonly AggCall[], options: { collations?: readonly CollationName[]; carry?: readonly PlanExpr[]; ordered?: 'first' } = {}): Op<'aggregate'> => ({
   op: 'aggregate',
   input,
   keys: keys.map((e, i) => ({ expr: e, collation: options.collations?.[i] ?? 'binary' })),
   aggs,
   carry: options.carry ?? [],
+  ...(options.ordered ? { ordered: options.ordered } : {}),
 });
 /** Distinct rows of an input with `width` columns. */
-export const distinct = (input: PlanOp, width: number, collations?: readonly CollationName[]): Op<'distinct'> => ({ op: 'distinct', input, collations: collations ?? Array<CollationName>(width).fill('binary') });
+export const distinct = (input: PlanOp, width: number, collations?: readonly CollationName[], options: { ordered?: 'first' } = {}): Op<'distinct'> => ({
+  op: 'distinct',
+  input,
+  collations: collations ?? Array<CollationName>(width).fill('binary'),
+  ...(options.ordered ? { ordered: options.ordered } : {}),
+});
 /** A set operation of two inputs with `width` columns each. */
 export const setop = (kind: Op<'setop'>['kind'], left: PlanOp, right: PlanOp, width: number, collations?: readonly CollationName[]): Op<'setop'> => ({ op: 'setop', kind, inputs: [left, right], collations: collations ?? Array<CollationName>(width).fill('binary') });
 

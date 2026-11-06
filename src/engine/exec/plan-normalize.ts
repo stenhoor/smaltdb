@@ -9,7 +9,7 @@
  * SQL's plans have this layering already and are not normalized.
  */
 import { type PlanExpr, typeOf } from '../plan/expr.js';
-import type { PlanOp } from '../plan/ops.js';
+import type { AggCall, PlanOp, SortKey, WindowCall } from '../plan/ops.js';
 import { SmaltError } from '../errors.js';
 import { planWidth } from './planner.js';
 
@@ -17,25 +17,25 @@ type Op<K extends PlanOp['op']> = Extract<PlanOp, { op: K }>;
 
 /** `op` as a query block the planner reads. */
 export function normalizePlan(op: PlanOp): PlanOp {
-  return block(semiJoins(op));
+  return block(rewrite(op));
 }
 
 /**
- * `op` with its semi and anti joins as filters: `semi(L, R, on)` is L where some row of R matches (`exists`), `anti`
- * where none does. A filter keeps L's order (ADR 0016 section 4), and the planner decorrelates the subquery into a hash
- * semi-join where it can. Plans are plain data, so this walks every field (inputs, and plans nested in any expression)
- * and copies only what changes: a plan without such joins comes back as it was.
+ * `op` with the operations the planner does not plan itself rewritten into ones it does: semi and anti joins
+ * (`semiJoin`), and the orders asked for with `ordered` (`orderedJoin`, `orderedGroups`). Plans are plain data, so this
+ * walks every field (inputs, and plans nested in any expression) and copies only what changes: a plan without such
+ * operations comes back as it was.
  */
-function semiJoins(op: PlanOp): PlanOp {
-  return rewriteSemiJoins(op) as PlanOp;
+function rewrite(op: PlanOp): PlanOp {
+  return rewriteAll(op) as PlanOp;
 }
 
-function rewriteSemiJoins(x: unknown): unknown {
+function rewriteAll(x: unknown): unknown {
   if (x === null || typeof x !== 'object') return x;
   if (Array.isArray(x)) {
     let out: unknown[] | undefined;
     for (let i = 0; i < x.length; i++) {
-      const r = rewriteSemiJoins(x[i]);
+      const r = rewriteAll(x[i]);
       if (r !== x[i]) (out ??= x.slice())[i] = r;
     }
     return out ?? x;
@@ -45,17 +45,101 @@ function rewriteSemiJoins(x: unknown): unknown {
   let out: Record<string, unknown> | undefined;
   for (const key in o) {
     if (key === 'origin') continue; // a caller's data, whatever its shape
-    const r = rewriteSemiJoins(o[key]);
+    const r = rewriteAll(o[key]);
     if (r !== o[key]) (out ??= { ...o })[key] = r;
   }
   const op = (out ?? o) as unknown as PlanOp;
-  if (op.op !== 'join' || (op.kind !== 'semi' && op.kind !== 'anti')) return op;
+  switch (op.op) {
+    case 'join':
+      return op.kind === 'semi' || op.kind === 'anti' ? semiJoin(op) : op.ordered ? orderedJoin(op) : op;
+    case 'aggregate':
+      return op.ordered ? orderedGroups(op) : op;
+    case 'distinct':
+      return op.ordered ? orderedGroups(distinctGroups(op)) : op;
+    default:
+      return op;
+  }
+}
+
+/**
+ * `semi(L, R, on)` is L where some row of R matches (`exists`), `anti` where none does. A filter keeps L's order (ADR
+ * 0016 section 4), and the planner decorrelates the subquery into a hash semi-join where it can.
+ */
+function semiJoin(op: Op<'join'>): PlanOp {
   const [left, right] = op.inputs;
   // In the layering the planner reads: a write's input is not normalized past its own operation.
   const inner = block(op.on ? { op: 'filter', input: right, pred: correlated(op.on, 0) } : right);
   const exists: PlanExpr = { k: 'subquery', mode: 'exists', plan: inner, type: 'int', collation: 'binary' };
   const pred: PlanExpr = op.kind === 'semi' ? exists : { k: 'not', arg: exists };
   return { op: 'filter', input: left, pred, ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+}
+
+const ROW_NUMBER: WindowCall = { fn: 'row_number', args: [], star: false, collation: 'binary', type: 'int' };
+const WHOLE: Op<'window'>['frame'] = { unit: 'ROWS', start: { kind: 'unboundedPreceding' }, end: { kind: 'currentRow' }, exclude: 'NO OTHERS' };
+
+/** `input` with each row's position appended (1, 2, …): a window without its own order keeps its input's order. */
+function numbered(input: PlanOp): PlanOp {
+  return { op: 'window', input, partition: [], order: [], frame: WHOLE, calls: [ROW_NUMBER] };
+}
+
+const column = (index: number, type: 'int' | 'any' = 'any'): PlanExpr => ({ k: 'col', input: 0, index, depth: 0, type, collation: 'binary' });
+const range = (from: number, to: number): PlanExpr[] => Array.from({ length: to - from }, (_, i) => column(from + i));
+/** `op` without its `ordered` flag. */
+function unordered<T extends { ordered?: unknown }>(op: T): T {
+  const { ordered: _, ...rest } = op;
+  return rest as T;
+}
+
+/**
+ * A join that keeps the left input's order, and for each left row its matches in the right input's order: both inputs
+ * numbered, joined, then sorted by the numbers (stable, so rows without a left number, a right or full join's unmatched
+ * right rows, come last in the right input's order), and the numbers dropped.
+ */
+function orderedJoin(op: Op<'join'>): PlanOp {
+  const [left, right] = op.inputs;
+  const l = planWidth(left);
+  const r = planWidth(right);
+  const joined: PlanOp = { ...unordered(op), inputs: [numbered(left), numbered(right)] };
+  const keys: SortKey[] = [
+    { expr: column(l, 'int'), desc: false, nullsFirst: false, collation: 'binary' },
+    { expr: column(l + 1 + r, 'int'), desc: false, nullsFirst: true, collation: 'binary' },
+  ];
+  return { op: 'project', input: { op: 'sort', input: joined, keys }, exprs: [...range(0, l), ...range(l + 1, l + 1 + r)] };
+}
+
+/** A distinct as an aggregate grouped by every column, with no aggregate calls. */
+function distinctGroups(op: Op<'distinct'>): Op<'aggregate'> {
+  const keys = op.collations.map((collation, i) => ({ expr: column(i), collation }));
+  return { op: 'aggregate', input: op.input, keys, aggs: [], carry: [], ordered: 'first' };
+}
+
+/**
+ * Groups in the order of their first row: the input numbered, each group's first number taken with the group, the
+ * groups sorted by it, and it dropped. With carried columns the number is an extra key, computed over each group's rows
+ * by a window, since one more aggregate call would change which row they are carried from.
+ */
+function orderedGroups(op: Op<'aggregate'>): PlanOp {
+  const plain = unordered(op);
+  if (op.keys.length === 0) return plain;
+  const w = planWidth(op.input);
+  const k = op.keys.length;
+  const a = op.aggs.length;
+  const first = column(w, 'int');
+  let grouped: PlanOp;
+  let at: number;
+  if (op.carry.length === 0) {
+    const min: AggCall = { fn: 'min', args: [first], star: false, distinct: false, collation: 'binary', type: 'int' };
+    grouped = { ...plain, input: numbered(op.input), aggs: [...op.aggs, min] };
+    at = k + a;
+  } else {
+    const minOver: WindowCall = { fn: 'min', args: [first], star: false, collation: 'binary', type: 'int' };
+    const input: PlanOp = { op: 'window', input: numbered(op.input), partition: op.keys, order: [], frame: { ...WHOLE, end: { kind: 'unboundedFollowing' } }, calls: [minOver] };
+    grouped = { ...plain, input, keys: [...op.keys, { expr: column(w + 1, 'int'), collation: 'binary' }] };
+    at = k;
+  }
+  const width = k + a + op.carry.length + 1;
+  const keys: SortKey[] = [{ expr: column(at, 'int'), desc: false, nullsFirst: false, collation: 'binary' }];
+  return { op: 'project', input: { op: 'sort', input: grouped, keys }, exprs: [...range(0, at), ...range(at + 1, width)] };
 }
 
 /**
@@ -88,7 +172,7 @@ function correlated(e: PlanExpr, depth: number): PlanExpr {
 
 /** A write's plan with its input normalized (an `append`'s rows; `update` and `delete` read their targets as given). */
 export function normalizeWrite(plan: PlanOp): PlanOp {
-  const op = semiJoins(plan);
+  const op = rewrite(plan);
   return op.op === 'append' && op.input ? { ...op, input: block(op.input) } : op;
 }
 
@@ -159,6 +243,31 @@ function shift(e: PlanExpr, by: number): PlanExpr {
   }
 }
 
+/** Whether a window's expressions read a column at `width` or past it: one its input window computes. */
+function readsWindowResult(op: Op<'window'>, width: number): boolean {
+  const es = [...op.partition.map((p) => p.expr), ...op.order.map((k) => k.expr), ...op.calls.flatMap((c) => (c.filter ? [...c.args, c.filter] : c.args))];
+  return es.some((e) => readsFrom(e, width));
+}
+
+function readsFrom(e: PlanExpr, width: number): boolean {
+  switch (e.k) {
+    case 'col':
+      return e.depth === 0 && e.input === 0 && e.index >= width;
+    case 'call':
+    case 'and':
+    case 'or':
+      return e.args.some((a) => readsFrom(a, width));
+    case 'cast':
+    case 'not':
+    case 'isNull':
+      return readsFrom(e.arg, width);
+    case 'case':
+      return e.whens.some((w) => readsFrom(w.when, width) || readsFrom(w.then, width)) || readsFrom(e.else, width);
+    default:
+      return false;
+  }
+}
+
 function hasSubquery(e: PlanExpr): boolean {
   switch (e.k) {
     case 'subquery':
@@ -187,7 +296,8 @@ function core(op: PlanOp): PlanOp {
       partition: op.partition.map((p) => ({ ...p, expr: expr(p.expr) })),
       order: op.order.map((k) => ({ ...k, expr: expr(k.expr) })),
       calls: op.calls.map((c) => ({ ...c, args: c.args.map(expr), ...(c.filter ? { filter: expr(c.filter) } : {}) })),
-      input: core(op.input),
+      // Windows of one block read the row below them all: one that reads an inner window's result reads it as a nested block.
+      input: op.input.op === 'window' && readsWindowResult(op, planWidth(op.input.input)) ? from(op.input) : core(op.input),
     };
   }
   if (op.op === 'filter' && op.input.op === 'aggregate') return { ...op, pred: expr(op.pred), input: aggregated(op.input) };

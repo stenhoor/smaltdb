@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
 import { plan as p } from '../src/engine/index.js';
+import type { PlanExpr } from '../src/engine/plan/expr.js';
 import type { PlanOp } from '../src/engine/plan/ops.js';
 
 const N = 3000;
@@ -102,6 +103,15 @@ describe('filter, project, limit and window keep their input order', () => {
       expect(d.queryPlan(w).rows.map((r) => r[0])).toEqual(reversedIds);
     }
   });
+
+  it('a window over a window, reading what the inner one computes', () => {
+    const frame = { unit: 'ROWS', start: { kind: 'unboundedPreceding' }, end: { kind: 'currentRow' }, exclude: 'NO OTHERS' } as const;
+    const call = (fn: string, args: PlanExpr[]) => ({ fn, args, star: false, collation: 'binary', type: 'int' }) as const;
+    const inner = { op: 'window', input: p.limit(reversed, 5), partition: [], order: [], frame, calls: [call('row_number', [])] } as unknown as PlanOp;
+    // A running sum of the inner window's row numbers: 1, 3, 6, 10, 15.
+    const outer = { op: 'window', input: inner, partition: [], order: [], frame, calls: [call('sum', [p.col(0, 2, 'int')])] } as unknown as PlanOp;
+    expect(d.queryPlan(outer).rows).toEqual(reversedIds.slice(0, 5).map((i, n) => [i, i % 7, n + 1, ((n + 1) * (n + 2)) / 2]));
+  });
 });
 
 describe('semi and anti joins keep the left order', () => {
@@ -154,5 +164,86 @@ describe('semi and anti joins keep the left order', () => {
     const copied = p.append('r', p.project(matched('anti'), [p.col(0, 1, 'int')]), [0]);
     expect(w.queryPlan({ kind: 'write', plan: copied }).changes).toBe(2);
     expect(w.queryPlan(p.scan('r', [0])).rows).toEqual([[2], [4], [1], [3]]);
+  });
+});
+
+describe('order on request', () => {
+  const d = Database.openMemory();
+  d.exec("CREATE TABLE a(id INTEGER PRIMARY KEY, k INT, name TEXT); CREATE TABLE b(id INTEGER PRIMARY KEY, k INT)");
+  d.exec('BEGIN');
+  const A = ids(400).map((i) => [i, (i * 37) % 23, ['x', 'X', 'y', 'Y', 'z'][i % 5]] as [number, number, string]);
+  const B = ids(300).map((i) => [i, (i * 11) % 31] as [number, number]);
+  for (const r of A) d.exec(`INSERT INTO a VALUES (${r[0]}, ${r[1]}, '${r[2]}')`);
+  for (const r of B) d.exec(`INSERT INTO b VALUES (${r[0]}, ${r[1]})`);
+  d.exec('COMMIT; ANALYZE');
+  // Both inputs in an order of their own: a by k descending (ties by id), b by id descending.
+  const left = p.sort(p.scan('a', [0, 1]), [p.desc(p.col(0, 1, 'int'))]);
+  const leftRows = stableSorted(A.map((r) => [r[0], r[1]]), (r) => r[1], true);
+  const right = p.sort(p.scan('b', [0, 1]), [p.desc(p.col(0, 0, 'int'))]);
+  const rightRows = [...B].reverse().map((r) => [r[0], r[1]]);
+  const on = p.call('cmp_eq', [p.col(0, 1, 'int'), p.col(1, 1, 'int')], 'int');
+  const matches = (l: number[]) => rightRows.filter((r) => r[1] === l[1]);
+
+  it('join with ordered: the left order, and for each left row its matches in the right order', () => {
+    const inner = leftRows.flatMap((l) => matches(l).map((r) => [...l, ...r]));
+    expect(d.queryPlan(p.join('inner', left, right, on, { ordered: true })).rows).toEqual(inner);
+    const leftJoin = leftRows.flatMap((l) => (matches(l).length ? matches(l).map((r) => [...l, ...r]) : [[...l, null, null]]));
+    expect(d.queryPlan(p.join('left', left, right, on, { ordered: true })).rows).toEqual(leftJoin);
+    // A right or full join's unmatched right rows come last, in the right order.
+    const unmatchedRight = rightRows.filter((r) => !leftRows.some((l) => l[1] === r[1])).map((r) => [null, null, ...r]);
+    expect(unmatchedRight.length).toBeGreaterThan(0);
+    expect(d.queryPlan(p.join('right', left, right, on, { ordered: true })).rows).toEqual([...inner, ...unmatchedRight]);
+    expect(d.queryPlan(p.join('full', left, right, on, { ordered: true })).rows).toEqual([...leftJoin, ...unmatchedRight]);
+    const small = p.limit(right, 3);
+    expect(d.queryPlan(p.join('cross', p.limit(left, 4), small, undefined, { ordered: true })).rows).toEqual(leftRows.slice(0, 4).flatMap((l) => rightRows.slice(0, 3).map((r) => [...l, ...r])));
+    // Semi and anti joins keep the left order with or without the flag.
+    expect(d.queryPlan(p.join('semi', left, right, on, { ordered: true })).rows).toEqual(leftRows.filter((l) => matches(l).length > 0));
+  });
+
+  it('aggregate with ordered first: groups in the order of their first row', () => {
+    const firstSeen = (keys: number[]) => keys.filter((x, i) => keys.indexOf(x) === i);
+    const order = firstSeen(leftRows.map((r) => r[1]));
+    const counted = d.queryPlan(p.aggregate(left, [p.col(0, 1, 'int')], [p.agg('count', [], 'int', { star: true })], { ordered: 'first' })).rows;
+    expect(counted).toEqual(order.map((k) => [k, leftRows.filter((r) => r[1] === k).length]));
+    // Over an input in a different order, the order follows it.
+    const byId = p.sort(p.scan('a', [0, 1]), [p.asc(p.col(0, 0, 'int'))]);
+    const keysById = firstSeen(A.map((r) => r[1]));
+    expect(d.queryPlan(p.aggregate(byId, [p.col(0, 1, 'int')], [], { ordered: 'first' })).rows).toEqual(keysById.map((k) => [k]));
+    // With carried columns: the same groups and values as without the flag, in order.
+    const carried = (ordered?: 'first') =>
+      d.queryPlan(p.aggregate(left, [p.col(0, 1, 'int')], [p.agg('max', [p.col(0, 0, 'int')], 'int')], { carry: [p.col(0, 0, 'int')], ...(ordered ? { ordered } : {}) })).rows;
+    const withFlag = carried('first');
+    expect(withFlag.map((r) => r[0])).toEqual(order);
+    expect([...withFlag].sort((x, y) => (x[0] as number) - (y[0] as number))).toEqual([...carried()].sort((x, y) => (x[0] as number) - (y[0] as number)));
+    // The carried column comes from the row with the maximum, as without the flag.
+    expect(withFlag.every((r) => r[1] === r[2])).toBe(true);
+    // Without keys: one row, as without the flag.
+    expect(d.queryPlan(p.aggregate(left, [], [p.agg('count', [], 'int', { star: true })], { ordered: 'first' })).rows).toEqual([[400]]);
+  });
+
+  it('distinct with ordered first: rows in the order of their first occurrence, by each column collation', () => {
+    const names = p.project(p.scan('a', [0, 2]), [p.col(0, 1, 'text')]);
+    expect(d.queryPlan(p.distinct(names, 1, ['binary'], { ordered: 'first' })).rows).toEqual([['X'], ['y'], ['Y'], ['z'], ['x']]);
+    const folded = d.queryPlan(p.distinct(names, 1, ['nocase'], { ordered: 'first' })).rows.map((r) => (r[0] as string).toLowerCase());
+    expect(folded).toEqual(['x', 'y', 'z']);
+    const pairs = p.project(left, [p.col(0, 1, 'int')]);
+    expect(d.queryPlan(p.distinct(pairs, 1, undefined, { ordered: 'first' })).rows.map((r) => r[0])).toEqual([...new Set(leftRows.map((r) => r[1]))]);
+  });
+
+  it('the validator checks the flags', () => {
+    const catalog = { tableColumns: (t: string) => (t === 'a' ? 3 : undefined) };
+    const bad = (plan: PlanOp) => {
+      try {
+        p.validatePlan(plan, catalog as never);
+      } catch (e) {
+        return (e as Error).message;
+      }
+      return 'valid';
+    };
+    const scan = p.scan('a', [0, 1]);
+    expect(bad({ ...p.join('inner', scan, scan), ordered: 'yes' } as unknown as PlanOp)).toMatch(/ordered: expected true/);
+    expect(bad({ ...p.aggregate(scan, [p.col(0, 1, 'int')], []), ordered: 'last' } as unknown as PlanOp)).toMatch(/ordered: expected 'first'/);
+    expect(bad({ ...p.distinct(scan, 2), ordered: true } as unknown as PlanOp)).toMatch(/ordered: expected 'first'/);
+    expect(bad({ ...p.distinct(scan, 2), collations: ['binary'] } as unknown as PlanOp)).toMatch(/expected 2 collations/);
   });
 });

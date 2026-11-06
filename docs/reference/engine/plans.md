@@ -48,9 +48,9 @@ Each operation's output columns, in order:
 | `project` | `input`, `exprs` | one column per expression |
 | `sort` | `input`, `keys` | its input's |
 | `limit` | `input`, `count`, `offset?` | its input's |
-| `distinct` | `input`, `collations` (one per column) | its input's |
-| `join` | `kind`, `inputs` (left, right), `on?` | the left input's, then the right's (`semi` / `anti`: the left's only) |
-| `aggregate` | `input`, `keys`, `aggs`, `carry` | its keys, then one per aggregate call, then the carried columns |
+| `distinct` | `input`, `collations` (one per column), `ordered?` (`'first'`) | its input's |
+| `join` | `kind`, `inputs` (left, right), `on?`, `ordered?` (`true`) | the left input's, then the right's (`semi` / `anti`: the left's only) |
+| `aggregate` | `input`, `keys`, `aggs`, `carry`, `ordered?` (`'first'`) | its keys, then one per aggregate call, then the carried columns |
 | `window` | `input`, `partition`, `order`, `frame`, `calls` | its input's, then one per window call |
 | `setop` | `kind` (`union` / `unionAll` / `intersect` / `except`), `inputs`, `collations` | the first input's |
 | `iterate` | `id`, `name`, `init`, `steps`, `distinct`, `collations`, `order?`, `limit?`, `offset?` | `init`'s: its rows, then each step's until a step gives none (a recursive query) |
@@ -69,7 +69,14 @@ without one). The condition reads input 0 (the left side) and input 1 (the right
 - `filter`, `project` and `limit` keep their input's order, and so does a `window` without its own `order`.
 - `semi` and `anti` joins keep the left input's order.
 
-The order of other operations' output is not defined, and the engine is free to choose it.
+Other operations keep an order when the plan asks, since keeping it costs time:
+
+- A `join` with `ordered: true` gives the left input's order, and for each left row its matches in the right input's
+  order. A left join's unmatched left rows keep their place; a right or full join's unmatched right rows come last, in
+  the right input's order.
+- An `aggregate` or a `distinct` with `ordered: 'first'` gives its groups in the order of each group's first row.
+
+Without these, the order of other operations' output is not defined, and the engine is free to choose it.
 
 **Sort keys** (`SortKey`) are `{ expr, desc, nullsFirst, collation }`.
 
@@ -179,7 +186,7 @@ NULLs first). They check nothing: the engine validates every plan it is given, b
 |---|---|
 | Expressions | `col(input, index, type, collation?, depth?)`, `lit(value, type?)`, `value(v)`, `param(index, type?)`, `call(fn, args, type, collation?)`, `cast(fn, arg, to)`, `and(...)`, `or(...)`, `not(x)`, `isNull(x)`, `isNotNull(x)`, `caseWhen(whens, type, otherwise?)`, `scalar(plan, type, collation?)`, `exists(plan)`, `inPlan(probe, plan, collation?)` |
 | Sort keys, aggregates | `asc(expr, options?)`, `desc(expr, options?)`, `agg(fn, args, type, options?)` |
-| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `filter`, `project`, `sort`, `limit(input, count, offset?)`, `join(kind, left, right, on?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width)`, `setop(kind, left, right, width)` |
+| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `filter`, `project`, `sort`, `limit(input, count, offset?)`, `join(kind, left, right, on?, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `setop(kind, left, right, width)` |
 | Writes | `append(table, input, columns, options?)`, `update(table, input, rowid, sets, options?)`, `remove(table, input, rowid, options?)` |
 
 `window`, `source`, `iterate` and `working` have no builder yet: write them as objects.
