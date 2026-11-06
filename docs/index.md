@@ -25,8 +25,8 @@ features:
     details: The engine runs in Web Workers, so queries never block the page.
   - title: Durable on OPFS
     details: Data lives in the Origin Private File System. Commits are atomic and durable through a write-ahead log.
-  - title: Plans, not a dialect
-    details: The engine reads plans as plain data. SQL is a language on top (smaltql); others can build plans too.
+  - title: Multiple languages
+    details: 'The engine runs plans; languages build them. <a href="https://stenhoor.github.io/smaltql/">SQL</a> (smaltql) today; DataFrames and a typed API are planned. <a href="/reference/engine/languages">Write your own</a>.'
   - title: Analytics built in
     details: Columnar tables and materialized views with zone maps, spilling sorts and parallel readers.
   - title: External data
