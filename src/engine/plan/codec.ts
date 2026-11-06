@@ -1,9 +1,8 @@
 /**
  * Plans as data that crosses a boundary (ADR 0015 section 9): to another worker (`structuredClone`, postMessage) or as
- * text (JSON). A plan in memory is plain data except for what SQL keeps beside it (exec/sql-meta.ts: an expression's
- * collation source and affinity, a SELECT's flattening mark), held under symbols that copying leaves out. Encoding
- * writes those as `$sql` / `$flattened` fields, and decoding puts them back, so a decoded plan plans and runs exactly
- * as the original.
+ * text (JSON). A plan is plain data: everything about its meaning is in its fields (ADR 0016 section 2), so encoding
+ * copies it and a decoded plan plans and runs exactly as the original. Plans of format version 0 kept SQL's metadata
+ * as `$sql` / `$flattened` fields; decoding still reads them, into the meaning fields.
  *
  * - `encodePlan` / `decodePlan`: a structured-clone-safe object (bigints and blobs stay as they are).
  * - `planToJSON` / `planFromJSON`: JSON text; bigints, blobs and non-finite numbers are tagged objects (`encodeDataJSON` /
@@ -12,7 +11,7 @@
  * Decoding checks the format version only; the validator (plan/validate.ts) checks the plan itself.
  */
 import { SmaltError } from '../errors.js';
-import { getMeta, isFlattened, markFlattened, setMeta, type SqlMeta } from '../exec/sql-meta.js';
+import { markFlattened, setMeta, type SqlMeta } from '../exec/sql-meta.js';
 import type { BoundExpr } from './expr.js';
 import type { PlanOp } from './ops.js';
 import { PLAN_FORMAT_VERSION } from './types.js';
@@ -22,8 +21,6 @@ export interface EncodedPlan {
   readonly version: number;
   readonly plan: unknown;
 }
-
-const isNode = (o: object): boolean => typeof (o as { op?: unknown }).op === 'string' || typeof (o as { k?: unknown }).k === 'string';
 
 /** `x` (plan nodes anywhere inside) as plain data, with SQL's metadata written as fields. */
 export function encodeData(x: unknown): unknown {
@@ -49,11 +46,6 @@ function encode(x: unknown, json: boolean): unknown {
     const v = (x as Record<string, unknown>)[k];
     if (v !== undefined) out[k] = encode(v, json);
   }
-  if (isNode(x)) {
-    const m = getMeta(x as BoundExpr);
-    if (m) out.$sql = { ...m };
-    if (isFlattened(x as PlanOp)) out.$flattened = true;
-  }
   return out;
 }
 
@@ -64,7 +56,7 @@ export function encodePlan(plan: PlanOp): EncodedPlan {
 
 /** The plan `e` encodes, with SQL's metadata restored. */
 export function decodePlan(e: EncodedPlan): PlanOp {
-  if (!e || typeof e !== 'object' || e.version !== PLAN_FORMAT_VERSION) {
+  if (!e || typeof e !== 'object' || (e.version !== PLAN_FORMAT_VERSION && e.version !== 0)) {
     throw new SmaltError('SMALT_PLAN', `plan format version ${String((e as { version?: unknown } | null)?.version)} is not supported (this engine reads version ${PLAN_FORMAT_VERSION})`);
   }
   return decodeData(e.plan) as PlanOp;
@@ -153,6 +145,7 @@ export function planToJSON(plan: PlanOp): string {
 /** The plan JSON text `text` (from {@link planToJSON}) holds. */
 export function planFromJSON(text: string): PlanOp {
   const e = JSON.parse(text) as { version?: unknown; plan?: unknown } | null;
-  if (!e || typeof e !== 'object' || e.version !== PLAN_FORMAT_VERSION) return decodePlan(e as EncodedPlan);
+  // Version 0 (with `$sql` / `$flattened` metadata) and the current version decode alike; others are refused.
+  if (!e || typeof e !== 'object' || (e.version !== PLAN_FORMAT_VERSION && e.version !== 0)) return decodePlan(e as EncodedPlan);
   return decode(e.plan, true) as PlanOp;
 }

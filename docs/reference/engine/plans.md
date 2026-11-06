@@ -99,6 +99,17 @@ integer primary key, `null` any).
 | `subquery` | `mode` (`scalar` / `exists`), `plan`, `type`, `collation` | the first column of the nested plan's first row (NULL if none), or whether it has a row |
 | `inSubquery` | `probe`, `plan`, `collation` | whether `probe` is in the nested plan's single column: 1, 0, or NULL |
 
+**Meaning fields.** Any expression may also say how it takes part in comparisons and code generation, and any
+operation whether decorrelation applies to it. They are optional; a language that states every collation and
+conversion on its calls needs none of them.
+
+| Field | On | Meaning |
+|---|---|---|
+| `carries` | expressions | `{ collation, from }`: the collation the value brings to a comparison it is an operand of, and where it came from, `explicit` (stated on the value) or `column` (a column's). An explicit one wins over a column's, the left operand over the right; with none, comparisons use `binary`. |
+| `affinity` | expressions | `INTEGER`, `REAL`, `NUMERIC`, `TEXT` or `BLOB`: the conversion a comparison applies to the other operand (SQLite's column affinity). `TEXT` turns a number on the other side into text; a numeric affinity turns numeric text into a number. |
+| `inline` | expressions | `false`: code generation leaves this expression whole to the general evaluator. Results are the same either way. |
+| `decorrelate` | operations | `false`: the planner does not rewrite correlated subqueries of this operation into joins. Results are the same either way. |
+
 ## Functions
 
 A `call` names a registered function. The validator checks it exists and accepts that many arguments.

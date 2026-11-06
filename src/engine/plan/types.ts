@@ -5,8 +5,11 @@
  */
 import type { StaticType } from '../exec/convert.js';
 
-/** Version of the plan format; 0 while it is experimental. */
-export const PLAN_FORMAT_VERSION = 0;
+/**
+ * Version of the plan format, experimental until its stability ADR. 1: meaning fields (ADR 0016 section 2) replace
+ * the `$sql` / `$flattened` metadata of version 0, which decoding still reads.
+ */
+export const PLAN_FORMAT_VERSION = 1;
 
 /** A value's static type. Today's `StaticType`: `num` is INTEGER or REAL, `any` is not known until run time. */
 export type PlanType = StaticType;

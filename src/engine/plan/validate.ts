@@ -20,7 +20,7 @@ import { SmaltError } from '../errors.js';
 import { aggregateFunctions, scalarFunctions } from '../exec/functions.js';
 import { SQL_FUNCTIONS, isEngineOperation } from '../exec/sql-functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../exec/window.js';
-import type { PlanExpr } from './expr.js';
+import type { ExprMeaning, PlanExpr } from './expr.js';
 import type { PlanOp } from './ops.js';
 
 /** What the validator asks of the catalog. */
@@ -40,6 +40,7 @@ export const MAX_PLAN_DEPTH = 1000;
 
 const TYPES = new Set(['int', 'real', 'num', 'text', 'blob', 'null', 'any']);
 const COLLATIONS = new Set(['binary', 'nocase', 'rtrim']);
+const AFFINITIES = new Set(['INTEGER', 'REAL', 'NUMERIC', 'TEXT', 'BLOB']);
 
 /** The input widths an expression may read at one scope (`input` indexes this). */
 type Scope = readonly number[];
@@ -79,6 +80,17 @@ class Validator {
 
   private collation(c: unknown, field: string): void {
     if (typeof c !== 'string' || !COLLATIONS.has(c)) this.fail(`unknown collation ${JSON.stringify(c)}`, field);
+  }
+
+  /** An expression's meaning fields (ADR 0016 section 2): `carries`, `affinity`, `inline`. */
+  private meaning(e: ExprMeaning): void {
+    if (e.carries !== undefined) {
+      if (!e.carries || typeof e.carries !== 'object') this.fail('expected { collation, from }', 'carries');
+      this.collation(e.carries.collation, 'carries.collation');
+      if (e.carries.from !== 'explicit' && e.carries.from !== 'column') this.fail(`unknown collation source ${JSON.stringify(e.carries.from)}`, 'carries.from');
+    }
+    if (e.affinity !== undefined && !AFFINITIES.has(e.affinity)) this.fail(`unknown affinity ${JSON.stringify(e.affinity)}`, 'affinity');
+    if (e.inline !== undefined && e.inline !== false) this.fail('inline is false or absent', 'inline');
   }
 
   /** `x` must be an object (an element of a list, a nested structure). */
@@ -126,6 +138,7 @@ class Validator {
   op(o: PlanOp, outer: readonly Scope[], depth: number, lateral: number | null): number {
     if (depth > MAX_PLAN_DEPTH) this.fail(`nested more than ${MAX_PLAN_DEPTH} deep`);
     if (!o || typeof o !== 'object') this.fail('expected an operation');
+    if (o.decorrelate !== undefined && o.decorrelate !== false) this.fail('decorrelate is false or absent', 'decorrelate');
     const d = depth + 1;
     const sub = (x: PlanOp, field: string, i?: number, lat: number | null = null): number => this.under(field, i, () => this.op(x, outer, d, lat));
     /** The scopes of expressions reading inputs of widths `ws`. */
@@ -629,6 +642,7 @@ class Validator {
   expr(e: PlanExpr, scopes: readonly Scope[], depth: number): void {
     if (depth > MAX_PLAN_DEPTH) this.fail(`nested more than ${MAX_PLAN_DEPTH} deep`);
     if (!e || typeof e !== 'object') this.fail('expected an expression');
+    this.meaning(e);
     const d = depth + 1;
     switch (e.k) {
       case 'col': {

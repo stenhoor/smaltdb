@@ -6,7 +6,7 @@ and a dataframe library or an application can build plans directly. This section
 for code that builds plans, and for people writing a language.
 
 ::: warning Experimental
-The plan format and the language interface are experimental (`plan.PLAN_FORMAT_VERSION` is `0`). They may change in
+The plan format and the language interface are experimental (`plan.PLAN_FORMAT_VERSION` is `1`). They may change in
 any release until a second language besides SQL has proven them ([ADR 0014](../../adr/0014-shared-plan-layer.md),
 [ADR 0015](../../adr/0015-smaltql.md)).
 :::

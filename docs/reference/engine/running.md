@@ -109,7 +109,8 @@ plan: a plan names nothing that has to be resolved.
 | `planToJSON(plan): string` / `planFromJSON(text): PlanOp` | A plan as JSON text. `bigint`s, blobs and non-finite numbers are tagged objects (`{"$bigint":"9007199254740993"}`). |
 | `encodePlan(plan): EncodedPlan` / `decodePlan(e): PlanOp` | A plan as an object `structuredClone` can copy (`{ version, plan }`), for `postMessage`. |
 
-Both record `PLAN_FORMAT_VERSION`, and decoding refuses a plan of another version. A decoded plan runs exactly as the
+Both record `PLAN_FORMAT_VERSION` (1), and decoding refuses a plan of another version, except version 0, whose
+`$sql` / `$flattened` metadata it reads into the [meaning fields](./plans#expressions). A decoded plan runs exactly as the
 original; the engine validates it like any other.
 
 ```ts
