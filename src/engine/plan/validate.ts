@@ -354,6 +354,22 @@ class Validator {
         orderedFirst(o.ordered);
         return o.keys.length + o.aggs.length + o.carry.length;
       }
+      case 'unpivot': {
+        const w = sub(o.input, 'input');
+        const index = (l: readonly unknown[], field: string): void => {
+          for (let i = 0; i < l.length; i++) if (!Number.isInteger(l[i]) || (l[i] as number) < 0 || (l[i] as number) >= w) this.fail(`no column ${String(l[i])}`, field, i);
+        };
+        const keep = this.list(o.keep, 'keep');
+        index(keep, 'keep');
+        const cols = this.list(o.columns, 'columns');
+        if (cols.length === 0) this.fail('expected at least one column', 'columns');
+        index(cols, 'columns');
+        const names = this.list(o.names, 'names');
+        if (names.length !== cols.length) this.fail(`expected ${cols.length} names, one per column`, 'names');
+        for (let i = 0; i < names.length; i++) if (typeof names[i] !== 'string') this.fail('expected a name', 'names', i);
+        if (!TYPES.has(o.type)) this.fail(`unknown type ${JSON.stringify(o.type)}`, 'type');
+        return keep.length + 2;
+      }
       case 'distinct': {
         const w = sub(o.input, 'input');
         if (this.list(o.collations, 'collations').length !== w) this.fail(`expected ${w} collations`, 'collations');

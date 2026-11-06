@@ -93,6 +93,11 @@ export const aggregate = (input: PlanOp, keys: readonly PlanExpr[], aggs: readon
   carry: options.carry ?? [],
   ...(options.ordered ? { ordered: options.ordered } : {}),
 });
+/**
+ * `input`'s `columns` as rows (a long form): each input row gives one row per column, in input order and then the
+ * columns' order, with the `keep` columns, the column's name (from `names`) and its value (of `type`).
+ */
+export const unpivot = (input: PlanOp, keep: readonly number[], columns: readonly number[], names: readonly string[], type: PlanType = 'any'): Op<'unpivot'> => ({ op: 'unpivot', input, keep, columns, names, type });
 /** Distinct rows of an input with `width` columns. */
 export const distinct = (input: PlanOp, width: number, collations?: readonly CollationName[], options: { ordered?: 'first'; on?: readonly number[]; keep?: 'first' | 'last' } = {}): Op<'distinct'> => ({
   op: 'distinct',

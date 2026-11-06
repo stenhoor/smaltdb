@@ -79,6 +79,8 @@ export function printPlan(op: PlanOp, depth = 0): string {
       const aggs = op.aggs.map((a) => `${a.fn}(${a.distinct ? 'distinct ' : ''}${a.star ? '*' : list(a.args)})${a.filter ? ` filter ${printExpr(a.filter)}` : ''}`);
       return `${pad}aggregate keys [${op.keys.map((k) => printExpr(k.expr)).join(', ')}] aggs [${aggs.join(', ')}]${op.carry.length ? ` carry [${list(op.carry)}]` : ''}\n${sub(op.input)}`;
     }
+    case 'unpivot':
+      return `${pad}unpivot keep [${op.keep.join(', ')}] columns [${op.columns.map((c, i) => `${c} as ${JSON.stringify(op.names[i])}`).join(', ')}]\n${sub(op.input)}`;
     case 'distinct':
       return `${pad}distinct\n${sub(op.input)}`;
     case 'append':

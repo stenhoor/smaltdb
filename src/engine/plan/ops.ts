@@ -154,6 +154,18 @@ export type PlanOp = OpMeaning & (
       readonly ordered?: 'first';
     }
   | {
+      readonly op: 'unpivot';
+      readonly input: PlanOp;
+      /** Input columns kept on every output row. */
+      readonly keep: readonly number[];
+      /** Input columns whose values become rows: one output row per input row and column, in this order. */
+      readonly columns: readonly number[];
+      /** The name each of `columns` gives its rows (the output's name column). */
+      readonly names: readonly string[];
+      /** The plan type of the value column. */
+      readonly type: PlanType;
+    }
+  | {
       readonly op: 'distinct';
       readonly input: PlanOp;
       readonly collations: readonly CollationName[];

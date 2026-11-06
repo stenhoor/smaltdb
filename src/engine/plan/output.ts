@@ -39,6 +39,10 @@ export function outputTypes(op: PlanOp, tableTypes: TableTypes): PlanType[] {
       const right = outputTypes(op.inputs[1], tableTypes);
       return left.map((t, i) => (t === right[i] ? t : 'any'));
     }
+    case 'unpivot': {
+      const t = outputTypes(op.input, tableTypes);
+      return [...op.keep.map((i) => t[i]), 'text', op.type];
+    }
     case 'aggregate':
       return [...op.keys.map((k) => typeOf(k.expr)), ...op.aggs.map((a) => a.type), ...op.carry.map(typeOf)];
     case 'window':

@@ -60,6 +60,9 @@ function rewriteAll(x: unknown): unknown {
       return op.on || op.keep ? keptRows(op) : op.ordered ? orderedGroups(distinctGroups(op)) : op;
     case 'limit':
       return op.fromEnd ? fromEnd(op) : op;
+    case 'unpivot':
+      // Its rewrite is an ordered join: rewritten in turn.
+      return rewriteAll(unpivotRows(op));
     default:
       return op;
   }
@@ -86,7 +89,7 @@ function numbered(input: PlanOp): PlanOp {
   return { op: 'window', input, partition: [], order: [], frame: WHOLE, calls: [ROW_NUMBER] };
 }
 
-const column = (index: number, type: 'int' | 'any' = 'any'): PlanExpr => ({ k: 'col', input: 0, index, depth: 0, type, collation: 'binary' });
+const column = (index: number, type: 'int' | 'text' | 'any' = 'any'): PlanExpr => ({ k: 'col', input: 0, index, depth: 0, type, collation: 'binary' });
 const range = (from: number, to: number): PlanExpr[] => Array.from({ length: to - from }, (_, i) => column(from + i));
 /** `op` without its `ordered` flag. */
 function unordered<T extends { ordered?: unknown }>(op: T): T {
@@ -150,6 +153,23 @@ function keptRows(op: Op<'distinct'>): PlanOp {
   let kept: PlanOp = { op: 'filter', input: sets, pred: cmp('cmp_eq', pos, column(op.keep === 'last' ? w + 2 : w + 1, 'int')) };
   if (op.ordered) kept = { op: 'sort', input: kept, keys: [{ expr: column(w + 1, 'int'), desc: false, nullsFirst: false, collation: 'binary' }] };
   return { op: 'project', input: kept, exprs: range(0, w) };
+}
+
+/**
+ * An unpivot as the input crossed with one row per column (its position and name), in order (an ordered join keeps
+ * the input's order, then the columns'), each output row taking its column's value.
+ */
+function unpivotRows(op: Op<'unpivot'>): PlanOp {
+  const w = planWidth(op.input);
+  const which: PlanOp = { op: 'values', rows: op.names.map((n, k) => [{ k: 'lit', value: k, type: 'int' }, { k: 'lit', value: n, type: 'text' }]), types: ['int', 'text'] };
+  const crossed: PlanOp = { op: 'join', kind: 'cross', inputs: [op.input, which], ordered: true };
+  const value: PlanExpr = {
+    k: 'case',
+    whens: op.columns.map((c, k) => ({ when: cmp('cmp_eq', column(w, 'int'), { k: 'lit', value: k, type: 'int' }), then: column(c) })),
+    else: { k: 'lit', value: null, type: 'any' },
+    type: op.type,
+  };
+  return { op: 'project', input: crossed, exprs: [...op.keep.map((i) => column(i)), column(w + 1, 'text'), value], ...(op.origin !== undefined ? { origin: op.origin } : {}) };
 }
 
 /** A distinct as an aggregate grouped by every column, with no aggregate calls. */
