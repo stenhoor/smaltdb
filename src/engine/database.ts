@@ -18,7 +18,7 @@ import type { ConflictAction, PlanOp } from './plan/ops.js';
 import { type EncodedPlan, canonicalJSON, decodeData, decodePlan, encodeData, encodePlan, planFromJSON, planToJSON } from './plan/codec.js';
 import { type PlanStatementInput, paramCount, toBoundStatement } from './plan/statement.js';
 import { normalizePlan, normalizeWrite } from './exec/plan-normalize.js';
-import { type ValidateCatalog, validatePlan } from './plan/validate.js';
+import { type ValidateCatalog, validatePlan, validateSchemaOp } from './plan/validate.js';
 import { type PlanExpr, forEachCol, typeOf } from './plan/expr.js';
 import type { CollationName } from './plan/types.js';
 import { type Compiled, type Fn } from './exec/expr.js';
@@ -521,6 +521,7 @@ export class Database implements FunctionContext {
   preparePlan(stmt: PlanStatementInput): PlanStatement {
     this.checkOpen();
     const bound = normalizeBound(toBoundStatement(stmt, (plan) => this.receivedPlan(plan)));
+    if (bound.kind === 'schema') validateSchemaOp(bound.op, this.validateCatalog);
     return new PlanStatement(this, bound, paramCount(bound));
   }
 
@@ -1174,7 +1175,13 @@ export class Database implements FunctionContext {
     return r;
   }
 
-  private readonly validateCatalog: ValidateCatalog = { tableColumns: (name, db) => this.getTable(name, db)?.columns.length };
+  private readonly validateCatalog: ValidateCatalog = {
+    tableColumns: (name, db) => this.getTable(name, db)?.columns.length,
+    sourceColumns: (kind, name, schema) => {
+      if (kind === 'external' || (kind === 'function' && this.external.plugins.isExternalFunction(name))) return 'data';
+      return this.virtualTable(kind === 'virtual' ? schema : undefined, name)?.columns.length;
+    },
+  };
 
   /** The logical catalog languages bind against (plan/bind-context.ts): the planner's tables, views and sources. */
   private bindContext(): BindContext {

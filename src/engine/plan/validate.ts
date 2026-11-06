@@ -23,9 +23,16 @@ import { NAVIGATION, RANKING, WINDOW_ARITY } from '../exec/window.js';
 import type { PlanExpr } from './expr.js';
 import type { PlanOp } from './ops.js';
 
-/** What the validator asks of the catalog: a table's column count (rowid not included), or undefined. */
+/** What the validator asks of the catalog. */
 export interface ValidateCatalog {
+  /** A table's column count (rowid not included), or undefined. */
   tableColumns(name: string, db?: 'main' | 'temp'): number | undefined;
+  /**
+   * A source's column count (a table-valued function or a virtual table): `'data'` when its columns come from the data
+   * it reads (external tables and functions), undefined when the catalog doesn't know the source (the planner reports
+   * it in its own words).
+   */
+  sourceColumns?(kind: 'function' | 'virtual' | 'external', name: string, schema: string | undefined): number | 'data' | undefined;
 }
 
 /** Deeper plans are refused (SQLite's expression depth limit is 1000). */
@@ -76,6 +83,11 @@ class Validator {
     if (typeof c !== 'string' || !COLLATIONS.has(c)) this.fail(`unknown collation ${JSON.stringify(c)}`, field);
   }
 
+  /** `x` must be an object (an element of a list, a nested structure). */
+  private object(x: unknown, field?: string): void {
+    if (!x || typeof x !== 'object' || Array.isArray(x)) this.fail('expected an object', ...(field === undefined ? [] : [field]));
+  }
+
   private list(x: unknown, field: string): readonly unknown[] {
     if (!Array.isArray(x)) this.fail('expected a list', field);
     return x;
@@ -120,19 +132,23 @@ class Validator {
     const sub = (x: PlanOp, field: string, i?: number, lat: number | null = null): number => this.under(field, i, () => this.op(x, outer, d, lat));
     /** The scopes of expressions reading inputs of widths `ws`. */
     const reading = (...ws: number[]): readonly Scope[] => [...outer, ws];
-    const ex = (e: PlanExpr | undefined, scopes: readonly Scope[], field: string, i?: number): void => {
-      if (e === undefined) return;
-      this.exprAt(e, scopes, d, field, i);
+    /** A required expression. */
+    const ex = (e: PlanExpr | undefined, scopes: readonly Scope[], field: string, i?: number): void => this.exprAt(e as PlanExpr, scopes, d, field, i);
+    /** An optional expression: absent is fine. */
+    const optEx = (e: PlanExpr | undefined, scopes: readonly Scope[], field: string): void => {
+      if (e !== undefined) this.exprAt(e, scopes, d, field, undefined);
     };
     const exprs = (es: unknown, scopes: readonly Scope[], field: string): void => {
       const l = this.list(es, field);
-      for (let i = 0; i < l.length; i++) ex(l[i] as PlanExpr, scopes, field, i);
+      // Every element of a list is an expression (`ex` skips undefined, for optional fields only).
+      for (let i = 0; i < l.length; i++) this.exprAt(l[i] as PlanExpr, scopes, d, field, i);
     };
     const sortKeys = (ks: unknown, scopes: readonly Scope[], field: string): void => {
       const l = this.list(ks, field);
       for (let i = 0; i < l.length; i++) {
         const key = l[i] as { expr: PlanExpr; desc: unknown; nullsFirst: unknown; collation: unknown };
         this.under(field, i, () => {
+          this.object(key);
           ex(key.expr, scopes, 'expr');
           if (typeof key.desc !== 'boolean' || typeof key.nullsFirst !== 'boolean') this.fail('expected desc and nullsFirst');
           this.collation(key.collation, 'collation');
@@ -174,7 +190,11 @@ class Validator {
         const scopes = lateral === null ? reading() : reading(lateral);
         exprs(o.args, scopes, 'args');
         if (o.named) for (const k of Object.keys(o.named)) ex(o.named[k], scopes, 'named', k as never);
-        return types(o.types, 'types');
+        const w = types(o.types, 'types');
+        // The planner reads as many columns as the source has, so `types` must describe each of them.
+        const n = this.catalog.sourceColumns?.(o.kind, o.name, o.schema);
+        if (typeof n === 'number' && n !== w) this.fail(`${o.kind === 'function' ? `${o.name}()` : o.schema ? `${o.schema}.${o.name}` : o.name} has ${n} column(s), but ${w} type(s) are given`, 'types');
+        return w;
       }
       case 'values': {
         const w = types(o.types, 'types');
@@ -204,8 +224,8 @@ class Validator {
         }
         collations(o.collations, 'collations');
         if (o.order) sortKeys(o.order, reading(w), 'order');
-        ex(o.limit, reading(), 'limit');
-        ex(o.offset, reading(), 'offset');
+        optEx(o.limit, reading(), 'limit');
+        optEx(o.offset, reading(), 'offset');
         return w;
       }
       case 'working': {
@@ -228,7 +248,7 @@ class Validator {
         const w = sub(o.input, 'input');
         const scopes = reading(w);
         ex(o.count, scopes, 'count');
-        ex(o.offset, scopes, 'offset');
+        optEx(o.offset, scopes, 'offset');
         return w;
       }
       case 'join': {
@@ -237,7 +257,7 @@ class Validator {
         const l = sub(ins[0] as PlanOp, 'inputs', 0);
         const r = sub(ins[1] as PlanOp, 'inputs', 1, l);
         if (!JOIN_KINDS.has(o.kind)) this.fail(`unknown join kind ${JSON.stringify(o.kind)}`, 'kind');
-        ex(o.on, reading(l, r), 'on');
+        optEx(o.on, reading(l, r), 'on');
         return o.kind === 'semi' || o.kind === 'anti' ? l : l + r;
       }
       case 'setop': {
@@ -262,12 +282,13 @@ class Validator {
         for (let i = 0; i < keys.length; i++) {
           const k = keys[i] as { expr: PlanExpr; collation: unknown };
           this.under('keys', i, () => {
-            ex(k.expr, scopes, 'expr');
+            if (!k || typeof k !== 'object') this.fail('expected a key');
+            this.exprAt(k.expr, scopes, d, 'expr', undefined);
             this.collation(k.collation, 'collation');
           });
         }
         const aggs = this.list(o.aggs, 'aggs');
-        for (let i = 0; i < aggs.length; i++) this.under('aggs', i, () => this.aggCall(aggs[i] as never, scopes, d, false));
+        for (let i = 0; i < aggs.length; i++) this.under('aggs', i, () => (this.object(aggs[i]), this.aggCall(aggs[i] as never, scopes, d, false)));
         exprs(o.carry, scopes, 'carry');
         return o.keys.length + o.aggs.length + o.carry.length;
       }
@@ -283,15 +304,17 @@ class Validator {
         for (let i = 0; i < part.length; i++) {
           const k = part[i] as { expr: PlanExpr; collation: unknown };
           this.under('partition', i, () => {
+            this.object(k);
             ex(k.expr, scopes, 'expr');
             this.collation(k.collation, 'collation');
           });
         }
         sortKeys(o.order, scopes, 'order');
-        ex(o.frame?.start?.offset, reading(), 'frame.start.offset');
-        ex(o.frame?.end?.offset, reading(), 'frame.end.offset');
+        if (!o.frame || typeof o.frame !== 'object' || !o.frame.start || !o.frame.end) this.fail('expected a frame { unit, start, end, exclude }', 'frame');
+        optEx(o.frame.start.offset, reading(), 'frame.start.offset');
+        optEx(o.frame.end.offset, reading(), 'frame.end.offset');
         const calls = this.list(o.calls, 'calls');
-        for (let i = 0; i < calls.length; i++) this.under('calls', i, () => this.aggCall(calls[i] as never, scopes, d, true));
+        for (let i = 0; i < calls.length; i++) this.under('calls', i, () => (this.object(calls[i]), this.aggCall(calls[i] as never, scopes, d, true)));
         return w + o.calls.length;
       }
       case 'delete': {
@@ -310,6 +333,7 @@ class Validator {
         for (let i = 0; i < sets.length; i++) {
           const set = sets[i] as { column: number; value: PlanExpr };
           this.under('sets', i, () => {
+            this.object(set);
             if (!Number.isInteger(set.column) || set.column < -1 || set.column >= n) this.fail(`table ${o.table} has no column ${set.column}`, 'column');
             ex(set.value, scopes, 'value');
           });
@@ -328,17 +352,21 @@ class Validator {
         const scopes = reading(2 * (n + 1));
         const ups = this.list(o.upserts, 'upserts');
         for (let i = 0; i < ups.length; i++) {
-          const up = ups[i] as { update?: { sets: { column: number; value: PlanExpr }[]; where?: PlanExpr } };
+          const up = ups[i] as { target?: unknown; update?: { sets: { column: number; value: PlanExpr }[]; where?: PlanExpr } };
+          this.under('upserts', i, () => this.object(up));
+          if (up.target !== null && !(Number.isInteger(up.target) && (up.target as number) >= -1)) this.under('upserts', i, () => this.fail(`expected a constraint index, -1 or null`, 'target'));
           if (!up.update) continue;
           this.under('upserts', i, () => {
-            const sets = up.update!.sets;
+            this.object(up.update, 'update');
+            const sets = this.list(up.update!.sets, 'update.sets') as { column: number; value: PlanExpr }[];
             for (let j = 0; j < sets.length; j++) {
               this.under('update.sets', j, () => {
+                this.object(sets[j]);
                 if (!Number.isInteger(sets[j].column) || sets[j].column < -1 || sets[j].column >= n) this.fail(`table ${o.table} has no column ${sets[j].column}`, 'column');
                 ex(sets[j].value, scopes, 'value');
               });
             }
-            ex(up.update!.where, scopes, 'update.where');
+            optEx(up.update!.where, scopes, 'update.where');
           });
         }
         return returning(o.returning, n);
@@ -349,6 +377,237 @@ class Validator {
   }
 
   /** An aggregate call (or a window call, `window`): a registered function with an arity it accepts. */
+  /** A schema operation (see validateSchemaOp). */
+  schemaOp(o: Record<string, unknown>): void {
+    this.top = 1;
+    if (!o || typeof o !== 'object') this.fail('expected a schema operation');
+    if (!SCHEMA_OPS.has(o.op as string)) this.fail(`unknown schema operation ${JSON.stringify(o.op)}`, 'op');
+    this.at[this.top++] = o.op as string;
+    const str = (x: unknown, field: string, nonEmpty = true): void => {
+      if (typeof x !== 'string' || (nonEmpty && x === '')) this.fail(nonEmpty ? 'expected a name' : 'expected text', field);
+    };
+    const bool = (x: unknown, field: string): void => {
+      if (typeof x !== 'boolean') this.fail('expected true or false', field);
+    };
+    const optBool = (x: unknown, field: string): void => {
+      if (x !== undefined) bool(x, field);
+    };
+    const schema = (x: unknown): void => {
+      if (x !== undefined && x !== 'main' && x !== 'temp') this.fail(`unknown schema ${JSON.stringify(x)}`, 'schema');
+    };
+    const source = (x: unknown): void =>
+      this.under('source', undefined, () => {
+        if (!x || typeof x !== 'object') this.fail('expected a source { language, text }');
+        const src = x as { language?: unknown; text?: unknown };
+        str(src.language, 'language');
+        str(src.text, 'text', false);
+      });
+    const conflict = (x: unknown, field: string): void => {
+      if (x !== undefined && !CONFLICT_ACTIONS.has(x as string)) this.fail(`unknown conflict action ${JSON.stringify(x)}`, field);
+    };
+    /** An expression of a definition over `width` columns (and the rowid when `rowid`). */
+    const exprDef = (x: unknown, width: number, rowid: boolean, field: string, i?: number): void =>
+      this.under(field, i, () => {
+        if (!x || typeof x !== 'object') this.fail('expected { text, expr? }');
+        const d = x as { text?: unknown; expr?: PlanExpr };
+        str(d.text, 'text', false);
+        if (d.expr !== undefined) this.exprAt(d.expr, [[rowid ? width + 1 : width]], 1, 'expr', undefined);
+      });
+    const columnIndex = (c: unknown, width: number, field: string, i?: number): void => {
+      if (!Number.isInteger(c) || (c as number) < 0 || (c as number) >= width) this.fail(`no column ${String(c)}`, field, ...(i === undefined ? [] : [i]));
+    };
+    const columnDef = (c: unknown, field: string, i?: number): string =>
+      this.under(field, i, () => {
+        if (!c || typeof c !== 'object') this.fail('expected a column');
+        const d = c as Record<string, unknown>;
+        str(d.name, 'name');
+        str(d.declaredType, 'declaredType', false);
+        if (!STORAGE_TYPES.has(d.type as string)) this.fail(`unknown storage type ${JSON.stringify(d.type)} (one of ${[...STORAGE_TYPES].join(', ')})`, 'type');
+        bool(d.notNull, 'notNull');
+        conflict(d.notNullConflict, 'notNullConflict');
+        this.collation(d.collation, 'collation');
+        if (d.default !== undefined) {
+          exprDef(d.default, 0, false, 'default');
+          const v = (d.default as { value?: unknown }).value;
+          if (v !== null && !['number', 'bigint', 'string'].includes(typeof v) && !(v instanceof Uint8Array)) this.fail('expected a value', 'default', 'value');
+        }
+        return d.name as string;
+      });
+    const checks = (cs: unknown, width: number, field: string): void => {
+      const l = this.list(cs, field);
+      for (let i = 0; i < l.length; i++) {
+        exprDef(l[i], width, true, field, i);
+        const of = (l[i] as { ofColumn?: unknown }).ofColumn;
+        if (of !== undefined) this.under(field, i, () => columnIndex(of, width, 'ofColumn'));
+      }
+    };
+    const foreignKeys = (fks: unknown, width: number, field: string): void => {
+      const l = this.list(fks, field);
+      for (let i = 0; i < l.length; i++)
+        this.under(field, i, () => {
+          const f = l[i] as Record<string, unknown>;
+          if (!f || typeof f !== 'object') this.fail('expected a foreign key');
+          const cols = this.list(f.columns, 'columns');
+          if (cols.length === 0) this.fail('expected at least one column', 'columns');
+          for (let j = 0; j < cols.length; j++) columnIndex(cols[j], width, 'columns', j);
+          str(f.table, 'table');
+          if (f.refColumns !== undefined) {
+            const refs = this.list(f.refColumns, 'refColumns');
+            if (refs.length !== cols.length) this.fail(`expected ${cols.length} parent column(s)`, 'refColumns');
+            for (let j = 0; j < refs.length; j++) this.under('refColumns', j, () => str(refs[j], 'name'));
+          }
+          if (!FK_ACTIONS.has(f.onDelete as string)) this.fail(`unknown action ${JSON.stringify(f.onDelete)}`, 'onDelete');
+          if (!FK_ACTIONS.has(f.onUpdate as string)) this.fail(`unknown action ${JSON.stringify(f.onUpdate)}`, 'onUpdate');
+          bool(f.deferrable, 'deferrable');
+          bool(f.isDeferrable, 'isDeferrable');
+        });
+    };
+    switch (o.op) {
+      case 'createTable': {
+        schema(o.schema);
+        bool(o.temp, 'temp');
+        bool(o.ifNotExists, 'ifNotExists');
+        source(o.source);
+        this.under('table', undefined, () => {
+          const t = o.table as Record<string, unknown>;
+          if (!t || typeof t !== 'object') this.fail('expected a table definition');
+          str(t.name, 'name');
+          const cols = this.list(t.columns, 'columns');
+          if (cols.length === 0) this.fail('a table needs at least one column', 'columns');
+          const seen = new Set<string>();
+          for (let i = 0; i < cols.length; i++) {
+            const name = columnDef(cols[i], 'columns', i).toLowerCase();
+            if (seen.has(name)) this.fail(`duplicate column name ${JSON.stringify((cols[i] as { name: string }).name)}`, 'columns', i);
+            seen.add(name);
+          }
+          const width = cols.length;
+          const keys = this.list(t.keys, 'keys');
+          let primary = 0;
+          for (let i = 0; i < keys.length; i++)
+            this.under('keys', i, () => {
+              const k = keys[i] as Record<string, unknown>;
+              if (!k || typeof k !== 'object') this.fail('expected a key');
+              if (k.kind !== 'primaryKey' && k.kind !== 'unique') this.fail(`unknown key kind ${JSON.stringify(k.kind)}`, 'kind');
+              if (k.kind === 'primaryKey' && ++primary > 1) this.fail('a table has at most one primary key');
+              const kc = this.list(k.columns, 'columns');
+              if (kc.length === 0) this.fail('expected at least one column', 'columns');
+              for (let j = 0; j < kc.length; j++)
+                this.under('columns', j, () => {
+                  const c = kc[j] as Record<string, unknown>;
+                  columnIndex(c?.column, width, 'column');
+                  bool(c.desc, 'desc');
+                  this.collation(c.collation, 'collation');
+                });
+              conflict(k.onConflict, 'onConflict');
+              optBool(k.autoincrement, 'autoincrement');
+              if (k.ofColumn !== undefined) columnIndex(k.ofColumn, width, 'ofColumn');
+            });
+          checks(t.checks, width, 'checks');
+          foreignKeys(t.foreignKeys, width, 'foreignKeys');
+          if (t.storage !== 'row' && t.storage !== 'columnar') this.fail(`unknown storage ${JSON.stringify(t.storage)}`, 'storage');
+        });
+        return;
+      }
+      case 'createIndex': {
+        schema(o.schema);
+        bool(o.ifNotExists, 'ifNotExists');
+        source(o.source);
+        this.under('index', undefined, () => {
+          const ix = o.index as Record<string, unknown>;
+          if (!ix || typeof ix !== 'object') this.fail('expected an index definition');
+          str(ix.name, 'name');
+          const width = this.tableWidth(ix.table, o.schema);
+          const cols = this.list(ix.columns, 'columns');
+          if (cols.length === 0) this.fail('expected at least one column', 'columns');
+          for (let i = 0; i < cols.length; i++)
+            this.under('columns', i, () => {
+              const c = cols[i] as Record<string, unknown>;
+              if (!c || typeof c !== 'object') this.fail('expected an index column');
+              if (c.column === -1) {
+                if (c.expr === undefined) this.fail('an expression column needs its expression', 'expr');
+                exprDef(c.expr, width, true, 'expr');
+              } else columnIndex(c.column, width, 'column');
+              bool(c.desc, 'desc');
+              this.collation(c.collation, 'collation');
+            });
+          bool(ix.unique, 'unique');
+          if (ix.where !== undefined) exprDef(ix.where, width, true, 'where');
+        });
+        return;
+      }
+      case 'createView': {
+        str(o.name, 'name');
+        schema(o.schema);
+        bool(o.temp, 'temp');
+        bool(o.ifNotExists, 'ifNotExists');
+        bool(o.materialized, 'materialized');
+        optBool(o.withData, 'withData');
+        if (o.columns !== undefined) {
+          const l = this.list(o.columns, 'columns');
+          for (let i = 0; i < l.length; i++) this.under('columns', i, () => str(l[i], 'name'));
+        }
+        source(o.source);
+        return;
+      }
+      case 'createConnection':
+      case 'createExternalTable': {
+        str(o.name, 'name');
+        bool(o.ifNotExists, 'ifNotExists');
+        if (!o.options || typeof o.options !== 'object' || Array.isArray(o.options)) this.fail('expected options', 'options');
+        if (o.op === 'createExternalTable') {
+          const l = this.list(o.columns, 'columns');
+          for (let i = 0; i < l.length; i++)
+            this.under('columns', i, () => {
+              const c = l[i] as Record<string, unknown>;
+              str(c?.name, 'name');
+              str(c.declaredType, 'declaredType', false);
+              bool(c.constrained, 'constrained');
+            });
+        }
+        source(o.source);
+        return;
+      }
+      case 'drop': {
+        if (!DROP_OBJECTS.has(o.objectType as string)) this.fail(`unknown object type ${JSON.stringify(o.objectType)}`, 'objectType');
+        str(o.name, 'name');
+        schema(o.schema);
+        bool(o.ifExists, 'ifExists');
+        return;
+      }
+      case 'alterTable': {
+        str(o.table, 'table');
+        schema(o.schema);
+        source(o.source);
+        const width = this.tableWidth(o.table, o.schema);
+        this.under('action', undefined, () => {
+          const a = o.action as Record<string, unknown>;
+          if (!a || typeof a !== 'object') this.fail('expected an action');
+          switch (a.kind) {
+            case 'renameTable':
+              str(a.newName, 'newName');
+              return;
+            case 'renameColumn':
+              str(a.column, 'column');
+              str(a.newName, 'newName');
+              return;
+            case 'dropColumn':
+              str(a.column, 'column');
+              return;
+            case 'addColumn':
+              columnDef(a.column, 'column');
+              checks(a.checks, width + 1, 'checks');
+              foreignKeys(a.foreignKeys, width + 1, 'foreignKeys');
+              str(a.text, 'text', false);
+              return;
+            default:
+              this.fail(`unknown action ${JSON.stringify(a.kind)}`, 'kind');
+          }
+        });
+        return;
+      }
+    }
+  }
+
   private aggCall(a: { fn: unknown; args: unknown; star: unknown; filter?: PlanExpr; collation: unknown; type: unknown }, scopes: readonly Scope[], depth: number, window: boolean): void {
     if (typeof a.fn !== 'string') this.fail('expected a function name', 'fn');
     const args = this.list(a.args, 'args');
@@ -361,6 +620,7 @@ class Validator {
     }
     if (!arity) this.fail(`no such ${window ? 'window' : 'aggregate'} function: ${a.fn}`, 'fn');
     if (!(a.star === true && n === 0) && (n < arity[0] || (arity[1] >= 0 && n > arity[1]))) this.fail(`wrong number of arguments to ${a.fn}: ${n}`);
+    if (n === 0 && a.star !== true && arity[0] === 0 && !window) this.fail(`${a.fn} with no arguments is ${a.fn}(*): set star`, 'star');
     for (let i = 0; i < n; i++) this.exprAt(args[i] as PlanExpr, scopes, depth, 'args', i);
     if (a.filter !== undefined) this.exprAt(a.filter!, scopes, depth, 'filter', undefined);
     this.collation(a.collation, 'collation');
@@ -435,6 +695,7 @@ class Validator {
         for (let i = 0; i < whens.length; i++) {
           const w = whens[i] as { when: PlanExpr; then: PlanExpr };
           this.under('whens', i, () => {
+            this.object(w);
             this.exprAt(w.when, scopes, d, 'when', undefined);
             this.exprAt(w.then, scopes, d, 'then', undefined);
           });
@@ -460,6 +721,24 @@ class Validator {
         this.fail(`unknown expression ${JSON.stringify((e as { k?: unknown }).k)}`);
     }
   }
+}
+
+// ------------------------------------------------------------------ schema operations
+
+const STORAGE_TYPES = new Set(['INTEGER', 'REAL', 'TEXT', 'BLOB', 'ANY', 'NUMERIC']);
+const FK_ACTIONS = new Set(['SET NULL', 'SET DEFAULT', 'CASCADE', 'RESTRICT', 'NO ACTION']);
+const DROP_OBJECTS = new Set(['table', 'index', 'view', 'materialized view', 'trigger', 'external table', 'connection']);
+const SCHEMA_OPS = new Set(['createTable', 'createIndex', 'createView', 'createConnection', 'createExternalTable', 'drop', 'alterTable']);
+
+/**
+ * Throws SMALT_PLAN when `op` is not a valid schema operation (ADR 0016 section 9): the fields each operation needs,
+ * storage types, collations and conflict actions from their sets, columns that exist and names that are unique, and
+ * CHECK, DEFAULT, index and partial-index expressions validated as plan expressions over the row (column `i` of the
+ * table, `n` its rowid) or over no columns (DEFAULT). Schema operations a language binds are checked by that language
+ * in its own words; this runs for schema operations given as plan data.
+ */
+export function validateSchemaOp(op: unknown, catalog: ValidateCatalog): void {
+  new Validator(catalog).schemaOp(op as Record<string, unknown>);
 }
 
 /** Path segments of the validation running (at most two per nesting level). */

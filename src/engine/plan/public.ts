@@ -6,4 +6,4 @@
  * release until its own stability ADR.
  */
 export * from './portable.js';
-export { validatePlan, MAX_PLAN_DEPTH, type ValidateCatalog } from './validate.js';
+export { validatePlan, validateSchemaOp, MAX_PLAN_DEPTH, type ValidateCatalog } from './validate.js';
