@@ -1,7 +1,7 @@
 # SQL Dialect
 
 > Status: design notes. The baseline is **SQLite 3.4x syntax and semantics**. The current reference is the
-> [SQL reference](reference/sql/index.md). Since ADR 0012, external sources and formats (§5a) come from plugins.
+> [SQL reference](https://stenhoor.github.io/smaltql/reference/sql). Since ADR 0012, external sources and formats (§5a) come from plugins.
 
 ## 1. Statements (initial scope)
 

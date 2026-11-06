@@ -1,5 +1,5 @@
 import { Database, type Statement } from '../../../src/engine/database.js';
-import '../../../src/engine/sql/register.js';
+import 'smaltql/register';
 import { OpfsVfs } from '../../../src/engine/vfs/opfs.js';
 import type { Vfs } from '../../../src/engine/vfs/types.js';
 import { ANALYTIC_DDL, type Adapter, analyticRow, valueFor } from '../adapter.js';

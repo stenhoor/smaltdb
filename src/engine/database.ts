@@ -479,7 +479,7 @@ export class Database implements FunctionContext {
     return new Statement(this, this.sql.parseOne(sql), sql);
   }
 
-  /** SQL, the language of the string API: registered by smaltdb's entry points (sql/register.ts). */
+  /** SQL, the language of the string API: registered by smaltql (`import 'smaltql/register'`, or a worker's `defineWorker`). */
   private get sql(): SmaltLanguage {
     return (this.sqlLanguage ??= this.languageOf('sql'));
   }
@@ -1233,7 +1233,7 @@ export class Database implements FunctionContext {
   }
 
   /**
-   * @internal Compile a statement into a program for the current schema: the language binds it (sql/frontend/bind.ts),
+   * @internal Compile a statement into a program for the current schema: the language binds it,
    * and the engine dispatches on the bound statement (plan/bound.ts).
    */
   compile(ps: LanguageStatement): Program {

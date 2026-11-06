@@ -1,8 +1,8 @@
 # Error codes
 
-Every error smaltdb raises carries a `code`. In the client it is a [`SmaltdbError`](./client#smaltdberror); in the engine it is a [`SmaltError`](./engine#errors) or a subclass. Codes are strings that start with `SMALT_`. Where SQLite has a matching result code, the name follows it (`SQLITE_BUSY` → `SMALT_BUSY`).
+Every error smaltdb raises carries a `code`. In the client it is a [`SmaltdbError`](https://stenhoor.github.io/smaltql/reference/api/client#smaltdberror); in the engine it is a [`SmaltError`](./engine#errors) or a subclass. Codes are strings that start with `SMALT_`. Where SQLite has a matching result code, the name follows it (`SQLITE_BUSY` → `SMALT_BUSY`).
 
-The [errors guide](../../guide/errors) shows how to handle them. This page lists every code the engine and client raise, what causes it, and what to do.
+The [errors guide](https://stenhoor.github.io/smaltql/guide/errors) shows how to handle them. This page lists every code the engine and client raise, what causes it, and what to do.
 
 | Code | Meaning | Retry? |
 |---|---|---|
@@ -60,13 +60,13 @@ SELECT * FROM no_such_table;
 
 The SQL does not parse. The message gives the token and position: `SELEC 1` fails with `near "SELEC": syntax error (line 1, column 1)`. `query()` and `prepare()` accept one statement only; a second statement is reported as a syntax error. (`exec()` with parameters reports it as `SMALT_MISUSE`.)
 
-**Remedy:** fix the SQL. See the [SQL reference](../sql/).
+**Remedy:** fix the SQL. See the [SQL reference](https://stenhoor.github.io/smaltql/reference/sql/).
 
 ## SMALT_UNSUPPORTED
 
 The SQL is valid in SQLite, or reserved for a future version, but smaltdb does not support it. Examples: `WITHOUT ROWID` tables, generated columns, `CREATE TABLE … AS SELECT`, some `PRAGMA`s, `UPDATE … ORDER BY/LIMIT`, indexes on columnar tables. The message names the feature.
 
-**Remedy:** rewrite the statement without the feature. See [differences from SQLite](../../guide/sqlite-differences).
+**Remedy:** rewrite the statement without the feature. See [differences from SQLite](https://stenhoor.github.io/smaltql/guide/sqlite-differences).
 
 <!-- docs:error SMALT_UNSUPPORTED -->
 ```sql
@@ -89,7 +89,7 @@ INSERT INTO users(email) VALUES (NULL);
 
 An `INSERT` or `UPDATE` would create a second row with the same value in a `UNIQUE` column or unique index. Message: `UNIQUE constraint failed: table.column`.
 
-**Remedy:** use a different value, or turn the insert into an upsert (`ON CONFLICT … DO UPDATE` or `DO NOTHING`, see [INSERT](../sql/insert)).
+**Remedy:** use a different value, or turn the insert into an upsert (`ON CONFLICT … DO UPDATE` or `DO NOTHING`, see [INSERT](https://stenhoor.github.io/smaltql/reference/sql/insert)).
 
 <!-- docs:error SMALT_CONSTRAINT_UNIQUE -->
 ```sql
@@ -122,7 +122,7 @@ INSERT INTO users(email, age) VALUES ('d@example.com', -1);
 
 A row refers to a parent row that does not exist, or a parent row that is still referenced would be deleted or changed. Message: `FOREIGN KEY constraint failed`. For deferred foreign keys, the error comes from `COMMIT`, and the transaction stays open so you can fix the data.
 
-**Remedy:** insert the parent first, delete children first, or use an `ON DELETE` action. See [tables and schema](../../guide/schema).
+**Remedy:** insert the parent first, delete children first, or use an `ON DELETE` action. See [tables and schema](https://stenhoor.github.io/smaltql/guide/schema).
 
 <!-- docs:error SMALT_CONSTRAINT_FOREIGNKEY -->
 ```sql
@@ -134,7 +134,7 @@ INSERT INTO orders(user_id) VALUES (999);
 
 A value cannot be converted to the column's declared type. Tables are strictly typed, so `'abc'` cannot go into an `INTEGER` column. Message: `cannot store TEXT value in INTEGER column table.column`.
 
-**Remedy:** convert the value first (`CAST`, or in JavaScript), or declare the column `ANY`. See [data types](../sql/types).
+**Remedy:** convert the value first (`CAST`, or in JavaScript), or declare the column `ANY`. See [data types](https://stenhoor.github.io/smaltql/reference/sql/types).
 
 <!-- docs:error SMALT_CONSTRAINT_DATATYPE -->
 ```sql
@@ -150,7 +150,7 @@ A value of the wrong kind where one kind is required. Message: `datatype mismatc
 - a parameter of an unsupported JavaScript type, such as a `Date` or an `ArrayBuffer` (`unsupported parameter type`);
 - a materialized view whose query produced a value that does not fit a view column.
 
-**Remedy:** pass a value of the right type. See [values](../../guide/queries#values).
+**Remedy:** pass a value of the right type. See [values](https://stenhoor.github.io/smaltql/guide/queries#values).
 
 <!-- docs:error SMALT_MISMATCH -->
 ```sql
@@ -169,7 +169,7 @@ The parameters do not match the statement:
 
 Also raised by the CSV import when `delimiter` or `quote` is not a single character.
 
-**Remedy:** pass one value per placeholder, within range. See [parameters](../../guide/queries#parameters).
+**Remedy:** pass one value per placeholder, within range. See [parameters](https://stenhoor.github.io/smaltql/guide/queries#parameters).
 
 <!-- docs:error SMALT_RANGE -->
 ```sql
@@ -180,7 +180,7 @@ SELECT ?;
 
 A value is too large to be stored in an index: index keys must fit within a page. Message: `index key too large for index <name>`. The limit depends on the page size.
 
-**Remedy:** do not index long text or blobs. Index a prefix or a hash instead, for example an [index on an expression](../sql/create-index), or open the database with a larger `pageSize`.
+**Remedy:** do not index long text or blobs. Index a prefix or a hash instead, for example an [index on an expression](https://stenhoor.github.io/smaltql/reference/sql/create-index), or open the database with a larger `pageSize`.
 
 <!-- docs:error SMALT_TOOBIG -->
 ```sql
@@ -208,26 +208,26 @@ The request cannot run now because of something else holding the database:
 
 | Message | Cause | Remedy |
 |---|---|---|
-| `cannot modify the database while a query cursor is open; finish or close it first` | A write from a tab that has an open [stream](../../guide/queries#streaming) on the owning engine worker. In the engine, a write while a `RowCursor` is open. | Finish or close the stream (or cursor), then write. |
-| `cannot lock <name>.db: …` | Another engine worker has the OPFS file open: another tab or `open()` call, with multi-tab access off or unavailable. | Close the other database, or use [multi-tab access](../../guide/databases#multi-tab-access). |
+| `cannot modify the database while a query cursor is open; finish or close it first` | A write from a tab that has an open [stream](https://stenhoor.github.io/smaltql/guide/queries#streaming) on the owning engine worker. In the engine, a write while a `RowCursor` is open. | Finish or close the stream (or cursor), then write. |
+| `cannot lock <name>.db: …` | Another engine worker has the OPFS file open: another tab or `open()` call, with multi-tab access off or unavailable. | Close the other database, or use [multi-tab access](https://stenhoor.github.io/smaltql/guide/databases#multi-tab-access). |
 | `cannot checkpoint inside a transaction` | Engine `checkpoint()` called inside a transaction. | Call it after `COMMIT`. |
 
 ## SMALT_INTERRUPT
 
-The request was cancelled through its `AbortSignal` (message `interrupted`), or the fetch of external data it was waiting for was aborted. A statement that was interrupted while running has been rolled back. See [cancellation](../../guide/queries#cancellation).
+The request was cancelled through its `AbortSignal` (message `interrupted`), or the fetch of external data it was waiting for was aborted. A statement that was interrupted while running has been rolled back. See [cancellation](https://stenhoor.github.io/smaltql/guide/queries#cancellation).
 
 **Remedy:** none needed. Run the request again if you still want its result.
 
 ## SMALT_RETRY
 
-Client only, with [multi-tab access](../../guide/databases#multi-tab-access). The tab whose engine worker owned the database closed, and another took over:
+Client only, with [multi-tab access](https://stenhoor.github.io/smaltql/guide/databases#multi-tab-access). The tab whose engine worker owned the database closed, and another took over:
 
 - requests that were in flight are lost (message `the tab that owned the database closed; retry`);
 - a `PreparedStatement` prepared before the change cannot be used (message `the tab that owned the database changed; prepare the statement again`).
 
 An open transaction of this tab is gone too.
 
-**Remedy:** retry the request, or prepare the statement again. A write that was in flight may have committed before the owner closed: make retried writes safe to repeat. See [retrying](../../guide/errors#retrying).
+**Remedy:** retry the request, or prepare the statement again. A write that was in flight may have committed before the owner closed: make retried writes safe to repeat. See [retrying](https://stenhoor.github.io/smaltql/guide/errors#retrying).
 
 ## SMALT_MISUSE
 
@@ -253,7 +253,7 @@ Low-level engine classes (pager, b-tree, VFS) raise it for invalid calls as well
 
 ## SMALT_PLUGIN_MISSING
 
-A statement or a plugin call needs a [plugin](../../guide/plugins) the engine does not have. The message names smaltdb's plugin for the feature when there is one:
+A statement or a plugin call needs a [plugin](https://stenhoor.github.io/smaltql/guide/plugins) the engine does not have. The message names smaltdb's plugin for the feature when there is one:
 
 - a format: `read_parquet('file:x.parquet'): the parquet format needs the @smaltdb/parquet plugin (install it and add it to the engine's plugins)`;
 - a source: `read_csv('file:x.csv'): reading file:x.csv needs the @smaltdb/external plugin (…)`, or `reading the path 'data/x.csv'` for a local path;
@@ -263,11 +263,11 @@ A statement or a plugin call needs a [plugin](../../guide/plugins) the engine do
 
 It is raised when a statement is planned or run, or when a plugin method is called, never when a database is opened. External tables and connections created with a plugin stay in the catalog without it.
 
-**Remedy:** install the plugin and add it to the engine: `serve({ plugins: [...] })` in the engine worker entry, with `worker: () => new Worker(new URL('./db-worker.ts', import.meta.url), { type: 'module' })` in `open()`, or `Database.openMemory({ plugins })` / `Database.open(…, { plugins })` with `smaltdb/engine`. See [plugins](../../guide/plugins).
+**Remedy:** install the plugin and add it to the engine: `serve({ plugins: [...] })` in the engine worker entry, with `worker: () => new Worker(new URL('./db-worker.ts', import.meta.url), { type: 'module' })` in `open()`, or `Database.openMemory({ plugins })` / `Database.open(…, { plugins })` with `smaltdb/engine`. See [plugins](https://stenhoor.github.io/smaltql/guide/plugins).
 
 ## SMALT_EXTERNAL
 
-Reading [external data](../../guide/external-data) failed. Plugins raise it: a format or source plugin that throws a plain `Error` is reported as `SMALT_EXTERNAL` (see [Writing plugins](./plugins#errors)). The message starts with the source (`read_csv('file:x.csv'): …`, a URL, an external table) and says why: no file registered under that name, an HTTP error, a network failure, a file that does not parse, a missing optional package (`this file uses a codec that needs the hyparquet-compressors package`), or credentials that could not be obtained (a credentials callback that failed, did not answer within 30 seconds, or whose tab closed).
+Reading [external data](https://stenhoor.github.io/smaltql/guide/external-data) failed. Plugins raise it: a format or source plugin that throws a plain `Error` is reported as `SMALT_EXTERNAL` (see [Writing plugins](./plugins#errors)). The message starts with the source (`read_csv('file:x.csv'): …`, a URL, an external table) and says why: no file registered under that name, an HTTP error, a network failure, a file that does not parse, a missing optional package (`this file uses a codec that needs the hyparquet-compressors package`), or credentials that could not be obtained (a credentials callback that failed, did not answer within 30 seconds, or whose tab closed).
 
 **Remedy:** depends on the cause. Network and HTTP errors are often temporary and can be retried.
 
@@ -320,7 +320,7 @@ A write reached a read-only snapshot (`attempt to write a read-only snapshot`). 
 
 Client only. The engine worker raised an error event: it failed to load (a wrong `worker` URL, a script that is not the smaltdb worker, a blocked module worker) or crashed. All pending requests reject with this code.
 
-**Remedy:** check the browser console and the [worker setup](../../guide/getting-started#loading-the-engine-worker). Open the database again.
+**Remedy:** check the browser console and the [worker setup](https://stenhoor.github.io/smaltql/guide/getting-started#loading-the-engine-worker). Open the database again.
 
 ## SMALT_INTERNAL
 

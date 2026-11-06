@@ -15,8 +15,8 @@
  ┌──────────────────── Engine (Dedicated Worker) ─────────────────┐
  │  Session manager ─ Transaction manager ─ Lock manager          │
  │        │                                                       │
- │  SQL front-end:  Lexer → Parser → AST rewrites                 │
- │        │         (views, subqueries, materialized views)       │
+ │  Language (smaltql for SQL): Lexer → Parser → plans            │
+ │        │         (registered; views kept as their source)      │
  │  Planner: names, types, costing, joins, access paths → ops     │
  │        │            ▲ statistics, catalog                      │
  │  Executor: pull operators over a register file, fused codegen  │
@@ -37,10 +37,10 @@
 |---|---|
 | **Client API** | Thin library on the main thread or another worker. Serializes requests and streams results back as columnar batches using transferable `ArrayBuffer`s. |
 | **Session manager** | One session per connection. Holds the prepared-statement cache, transaction state, and settings. |
-| **Languages** | A language (SQL is the only one so far) parses its source and binds it to plans; the engine never reads its syntax. Languages register with the engine (`registerLanguage`), which keeps views and stored objects as their language's source ([ADR 0015](adr/0015-smaltql.md)). The SQL language (`sql/`) reaches the engine only through `language-support.ts`, and engine code does not import it; smaltdb's entry points register it. |
-| **Lexer / Parser** | Hand-written recursive-descent parser with Pratt parsing for expressions. Produces an AST. No parser generator, which keeps the bundle small and the parser fast. |
-| **Rewrites** | View/subquery flattening rewrites the parser's output (`sql/frontend/flatten.ts`); materialized-view matching rewrites plans (`exec/plan-mv-match.ts`). |
-| **Planner** | The SQL front end (`sql/frontend/select.ts`) resolves names against the catalog, infers types, expands `*` and makes SQL's rules explicit in a positional plan ([ADR 0014](adr/0014-shared-plan-layer.md)); the physical planner (`exec/planner.ts`) decorrelates subqueries, chooses join order and access paths by cost, and builds operators. Writes and a few SELECTs still go from the AST to operators in one pass. See [QUERY_ENGINE.md](QUERY_ENGINE.md). |
+| **Languages** | A language parses its source and binds it to plans; the engine never reads its syntax and carries none. Languages register with the engine (`registerLanguage`, or a worker's `defineWorker`), which keeps views and stored objects as their language's source ([ADR 0015](adr/0015-smaltql.md)). SQL is [smaltql](https://github.com/stenhoor/smaltql), which reaches the engine only through `smaltdb/language` (`language-support.ts`). |
+| **Lexer / Parser** | smaltql's: a hand-written recursive-descent parser with Pratt parsing for expressions. |
+| **Rewrites** | View/subquery flattening rewrites SQL's parse tree (in smaltql); materialized-view matching rewrites plans (`exec/plan-mv-match.ts`). |
+| **Planner** | A language's front end (SQL's in smaltql) resolves names against the catalog, infers types, expands `*` and makes SQL's rules explicit in a positional plan ([ADR 0014](adr/0014-shared-plan-layer.md)); the physical planner (`exec/planner.ts`) decorrelates subqueries, chooses join order and access paths by cost, and builds operators. Writes and a few SELECTs still go from the AST to operators in one pass. See [QUERY_ENGINE.md](QUERY_ENGINE.md). |
 | **Executor** | Vectorized operators that process batches of about 1024 rows held in typed arrays. Expressions compile to specialized JS closures, or to generated code if CSP allows it **[Q-9]**. |
 | **Catalog** | System tables stored in the database itself, holding each object's language-neutral definition beside its source text ([STORAGE_FORMAT.md](STORAGE_FORMAT.md)): opening a database parses nothing. `information_schema` and `sqlite_schema` are views over the catalog. |
 | **Statistics** | Row counts, NDV sketches (HyperLogLog), histograms, and min/max per column. Updated by `ANALYZE` and incrementally on write. |
@@ -82,9 +82,7 @@ src/
   engine/
     vfs/              Vfs interface, MemoryVfs, OpfsVfs, capability detection
     storage/          pager, WAL, B-trees, key codec, record format, columnar segments, CRC-32C
-    sql/              the SQL language: lexer, parser, AST; frontend/: binding statements and expressions to plans, view
-                      flattening, DDL, source editing for ALTER; register.ts registers it
-    language-support.ts  what a language reaches in the engine (sql/ imports nothing else of the engine)
+    language-support.ts  what a language reaches in the engine (`smaltdb/language`); the engine carries no language
     exec/             planner, rewrites (plan-mv-match, plan-morsel, plan-normalize), operators, expression
                       compiler, code generation, functions, window, spill, statistics, writes
     catalog/          schema, stored definitions, information_schema

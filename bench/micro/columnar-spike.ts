@@ -3,7 +3,7 @@
 // workload plus a clustered "ts" column; both engines in memory, Node.
 //   npx tsx bench/micro/columnar-spike.ts [rows]
 import { Database } from '../../src/engine/database.js';
-import '../../src/engine/sql/register.js';
+import 'smaltql/register';
 import { MemoryVfs } from '../../src/engine/vfs/memory.js';
 import { analyticRow } from '../browser/adapter.js';
 

@@ -46,12 +46,9 @@ export default defineConfig({
     logo: { light: '/lockup.svg', dark: '/lockup-on-dark.svg', alt: 'smaltdb' },
     siteTitle: false,
     nav: [
-      { text: 'Guide', link: '/guide/getting-started' },
-      { text: 'SQL', link: '/reference/sql/' },
-      { text: 'Functions', link: '/reference/functions/' },
       { text: 'Engine', link: '/reference/engine/' },
-      { text: 'API', link: '/reference/api/client' },
-      { text: 'FAQ', link: '/guide/faq' },
+      { text: 'API', link: '/reference/api/engine' },
+      { text: 'SQL (smaltql)', link: 'https://stenhoor.github.io/smaltql/' },
       {
         text: 'Internals',
         items: [
@@ -63,71 +60,7 @@ export default defineConfig({
     ],
     sidebar: [
       {
-        text: 'Getting started',
-        items: [
-          { text: 'Installation', link: '/guide/getting-started' },
-          { text: 'Quick start', link: '/guide/quick-start' },
-          { text: 'FAQ', link: '/guide/faq' },
-        ],
-      },
-      {
-        text: 'User guide',
-        items: [
-          { text: 'Databases', link: '/guide/databases' },
-          { text: 'Queries', link: '/guide/queries' },
-          { text: 'Transactions', link: '/guide/transactions' },
-          { text: 'Tables and schema', link: '/guide/schema' },
-          { text: 'Indexes and performance', link: '/guide/indexes-and-performance' },
-          { text: 'Views and materialized views', link: '/guide/views-and-materialized-views' },
-          { text: 'Analytics', link: '/guide/analytics' },
-          { text: 'Import and export', link: '/guide/import-export' },
-          { text: 'External data', link: '/guide/external-data' },
-          { text: 'Plugins', link: '/guide/plugins' },
-          { text: 'Introspection', link: '/guide/introspection' },
-          { text: 'Errors', link: '/guide/errors' },
-          { text: 'Differences from SQLite', link: '/guide/sqlite-differences' },
-        ],
-      },
-      {
-        text: 'SQL reference',
-        collapsed: true,
-        items: [
-          { text: 'Overview', link: '/reference/sql/' },
-          { text: 'SELECT', link: '/reference/sql/select' },
-          { text: 'INSERT', link: '/reference/sql/insert' },
-          { text: 'UPDATE', link: '/reference/sql/update' },
-          { text: 'DELETE', link: '/reference/sql/delete' },
-          { text: 'CREATE TABLE', link: '/reference/sql/create-table' },
-          { text: 'ALTER TABLE', link: '/reference/sql/alter-table' },
-          { text: 'DROP', link: '/reference/sql/drop' },
-          { text: 'CREATE INDEX', link: '/reference/sql/create-index' },
-          { text: 'Views', link: '/reference/sql/views' },
-          { text: 'External tables', link: '/reference/sql/external' },
-          { text: 'Transactions', link: '/reference/sql/transactions' },
-          { text: 'EXPLAIN and ANALYZE', link: '/reference/sql/explain' },
-          { text: 'PRAGMA', link: '/reference/sql/pragmas' },
-          { text: 'Expressions', link: '/reference/sql/expressions' },
-          { text: 'Data types', link: '/reference/sql/types' },
-          { text: 'information_schema', link: '/reference/sql/information-schema' },
-        ],
-      },
-      {
-        text: 'Functions',
-        collapsed: true,
-        items: [
-          { text: 'All functions', link: '/reference/functions/' },
-          { text: 'Scalar', link: '/reference/functions/scalar' },
-          { text: 'String', link: '/reference/functions/string' },
-          { text: 'Math', link: '/reference/functions/math' },
-          { text: 'Date and time', link: '/reference/functions/datetime' },
-          { text: 'Aggregate', link: '/reference/functions/aggregate' },
-          { text: 'Window', link: '/reference/functions/window' },
-          { text: 'Table-valued', link: '/reference/functions/table-valued' },
-        ],
-      },
-      {
         text: 'Engine',
-        collapsed: true,
         items: [
           { text: 'Overview', link: '/reference/engine/' },
           { text: 'The plan format', link: '/reference/engine/plans' },
@@ -138,12 +71,19 @@ export default defineConfig({
       },
       {
         text: 'API reference',
-        collapsed: true,
         items: [
-          { text: 'Client (smaltdb)', link: '/reference/api/client' },
           { text: 'Engine (smaltdb/engine)', link: '/reference/api/engine' },
           { text: 'Writing plugins', link: '/reference/api/plugins' },
           { text: 'Error codes', link: '/reference/api/errors' },
+          { text: 'Client (smaltql docs)', link: 'https://stenhoor.github.io/smaltql/reference/api/client' },
+        ],
+      },
+      {
+        text: 'SQL (smaltql docs)',
+        items: [
+          { text: 'Getting started', link: 'https://stenhoor.github.io/smaltql/guide/getting-started' },
+          { text: 'SQL reference', link: 'https://stenhoor.github.io/smaltql/reference/sql/' },
+          { text: 'Functions', link: 'https://stenhoor.github.io/smaltql/reference/functions/' },
         ],
       },
       {

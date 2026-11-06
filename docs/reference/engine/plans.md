@@ -66,7 +66,7 @@ without one). The condition reads input 0 (the left side) and input 1 (the right
 
 **Aggregates.** `keys` are `{ expr, collation }`. Each call (`AggCall`) is
 `{ fn, args, star, distinct, filter?, collation, type }`: `fn` names an aggregate function (`count`, `sum`, `avg`,
-`min`, `max`, `group_concat`, `total`, and the [others](../functions/aggregate)); `star` is `count(*)`. `carry` passes
+`min`, `max`, `group_concat`, `total`, and the [others](https://stenhoor.github.io/smaltql/reference/functions/aggregate)); `star` is `count(*)`. `carry` passes
 input columns through, taken from one row of each group (SQL's bare columns). With no keys, an aggregate gives one row,
 also over no input rows.
 
@@ -104,7 +104,7 @@ integer primary key, `null` any).
 A `call` names a registered function. The validator checks it exists and accepts that many arguments.
 
 **Named functions** are the engine's built-in scalar functions, the same names and behaviour as in the
-[functions reference](../functions/): `upper`, `abs`, `round`, `substr`, `coalesce`, `json_extract`, `date`, …, and
+[functions reference](https://stenhoor.github.io/smaltql/reference/functions/): `upper`, `abs`, `round`, `substr`, `coalesce`, `json_extract`, `date`, …, and
 any a plugin registers.
 
 **`sql.*` functions** give the operations whose meaning languages differ on the meaning SQLite gives them. A language

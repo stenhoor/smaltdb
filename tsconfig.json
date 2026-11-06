@@ -17,6 +17,7 @@
       "smaltdb": ["./src/client/index.ts"],
       "smaltdb/engine": ["./src/engine/index.ts"],
       "smaltdb/plan": ["./src/engine/plan/portable.ts"],
+      "smaltdb/language": ["./src/engine/language-support.ts"],
       "smaltdb/worker-runtime": ["./src/engine/worker-runtime.ts"]
     }
   },

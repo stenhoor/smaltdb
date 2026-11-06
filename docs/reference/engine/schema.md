@@ -61,6 +61,7 @@ partial index.
 
 ```ts
 import { Database, type plan } from 'smaltdb/engine';
+import 'smaltql/register';
 
 const db = Database.openMemory();
 db.exec('CREATE TABLE fruit(id INTEGER PRIMARY KEY, name TEXT, qty INT)');

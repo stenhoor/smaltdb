@@ -5,7 +5,7 @@
 //     --external:@sqlite.org/sqlite-wasm && node .cache/window-bench.mjs 100000
 import sqliteInit from '@sqlite.org/sqlite-wasm';
 import { Database } from '../../src/engine/database.js';
-import '../../src/engine/sql/register.js';
+import 'smaltql/register';
 import { MemoryVfs } from '../../src/engine/vfs/memory.js';
 
 const N = Number(process.argv[2] ?? 100_000);

@@ -61,6 +61,7 @@ An example: a language whose whole syntax is `table.column`, meaning that column
 
 ```ts
 import { Collation, Database, plan as p, registerLanguage, type SmaltLanguage } from 'smaltdb/engine';
+import 'smaltql/register';
 
 const unchanged = (text: string): string => text;
 const dotted: SmaltLanguage = {

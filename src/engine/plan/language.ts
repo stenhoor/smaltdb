@@ -5,7 +5,8 @@
  * of them.
  *
  * Languages register with the engine (`registerLanguage`); engine code never imports one. smaltdb's entry points
- * register SQL (sql/register.ts) until SQL is its own package (ADR 0015 step 9).
+ * The engine carries none: SQL is smaltql's, which registers itself (`import 'smaltql/register'`) or through a worker
+ * entry (`defineWorker({ languages })`), ADR 0015.
  */
 import type { TableSchema } from '../catalog/schema.js';
 import type { SqlValue } from '../values.js';
