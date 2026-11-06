@@ -8,7 +8,7 @@
  */
 import type { SqlValue } from '../values.js';
 import { call, col, lit, param, type PlanExpr, typeOf } from './expr.js';
-import type { AggCall, ConflictAction, JoinKind, PlanOp, SortKey, ValueColumn } from './ops.js';
+import type { AggCall, ConflictAction, JoinKind, PlanOp, SortKey, ValueColumn, WindowCall, WindowFrame } from './ops.js';
 import type { CollationName, PlanType } from './types.js';
 
 type Op<K extends PlanOp['op']> = Extract<PlanOp, { op: K }>;
@@ -148,6 +148,85 @@ export const distinct = (input: PlanOp, width: number, collations?: readonly Col
 });
 /** A set operation of two inputs with `width` columns each. */
 export const setop = (kind: Op<'setop'>['kind'], left: PlanOp, right: PlanOp, width: number, collations?: readonly CollationName[]): Op<'setop'> => ({ op: 'setop', kind, inputs: [left, right], collations: collations ?? Array<CollationName>(width).fill('binary') });
+
+// ------------------------------------------------------------------ windows
+
+/** A frame bound: `unboundedPreceding`, `preceding(n)`, `currentRow`, `following(n)`, `unboundedFollowing`. */
+export type FrameBound = WindowFrame['start'];
+export const unboundedPreceding: FrameBound = { kind: 'unboundedPreceding' };
+export const currentRow: FrameBound = { kind: 'currentRow' };
+export const unboundedFollowing: FrameBound = { kind: 'unboundedFollowing' };
+export const preceding = (offset: PlanExpr | number): FrameBound => ({ kind: 'preceding', offset: expr(offset) });
+export const following = (offset: PlanExpr | number): FrameBound => ({ kind: 'following', offset: expr(offset) });
+/** A window frame: its unit, bounds and exclusion. */
+export const frame = (unit: WindowFrame['unit'], start: FrameBound, end: FrameBound, exclude: WindowFrame['exclude'] = 'NO OTHERS'): WindowFrame => ({ unit, start, end, exclude });
+
+/** A window call: a ranking or navigation function, or an aggregate over the frame. */
+export const windowCall = (fn: string, args: readonly PlanExpr[], type: PlanType, options: { star?: boolean; filter?: PlanExpr; collation?: CollationName; ignoreNulls?: boolean } = {}): WindowCall => ({
+  fn,
+  args,
+  star: options.star ?? false,
+  type,
+  collation: options.collation ?? 'binary',
+  ...(options.filter ? { filter: options.filter } : {}),
+  ...(options.ignoreNulls ? { ignoreNulls: true } : {}),
+});
+
+/**
+ * The window `calls` over `input`: its columns, then one per call. Rows are grouped by `partition` and ordered by
+ * `order` within it; the frame defaults to the partition's rows up to the current row and its peers (the whole
+ * partition without an order).
+ */
+export const window = (
+  input: PlanOp,
+  calls: readonly WindowCall[],
+  options: { partition?: readonly PlanExpr[]; collations?: readonly CollationName[]; order?: readonly SortKey[]; frame?: WindowFrame } = {},
+): Op<'window'> => ({
+  op: 'window',
+  input,
+  partition: (options.partition ?? []).map((e, i) => ({ expr: e, collation: options.collations?.[i] ?? 'binary' })),
+  order: options.order ?? [],
+  frame: options.frame ?? frame('RANGE', unboundedPreceding, currentRow),
+  calls,
+});
+
+// ------------------------------------------------------------------ sources and recursion
+
+/** Rows of a table function, a virtual table or an external table: `types` describes each of its columns. */
+export const source = (kind: Op<'source'>['kind'], name: string, args: readonly PlanExpr[], types: readonly PlanType[], options: { schema?: string; named?: Readonly<Record<string, PlanExpr>> } = {}): Op<'source'> => ({
+  op: 'source',
+  kind,
+  name,
+  args,
+  types,
+  ...(options.schema !== undefined ? { schema: options.schema } : {}),
+  ...(options.named ? { named: options.named } : {}),
+});
+
+/**
+ * Recursion: `init`'s rows, then each step's over the rows the previous one gave (read with `working(id, types)`),
+ * until a step gives none. `distinct` drops rows already given (by `collations`).
+ */
+export const iterate = (
+  id: number,
+  name: string,
+  init: PlanOp,
+  steps: readonly PlanOp[],
+  options: { distinct?: boolean; collations?: readonly CollationName[]; order?: readonly SortKey[]; limit?: PlanExpr | number; offset?: PlanExpr | number } = {},
+): Op<'iterate'> => ({
+  op: 'iterate',
+  id,
+  name,
+  init,
+  steps,
+  distinct: options.distinct ?? false,
+  collations: options.collations ?? [],
+  ...(options.order ? { order: options.order } : {}),
+  ...(options.limit !== undefined ? { limit: expr(options.limit) } : {}),
+  ...(options.offset !== undefined ? { offset: expr(options.offset) } : {}),
+});
+/** Inside `iterate` `id`: the rows the previous step gave. */
+export const working = (id: number, types: readonly PlanType[]): Op<'working'> => ({ op: 'working', id, types });
 
 /** Rows of `input` appended to `table`, its columns assigned to the table's `columns` (-1: the rowid). */
 export const append = (table: string, input: PlanOp | null, columns: readonly number[], options: { db?: 'main' | 'temp'; onConflict?: ConflictAction; returning?: readonly PlanExpr[] } = {}): Op<'append'> => ({
