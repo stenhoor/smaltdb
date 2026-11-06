@@ -306,8 +306,8 @@ function keyEquals(t: TableSchema, c: number, at: number, paramIndex: number): P
   const p = param(paramIndex);
   const coll = comparisonCollation(operand, { type: 'any', collation: 0, collSrc: CollSrc.None, affinity: 'NONE' });
   const [, conv] = comparisonConverters(operand, { type: 'any', collation: 0, collSrc: CollSrc.None, affinity: 'NONE' });
-  const right = conv === null ? p : call(conv === applyNumericAffinity ? 'sql.affinity_numeric' : 'sql.affinity_text', [p], 'any');
-  return call('sql.eq', [e, right], 'int', collationName(coll));
+  const right = conv === null ? p : call(conv === applyNumericAffinity ? 'affinity_numeric' : 'affinity_text', [p], 'any');
+  return call('cmp_eq', [e, right], 'int', collationName(coll));
 }
 
 /** The rows of `t` whose `cols` equal parameters 0.., as a filter over a scan of `columns` of `t` (`at` maps). */

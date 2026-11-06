@@ -255,7 +255,7 @@ function rollUp(q: Shape, v: Shape, view: PlanMatview): PlanOp | null {
         const s = col('total');
         const n = col('count');
         if (s === undefined || n === undefined) return null;
-        outputs.push({ k: 'call', fn: 'sql.div', args: [out('total', s, 'real'), out('sum', n, 'int')], type: 'real' });
+        outputs.push({ k: 'call', fn: 'div_trunc', args: [out('total', s, 'real'), out('sum', n, 'int')], type: 'real' });
         break;
       }
       default:

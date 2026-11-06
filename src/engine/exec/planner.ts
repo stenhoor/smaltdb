@@ -34,6 +34,7 @@ import { type ColumnarHelpers, type FusedAggSpec, type FusedHelpers, type Pipeli
 import { CODEGEN_HELPERS_FOR_FUSION } from './expr.js';
 import { getMeta, isFlattened, isOpaque, setMeta } from './sql-meta.js';
 import { type CompareOp, traitsOf, withoutComparisonConversion } from './traits.js';
+import { isEngineOperation } from './sql-functions.js';
 import { printExpr } from '../plan/print.js';
 import type { Frame } from '../storage/pager.js';
 import { PH_RIGHT } from '../storage/format.js';
@@ -1906,8 +1907,8 @@ export class Planner {
               return;
             }
             case 'call': {
-              const f = x.fn.startsWith('sql.') ? undefined : scalarFunctions.get(x.fn);
-              if (!x.fn.startsWith('sql.') && (!f || !f.deterministic)) ok = false;
+              const f = isEngineOperation(x.fn) ? undefined : scalarFunctions.get(x.fn);
+              if (!isEngineOperation(x.fn) && (!f || !f.deterministic)) ok = false;
               else x.args.forEach(visit);
               return;
             }

@@ -10,8 +10,8 @@ Three rules run through the format:
 - **Columns are positions.** An expression reads column `index` of input `input` of the operation that owns it
   (`col(0, 2, …)`), never a name. Each operation's output columns are defined below.
 - **Nothing is implicit.** Every value has a static type, every comparison, sort and grouping names its collation, and
-  every conversion is an explicit cast or function call. Behaviour that differs between languages lives in named
-  functions (SQL's are the `sql.*` functions below).
+  every conversion is an explicit cast or function call. Behaviour that differs between languages lives in the
+  engine's operations, named for what they do (below): a language picks the ones that give its meaning.
 - **NULL is three-valued.** Predicates are integers: 1 true, 0 false, NULL unknown. A filter keeps the rows where its
   predicate is 1.
 
@@ -91,7 +91,7 @@ integer primary key, `null` any).
 | `lit` | `value`, `type` | a constant |
 | `param` | `index`, `type` | positional parameter `index` (0-based) |
 | `call` | `fn`, `args`, `type`, `collation?` | a function; `collation` is the rule a comparison-like function compares text by |
-| `cast` | `fn`, `to`, `arg` | a conversion, `fn` naming it (`sql.cast_integer`, …) |
+| `cast` | `fn`, `to`, `arg` | a conversion, `fn` naming it (`cast_integer`, …) |
 | `and`, `or` | `args` | three-valued logic |
 | `not` | `arg` | three-valued NOT |
 | `isNull` | `arg`, `not` | 1 when `arg` is NULL (`not`: when it is not), never NULL |
@@ -107,22 +107,27 @@ A `call` names a registered function. The validator checks it exists and accepts
 [functions reference](https://stenhoor.github.io/smaltql/reference/functions/): `upper`, `abs`, `round`, `substr`, `coalesce`, `json_extract`, `date`, …, and
 any a plugin registers.
 
-**`sql.*` functions** give the operations whose meaning languages differ on the meaning SQLite gives them. A language
-with other rules uses other functions.
+**Operations** are the engine's own arithmetic, comparisons and conversions, named for what they do
+([ADR 0016](../../adr/0016-plan-api-for-every-language.md)). The planner and code generation recognise them by the
+traits they declare (a comparison, a constant offset, an inline form), not by their names. Each also answers to its
+former `sql.*` name, which stays as an alias until smaltql uses the behaviour names.
 
-| Function | Arguments | Meaning |
-|---|---|---|
-| `sql.eq`, `sql.ne`, `sql.lt`, `sql.le`, `sql.gt`, `sql.ge` | 2 | Comparison in SQLite's storage-class order (NULL < numbers < text < blobs); NULL if either side is NULL. Text compares by the call's `collation`. |
-| `sql.is`, `sql.is_not` | 2 | Comparison where NULL equals NULL; never NULL |
-| `sql.add`, `sql.sub`, `sql.mul`, `sql.div`, `sql.mod` | 2 | Arithmetic: integer overflow becomes REAL, integer division truncates, division by zero is NULL |
-| `sql.neg` | 1 | Negation |
-| `sql.bitand`, `sql.bitor`, `sql.shl`, `sql.shr`, `sql.bitnot` | 2 (`bitnot`: 1) | Bit operations on 64-bit integers |
-| `sql.not` | 1 | Truth-value NOT of any value |
-| `sql.concat` | 2 | Text concatenation (`\|\|`) |
-| `sql.like`, `sql.glob` | 2 or 3 | `value`, `pattern`, optional escape character |
-| `sql.in_list` | 2 or more | Whether the first argument equals one of the others: 1, 0 or NULL |
-| `sql.cast_integer`, `sql.cast_real`, `sql.cast_text`, `sql.cast_blob`, `sql.cast_numeric` | 1 | SQLite's CAST |
-| `sql.affinity_numeric`, `sql.affinity_text` | 1 | The conversion SQLite applies to a comparison operand of that affinity |
+| Operation | Former name | Arguments | Meaning |
+|---|---|---|---|
+| `cmp_eq`, `cmp_ne`, `cmp_lt`, `cmp_le`, `cmp_gt`, `cmp_ge` | `sql.eq`, `sql.ne`, `sql.lt`, `sql.le`, `sql.gt`, `sql.ge` | 2 | Comparison in SQLite's storage-class order (NULL < numbers < text < blobs); NULL if either side is NULL. Text compares by the call's `collation`. |
+| `cmp_is`, `cmp_is_not` | `sql.is`, `sql.is_not` | 2 | Comparison where NULL equals NULL; never NULL |
+| `add`, `sub`, `mul` | `sql.add`, `sql.sub`, `sql.mul` | 2 | Arithmetic; integer overflow becomes REAL, text converts by its numeric prefix |
+| `div_trunc` | `sql.div` | 2 | Division: two integers divide truncating toward zero, a REAL operand gives REAL division; division by zero is NULL |
+| `mod_trunc` | `sql.mod` | 2 | Remainder with the sign of the dividend; by zero is NULL |
+| `neg` | `sql.neg` | 1 | Negation |
+| `bit_and`, `bit_or`, `shift_left`, `shift_right`, `bit_not` | `sql.bitand`, `sql.bitor`, `sql.shl`, `sql.shr`, `sql.bitnot` | 2 (`bit_not`: 1) | Bit operations on 64-bit integers |
+| `truth_not` | `sql.not` | 1 | Truth-value NOT of any value |
+| `text_concat` | `sql.concat` | 2 | Text concatenation; NULL if either side is NULL |
+| `like`, `glob` | `sql.like`, `sql.glob` | 2 or 3 | `value`, `pattern`, optional escape character |
+| `in_list` | `sql.in_list` | 2 or more | Whether the first argument equals one of the others: 1, 0 or NULL |
+| `cast_integer`, `cast_real`, `cast_text`, `cast_blob`, `cast_numeric` | `sql.cast_*` | 1 | SQLite's CAST |
+| `affinity_numeric`, `affinity_text` | `sql.affinity_*` | 1 | The conversion SQLite applies to a comparison operand of that affinity |
+| `current_date`, `current_time`, `current_timestamp` | `sql.current_*` | 0 | The statement's date and time as text |
 
 **Aggregate and window functions** are named the same way (`sum`, `rank`, …) in `AggCall` and `WindowCall`.
 
@@ -144,7 +149,7 @@ NULLs first). They check nothing: the engine validates every plan it is given, b
 import { plan as p } from 'smaltdb/engine';
 
 // SELECT f.name, sum(o.n), count(*) FROM fruit f JOIN orders o ON o.fruit = f.id GROUP BY f.name
-const joined = p.join('inner', p.scan('fruit', [0, 1]), p.scan('orders', [1, 2]), p.call('sql.eq', [p.col(0, 0, 'int'), p.col(1, 0, 'int')], 'int'));
+const joined = p.join('inner', p.scan('fruit', [0, 1]), p.scan('orders', [1, 2]), p.call('cmp_eq', [p.col(0, 0, 'int'), p.col(1, 0, 'int')], 'int'));
 // The join's output: fruit.id, fruit.name, orders.fruit, orders.n
 const totals = p.aggregate(joined, [p.col(0, 1, 'text')], [p.agg('sum', [p.col(0, 3, 'int')], 'int'), p.agg('count', [], 'int', { star: true })]);
 ```

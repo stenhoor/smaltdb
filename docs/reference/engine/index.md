@@ -69,7 +69,7 @@ db.queryPlan({ kind: 'write', plan: p.append('fruit', rows, [1, 2]) });
 
 // SELECT name FROM fruit WHERE qty > ? ORDER BY qty DESC
 const qty = p.col(0, 2, 'int');
-const query = p.project(p.sort(p.filter(p.scan('fruit', [0, 1, 2]), p.call('sql.gt', [qty, p.param(0, 'int')], 'int')), [p.desc(qty)]), [p.col(0, 1, 'text')]);
+const query = p.project(p.sort(p.filter(p.scan('fruit', [0, 1, 2]), p.call('cmp_gt', [qty, p.param(0, 'int')], 'int')), [p.desc(qty)]), [p.col(0, 1, 'text')]);
 console.log(db.queryPlan({ kind: 'query', plan: query, columns: [{ name: 'name', type: 'text' }] }, [4]).rows); // [['plum'], ['pear']]
 ```
 

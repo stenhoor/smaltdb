@@ -3,6 +3,7 @@ import type { CollationName } from '../plan/types.js';
 import type { SqlValue } from '../values.js';
 import { isOpaque } from './sql-meta.js';
 import { type InlineForm, traitsOf, withoutComparisonConversion } from './traits.js';
+import { isEngineOperation } from './sql-functions.js';
 import { type StaticType, truthy } from './convert.js';
 import { type InlineMath, type MathFunction, inlineMath, roundingType } from './math.js';
 
@@ -124,7 +125,7 @@ export function isCodegenRoot(e: BoundExpr): boolean {
 
 /** A call of a math function that generated code can emit inline. */
 function mathCall(e: BoundExpr): InlineMath | undefined {
-  if (e.k !== 'call' || e.fn.startsWith('sql.')) return undefined;
+  if (e.k !== 'call' || isEngineOperation(e.fn)) return undefined;
   return inlineMath(e.fn, e.args.length);
 }
 

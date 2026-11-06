@@ -161,7 +161,7 @@ export function planMorsels(plan: PlanOp, paramCount: number, eligible: (table: 
   const columns = rowidAt >= 0 ? scan.columns : [...scan.columns, -1];
   const rowid: PlanExpr = col(rowidAt >= 0 ? rowidAt : scan.columns.length, 'int');
   const bound = (fn: string, p: number): PlanExpr => ({ k: 'call', fn, args: [rowid, { k: 'param', index: p, type: 'int' }], type: 'int', collation: 'binary' });
-  const range: PlanExpr[] = [bound('sql.ge', paramCount), bound('sql.lt', paramCount + 1)];
+  const range: PlanExpr[] = [bound('cmp_ge', paramCount), bound('cmp_lt', paramCount + 1)];
   const pred = [where, ...range].filter((x): x is PlanExpr => x !== undefined).reduce((x, y) => ({ k: 'and', args: [x, y] }));
   const partialAgg = copy(a, { input: { op: 'filter', input: copy(scan, { columns }), pred }, aggs: partials, carry: [] });
   // A query's root is a projection (the planner plans results from one).
@@ -182,7 +182,7 @@ export function planMorsels(plan: PlanOp, paramCount: number, eligible: (table: 
         outputs.push({ k: 'call', fn: 'coalesce', args: [merged('sum', p.cols[0], 'int'), { k: 'lit', value: 0, type: 'int' }], type: 'int' });
         break;
       case 'avg':
-        outputs.push({ k: 'call', fn: 'sql.div', args: [merged('total', p.cols[0], 'real'), merged('sum', p.cols[1], 'int')], type: 'real' });
+        outputs.push({ k: 'call', fn: 'div_trunc', args: [merged('total', p.cols[0], 'real'), merged('sum', p.cols[1], 'int')], type: 'real' });
         break;
       default:
         outputs.push(merged(p.fn, p.cols[0], c.type));

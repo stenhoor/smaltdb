@@ -11,7 +11,7 @@ import {
   truthy,
 } from './convert.js';
 import { currentTimeText } from './datetime.js';
-import { ARITHMETIC_FUNCTIONS, BITWISE_FUNCTIONS, COMPARISON_FUNCTIONS, arithImpl, negate, sqlFunction } from './sql-functions.js';
+import { ARITHMETIC_FUNCTIONS, BITWISE_FUNCTIONS, COMPARISON_FUNCTIONS, arithImpl, canonicalName, isEngineOperation, negate, sqlFunction } from './sql-functions.js';
 import { type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type CodegenHelpers, type FallbackNode, codegenEnabled, generate, generatedType, isCodegenRoot } from './codegen.js';
 import { WINDOW_ARITY } from './window.js';
@@ -68,7 +68,7 @@ function fold(c: Compiled): Compiled {
 /** Compile a bound expression: generated code for arithmetic / comparison / logic roots, otherwise closures. */
 export function compileBoundExpr(b: BoundExpr, ctx: FunctionContext): Compiled {
   if (!codegenEnabled() || !isCodegenRoot(b)) return compilePlanExpr(b, ctx);
-  if (b.k === 'call' && !b.fn.startsWith('sql.')) {
+  if (b.k === 'call' && !isEngineOperation(b.fn)) {
     // A math call: keep the closure compiler's result when it is constant (folded) or a register read.
     const c = compilePlanExpr(b, ctx);
     if (c.constant || c.reg !== undefined) return c;
@@ -83,7 +83,7 @@ export function compileBoundExpr(b: BoundExpr, ctx: FunctionContext): Compiled {
  */
 export function boundMetadata(b: BoundExpr, ctx: FunctionContext): Pick<Compiled, 'type' | 'collation' | 'collSrc' | 'affinity'> {
   if (!codegenEnabled() || !isCodegenRoot(b)) return compilePlanExpr(b, ctx);
-  if (b.k === 'call' && !b.fn.startsWith('sql.')) {
+  if (b.k === 'call' && !isEngineOperation(b.fn)) {
     const c = compilePlanExpr(b, ctx);
     if (c.constant || c.reg !== undefined) return c;
   }
@@ -140,7 +140,7 @@ export function withMeta<T extends BoundExpr>(e: T, m: SqlMeta): T {
 
 export const metaOf = (e: BoundExpr): SqlMeta => getMeta(e) ?? NO_META;
 
-const AFFINITY_CALLS = new Set(['sql.affinity_numeric', 'sql.affinity_text']);
+const AFFINITY_CALLS = new Set(['affinity_numeric', 'affinity_text']);
 
 /** Compile a bound expression to a closure, with its SQL metadata. */
 export function compilePlanExpr(e: BoundExpr, ctx: FunctionContext): Compiled {
@@ -172,7 +172,7 @@ function compileBound(e: BoundExpr, ctx: FunctionContext): Compiled {
     case 'not': {
       const a = e.arg;
       // NOT LIKE, NOT GLOB and NOT IN compile to one closure, as their own forms.
-      if (a.k === 'call' && (a.fn === 'sql.like' || a.fn === 'sql.glob' || a.fn === 'sql.in_list')) return compileSqlCall(a, ctx, true);
+      if (a.k === 'call' && ['like', 'glob', 'in_list'].includes(canonicalName(a.fn))) return compileSqlCall(a, ctx, true);
       return compileUnary('NOT', sub(a));
     }
     case 'and':
@@ -193,7 +193,7 @@ function compileBound(e: BoundExpr, ctx: FunctionContext): Compiled {
       return fold({ fn, type: e.to, collation: x.collation, collSrc: x.collSrc, affinity: 'NONE', constant: x.constant });
     }
     case 'call':
-      return e.fn.startsWith('sql.') ? compileSqlCall(e, ctx, false) : compileScalarCall(e, ctx);
+      return isEngineOperation(e.fn) ? compileSqlCall(e, ctx, false) : compileScalarCall(e, ctx);
     case 'subquery':
     case 'inSubquery': {
       // Plans from the SQL front end are not executed yet (ADR 0014, step 6): compiling one gives its static
@@ -212,33 +212,34 @@ function compileBound(e: BoundExpr, ctx: FunctionContext): Compiled {
 function compileSqlCall(e: Extract<BoundExpr, { k: 'call' }>, ctx: FunctionContext, negated: boolean): Compiled {
   const sub = (x: BoundExpr): Compiled => compilePlanExpr(x, ctx);
   const args = e.args;
-  switch (e.fn) {
-    case 'sql.in_list':
+  const name = canonicalName(e.fn);
+  switch (name) {
+    case 'in_list':
       return compileInList(negated, sub(args[0]), args.slice(1).map(sub));
-    case 'sql.like':
-    case 'sql.glob': {
+    case 'like':
+    case 'glob': {
       const [x, pat, esc] = args.map(sub);
       const { fn } = sqlFunction(e.fn).compile(esc ? [x, pat, esc] : [x, pat], { negated });
       return fold({ fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: x.constant && pat.constant && (esc?.constant ?? true) });
     }
-    case 'sql.current_date':
-    case 'sql.current_time':
-    case 'sql.current_timestamp': {
-      const kind = e.fn.slice(4) as 'current_date' | 'current_time' | 'current_timestamp';
+    case 'current_date':
+    case 'current_time':
+    case 'current_timestamp': {
+      const kind = name;
       return { fn: () => currentTimeText(kind, ctx.now()), type: 'text', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
     }
-    case 'sql.neg':
+    case 'neg':
       return compileUnary('-', sub(args[0]));
-    case 'sql.bitnot':
+    case 'bit_not':
       return compileUnary('~', sub(args[0]));
     default:
       if (e.collation !== undefined) {
         // A comparison: its operands' affinity conversions run inside its closure, after the NULL checks.
         const ops = args.map((x) => {
-          if (x.k === 'call' && AFFINITY_CALLS.has(x.fn)) {
+          if (x.k === 'call' && AFFINITY_CALLS.has(canonicalName(x.fn))) {
             const inner = sub(x.args[0]);
             const real = inner.type === 'real';
-            const convert = x.fn === 'sql.affinity_numeric' ? applyNumericAffinity : (v: SqlValue) => applyTextAffinity(v, real);
+            const convert = canonicalName(x.fn) === 'affinity_numeric' ? applyNumericAffinity : (v: SqlValue) => applyTextAffinity(v, real);
             return { c: inner, arg: { fn: inner.fn, type: inner.type, convert } };
           }
           const c = sub(x);
@@ -269,7 +270,7 @@ function regReader(reg: number): Fn {
 // ------------------------------------------------------------------ unary / logic
 
 function compileUnary(op: string, x: Compiled): Compiled {
-  const name = op === 'NOT' ? 'sql.not' : op === '-' ? 'sql.neg' : op === '~' ? 'sql.bitnot' : null;
+  const name = op === 'NOT' ? 'truth_not' : op === '-' ? 'neg' : op === '~' ? 'bit_not' : null;
   if (op === '+') {
     // Unary plus is a no-op that strips affinity and collation (SQLite).
     return fold({ ...x, affinity: 'NONE', collSrc: CollSrc.None, collation: Collation.Binary });
@@ -373,7 +374,7 @@ function comparison(op: string, a: Compiled, b: Compiled): Compiled {
 function compileInList(not: boolean, x: Compiled, list: Compiled[]): Compiled {
   const base = { type: 'int' as StaticType, collation: 0 as Collation, collSrc: CollSrc.None, affinity: 'NONE' as Affinity };
   if (list.length === 0) return konst(not ? 1 : 0, 'int');
-  const f = sqlFunction('sql.in_list');
+  const f = sqlFunction('in_list');
   // All-constant list: hash lookup with the probe's affinity and collation applied up front.
   if (list.every((c) => c.constant)) {
     const collation = x.collSrc !== CollSrc.None ? x.collation : Collation.Binary;
