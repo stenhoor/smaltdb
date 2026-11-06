@@ -37,12 +37,12 @@ const db = Database.openMemory();
 db.exec("CREATE TABLE fruit(id INTEGER PRIMARY KEY, name TEXT, qty INT); INSERT INTO fruit(name, qty) VALUES ('apple', 3), ('pear', 5), ('plum', 7)");
 
 // UPDATE fruit SET qty = qty + 1 WHERE name = 'PEAR' COLLATE NOCASE
-const pear = p.filter(p.scan('fruit', [-1, 1, 2]), p.call('sql.eq', [p.col(0, 1, 'text'), p.lit('PEAR')], 'int', 'nocase'));
-const add = db.preparePlan({ kind: 'write', plan: p.update('fruit', pear, 0, [{ column: 2, value: p.call('sql.add', [p.col(0, 2, 'int'), p.lit(1)], 'int') }]) });
+const pear = p.filter(p.scan('fruit', [-1, 1, 2]), p.call('cmp_eq', [p.col(0, 1, 'text'), p.lit('PEAR')], 'int', 'nocase'));
+const add = db.preparePlan({ kind: 'write', plan: p.update('fruit', pear, 0, [{ column: 2, value: p.call('add', [p.col(0, 2, 'int'), p.lit(1)], 'int') }]) });
 console.log(add.run().changes); // 1
 
 // DELETE FROM fruit WHERE qty > 6 RETURNING name
-const many = p.filter(p.scan('fruit', [-1, 2]), p.call('sql.gt', [p.col(0, 1, 'int'), p.lit(6)], 'int'));
+const many = p.filter(p.scan('fruit', [-1, 2]), p.call('cmp_gt', [p.col(0, 1, 'int'), p.lit(6)], 'int'));
 const removed = db.queryPlan({ kind: 'write', plan: p.remove('fruit', many, 0, { returning: [p.col(0, 1, 'text')] }), returning: [{ name: 'name', type: 'text' }] });
 console.log(removed.rows); // [['plum']]
 ```
@@ -59,7 +59,7 @@ import { open } from 'smaltdb';
 import * as p from 'smaltdb/plan';
 
 const db = await open('app');
-const byId = p.project(p.filter(p.scan('fruit', [0, 1]), p.call('sql.eq', [p.col(0, 0, 'int'), p.param(0, 'int')], 'int')), [p.col(0, 1, 'text')]);
+const byId = p.project(p.filter(p.scan('fruit', [0, 1]), p.call('cmp_eq', [p.col(0, 0, 'int'), p.param(0, 'int')], 'int')), [p.col(0, 1, 'text')]);
 const rows = await db.queryPlan<{ name: string }>({ kind: 'query', plan: byId, columns: [{ name: 'name', type: 'text' }] }, [2]);
 ```
 
@@ -115,6 +115,6 @@ original; the engine validates it like any other.
 ```ts
 import { plan as p } from 'smaltdb/engine';
 
-const text = p.planToJSON(p.filter(p.scan('fruit', [0]), p.call('sql.gt', [p.col(0, 0, 'int'), p.lit(9007199254740993n)], 'int')));
+const text = p.planToJSON(p.filter(p.scan('fruit', [0]), p.call('cmp_gt', [p.col(0, 0, 'int'), p.lit(9007199254740993n)], 'int')));
 const again = p.planFromJSON(text);
 ```

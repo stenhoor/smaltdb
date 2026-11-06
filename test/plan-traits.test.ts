@@ -95,4 +95,18 @@ describe('operations are recognised by their traits', () => {
     const j = p.join('inner', p.scan('t', [0, 1]), p.scan('u', [0, 1]), p.call('test_eq_plain', [p.col(0, 1, 'int'), p.col(1, 1, 'int')], 'int'));
     expect(plan(d, j)).not.toMatch(/HASH JOIN/);
   });
+
+  it('behaviour names and their sql.* aliases give the same plans and results (ADR 0016 step 4)', () => {
+    const d = db();
+    const q = (eq: string, add: string, div: string, inList: string) =>
+      p.project(
+        p.filter(p.scan('t', [0, 1, 2]), p.and(p.call(eq, [k, p.lit(7)], 'int'), p.call(inList, [id, p.lit(7), p.lit(507), p.lit(1007)], 'int'))),
+        [p.call(add, [k, p.lit(1)], 'int'), p.call(div, [id, p.lit(2)], 'int')],
+      );
+    const named = q('cmp_eq', 'add', 'div_trunc', 'in_list');
+    const aliased = q('sql.eq', 'sql.add', 'sql.div', 'sql.in_list');
+    expect(d.queryPlan(named).rows).toEqual(d.queryPlan(aliased).rows);
+    expect(d.queryPlan(named).rows.length).toBeGreaterThan(0);
+    expect(plan(d, named)).toBe(plan(d, aliased));
+  });
 });

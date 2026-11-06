@@ -537,6 +537,48 @@ function inListFn(args: SqlArg[], options: SqlCompileOptions): Fn {
 
 // ------------------------------------------------------------------ the registry
 
+/**
+ * The engine's operations under their former `sql.*` names (ADR 0016 section 1): each is the same operation as its
+ * behaviour name, traits included, so plans that use either mean the same. They stay until smaltql has moved to the
+ * behaviour names.
+ */
+export const SQL_ALIASES: Readonly<Record<string, string>> = {
+  'sql.eq': 'cmp_eq',
+  'sql.ne': 'cmp_ne',
+  'sql.lt': 'cmp_lt',
+  'sql.le': 'cmp_le',
+  'sql.gt': 'cmp_gt',
+  'sql.ge': 'cmp_ge',
+  'sql.is': 'cmp_is',
+  'sql.is_not': 'cmp_is_not',
+  'sql.add': 'add',
+  'sql.sub': 'sub',
+  'sql.mul': 'mul',
+  'sql.div': 'div_trunc',
+  'sql.mod': 'mod_trunc',
+  'sql.bitand': 'bit_and',
+  'sql.bitor': 'bit_or',
+  'sql.shl': 'shift_left',
+  'sql.shr': 'shift_right',
+  'sql.bitnot': 'bit_not',
+  'sql.neg': 'neg',
+  'sql.not': 'truth_not',
+  'sql.concat': 'text_concat',
+  'sql.like': 'like',
+  'sql.glob': 'glob',
+  'sql.in_list': 'in_list',
+  'sql.cast_integer': 'cast_integer',
+  'sql.cast_real': 'cast_real',
+  'sql.cast_text': 'cast_text',
+  'sql.cast_blob': 'cast_blob',
+  'sql.cast_numeric': 'cast_numeric',
+  'sql.affinity_numeric': 'affinity_numeric',
+  'sql.affinity_text': 'affinity_text',
+  'sql.current_date': 'current_date',
+  'sql.current_time': 'current_time',
+  'sql.current_timestamp': 'current_timestamp',
+};
+
 const fixed = (name: string, arity: SqlFunction['arity'], compile: SqlFunction['compile'], traits?: FnTraits): [string, SqlFunction] => [name, traits ? { name, arity, compile, traits } : { name, arity, compile }];
 
 /** The traits of SQL's comparison operators: all compare in SQLite's value order; IS / IS NOT are not inlined. */
@@ -559,14 +601,14 @@ const ARITHMETIC_TRAITS: Readonly<Record<string, FnTraits>> = {
   '%': { inline: '%' },
 };
 
-export const SQL_FUNCTIONS: ReadonlyMap<string, SqlFunction> = new Map<string, SqlFunction>([
-  ...Object.entries(COMPARISON_FUNCTIONS).map(([op, name]) =>
+const OPERATIONS: ReadonlyMap<string, SqlFunction> = new Map<string, SqlFunction>([
+  ...Object.entries(COMPARISON_FUNCTIONS).map(([op, alias]) => [op, SQL_ALIASES[alias]] as const).map(([op, name]) =>
     fixed(name, 2, (args, o) => ({ fn: comparisonFn(op, args[0], args[1], o.collation ?? Collation.Binary), type: 'int' }), COMPARISON_TRAITS[op]),
   ),
-  ...Object.entries(ARITHMETIC_FUNCTIONS).map(([op, name]) => fixed(name, 2, (args) => arithmeticFn(op, args[0], args[1]), ARITHMETIC_TRAITS[op])),
-  ...Object.entries(BITWISE_FUNCTIONS).map(([op, name]) => fixed(name, 2, (args) => ({ fn: bitwiseFn(op, args[0], args[1]), type: 'int' }))),
+  ...Object.entries(ARITHMETIC_FUNCTIONS).map(([op, alias]) => [op, SQL_ALIASES[alias]] as const).map(([op, name]) => fixed(name, 2, (args) => arithmeticFn(op, args[0], args[1]), ARITHMETIC_TRAITS[op])),
+  ...Object.entries(BITWISE_FUNCTIONS).map(([op, alias]) => [op, SQL_ALIASES[alias]] as const).map(([op, name]) => fixed(name, 2, (args) => ({ fn: bitwiseFn(op, args[0], args[1]), type: 'int' }))),
   fixed(
-    'sql.neg',
+    'neg',
     1,
     ([x]) => {
       const f = x.fn;
@@ -574,7 +616,7 @@ export const SQL_FUNCTIONS: ReadonlyMap<string, SqlFunction> = new Map<string, S
     },
     { inline: 'neg', negation: true },
   ),
-  fixed('sql.bitnot', 1, ([x]) => {
+  fixed('bit_not', 1, ([x]) => {
     const f = x.fn;
     return {
       fn: (r) => {
@@ -586,7 +628,7 @@ export const SQL_FUNCTIONS: ReadonlyMap<string, SqlFunction> = new Map<string, S
       type: 'int',
     };
   }),
-  fixed('sql.not', 1, ([x]) => {
+  fixed('truth_not', 1, ([x]) => {
     const f = x.fn;
     return {
       fn: (r) => {
@@ -596,7 +638,7 @@ export const SQL_FUNCTIONS: ReadonlyMap<string, SqlFunction> = new Map<string, S
       type: 'int',
     };
   }),
-  fixed('sql.concat', 2, ([a, b]) => {
+  fixed('text_concat', 2, ([a, b]) => {
     const fa = a.fn;
     const fb = b.fn;
     const ra = a.type === 'real';
@@ -612,34 +654,34 @@ export const SQL_FUNCTIONS: ReadonlyMap<string, SqlFunction> = new Map<string, S
       type: 'text',
     };
   }),
-  fixed('sql.like', [2, 3], (args, o) => ({ fn: likeFn(false, args, o.negated ?? false), type: 'int' }), { pattern: true }),
-  fixed('sql.glob', [2, 3], (args, o) => ({ fn: likeFn(true, args, o.negated ?? false), type: 'int' }), { pattern: true }),
-  fixed('sql.in_list', [1, -1], (args, o) => ({ fn: inListFn(args, o), type: 'int' }), { inList: true }),
-  fixed('sql.cast_integer', 1, ([x]) => {
+  fixed('like', [2, 3], (args, o) => ({ fn: likeFn(false, args, o.negated ?? false), type: 'int' }), { pattern: true }),
+  fixed('glob', [2, 3], (args, o) => ({ fn: likeFn(true, args, o.negated ?? false), type: 'int' }), { pattern: true }),
+  fixed('in_list', [1, -1], (args, o) => ({ fn: inListFn(args, o), type: 'int' }), { inList: true }),
+  fixed('cast_integer', 1, ([x]) => {
     const f = x.fn;
     return { fn: (r) => castToInteger(f(r)), type: 'int' };
   }),
-  fixed('sql.cast_real', 1, ([x]) => {
+  fixed('cast_real', 1, ([x]) => {
     const f = x.fn;
     return { fn: (r) => castToReal(f(r)), type: 'real' };
   }),
-  fixed('sql.cast_text', 1, ([x]) => {
+  fixed('cast_text', 1, ([x]) => {
     const f = x.fn;
     const xr = x.type === 'real';
     return { fn: (r) => toText(f(r), xr), type: 'text' };
   }),
-  fixed('sql.cast_blob', 1, ([x]) => {
+  fixed('cast_blob', 1, ([x]) => {
     const f = x.fn;
     const xr = x.type === 'real';
     return { fn: (r) => toBlob(f(r), xr), type: 'blob' };
   }),
-  fixed('sql.cast_numeric', 1, ([x]) => {
+  fixed('cast_numeric', 1, ([x]) => {
     const f = x.fn;
     return { fn: (r) => castToNumeric(f(r)), type: 'num' };
   }),
   // The affinity conversions SQLite applies to a comparison operand (§4.2), as values in their own right.
   fixed(
-    'sql.affinity_numeric',
+    'affinity_numeric',
     1,
     ([x]) => {
       const f = x.fn;
@@ -648,7 +690,7 @@ export const SQL_FUNCTIONS: ReadonlyMap<string, SqlFunction> = new Map<string, S
     { comparisonConversion: true },
   ),
   fixed(
-    'sql.affinity_text',
+    'affinity_text',
     1,
     ([x]) => {
       const f = x.fn;
@@ -658,6 +700,24 @@ export const SQL_FUNCTIONS: ReadonlyMap<string, SqlFunction> = new Map<string, S
     { comparisonConversion: true },
   ),
 ]);
+
+/** Operations the expression compiler builds itself rather than from the registry (they read the statement's clock). */
+const COMPILED_OPERATIONS = new Set(['current_date', 'current_time', 'current_timestamp']);
+
+/**
+ * The engine's own operations (ADR 0016 section 1), by behaviour name and by their former `sql.*` names: arithmetic,
+ * comparisons, conversions and the other operations languages build plans from, besides the named scalar functions.
+ */
+export const SQL_FUNCTIONS: ReadonlyMap<string, SqlFunction> = new Map<string, SqlFunction>([
+  ...OPERATIONS,
+  ...Object.entries(SQL_ALIASES).flatMap(([alias, name]) => (OPERATIONS.has(name) ? [[alias, OPERATIONS.get(name)!] as const] : [])),
+]);
+
+/** An operation's behaviour name: a former `sql.*` name resolved, any other name as it is. */
+export const canonicalName = (fn: string): string => SQL_ALIASES[fn] ?? fn;
+
+/** True for one of the engine's own operations (not a named scalar function), under either of its names. */
+export const isEngineOperation = (fn: string): boolean => SQL_FUNCTIONS.has(fn) || COMPILED_OPERATIONS.has(canonicalName(fn));
 
 /** The named function `name`; throws for a name the registry doesn't have (a bug in a front end). */
 export function sqlFunction(name: string): SqlFunction {

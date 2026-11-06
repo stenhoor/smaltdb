@@ -18,7 +18,7 @@
  */
 import { SmaltError } from '../errors.js';
 import { aggregateFunctions, scalarFunctions } from '../exec/functions.js';
-import { SQL_FUNCTIONS } from '../exec/sql-functions.js';
+import { SQL_FUNCTIONS, isEngineOperation } from '../exec/sql-functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../exec/window.js';
 import type { PlanExpr } from './expr.js';
 import type { PlanOp } from './ops.js';
@@ -40,8 +40,6 @@ export const MAX_PLAN_DEPTH = 1000;
 
 const TYPES = new Set(['int', 'real', 'num', 'text', 'blob', 'null', 'any']);
 const COLLATIONS = new Set(['binary', 'nocase', 'rtrim']);
-/** `sql.*` calls compiled by the expression compiler itself rather than looked up in the registry. */
-const SQL_SPECIAL = new Set(['sql.in_list', 'sql.like', 'sql.glob', 'sql.current_date', 'sql.current_time', 'sql.current_timestamp']);
 
 /** The input widths an expression may read at one scope (`input` indexes this). */
 type Scope = readonly number[];
@@ -656,12 +654,12 @@ class Validator {
         if (typeof e.fn !== 'string') this.fail('expected a function name', 'fn');
         const args = this.list(e.args, 'args');
         const n = args.length;
-        if (e.fn.startsWith('sql.')) {
+        if (isEngineOperation(e.fn)) {
           const f = SQL_FUNCTIONS.get(e.fn);
           if (f) {
             const ar = f.arity;
             if (typeof ar === 'number' ? n !== ar : n < ar[0] || (ar[1] >= 0 && n > ar[1])) this.fail(`wrong number of arguments to ${e.fn}: ${n}`);
-          } else if (!SQL_SPECIAL.has(e.fn)) this.fail(`no such function: ${e.fn}`, 'fn');
+          }
         } else {
           const f = scalarFunctions.get(e.fn);
           if (!f) this.fail(`no such function: ${e.fn}`, 'fn');

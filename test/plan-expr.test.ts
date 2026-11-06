@@ -1,6 +1,6 @@
 /** Plan expressions and the SQL semantic functions (ADR 0014, step 3a). */
 import { describe, expect, it } from 'vitest';
-import { SQL_FUNCTIONS, sqlFunction } from '../src/engine/exec/sql-functions.js';
+import { SQL_FUNCTIONS, sqlFunction, SQL_ALIASES, canonicalName, isEngineOperation } from '../src/engine/exec/sql-functions.js';
 import { applyNumericAffinity } from '../src/engine/exec/convert.js';
 import { call, col, lit, param, typeOf } from '../src/engine/plan/expr.js';
 import { printExpr } from '../src/engine/plan/print.js';
@@ -23,8 +23,19 @@ describe('plan expressions', () => {
 });
 
 describe('SQL semantic functions', () => {
-  it('are all in the sql namespace', () => {
-    expect([...SQL_FUNCTIONS.keys()].every((n) => n.startsWith('sql.'))).toBe(true);
+  it('have behaviour names, with their former sql.* names as aliases of the same operation (ADR 0016 step 4)', () => {
+    const names = [...SQL_FUNCTIONS.keys()];
+    const canonical = names.filter((n) => !n.startsWith('sql.'));
+    expect(canonical.length).toBeGreaterThan(0);
+    for (const [alias, name] of Object.entries(SQL_ALIASES)) {
+      expect(alias.startsWith('sql.'), alias).toBe(true);
+      expect(name.startsWith('sql.'), name).toBe(false);
+      expect(canonicalName(alias)).toBe(name);
+      expect(isEngineOperation(alias) && isEngineOperation(name), alias).toBe(true);
+      // The same definition, traits included, under both names (the clock operations are compiled, not registered).
+      if (SQL_FUNCTIONS.has(name)) expect(SQL_FUNCTIONS.get(alias), alias).toBe(SQL_FUNCTIONS.get(name));
+    }
+    for (const n of names) if (n.startsWith('sql.')) expect(SQL_ALIASES[n], n).toBeDefined();
     expect(() => sqlFunction('sql.nope')).toThrow(/no SQL function/);
   });
 
