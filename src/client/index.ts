@@ -16,8 +16,24 @@ export type { SqlValue, Params, PlanStatementInput };
 /** A plan's parameters: positional. */
 export type PlanParams = readonly (SqlValue | boolean | undefined)[];
 
-/** A statement as plan data, as the worker protocol carries it. */
-const planRequest = (stmt: PlanStatementInput): { plan: string; planVersion: number } => ({ plan: encodeDataJSON(stmt), planVersion: PLAN_FORMAT_VERSION });
+/**
+ * A statement as plan data, as the worker protocol carries it: JSON text, with the typed arrays of values given as
+ * columns beside it as binary data (`data`), handed over rather than copied with `transfer`.
+ */
+const planRequest = (stmt: PlanStatementInput, transfer = false): { plan: string; planVersion: number; data?: unknown[]; transfer?: true } => {
+  const data: unknown[] = [];
+  const plan = encodeDataJSON(stmt, data);
+  return { plan, planVersion: PLAN_FORMAT_VERSION, ...(data.length ? { data, ...(transfer ? { transfer: true as const } : {}) } : {}) };
+};
+
+/** The buffers a request hands over (`transfer`): those of its data's typed arrays. */
+function transferOf(req: Request): Transferable[] {
+  const r = req as { data?: unknown[]; transfer?: boolean };
+  if (!r.transfer || !r.data) return [];
+  const out = new Set<ArrayBuffer>();
+  for (const d of r.data) if (ArrayBuffer.isView(d) && d.buffer instanceof ArrayBuffer) out.add(d.buffer);
+  return [...out];
+}
 
 export interface OpenOptions {
   /** 'opfs' (default) persists in the Origin Private File System; 'memory' is discarded on close. */
@@ -52,6 +68,11 @@ export interface QueryOptions {
   batchSize?: number;
   /** Cancel the request: queued requests and streams stop at once; running statements are interrupted when possible. */
   signal?: AbortSignal;
+  /**
+   * Plans only: hand the buffers of the typed arrays of `values` given as columns to the worker instead of copying them.
+   * The arrays are unusable afterwards (their buffers are detached).
+   */
+  transfer?: boolean;
 }
 
 export interface StreamOptions extends QueryOptions {
@@ -253,7 +274,7 @@ export class Database implements Queryable {
       (openReq as { interrupt?: SharedArrayBuffer }).interrupt = sab;
     }
     if (bus) (openReq as { bus?: string }).bus = bus;
-    this.link = { send: (req) => worker.postMessage(req), close: () => worker.terminate() };
+    this.link = { send: (req) => worker.postMessage(req, transferOf(req)), close: () => worker.terminate() };
     this.isLeader = true;
   }
 
@@ -438,7 +459,7 @@ export class Database implements Queryable {
 
   /** @internal Unlocked plan query (used inside transactions). */
   async rawQueryPlan(stmt: PlanStatementInput, params: PlanParams | undefined, options: QueryOptions): Promise<unknown> {
-    const res = (await this.request({ op: 'queryPlan', ...planRequest(stmt), params, batchSize: options.batchSize }, options.signal)) as Collected;
+    const res = (await this.request({ op: 'queryPlan', ...planRequest(stmt, options.transfer), params, batchSize: options.batchSize }, options.signal)) as Collected;
     return materialize(res, options.rowMode ?? 'object');
   }
 
@@ -454,7 +475,7 @@ export class Database implements Queryable {
 
   /** Stream a statement given as plan data in batches, as `stream` streams SQL (see `queryPlan`). */
   streamPlan<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(stmt: PlanStatementInput, params?: PlanParams, options: StreamOptions & { rowMode?: M } = {}): AsyncIterableIterator<QueryResultFor<M, T>> {
-    return this.openStream({ op: 'queryPlan', ...planRequest(stmt), params, batchSize: options.batchSize } as RequestBody, options, true) as AsyncIterableIterator<QueryResultFor<M, T>>;
+    return this.openStream({ op: 'queryPlan', ...planRequest(stmt, options.transfer), params, batchSize: options.batchSize } as RequestBody, options, true) as AsyncIterableIterator<QueryResultFor<M, T>>;
   }
 
   /**
@@ -467,9 +488,9 @@ export class Database implements Queryable {
   }
 
   /** Prepare a statement given as plan data (see queryPlan). Its parameters are positional. */
-  async preparePlan(stmt: PlanStatementInput): Promise<PreparedStatement> {
+  async preparePlan(stmt: PlanStatementInput, options: { transfer?: boolean } = {}): Promise<PreparedStatement> {
     const epoch = this.epoch;
-    const r = (await this.withLock(() => this.request({ op: 'preparePlan', ...planRequest(stmt) }))) as { stmt: number; columns: string[]; columnTypes?: PlanType[]; paramCount: number };
+    const r = (await this.withLock(() => this.request({ op: 'preparePlan', ...planRequest(stmt, options.transfer) }))) as { stmt: number; columns: string[]; columnTypes?: PlanType[]; paramCount: number };
     return new PreparedStatement(this, r.stmt, r.columns, r.paramCount, epoch, r.columnTypes ?? r.columns.map(() => 'any'));
   }
 
@@ -675,7 +696,7 @@ export class Database implements Queryable {
       queryPlan: (stmt, params, options = {}) => (active ? this.rawQueryPlan(stmt, params, options) : Promise.reject(ended())) as never,
       exec: (sql, params, options = {}) => (active ? this.rawExec(sql, params, options.signal) : Promise.reject(ended())),
       stream: (sql, params, options = {}) => (active ? this.openStream({ op: 'query', sql, params, batchSize: options.batchSize }, options) : failingIterator(ended())) as never,
-      streamPlan: (stmt, params, options = {}) => (active ? this.openStream({ op: 'queryPlan', ...planRequest(stmt), params, batchSize: options.batchSize } as RequestBody, options) : failingIterator(ended())) as never,
+      streamPlan: (stmt, params, options = {}) => (active ? this.openStream({ op: 'queryPlan', ...planRequest(stmt, options.transfer), params, batchSize: options.batchSize } as RequestBody, options) : failingIterator(ended())) as never,
       statement: (stmt) => {
         if (stmt.db !== this) throw new SmaltdbError('SMALT_MISUSE', 'the statement was prepared on another Database');
         return {

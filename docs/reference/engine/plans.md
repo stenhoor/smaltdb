@@ -42,7 +42,7 @@ Each operation's output columns, in order:
 | Operation | Fields | Output |
 |---|---|---|
 | `scan` | `table`, `columns` (table column indexes, -1 the rowid), `db?` (`main` / `temp`), `indexedBy?` | the listed columns. `table` may name a view: its query, bound by its language when the plan is compiled ([views](./languages#views)) |
-| `values` | `rows` (expressions over no columns), `types` | one column per value |
+| `values` | `rows` (expressions over no columns), `types`, `columns?` (the values as data: see below) | one column per value |
 | `source` | `kind` (`function` / `virtual` / `external`), `name`, `schema?`, `args`, `named?`, `types` | the source's columns (a table function, `information_schema.*`, an external table) |
 | `filter` | `input`, `pred` | its input's |
 | `project` | `input`, `exprs` | one column per expression |
@@ -89,6 +89,20 @@ These operations are defined by order:
   collations, and keeps one row of each set: the first by input order, or the last with `keep: 'last'`. `keep` without
   `on` compares every column. The kept rows come in input order, or with `ordered: 'first'` in the order of each set's
   first row.
+
+**Values from columns.** `values` may give its rows as data instead of expressions: `columns`, one per type, all of
+one length, with `rows` empty. A column is a typed array (`Float64Array`, `Float32Array`, `Int32Array`, `Int16Array`,
+`Int8Array`, `Uint32Array`, `Uint16Array`, `Uint8Array`, or `BigInt64Array` for integers beyond 2^53), an array of values, or either as
+`{ data, nulls }` with a null bitmap (bit `i % 8` of byte `i >> 3` set when value `i` is NULL, as results carry them). NaN in a float
+array reads as NULL. The engine reads the values where they are. In JSON a typed array is `{"$typed": "f64", "data":
+[…]}`; through the client it crosses to the worker as binary data beside the plan's JSON (see [running
+plans](./running#through-the-client)).
+
+```ts
+import { plan as p } from 'smaltdb/engine';
+
+const fruit = p.fromColumns([new Int32Array([1, 2, 3]), ['apple', 'pear', 'plum'], new Float64Array([1.5, 0.5, 2])], ['int', 'text', 'real']);
+```
 
 **Sort keys** (`SortKey`) are `{ expr, desc, nullsFirst, collation }`.
 
@@ -198,7 +212,7 @@ NULLs first). They check nothing: the engine validates every plan it is given, b
 |---|---|
 | Expressions | `col(input, index, type, collation?, depth?)`, `lit(value, type?)`, `value(v)`, `param(index, type?)`, `call(fn, args, type, collation?)`, `cast(fn, arg, to)`, `and(...)`, `or(...)`, `not(x)`, `isNull(x)`, `isNotNull(x)`, `caseWhen(whens, type, otherwise?)`, `scalar(plan, type, collation?)`, `exists(plan)`, `inPlan(probe, plan, collation?)` |
 | Sort keys, aggregates | `asc(expr, options?)`, `desc(expr, options?)`, `agg(fn, args, type, options?)` |
-| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `setop(kind, left, right, width)` |
+| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `setop(kind, left, right, width)` |
 | Writes | `append(table, input, columns, options?)`, `update(table, input, rowid, sets, options?)`, `remove(table, input, rowid, options?)` |
 
 `window`, `source`, `iterate` and `working` have no builder yet: write them as objects.

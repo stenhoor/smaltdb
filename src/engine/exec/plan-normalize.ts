@@ -31,7 +31,7 @@ function rewrite(op: PlanOp): PlanOp {
 }
 
 function rewriteAll(x: unknown): unknown {
-  if (x === null || typeof x !== 'object') return x;
+  if (x === null || typeof x !== 'object' || ArrayBuffer.isView(x)) return x; // data (values' columns, blobs) holds no plans
   if (Array.isArray(x)) {
     let out: unknown[] | undefined;
     for (let i = 0; i < x.length; i++) {

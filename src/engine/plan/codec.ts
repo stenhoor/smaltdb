@@ -27,24 +27,47 @@ export function encodeData(x: unknown): unknown {
   return encode(x, false);
 }
 
-/** `x` as {@link encodeData} encodes it, as JSON text: bigints, blobs and non-finite numbers are tagged objects. */
-export function encodeDataJSON(x: unknown): string {
-  return JSON.stringify(encode(x, true));
+/**
+ * `x` as {@link encodeData} encodes it, as JSON text: bigints, blobs and non-finite numbers are tagged objects, and
+ * typed arrays other than blobs `{$typed: kind, data}`. With `lifted`, typed arrays are not written: each is pushed to
+ * `lifted` and written as `{$data: i}`, its position there, so that it can travel beside the text as binary data (the
+ * worker protocol: plan requests' `data`); {@link decodeDataJSON} puts them back.
+ */
+export function encodeDataJSON(x: unknown, lifted?: unknown[]): string {
+  return JSON.stringify(encode(x, true, lifted));
 }
 
+/** The typed arrays JSON can tag, by the name their tag records. */
+const TYPED: Readonly<Record<string, new (values: ArrayLike<number> & ArrayLike<bigint>) => ArrayBufferView>> = {
+  f64: Float64Array as never,
+  f32: Float32Array as never,
+  i32: Int32Array as never,
+  i16: Int16Array as never,
+  i8: Int8Array as never,
+  u32: Uint32Array as never,
+  u16: Uint16Array as never,
+  i64: BigInt64Array as never,
+};
+const typedName = (x: ArrayBufferView): string | undefined => Object.keys(TYPED).find((k) => x instanceof TYPED[k]);
+
 /** `x` encoded; with `json`, also tagged for JSON. One walk does both: a `JSON.stringify` replacer is slow. */
-function encode(x: unknown, json: boolean): unknown {
+function encode(x: unknown, json: boolean, lifted?: unknown[]): unknown {
   if (json) {
+    if (lifted && ArrayBuffer.isView(x)) return { $data: lifted.push(x) - 1 };
     if (typeof x === 'bigint') return { $bigint: x.toString() };
     if (x instanceof Uint8Array) return { $blob: Array.from(x, (b) => b.toString(16).padStart(2, '0')).join('') };
     if (typeof x === 'number' && !Number.isFinite(x)) return { $real: String(x) };
+    if (ArrayBuffer.isView(x)) {
+      const kind = typedName(x);
+      if (kind) return { $typed: kind, data: Array.from(x as unknown as ArrayLike<number | bigint>, (v) => (typeof v === 'bigint' ? v.toString() : Number.isFinite(v) ? v : String(v))) };
+    }
   }
-  if (Array.isArray(x)) return x.map((v) => encode(v, json));
-  if (!x || typeof x !== 'object' || x instanceof Uint8Array) return x;
+  if (Array.isArray(x)) return x.map((v) => encode(v, json, lifted));
+  if (!x || typeof x !== 'object' || ArrayBuffer.isView(x)) return x;
   const out: Record<string, unknown> = {};
   for (const k in x) {
     const v = (x as Record<string, unknown>)[k];
-    if (v !== undefined) out[k] = encode(v, json);
+    if (v !== undefined) out[k] = encode(v, json, lifted);
   }
   return out;
 }
@@ -71,11 +94,11 @@ export function decodeData(x: unknown): unknown {
  * `x` decoded; with `json`, also the values {@link encodeDataJSON} tagged. One walk does both: `JSON.parse` with a reviver
  * is several times slower than parsing plain JSON and walking the result.
  */
-function decode(x: unknown, json: boolean): unknown {
-  if (Array.isArray(x)) return x.map((v) => decode(v, json));
-  if (!x || typeof x !== 'object' || x instanceof Uint8Array) return x;
+function decode(x: unknown, json: boolean, lifted?: readonly unknown[]): unknown {
+  if (Array.isArray(x)) return x.map((v) => decode(v, json, lifted));
+  if (!x || typeof x !== 'object' || ArrayBuffer.isView(x)) return x;
   if (json) {
-    const tagged = untag(x as Record<string, unknown>);
+    const tagged = untag(x as Record<string, unknown>, lifted);
     if (tagged !== x) return tagged;
   }
   const out: Record<string, unknown> = {};
@@ -85,7 +108,7 @@ function decode(x: unknown, json: boolean): unknown {
     const v = (x as Record<string, unknown>)[k];
     if (k === '$sql') meta = v as SqlMeta;
     else if (k === '$flattened') flattened = v === true;
-    else out[k] = decode(v, json);
+    else out[k] = decode(v, json, lifted);
   }
   if (meta) setMeta(out as unknown as BoundExpr, { ...meta });
   if (flattened) markFlattened(out as unknown as PlanOp);
@@ -97,14 +120,23 @@ export function valueFromJSON(v: unknown): unknown {
   return v && typeof v === 'object' && !Array.isArray(v) ? untag(v as Record<string, unknown>) : v;
 }
 
-/** The value a tagged object (`{$bigint}`, `{$blob}`, `{$real}`) stands for, or `o` itself. */
-function untag(o: Record<string, unknown>): unknown {
+/** The value a tagged object (`{$bigint}`, `{$blob}`, `{$real}`, `{$typed, data}`, `{$data}`) stands for, or `o` itself. */
+function untag(o: Record<string, unknown>, lifted?: readonly unknown[]): unknown {
+  if (typeof o.$typed === 'string' && Array.isArray(o.data) && Object.keys(o).length === 2) {
+    const make = TYPED[o.$typed];
+    if (!make) throw new SmaltError('SMALT_PLAN', `unknown typed array ${JSON.stringify(o.$typed)}`);
+    return new make((o.data as unknown[]).map((v) => (o.$typed === 'i64' ? BigInt(v as string) : Number(v))) as never);
+  }
   let key: string | undefined;
   for (const k in o) {
     if (key !== undefined) return o;
     key = k;
   }
   const v = key === undefined ? undefined : o[key];
+  if (key === '$data' && typeof v === 'number') {
+    if (!lifted || !(v in lifted)) throw new SmaltError('SMALT_PLAN', `the plan refers to data ${v} it was not given`);
+    return lifted[v];
+  }
   if (typeof v !== 'string') return o;
   if (key === '$bigint') return BigInt(v);
   if (key === '$blob') {
@@ -117,8 +149,8 @@ function untag(o: Record<string, unknown>): unknown {
 }
 
 /** JSON text {@link encodeDataJSON} made, decoded: its tagged values and SQL's metadata restored. */
-export function decodeDataJSON(text: string): unknown {
-  return decode(JSON.parse(text), true);
+export function decodeDataJSON(text: string, lifted?: readonly unknown[]): unknown {
+  return decode(JSON.parse(text), true, lifted);
 }
 
 /**

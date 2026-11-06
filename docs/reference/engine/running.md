@@ -55,7 +55,10 @@ In a page, the client runs plans in the engine's worker: `db.queryPlan(stmt, par
 `db.streamPlan(stmt, params?, options?)` (in batches, as `stream`) and `db.preparePlan(stmt)` (see [the client
 reference](https://stenhoor.github.io/smaltql/reference/api/client#queryplan)). Build them with `smaltdb/plan`, the plan
 format without the engine, so that pages which don't build plans don't load it. The plan crosses to the worker as JSON;
-results, options, transactions and parallel readers work as for SQL queries.
+results, options, transactions and parallel readers work as for SQL queries. The typed arrays of
+[values given as columns](./plans#operations) travel beside the JSON as binary data, copied; with `{ transfer: true }`
+(an option of `queryPlan`, `streamPlan` and `preparePlan`) their buffers are handed to the worker instead, and the
+arrays are unusable afterwards. A plan that carries data is not cached by the worker.
 
 Results carry each column's plan type: `columnTypes` on `rowMode: 'array'` and `'columnar'` results and on prepared
 statements. A write run with `queryPlan` gives `changes` and `lastInsertRowid` on its result, beside any RETURNING rows;

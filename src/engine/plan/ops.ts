@@ -16,6 +16,17 @@
  */
 import type { PlanExpr, PlanOrigin } from './expr.js';
 import type { CollationName, PlanType } from './types.js';
+import type { SqlValue } from '../values.js';
+
+/** A typed array a column of values may be. */
+export type ColumnArray = Float64Array | Float32Array | Int32Array | Int16Array | Int8Array | Uint32Array | Uint16Array | Uint8Array | BigInt64Array;
+
+/**
+ * A column of `values` given as data: a typed array (numbers; `BigInt64Array`: integers), an array of values, or
+ * either with a null bitmap (`nulls`: bit `i % 8` of byte `i >> 3` set when value `i` is NULL, as results carry them).
+ * NaN in a float array reads as NULL.
+ */
+export type ValueColumn = ColumnArray | readonly SqlValue[] | { readonly data: ColumnArray | readonly SqlValue[]; readonly nulls: Uint8Array };
 
 export interface SortKey {
   readonly expr: PlanExpr;
@@ -104,7 +115,14 @@ export type PlanOp = OpMeaning & (
   /** The previous step's rows inside an `iterate` with the same `id`. */
   | { readonly op: 'working'; readonly id: number; readonly types: readonly PlanType[] }
   /** Constant rows (VALUES, and the single empty row of a SELECT without FROM). */
-  | { readonly op: 'values'; readonly rows: readonly (readonly PlanExpr[])[]; readonly types: readonly PlanType[] }
+  | {
+      readonly op: 'values';
+      /** Rows of expressions over no columns; empty when the values are given as `columns`. */
+      readonly rows: readonly (readonly PlanExpr[])[];
+      readonly types: readonly PlanType[];
+      /** The values as one array per column, all of one length (ADR 0016 section 5): data, not expressions. */
+      readonly columns?: readonly ValueColumn[];
+    }
   | { readonly op: 'filter'; readonly input: PlanOp; readonly pred: PlanExpr }
   | { readonly op: 'project'; readonly input: PlanOp; readonly exprs: readonly PlanExpr[] }
   | {

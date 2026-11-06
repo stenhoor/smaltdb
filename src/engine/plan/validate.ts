@@ -69,6 +69,35 @@ class Validator {
 
   constructor(private readonly catalog: ValidateCatalog) {}
 
+  /** A `values` operation's columns: one per type, all of one length, with values and null bitmaps that are such. */
+  private valueColumns(cs: unknown, width: number, rows: number): void {
+    const l = this.list(cs, 'columns');
+    if (rows > 0) this.fail('expected no rows beside columns', 'rows');
+    if (l.length !== width) this.fail(`expected ${width} columns, one per type`, 'columns');
+    let length: number | undefined;
+    for (let i = 0; i < l.length; i++) {
+      const c = l[i] as { data?: unknown; nulls?: unknown } | undefined;
+      const wrapped = c !== null && typeof c === 'object' && !Array.isArray(c) && !ArrayBuffer.isView(c);
+      const data = wrapped ? c.data : c;
+      let n: number;
+      if (ArrayBuffer.isView(data) && !(data instanceof DataView) && !(data instanceof BigUint64Array) && !(data instanceof Uint8ClampedArray)) {
+        n = (data as unknown as ArrayLike<unknown>).length;
+      } else if (Array.isArray(data)) {
+        n = data.length;
+        for (let j = 0; j < n; j++) {
+          const v = data[j];
+          if (!(v === null || typeof v === 'number' || typeof v === 'bigint' || typeof v === 'string' || v instanceof Uint8Array)) this.fail(`expected a value at ${j}`, 'columns', i);
+        }
+      } else this.fail('expected a typed array, an array of values, or { data, nulls }', 'columns', i);
+      if (wrapped) {
+        const nulls = c.nulls;
+        if (!(nulls instanceof Uint8Array) || nulls.length < (n + 7) >>> 3) this.fail(`expected a null bitmap of at least ${(n + 7) >>> 3} bytes`, 'columns', i);
+      }
+      if (length === undefined) length = n;
+      else if (n !== length) this.fail(`expected ${length} values, as the first column has`, 'columns', i);
+    }
+  }
+
   private fail(message: string, ...more: (string | number)[]): never {
     const path = ['plan', ...this.at.slice(1, this.top), ...more].map((x) => (typeof x === 'number' ? `[${x}]` : `.${x}`)).join('').slice(1);
     throw new Invalid(path, message);
@@ -235,6 +264,7 @@ class Validator {
           });
           exprs(rows[i], scopes, `rows[${i}]`);
         }
+        if (o.columns !== undefined) this.valueColumns(o.columns, w, rows.length);
         return w;
       }
       case 'iterate': {

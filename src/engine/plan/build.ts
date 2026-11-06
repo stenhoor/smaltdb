@@ -8,7 +8,7 @@
  */
 import type { SqlValue } from '../values.js';
 import { call, col, lit, param, type PlanExpr, typeOf } from './expr.js';
-import type { AggCall, ConflictAction, JoinKind, PlanOp, SortKey } from './ops.js';
+import type { AggCall, ConflictAction, JoinKind, PlanOp, SortKey, ValueColumn } from './ops.js';
 import type { CollationName, PlanType } from './types.js';
 
 type Op<K extends PlanOp['op']> = Extract<PlanOp, { op: K }>;
@@ -62,6 +62,9 @@ export const scan = (table: string, columns: readonly number[], options: { db?: 
 
 /** Constant rows; `types` default to the first row's. */
 export const values = (rows: readonly (readonly PlanExpr[])[], types?: readonly PlanType[]): Op<'values'> => ({ op: 'values', rows, types: types ?? (rows[0] ?? []).map(typeOfLit) });
+
+/** Rows given as one array per column (typed arrays, value arrays, or either with a null bitmap), of `types`. */
+export const fromColumns = (columns: readonly ValueColumn[], types: readonly PlanType[]): Op<'values'> => ({ op: 'values', rows: [], types, columns });
 
 export const filter = (input: PlanOp, pred: PlanExpr): Op<'filter'> => ({ op: 'filter', input, pred });
 export const project = (input: PlanOp, exprs: readonly PlanExpr[]): Op<'project'> => ({ op: 'project', input, exprs });

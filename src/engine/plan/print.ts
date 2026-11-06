@@ -61,6 +61,7 @@ export function printPlan(op: PlanOp, depth = 0): string {
     case 'working':
       return `${pad}working #${op.id}`;
     case 'values':
+      if (op.columns) return `${pad}values columns [${op.types.join(', ')}]`;
       return `${pad}values ${op.rows.map((r) => `(${list(r)})`).join(', ')}`;
     case 'filter':
       return `${pad}filter ${printExpr(op.pred)}\n${sub(op.input)}`;

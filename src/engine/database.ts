@@ -1236,7 +1236,7 @@ export class Database implements FunctionContext {
    */
   private expandViews(plan: PlanOp, depth = 0): PlanOp {
     const walk = (x: unknown): unknown => {
-      if (x === null || typeof x !== 'object') return x;
+      if (x === null || typeof x !== 'object' || ArrayBuffer.isView(x)) return x; // data (values' columns, blobs) holds no plans
       if (Array.isArray(x)) {
         let out: unknown[] | undefined;
         for (let i = 0; i < x.length; i++) {
@@ -4005,7 +4005,8 @@ export class Database implements FunctionContext {
         return { target: u.target, update: { sets, where, oldBase, oldRowid } };
       });
       let rows: InsertParts['rows'] = { kind: 'default' };
-      if (op.input?.op === 'values') rows = { kind: 'values', rows: op.input.rows.map((row) => planner.compileAt(row, () => -1)) };
+      // VALUES rows are compiled one by one; values given as columns are read as a query is.
+      if (op.input?.op === 'values' && !op.input.columns) rows = { kind: 'values', rows: op.input.rows.map((row) => planner.compileAt(row, () => -1)) };
       else if (op.input) {
         const plan = planner.planPlan(op.input, fe.source!);
         if (!plan) return null;

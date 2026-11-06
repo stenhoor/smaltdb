@@ -497,7 +497,8 @@ export class EngineServer {
         return;
       }
       case 'queryPlan': {
-        const st = this.requireDb().cachedPlan(planInput(req));
+        // A plan that carries data is not cached: its key would be the data.
+        const st = req.data ? this.requireDb().preparePlan(planInput(req)) : this.requireDb().cachedPlan(planInput(req));
         if (this.readsExternal(st)) return this.queryExternal(session, st, req);
         if (this.toReader(session, st, req)) return;
         this.startStream(session, id, st.cursor(req.params as BindParams | undefined), req.batchSize ?? 4096, req.credit);
@@ -806,11 +807,12 @@ export function defaultOpen(vfs: () => Vfs, plugins: readonly SmaltPlugin[] = []
 type ReaderRequest = Extract<RequestBody, { op: 'query' | 'queryPlan' }>;
 
 /** The statement a plan request carries, in this engine's plan format. */
-function planInput(req: { plan: string; planVersion: number }): PlanStatementInput {
+function planInput(req: { plan: string; planVersion: number; data?: unknown[] }): PlanStatementInput {
   if (req.planVersion !== PLAN_FORMAT_VERSION) throw new SmaltError('SMALT_PLAN', `plan format version ${String(req.planVersion)} is not supported (this engine reads version ${PLAN_FORMAT_VERSION})`);
   try {
-    return decodeDataJSON(req.plan) as PlanStatementInput;
-  } catch {
+    return decodeDataJSON(req.plan, req.data) as PlanStatementInput;
+  } catch (e) {
+    if (e instanceof SmaltError) throw e;
     throw new SmaltError('SMALT_PLAN', 'the plan is not valid JSON');
   }
 }

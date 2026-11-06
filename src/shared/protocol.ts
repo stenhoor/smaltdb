@@ -40,8 +40,9 @@ export type Request = { id: number } & (
    * A statement given as plan data (ADR 0014 section 4): `plan` is its JSON text (engine/plan/codec.ts
    * `encodeDataJSON`), in plan format `planVersion`. Parameters are positional.
    */
-  | { op: 'queryPlan'; plan: string; planVersion: number; params?: readonly (SqlValue | boolean | undefined)[]; batchSize?: number; credit?: number }
-  | { op: 'preparePlan'; plan: string; planVersion: number }
+  /** `data`: the plan's typed arrays (values given as columns), which its JSON refers to as `{$data: i}`; `transfer`: their buffers were handed over. */
+  | { op: 'queryPlan'; plan: string; planVersion: number; data?: unknown[]; transfer?: true; params?: readonly (SqlValue | boolean | undefined)[]; batchSize?: number; credit?: number }
+  | { op: 'preparePlan'; plan: string; planVersion: number; data?: unknown[]; transfer?: true }
   | { op: 'stmtRun'; stmt: number; params?: Params }
   | { op: 'stmtQuery'; stmt: number; params?: Params; batchSize?: number; credit?: number }
   | { op: 'finalize'; stmt: number }

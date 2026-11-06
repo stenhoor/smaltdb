@@ -1723,6 +1723,33 @@ export class Values implements Operator {
   close(): void {}
 }
 
+/** Rows from one array per column (`values` with `columns`): each value read where it is, nothing copied. */
+export class ColumnValues implements Operator {
+  readonly children: Operator[] = [];
+  readonly detail = 'SCAN COLUMNS';
+  private r!: SqlValue[];
+  private i = 0;
+  private readonly length: number;
+  constructor(
+    readonly columns: readonly ((i: number) => SqlValue)[],
+    length: number,
+    readonly outRegs: number[],
+  ) {
+    this.length = length;
+  }
+  open(r: SqlValue[]): void {
+    this.r = r;
+    this.i = 0;
+  }
+  next(): boolean {
+    if (this.i >= this.length) return false;
+    const i = this.i++;
+    for (let j = 0; j < this.columns.length; j++) this.r[this.outRegs[j]] = this.columns[j](i);
+    return true;
+  }
+  close(): void {}
+}
+
 /** UNION ALL / UNION / INTERSECT / EXCEPT over children that all write the same registers. */
 export class Compound implements Operator {
   readonly children: Operator[];

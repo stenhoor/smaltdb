@@ -15,7 +15,7 @@ import { type IndexEval, type IndexSchema, type TableSchema, isColumnar, storage
 import { type BTree, BTreeCursor } from '../storage/btree.js';
 import { KEY_AFTER_NULL, decodeKey, rowidSuffixStart } from '../storage/key-codec.js';
 import { RecordReader } from '../storage/record.js';
-import { Collation, type SqlValue } from '../values.js';
+import { Collation, type SqlValue, normalizeInt } from '../values.js';
 import { type Affinity, type StaticType, affinityOfStorage, hashKey, hashKeyMulti, staticTypeOfStorage, truthy } from './convert.js';
 import {
   CollSrc,
@@ -76,6 +76,7 @@ import {
   TableAccess,
   TableScan,
   Values,
+  ColumnValues,
   RecursiveCte,
   VirtualScan,
   WorkingScan,
@@ -84,7 +85,7 @@ import {
 import { type ColumnStore, ROW_GROUP_ROWS, type Zone, zoneMayMatch } from '../storage/columnar.js';
 import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
 import { type BoundExpr, type PlanExpr, lit } from '../plan/expr.js';
-import type { AggCall, JoinKind, PlanOp, SortKey as PlanSortKey } from '../plan/ops.js';
+import type { AggCall, ColumnArray, JoinKind, PlanOp, SortKey as PlanSortKey, ValueColumn } from '../plan/ops.js';
 import type { CollationName } from '../plan/types.js';
 import type { ExternalSource } from '../external/external.js';
 
@@ -779,10 +780,19 @@ export class Planner {
       scope.correlated = true;
       return outer!(shallower(c));
     };
-    const compiled = op.rows.map((r) => r.map((e) => compileBoundExpr(rebind(e, f, (m, g) => this.subqueryExpr(m, g)), this.env.funcCtx)));
-    const regs = outRegs ?? compiled[0].map(() => this.regs.alloc());
-    const columns = given ?? compiled[0].map((c, i) => ({ name: `column${i + 1}`, type: c.type, collation: Collation.Binary, affinity: 'NONE' as Affinity }));
-    let root: Operator = new Values(compiled.map((r) => r.map((c) => c.fn)), regs);
+    let root: Operator;
+    let regs: number[];
+    let columns: ResultColumnInfo[];
+    if (op.columns) {
+      regs = outRegs ?? op.types.map(() => this.regs.alloc());
+      columns = given ?? op.types.map((type, i) => ({ name: `column${i + 1}`, type, collation: Collation.Binary, affinity: 'NONE' as Affinity }));
+      root = new ColumnValues(op.columns.map(columnReader), columnLength(op.columns[0]), regs);
+    } else {
+      const compiled = op.rows.map((r) => r.map((e) => compileBoundExpr(rebind(e, f, (m, g) => this.subqueryExpr(m, g)), this.env.funcCtx)));
+      regs = outRegs ?? compiled[0].map(() => this.regs.alloc());
+      columns = given ?? compiled[0].map((c, i) => ({ name: `column${i + 1}`, type: c.type, collation: Collation.Binary, affinity: 'NONE' as Affinity }));
+      root = new Values(compiled.map((r) => r.map((c) => c.fn)), regs);
+    }
     if (sort) root = new Sort(root, sort.map((k) => ({ ...this.resultKey(k, regs, columns), collation: Collation.Binary })), regs, undefined, this.env.spill ?? null);
     return { root, outRegs: regs, columns, correlated: scope.correlated };
   }
@@ -2529,6 +2539,26 @@ function fromLeaves(op: PlanOp, out: FromLeaf[] = []): FromLeaf[] | null {
   if (right.op === 'join' || !fromLeaves(op.inputs[0], out)) return null;
   out.push({ op: right, join: op.kind, ...(op.on ? { on: op.on } : {}) });
   return out;
+}
+
+/** The number of values in a column of `values` (0 for none). */
+function columnLength(c: ValueColumn | undefined): number {
+  if (c === undefined) return 0;
+  const data = 'nulls' in c && !ArrayBuffer.isView(c) ? c.data : c;
+  return (data as ArrayLike<unknown>).length;
+}
+
+/** Value `i` of a column of `values`: NULL where its bitmap says so, NaN as NULL, integers beyond 2^53 as bigints. */
+function columnReader(c: ValueColumn): (i: number) => SqlValue {
+  const wrapped = !ArrayBuffer.isView(c) && !Array.isArray(c);
+  const data = (wrapped ? (c as { data: ColumnArray | readonly SqlValue[] }).data : c) as ColumnArray | readonly SqlValue[];
+  const nulls = wrapped ? (c as { nulls: Uint8Array }).nulls : null;
+  let read: (i: number) => SqlValue;
+  if (data instanceof BigInt64Array) read = (i) => normalizeInt(data[i]);
+  else if (data instanceof Float64Array || data instanceof Float32Array) read = (i) => (Number.isNaN(data[i]) ? null : data[i]);
+  else if (ArrayBuffer.isView(data)) read = (i) => (data as Exclude<ColumnArray, BigInt64Array>)[i];
+  else read = (i) => (data as readonly SqlValue[])[i] ?? null;
+  return nulls ? (i) => (nulls[i >>> 3] & (1 << (i & 7)) ? null : read(i)) : read;
 }
 
 /** The number of columns a plan outputs. */
