@@ -42,14 +42,17 @@ Each operation's output columns, in order:
 | Operation | Fields | Output |
 |---|---|---|
 | `scan` | `table`, `columns` (table column indexes, -1 the rowid), `db?` (`main` / `temp`), `indexedBy?` | the listed columns. `table` may name a view: its query, bound by its language when the plan is compiled ([views](./languages#views)) |
-| `values` | `rows` (expressions over no columns), `types` | one column per value |
+| `values` | `rows` (expressions over no columns), `types`, `columns?` (the values as data: see below) | one column per value |
 | `source` | `kind` (`function` / `virtual` / `external`), `name`, `schema?`, `args`, `named?`, `types` | the source's columns (a table function, `information_schema.*`, an external table) |
 | `filter` | `input`, `pred` | its input's |
 | `project` | `input`, `exprs` | one column per expression |
 | `sort` | `input`, `keys` | its input's |
 | `limit` | `input`, `count`, `offset?`, `fromEnd?` (`true`) | its input's |
+| `sample` | `input`, `count?` or `fraction?`, `replace`, `seed` | its input's |
+| `pivot` | `input`, `keys`, `on`, `collation`, `values`, `aggs`, `ordered?` | its keys, then one column per value and aggregate call (value by value) |
+| `unpivot` | `input`, `keep` (columns kept), `columns` (columns that become rows), `names` (one per column), `type` (of the values) | the kept columns, then each row's column name (`text`), then its value |
 | `distinct` | `input`, `collations` (one per column), `ordered?` (`'first'`), `on?`, `keep?` (`'first'` / `'last'`) | its input's |
-| `join` | `kind`, `inputs` (left, right), `on?`, `ordered?` (`true`) | the left input's, then the right's (`semi` / `anti`: the left's only) |
+| `join` | `kind`, `inputs` (left, right), `on?`, `ordered?` (`true`), `asof?` (kind `asof`) | the left input's, then the right's (`semi` / `anti`: the left's only) |
 | `aggregate` | `input`, `keys`, `aggs`, `carry`, `ordered?` (`'first'`) | its keys, then one per aggregate call, then the carried columns |
 | `window` | `input`, `partition`, `order`, `frame`, `calls` | its input's, then one per window call |
 | `setop` | `kind` (`union` / `unionAll` / `intersect` / `except`), `inputs`, `collations` | the first input's |
@@ -59,8 +62,16 @@ Each operation's output columns, in order:
 | `update` | `table`, `db`, `input`, `rowid`, `sets`, `from`, `onConflict?`, `returning?` | the RETURNING rows |
 | `delete` | `table`, `db`, `input`, `rowid`, `returning?` | the RETURNING rows |
 
-**Joins.** `kind` is `inner`, `left`, `right`, `full`, `cross`, `semi` (left rows with a match) or `anti` (left rows
-without one). The condition reads input 0 (the left side) and input 1 (the right side).
+**Joins.** `kind` is `inner`, `left`, `right`, `full`, `cross`, `semi` (left rows with a match), `anti` (left rows
+without one) or `asof`. The condition reads input 0 (the left side) and input 1 (the right side).
+
+**As-of joins.** A join of kind `asof` gives each left row, in left order, the right row whose key is nearest its own,
+or NULLs when none is. `asof` is `{ left, right, direction, tolerance? }`: the left row's key (over input 0), the right
+row's (over input 1), and `direction`: `backward` takes the largest right key at or below the left's, `forward` the
+smallest at or above, `nearest` the closest (ties to the smaller key). `tolerance`, an expression over no columns, is
+the largest distance allowed. `on` limits the candidates (for example, the same symbol). The engine runs it as a join
+under these conditions, ranked per left row: with an equality in `on` it uses that to find candidates; without one,
+it compares every pair of rows.
 
 **Order.** These operations keep an order, whatever plan the engine picks:
 
@@ -90,6 +101,33 @@ These operations are defined by order:
   `on` compares every column. The kept rows come in input order, or with `ordered: 'first'` in the order of each set's
   first row.
 
+**Values from columns.** `values` may give its rows as data instead of expressions: `columns`, one per type, all of
+one length, with `rows` empty. A column is a typed array (`Float64Array`, `Float32Array`, `Int32Array`, `Int16Array`,
+`Int8Array`, `Uint32Array`, `Uint16Array`, `Uint8Array`, or `BigInt64Array` for integers beyond 2^53), an array of values, or either as
+`{ data, nulls }` with a null bitmap (bit `i % 8` of byte `i >> 3` set when value `i` is NULL, as results carry them). NaN in a float
+array reads as NULL. The engine reads the values where they are. In JSON a typed array is `{"$typed": "f64", "data":
+[…]}`; through the client it crosses to the worker as binary data beside the plan's JSON (see [running
+plans](./running#through-the-client)).
+
+```ts
+import { plan as p } from 'smaltdb/engine';
+
+const fruit = p.fromColumns([new Int32Array([1, 2, 3]), ['apple', 'pear', 'plum'], new Float64Array([1.5, 0.5, 2])], ['int', 'text', 'real']);
+```
+
+**Sample.** A `sample` draws rows at random, fixed by its integer `seed`: `count` rows, or a `fraction` of the input's
+(expressions over no columns; exactly one of them). Without `replace`, it takes that many distinct rows (all of them
+when there are fewer) and keeps their input order. With `replace`, it makes that many draws, each any row, and gives
+the rows in the order drawn.
+
+**Pivot.** A `pivot` turns values of `on` into columns: one row per group of `keys` (as `aggregate` groups), then for
+each of `values`, in order, each of `aggs` over the group's rows whose `on` equals that value by `collation` (a NULL
+value matches NULL). The values are given in the plan: a dynamic pivot reads them first, then builds the plan.
+
+**Unpivot.** An `unpivot` turns columns into rows: each input row gives one row per column in `columns`, in input
+order and then the columns' order, holding the `keep` columns, the column's name from `names`, and its value. NULL
+values give rows too.
+
 **Sort keys** (`SortKey`) are `{ expr, desc, nullsFirst, collation }`.
 
 **Aggregates.** `keys` are `{ expr, collation }`. Each call (`AggCall`) is
@@ -102,7 +140,10 @@ also over no input rows.
 keys) and `frame` (`{ unit: 'ROWS' | 'RANGE' | 'GROUPS', start, end, exclude }`, each bound
 `{ kind, offset? }` with `kind` `unboundedPreceding`, `preceding`, `currentRow`, `following` or `unboundedFollowing`).
 A call (`WindowCall`) is a ranking function (`row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`),
-a navigation function (`lag`, `lead`, `first_value`, `last_value`, `nth_value`) or an aggregate over the frame.
+a navigation function (`lag`, `lead`, `first_value`, `last_value`, `nth_value`) or an aggregate over the frame. A
+navigation call with `ignoreNulls: true` counts only rows whose value is not NULL: `lag(x, 2)` is the second earlier
+non-NULL `x` (its default when there is none), and `first_value`, `last_value` and `nth_value` skip NULLs in the
+frame.
 
 **Writes.** `append` assigns its input's columns to the table's `columns` (-1 the rowid; the others take their
 defaults). `update` and `delete` take the target rows from `input`, the rowid in its column `rowid`; `update`'s `sets`
@@ -179,6 +220,7 @@ picks the one it means. smaltdf, for example, divides with `div_float` where SQL
 | `mod_floor` | 2 | The remainder of `div_floor`, with the sign of the divisor (`-7, 2` gives `1`). By zero is NULL |
 | `round_half_even` | 1 or 2 | `x` rounded to `digits` places (default 0) with halves to even, decided on the exact binary value (`0.125` gives `0.12`, `2.675` gives `2.67`). REAL |
 | `round_half_away` | 1 or 2 | The same with halves away from zero: `round` |
+| `random_at` | 2 | A value in [0, 1) fixed by an integer `seed` and `index`: the same arguments always give the same value (`sample` ranks rows by it) |
 | `lower_unicode`, `upper_unicode` | 1 | Case mapping of every script (`straße` gives `STRASSE`); `lower` and `upper` map ASCII only |
 | `regex_match` | 2 or 3 | Whether `text` matches `pattern`: 1, 0 or NULL |
 | `regex_find` | 2 or 3 | The first match of `pattern` in `text`, or NULL |
@@ -198,10 +240,10 @@ NULLs first). They check nothing: the engine validates every plan it is given, b
 |---|---|
 | Expressions | `col(input, index, type, collation?, depth?)`, `lit(value, type?)`, `value(v)`, `param(index, type?)`, `call(fn, args, type, collation?)`, `cast(fn, arg, to)`, `and(...)`, `or(...)`, `not(x)`, `isNull(x)`, `isNotNull(x)`, `caseWhen(whens, type, otherwise?)`, `scalar(plan, type, collation?)`, `exists(plan)`, `inPlan(probe, plan, collation?)` |
 | Sort keys, aggregates | `asc(expr, options?)`, `desc(expr, options?)`, `agg(fn, args, type, options?)` |
-| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `setop(kind, left, right, width)` |
+| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `asofJoin(left, right, leftKey, rightKey, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `sample(input, { count } or { fraction }, options?)`, `pivot(input, keys, on, values, aggs, options?)`, `unpivot(input, keep, columns, names, type?)`, `setop(kind, left, right, width)` |
+| Windows | `window(input, calls, options?)` (`partition`, `collations`, `order`, `frame`; the frame defaults to the partition's rows up to the current row and its peers), `windowCall(fn, args, type, options?)`, `frame(unit, start, end, exclude?)` with `unboundedPreceding`, `preceding(n)`, `currentRow`, `following(n)`, `unboundedFollowing` |
+| Sources and recursion | `source(kind, name, args, types, options?)`, `iterate(id, name, init, steps, options?)`, `working(id, types)` |
 | Writes | `append(table, input, columns, options?)`, `update(table, input, rowid, sets, options?)`, `remove(table, input, rowid, options?)` |
-
-`window`, `source`, `iterate` and `working` have no builder yet: write them as objects.
 
 ```ts
 import { plan as p } from 'smaltdb/engine';

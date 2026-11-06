@@ -69,6 +69,35 @@ class Validator {
 
   constructor(private readonly catalog: ValidateCatalog) {}
 
+  /** A `values` operation's columns: one per type, all of one length, with values and null bitmaps that are such. */
+  private valueColumns(cs: unknown, width: number, rows: number): void {
+    const l = this.list(cs, 'columns');
+    if (rows > 0) this.fail('expected no rows beside columns', 'rows');
+    if (l.length !== width) this.fail(`expected ${width} columns, one per type`, 'columns');
+    let length: number | undefined;
+    for (let i = 0; i < l.length; i++) {
+      const c = l[i] as { data?: unknown; nulls?: unknown } | undefined;
+      const wrapped = c !== null && typeof c === 'object' && !Array.isArray(c) && !ArrayBuffer.isView(c);
+      const data = wrapped ? c.data : c;
+      let n: number;
+      if (ArrayBuffer.isView(data) && !(data instanceof DataView) && !(data instanceof BigUint64Array) && !(data instanceof Uint8ClampedArray)) {
+        n = (data as unknown as ArrayLike<unknown>).length;
+      } else if (Array.isArray(data)) {
+        n = data.length;
+        for (let j = 0; j < n; j++) {
+          const v = data[j];
+          if (!(v === null || typeof v === 'number' || typeof v === 'bigint' || typeof v === 'string' || v instanceof Uint8Array)) this.fail(`expected a value at ${j}`, 'columns', i);
+        }
+      } else this.fail('expected a typed array, an array of values, or { data, nulls }', 'columns', i);
+      if (wrapped) {
+        const nulls = c.nulls;
+        if (!(nulls instanceof Uint8Array) || nulls.length < (n + 7) >>> 3) this.fail(`expected a null bitmap of at least ${(n + 7) >>> 3} bytes`, 'columns', i);
+      }
+      if (length === undefined) length = n;
+      else if (n !== length) this.fail(`expected ${length} values, as the first column has`, 'columns', i);
+    }
+  }
+
   private fail(message: string, ...more: (string | number)[]): never {
     const path = ['plan', ...this.at.slice(1, this.top), ...more].map((x) => (typeof x === 'number' ? `[${x}]` : `.${x}`)).join('').slice(1);
     throw new Invalid(path, message);
@@ -235,6 +264,7 @@ class Validator {
           });
           exprs(rows[i], scopes, `rows[${i}]`);
         }
+        if (o.columns !== undefined) this.valueColumns(o.columns, w, rows.length);
         return w;
       }
       case 'iterate': {
@@ -289,6 +319,17 @@ class Validator {
         if (!JOIN_KINDS.has(o.kind)) this.fail(`unknown join kind ${JSON.stringify(o.kind)}`, 'kind');
         optEx(o.on, reading(l, r), 'on');
         if (o.ordered !== undefined && o.ordered !== true) this.fail('expected true', 'ordered');
+        if ((o.kind === 'asof') !== (o.asof !== undefined)) this.fail(o.kind === 'asof' ? 'an asof join needs its match { left, right, direction }' : 'only an asof join has a match', 'asof');
+        if (o.asof) {
+          const m = o.asof;
+          this.under('asof', undefined, () => {
+            if (!m || typeof m !== 'object') this.fail('expected { left, right, direction, tolerance? }');
+            ex(m.left, reading(l, r), 'left');
+            ex(m.right, reading(l, r), 'right');
+            if (m.direction !== 'backward' && m.direction !== 'forward' && m.direction !== 'nearest') this.fail(`unknown direction ${JSON.stringify(m.direction)}`, 'direction');
+            optEx(m.tolerance, reading(), 'tolerance');
+          });
+        }
         return o.kind === 'semi' || o.kind === 'anti' ? l : l + r;
       }
       case 'setop': {
@@ -324,6 +365,57 @@ class Validator {
         orderedFirst(o.ordered);
         return o.keys.length + o.aggs.length + o.carry.length;
       }
+      case 'sample': {
+        const w = sub(o.input, 'input');
+        if ((o.count === undefined) === (o.fraction === undefined)) this.fail('expected a count or a fraction (one of them)');
+        optEx(o.count, reading(), 'count');
+        optEx(o.fraction, reading(), 'fraction');
+        if (typeof o.replace !== 'boolean') this.fail('expected true or false', 'replace');
+        if (!Number.isInteger(o.seed)) this.fail('expected an integer seed', 'seed');
+        return w;
+      }
+      case 'pivot': {
+        const w = sub(o.input, 'input');
+        const scopes = reading(w);
+        const keys = this.list(o.keys, 'keys');
+        for (let i = 0; i < keys.length; i++) {
+          const k = keys[i] as { expr: PlanExpr; collation: unknown };
+          this.under('keys', i, () => {
+            if (!k || typeof k !== 'object') this.fail('expected a key');
+            this.exprAt(k.expr, scopes, d, 'expr', undefined);
+            this.collation(k.collation, 'collation');
+          });
+        }
+        ex(o.on, scopes, 'on');
+        this.collation(o.collation, 'collation');
+        const values = this.list(o.values, 'values');
+        if (values.length === 0) this.fail('expected at least one value', 'values');
+        for (let i = 0; i < values.length; i++) {
+          const v = values[i];
+          if (!(v === null || typeof v === 'number' || typeof v === 'bigint' || typeof v === 'string' || v instanceof Uint8Array)) this.fail('expected a value', 'values', i);
+        }
+        const aggs = this.list(o.aggs, 'aggs');
+        if (aggs.length === 0) this.fail('expected at least one aggregate', 'aggs');
+        for (let i = 0; i < aggs.length; i++) this.under('aggs', i, () => (this.object(aggs[i]), this.aggCall(aggs[i] as never, scopes, d, false)));
+        orderedFirst(o.ordered);
+        return keys.length + values.length * aggs.length;
+      }
+      case 'unpivot': {
+        const w = sub(o.input, 'input');
+        const index = (l: readonly unknown[], field: string): void => {
+          for (let i = 0; i < l.length; i++) if (!Number.isInteger(l[i]) || (l[i] as number) < 0 || (l[i] as number) >= w) this.fail(`no column ${String(l[i])}`, field, i);
+        };
+        const keep = this.list(o.keep, 'keep');
+        index(keep, 'keep');
+        const cols = this.list(o.columns, 'columns');
+        if (cols.length === 0) this.fail('expected at least one column', 'columns');
+        index(cols, 'columns');
+        const names = this.list(o.names, 'names');
+        if (names.length !== cols.length) this.fail(`expected ${cols.length} names, one per column`, 'names');
+        for (let i = 0; i < names.length; i++) if (typeof names[i] !== 'string') this.fail('expected a name', 'names', i);
+        if (!TYPES.has(o.type)) this.fail(`unknown type ${JSON.stringify(o.type)}`, 'type');
+        return keep.length + 2;
+      }
       case 'distinct': {
         const w = sub(o.input, 'input');
         if (this.list(o.collations, 'collations').length !== w) this.fail(`expected ${w} collations`, 'collations');
@@ -357,7 +449,16 @@ class Validator {
         optEx(o.frame.start.offset, reading(), 'frame.start.offset');
         optEx(o.frame.end.offset, reading(), 'frame.end.offset');
         const calls = this.list(o.calls, 'calls');
-        for (let i = 0; i < calls.length; i++) this.under('calls', i, () => (this.object(calls[i]), this.aggCall(calls[i] as never, scopes, d, true)));
+        for (let i = 0; i < calls.length; i++)
+          this.under('calls', i, () => {
+            this.object(calls[i]);
+            this.aggCall(calls[i] as never, scopes, d, true);
+            const c = calls[i] as { fn: string; ignoreNulls?: unknown };
+            if (c.ignoreNulls !== undefined) {
+              if (typeof c.ignoreNulls !== 'boolean') this.fail('expected true or false', 'ignoreNulls');
+              if (c.ignoreNulls && !NAVIGATION_FUNCTIONS.has(c.fn)) this.fail(`${c.fn} does not ignore NULLs (only lag, lead, first_value, last_value and nth_value do)`, 'ignoreNulls');
+            }
+          });
         return w + o.calls.length;
       }
       case 'delete': {
@@ -796,5 +897,6 @@ export function validateSchemaOp(op: unknown, catalog: ValidateCatalog): void {
 const PATH: (string | number)[] = new Array<string | number>(2 * MAX_PLAN_DEPTH + 8).fill('');
 
 const CONFLICT_ACTIONS = new Set(['rollback', 'abort', 'fail', 'ignore', 'replace']);
-const JOIN_KINDS = new Set(['inner', 'left', 'right', 'full', 'semi', 'anti', 'cross']);
+const NAVIGATION_FUNCTIONS = new Set(['lag', 'lead', 'first_value', 'last_value', 'nth_value']);
+const JOIN_KINDS = new Set(['inner', 'left', 'right', 'full', 'semi', 'anti', 'cross', 'asof']);
 const SETOP_KINDS = new Set(['union', 'unionAll', 'intersect', 'except']);

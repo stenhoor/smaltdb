@@ -8,7 +8,7 @@
  */
 import type { SqlValue } from '../values.js';
 import { call, col, lit, param, type PlanExpr, typeOf } from './expr.js';
-import type { AggCall, ConflictAction, JoinKind, PlanOp, SortKey } from './ops.js';
+import type { AggCall, ConflictAction, JoinKind, PlanOp, SortKey, ValueColumn, WindowCall, WindowFrame } from './ops.js';
 import type { CollationName, PlanType } from './types.js';
 
 type Op<K extends PlanOp['op']> = Extract<PlanOp, { op: K }>;
@@ -63,6 +63,9 @@ export const scan = (table: string, columns: readonly number[], options: { db?: 
 /** Constant rows; `types` default to the first row's. */
 export const values = (rows: readonly (readonly PlanExpr[])[], types?: readonly PlanType[]): Op<'values'> => ({ op: 'values', rows, types: types ?? (rows[0] ?? []).map(typeOfLit) });
 
+/** Rows given as one array per column (typed arrays, value arrays, or either with a null bitmap), of `types`. */
+export const fromColumns = (columns: readonly ValueColumn[], types: readonly PlanType[]): Op<'values'> => ({ op: 'values', rows: [], types, columns });
+
 export const filter = (input: PlanOp, pred: PlanExpr): Op<'filter'> => ({ op: 'filter', input, pred });
 export const project = (input: PlanOp, exprs: readonly PlanExpr[]): Op<'project'> => ({ op: 'project', input, exprs });
 export const limit = (input: PlanOp, count: PlanExpr | number, offset?: PlanExpr | number, options: { fromEnd?: boolean } = {}): Op<'limit'> => ({
@@ -81,6 +84,18 @@ export const join = (kind: JoinKind, left: PlanOp, right: PlanOp, on?: PlanExpr,
   ...(on ? { on } : {}),
   ...(options.ordered ? { ordered: true as const } : {}),
 });
+/**
+ * An as-of join: each left row, in left order, with the right row whose `rightKey` is nearest its `leftKey` in
+ * `direction` (within `tolerance`) among those `on` matches, or NULLs when none does. Keys read input 0 (left) and 1.
+ */
+export const asofJoin = (left: PlanOp, right: PlanOp, leftKey: PlanExpr, rightKey: PlanExpr, options: { direction?: 'backward' | 'forward' | 'nearest'; tolerance?: PlanExpr | number; on?: PlanExpr } = {}): Op<'join'> => ({
+  op: 'join',
+  kind: 'asof',
+  inputs: [left, right],
+  ...(options.on ? { on: options.on } : {}),
+  asof: { left: leftKey, right: rightKey, direction: options.direction ?? 'backward', ...(options.tolerance !== undefined ? { tolerance: expr(options.tolerance) } : {}) },
+});
+
 /** Rows grouped by `keys`: outputs the keys, then the aggregates, then the carried columns. */
 export const aggregate = (input: PlanOp, keys: readonly PlanExpr[], aggs: readonly AggCall[], options: { collations?: readonly CollationName[]; carry?: readonly PlanExpr[]; ordered?: 'first' } = {}): Op<'aggregate'> => ({
   op: 'aggregate',
@@ -90,6 +105,38 @@ export const aggregate = (input: PlanOp, keys: readonly PlanExpr[], aggs: readon
   carry: options.carry ?? [],
   ...(options.ordered ? { ordered: options.ordered } : {}),
 });
+/**
+ * Rows drawn from `input` at random, fixed by `seed`: `count` of them or a `fraction` of its rows. Without replacement
+ * the rows keep their input order; with it they come in the order drawn.
+ */
+export const sample = (input: PlanOp, size: { count: PlanExpr | number } | { fraction: PlanExpr | number }, options: { replace?: boolean; seed?: number } = {}): Op<'sample'> => ({
+  op: 'sample',
+  input,
+  ...('count' in size ? { count: expr(size.count) } : { fraction: expr(size.fraction) }),
+  replace: options.replace ?? false,
+  seed: options.seed ?? 0,
+});
+
+/**
+ * Values of `on` as columns (a wide form): one row per group of `keys`, then for each of `values` and each of `aggs`
+ * the aggregate over the group's rows whose `on` is that value.
+ */
+export const pivot = (input: PlanOp, keys: readonly PlanExpr[], on: PlanExpr, values: readonly SqlValue[], aggs: readonly AggCall[], options: { collations?: readonly CollationName[]; collation?: CollationName; ordered?: 'first' } = {}): Op<'pivot'> => ({
+  op: 'pivot',
+  input,
+  keys: keys.map((e, i) => ({ expr: e, collation: options.collations?.[i] ?? 'binary' })),
+  on,
+  collation: options.collation ?? 'binary',
+  values,
+  aggs,
+  ...(options.ordered ? { ordered: options.ordered } : {}),
+});
+
+/**
+ * `input`'s `columns` as rows (a long form): each input row gives one row per column, in input order and then the
+ * columns' order, with the `keep` columns, the column's name (from `names`) and its value (of `type`).
+ */
+export const unpivot = (input: PlanOp, keep: readonly number[], columns: readonly number[], names: readonly string[], type: PlanType = 'any'): Op<'unpivot'> => ({ op: 'unpivot', input, keep, columns, names, type });
 /** Distinct rows of an input with `width` columns. */
 export const distinct = (input: PlanOp, width: number, collations?: readonly CollationName[], options: { ordered?: 'first'; on?: readonly number[]; keep?: 'first' | 'last' } = {}): Op<'distinct'> => ({
   op: 'distinct',
@@ -101,6 +148,85 @@ export const distinct = (input: PlanOp, width: number, collations?: readonly Col
 });
 /** A set operation of two inputs with `width` columns each. */
 export const setop = (kind: Op<'setop'>['kind'], left: PlanOp, right: PlanOp, width: number, collations?: readonly CollationName[]): Op<'setop'> => ({ op: 'setop', kind, inputs: [left, right], collations: collations ?? Array<CollationName>(width).fill('binary') });
+
+// ------------------------------------------------------------------ windows
+
+/** A frame bound: `unboundedPreceding`, `preceding(n)`, `currentRow`, `following(n)`, `unboundedFollowing`. */
+export type FrameBound = WindowFrame['start'];
+export const unboundedPreceding: FrameBound = { kind: 'unboundedPreceding' };
+export const currentRow: FrameBound = { kind: 'currentRow' };
+export const unboundedFollowing: FrameBound = { kind: 'unboundedFollowing' };
+export const preceding = (offset: PlanExpr | number): FrameBound => ({ kind: 'preceding', offset: expr(offset) });
+export const following = (offset: PlanExpr | number): FrameBound => ({ kind: 'following', offset: expr(offset) });
+/** A window frame: its unit, bounds and exclusion. */
+export const frame = (unit: WindowFrame['unit'], start: FrameBound, end: FrameBound, exclude: WindowFrame['exclude'] = 'NO OTHERS'): WindowFrame => ({ unit, start, end, exclude });
+
+/** A window call: a ranking or navigation function, or an aggregate over the frame. */
+export const windowCall = (fn: string, args: readonly PlanExpr[], type: PlanType, options: { star?: boolean; filter?: PlanExpr; collation?: CollationName; ignoreNulls?: boolean } = {}): WindowCall => ({
+  fn,
+  args,
+  star: options.star ?? false,
+  type,
+  collation: options.collation ?? 'binary',
+  ...(options.filter ? { filter: options.filter } : {}),
+  ...(options.ignoreNulls ? { ignoreNulls: true } : {}),
+});
+
+/**
+ * The window `calls` over `input`: its columns, then one per call. Rows are grouped by `partition` and ordered by
+ * `order` within it; the frame defaults to the partition's rows up to the current row and its peers (the whole
+ * partition without an order).
+ */
+export const window = (
+  input: PlanOp,
+  calls: readonly WindowCall[],
+  options: { partition?: readonly PlanExpr[]; collations?: readonly CollationName[]; order?: readonly SortKey[]; frame?: WindowFrame } = {},
+): Op<'window'> => ({
+  op: 'window',
+  input,
+  partition: (options.partition ?? []).map((e, i) => ({ expr: e, collation: options.collations?.[i] ?? 'binary' })),
+  order: options.order ?? [],
+  frame: options.frame ?? frame('RANGE', unboundedPreceding, currentRow),
+  calls,
+});
+
+// ------------------------------------------------------------------ sources and recursion
+
+/** Rows of a table function, a virtual table or an external table: `types` describes each of its columns. */
+export const source = (kind: Op<'source'>['kind'], name: string, args: readonly PlanExpr[], types: readonly PlanType[], options: { schema?: string; named?: Readonly<Record<string, PlanExpr>> } = {}): Op<'source'> => ({
+  op: 'source',
+  kind,
+  name,
+  args,
+  types,
+  ...(options.schema !== undefined ? { schema: options.schema } : {}),
+  ...(options.named ? { named: options.named } : {}),
+});
+
+/**
+ * Recursion: `init`'s rows, then each step's over the rows the previous one gave (read with `working(id, types)`),
+ * until a step gives none. `distinct` drops rows already given (by `collations`).
+ */
+export const iterate = (
+  id: number,
+  name: string,
+  init: PlanOp,
+  steps: readonly PlanOp[],
+  options: { distinct?: boolean; collations?: readonly CollationName[]; order?: readonly SortKey[]; limit?: PlanExpr | number; offset?: PlanExpr | number } = {},
+): Op<'iterate'> => ({
+  op: 'iterate',
+  id,
+  name,
+  init,
+  steps,
+  distinct: options.distinct ?? false,
+  collations: options.collations ?? [],
+  ...(options.order ? { order: options.order } : {}),
+  ...(options.limit !== undefined ? { limit: expr(options.limit) } : {}),
+  ...(options.offset !== undefined ? { offset: expr(options.offset) } : {}),
+});
+/** Inside `iterate` `id`: the rows the previous step gave. */
+export const working = (id: number, types: readonly PlanType[]): Op<'working'> => ({ op: 'working', id, types });
 
 /** Rows of `input` appended to `table`, its columns assigned to the table's `columns` (-1: the rowid). */
 export const append = (table: string, input: PlanOp | null, columns: readonly number[], options: { db?: 'main' | 'temp'; onConflict?: ConflictAction; returning?: readonly PlanExpr[] } = {}): Op<'append'> => ({

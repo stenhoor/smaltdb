@@ -16,6 +16,17 @@
  */
 import type { PlanExpr, PlanOrigin } from './expr.js';
 import type { CollationName, PlanType } from './types.js';
+import type { SqlValue } from '../values.js';
+
+/** A typed array a column of values may be. */
+export type ColumnArray = Float64Array | Float32Array | Int32Array | Int16Array | Int8Array | Uint32Array | Uint16Array | Uint8Array | BigInt64Array;
+
+/**
+ * A column of `values` given as data: a typed array (numbers; `BigInt64Array`: integers), an array of values, or
+ * either with a null bitmap (`nulls`: bit `i % 8` of byte `i >> 3` set when value `i` is NULL, as results carry them).
+ * NaN in a float array reads as NULL.
+ */
+export type ValueColumn = ColumnArray | readonly SqlValue[] | { readonly data: ColumnArray | readonly SqlValue[]; readonly nulls: Uint8Array };
 
 export interface SortKey {
   readonly expr: PlanExpr;
@@ -51,9 +62,29 @@ export interface WindowCall {
   readonly filter?: PlanExpr;
   readonly type: PlanType;
   readonly collation: CollationName;
+  /**
+   * Navigation functions (`lag`, `lead`, `first_value`, `last_value`, `nth_value`): count only rows whose value is not
+   * NULL (ADR 0016 section 5). `lag(x, 2)` is then the second earlier non-NULL `x`; `first_value(x)` the frame's first
+   * non-NULL `x`.
+   */
+  readonly ignoreNulls?: boolean;
 }
 
-export type JoinKind = 'inner' | 'left' | 'right' | 'full' | 'semi' | 'anti' | 'cross';
+export type JoinKind = 'inner' | 'left' | 'right' | 'full' | 'semi' | 'anti' | 'cross' | 'asof';
+
+/**
+ * An as-of join's match (ADR 0016 section 5): each left row takes the right row whose key is nearest its own in
+ * `direction` (`backward`: the largest right key at or below the left's; `forward`: the smallest at or above; `nearest`:
+ * the closest, ties to the smaller key), within `tolerance` when given, among the right rows the join's `on` matches.
+ */
+export interface AsofMatch {
+  /** The left row's key (over input 0) and the right row's (over input 1). */
+  readonly left: PlanExpr;
+  readonly right: PlanExpr;
+  readonly direction: 'backward' | 'forward' | 'nearest';
+  /** The largest distance between the keys, an expression over no columns. */
+  readonly tolerance?: PlanExpr;
+}
 
 /**
  * What a write does when a row violates a constraint, for the whole statement (SQL's `INSERT OR …` / `UPDATE OR …`).
@@ -104,7 +135,14 @@ export type PlanOp = OpMeaning & (
   /** The previous step's rows inside an `iterate` with the same `id`. */
   | { readonly op: 'working'; readonly id: number; readonly types: readonly PlanType[] }
   /** Constant rows (VALUES, and the single empty row of a SELECT without FROM). */
-  | { readonly op: 'values'; readonly rows: readonly (readonly PlanExpr[])[]; readonly types: readonly PlanType[] }
+  | {
+      readonly op: 'values';
+      /** Rows of expressions over no columns; empty when the values are given as `columns`. */
+      readonly rows: readonly (readonly PlanExpr[])[];
+      readonly types: readonly PlanType[];
+      /** The values as one array per column, all of one length (ADR 0016 section 5): data, not expressions. */
+      readonly columns?: readonly ValueColumn[];
+    }
   | { readonly op: 'filter'; readonly input: PlanOp; readonly pred: PlanExpr }
   | { readonly op: 'project'; readonly input: PlanOp; readonly exprs: readonly PlanExpr[] }
   | {
@@ -122,6 +160,8 @@ export type PlanOp = OpMeaning & (
       readonly on?: PlanExpr;
       /** Keep the left input's order, and for each left row its matches in the right input's order (ADR 0016 section 4). */
       readonly ordered?: true;
+      /** An `asof` join's match: required for that kind, and for no other. */
+      readonly asof?: AsofMatch;
     }
   | { readonly op: 'setop'; readonly kind: 'union' | 'unionAll' | 'intersect' | 'except'; readonly inputs: readonly [PlanOp, PlanOp]; readonly collations: readonly CollationName[] }
   | { readonly op: 'sort'; readonly input: PlanOp; readonly keys: readonly SortKey[] }
@@ -134,6 +174,43 @@ export type PlanOp = OpMeaning & (
       readonly carry: readonly PlanExpr[];
       /** Give the groups in the order of their first row (ADR 0016 section 4). */
       readonly ordered?: 'first';
+    }
+  | {
+      readonly op: 'sample';
+      readonly input: PlanOp;
+      /** How many rows: `count`, or `fraction` of the input's (expressions over no columns); exactly one. */
+      readonly count?: PlanExpr;
+      readonly fraction?: PlanExpr;
+      /** With replacement a row may be drawn more than once, and rows come in the order drawn. */
+      readonly replace: boolean;
+      /** The same seed gives the same rows from the same input. */
+      readonly seed: number;
+    }
+  | {
+      readonly op: 'pivot';
+      readonly input: PlanOp;
+      /** The columns that group rows: one output row per group. */
+      readonly keys: readonly { readonly expr: PlanExpr; readonly collation: CollationName }[];
+      /** The column whose values become output columns, and the collation it is compared by. */
+      readonly on: PlanExpr;
+      readonly collation: CollationName;
+      /** The values of `on` that become columns, in order (dynamic pivot reads them first, then builds this). */
+      readonly values: readonly SqlValue[];
+      /** The aggregates computed over each group's rows with each value: one output column per value and call. */
+      readonly aggs: readonly AggCall[];
+      readonly ordered?: 'first';
+    }
+  | {
+      readonly op: 'unpivot';
+      readonly input: PlanOp;
+      /** Input columns kept on every output row. */
+      readonly keep: readonly number[];
+      /** Input columns whose values become rows: one output row per input row and column, in this order. */
+      readonly columns: readonly number[];
+      /** The name each of `columns` gives its rows (the output's name column). */
+      readonly names: readonly string[];
+      /** The plan type of the value column. */
+      readonly type: PlanType;
     }
   | {
       readonly op: 'distinct';

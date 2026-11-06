@@ -8,7 +8,7 @@
  *
  * SQL's plans have this layering already and are not normalized.
  */
-import { type PlanExpr, typeOf } from '../plan/expr.js';
+import { lit, type PlanExpr, typeOf } from '../plan/expr.js';
 import type { AggCall, PlanOp, SortKey, WindowCall } from '../plan/ops.js';
 import { SmaltError } from '../errors.js';
 import { planWidth } from './planner.js';
@@ -31,7 +31,7 @@ function rewrite(op: PlanOp): PlanOp {
 }
 
 function rewriteAll(x: unknown): unknown {
-  if (x === null || typeof x !== 'object') return x;
+  if (x === null || typeof x !== 'object' || ArrayBuffer.isView(x)) return x; // data (values' columns, blobs) holds no plans
   if (Array.isArray(x)) {
     let out: unknown[] | undefined;
     for (let i = 0; i < x.length; i++) {
@@ -51,6 +51,7 @@ function rewriteAll(x: unknown): unknown {
   const op = (out ?? o) as unknown as PlanOp;
   switch (op.op) {
     case 'join':
+      if (op.kind === 'asof') return rewriteAll(asofJoin(op));
       return op.kind === 'semi' || op.kind === 'anti' ? semiJoin(op) : op.ordered ? orderedJoin(op) : op;
     case 'aggregate': {
       const positioned = firstLast(op);
@@ -60,6 +61,15 @@ function rewriteAll(x: unknown): unknown {
       return op.on || op.keep ? keptRows(op) : op.ordered ? orderedGroups(distinctGroups(op)) : op;
     case 'limit':
       return op.fromEnd ? fromEnd(op) : op;
+    case 'sample':
+      // Its rewrite holds windows and, with replacement, an ordered join: rewritten in turn.
+      return rewriteAll(sampleRows(op));
+    case 'pivot':
+      // Its rewrite is an aggregate, which may be ordered: rewritten in turn.
+      return rewriteAll(pivotGroups(op));
+    case 'unpivot':
+      // Its rewrite is an ordered join: rewritten in turn.
+      return rewriteAll(unpivotRows(op));
     default:
       return op;
   }
@@ -86,7 +96,7 @@ function numbered(input: PlanOp): PlanOp {
   return { op: 'window', input, partition: [], order: [], frame: WHOLE, calls: [ROW_NUMBER] };
 }
 
-const column = (index: number, type: 'int' | 'any' = 'any'): PlanExpr => ({ k: 'col', input: 0, index, depth: 0, type, collation: 'binary' });
+const column = (index: number, type: 'int' | 'text' | 'any' = 'any'): PlanExpr => ({ k: 'col', input: 0, index, depth: 0, type, collation: 'binary' });
 const range = (from: number, to: number): PlanExpr[] => Array.from({ length: to - from }, (_, i) => column(from + i));
 /** `op` without its `ordered` flag. */
 function unordered<T extends { ordered?: unknown }>(op: T): T {
@@ -150,6 +160,140 @@ function keptRows(op: Op<'distinct'>): PlanOp {
   let kept: PlanOp = { op: 'filter', input: sets, pred: cmp('cmp_eq', pos, column(op.keep === 'last' ? w + 2 : w + 1, 'int')) };
   if (op.ordered) kept = { op: 'sort', input: kept, keys: [{ expr: column(w + 1, 'int'), desc: false, nullsFirst: false, collation: 'binary' }] };
   return { op: 'project', input: kept, exprs: range(0, w) };
+}
+
+/** Ids for the `iterate` operations rewrites make (above any a plan is likely to use). */
+let rewriteIterates = 2 ** 30;
+
+/**
+ * A sample. Without replacement: the input numbered and counted, ranked by a value fixed by the seed and each row's
+ * position (`random_at`), the first `count` (or `fraction` × the count) kept, and the input order restored. With it:
+ * that many draws (an `iterate` counting them), each the row at a position fixed by the seed and the draw's number,
+ * joined in the order drawn.
+ */
+function sampleRows(op: Op<'sample'>): PlanOp {
+  const w = planWidth(op.input);
+  const at = (e: PlanExpr): PlanExpr => ({ k: 'call', fn: 'random_at', args: [{ k: 'lit', value: op.seed, type: 'int' }, e], type: 'real' });
+  const mul = (a: PlanExpr, b: PlanExpr): PlanExpr => ({ k: 'call', fn: 'mul', args: [a, b], type: 'any' });
+  const add1 = (e: PlanExpr): PlanExpr => ({ k: 'call', fn: 'add', args: [e, { k: 'lit', value: 1, type: 'int' }], type: 'any' });
+  const pos = column(w, 'int');
+  if (!op.replace) {
+    const counted: PlanOp = { op: 'window', input: op.input, partition: [], order: [], frame: EVERY_ROW, calls: [ROW_NUMBER, call('count', [], true)] };
+    const ranked: PlanOp = { op: 'window', input: counted, partition: [], order: [{ expr: at(pos), desc: false, nullsFirst: false, collation: 'binary' }], frame: WHOLE, calls: [ROW_NUMBER] };
+    const n = op.count ?? mul(op.fraction!, column(w + 1, 'int'));
+    const kept: PlanOp = { op: 'filter', input: ranked, pred: cmp('cmp_le', column(w + 2, 'int'), n) };
+    const inOrder: PlanOp = { op: 'sort', input: kept, keys: [{ expr: pos, desc: false, nullsFirst: false, collation: 'binary' }] };
+    return { op: 'project', input: inOrder, exprs: range(0, w), ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+  }
+  const total: PlanExpr = { k: 'subquery', mode: 'scalar', plan: { op: 'aggregate', input: op.input, keys: [], aggs: [{ fn: 'count', args: [], star: true, distinct: false, collation: 'binary', type: 'int' }], carry: [] }, type: 'int', collation: 'binary' };
+  const n = op.count ?? mul(op.fraction!, total);
+  const id = rewriteIterates++;
+  const zero: PlanExpr = { k: 'lit', value: 0, type: 'int' };
+  const draws: PlanOp = {
+    op: 'iterate',
+    id,
+    name: 'sample',
+    init: { op: 'filter', input: { op: 'values', rows: [[zero]], types: ['int'] }, pred: cmp('cmp_lt', zero, n) },
+    steps: [{ op: 'filter', input: { op: 'project', input: { op: 'working', id, types: ['int'] }, exprs: [add1(column(0, 'int'))] }, pred: cmp('cmp_lt', column(0, 'int'), n) }],
+    distinct: false,
+    collations: ['binary'],
+  };
+  // Each draw: its number, and the position of the row it takes (1 … the count).
+  const targets: PlanOp = { op: 'project', input: draws, exprs: [column(0, 'int'), add1({ k: 'call', fn: 'floor', args: [mul(at(column(0, 'int')), total)], type: 'any' })] };
+  const on = cmp('cmp_eq', column(1, 'int'), { k: 'col', input: 1, index: w, depth: 0, type: 'int', collation: 'binary' });
+  const joined: PlanOp = { op: 'join', kind: 'inner', inputs: [targets, numbered(op.input)], on, ordered: true };
+  return { op: 'project', input: joined, exprs: range(2, 2 + w), ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+}
+
+/** A pivot as an aggregate whose calls each read the rows of one value of `on` (a filter beside the call's own). */
+function pivotGroups(op: Op<'pivot'>): PlanOp {
+  const aggs = op.values.flatMap((v) => {
+    const match: PlanExpr = v === null ? { k: 'isNull', arg: op.on, not: false } : { k: 'call', fn: 'cmp_eq', args: [op.on, lit(v)], type: 'int', collation: op.collation };
+    return op.aggs.map((a) => ({ ...a, filter: a.filter ? { k: 'and' as const, args: [a.filter, match] } : match }));
+  });
+  return { op: 'aggregate', input: op.input, keys: op.keys, aggs, carry: [], ...(op.ordered ? { ordered: op.ordered } : {}), ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+}
+
+/**
+ * An unpivot as the input crossed with one row per column (its position and name), in order (an ordered join keeps
+ * the input's order, then the columns'), each output row taking its column's value.
+ */
+function unpivotRows(op: Op<'unpivot'>): PlanOp {
+  const w = planWidth(op.input);
+  const which: PlanOp = { op: 'values', rows: op.names.map((n, k) => [{ k: 'lit', value: k, type: 'int' }, { k: 'lit', value: n, type: 'text' }]), types: ['int', 'text'] };
+  const crossed: PlanOp = { op: 'join', kind: 'cross', inputs: [op.input, which], ordered: true };
+  const value: PlanExpr = {
+    k: 'case',
+    whens: op.columns.map((c, k) => ({ when: cmp('cmp_eq', column(w, 'int'), { k: 'lit', value: k, type: 'int' }), then: column(c) })),
+    else: { k: 'lit', value: null, type: 'any' },
+    type: op.type,
+  };
+  return { op: 'project', input: crossed, exprs: [...op.keep.map((i) => column(i)), column(w + 1, 'text'), value], ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+}
+
+/**
+ * An as-of join as the left input (numbered) left-joined to the right rows its match allows, the best of them per left
+ * row ranked by a window (closest key first), the left order restored, and the numbers dropped.
+ */
+function asofJoin(op: Op<'join'>): PlanOp {
+  const m = op.asof!;
+  const [left, right] = op.inputs;
+  const l = planWidth(left);
+  const r = planWidth(right);
+  const lk = m.left;
+  const rk = m.right;
+  const conds: PlanExpr[] = [];
+  if (op.on) conds.push(op.on);
+  const distance = (a: PlanExpr, b: PlanExpr): PlanExpr => minus(a, b);
+  if (m.direction === 'backward') conds.push(cmp('cmp_le', rk, lk));
+  if (m.direction === 'forward') conds.push(cmp('cmp_ge', rk, lk));
+  if (m.direction === 'nearest') conds.push({ k: 'isNull', arg: minus(lk, rk), not: true });
+  if (m.tolerance) {
+    const gap: PlanExpr = m.direction === 'backward' ? distance(lk, rk) : m.direction === 'forward' ? distance(rk, lk) : { k: 'call', fn: 'abs', args: [minus(lk, rk)], type: 'any' };
+    conds.push(cmp('cmp_le', gap, m.tolerance));
+  }
+  // The joined row: the left columns, its number (at l), then the right columns (from l + 1).
+  const joined: PlanOp = { op: 'join', kind: 'left', inputs: [numbered(left), right], on: conds.length === 1 ? conds[0] : { k: 'and', args: conds } };
+  const shiftRight = (e: PlanExpr): PlanExpr => joinedColumns(e, l + 1);
+  const lkJ = joinedColumns(lk, l + 1);
+  const rkJ = shiftRight(rk);
+  const order: SortKey[] =
+    m.direction === 'backward'
+      ? [{ expr: rkJ, desc: true, nullsFirst: false, collation: 'binary' }]
+      : m.direction === 'forward'
+        ? [{ expr: rkJ, desc: false, nullsFirst: false, collation: 'binary' }]
+        : [
+            { expr: { k: 'call', fn: 'abs', args: [minus(lkJ, rkJ)], type: 'any' }, desc: false, nullsFirst: false, collation: 'binary' },
+            { expr: rkJ, desc: false, nullsFirst: false, collation: 'binary' },
+          ];
+  const width = l + 1 + r;
+  const ranked: PlanOp = { op: 'window', input: joined, partition: [{ expr: column(l, 'int'), collation: 'binary' }], order, frame: WHOLE, calls: [ROW_NUMBER] };
+  const best: PlanOp = { op: 'filter', input: ranked, pred: cmp('cmp_eq', column(width, 'int'), { k: 'lit', value: 1, type: 'int' }) };
+  const inOrder: PlanOp = { op: 'sort', input: best, keys: [{ expr: column(l, 'int'), desc: false, nullsFirst: false, collation: 'binary' }] };
+  return { op: 'project', input: inOrder, exprs: [...range(0, l), ...range(l + 1, l + 1 + r)], ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+}
+
+/** A join expression (input 0 the left, 1 the right) over the joined row: the right's columns from `at`. */
+function joinedColumns(e: PlanExpr, at: number): PlanExpr {
+  switch (e.k) {
+    case 'col':
+      return e.depth === 0 && e.input === 1 ? { ...e, input: 0, index: e.index + at } : e;
+    case 'call':
+    case 'and':
+    case 'or':
+      return { ...e, args: e.args.map((a) => joinedColumns(a, at)) };
+    case 'cast':
+    case 'not':
+    case 'isNull':
+      return { ...e, arg: joinedColumns(e.arg, at) };
+    case 'case':
+      return { ...e, whens: e.whens.map((w) => ({ when: joinedColumns(w.when, at), then: joinedColumns(w.then, at) })), else: joinedColumns(e.else, at) };
+    case 'subquery':
+    case 'inSubquery':
+      throw new SmaltError('SMALT_UNSUPPORTED', 'an asof join whose keys hold a subquery is not supported yet');
+    default:
+      return e;
+  }
 }
 
 /** A distinct as an aggregate grouped by every column, with no aggregate calls. */
