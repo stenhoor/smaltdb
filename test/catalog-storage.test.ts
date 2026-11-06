@@ -29,13 +29,13 @@ describe('catalog storage', () => {
     d.close();
     d = open(vfs);
     // CHECKs were bound at CREATE TABLE and stored bound: opening binds nothing and still has them.
-    const p = (d as unknown as { bindContext(): BindContext }).bindContext().getTable('p')!;
+    const p = d.getTable('p')!;
     expect(p.checks.map((c) => [c.name, c.text, c.expr?.k])).toEqual([[undefined, 'n >= 0', 'call'], ['short', 'length(code) < 5', 'call']]);
     expect(d.query('SELECT big, hex(b), r FROM c').rows).toEqual([[9223372036854775807n, '00FF', Infinity]]);
     expect(() => d.exec('INSERT INTO p(code, n) VALUES (\'x\', -1)')).toThrow(/CHECK constraint failed: n >= 0/);
     expect(() => d.exec("INSERT INTO p(code) VALUES ('AB')")).toThrow(/UNIQUE/);
     expect(d.query('SELECT * FROM pv ORDER BY i').rows).toEqual([[1, 'AB'], [2, 'CD']]);
-    const idx = (d as unknown as { bindContext(): BindContext }).bindContext().getTable('c')!.indexes.find((i) => i.name === 'c_expr')!;
+    const idx = d.getTable('c')!.indexes.find((i) => i.name === 'c_expr')!;
     expect(idx.columns[0].expr).toMatchObject({ text: 'pid * 2', expr: { k: 'call', fn: 'sql.mul' } });
     expect(idx.where).toMatchObject({ text: 'pid IS NOT NULL', expr: { k: 'isNull' } });
     expect(d.query('SELECT id FROM c INDEXED BY c_expr WHERE pid * 2 = 2 AND pid IS NOT NULL').rows).toEqual([[1]]);

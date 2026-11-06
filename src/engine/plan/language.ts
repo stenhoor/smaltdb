@@ -8,7 +8,6 @@
  * The engine carries none: SQL is smaltql's, which registers itself (`import 'smaltql/register'`) or through a worker
  * entry (`defineWorker({ languages })`), ADR 0015.
  */
-import type { TableSchema } from '../catalog/schema.js';
 import type { CatalogTable } from './catalog.js';
 import type { SqlValue } from '../values.js';
 import type { BindContext } from './bind-context.js';
@@ -51,14 +50,14 @@ export interface SmaltLanguage {
   parseOne(source: string): LanguageStatement;
   /**
    * The CHECK and DEFAULT expressions of a stored table that its definition holds unbound (a DEFAULT naming a function
-   * that did not exist when the table was made), bound from the table's source where first used.
+   * that did not exist when the table was made), bound from the table's source (`table.source`) where first used.
    */
-  bindStoredExprs(table: TableSchema, ctx: BindContext): { checks: PlanExpr[]; defaults: (PlanExpr | null)[] };
+  bindTableExprs(table: CatalogTable, ctx: BindContext): { checks: PlanExpr[]; defaults: (PlanExpr | null)[] };
   /**
-   * `bindStoredExprs` for a table as the catalog describes it (its source text in `table.source`). Preferred when a
-   * language has it; `bindStoredExprs` is being replaced by it (ADR 0016 section 7).
+   * The engine no longer calls this (it calls `bindTableExprs`). Kept optional, and ignored, until languages that
+   * still define it have dropped it (ADR 0016 section 7).
    */
-  bindTableExprs?(table: CatalogTable, ctx: BindContext): { checks: PlanExpr[]; defaults: (PlanExpr | null)[] };
+  bindStoredExprs?(...args: never[]): unknown;
   /** A stored view's or materialized view's query (its CREATE statement's source), bound where it is read. */
   bindView(source: Source, ctx: BindContext): BoundQuery;
   /**

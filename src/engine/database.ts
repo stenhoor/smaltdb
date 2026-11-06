@@ -1210,9 +1210,6 @@ export class Database implements FunctionContext {
       table: (n, schema) => this.described(this.plannedTable(n, schema)),
       writeTable: (n, schema) => this.described(this.targetTable(n, schema))!,
       indexTable: (n, schema) => this.described(this.indexTarget(n, schema))!,
-      getTable: (n, schema) => this.plannedTable(n, schema),
-      writeTarget: (n, schema) => this.targetTable(n, schema),
-      indexTarget: (n, schema) => this.indexTarget(n, schema),
       getView: (n, schema) => this.getView(n, schema),
       isExternal: (n) => this.externals.has(n.toLowerCase()),
       externalColumns: (n) => this.externalTableScan(n)?.columns,
@@ -1244,11 +1241,14 @@ export class Database implements FunctionContext {
     return {
       env: { getTable, openTree: (root) => this.tree(root), funcCtx: this, state: this.state },
       catalog: {
-        getTable,
         table: (n) => this.described(getTable(n)),
         writeTable: (n, schema) => this.described(this.targetTable(n, schema))!,
         indexTable: (n, schema) => this.described(this.indexTarget(n, schema))!,
-        writeTarget: (n, schema) => this.targetTable(n, schema), indexTarget: (n, schema) => this.indexTarget(n, schema), getView: (n) => this.getView(n), isExternal: (n) => this.externals.has(n.toLowerCase()), catalog: this.catalog, funcCtx: this },
+        getView: (n) => this.getView(n),
+        isExternal: (n) => this.externals.has(n.toLowerCase()),
+        catalog: this.catalog,
+        funcCtx: this,
+      },
     };
   }
 
@@ -1309,8 +1309,6 @@ export class Database implements FunctionContext {
       ...base,
       table: (n, schema) => (note(n, schema), base.table(n, schema)),
       writeTable: (n, schema) => (note(n, schema), base.writeTable(n, schema)),
-      getTable: (n, schema) => (note(n, schema), base.getTable(n, schema)),
-      writeTarget: (n, schema) => (note(n, schema), base.writeTarget(n, schema)),
       getView: (n, schema) => {
         const v = base.getView?.(n, schema);
         if (v && this.tempViews.get(v.name.toLowerCase()) === v) memory = true;
@@ -3652,7 +3650,7 @@ export class Database implements FunctionContext {
     // made is bound where first used, from the table's source. A failure is the binder's error.
     if (checks.some((c) => !c.expr) || defaults.some((d) => d && !d.expr)) {
       const lang = this.languageOf(table.language ?? 'sql');
-      const b = lang.bindTableExprs ? lang.bindTableExprs(this.described(table)!, this.bindContext()) : lang.bindStoredExprs(table, this.bindContext());
+      const b = lang.bindTableExprs(this.described(table)!, this.bindContext());
       checks = checks.map((c, i) => (c.expr ? c : { ...c, expr: b.checks[i] }));
       defaults = defaults.map((d, i) => (d && !d.expr ? { ...d, expr: b.defaults[i]! } : d));
     }

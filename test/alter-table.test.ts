@@ -139,7 +139,7 @@ describe('ALTER TABLE', () => {
 describe('ALTER TABLE changes stored definitions', () => {
   const reopen = (vfs: MemoryVfs): Database => Database.openFile(vfs.openSync('d.db'), {}, vfs.openSync('d.db-wal'));
   const checks = (d: Database, table: string): unknown =>
-    (d as unknown as { bindContext(): { getTable(n: string): { checks: { text: string; name?: string }[] } } }).bindContext().getTable(table)!.checks.map((c) => c.name ?? c.text);
+    d.getTable(table)!.checks.map((c) => c.name ?? c.text);
 
   it('DROP COLUMN moves later columns, the rowid and expressions over them', () => {
     const vfs = new MemoryVfs();

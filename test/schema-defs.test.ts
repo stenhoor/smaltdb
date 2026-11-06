@@ -49,7 +49,7 @@ describe('schema definitions', () => {
     const db = await Database.open(new MemoryVfs(), 'db');
     db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT CHECK (a >= 0), b TEXT DEFAULT ('x' || 'y'), CONSTRAINT pos CHECK (length(b) < 9))");
     db.exec('CREATE INDEX ta ON t(a * 2) WHERE b IS NOT NULL');
-    const t = (db as unknown as { bindContext(): BindContext }).bindContext().getTable('t')!;
+    const t = db.getTable('t')!;
     expect(t.checks.map((c) => [c.name, c.text, c.expr?.k])).toEqual([[undefined, 'a >= 0', 'call'], ['pos', 'length(b) < 9', 'call']]);
     expect(t.columns[2].default).toMatchObject({ text: "'x' || 'y'", expr: { k: 'call' }, value: null });
     const idx = t.indexes.find((i) => i.name === 'ta')!;

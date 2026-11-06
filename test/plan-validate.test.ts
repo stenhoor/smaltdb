@@ -27,7 +27,7 @@ describe('plan validator', () => {
     const db = await Database.open(new MemoryVfs(), 'db');
     db.exec('CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, s TEXT); CREATE TABLE u(x INT, y REAL)');
     const ctx = (db as unknown as { bindContext(): BindContext }).bindContext();
-    const live: ValidateCatalog = { tableColumns: (n) => ctx.getTable(n)?.columns.length };
+    const live: ValidateCatalog = { tableColumns: (n) => ctx.table(n)?.columns.length };
     for (const q of [
       'SELECT a, count(*), sum(x) FILTER (WHERE y > 1) FROM t JOIN u ON u.x = t.a GROUP BY a HAVING count(*) > ? ORDER BY 2 LIMIT 3',
       'SELECT id, (SELECT max(y) FROM u WHERE u.x = t.a) FROM t WHERE a IN (SELECT x FROM u WHERE y > t.id)',

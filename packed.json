@@ -2,5 +2,5 @@
   "smaltdb": { "path": "." },
   "@smaltdb/io": { "repo": "stenhoor/smaltdb-io", "ref": "790774c28828b9eb5942464a33f40fbeef022138" },
   "@smaltdb/external": { "repo": "stenhoor/smaltdb-external", "ref": "1f2c6976b440263128b6f3d886d15e17dd78cd73" },
-  "smaltql": { "repo": "stenhoor/smaltql", "ref": "e777042c027de042cee090475fbf7f156ca51ea3" }
+  "smaltql": { "repo": "stenhoor/smaltql", "ref": "aa40d925094926c9741bd26f0bd71e5ecaf5b221" }
 }
