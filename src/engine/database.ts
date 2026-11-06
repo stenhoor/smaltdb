@@ -1307,6 +1307,8 @@ export class Database implements FunctionContext {
     };
     const ctx: BindContext = {
       ...base,
+      table: (n, schema) => (note(n, schema), base.table(n, schema)),
+      writeTable: (n, schema) => (note(n, schema), base.writeTable(n, schema)),
       getTable: (n, schema) => (note(n, schema), base.getTable(n, schema)),
       writeTarget: (n, schema) => (note(n, schema), base.writeTarget(n, schema)),
       getView: (n, schema) => {

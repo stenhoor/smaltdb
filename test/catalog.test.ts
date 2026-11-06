@@ -197,6 +197,15 @@ describe('tables while binding', () => {
     expect(d.catalog.table('mv')!.source).toEqual({ language: 'sql', text: expect.stringMatching(/SELECT count\(\*\)/) });
   });
 
+  it('counts a TEMP table found with table() or writeTable() as a memory object the statement reads', () => {
+    const d = db();
+    d.exec('CREATE TEMP TABLE scratch(a INT)');
+    const binding = (lookup: (ctx: BindContext) => unknown) => ({ text: '', paramCount: 0, paramNames: [], bind: (ctx: BindContext) => (lookup(ctx), { kind: 'transaction' }) }) as never;
+    expect(d.bindsMemoryObjects(binding((ctx) => ctx.table('scratch')))).toBe(true);
+    expect(d.bindsMemoryObjects(binding((ctx) => ctx.writeTable('scratch')))).toBe(true);
+    expect(d.bindsMemoryObjects(binding((ctx) => ctx.table('t')))).toBe(false);
+  });
+
   it('follows CREATE INDEX on a table it described', () => {
     const d = db();
     const ctx = (d as unknown as { bindContext(): BindContext }).bindContext();
