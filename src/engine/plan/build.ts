@@ -21,6 +21,8 @@ export const and = (...args: PlanExpr[]): PlanExpr => ({ k: 'and', args });
 export const or = (...args: PlanExpr[]): PlanExpr => ({ k: 'or', args });
 export const not = (arg: PlanExpr): PlanExpr => ({ k: 'not', arg });
 export const isNull = (arg: PlanExpr): PlanExpr => ({ k: 'isNull', arg, not: false });
+/** A logic node (`and`, `or`, `not`, `isNull`) typed `bool` (or `int`) explicitly (ADR 0018). */
+export const typed = <E extends PlanExpr>(e: E, type: 'bool' | 'int'): E => ({ ...e, type }) as E;
 export const isNotNull = (arg: PlanExpr): PlanExpr => ({ k: 'isNull', arg, not: true });
 /** A conversion: `fn` names it (e.g. `cast_integer`). */
 export const cast = (fn: string, arg: PlanExpr, to: PlanType): PlanExpr => ({ k: 'cast', fn, to, arg });

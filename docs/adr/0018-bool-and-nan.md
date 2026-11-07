@@ -142,7 +142,8 @@ One PR each:
    validator, results as `true` / `false` in process and through the client, and values from columns.
 5. **`BOOLEAN` storage:** the storage type, stored definitions, coercion on write, the catalog, and the docs
    (`plans.md`, `schema.md`, `catalog.md`).
-6. **smaltql:** declares its comparisons and logic `int`, converts NaN parameters and results to NULL (through a
+6. **smaltql:** declares its comparisons and logic `int` (then the engine's defaults become `bool`: the catalog's result
+   for comparisons and logic, and a logic node without `type`; until then they are `int`, so SQL is unchanged), converts NaN parameters and results to NULL (through a
    language hook for parameters the engine binds, which this step adds), and updates its pin. sqllogictest stays at its pass rate.
 7. **smaltdf:** `bool` from the engine (its own 0 / 1 conversion goes), `BOOLEAN` in `createTable`, NaN from `div`,
    and the Polars comparison table updated (`0 / 0` stops differing).

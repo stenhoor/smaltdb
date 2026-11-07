@@ -20,6 +20,7 @@ Three rules run through the format:
 | `PlanType` | Values |
 |---|---|
 | `int` | 64-bit integers: JavaScript numbers within ±(2^53 − 1), `bigint` beyond |
+| `bool` | truth values: 0 and 1 while a plan runs (an integer to every operation), `true` and `false` in results ([ADR 0018](../../adr/0018-bool-and-nan.md)) |
 | `real` | 64-bit floating point |
 | `num` | `int` or `real`, not known until run time |
 | `text` | strings |
@@ -28,6 +29,12 @@ Three rules run through the format:
 | `any` | not known until run time |
 
 A type is what the engine knows of a value ahead of time, used to pick specialized code: a value may always be NULL.
+
+A comparison or logic gives 0 / 1. A language says how its results show them by the type it declares: a `call` declared
+`bool` (`call('cmp_gt', args, 'bool')`) or a logic node typed `bool` gives `true` / `false` in results, declared `int`
+it gives 0 / 1 (as SQL's do). For now the engine's own default is `int` for both: the functions catalog reports
+`int`, and a logic node without `type` is `int`; both become `bool` once languages declare what they want (ADR 0018,
+step 6). A column of values may hold JavaScript booleans, as a `bool` column.
 
 | `CollationName` | Text compares |
 |---|---|
@@ -166,9 +173,9 @@ integer primary key, `null` any).
 | `param` | `index`, `type` | positional parameter `index` (0-based) |
 | `call` | `fn`, `args`, `type`, `collation?` | a function; `collation` is the rule a comparison-like function compares text by |
 | `cast` | `fn`, `to`, `arg` | a conversion, `fn` naming it (`cast_integer`, …) |
-| `and`, `or` | `args` | three-valued logic |
+| `and`, `or` | `args`, `type?` | three-valued logic; `type` is `bool` or `int` (left out: `int`, until languages declare it; see below) |
 | `not` | `arg` | three-valued NOT |
-| `isNull` | `arg`, `not` | 1 when `arg` is NULL (`not`: when it is not), never NULL |
+| `isNull` | `arg`, `not`, `type?` | 1 when `arg` is NULL (`not`: when it is not), never NULL; `type` as for `and` |
 | `case` | `whens` (`{ when, then }`), `else`, `type` | the `then` of the first `when` that is 1, else `else` |
 | `subquery` | `mode` (`scalar` / `exists`), `plan`, `type`, `collation` | the first column of the nested plan's first row (NULL if none), or whether it has a row |
 | `inSubquery` | `probe`, `plan`, `collation` | whether `probe` is in the nested plan's single column: 1, 0, or NULL |
@@ -246,7 +253,7 @@ NULLs first). They check nothing: the engine validates every plan it is given, b
 
 | | Builders |
 |---|---|
-| Expressions | `col(input, index, type, collation?, depth?)`, `lit(value, type?)`, `value(v)`, `param(index, type?)`, `call(fn, args, type, collation?)`, `cast(fn, arg, to)`, `and(...)`, `or(...)`, `not(x)`, `isNull(x)`, `isNotNull(x)`, `caseWhen(whens, type, otherwise?)`, `scalar(plan, type, collation?)`, `exists(plan)`, `inPlan(probe, plan, collation?)` |
+| Expressions | `col(input, index, type, collation?, depth?)`, `lit(value, type?)`, `value(v)`, `param(index, type?)`, `call(fn, args, type, collation?)`, `cast(fn, arg, to)`, `and(...)`, `or(...)`, `not(x)`, `isNull(x)`, `isNotNull(x)`, `typed(logic, 'bool' | 'int')`, `caseWhen(whens, type, otherwise?)`, `scalar(plan, type, collation?)`, `exists(plan)`, `inPlan(probe, plan, collation?)` |
 | Sort keys, aggregates | `asc(expr, options?)`, `desc(expr, options?)`, `agg(fn, args, type, options?)` |
 | Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `asofJoin(left, right, leftKey, rightKey, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `sample(input, { count } or { fraction }, options?)`, `pivot(input, keys, on, values, aggs, options?)`, `unpivot(input, keep, columns, names, type?)`, `setop(kind, left, right, width)` |
 | Windows | `window(input, calls, options?)` (`partition`, `collations`, `order`, `frame`; the frame defaults to the partition's rows up to the current row and its peers), `windowCall(fn, args, type, options?)`, `frame(unit, start, end, exclude?)` with `unboundedPreceding`, `preceding(n)`, `currentRow`, `following(n)`, `unboundedFollowing` |

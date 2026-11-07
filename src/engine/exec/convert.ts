@@ -7,7 +7,8 @@ import { type SqlValue, normalizeInt } from '../values.js';
  * Integral JS numbers are ambiguous between INTEGER and REAL at runtime, so REAL-ness is tracked
  * statically where SQLite semantics depend on it (division, typeof, text conversion).
  */
-export type StaticType = 'int' | 'real' | 'num' | 'text' | 'blob' | 'null' | 'any';
+/** `bool` (ADR 0018) is 0 / 1 at run time, an integer to every operation; results give it as `true` / `false`. */
+export type StaticType = 'int' | 'bool' | 'real' | 'num' | 'text' | 'blob' | 'null' | 'any';
 
 /** Column affinity used for comparisons (SQLite rules). */
 export type Affinity = 'INTEGER' | 'REAL' | 'NUMERIC' | 'TEXT' | 'BLOB' | 'NONE';

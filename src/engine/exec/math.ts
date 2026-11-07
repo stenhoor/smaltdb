@@ -210,7 +210,7 @@ function doubleArg(v: SqlValue): number {
   return n === null ? 0 : Number(n);
 }
 
-const isNumeric = (t: StaticType): boolean => t === 'int' || t === 'real' || t === 'num';
+const isNumeric = (t: StaticType): boolean => t === 'int' || t === 'bool' || t === 'real' || t === 'num';
 
 /** The REAL result of a double: NaN is NULL. */
 const real = (z: number): SqlValue => (z === z ? z : null);

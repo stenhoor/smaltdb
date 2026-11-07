@@ -38,7 +38,8 @@ export function outputTypes(op: PlanOp, tableTypes: TableTypes): PlanType[] {
     case 'setop': {
       const left = outputTypes(op.inputs[0], tableTypes);
       const right = outputTypes(op.inputs[1], tableTypes);
-      return left.map((t, i) => (t === right[i] ? t : 'any'));
+      // bool with int is int: the same 0 / 1 values (ADR 0018).
+      return left.map((t, i) => (t === right[i] ? t : (t === 'bool' || t === 'int') && (right[i] === 'bool' || right[i] === 'int') ? 'int' : 'any'));
     }
     case 'pivot':
       return [...op.keys.map((k) => typeOf(k.expr)), ...op.values.flatMap(() => op.aggs.map((a) => a.type))];

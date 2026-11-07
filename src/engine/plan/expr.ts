@@ -49,10 +49,15 @@ export interface ParamExpr extends ExprMeaning { readonly k: 'param'; readonly i
 export interface CallExpr<E> extends ExprMeaning { readonly k: 'call'; readonly fn: string; readonly args: readonly E[]; readonly type: PlanType; readonly collation?: CollationName }
 /** A conversion chosen by the language (`fn`, e.g. `cast_integer`). */
 export interface CastExpr<E> extends ExprMeaning { readonly k: 'cast'; readonly fn: string; readonly to: PlanType; readonly arg: E }
-/** Three-valued logic over 0 / 1 / NULL. */
-export interface LogicExpr<E> extends ExprMeaning { readonly k: 'and' | 'or'; readonly args: readonly E[] }
-export interface NotExpr<E> extends ExprMeaning { readonly k: 'not'; readonly arg: E }
-export interface IsNullExpr<E> extends ExprMeaning { readonly k: 'isNull'; readonly arg: E; readonly not: boolean }
+/**
+ * Three-valued logic over 0 / 1 / NULL. `type` (ADR 0018): `bool`, or `int` for a language that wants 0 / 1 in its
+ * results (the same values). Left out it is `int`, until languages declare it (ADR 0018 step 6); then `bool`.
+ */
+export interface LogicExpr<E> extends ExprMeaning { readonly k: 'and' | 'or'; readonly args: readonly E[]; readonly type?: LogicType }
+export interface NotExpr<E> extends ExprMeaning { readonly k: 'not'; readonly arg: E; readonly type?: LogicType }
+export interface IsNullExpr<E> extends ExprMeaning { readonly k: 'isNull'; readonly arg: E; readonly not: boolean; readonly type?: LogicType }
+/** The type a logic node gives: its values are 0 / 1 either way. */
+export type LogicType = 'bool' | 'int';
 /** Searched CASE: the first `when` that is true gives the value. */
 export interface CaseExpr<E> extends ExprMeaning { readonly k: 'case'; readonly whens: readonly { readonly when: E; readonly then: E }[]; readonly else: E; readonly type: PlanType }
 /** A dependent evaluation: the first column of the nested plan's first row, or whether it has a row. */
@@ -89,6 +94,7 @@ export function typeOf(e: BoundExpr): PlanType {
     case 'or':
     case 'not':
     case 'isNull':
+      return e.type ?? 'int';
     case 'inSubquery':
       return 'int';
     default:
