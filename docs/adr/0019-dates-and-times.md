@@ -1,6 +1,6 @@
 # ADR 0019: Dates and times
 
-- **Status:** proposed: the questions for the owner are at the end, each with a recommendation
+- **Status:** accepted with the owner's decisions of 2026-11-07 (at the end: each as recommended)
 - **Date:** 2026-11-07
 - **Builds on:** [ADR 0016](0016-plan-api-for-every-language.md) section 3 (types), item 3; [ADR 0018](0018-bool-and-nan.md)
   (the pattern: a static type over integers, a storage type, results converted at the boundary)
@@ -47,9 +47,9 @@ or bigints beyond 2^53) at run time, works well:
 | Type | Value at run time | Range at full speed (numbers) | Beyond |
 |---|---|---|---|
 | `date` | days since 1970-01-01 | any date | n/a (it fits in a number) |
-| `datetime` | µs since 1970-01-01T00:00:00 (Q1) | 1685 to 2255 | a bigint, exact, slower |
+| `datetime` | µs since 1970-01-01T00:00:00 (decision 1) | 1685 to 2255 | a bigint, exact, slower |
 | `time` | µs since midnight, 0 to 86,400,000,000 − 1 | all | n/a |
-| `duration` | µs (Q1) | ±285 years | a bigint |
+| `duration` | µs (decision 1) | ±285 years | a bigint |
 
 - **Plan types:** `date`, `time`, `datetime` and `duration` are plan types, as `bool` is. To every arithmetic and
   comparison operation they are integers.
@@ -58,7 +58,7 @@ or bigints beyond 2^53) at run time, works well:
   They join format 4, which is still unreleased, as `BOOLEAN` did.
 - **Index keys and zone maps:** they need nothing new; they are numbers.
 
-### 2. Time zones (Q2)
+### 2. Time zones (decision 2)
 
 - **`datetime` is wall-clock time with no zone**, as Polars' default `Datetime` is.
 - **Time zones:** a column can carry one IANA zone in its type, as `datetime(Europe/Paris)`. Its values are then
@@ -66,7 +66,7 @@ or bigints beyond 2^53) at run time, works well:
 - **Conversion** between zones uses `Intl.DateTimeFormat`, which every browser has. The engine carries no time zone
   database.
 
-### 3. Results (Q3)
+### 3. Results (decision 3)
 
 A result column of a temporal type gives each value as text, in a fixed format that sorts as the values do:
 
@@ -121,10 +121,10 @@ SQLite's date functions stay as they are. They are SQL's.
   - an array of JS `Date`s is a `datetime` (ms, so µs end in 000);
   - text in the result format parses.
 - **Parameters:** a JS `Date` binds as a `datetime`. Text stays text: a language converts it where it means a date.
-- **Parquet:** DATE and TIMESTAMP become `date` and `datetime` (micros, or nanos truncated, Q1). They are no longer
+- **Parquet:** DATE and TIMESTAMP become `date` and `datetime` (micros, or nanos truncated: decision 1). They are no longer
   text. A TIMESTAMP with `isAdjustedToUTC` gets the zone `UTC`.
 
-### 6. SQL (Q4)
+### 6. SQL (decision 4)
 
 SQLite has no date types, and smaltql keeps SQLite's meaning:
 - **Results:** a temporal column read by SQL gives the result format of section 3, which is SQLite's date text. So
@@ -141,7 +141,7 @@ SQLite has no date types, and smaltql keeps SQLite's meaning:
 - **Types and parts:** `date`, `datetime`, `time` and `duration` columns, `col(...).dt.year()` and the rest of
   section 4, `lit(new Date(...))`.
 - **Data in:** `frame({ d: [new Date(...)] })`.
-- **Collect** gives `Date` objects for `datetime` and ISO text for the others (Q3).
+- **Collect** gives `Date` objects for `datetime` and ISO text for the others (decision 3).
 - **Polars:** the comparison tests gain the `dt` functions.
 
 ## Order of work
@@ -151,12 +151,14 @@ One PR each, after this ADR:
 1. The types, storage and results: plan types, storage types (format 4), the result format and options, and values
    from columns.
 2. The operations: parts, truncation, offsets, arithmetic types, parse, format and casts.
-3. Time zones (if decided so in Q2): zoned `datetime` and `Intl`-based conversion.
+3. Time zones (decision 2): zoned `datetime` and `Intl`-based conversion.
 4. Parquet gives `date` and `datetime` (`stenhoor/smaltdb-parquet`).
 5. smaltql: comparisons with text, and SQLite's functions reading temporal values.
 6. smaltdf: the types, `dt`, collect, and the comparison tests.
 
-## Questions for the owner
+## Owner's decisions (2026-11-07)
+
+Each as recommended. The questions as they were put, with the recommendation taken:
 
 1. **Unit.**
    - **Recommendation:** one unit, µs, for `datetime`, `time` and `duration`, as Polars' default. Plan types stay
