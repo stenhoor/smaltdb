@@ -286,8 +286,14 @@ function compileSqlCall(e: Extract<BoundExpr, { k: 'call' }>, ctx: FunctionConte
         );
         return fold({ fn, type: 'int', collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: ops.every((o) => o.c.constant) });
       }
-      return call2(e.fn, sub(args[0]), sub(args[1]));
+      // Any other operation, with however many arguments it takes (a one-argument operation used to read a second).
+      return callN(e.fn, args.map(sub));
   }
+}
+
+function callN(name: string, cs: Compiled[]): Compiled {
+  const { fn, type } = sqlFunction(name).compile(cs, {});
+  return fold({ fn, type, collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: cs.every((c) => c.constant) });
 }
 
 function compileScalarCall(e: Extract<BoundExpr, { k: 'call' }>, ctx: FunctionContext): Compiled {

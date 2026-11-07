@@ -326,6 +326,78 @@ function arithmeticFn(op: string, a: SqlArg, b: SqlArg): { fn: Fn; type: StaticT
   };
 }
 
+// ------------------------------------------------------------------ checked arithmetic and strict casts
+
+/** Numbers only: the checked and strict operations take what their language has already typed. */
+function numberOperand(v: SqlValue, name: string): number | bigint {
+  if (typeof v === 'number' || typeof v === 'bigint') return v;
+  throw new SmaltError('SMALT_MISMATCH', `${name} takes numbers, not ${typeof v === 'string' ? 'text' : 'a blob'}`);
+}
+
+/**
+ * `add_checked`, `sub_checked`, `mul_checked`: as `add`, `sub`, `mul`, except that an integer result outside the
+ * 64-bit range is an error (`SMALT_RANGE`) rather than a real, and text is not converted.
+ */
+function checkedArithmeticFn(op: '+' | '-' | '*', name: string, a: SqlArg, b: SqlArg): { fn: Fn; type: StaticType } {
+  const fa = a.fn;
+  const fb = b.fn;
+  const real = a.type === 'real' || b.type === 'real';
+  const type: StaticType = real ? 'real' : a.type === 'int' && b.type === 'int' ? 'int' : 'num';
+  return {
+    fn: (r) => {
+      const x0 = fa(r);
+      if (x0 === null) return null;
+      const y0 = fb(r);
+      if (y0 === null) return null;
+      const x = numberOperand(x0, name);
+      const y = numberOperand(y0, name);
+      if (real || !isIntValue(x) || !isIntValue(y)) {
+        const fx = Number(x);
+        const fy = Number(y);
+        return realResult(op === '+' ? fx + fy : op === '-' ? fx - fy : fx * fy);
+      }
+      if (typeof x === 'number' && typeof y === 'number') {
+        const s = op === '+' ? x + y : op === '-' ? x - y : x * y;
+        if (Number.isSafeInteger(s)) return s === 0 ? 0 : s;
+      }
+      const bx = BigInt(x);
+      const by = BigInt(y);
+      const res = op === '+' ? bx + by : op === '-' ? bx - by : bx * by;
+      if (res < I64_MIN || res > I64_MAX) throw new SmaltError('SMALT_RANGE', `integer overflow in ${name}`);
+      return normalizeInt(res);
+    },
+    type,
+  };
+}
+
+const INTEGER_TEXT = /^\s*[+-]?\d+\s*$/;
+const NUMBER_TEXT = /^\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?\s*$/;
+
+/** `cast_integer_strict`: an integer, or an error for what is not one (no prefix of text, no saturation). */
+export function castToIntegerStrict(v: SqlValue): number | bigint | null {
+  if (v === null || typeof v === 'bigint') return v;
+  if (typeof v === 'number') {
+    const t = Math.trunc(v);
+    if (Number.isSafeInteger(t)) return t === 0 ? 0 : t;
+    if (Number.isFinite(t) && t >= -9223372036854775808 && t < 9223372036854775808) return normalizeInt(BigInt(t));
+    throw new SmaltError('SMALT_RANGE', `${v} does not fit in an integer`);
+  }
+  if (typeof v === 'string' && INTEGER_TEXT.test(v)) {
+    const n = BigInt(v.trim());
+    if (n >= I64_MIN && n <= I64_MAX) return normalizeInt(n);
+    throw new SmaltError('SMALT_RANGE', `${v.trim()} does not fit in an integer`);
+  }
+  throw new SmaltError('SMALT_MISMATCH', typeof v === 'string' ? `cannot convert text ${JSON.stringify(v)} to an integer` : 'cannot convert a blob to an integer');
+}
+
+/** `cast_real_strict`: a real, or an error for text that is not a number in full, and for blobs. */
+export function castToRealStrict(v: SqlValue): number | null {
+  if (v === null || typeof v === 'number') return v;
+  if (typeof v === 'bigint') return Number(v);
+  if (typeof v === 'string' && NUMBER_TEXT.test(v)) return Number(v.trim());
+  throw new SmaltError('SMALT_MISMATCH', typeof v === 'string' ? `cannot convert text ${JSON.stringify(v)} to a real` : 'cannot convert a blob to a real');
+}
+
 // ------------------------------------------------------------------ bit operators
 
 /** Bit operators by name. */
@@ -657,6 +729,17 @@ const OPERATIONS: ReadonlyMap<string, SqlFunction> = new Map<string, SqlFunction
   fixed('like', [2, 3], (args, o) => ({ fn: likeFn(false, args, o.negated ?? false), type: 'int' }), { pattern: true }),
   fixed('glob', [2, 3], (args, o) => ({ fn: likeFn(true, args, o.negated ?? false), type: 'int' }), { pattern: true }),
   fixed('in_list', [1, -1], (args, o) => ({ fn: inListFn(args, o), type: 'int' }), { inList: true }),
+  fixed('add_checked', 2, ([a, b]) => checkedArithmeticFn('+', 'add_checked', a, b)),
+  fixed('sub_checked', 2, ([a, b]) => checkedArithmeticFn('-', 'sub_checked', a, b)),
+  fixed('mul_checked', 2, ([a, b]) => checkedArithmeticFn('*', 'mul_checked', a, b)),
+  fixed('cast_integer_strict', 1, ([x]) => {
+    const f = x.fn;
+    return { fn: (r) => castToIntegerStrict(f(r)), type: 'int' };
+  }),
+  fixed('cast_real_strict', 1, ([x]) => {
+    const f = x.fn;
+    return { fn: (r) => castToRealStrict(f(r)), type: 'real' };
+  }),
   fixed('cast_integer', 1, ([x]) => {
     const f = x.fn;
     return { fn: (r) => castToInteger(f(r)), type: 'int' };
