@@ -76,7 +76,9 @@
   - **Record format**: a null bitmap, then fixed-width columns at fixed offsets, then a variable-width offset table, then variable data.
     Unlike SQLite's varint serial types, fixed offsets let the executor decode a single column without parsing the whole record.
     INTEGER, BOOLEAN (0 and 1, ADR 0018), DATE, DATETIME, TIME, DURATION (days and µs, ADR 0019) and REAL columns are
-    fixed-width (8 bytes); the BOOLEAN and temporal columns are stored as an INTEGER is.
+    fixed-width (8 bytes); the BOOLEAN and temporal columns are stored as an INTEGER is. LIST and STRUCT columns
+    (ADR 0020) are variable-width and stored as an ANY column holding a BLOB is (tag byte and bytes): their value is a
+    sequence of key components (section 4) with no terminator.
   - Records carry the schema version so `ALTER TABLE ADD COLUMN` can be lazy.
 - Interior pages store **suffix-truncated** separator keys: the shortest prefix that separates two leaves.
 - **Leaf sibling pointers** support fast range scans in both directions.
@@ -226,7 +228,7 @@ Original plan:
 
 - Current format: **4.0**, unreleased (smaltdb 0.8.3 wrote format 3). Format 4 stores definitions instead of SQL text
   (ADR 0015 step 7) and, before 0.9.0, gains ADR 0018's types: NaN's own key tag and zone maps that order it, then
-  the `BOOLEAN` storage type. Format 1 used 11-byte numeric key components (ADR 0006); format 2 used 7-byte fixed leaf
+  the `BOOLEAN` storage type, the date and time storage types (ADR 0019), and `LIST` and `STRUCT` (ADR 0020). Format 1 used 11-byte numeric key components (ADR 0006); format 2 used 7-byte fixed leaf
   cell headers and no free blocks (ADR 0007); format 3 stored SQL text in the catalog.
 
 - A format version in the header. Engines refuse to write newer major versions, and minor versions must be backward compatible.
