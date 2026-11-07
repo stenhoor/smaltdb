@@ -32,9 +32,9 @@ A type is what the engine knows of a value ahead of time, used to pick specializ
 
 A comparison or logic gives 0 / 1. A language says how its results show them by the type it declares: a `call` declared
 `bool` (`call('cmp_gt', args, 'bool')`) or a logic node typed `bool` gives `true` / `false` in results, declared `int`
-it gives 0 / 1 (as SQL's do). For now the engine's own default is `int` for both: the functions catalog reports
-`int`, and a logic node without `type` is `int`; both become `bool` once languages declare what they want (ADR 0018,
-step 6). A column of values may hold JavaScript booleans, as a `bool` column.
+it gives 0 / 1 (as SQL's do). Left to the engine, they are `bool`: the functions catalog gives `bool` as the result of
+the comparisons, `truth_not`, `like`, `glob`, `in_list` and `regex_match`, and a logic node without `type` is `bool`.
+(`inSubquery` has no `type` yet and gives `int`.) A column of values may hold JavaScript booleans, as a `bool` column.
 
 | `CollationName` | Text compares |
 |---|---|
@@ -173,7 +173,7 @@ integer primary key, `null` any).
 | `param` | `index`, `type` | positional parameter `index` (0-based) |
 | `call` | `fn`, `args`, `type`, `collation?` | a function; `collation` is the rule a comparison-like function compares text by |
 | `cast` | `fn`, `to`, `arg` | a conversion, `fn` naming it (`cast_integer`, …) |
-| `and`, `or` | `args`, `type?` | three-valued logic; `type` is `bool` or `int` (left out: `int`, until languages declare it; see below) |
+| `and`, `or` | `args`, `type?` | three-valued logic; `type` is `bool` (left out) or `int` (see below) |
 | `not` | `arg` | three-valued NOT |
 | `isNull` | `arg`, `not`, `type?` | 1 when `arg` is NULL (`not`: when it is not), never NULL; `type` as for `and` |
 | `case` | `whens` (`{ when, then }`), `else`, `type` | the `then` of the first `when` that is 1, else `else` |
