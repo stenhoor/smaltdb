@@ -101,9 +101,9 @@ Where NaN is kept:
 - **Storage** keeps it, as now, and index keys now keep it too.
 - **Values from columns.** NaN in a float array is NaN. NULL comes from the null bitmap (`ValueColumn.nulls`) or a
   null in an array of values.
-- **Parameters** keep NaN. A language that wants NULL converts its own parameters. *(Moved to step 6 when step 2
-  was done: the engine binds SQL text's parameters itself today, with no language hook, so keeping NaN there before
-  smaltql converts would change SQL's results. Step 6 adds the hook and the change together.)*
+- **Parameters** keep NaN. A language that wants NULL converts its own parameters, through `SmaltLanguage.parameter`
+  (step 6). Until smaltql provides it, a language statement without the hook binds NaN as NULL, as before; plans'
+  parameters keep NaN from step 6's first PR on.
 - **Operations whose behaviour is IEEE keep a NaN result:**
   - `div_float`, `div_floor`, `mod_floor`, and `add_checked` / `sub_checked` / `mul_checked` on reals;
   - `cast_real` / `cast_real_strict` of a NaN;

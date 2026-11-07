@@ -78,6 +78,11 @@ export interface SmaltLanguage {
   viewDefinition?(source: Source): string;
   /** Edits the source texts kept beside definitions when ALTER TABLE changes them. */
   readonly sourceEditor?: SourceEditor;
+  /**
+   * A parameter of one of its statements as the language means it, after the engine's own conversions (booleans to
+   * 1 / 0, bigints checked). SQL gives NaN as NULL, as SQLite binds it (ADR 0018); plans' parameters keep NaN.
+   */
+  parameter?(value: SqlValue): SqlValue;
 }
 
 /** The parts of a language, as {@link languagePart} names them in its error. */
