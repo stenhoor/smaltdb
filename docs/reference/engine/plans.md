@@ -78,6 +78,8 @@ it compares every pair of rows.
 - `sort` is stable: rows with equal keys keep their input order, also as a top-N under a `limit` and when the sort
   spills to disk.
 - `filter`, `project` and `limit` keep their input's order, and so does a `window` without its own `order`.
+  Such a window also takes its rows in that order: its ranking and navigation calls (`row_number`, `lag`, …) and a
+  `ROWS` frame number, look back over and accumulate the rows as its input gives them, in each partition.
 - `semi` and `anti` joins keep the left input's order.
 - A `setop` of kind `unionAll` gives its first input's rows, in their order, then its second's.
 

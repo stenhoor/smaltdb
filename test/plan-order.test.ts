@@ -105,6 +105,25 @@ describe('filter, project, limit and window keep their input order', () => {
     }
   });
 
+  it('a window without its own order numbers, navigates and frames its rows in input order', () => {
+    const rows = { unit: 'ROWS', start: { kind: 'unboundedPreceding' }, end: { kind: 'currentRow' }, exclude: 'NO OTHERS' } as const;
+    const calls = [p.windowCall('row_number', [], 'int'), p.windowCall('lag', [id], 'int'), p.windowCall('sum', [id], 'int')];
+    for (const part of [false, true]) {
+      const w = p.window(reversed, calls, { ...(part ? { partition: [k] } : {}), frame: rows as never });
+      const got = d.queryPlan(w).rows as number[][];
+      // Expected, walking the input (reversed ids) in order, per partition when there is one.
+      const seen = new Map<number, { n: number; prev: number | null; sum: number }>();
+      const want = reversedIds.map((i) => {
+        const key = part ? i % 7 : 0;
+        const st = seen.get(key) ?? { n: 0, prev: null, sum: 0 };
+        const row = [i, i % 7, st.n + 1, st.prev, st.sum + i];
+        seen.set(key, { n: st.n + 1, prev: i, sum: st.sum + i });
+        return row;
+      });
+      expect(got, part ? 'partitioned' : 'one partition').toEqual(want);
+    }
+  });
+
   it('a window over a window, reading what the inner one computes', () => {
     const frame = { unit: 'ROWS', start: { kind: 'unboundedPreceding' }, end: { kind: 'currentRow' }, exclude: 'NO OTHERS' } as const;
     const call = (fn: string, args: PlanExpr[]) => ({ fn, args, star: false, collation: 'binary', type: 'int' }) as const;
