@@ -17,3 +17,6 @@ The wordmark is Martian Mono 600 (SIL Open Font License) converted to paths, so 
 Colours: smalt `#003399`, chip `#7B97D4`, ink `#151922`; on dark, `#9DB4F5`, `#D6E0F3` and `#E9EBF0`.
 
 Don't recolour, rotate, outline or add effects to the marks, and keep the light files off dark backgrounds.
+
+The stage badge (`work-in-progress.svg`, `-on-dark`) and the family badge (`a-smaltworks-project.svg`, `-on-dark`) are
+copied from smalt-brand `badges/` (commit `8396e75`), for the site and the README.
