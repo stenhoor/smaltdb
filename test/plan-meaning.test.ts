@@ -5,7 +5,7 @@
  * exactly what SQL's does. Format version 1; version 0 kept them as hidden `$sql` / `$flattened` metadata.
  */
 import { describe, expect, it } from 'vitest';
-import { sqlLanguage } from 'smaltql';
+import { sqlLanguage } from '@smaltworks/smaltql';
 import { Database, plan as p } from '../src/engine/index.js';
 import { SmaltError } from '../src/engine/errors.js';
 import type { BindContext } from '../src/engine/plan/bind-context.js';

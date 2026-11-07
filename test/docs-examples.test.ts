@@ -28,7 +28,7 @@ import external from '@smaltdb/external';
 import { registerFile } from '@smaltdb/external/client';
 import io from '@smaltdb/io';
 import { Database } from '../src/engine/database.js';
-import { parse } from 'smaltql';
+import { parse } from '@smaltworks/smaltql';
 import type { SqlValue } from '../src/engine/values.js';
 
 const DOCS = 'docs';

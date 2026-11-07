@@ -495,7 +495,7 @@ export class Database implements FunctionContext {
     return new Statement(this, this.parseOneSql(sql), sql);
   }
 
-  /** SQL, the language of the string API: registered by smaltql (`import 'smaltql/register'`, or a worker's `defineWorker`). */
+  /** SQL, the language of the string API: registered by smaltql (`import '@smaltworks/smaltql/register'`, or a worker's `defineWorker`). */
   private get sql(): SmaltLanguage {
     return (this.sqlLanguage ??= this.languageOf('sql'));
   }

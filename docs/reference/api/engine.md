@@ -4,7 +4,7 @@
 
 ```ts
 import { Database } from 'smaltdb/engine';
-import 'smaltql/register';
+import '@smaltworks/smaltql/register';
 
 const db = Database.openMemory();
 db.exec('CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)');
@@ -13,7 +13,7 @@ const { columns, rows } = db.query('SELECT a, b FROM t'); // ['a', 'b'], [[1, 'x
 db.close();
 ```
 
-The engine carries no language: the text methods (`exec`, `query`, `run`, `prepare`) run SQL from [smaltql](https://stenhoor.github.io/smaltql/), registered with `import 'smaltql/register'`, and without it they fail with `SMALT_MISUSE`. Statements given as [plans](../engine/) need no language. The SQL, the values, the parameters and the errors are the same as in the client. Results differ: the engine returns `{ columns, rows }` with rows as value arrays.
+The engine carries no language: the text methods (`exec`, `query`, `run`, `prepare`) run SQL from [smaltql](https://stenhoor.github.io/smaltql/), registered with `import '@smaltworks/smaltql/register'`, and without it they fail with `SMALT_MISUSE`. Statements given as [plans](../engine/) need no language. The SQL, the values, the parameters and the errors are the same as in the client. Results differ: the engine returns `{ columns, rows }` with rows as value arrays.
 
 ## Exports
 
@@ -42,7 +42,7 @@ The engine carries no language: the text methods (`exec`, `query`, `run`, `prepa
 
 ```ts
 import { Database, MemoryVfs } from 'smaltdb/engine';
-import 'smaltql/register';
+import '@smaltworks/smaltql/register';
 
 const vfs = new MemoryVfs();
 const db = await Database.open(vfs, 'app.db');
@@ -150,7 +150,7 @@ A compiled statement, from `db.prepare()`. It compiles again by itself after sch
 
 ```ts
 import { Database } from 'smaltdb/engine';
-import 'smaltql/register';
+import '@smaltworks/smaltql/register';
 
 const db = Database.openMemory();
 db.exec('CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)');
@@ -179,7 +179,7 @@ While a cursor over table data is open, writes on the same database throw `SMALT
 
 ```ts
 import { Database } from 'smaltdb/engine';
-import 'smaltql/register';
+import '@smaltworks/smaltql/register';
 
 const db = Database.openMemory();
 db.exec('CREATE TABLE t(a); INSERT INTO t VALUES (1), (2), (3)');
@@ -282,7 +282,7 @@ Engine methods throw `SmaltError` (or a subclass) with the same `code` and `mess
 | Class | Code |
 |---|---|
 | `SmaltError` | Any; the base class. |
-| `SqlSyntaxError` (from `smaltql`) | `SMALT_SYNTAX`. Also has `line` and `column` (1-based), `position` (0-based offset into the SQL) and `reason` (the message without the location). |
+| `SqlSyntaxError` (from `@smaltworks/smaltql`) | `SMALT_SYNTAX`. Also has `line` and `column` (1-based), `position` (0-based offset into the SQL) and `reason` (the message without the location). |
 | `MisuseError` | `SMALT_MISUSE` |
 | `CorruptionError` | `SMALT_CORRUPT` |
 
@@ -292,8 +292,8 @@ Errors from [plugins](./plugins#errors), such as `@smaltdb/io`'s import errors f
 
 ```ts
 import { Database, SmaltError } from 'smaltdb/engine';
-import { SqlSyntaxError } from 'smaltql';
-import 'smaltql/register';
+import { SqlSyntaxError } from '@smaltworks/smaltql';
+import '@smaltworks/smaltql/register';
 
 const db = Database.openMemory();
 try {
@@ -306,7 +306,7 @@ try {
 
 ## Parsing
 
-The SQL parser is smaltql's: `parse`, `parseOne` and `SqlSyntaxError` are exported from `smaltql`.
+The SQL parser is smaltql's: `parse`, `parseOne` and `SqlSyntaxError` are exported from `@smaltworks/smaltql`.
 
 ## detectCapabilities
 

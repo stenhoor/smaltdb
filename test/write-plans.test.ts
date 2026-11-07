@@ -1,7 +1,7 @@
 /** Writes compile from their plans alone (ADR 0015 step 6a): the front end resolves the target, columns and conflict action. */
 import { describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
-import { sqlLanguage } from 'smaltql';
+import { sqlLanguage } from '@smaltworks/smaltql';
 import type { BindContext } from '../src/engine/plan/bind-context.js';
 import { validatePlan } from '../src/engine/plan/validate.js';
 import type { PlanOp } from '../src/engine/plan/ops.js';

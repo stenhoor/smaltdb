@@ -55,7 +55,7 @@ describe('language boundary', () => {
   });
 
   it('no source file imports a language', () => {
-    const into = files(SRC).flatMap((f) => packages(f).filter((p) => /^smaltql(\/|$)/.test(p)).map((p) => `${relative(SRC, f)} -> ${p}`));
+    const into = files(SRC).flatMap((f) => packages(f).filter((p) => /^@smaltworks\/smaltql(\/|$)/.test(p)).map((p) => `${relative(SRC, f)} -> ${p}`));
     expect(into).toEqual([]);
   });
 });
