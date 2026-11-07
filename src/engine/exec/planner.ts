@@ -88,6 +88,7 @@ import { type BoundExpr, type PlanExpr, lit } from '../plan/expr.js';
 import type { AggCall, ColumnArray, JoinKind, PlanOp, SortKey as PlanSortKey, ValueColumn } from '../plan/ops.js';
 import type { CollationName } from '../plan/types.js';
 import { datetimeFromDate, isTemporal, parseDate, parseDatetime, parseTime } from '../../shared/temporal.js';
+import { encodeNested, isNested } from '../../shared/nested.js';
 import { planTypeOfStorage } from '../plan/catalog.js';
 import type { ExternalSource } from '../external/external.js';
 
@@ -1401,7 +1402,7 @@ export class Planner {
     const cols: SourceColumn[] = table.columns.map((c, i) => ({
       name: c.name,
       reg: base + i,
-      type: c.rowidAlias ? 'int' : staticTypeOfStorage(c.type),
+      type: c.rowidAlias ? 'int' : staticTypeOfStorage(c.type, c.declaredType),
       collation: c.collation,
       affinity: affinityOfStorage(c.type),
       declType: c.declaredType,
@@ -2567,6 +2568,8 @@ function columnReader(c: ValueColumn, type: string): (i: number) => SqlValue {
       if (typeof v === 'boolean') return v ? 1 : 0;
       if (v instanceof Date) return datetimeFromDate(v);
       if (typeof v === 'string' && isTemporal(type)) return temporalFromText(type, v);
+      // A JS array or object in a list or struct column (ADR 0020): its bytes.
+      if (typeof v === 'object' && v !== null && !(v instanceof Uint8Array) && isNested(type)) return encodeNested(type, v, 'values');
       return v ?? null;
     };
   return nulls ? (i) => (nulls[i >>> 3] & (1 << (i & 7)) ? null : read(i)) : read;

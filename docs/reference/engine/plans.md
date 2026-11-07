@@ -25,6 +25,8 @@ Three rules run through the format:
 | `datetime` | dates and times: µs since 1970-01-01 00:00:00 (a `bigint` beyond 2^53: after 2255 or before 1685), text such as `2026-11-07 12:30:00.500` in results |
 | `time` | times of day: µs since midnight, text such as `12:30:00` in results |
 | `duration` | spans of time: µs, ISO 8601 text such as `P1DT2H` in results |
+| `list<T>` | lists of `T` values, nested to any depth (`list<list<int>>`): blobs while a plan runs, JS arrays in results ([ADR 0020](../../adr/0020-lists-and-structs.md)) |
+| `struct<name T, …>` | named fields in order (`struct<x real, y real>`): blobs while a plan runs, JS objects in results |
 | `real` | 64-bit floating point |
 | `num` | `int` or `real`, not known until run time |
 | `text` | strings |
@@ -121,7 +123,9 @@ one length, with `rows` empty. A column is a typed array (`Float64Array`, `Float
 `{ data, nulls }` with a null bitmap (bit `i % 8` of byte `i >> 3` set when value `i` is NULL, as results carry them). NaN in a float
 array is NaN, a value of `real` that sorts after every number ([ADR 0018](../../adr/0018-bool-and-nan.md)). A
 column typed `date` holds days (an `Int32Array`, say), one typed `datetime`, `time` or `duration` µs; an array may also
-hold JavaScript `Date`s (a `datetime`, ms as µs) or the text results give, which parses (or is an error). The engine reads the values where they are. In JSON a typed array is `{"$typed": "f64", "data":
+hold JavaScript `Date`s (a `datetime`, ms as µs) or the text results give, which parses (or is an error). A column typed
+`list<…>` or `struct<…>` holds JS arrays, and objects by field name (or arrays by position) for a struct, their elements as
+the element types take them, or the bytes a list or struct is. The engine reads the values where they are. In JSON a typed array is `{"$typed": "f64", "data":
 […]}`; through the client it crosses to the worker as binary data beside the plan's JSON (see [running
 plans](./running#through-the-client)).
 

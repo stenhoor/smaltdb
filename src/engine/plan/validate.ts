@@ -16,6 +16,7 @@
  * A failure throws SMALT_PLAN with where in the plan it is (`project.exprs[1].args[0]`). Errors a language reports
  * in its own terms (no such table, ambiguous names) come from the language before it builds a plan.
  */
+import { isNested, isPlanTypeName, parseNested } from '../../shared/nested-types.js';
 import { SmaltError } from '../errors.js';
 import { aggregateFunctions, scalarFunctions } from '../exec/functions.js';
 import { SQL_FUNCTIONS, isEngineOperation } from '../exec/sql-functions.js';
@@ -38,7 +39,8 @@ export interface ValidateCatalog {
 /** Deeper plans are refused (SQLite's expression depth limit is 1000). */
 export const MAX_PLAN_DEPTH = 1000;
 
-const TYPES = new Set(['int', 'bool', 'real', 'num', 'text', 'blob', 'null', 'any', 'date', 'datetime', 'time', 'duration']);
+/** Plan types: the simple ones, and list and struct types (ADR 0020), checked by `isPlanTypeName`. */
+const TYPES = { has: (t: string): boolean => isPlanTypeName(t) };
 const COLLATIONS = new Set(['binary', 'nocase', 'rtrim']);
 const AFFINITIES = new Set(['INTEGER', 'REAL', 'NUMERIC', 'TEXT', 'BLOB']);
 
@@ -70,7 +72,7 @@ class Validator {
   constructor(private readonly catalog: ValidateCatalog) {}
 
   /** A `values` operation's columns: one per type, all of one length, with values and null bitmaps that are such. */
-  private valueColumns(cs: unknown, width: number, rows: number): void {
+  private valueColumns(cs: unknown, width: number, rows: number, types?: readonly unknown[]): void {
     const l = this.list(cs, 'columns');
     if (rows > 0) this.fail('expected no rows beside columns', 'rows');
     if (l.length !== width) this.fail(`expected ${width} columns, one per type`, 'columns');
@@ -86,8 +88,11 @@ class Validator {
         n = data.length;
         for (let j = 0; j < n; j++) {
           const v = data[j];
-          // A JS boolean is a value of a bool column (ADR 0018), a JS Date one of a datetime column (ADR 0019).
-          if (!(v === null || typeof v === 'number' || typeof v === 'bigint' || typeof v === 'string' || typeof v === 'boolean' || v instanceof Uint8Array || v instanceof Date)) this.fail(`expected a value at ${j}`, 'columns', i);
+          // A JS boolean is a value of a bool column (ADR 0018), a JS Date one of a datetime column (ADR 0019), a JS
+          // array or object one of a list or struct column (ADR 0020).
+          if (!(v === null || typeof v === 'number' || typeof v === 'bigint' || typeof v === 'string' || typeof v === 'boolean' || v instanceof Uint8Array || v instanceof Date)) {
+            if (!(typeof v === 'object' && typeof types?.[i] === 'string' && isNested(types[i] as string))) this.fail(`expected a value at ${j}`, 'columns', i);
+          }
         }
       } else this.fail('expected a typed array, an array of values, or { data, nulls }', 'columns', i);
       if (wrapped) {
@@ -270,7 +275,7 @@ class Validator {
           });
           exprs(rows[i], scopes, `rows[${i}]`);
         }
-        if (o.columns !== undefined) this.valueColumns(o.columns, w, rows.length);
+        if (o.columns !== undefined) this.valueColumns(o.columns, w, rows.length, o.types as readonly unknown[]);
         return w;
       }
       case 'iterate': {
@@ -580,6 +585,11 @@ class Validator {
         str(d.name, 'name');
         str(d.declaredType, 'declaredType', false);
         if (!STORAGE_TYPES.has(d.type as string)) this.fail(`unknown storage type ${JSON.stringify(d.type)} (one of ${[...STORAGE_TYPES].join(', ')})`, 'type');
+        // A LIST or STRUCT column's declared type is its full type (ADR 0020): list<int>, struct<a int, b text>.
+        if (d.type === 'LIST' || d.type === 'STRUCT') {
+          const n = typeof d.declaredType === 'string' ? parseNested(d.declaredType) : null;
+          if (!n || n.kind !== (d.type === 'LIST' ? 'list' : 'struct')) this.fail(`a ${d.type} column's declared type is a ${d.type === 'LIST' ? 'list<…>' : 'struct<…>'} type, not ${JSON.stringify(d.declaredType)}`, 'declaredType');
+        }
         bool(d.notNull, 'notNull');
         conflict(d.notNullConflict, 'notNullConflict');
         this.collation(d.collation, 'collation');
@@ -886,7 +896,7 @@ class Validator {
 
 // ------------------------------------------------------------------ schema operations
 
-const STORAGE_TYPES = new Set(['INTEGER', 'BOOLEAN', 'DATE', 'TIME', 'DATETIME', 'DURATION', 'REAL', 'TEXT', 'BLOB', 'ANY', 'NUMERIC']);
+const STORAGE_TYPES = new Set(['INTEGER', 'BOOLEAN', 'DATE', 'TIME', 'DATETIME', 'DURATION', 'LIST', 'STRUCT', 'REAL', 'TEXT', 'BLOB', 'ANY', 'NUMERIC']);
 const FK_ACTIONS = new Set(['SET NULL', 'SET DEFAULT', 'CASCADE', 'RESTRICT', 'NO ACTION']);
 const DROP_OBJECTS = new Set(['table', 'index', 'view', 'materialized view', 'trigger', 'external table', 'connection']);
 const SCHEMA_OPS = new Set(['createTable', 'createIndex', 'createView', 'createConnection', 'createExternalTable', 'drop', 'alterTable']);

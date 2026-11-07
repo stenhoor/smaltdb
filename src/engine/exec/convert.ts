@@ -8,12 +8,13 @@ import { type SqlValue, normalizeInt } from '../values.js';
  * statically where SQLite semantics depend on it (division, typeof, text conversion).
  */
 import type { TemporalType } from '../../shared/temporal.js';
+import type { NestedTypeName } from '../../shared/nested-types.js';
 
 /**
  * `bool` (ADR 0018) is 0 / 1 at run time, an integer to every operation; results give it as `true` / `false`. The
  * temporal types (ADR 0019: `date`, `datetime`, `time`, `duration`) are integers too (days, µs); results give text.
  */
-export type StaticType = 'int' | 'bool' | 'real' | 'num' | 'text' | 'blob' | 'null' | 'any' | TemporalType;
+export type StaticType = 'int' | 'bool' | 'real' | 'num' | 'text' | 'blob' | 'null' | 'any' | TemporalType | NestedTypeName;
 
 /** Column affinity used for comparisons (SQLite rules). */
 export type Affinity = 'INTEGER' | 'REAL' | 'NUMERIC' | 'TEXT' | 'BLOB' | 'NONE';

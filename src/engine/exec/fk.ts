@@ -295,7 +295,7 @@ function sameValue(a: SqlValue, b: SqlValue): boolean {
  */
 function columnRef(t: TableSchema, c: number, at: number): { e: PlanExpr; operand: SqlOperand } {
   const cs = t.columns[c];
-  const type = cs.rowidAlias ? 'int' : staticTypeOfStorage(cs.type);
+  const type = cs.rowidAlias ? 'int' : staticTypeOfStorage(cs.type, cs.declaredType);
   const affinity = affinityOfStorage(cs.type);
   const e = withMeta(col(0, at, type, collationName(cs.collation)), { collation: cs.collation, collSrc: CollSrc.Column, affinity });
   return { e, operand: { type, collation: cs.collation, collSrc: CollSrc.Column, affinity } };

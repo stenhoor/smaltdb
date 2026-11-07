@@ -10,6 +10,7 @@ import type { SqlValue } from '../values.js';
 import type { BoundExpr, ExprMeaning } from './expr.js';
 import type { Source, StorageType } from './schema.js';
 import type { CollationName, PlanType } from './types.js';
+import { isNestedType } from '../../shared/nested-types.js';
 
 /** A column of a table, a materialized view or an external table. */
 export interface CatalogColumn {
@@ -176,9 +177,15 @@ export function storageTypeFor(declared: string | undefined): StorageType {
   return 'NUMERIC';
 }
 
-/** The plan type of values stored as `t`. */
-export function planTypeOfStorage(t: StorageType): PlanType {
+/**
+ * The plan type of values stored as `t`. A LIST or STRUCT column's plan type is its declared type (ADR 0020), so pass
+ * `declared` for one; without it, or when it isn't a list or struct type, its values are blobs.
+ */
+export function planTypeOfStorage(t: StorageType, declared?: string): PlanType {
   switch (t) {
+    case 'LIST':
+    case 'STRUCT':
+      return declared !== undefined && isNestedType(declared) ? declared : 'blob';
     case 'INTEGER':
       return 'int';
     case 'BOOLEAN':
