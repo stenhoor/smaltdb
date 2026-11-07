@@ -86,8 +86,9 @@ Named by behaviour, as the engine's operations are (ADR 0016 section 1):
   `list_sum`, `list_min`, `list_max`, `list_mean`.
 - **Structs:** `struct_field(value, index)` (the language resolves names to indexes from the type).
 - **Aggregate:** `implode`: a group's values as a list, in the group's order (ADR 0016 section 2).
-- **Plan operation `explode`:** one row per element of a list column, the row's other columns repeated. An empty list
-  or NULL gives one row with NULL, as in Polars. Optionally with the element's position.
+- **Plan operation `explode`:** one row per element of a list column, the row's other columns repeated. As Polars
+  2's `explode`, an empty list gives no row and a NULL list one row with NULL, with options for the other choices
+  (`emptyAsNull`, `keepNulls`). Optionally with the element's position.
 - **Unnest** needs no operation: it is a projection of `struct_field`s, which a language writes.
 - **Casts:** `cast_text` of a list or struct gives its JSON text.
 

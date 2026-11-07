@@ -416,7 +416,7 @@ class Validator {
         if (!Number.isInteger(o.column) || o.column < 0 || o.column >= w) this.fail(`no column ${String(o.column)}`, 'column');
         const n = typeof o.type === 'string' ? parseNested(o.type) : null;
         if (!n || n.kind !== 'list') this.fail(`expected a list type, not ${JSON.stringify(o.type)}`, 'type');
-        if (o.position !== undefined && typeof o.position !== 'boolean') this.fail('expected true or false', 'position');
+        for (const f of ['position', 'emptyAsNull', 'keepNulls'] as const) if (o[f] !== undefined && typeof o[f] !== 'boolean') this.fail('expected true or false', f);
         return w + (o.position ? 1 : 0);
       }
       case 'unpivot': {

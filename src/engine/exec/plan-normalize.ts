@@ -242,8 +242,9 @@ let rewriteIterationId = 1 << 30;
 /**
  * An explode (ADR 0020) as an iteration over each row's positions: the input numbered, each row given position 0, a
  * step adding the next position while it is within the list, the rows sorted by number and position (the input's order,
- * then the list's), and the list column read at each row's position. An empty or NULL list keeps its one row at
- * position 0, whose element is NULL (`list_get` out of range).
+ * then the list's), and the list column read at each row's position. A row whose list is empty or NULL starts only
+ * where it gives a row (`emptyAsNull`, `keepNulls`): its one row at position 0, whose element is NULL (`list_get` out of
+ * range).
  */
 function explodeRows(op: Op<'explode'>): PlanOp {
   const w = planWidth(op.input);
@@ -253,7 +254,14 @@ function explodeRows(op: Op<'explode'>): PlanOp {
   const list: PlanExpr = { k: 'col', input: 0, index: op.column, depth: 0, type: op.type, collation: 'binary' };
   const pos = column(w + 1, 'int');
   const next: PlanExpr = { k: 'call', fn: 'add', args: [pos, { k: 'lit', value: 1, type: 'int' }], type: 'int' };
-  const init: PlanOp = { op: 'project', input: numbered(op.input), exprs: [...range(0, w + 1), { k: 'lit', value: 0, type: 'int' }] };
+  const length: PlanExpr = { k: 'call', fn: 'list_len', args: [list], type: 'int' };
+  // Which rows start: those with elements, and the empty and NULL lists the options keep.
+  const starts: PlanExpr[] = [cmp('cmp_gt', length, { k: 'lit', value: 0, type: 'int' })];
+  if (op.emptyAsNull) starts.push(cmp('cmp_eq', length, { k: 'lit', value: 0, type: 'int' }));
+  if (op.keepNulls !== false) starts.push({ k: 'isNull', arg: list, not: false });
+  const anyOf = starts.reduce((x, y): PlanExpr => ({ k: 'or', args: [x, y] }));
+  const first: PlanOp = { op: 'filter', input: numbered(op.input), pred: anyOf };
+  const init: PlanOp = { op: 'project', input: first, exprs: [...range(0, w + 1), { k: 'lit', value: 0, type: 'int' }] };
   const types: PlanType[] = [...Array.from({ length: w }, (_, i): PlanType => (i === op.column ? op.type : 'any')), 'int', 'int'];
   const within: PlanExpr = cmp('cmp_lt', next, { k: 'call', fn: 'list_len', args: [list], type: 'int' });
   const step: PlanOp = { op: 'project', input: { op: 'filter', input: { op: 'working', id, types }, pred: within }, exprs: [...range(0, w + 1), next] };

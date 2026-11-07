@@ -209,8 +209,9 @@ export type PlanOp = OpMeaning & (
   | {
       /**
        * One row per element of a list column (ADR 0020): the input's columns with `column` replaced by each element, in
-       * the input's order and then the list's. An empty or NULL list gives one row with NULL. With `position`, each row
-       * also has the element's position (from 0) as a last column.
+       * the input's order and then the list's. As Polars' `explode`: an empty list gives no row (one row with NULL with
+       * `emptyAsNull`), a NULL list one row with NULL (none with `keepNulls: false`). With `position`, each row also has
+       * the element's position (from 0) as a last column.
        */
       readonly op: 'explode';
       readonly input: PlanOp;
@@ -218,6 +219,8 @@ export type PlanOp = OpMeaning & (
       /** The list column's type (`list<T>`); the output column's is `T`. */
       readonly type: PlanType;
       readonly position?: boolean;
+      readonly emptyAsNull?: boolean;
+      readonly keepNulls?: boolean;
     }
   | {
       readonly op: 'unpivot';
