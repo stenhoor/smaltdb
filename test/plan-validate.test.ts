@@ -59,7 +59,7 @@ describe('plan validator', () => {
     bad(project(scan(), [{ k: 'call', fn: 'add', args: [lit(1)], type: 'int' }]), /wrong number of arguments to add: 1/);
     bad(project(scan(), [{ k: 'call', fn: 'abs', args: [lit(1), lit(2)], type: 'int' }]), /wrong number of arguments to abs: 2/);
     bad({ op: 'aggregate', input: scan(), keys: [], aggs: [{ fn: 'nope', args: [], star: false, distinct: false, collation: 'binary', type: 'int' }], carry: [] }, /no such aggregate function: nope/);
-    bad(project(scan(), [{ k: 'lit', value: 1, type: 'date' as never }]), /unknown type "date"/);
+    bad(project(scan(), [{ k: 'lit', value: 1, type: 'decimal' as never }]), /unknown type "decimal"/);
     bad({ op: 'sort', input: scan(), keys: [{ expr: col(0), desc: false, nullsFirst: true, collation: 'french' as never }] }, /unknown collation "french"/);
     bad({ op: 'teleport' } as never, /unknown operation "teleport"/);
   });

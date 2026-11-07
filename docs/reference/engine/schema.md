@@ -39,7 +39,7 @@ later changes to the tables it reads (see [writing a language](./languages#views
 |---|---|
 | `name` | The column's name |
 | `declaredType` | The declared type as written, `''` when none |
-| `type` | How values are stored: `INTEGER`, `BOOLEAN`, `REAL`, `TEXT`, `BLOB`, `NUMERIC` or `ANY` (tables are strict). `BOOLEAN` holds 0 and 1, stored as an integer, and reads as `bool` ([ADR 0018](../../adr/0018-bool-and-nan.md)); writing anything else into it fails with `SMALT_CONSTRAINT_DATATYPE` |
+| `type` | How values are stored: `INTEGER`, `BOOLEAN`, `DATE`, `DATETIME`, `TIME`, `DURATION`, `REAL`, `TEXT`, `BLOB`, `NUMERIC` or `ANY` (tables are strict). `BOOLEAN` holds 0 and 1, stored as an integer, and reads as `bool` ([ADR 0018](../../adr/0018-bool-and-nan.md)); writing anything else into it fails with `SMALT_CONSTRAINT_DATATYPE`. `DATE`, `DATETIME`, `TIME` and `DURATION` hold days and µs, stored as integers, and read as their plan types ([ADR 0019](../../adr/0019-dates-and-times.md)); a write takes an integer or the text results give |
 | `notNull`, `notNullConflict?` | NOT NULL, and its conflict action |
 | `collation` | `binary`, `nocase` or `rtrim` |
 | `default?` | A `DefaultDef`: `{ text, expr?, value }`, an expression over no columns and its value when constant |

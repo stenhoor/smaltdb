@@ -1,4 +1,5 @@
 import { type ErrorDetails, SmaltError } from '../errors.js';
+import { parseDate, parseDatetime, parseTime } from '../../shared/temporal.js';
 import type { PlanExpr } from '../plan/expr.js';
 import type { ConflictAction as PlanConflict } from '../plan/ops.js';
 import type { CheckDef, DefaultDef, ExprDef, FkAction, IndexDef, TableDef } from '../plan/schema.js';
@@ -253,6 +254,21 @@ export function coerceForColumn(v: SqlValue, col: ColumnSchema, table: string, i
         const n = textToNumber(v);
         if (n !== undefined && (typeof n === 'bigint' || Number.isSafeInteger(n))) return n;
         if (typeof n === 'number' && Number.isInteger(n) && Math.abs(n) < 9223372036854775808) return normalizeInt(BigInt(n));
+      }
+      break;
+    }
+    case 'DATE':
+    case 'TIME':
+    case 'DATETIME':
+    case 'DURATION': {
+      // Days or µs (ADR 0019): an integer, or the text results give (a date, a date and time, a time of day).
+      if (typeof v === 'bigint' || (typeof v === 'number' && Number.isSafeInteger(v))) {
+        if (col.type !== 'TIME' || (Number(v) >= 0 && Number(v) < 86_400_000_000)) return v;
+        break;
+      }
+      if (typeof v === 'string') {
+        const t = col.type === 'DATE' ? parseDate(v) : col.type === 'DATETIME' ? parseDatetime(v) : col.type === 'TIME' ? parseTime(v) : null;
+        if (t !== null) return t;
       }
       break;
     }

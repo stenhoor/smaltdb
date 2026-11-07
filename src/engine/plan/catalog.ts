@@ -183,6 +183,14 @@ export function planTypeOfStorage(t: StorageType): PlanType {
       return 'int';
     case 'BOOLEAN':
       return 'bool';
+    case 'DATE':
+      return 'date';
+    case 'TIME':
+      return 'time';
+    case 'DATETIME':
+      return 'datetime';
+    case 'DURATION':
+      return 'duration';
     case 'REAL':
       return 'real';
     case 'TEXT':
@@ -203,6 +211,10 @@ export function affinityOfStorage(t: StorageType): 'INTEGER' | 'REAL' | 'NUMERIC
   switch (t) {
     case 'INTEGER':
     case 'BOOLEAN':
+    case 'DATE':
+    case 'TIME':
+    case 'DATETIME':
+    case 'DURATION':
       return 'INTEGER';
     case 'REAL':
       return 'REAL';

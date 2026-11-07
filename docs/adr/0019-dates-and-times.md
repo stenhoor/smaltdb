@@ -148,8 +148,8 @@ SQLite has no date types, and smaltql keeps SQLite's meaning:
 
 One PR each, after this ADR:
 
-1. The types, storage and results: plan types, storage types (format 4), the result format and options, and values
-   from columns.
+1. The types, storage and results: plan types, storage types (format 4), the result format, and values from columns.
+   The result options (`Date` or `Temporal` objects on request) follow in their own PR, after this one.
 2. The operations: parts, truncation, offsets, arithmetic types, parse, format and casts.
 3. Time zones (decision 2): zoned `datetime` and `Intl`-based conversion.
 4. Parquet gives `date` and `datetime` (`stenhoor/smaltdb-parquet`).

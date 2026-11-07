@@ -52,6 +52,8 @@ const typedName = (x: ArrayBufferView): string | undefined => Object.keys(TYPED)
 
 /** `x` encoded; with `json`, also tagged for JSON. One walk does both: a `JSON.stringify` replacer is slow. */
 function encode(x: unknown, json: boolean, lifted?: unknown[]): unknown {
+  // A JS Date (a datetime in a column of values, ADR 0019): kept, or tagged with its ms for JSON.
+  if (x instanceof Date) return json ? { $date: String(x.getTime()) } : x;
   if (json) {
     if (lifted && ArrayBuffer.isView(x)) return { $data: lifted.push(x) - 1 };
     if (typeof x === 'bigint') return { $bigint: x.toString() };
@@ -120,7 +122,7 @@ export function valueFromJSON(v: unknown): unknown {
   return v && typeof v === 'object' && !Array.isArray(v) ? untag(v as Record<string, unknown>) : v;
 }
 
-/** The value a tagged object (`{$bigint}`, `{$blob}`, `{$real}`, `{$typed, data}`, `{$data}`) stands for, or `o` itself. */
+/** The value a tagged object (`{$bigint}`, `{$blob}`, `{$real}`, `{$date}`, `{$typed, data}`, `{$data}`) stands for, or `o` itself. */
 function untag(o: Record<string, unknown>, lifted?: readonly unknown[]): unknown {
   if (typeof o.$typed === 'string' && Array.isArray(o.data) && Object.keys(o).length === 2) {
     const make = TYPED[o.$typed];
@@ -145,6 +147,7 @@ function untag(o: Record<string, unknown>, lifted?: readonly unknown[]): unknown
     return b;
   }
   if (key === '$real') return Number(v);
+  if (key === '$date') return new Date(Number(v));
   return o;
 }
 

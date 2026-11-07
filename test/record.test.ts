@@ -11,13 +11,17 @@ const norm = (v: bigint): number | bigint => (v >= BigInt(Number.MIN_SAFE_INTEGE
 const valueFor: Record<StorageType, fc.Arbitrary<SqlValue>> = {
   INTEGER: fc.oneof(fc.integer(), fc.bigInt(I64).map(norm), fc.constantFrom(2 ** 53 - 1, -(2 ** 53 - 1), 0)),
   BOOLEAN: fc.constantFrom(0, 1),
+  DATE: fc.integer({ min: -1e6, max: 1e6 }),
+  TIME: fc.integer({ min: 0, max: 86_400_000_000 - 1 }),
+  DATETIME: fc.oneof(fc.integer(), fc.bigInt(I64).map(norm)),
+  DURATION: fc.oneof(fc.integer(), fc.bigInt(I64).map(norm)),
   REAL: fc.double({ noNaN: true }),
   TEXT: fc.string({ unit: 'grapheme', maxLength: 30 }),
   BLOB: fc.uint8Array({ maxLength: 40 }),
   ANY: fc.oneof(fc.integer(), fc.double({ noNaN: true }).filter((d) => !Number.isInteger(d)), fc.string(), fc.uint8Array({ maxLength: 10 }), fc.bigInt(I64).map(norm)),
   NUMERIC: fc.oneof(fc.integer(), fc.double({ noNaN: true }).filter((d) => !Number.isInteger(d))),
 };
-const typeArb = fc.constantFrom<StorageType>('INTEGER', 'BOOLEAN', 'REAL', 'TEXT', 'BLOB', 'ANY', 'NUMERIC');
+const typeArb = fc.constantFrom<StorageType>('INTEGER', 'BOOLEAN', 'DATE', 'TIME', 'DATETIME', 'DURATION', 'REAL', 'TEXT', 'BLOB', 'ANY', 'NUMERIC');
 
 describe('record format', () => {
   it('round-trips random rows', () => {
