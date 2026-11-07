@@ -14,7 +14,7 @@ import { SmaltError } from '../errors.js';
 import { type IndexEval, type IndexSchema, type TableSchema, isColumnar, storageTypeFor } from '../catalog/schema.js';
 import { type BTree, BTreeCursor } from '../storage/btree.js';
 import { KEY_AFTER_NULL, decodeKey, rowidSuffixStart } from '../storage/key-codec.js';
-import { RecordReader } from '../storage/record.js';
+import { RecordReader, isInt64Storage } from '../storage/record.js';
 import { Collation, type SqlValue, normalizeInt } from '../values.js';
 import { type Affinity, type StaticType, affinityOfStorage, hashKey, hashKeyMulti, staticTypeOfStorage, truthy } from './convert.js';
 import {
@@ -87,6 +87,8 @@ import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
 import { type BoundExpr, type PlanExpr, lit } from '../plan/expr.js';
 import type { AggCall, ColumnArray, JoinKind, PlanOp, SortKey as PlanSortKey, ValueColumn } from '../plan/ops.js';
 import type { CollationName } from '../plan/types.js';
+import { datetimeFromDate, isTemporal, parseDate, parseDatetime, parseTime } from '../../shared/temporal.js';
+import { planTypeOfStorage } from '../plan/catalog.js';
 import type { ExternalSource } from '../external/external.js';
 
 /**
@@ -430,7 +432,7 @@ export class Planner {
       const outs: { reg: number; type: StaticType }[] = [];
       for (let i = 0; i < spec.decode.length; i += 2) {
         const t = table.columns[spec.decode[i]].type;
-        outs.push({ reg: spec.decode[i + 1], type: t === 'INTEGER' ? 'int' : t === 'BOOLEAN' ? 'bool' : t === 'REAL' ? 'real' : 'any' });
+        outs.push({ reg: spec.decode[i + 1], type: t === 'INTEGER' ? 'int' : t === 'REAL' ? 'real' : isInt64Storage(t) ? planTypeOfStorage(t) : 'any' });
       }
       for (const reg of spec.rowidRegs) outs.push({ reg, type: 'int' });
       const fill = generateScanFilter(preds, outs, cap, () => access.loaderSpec(), helpers, pipelineCompiler(ctx));
@@ -786,7 +788,7 @@ export class Planner {
     if (op.columns) {
       regs = outRegs ?? op.types.map(() => this.regs.alloc());
       columns = given ?? op.types.map((type, i) => ({ name: `column${i + 1}`, type, collation: Collation.Binary, affinity: 'NONE' as Affinity }));
-      root = new ColumnValues(op.columns.map(columnReader), columnLength(op.columns[0]), regs);
+      root = new ColumnValues(op.columns.map((c, i) => columnReader(c, op.types[i]!)), columnLength(op.columns[0]), regs);
     } else {
       const compiled = op.rows.map((r) => r.map((e) => compileBoundExpr(rebind(e, f, (m, g) => this.subqueryExpr(m, g)), this.env.funcCtx)));
       regs = outRegs ?? compiled[0].map(() => this.regs.alloc());
@@ -2550,7 +2552,7 @@ function columnLength(c: ValueColumn | undefined): number {
 }
 
 /** Value `i` of a column of `values`: NULL where its bitmap says so, integers beyond 2^53 as bigints. NaN is NaN (ADR 0018). */
-function columnReader(c: ValueColumn): (i: number) => SqlValue {
+function columnReader(c: ValueColumn, type: string): (i: number) => SqlValue {
   const wrapped = !ArrayBuffer.isView(c) && !Array.isArray(c);
   const data = (wrapped ? (c as { data: ColumnArray | readonly SqlValue[] }).data : c) as ColumnArray | readonly SqlValue[];
   const nulls = wrapped ? (c as { nulls: Uint8Array }).nulls : null;
@@ -2559,11 +2561,22 @@ function columnReader(c: ValueColumn): (i: number) => SqlValue {
   else if (ArrayBuffer.isView(data)) read = (i) => (data as Exclude<ColumnArray, BigInt64Array>)[i];
   else
     read = (i) => {
-      const v = (data as readonly (SqlValue | boolean)[])[i];
-      // JS booleans (a bool column, ADR 0018) are 1 / 0 at run time.
-      return typeof v === 'boolean' ? (v ? 1 : 0) : (v ?? null);
+      const v = (data as readonly (SqlValue | boolean | Date)[])[i];
+      // JS booleans (a bool column, ADR 0018) are 1 / 0 at run time; JS Dates are µs, and the text results give
+      // parses, in a temporal column (ADR 0019).
+      if (typeof v === 'boolean') return v ? 1 : 0;
+      if (v instanceof Date) return datetimeFromDate(v);
+      if (typeof v === 'string' && isTemporal(type)) return temporalFromText(type, v);
+      return v ?? null;
     };
   return nulls ? (i) => (nulls[i >>> 3] & (1 << (i & 7)) ? null : read(i)) : read;
+}
+
+/** A temporal value given as text in a column of values (ADR 0019): parsed, or an error naming the text. */
+function temporalFromText(type: string, text: string): SqlValue {
+  const v = type === 'date' ? parseDate(text) : type === 'time' ? parseTime(text) : type === 'datetime' ? parseDatetime(text) : null;
+  if (v === null) throw new SmaltError('SMALT_MISMATCH', `cannot read ${JSON.stringify(text)} as a ${type}`);
+  return v;
 }
 
 /** The number of columns a plan outputs. */

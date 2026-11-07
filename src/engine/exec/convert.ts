@@ -7,8 +7,13 @@ import { type SqlValue, normalizeInt } from '../values.js';
  * Integral JS numbers are ambiguous between INTEGER and REAL at runtime, so REAL-ness is tracked
  * statically where SQLite semantics depend on it (division, typeof, text conversion).
  */
-/** `bool` (ADR 0018) is 0 / 1 at run time, an integer to every operation; results give it as `true` / `false`. */
-export type StaticType = 'int' | 'bool' | 'real' | 'num' | 'text' | 'blob' | 'null' | 'any';
+import type { TemporalType } from '../../shared/temporal.js';
+
+/**
+ * `bool` (ADR 0018) is 0 / 1 at run time, an integer to every operation; results give it as `true` / `false`. The
+ * temporal types (ADR 0019: `date`, `datetime`, `time`, `duration`) are integers too (days, µs); results give text.
+ */
+export type StaticType = 'int' | 'bool' | 'real' | 'num' | 'text' | 'blob' | 'null' | 'any' | TemporalType;
 
 /** Column affinity used for comparisons (SQLite rules). */
 export type Affinity = 'INTEGER' | 'REAL' | 'NUMERIC' | 'TEXT' | 'BLOB' | 'NONE';

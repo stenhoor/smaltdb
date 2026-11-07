@@ -6,6 +6,7 @@ import { type InlineForm, traitsOf, withoutComparisonConversion } from './traits
 import { isEngineOperation } from './sql-functions.js';
 import { type StaticType, truthy } from './convert.js';
 import { type InlineMath, type MathFunction, inlineMath, roundingType } from './math.js';
+import { isInt64Storage } from '../storage/record.js';
 
 /**
  * Expression code generation (ADR 0001 decision 5). Arithmetic, numeric comparisons, boolean
@@ -88,7 +89,9 @@ const utf8Encoder = new TextEncoder();
  * number (checked by `binaryTextOperands`), so they compare the operands themselves.
  */
 const unconverted = (x: BoundExpr): BoundExpr => withoutComparisonConversion(x);
-const isNum = (t: StaticType): boolean => t === 'int' || t === 'bool' || t === 'real' || t === 'num';
+const isNum = (t: StaticType): boolean => t === 'int' || t === 'bool' || t === 'real' || t === 'num' || t === 'date' || t === 'datetime' || t === 'time' || t === 'duration';
+/** Never NaN: integers, truth values and the temporal types (their values are integers, ADR 0019). */
+const neverNaN = (t: StaticType): boolean => t === 'int' || t === 'bool' || t === 'date' || t === 'datetime' || t === 'time' || t === 'duration';
 
 let enabled: boolean | undefined;
 
@@ -406,7 +409,7 @@ class Emitter {
   private compare(op: string, a: Gen, b: Gen): Gen {
     const v = this.tmp();
     const nul = orNull(nullOf(a), nullOf(b));
-    this.lines.push(`const ${v}n = ${nul}; const ${v} = ${v}n ? 0 : (${numericTest(op, a.v, b.v, a.num === true || a.type === 'int' || a.type === 'bool', b.num === true || b.type === 'int' || b.type === 'bool')} ? 1 : 0);`);
+    this.lines.push(`const ${v}n = ${nul}; const ${v} = ${v}n ? 0 : (${numericTest(op, a.v, b.v, a.num === true || neverNaN(a.type), b.num === true || neverNaN(b.type))} ? 1 : 0);`);
     return { v, nul: `${v}n`, type: 'int' };
   }
 
@@ -558,7 +561,7 @@ function emitDecode(spec: LoaderSpec, L: string[], assign: Assign = toRegister, 
   L.push('const ko = off + (b[off + 1] < 128 ? 2 : 3); const vo = ko + b[off];');
   if (spec.decode.length > 0) {
     L.push(`const bm = vo + 3; const fx = bm + ${bitmap}; const vt = fx + ${spec.fixedSize};`);
-    const needsVar = spec.decode.some((_, i) => i % 2 === 0 && !(spec.types[spec.decode[i]] === 'INTEGER' || spec.types[spec.decode[i]] === 'BOOLEAN' || spec.types[spec.decode[i]] === 'REAL'));
+    const needsVar = spec.decode.some((_, i) => i % 2 === 0 && !(isInt64Storage(spec.types[spec.decode[i]]) || spec.types[spec.decode[i]] === 'REAL'));
     if (needsVar) L.push(`const wide = (b[vo] & 1) === 1; const vd = vt + ${spec.varCount} * (wide ? 4 : 2);`);
     const endOf = (j: number): string => `(wide ? dv.getUint32(vt + ${4 * j}, true) : (b[vt + ${2 * j}] | (b[vt + ${2 * j + 1}] << 8)))`;
     const bounds = (col: number): ColBounds => {
@@ -573,7 +576,7 @@ function emitDecode(spec: LoaderSpec, L: string[], assign: Assign = toRegister, 
       const sl = spec.slots[col];
       const isNull = `(b[bm + ${col >>> 3}] & ${1 << (col & 7)}) !== 0`;
       let value: string;
-      if (t === 'INTEGER' || t === 'BOOLEAN') {
+      if (isInt64Storage(t)) {
         // Values that fit in int32 are produced as int32 so V8 keeps them as small integers (fast % and /).
         value =
           `{ const o = fx + ${sl}; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24);` +

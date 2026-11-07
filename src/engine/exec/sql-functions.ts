@@ -64,7 +64,7 @@ const I64_MIN = -(2n ** 63n);
 const I64_MAX = 2n ** 63n - 1n;
 
 function isNumericType(t: StaticType): boolean {
-  return t === 'int' || t === 'bool' || t === 'real' || t === 'num';
+  return t === 'int' || t === 'bool' || t === 'real' || t === 'num' || t === 'date' || t === 'datetime' || t === 'time' || t === 'duration';
 }
 
 // ------------------------------------------------------------------ comparison

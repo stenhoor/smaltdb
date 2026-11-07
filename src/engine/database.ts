@@ -34,6 +34,7 @@ import { SYSTEM_TABLES, type StoredDef, type StoredText, type SystemTableName, d
 import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
+import { type TemporalType, datetimeFromDate, isTemporal, temporalText } from '../shared/temporal.js';
 import type { ReaderSettings } from '../shared/protocol.js';
 import { describeTable, logicalCatalog } from './catalog/logical.js';
 import { outputTypes } from './plan/output.js';
@@ -4913,6 +4914,8 @@ function normalizeParam(v: SqlValue | boolean | undefined, slot: number | string
   if (typeof v === 'number') return v;
   if (v === undefined) return null;
   if (typeof v === 'boolean') return v ? 1 : 0;
+  // A JS Date binds as a datetime: its ms as µs (ADR 0019).
+  if (v instanceof Date) return datetimeFromDate(v);
   if (typeof v === 'bigint') {
     if (v < INT64_MIN || v > INT64_MAX) throw new SmaltError('SMALT_RANGE', `parameter ${typeof slot === 'number' ? '?' + slot : slot}: integer ${v} is out of range (INTEGER values are 64-bit signed)`);
     return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v;
@@ -4929,8 +4932,12 @@ export class RowCursor {
   private open = false;
   private done = false;
   private i = 0;
-  /** Columns typed `bool` (ADR 0018): their 0 / 1 values come out as `false` / `true` from `next()`. */
+  /**
+   * Columns typed `bool` (ADR 0018) or a temporal type (ADR 0019): `next()` gives the first's 0 / 1 as `false` /
+   * `true` and the others' days or µs as text.
+   */
   private readonly bools: readonly number[];
+  private readonly temporals: readonly [number, TemporalType][];
 
   constructor(
     readonly db: Database,
@@ -4944,6 +4951,7 @@ export class RowCursor {
     readonly run: RunResult | null = null,
   ) {
     this.bools = boolColumns(columnTypes);
+    this.temporals = temporalColumns(columnTypes);
     if (plan) {
       try {
         plan.root.open(regs);
@@ -4963,7 +4971,7 @@ export class RowCursor {
     if (this.fixedRows) {
       if (this.i < this.fixedRows.length) {
         const row = this.fixedRows[this.i++];
-        return this.bools.length === 0 ? row : asBooleans(row.slice(), this.bools);
+        return this.bools.length === 0 && this.temporals.length === 0 ? row : this.converted(row.slice());
       }
       this.done = true;
       return null;
@@ -4987,7 +4995,14 @@ export class RowCursor {
     const r = this.regs;
     const row = new Array(out.length);
     for (let j = 0; j < out.length; j++) row[j] = r[out[j]];
-    return this.bools.length === 0 ? row : asBooleans(row, this.bools);
+    return this.bools.length === 0 && this.temporals.length === 0 ? row : this.converted(row);
+  }
+
+  /** `row` with its bool and temporal columns as results give them. */
+  private converted(row: SqlValue[]): SqlValue[] {
+    if (this.bools.length) asBooleans(row, this.bools);
+    for (const [c, t] of this.temporals) row[c] = temporalText(t, row[c]);
+    return row;
   }
 
   /**
@@ -5041,6 +5056,16 @@ export class RowCursor {
 }
 
 
+/** The indexes and types of the temporal columns (ADR 0019). */
+function temporalColumns(types: readonly StaticType[]): [number, TemporalType][] {
+  const out: [number, TemporalType][] = [];
+  for (let i = 0; i < types.length; i++) {
+    const t = types[i];
+    if (isTemporal(t)) out.push([i, t]);
+  }
+  return out;
+}
+
 /** The indexes of the columns typed `bool`. */
 function boolColumns(types: readonly StaticType[]): number[] {
   const out: number[] = [];
@@ -5065,6 +5090,12 @@ function fitsStorage(v: SqlValue, t: string): boolean {
       return typeof v === 'bigint' || (typeof v === 'number' && Number.isInteger(v));
     case 'BOOLEAN':
       return v === 0 || v === 1;
+    case 'DATE':
+    case 'DATETIME':
+    case 'DURATION':
+      return typeof v === 'bigint' || (typeof v === 'number' && Number.isInteger(v));
+    case 'TIME':
+      return typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < 86_400_000_000;
     case 'REAL':
       return typeof v === 'number';
     case 'TEXT':

@@ -8,6 +8,7 @@ import type { ErrorDetails } from '../engine/errors.js';
 import type { CatalogData } from '../engine/plan/catalog.js';
 import type { PlanStatementInput } from '../engine/plan/statement.js';
 import { PLAN_FORMAT_VERSION, type PlanType } from '../engine/plan/types.js';
+import { isTemporal, temporalText } from '../shared/temporal.js';
 import { type BusMessage, type Params, type Request, type RequestBody, type Response, type WireColumn, columnValue } from '../shared/protocol.js';
 
 /** A statement as plan data (the plan format is experimental): its types, builders and codec are in `smaltdb/plan`. */
@@ -839,18 +840,23 @@ function materialize(res: Collected, mode: RowMode): unknown {
 
 function materializeRows(columns: string[], columnTypes: PlanType[], batches: { length: number; cols: WireColumn[] }[], mode: RowMode): unknown {
   const width = columns.length;
-  // Columns typed bool (ADR 0018) travel as 0 / 1 and are given as false / true.
+  // Columns typed bool (ADR 0018) travel as 0 / 1 and are given as false / true; temporal ones (ADR 0019) travel as
+  // days or µs and are given as text.
   const bool = columnTypes.map((t) => t === 'bool');
+  const temporal = columnTypes.map((t) => (isTemporal(t) ? t : null));
   const value = (col: WireColumn, c: number, i: number): SqlValue => {
     const v = columnValue(col, i);
-    return bool[c] && v !== null ? ((v !== 0 && v !== 0n) as unknown as SqlValue) : v;
+    if (v === null) return v;
+    if (bool[c]) return (v !== 0 && v !== 0n) as unknown as SqlValue;
+    const t = temporal[c];
+    return t ? temporalText(t, v) : v;
   };
   if (mode === 'columnar') {
     let length = 0;
     for (const b of batches) length += b.length;
     const data: Record<string, Float64Array | SqlValue[]> = {};
     for (let c = 0; c < width; c++) {
-      const allNumeric = !bool[c] && batches.every((b) => b.cols[c].t === 'f64' && (b.cols[c] as { nulls: Uint8Array | null }).nulls === null);
+      const allNumeric = !bool[c] && !temporal[c] && batches.every((b) => b.cols[c].t === 'f64' && (b.cols[c] as { nulls: Uint8Array | null }).nulls === null);
       if (allNumeric) {
         if (batches.length === 1) data[columns[c]] = (batches[0].cols[c] as { data: Float64Array }).data;
         else {

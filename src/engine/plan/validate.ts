@@ -38,7 +38,7 @@ export interface ValidateCatalog {
 /** Deeper plans are refused (SQLite's expression depth limit is 1000). */
 export const MAX_PLAN_DEPTH = 1000;
 
-const TYPES = new Set(['int', 'bool', 'real', 'num', 'text', 'blob', 'null', 'any']);
+const TYPES = new Set(['int', 'bool', 'real', 'num', 'text', 'blob', 'null', 'any', 'date', 'datetime', 'time', 'duration']);
 const COLLATIONS = new Set(['binary', 'nocase', 'rtrim']);
 const AFFINITIES = new Set(['INTEGER', 'REAL', 'NUMERIC', 'TEXT', 'BLOB']);
 
@@ -86,8 +86,8 @@ class Validator {
         n = data.length;
         for (let j = 0; j < n; j++) {
           const v = data[j];
-          // A JS boolean is a value of a bool column (ADR 0018).
-          if (!(v === null || typeof v === 'number' || typeof v === 'bigint' || typeof v === 'string' || typeof v === 'boolean' || v instanceof Uint8Array)) this.fail(`expected a value at ${j}`, 'columns', i);
+          // A JS boolean is a value of a bool column (ADR 0018), a JS Date one of a datetime column (ADR 0019).
+          if (!(v === null || typeof v === 'number' || typeof v === 'bigint' || typeof v === 'string' || typeof v === 'boolean' || v instanceof Uint8Array || v instanceof Date)) this.fail(`expected a value at ${j}`, 'columns', i);
         }
       } else this.fail('expected a typed array, an array of values, or { data, nulls }', 'columns', i);
       if (wrapped) {
@@ -886,7 +886,7 @@ class Validator {
 
 // ------------------------------------------------------------------ schema operations
 
-const STORAGE_TYPES = new Set(['INTEGER', 'BOOLEAN', 'REAL', 'TEXT', 'BLOB', 'ANY', 'NUMERIC']);
+const STORAGE_TYPES = new Set(['INTEGER', 'BOOLEAN', 'DATE', 'TIME', 'DATETIME', 'DURATION', 'REAL', 'TEXT', 'BLOB', 'ANY', 'NUMERIC']);
 const FK_ACTIONS = new Set(['SET NULL', 'SET DEFAULT', 'CASCADE', 'RESTRICT', 'NO ACTION']);
 const DROP_OBJECTS = new Set(['table', 'index', 'view', 'materialized view', 'trigger', 'external table', 'connection']);
 const SCHEMA_OPS = new Set(['createTable', 'createIndex', 'createView', 'createConnection', 'createExternalTable', 'drop', 'alterTable']);
