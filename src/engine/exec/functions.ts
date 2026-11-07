@@ -579,7 +579,7 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
   ['mod_floor', simple(2, 2, twoNumberType, ([x, y], args) => modFloor(x, y, args))],
   ['lower_unicode', simple(1, 1, 'text', ([x], args) => (x === null ? null : toText(x, isRealType(args[0].type))!.toLowerCase()))],
   ['upper_unicode', simple(1, 1, 'text', ([x], args) => (x === null ? null : toText(x, isRealType(args[0].type))!.toUpperCase()))],
-  ['regex_match', simple(2, 3, 'int', (v) => (v[0] === null || v[1] === null ? null : regex(v[1], v[2], false).test(toText(v[0])!) ? 1 : 0))],
+  ['regex_match', simple(2, 3, 'bool', (v) => (v[0] === null || v[1] === null ? null : regex(v[1], v[2], false).test(toText(v[0])!) ? 1 : 0))],
   ['regex_find', simple(2, 3, 'text', (v) => {
     if (v[0] === null || v[1] === null) return null;
     const m = regex(v[1], v[2], false).exec(toText(v[0])!);

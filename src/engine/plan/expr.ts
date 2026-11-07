@@ -50,8 +50,8 @@ export interface CallExpr<E> extends ExprMeaning { readonly k: 'call'; readonly 
 /** A conversion chosen by the language (`fn`, e.g. `cast_integer`). */
 export interface CastExpr<E> extends ExprMeaning { readonly k: 'cast'; readonly fn: string; readonly to: PlanType; readonly arg: E }
 /**
- * Three-valued logic over 0 / 1 / NULL. `type` (ADR 0018): `bool`, or `int` for a language that wants 0 / 1 in its
- * results (the same values). Left out it is `int`, until languages declare it (ADR 0018 step 6); then `bool`.
+ * Three-valued logic over 0 / 1 / NULL. `type` (ADR 0018): `bool` (left out), or `int` for a language that wants 0 / 1
+ * in its results (the same values).
  */
 export interface LogicExpr<E> extends ExprMeaning { readonly k: 'and' | 'or'; readonly args: readonly E[]; readonly type?: LogicType }
 export interface NotExpr<E> extends ExprMeaning { readonly k: 'not'; readonly arg: E; readonly type?: LogicType }
@@ -94,7 +94,7 @@ export function typeOf(e: BoundExpr): PlanType {
     case 'or':
     case 'not':
     case 'isNull':
-      return e.type ?? 'int';
+      return e.type ?? 'bool';
     case 'inSubquery':
       return 'int';
     default:

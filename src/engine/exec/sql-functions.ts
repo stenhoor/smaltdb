@@ -635,7 +635,8 @@ const ARITHMETIC_TRAITS: Readonly<Record<string, FnTraits>> = {
 
 const OPERATIONS: ReadonlyMap<string, SqlFunction> = new Map<string, SqlFunction>([
   ...Object.entries(COMPARISON_FUNCTIONS).map(([op, alias]) => [op, alias] as const).map(([op, name]) =>
-    fixed(name, 2, (args, o) => ({ fn: comparisonFn(op, args[0], args[1], o.collation ?? Collation.Binary), type: 'int' }), COMPARISON_TRAITS[op]),
+    // A comparison gives bool (ADR 0018): 0 / 1 at run time; a language that wants an INTEGER declares int.
+    fixed(name, 2, (args, o) => ({ fn: comparisonFn(op, args[0], args[1], o.collation ?? Collation.Binary), type: 'bool' }), COMPARISON_TRAITS[op]),
   ),
   ...Object.entries(ARITHMETIC_FUNCTIONS).map(([op, alias]) => [op, alias] as const).map(([op, name]) => fixed(name, 2, (args) => arithmeticFn(op, args[0], args[1]), ARITHMETIC_TRAITS[op])),
   ...Object.entries(BITWISE_FUNCTIONS).map(([op, alias]) => [op, alias] as const).map(([op, name]) => fixed(name, 2, (args) => ({ fn: bitwiseFn(op, args[0], args[1]), type: 'int' }))),
@@ -667,7 +668,7 @@ const OPERATIONS: ReadonlyMap<string, SqlFunction> = new Map<string, SqlFunction
         const t = truthy(f(r));
         return t === null ? null : t ? 0 : 1;
       },
-      type: 'int',
+      type: 'bool',
     };
   }),
   fixed('text_concat', 2, ([a, b]) => {
@@ -686,9 +687,9 @@ const OPERATIONS: ReadonlyMap<string, SqlFunction> = new Map<string, SqlFunction
       type: 'text',
     };
   }),
-  fixed('like', [2, 3], (args, o) => ({ fn: likeFn(false, args, o.negated ?? false), type: 'int' }), { pattern: true }),
-  fixed('glob', [2, 3], (args, o) => ({ fn: likeFn(true, args, o.negated ?? false), type: 'int' }), { pattern: true }),
-  fixed('in_list', [1, -1], (args, o) => ({ fn: inListFn(args, o), type: 'int' }), { inList: true }),
+  fixed('like', [2, 3], (args, o) => ({ fn: likeFn(false, args, o.negated ?? false), type: 'bool' }), { pattern: true }),
+  fixed('glob', [2, 3], (args, o) => ({ fn: likeFn(true, args, o.negated ?? false), type: 'bool' }), { pattern: true }),
+  fixed('in_list', [1, -1], (args, o) => ({ fn: inListFn(args, o), type: 'bool' }), { inList: true }),
   fixed('add_checked', 2, ([a, b]) => checkedArithmeticFn('+', 'add_checked', a, b)),
   fixed('sub_checked', 2, ([a, b]) => checkedArithmeticFn('-', 'sub_checked', a, b)),
   fixed('mul_checked', 2, ([a, b]) => checkedArithmeticFn('*', 'mul_checked', a, b)),

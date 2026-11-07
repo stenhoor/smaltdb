@@ -116,9 +116,8 @@ Where NaN is kept:
   - `sum`, `total`, `avg` and the statistical aggregates.
 
   These are the names SQL calls, so SQL's results don't change for SQL's own data.
-- **NaN read by SQL.** A NaN another language stored can reach a SQL query. How SQL shows it is smaltql's decision;
-  the engine does not turn it into NULL behind a language's back. The recommendation is NULL at smaltql's result
-  boundary, as SQLite would have stored it.
+- **NaN read by SQL.** A NaN another language stored can reach a SQL query, and SQL shows it as NaN (owner's decision
+  5): the engine does not turn it into NULL behind a language's back, and smaltql does not either.
 
 ### 3. Format 4 carries both
 
@@ -143,9 +142,11 @@ One PR each:
    validator, results as `true` / `false` in process and through the client, and values from columns.
 5. **`BOOLEAN` storage:** the storage type, stored definitions, coercion on write, the catalog, and the docs
    (`plans.md`, `schema.md`, `catalog.md`).
-6. **smaltql:** declares its comparisons and logic `int` (then the engine's defaults become `bool`: the catalog's result
-   for comparisons and logic, and a logic node without `type`; until then they are `int`, so SQL is unchanged), converts NaN parameters and results to NULL (through a
-   language hook for parameters the engine binds, which this step adds), and updates its pin. sqllogictest stays at its pass rate.
+6. **smaltql** declares its comparisons and logic `int` and gives NaN parameters as NULL, through a language hook for
+   parameters (`SmaltLanguage.parameter`); then the engine's defaults become `bool` (the catalog's result for the
+   comparisons and the other truth-valued operations, and a logic node without `type`; `inSubquery`, which has no
+   `type` field, stays `int`) and the fallback for languages without the hook goes. Three PRs: the hook
+   (#147), smaltql (stenhoor/smaltql, `claude/declare-int`), the defaults. sqllogictest stays at its pass rate.
 7. **smaltdf:** `bool` from the engine (its own 0 / 1 conversion goes), `BOOLEAN` in `createTable`, NaN from `div`,
    and the Polars comparison table updated (`0 / 0` stops differing).
 
@@ -159,6 +160,7 @@ plan-shape and generated-code corpora, and smaltql's suites.
 3. **NaN:** a total order: NaN equals NaN and sorts after every number.
 4. **SQL's names:** the `sql.*` operation names are removed, not kept for SQL's 0 / 1. SQL types what it needs
    through the declared `int` (section 1).
+5. **NaN in SQL:** a NaN another language stored stays visible in SQL as NaN (not NULL).
 
 ## Alternatives considered
 

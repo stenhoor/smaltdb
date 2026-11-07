@@ -1,7 +1,6 @@
 /**
  * Parameters and NaN (ADR 0018 section 2): a plan's parameters keep NaN, a value of `real`; a language statement's
- * parameters go through its language's `parameter` hook, and without one NaN binds as NULL (SQL's meaning, until
- * smaltql provides the hook).
+ * parameters go through its language's `parameter` hook (SQL's gives NaN as NULL), and without one they keep NaN.
  */
 import { afterEach, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
@@ -19,9 +18,12 @@ it("a plan's parameters keep NaN", () => {
   expect(Number.isNaN(v as number)).toBe(true);
 });
 
-it("a language statement's parameters: NaN as NULL without the hook", () => {
-  const d = Database.openMemory();
-  expect(d.query('SELECT ?', [NaN]).rows).toEqual([[null]]);
+it("SQL's parameters: NaN as NULL, through smaltql's hook; a language without the hook keeps NaN", () => {
+  expect(Database.openMemory().query('SELECT ?', [NaN]).rows).toEqual([[null]]);
+  const { parameter: _, ...noHook } = sql;
+  registerLanguage(noHook);
+  const v = Database.openMemory().query('SELECT ?', [NaN]).rows[0][0];
+  expect(Number.isNaN(v as number)).toBe(true);
 });
 
 it("a language statement's parameters go through its parameter hook", () => {

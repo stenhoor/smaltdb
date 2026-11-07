@@ -35,10 +35,11 @@ describe('in process', () => {
     expect(q(p.project(frame(), [p.call('cmp_eq', [n, p.lit(null)], 'bool')])).rows).toEqual([[null], [null], [null], [null]]);
   });
 
-  it('logic nodes: typed bool, or int (also when left out, until ADR 0018 step 6)', () => {
+  it('logic nodes: bool (also when left out), or typed int', () => {
     const both = p.and(flag, gt2('bool'));
     expect(q(p.project(frame(), [p.typed(both, 'bool')])).rows).toEqual([[false], [false], [null], [true]]);
-    expect(q(p.project(frame(), [both])).rows).toEqual([[0], [0], [null], [1]]);
+    expect(q(p.project(frame(), [both])).rows).toEqual([[false], [false], [null], [true]]);
+    expect(q(p.project(frame(), [p.typed(both, 'int')])).rows).toEqual([[0], [0], [null], [1]]);
     expect(q(p.project(frame(), [p.typed(p.not(flag), 'bool'), p.typed(p.isNull(flag), 'bool')])).rows).toEqual([[false, false], [true, false], [null, true], [false, false]]);
   });
 
