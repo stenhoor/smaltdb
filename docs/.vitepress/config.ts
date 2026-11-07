@@ -124,6 +124,10 @@ export default defineConfig({
           { text: '0014 Shared plan layer (proposed)', link: '/adr/0014-shared-plan-layer' },
           { text: '0015 smaltql and the language API', link: '/adr/0015-smaltql' },
           { text: '0016 Plan API for every language', link: '/adr/0016-plan-api-for-every-language' },
+          { text: '0017 Remaining SQL dependencies', link: '/adr/0017-remaining-sql-dependencies' },
+          { text: '0018 bool and NaN', link: '/adr/0018-bool-and-nan' },
+          { text: '0019 Dates and times', link: '/adr/0019-dates-and-times' },
+          { text: '0020 Lists and structs (proposed)', link: '/adr/0020-lists-and-structs' },
         ],
       },
       {
