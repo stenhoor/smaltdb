@@ -64,6 +64,19 @@ Results carry each column's plan type: `columnTypes` on `rowMode: 'array'` and `
 statements. A write run with `queryPlan` gives `changes` and `lastInsertRowid` on its result, beside any RETURNING rows;
 they are not enumerable, so the rows compare and serialize as before.
 
+Dates and times (`date`, `datetime`, `time`, `duration`) come back as text, such as `2026-11-07` or
+`2026-11-07 12:30:00.500` ([ADR 0019](../../adr/0019-dates-and-times.md)). The option `temporal` asks for another
+form, on `queryPlan` and `streamPlan` in the client and on the engine's `query`, `queryPlan` and `queryPlanAsync`:
+
+| `temporal` | `date` | `datetime` | `time` | `duration` |
+|---|---|---|---|---|
+| `'text'` (default) | `2026-11-07` | `2026-11-07 12:30:00` | `12:30:00` | `P1DT2H` |
+| `'date'` | `Date` (midnight UTC) | `Date` (as UTC, ms) | text | text |
+| `'temporal'` | `Temporal.PlainDate` | `Temporal.PlainDateTime` | `Temporal.PlainTime` | `Temporal.Duration` |
+
+`'temporal'` needs a runtime with the `Temporal` API, and fails without one. A `Date` holds ms, so `'date'` drops a
+`datetime`'s µs.
+
 ```ts
 import { open } from 'smaltdb';
 import * as p from 'smaltdb/plan';

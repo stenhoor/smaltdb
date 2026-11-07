@@ -34,7 +34,7 @@ import { SYSTEM_TABLES, type StoredDef, type StoredText, type SystemTableName, d
 import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
-import { type TemporalType, datetimeFromDate, isTemporal, temporalText } from '../shared/temporal.js';
+import { type TemporalForm, type TemporalType, datetimeFromDate, isTemporal, rowsInForm, temporalText } from '../shared/temporal.js';
 import type { ReaderSettings } from '../shared/protocol.js';
 import { describeTable, logicalCatalog } from './catalog/logical.js';
 import { outputTypes } from './plan/output.js';
@@ -528,10 +528,10 @@ export class Database implements FunctionContext {
     for (const ps of stmts) new Statement(this, ps, ps.text).run(params);
   }
 
-  /** Run a single statement and return all rows. */
-  query(sql: string, params?: BindParams): QueryResult {
+  /** Run a single statement and return all rows; `temporal` gives dates and times as text (default), `Date`s or `Temporal` objects (ADR 0019). */
+  query(sql: string, params?: BindParams, options: { temporal?: TemporalForm } = {}): QueryResult {
     const st = this.cached(sql);
-    return { columns: st.columns, rows: st.all(params) };
+    return { columns: st.columns, rows: rowsInForm(st.all(params), st.columnTypes, options.temporal) };
   }
 
   run(sql: string, params?: BindParams): RunResult {
@@ -552,14 +552,14 @@ export class Database implements FunctionContext {
   }
 
   /** Run a query given as plan data and return all rows (statements are cached by the plan's canonical form). */
-  queryPlan(stmt: PlanStatementInput, params?: readonly SqlValue[]): QueryResult {
-    return this.cachedPlan(stmt).result(params as BindParams | undefined);
+  queryPlan(stmt: PlanStatementInput, params?: readonly SqlValue[], options: { temporal?: TemporalForm } = {}): QueryResult {
+    return inForm(this.cachedPlan(stmt).result(params as BindParams | undefined), options.temporal);
   }
 
   /** `queryPlan` for a plan that may read external data: its sources are fetched first. */
-  async queryPlanAsync(stmt: PlanStatementInput, params?: readonly SqlValue[], options: { signal?: AbortSignal } = {}): Promise<QueryResult> {
+  async queryPlanAsync(stmt: PlanStatementInput, params?: readonly SqlValue[], options: { signal?: AbortSignal; temporal?: TemporalForm } = {}): Promise<QueryResult> {
     const st = this.cachedPlan(stmt);
-    return this.withExternal(options.signal, st, () => st.result(params as BindParams | undefined));
+    return this.withExternal(options.signal, st, () => inForm(st.result(params as BindParams | undefined), options.temporal));
   }
 
   /** A plan from outside the engine, as it is received: validated, giving its output width. */
@@ -5055,6 +5055,12 @@ export class RowCursor {
   }
 }
 
+
+/** `r` with its temporal columns in `form` (text when left out). */
+function inForm(r: QueryResult, form: TemporalForm | undefined): QueryResult {
+  if (form && form !== 'text' && r.columnTypes) rowsInForm(r.rows, r.columnTypes, form);
+  return r;
+}
 
 /** The indexes and types of the temporal columns (ADR 0019). */
 function temporalColumns(types: readonly StaticType[]): [number, TemporalType][] {

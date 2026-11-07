@@ -89,6 +89,26 @@ describe('in process', () => {
     expect(db.queryPlan(p.project(after2000, [p.col(0, 1, 'date')])).rows).toEqual([['2026-11-07']]);
   });
 
+  it('results in other forms on request: Date, or Temporal where the runtime has it', () => {
+    const db = Database.openMemory();
+    const [first] = db.queryPlan(frame(), [], { temporal: 'date' }).rows;
+    expect(first![1]).toEqual(new Date(Date.UTC(2026, 10, 7)));
+    expect(first![2]).toEqual(new Date(Date.UTC(2026, 10, 7, 12, 30)));
+    // time and duration have no JS Date form: they stay text.
+    expect(first!.slice(3)).toEqual(['08:15:00', 'P1DT1S']);
+    expect(() => db.queryPlan(frame(), [], { temporal: 'temporal' })).toThrow(/no Temporal API/);
+    const g = globalThis as { Temporal?: unknown };
+    const seen: string[] = [];
+    const kind = (k: string) => ({ from: (s: string) => (seen.push(`${k} ${s}`), { k, s }) });
+    g.Temporal = { PlainDate: kind('PlainDate'), PlainDateTime: kind('PlainDateTime'), PlainTime: kind('PlainTime'), Duration: kind('Duration') };
+    try {
+      db.queryPlan(frame(), [], { temporal: 'temporal' });
+      expect(seen.slice(0, 4)).toEqual(['PlainDate 2026-11-07', 'PlainDateTime 2026-11-07T12:30:00', 'PlainTime 08:15:00', 'Duration P1DT1S']);
+    } finally {
+      delete g.Temporal;
+    }
+  });
+
   it('a JS Date binds as a datetime', () => {
     const st = Database.openMemory().preparePlan(p.project(p.values([[]]), [p.param(0, 'datetime')]));
     expect(st.all([new Date(Date.UTC(2026, 0, 2, 3, 4, 5, 6)) as never])).toEqual([['2026-01-02 03:04:05.006']]);
@@ -164,6 +184,8 @@ describe('through the client', () => {
     expect([...(await db.queryPlan(frame(), [], { rowMode: 'array' }))]).toEqual(ROWS);
     const columnar = (await db.queryPlan(frame(), [], { rowMode: 'columnar' })) as unknown as { data: Record<string, unknown> };
     expect([...(Object.values(columnar.data)[1] as unknown[])]).toEqual(['2026-11-07', '1999-12-31', null]);
+    const dated = [...(await db.queryPlan(frame(), [], { rowMode: 'array', temporal: 'date' }))] as unknown[][];
+    expect(dated[0]!.slice(1)).toEqual([new Date(Date.UTC(2026, 10, 7)), new Date(Date.UTC(2026, 10, 7, 12, 30)), '08:15:00', 'P1DT1S']);
     const streamed: unknown[] = [];
     for await (const b of db.streamPlan(frame(), [], { batchSize: 2, rowMode: 'array' })) streamed.push(...b);
     expect(streamed).toEqual(ROWS);
