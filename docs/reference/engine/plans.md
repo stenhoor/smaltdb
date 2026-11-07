@@ -264,10 +264,18 @@ when the plan is compiled. NULL arguments give NULL.
 | `format_temporal` | 2: a `date`, `datetime` or `time`, format | Text written with a `strftime` format |
 | `trunc_temporal` | 2: a value, unit | The value truncated to `year`, `quarter`, `month`, `week` (to Monday), `day`, `hour`, `minute`, `second`, `millisecond` or `microsecond`. Its type is the value's |
 | `offset_by` | 2: a `date` or `datetime`, offset | The value moved by a `duration`, or by text such as `1mo`, `-2d` or `1y3mo`: units `y`, `q`, `mo`, `w`, `d`, `h`, `m`, `s`, `ms`, `us`. Months move on the calendar and keep the day of the month, or take the last day of a shorter one (`2026-01-31` and `1mo` give `2026-02-28`); then days and the clock. A `date` moves by whole days only |
+| `to_zone` | 2: a `datetime` (a UTC instant), zone | The wall-clock time in `zone` at that instant |
+| `from_zone` | 2 or 3: a `datetime` (a wall-clock time), zone, how | The UTC instant of that wall-clock time in `zone`. A time that occurs twice (clocks going back) is the earlier instant, or with `how` `later` the later; one that doesn't occur (clocks going forward) moves forward by the gap, or with `earlier` back. `reject` makes either an error (`SMALT_RANGE`). The default, `compatible`, is `Temporal`'s |
+| `zone_offset` | 2: a `datetime` (a UTC instant), zone | The zone's offset from UTC at that instant, a `duration` |
 | `cast_date` | 1 | A `date` from a `datetime` (its day), from text in the result format, or from a number of days. Anything else is an error (`SMALT_MISMATCH`) |
 | `cast_datetime` | 1 | A `datetime` from a `date` (midnight), from text in the result format, or from a number of µs. Anything else is an error |
 
 `cast_text` of a temporal value gives its result text.
+
+A **zone** is text: an IANA name (`Europe/Paris`), `UTC`, or a fixed offset (`+05:30`, `-08`). It is an argument
+like any other, so a column can give each row its own. A `datetime` has no zone: whether a value is a UTC instant or a
+wall-clock time is what the data means, and the operations above say which they take. Offsets come from the runtime's
+`Intl.DateTimeFormat` and are cached by day. An unknown zone is an error (`SMALT_MISMATCH`).
 
 Formats take `%Y` (year), `%y` (two digits: 69–99 are 1900s), `%m`, `%d`, `%e` (day, space-padded), `%j` (day of
 the year), `%H`, `%I` (12-hour), `%p` (`AM` or `PM`), `%M`, `%S`, `%f` (µs, six digits), `%a` and `%A` (weekday
