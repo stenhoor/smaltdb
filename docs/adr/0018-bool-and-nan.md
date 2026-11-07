@@ -1,6 +1,7 @@
 # ADR 0018: `bool` and NaN
 
-- **Status:** accepted (#142), with the owner's decisions of 2026-11-07 (below)
+- **Status:** done: accepted with #142; steps 2–6 in #144, #145, #146, #148, #147, stenhoor/smaltql#18 and #149;
+  step 7 in stenhoor/smaltdf#18. Owner's decisions of 2026-11-07 below
 - **Date:** 2026-11-07
 - **Builds on:** [ADR 0016](0016-plan-api-for-every-language.md) section 3 (types) and step 11, owner's decision 4
   (`bool` goes with a file-format change)
