@@ -123,6 +123,12 @@ export interface MethodContext {
 export interface FormatColumn {
   name: string;
   declType: string;
+  /**
+   * Dates and times (ADR 0019): the column's values are integers of this type, days for `date` and µs for the others,
+   * and results give them as text (`2026-11-07`). Absent: the column is typed from `declType`. Optional since API
+   * version 1 (engines before it ignore it).
+   */
+  type?: 'date' | 'datetime' | 'time' | 'duration';
 }
 
 /** Random access to a file: its size and byte ranges (HTTP Range requests, Blob slices, file reads). */

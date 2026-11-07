@@ -1052,7 +1052,7 @@ export class Database implements FunctionContext {
       this.catalogEntries.set(r.name.toLowerCase(), { type: r.type as CatalogEntry['type'], name: r.name, rowid: r.rowid });
       if (r.type === 'external') {
         const x = def(r.name.toLowerCase(), 'external');
-        this.externals.set(r.name.toLowerCase(), { name: r.name, columns: x.columns.map((c) => ({ name: c.name, declType: c.declaredType })), options: { ...x.options }, sql: r.sql!, ...(x.language !== undefined ? { language: x.language } : {}), ...(isDescribed(x) ? { described: true } : {}) });
+        this.externals.set(r.name.toLowerCase(), { name: r.name, columns: x.columns.map((c) => ({ name: c.name, declType: c.declaredType, ...(c.type ? { type: c.type } : {}) })), options: { ...x.options }, sql: r.sql!, ...(x.language !== undefined ? { language: x.language } : {}), ...(isDescribed(x) ? { described: true } : {}) });
         continue;
       }
       if (r.type === 'view') {
@@ -2960,10 +2960,10 @@ export class Database implements FunctionContext {
       // Columns inferred from the source now (fetched by the async API; Parquet: only its footer), and stored with the table.
       const data = this.external.data(schemaSourceOf(source));
       if (data.columns.length === 0) throw externalError(source, 'no columns found (the source is empty)');
-      columns = data.columns.map((c) => ({ name: c.name, declType: c.declType || 'ANY' }));
+      columns = data.columns.map((c) => ({ name: c.name, declType: c.declType || 'ANY', ...(c.type !== undefined && isTemporal(c.type) ? { type: c.type } : {}) }));
       if (stmt.source) text = languagePart(this.languageOf(stmt.source.language), 'sourceEditor').externalTable(stmt.name, columns.map((c) => ({ name: c.name, declaredType: c.declType })), stmt.options);
     }
-    const stored: StoredDef = { kind: 'external', columns: columns.map((c) => ({ name: c.name, declaredType: c.declType })), options: stmt.options, ...described };
+    const stored: StoredDef = { kind: 'external', columns: columns.map((c) => ({ name: c.name, declaredType: c.declType, ...(c.type ? { type: c.type } : {}) })), options: stmt.options, ...described };
     text ??= describeDefinition(stored);
     this.dirtySchema = true;
     this.addCatalogRow('external', stmt.name, stmt.name, 0, text, undefined, stored);
@@ -2981,8 +2981,9 @@ export class Database implements FunctionContext {
     return {
       label: `${def.name} (${source.location})`,
       source,
-      // Declared types are conversions, not guarantees (text that does not convert stays text).
-      columns: def.columns.map((c) => ({ name: c.name, declType: c.declType, type: 'any' as StaticType })),
+      // Declared types are conversions, not guarantees (text that does not convert stays text); a date or time type
+      // the format gave is a guarantee (its values were checked when read).
+      columns: def.columns.map((c) => ({ name: c.name, declType: c.declType, type: (c.type ?? 'any') as StaticType })),
       rows: () => this.external.data(source).rows,
     };
   }

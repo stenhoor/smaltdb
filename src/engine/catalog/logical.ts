@@ -8,6 +8,8 @@ import { type CompiledArg, type FunctionContext, aggregateFunctions, scalarFunct
 import { SQL_FUNCTIONS } from '../exec/sql-functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../exec/window.js';
 import type { Catalog, CatalogData, CatalogFunction, CatalogKey, CatalogSettings, CatalogTable, CatalogView, FunctionCatalog } from '../plan/catalog.js';
+import type { TemporalType } from '../../shared/temporal.js';
+import type { StorageType } from '../plan/schema.js';
 import { declaredType, planTypeOfStorage } from '../plan/catalog.js';
 import { type BoundExpr, typeOf } from '../plan/expr.js';
 import type { Source, TableDef } from '../plan/schema.js';
@@ -80,13 +82,13 @@ export function describeTableDef(def: TableDef, source?: Source, schema: 'main' 
   return { ...d, keys, schema, storage: def.storage };
 }
 
-function describeExternal(x: { name: string; sql: string; columns: readonly { name: string; declType: string }[]; language?: string; described?: boolean }): CatalogTable {
+function describeExternal(x: { name: string; sql: string; columns: readonly { name: string; declType: string; type?: TemporalType }[]; language?: string; described?: boolean }): CatalogTable {
   return {
     kind: 'external',
     name: x.name,
     schema: 'main',
     columns: x.columns.map((c) => {
-      const d = declaredType(c.declType);
+      const d = c.type ? { type: c.type, storageType: c.type.toUpperCase() as StorageType } : declaredType(c.declType);
       return { name: c.name, type: d.type, storageType: d.storageType, declaredType: c.declType, collation: 'binary', notNull: false, rowid: false, hasDefault: false };
     }),
     keys: [],
