@@ -130,6 +130,15 @@ function resultOf(name: string, minArgs: number, ctx: FunctionContext): PlanType
 /** Traits as plain data. */
 const traitData = (t: object | undefined): Readonly<Record<string, string | number | boolean>> => ({ ...(t as Record<string, string | number | boolean>) });
 
+/**
+ * `f` with its `result` computed when first read. Computing it compiles the function: done for every function at once,
+ * that was the cost of a process's first lookup of any function (a language binding its first call).
+ */
+function lazily(f: Omit<CatalogFunction, 'result'>, minArgs: number, ctx: FunctionContext): CatalogFunction {
+  let result: PlanType | undefined;
+  return Object.defineProperty(f, 'result', { get: () => (result ??= resultOf(f.name, minArgs, ctx)), enumerable: true }) as CatalogFunction;
+}
+
 function describeFunctions(ctx: FunctionContext): CatalogFunction[] {
   const out: CatalogFunction[] = [];
   const aliases = new Map<string, string[]>();
@@ -137,27 +146,32 @@ function describeFunctions(ctx: FunctionContext): CatalogFunction[] {
   for (const [name, op] of SQL_FUNCTIONS) {
     if (canonicalName(name) !== name) continue;
     const [minArgs, max] = typeof op.arity === 'number' ? [op.arity, op.arity] : op.arity;
-    out.push({ name, kind: 'scalar', minArgs, maxArgs: max < 0 ? null : max, deterministic: true, result: resultOf(name, minArgs, ctx), operation: { aliases: aliases.get(name) ?? [] }, traits: traitData(op.traits) });
+    out.push(lazily({ name, kind: 'scalar', minArgs, maxArgs: max < 0 ? null : max, deterministic: true, operation: { aliases: aliases.get(name) ?? [] }, traits: traitData(op.traits) }, minArgs, ctx));
   }
   for (const [name, f] of scalarFunctions) {
     if (SQL_FUNCTIONS.has(name)) continue;
-    out.push({
-      name,
-      kind: 'scalar',
-      minArgs: f.minArgs,
-      maxArgs: f.maxArgs < 0 ? null : f.maxArgs,
-      deterministic: f.deterministic && !f.pureDate,
-      ...(f.pureDate ? { dateTime: true as const } : {}),
-      result: resultOf(name, f.minArgs, ctx),
-      traits: traitData(f.traits),
-    });
+    out.push(
+      lazily(
+        {
+          name,
+          kind: 'scalar',
+          minArgs: f.minArgs,
+          maxArgs: f.maxArgs < 0 ? null : f.maxArgs,
+          deterministic: f.deterministic && !f.pureDate,
+          ...(f.pureDate ? { dateTime: true as const } : {}),
+          traits: traitData(f.traits),
+        },
+        f.minArgs,
+        ctx,
+      ),
+    );
   }
   for (const [name, f] of aggregateFunctions) {
-    out.push({ name, kind: 'aggregate', minArgs: f.minArgs, maxArgs: f.maxArgs < 0 ? null : f.maxArgs, deterministic: true, result: resultOf(name, f.minArgs, ctx), traits: {} });
+    out.push(lazily({ name, kind: 'aggregate', minArgs: f.minArgs, maxArgs: f.maxArgs < 0 ? null : f.maxArgs, deterministic: true, traits: {} }, f.minArgs, ctx));
   }
   for (const name of [...RANKING, ...NAVIGATION]) {
     const [minArgs, maxArgs] = WINDOW_ARITY[name];
-    out.push({ name, kind: 'window', minArgs, maxArgs, deterministic: true, result: resultOf(name, minArgs, ctx), traits: {} });
+    out.push(lazily({ name, kind: 'window', minArgs, maxArgs, deterministic: true, traits: {} }, minArgs, ctx));
   }
   return out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
