@@ -1,0 +1,90 @@
+/**
+ * The list and struct operations (ADR 0020 step 2): building, the list_* operations, struct_field, implode, and
+ * cast_text's JSON. Run with and without code generation and through the plan codec by the suite's modes.
+ */
+import { describe, expect, it } from 'vitest';
+import { Database } from '../src/engine/database.js';
+import { plan as p } from '../src/engine/index.js';
+import type { PlanExpr } from '../src/engine/plan/expr.js';
+import type { PlanType } from '../src/engine/plan/types.js';
+
+const db = Database.openMemory();
+const L = (t: string) => t as PlanType;
+
+/** A column of lists `xs` of type `t`, and `fn(col, ...rest)` declared `type` over it. */
+function over(t: string, xs: unknown[], fn: string, rest: PlanExpr[], type: string): unknown[] {
+  const src = p.fromColumns([xs as never], [L(t)]);
+  return db.queryPlan(p.project(src, [p.call(fn, [p.col(0, 0, L(t)), ...rest], L(type))])).rows.map((r) => r[0]);
+}
+
+describe('list operations', () => {
+  const ints = [[3, 1, 2], [], null, [5, null, 5]];
+
+  it('len, get, contains, slice, reverse', () => {
+    expect(over('list<int>', ints, 'list_len', [], 'int')).toEqual([3, 0, null, 3]);
+    expect(over('list<int>', ints, 'list_get', [p.lit(0)], 'int')).toEqual([3, null, null, 5]);
+    expect(over('list<int>', ints, 'list_get', [p.lit(-1)], 'int')).toEqual([2, null, null, 5]);
+    expect(over('list<int>', ints, 'list_get', [p.lit(9)], 'int')).toEqual([null, null, null, null]);
+    expect(over('list<int>', ints, 'list_contains', [p.lit(5)], 'bool')).toEqual([false, false, null, true]);
+    expect(over('list<int>', ints, 'list_contains', [p.lit(null)], 'bool')).toEqual([false, false, null, true]);
+    expect(over('list<int>', ints, 'list_slice', [p.lit(1)], 'list<int>')).toEqual([[1, 2], [], null, [null, 5]]);
+    expect(over('list<int>', ints, 'list_slice', [p.lit(-2), p.lit(1)], 'list<int>')).toEqual([[1], [], null, [null]]);
+    expect(over('list<int>', ints, 'list_reverse', [], 'list<int>')).toEqual([[2, 1, 3], [], null, [5, null, 5]]);
+  });
+
+  it('sort, unique, concat, join', () => {
+    expect(over('list<int>', ints, 'list_sort', [], 'list<int>')).toEqual([[1, 2, 3], [], null, [null, 5, 5]]);
+    expect(over('list<int>', ints, 'list_sort', [p.lit(1)], 'list<int>')).toEqual([[3, 2, 1], [], null, [null, 5, 5]]);
+    expect(over('list<int>', ints, 'list_unique', [], 'list<int>')).toEqual([[3, 1, 2], [], null, [5, null]]);
+    expect(over('list<int>', ints, 'list_concat', [p.call('list_of', [p.lit(7)], L('list<int>'))], 'list<int>')).toEqual([[3, 1, 2, 7], [7], null, [5, null, 5, 7]]);
+    expect(over('list<text>', [['a', 'b'], [], ['x', null]], 'list_join', [p.lit('-')], 'text')).toEqual(['a-b', '', 'x']);
+    expect(over('list<date>', [[0, 1]], 'list_join', [p.lit(',')], 'text')).toEqual(['1970-01-01,1970-01-02']);
+  });
+
+  it('reductions skip nulls', () => {
+    const xs = [[1, 2, null], [], [2.5, -1]];
+    expect(over('list<int>', xs.slice(0, 2), 'list_sum', [], 'int')).toEqual([3, 0]);
+    expect(over('list<real>', xs, 'list_mean', [], 'real')).toEqual([1.5, null, 0.75]);
+    expect(over('list<real>', xs, 'list_min', [], 'real')).toEqual([1, null, -1]);
+    expect(over('list<real>', xs, 'list_max', [], 'real')).toEqual([2, null, 2.5]);
+    expect(() => over('list<text>', [['a']], 'list_sum', [], 'int')).toThrow(/list_sum takes a list of numbers/);
+  });
+
+  it('take lists only', () => {
+    expect(() => over('int', [1], 'list_len', [], 'int')).toThrow(/list_len takes a list, not int/);
+  });
+});
+
+describe('building and structs', () => {
+  it('list_of and struct_of, and struct_field', () => {
+    const r = db.queryPlan(
+      p.project(p.values([[]]), [
+        p.call('list_of', [p.lit(1), p.lit(null), p.lit(3)], L('list<int>')),
+        p.call('struct_of', [p.lit('a'), p.lit(2.5)], L('struct<name text, score real>')),
+        p.call('struct_field', [p.call('struct_of', [p.lit('a'), p.lit(2.5)], L('struct<name text, score real>')), p.lit(1)], 'real'),
+        p.call('list_of', [p.call('list_of', [p.lit(1)], L('list<int>')), p.call('list_of', [], L('list<int>'))], L('list<list<int>>')),
+      ]),
+    ).rows[0];
+    expect(r).toEqual([[1, null, 3], { name: 'a', score: 2.5 }, 2.5, [[1], []]]);
+    expect(() => over('struct<a int>', [{ a: 1 }], 'struct_field', [p.lit(3)], 'int')).toThrow(/has no field 3/);
+    expect(() => over('list<int>', [[1]], 'struct_field', [p.lit(0)], 'int')).toThrow(/struct_field takes a struct/);
+  });
+});
+
+describe('implode', () => {
+  it("collects a group's values in its order, nulls included", () => {
+    const src = p.fromColumns([['a', 'b', 'a', 'a'], [1, 2, null, 3]], ['text', 'int']);
+    const agg = p.aggregate(src, [p.col(0, 0, 'text')], [p.agg('implode', [p.col(0, 1, 'int')], L('list<int>'))]);
+    const rows = db.queryPlan(p.sort(agg, [p.asc(p.col(0, 0, 'text'))])).rows;
+    expect(rows).toEqual([['a', [1, null, 3]], ['b', [2]]]);
+  });
+});
+
+describe('JSON text', () => {
+  it('cast_text gives a list or struct as JSON', () => {
+    const t = 'list<struct<d date, ok bool, n list<int>, big int>>';
+    const v = [{ d: '2026-11-07', ok: true, n: [1, 2], big: 2n ** 60n }, null];
+    expect(over(t, [v], 'cast_text', [], 'text')).toEqual(['[{"d":"2026-11-07","ok":true,"n":[1,2],"big":1152921504606846976},null]']);
+    expect(over('list<text>', [['a"b', null]], 'cast_text', [], 'text')).toEqual(['["a\\"b",null]']);
+  });
+});

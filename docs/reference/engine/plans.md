@@ -299,7 +299,29 @@ checked forms), with these result types:
 
 Other operands count as integers: `date + int` is an `int` (a day count).
 
-**Aggregate and window functions** are named the same way (`sum`, `rank`, …) in `AggCall` and `WindowCall`.
+**Lists and structs** ([ADR 0020](../../adr/0020-lists-and-structs.md)) have their own operations. A list argument must
+be typed `list<…>` (an error when the plan is compiled otherwise); NULL lists give NULL.
+
+| Function | Arguments | Meaning |
+|---|---|---|
+| `list_of` | any number | A list of the arguments, in order. Declare the call's type (`list<int>`) |
+| `struct_of` | 1 or more | A struct of the arguments, as the fields of the call's declared type (`struct<name text, score real>`) |
+| `struct_field` | 2: a struct, field index | The field's value (from 0); declare the field's type on the call. A field it doesn't have is an error (`SMALT_RANGE`) |
+| `list_len` | 1 | The number of elements |
+| `list_get` | 2: a list, index | The element at `index` (from 0; negative from the end), or NULL out of range |
+| `list_contains` | 2: a list, value | Whether an element equals `value` (NULL: whether there is a NULL element): `bool` |
+| `list_slice` | 2 or 3: a list, offset, length | The elements from `offset` (negative from the end), `length` of them or to the end |
+| `list_concat` | 2 | The two lists one after the other |
+| `list_join` | 2: a list, separator | Its non-NULL elements as text, joined by `separator` |
+| `list_sort` | 1 or 2: a list, descending | Its elements sorted, NULLs first |
+| `list_unique` | 1 | Its elements without repeats, the first of each, in order |
+| `list_reverse` | 1 | Its elements in reverse order |
+| `list_sum`, `list_mean`, `list_min`, `list_max` | 1 | Over the non-NULL numbers: the sum (0 for none), the mean, the least and greatest (NULL for none) |
+
+`cast_text` of a list or struct gives its JSON text: `[1,2]`, `{"name":"a","score":2.5}`, dates and times as their text,
+`bool` as `true` / `false`, integers beyond 2^53 with every digit.
+
+**Aggregate and window functions** are named the same way (`sum`, `rank`, …) in `AggCall` and `WindowCall`. `implode` gives a group's values as a list, in the group's order, NULLs included.
 
 ## Builders
 

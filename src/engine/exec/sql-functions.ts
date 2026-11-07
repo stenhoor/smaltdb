@@ -29,6 +29,8 @@ import {
 import type { Fn } from './functions.js';
 import { arithOperandType, daysAsUs, isDateDifference, temporalArithType } from './temporal-ops.js';
 import { isTemporal, temporalText } from '../../shared/temporal.js';
+import { isNestedType } from '../../shared/nested-types.js';
+import { nestedJson } from './nested-ops.js';
 
 /** One compiled argument. */
 export interface SqlArg {
@@ -732,6 +734,8 @@ const OPERATIONS: ReadonlyMap<string, SqlFunction> = new Map<string, SqlFunction
     const f = x.fn;
     const xt = x.type;
     if (isTemporal(xt)) return { fn: (r) => temporalText(xt, f(r)), type: 'text' };
+    // A list or struct as its JSON text (ADR 0020).
+    if (isNestedType(xt)) return { fn: (r) => { const v = f(r); return v instanceof Uint8Array ? nestedJson(xt, v) : toText(v, false); }, type: 'text' };
     const xr = xt === 'real';
     return { fn: (r) => toText(f(r), xr), type: 'text' };
   }),

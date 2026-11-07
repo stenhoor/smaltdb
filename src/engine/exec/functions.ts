@@ -16,6 +16,7 @@ import { sqlPrintf, valueInt64 } from './printf.js';
 import { STAT_AGGREGATES } from './stat-aggregates.js';
 import { dateFn, datetimeFn, juliandayFn, strftimeFn, timeFn, timediffFn, unixepochFn } from './datetime.js';
 import { TEMPORAL_FUNCTIONS } from './temporal-ops.js';
+import { IMPLODE, NESTED_FUNCTIONS } from './nested-ops.js';
 import { MATH_FUNCTIONS, ROUNDING, logScalar, mathScalar, roundingScalar } from './math.js';
 
 /**
@@ -581,6 +582,7 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
   ['lower_unicode', simple(1, 1, 'text', ([x], args) => (x === null ? null : toText(x, isRealType(args[0].type))!.toLowerCase()))],
   ['upper_unicode', simple(1, 1, 'text', ([x], args) => (x === null ? null : toText(x, isRealType(args[0].type))!.toUpperCase()))],
   ...TEMPORAL_FUNCTIONS,
+  ...NESTED_FUNCTIONS,
   ['regex_match', simple(2, 3, 'bool', (v) => (v[0] === null || v[1] === null ? null : regex(v[1], v[2], false).test(toText(v[0])!) ? 1 : 0))],
   ['regex_find', simple(2, 3, 'text', (v) => {
     if (v[0] === null || v[1] === null) return null;
@@ -974,6 +976,8 @@ export const aggregateFunctions = new Map<string, AggregateFunction>([
 // Statistics (stat-aggregates.ts): variance, standard deviation, covariance, correlation, skewness, kurtosis, and
 // SQLite's median and percentile functions.
 for (const [name, agg] of STAT_AGGREGATES) aggregateFunctions.set(name, agg);
+// A group's values as a list (ADR 0020).
+aggregateFunctions.set('implode', IMPLODE);
 
 /** Format helper re-exported for EXPLAIN and tests. */
 export { formatReal };
