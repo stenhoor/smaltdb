@@ -159,7 +159,7 @@ and sensitive to the I/O of preceding engines. Cold-read comparisons should be c
 ## Baseline after the plan API and SQL split (Node, 2026-11-07)
 
 Raw data: [bench/results/2026-11-07-node-fabbd86.json](../../bench/results/2026-11-07-node-fabbd86.json) (`main` after
-ADR 0016 steps 4–10 and ADR 0017) and [bench/results/2026-11-07-node-d94769b.json](../../bench/results/2026-11-07-node-d94769b.json)
+ADR 0016's code, #104–#130, and ADR 0017, #131–#134) and [bench/results/2026-11-07-node-d94769b.json](../../bench/results/2026-11-07-node-d94769b.json)
 (the last `main` before them). Run on the same machine with `npm run bench:native -- --engines smaltdb,smaltdb-mem,native-wal,native-mem --reps 5`, with
 the "after" run repeated once to measure the machine's drift, and SQL from each commit's smaltql pin (`32c3de0` and
 `fca25f9`).
