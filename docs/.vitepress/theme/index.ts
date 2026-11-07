@@ -2,6 +2,7 @@ import { inBrowser } from 'vitepress'
 import DefaultTheme from 'vitepress/theme'
 import type { Theme } from 'vitepress'
 import './smaltdb.css'
+import { withSmaltworks } from './stage'
 
 /**
  * The SQL guide and references moved to smaltql's site (ADR 0015). GitHub Pages can't redirect on the server, so old
@@ -12,6 +13,7 @@ const MOVED = /^\/(guide\/|reference\/sql(\/|$)|reference\/functions(\/|$)|refer
 
 export default {
   extends: DefaultTheme,
+  Layout: withSmaltworks(DefaultTheme),
   enhanceApp() {
     if (inBrowser && MOVED.test(location.pathname)) {
       location.replace(SMALTQL + location.pathname + location.search + location.hash)
