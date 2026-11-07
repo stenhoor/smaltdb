@@ -1,6 +1,7 @@
 # ADR 0019: Dates and times
 
-- **Status:** accepted with the owner's decisions of 2026-11-07 (at the end: each as recommended)
+- **Status:** accepted with the owner's decisions of 2026-11-07 (at the end: each as recommended); decision 2
+  amended the same day: a zone is a value passed to the operations, not part of a type (section 2)
 - **Date:** 2026-11-07
 - **Builds on:** [ADR 0016](0016-plan-api-for-every-language.md) section 3 (types), item 3; [ADR 0018](0018-bool-and-nan.md)
   (the pattern: a static type over integers, a storage type, results converted at the boundary)
@@ -58,13 +59,29 @@ or bigints beyond 2^53) at run time, works well:
   They join format 4, which is still unreleased, as `BOOLEAN` did.
 - **Index keys and zone maps:** they need nothing new; they are numbers.
 
-### 2. Time zones (decision 2)
+### 2. Time zones (decision 2, amended)
 
-- **`datetime` is wall-clock time with no zone**, as Polars' default `Datetime` is.
-- **Time zones:** a column can carry one IANA zone in its type, as `datetime(Europe/Paris)`. Its values are then
-  instants stored in UTC, as in Polars.
-- **Conversion** between zones uses `Intl.DateTimeFormat`, which every browser has. The engine carries no time zone
-  database.
+A zone fixed to a column's type fits data from one place, but not data from many (flights, users around the world),
+where each row has its own zone. So the zone is a value, not part of a type:
+
+- **`datetime` stays one type with no zone.** A value is either a wall-clock time or a UTC instant, as the data means
+  it; the engine doesn't tell them apart, as Polars' naive `Datetime` doesn't.
+- **A zone is an argument:** text naming an IANA zone (`Europe/Paris`), `UTC`, or a fixed offset (`+05:30`). It can
+  be any expression, so a constant or a column of zones, one per row.
+- **Two operations convert,** and the others compose with them (`hour(to_zone(ts, zone))`):
+  - `to_zone(instant, zone)`: the wall-clock time in `zone` of a UTC instant;
+  - `from_zone(wall_clock, zone)`: the UTC instant of a wall-clock time in `zone`. A time that occurs twice (clocks
+    going back) gives the earlier instant, and one that doesn't occur (clocks going forward) is moved forward by the
+    gap, as `Temporal`'s `compatible` disambiguation does. An optional third argument picks `earlier`, `later` or
+    `reject` (an error).
+  - `zone_offset(instant, zone)`: the zone's offset from UTC at that instant, a `duration`.
+- **Conversion** uses `Intl.DateTimeFormat`, which every browser has. The engine carries no time zone database. An
+  unknown zone is an error (`SMALT_MISMATCH`).
+- **Speed:** an `Intl` call costs microseconds, too slow per row. The engine caches each zone's offsets by day and
+  finds the instant of a change by bisection, so a lookup is a map read; a column of zones costs one more lookup per
+  row. Storage, sorting and code generation don't change: values stay 8-byte integers.
+- **Storage types** have no zone. A language that wants a default zone for a column keeps it in its own metadata
+  and passes it to the operations.
 
 ### 3. Results (decision 3)
 
@@ -73,7 +90,7 @@ A result column of a temporal type gives each value as text, in a fixed format t
 | Type | Format |
 |---|---|
 | `date` | `2026-11-07` |
-| `datetime` | `2026-11-07 12:00:00`, then `.123` or `.123456` when there is a fraction; with a zone, `+01:00` |
+| `datetime` | `2026-11-07 12:00:00`, then `.123` or `.123456` when there is a fraction |
 | `time` | `12:00:00` (and a fraction) |
 | `duration` | ISO 8601, e.g. `PT1H30M` |
 
@@ -103,9 +120,7 @@ These are new engine operations, named by behaviour:
 
   These are the existing arithmetic operations on the numbers, with result types the binder (and the operations'
   `resultType`) gives.
-- **Time zones:**
-  - `to_zone` changes the zone shown;
-  - `replace_zone` keeps the wall clock and changes the instant.
+- **Time zones** (section 2): `to_zone`, `from_zone` and `zone_offset`.
 - **Casts:**
   - `cast_date` and `cast_datetime` from text (strict: a string that isn't one is an error, as ADR 0016 decision E
     has it for numbers) and from numbers;
@@ -122,7 +137,7 @@ SQLite's date functions stay as they are. They are SQL's.
   - text in the result format parses.
 - **Parameters:** a JS `Date` binds as a `datetime`. Text stays text: a language converts it where it means a date.
 - **Parquet:** DATE and TIMESTAMP become `date` and `datetime` (micros, or nanos truncated: decision 1). They are no longer
-  text. A TIMESTAMP with `isAdjustedToUTC` gets the zone `UTC`.
+  text. A TIMESTAMP with `isAdjustedToUTC` is a UTC instant: its values are as stored.
 
 ### 6. SQL (decision 4)
 
@@ -151,7 +166,7 @@ One PR each, after this ADR:
 1. The types, storage and results: plan types, storage types (format 4), the result format, and values from columns.
    The result options (`Date` or `Temporal` objects on request) follow in their own PR, after this one.
 2. The operations: parts, truncation, offsets, arithmetic types, parse, format and casts.
-3. Time zones (decision 2): zoned `datetime` and `Intl`-based conversion.
+3. Time zones (decision 2, amended): `to_zone`, `from_zone` and `zone_offset`, with `Intl`-based conversion.
 4. Parquet gives `date` and `datetime` (`stenhoor/smaltdb-parquet`).
 5. smaltql: comparisons with text, and SQLite's functions reading temporal values.
 6. smaltdf: the types, `dt`, collect, and the comparison tests.
@@ -170,6 +185,9 @@ Each as recommended. The questions as they were put, with the recommendation tak
 2. **Time zones.**
    - **Recommendation:** naive `datetime` by default, plus an optional IANA zone in the type, converted with `Intl`
      (step 3). That is Polars' model.
+   - **Amended (owner, 2026-11-07):** a zone fixed per column doesn't fit data whose rows have different zones. The
+     zone is a value passed to the operations instead, which allows a zone per row and keeps values 8-byte integers
+     (section 2).
    - **Alternative A:** UTC instants only, no zones. Simpler, but `dt.hour()` and truncation to days are UTC's.
    - **Alternative B:** naive only, for now.
 3. **What results give.**
