@@ -48,3 +48,5 @@ export {
   planTypeOfStorage,
   storageTypeFor,
 } from './catalog.js';
+/** List and struct types (ADR 0020): parsing and checking their text. */
+export { type NestedType, type NestedTypeName, isNested, isNestedType, isPlanTypeName, parseNested } from '../../shared/nested-types.js';
