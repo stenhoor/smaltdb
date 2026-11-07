@@ -49,6 +49,7 @@ import {
   checkReaderOptions,
   externalError,
   formatOf,
+  isFormatType,
 } from './external/external.js';
 import { BTree } from './storage/btree.js';
 import { ColumnStore, ColumnStoreAppender, ColumnStoreWriter, ROW_GROUP_ROWS, chunkValue } from './storage/columnar.js';
@@ -2961,7 +2962,7 @@ export class Database implements FunctionContext {
       // Columns inferred from the source now (fetched by the async API; Parquet: only its footer), and stored with the table.
       const data = this.external.data(schemaSourceOf(source));
       if (data.columns.length === 0) throw externalError(source, 'no columns found (the source is empty)');
-      columns = data.columns.map((c) => ({ name: c.name, declType: c.declType || 'ANY', ...(c.type !== undefined && isTemporal(c.type) ? { type: c.type } : {}) }));
+      columns = data.columns.map((c) => ({ name: c.name, declType: c.declType || 'ANY', ...(isFormatType(c.type) ? { type: c.type } : {}) }));
       if (stmt.source) text = languagePart(this.languageOf(stmt.source.language), 'sourceEditor').externalTable(stmt.name, columns.map((c) => ({ name: c.name, declaredType: c.declType })), stmt.options);
     }
     const stored: StoredDef = { kind: 'external', columns: columns.map((c) => ({ name: c.name, declaredType: c.declType, ...(c.type ? { type: c.type } : {}) })), options: stmt.options, ...described };

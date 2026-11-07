@@ -240,7 +240,7 @@ them: a block is then never skipped for that column.
 ### FormatResult
 
 `{ columns: FormatColumn[]; rows: SqlValue[][] }`. A `FormatColumn` is `{ name: string; declType: string; type?:
-'date' | 'datetime' | 'time' | 'duration' }`, where `declType` is a declared type such as `INTEGER`, `REAL`, `TEXT`,
+'date' | 'datetime' | 'time' | 'duration' | 'list<…>' | 'struct<…>' }`, where `declType` is a declared type such as `INTEGER`, `REAL`, `TEXT`,
 `BLOB` or `ANY`.
 
 - With `request.columns`, return those columns, in that order, and one value per column in each row.
@@ -251,6 +251,10 @@ them: a block is then never skipped for that column.
   integer is an error. An external table whose columns come from the source keeps the type in its definition.
   Engines before 0.9.0 ignore `type`: a format that sets it should give `declType` a type such as `DATE`, whose
   integer values they then read as numbers.
+- A `list<…>` or `struct<…>` `type` gives a column of lists or structs ([ADR 0020](../../adr/0020-lists-and-structs.md)).
+  Its values are JS arrays, and objects by field name for a struct, whose elements are of their element types (text
+  for `text`, integers for `int`, …), or a list or struct's bytes. The engine encodes them; an element of another type is
+  an error naming the column.
 - Values are `SqlValue`s: `null`, `number`, `bigint` (integers beyond 2^53), `string` or `Uint8Array`.
 
 ## Sources

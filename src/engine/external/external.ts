@@ -15,6 +15,10 @@ import type { Zone } from '../storage/columnar.js';
 import type { SqlValue } from '../values.js';
 import { hivePartitions, isGlob, partitionValue } from './glob.js';
 import { type TemporalType, isTemporal } from '../../shared/temporal.js';
+import { type NestedTypeName, encodeNested, isNestedType } from '../../shared/nested.js';
+
+/** A type a format may give a column (FormatColumn.type): a date and time type, or a list or struct type. */
+export const isFormatType = (t: unknown): t is TemporalType | NestedTypeName => typeof t === 'string' && (isTemporal(t) || isNestedType(t));
 
 /** A named endpoint (`CREATE CONNECTION`). */
 export interface ConnectionInfo {
@@ -26,8 +30,8 @@ export interface ConnectionInfo {
 export interface ExternalColumn {
   name: string;
   declType: string;
-  /** A temporal type the format gave the column (FormatColumn.type). */
-  type?: TemporalType;
+  /** A date and time or list and struct type the format gave the column (FormatColumn.type). */
+  type?: TemporalType | NestedTypeName;
 }
 
 /** What to fetch and how to read it: an external table, or one call of a table function such as `read_csv`. */
@@ -163,6 +167,21 @@ function fits(v: SqlValue, t: StaticType): boolean {
 
 function typed(columns: ExternalColumn[], rows: SqlValue[][]): ExternalData['columns'] {
   return columns.map((c, i) => {
+    if (c.type !== undefined && isNestedType(c.type)) {
+      // A list or struct (ADR 0020): JS arrays and objects as the format reads them, encoded by the type, or its bytes.
+      const t = c.type;
+      for (const r of rows) {
+        const v = r[i];
+        if (v === null || v === undefined || v instanceof Uint8Array) continue;
+        if (typeof v !== 'object') throw new SmaltError('SMALT_ERROR', `column ${c.name}: a ${t} value is an array or object, not ${typeof v}`);
+        try {
+          r[i] = encodeNested(t, v, `column ${c.name}`);
+        } catch (e) {
+          throw new SmaltError('SMALT_ERROR', (e as Error).message);
+        }
+      }
+      return { ...c, type: t };
+    }
     if (c.type !== undefined && isTemporal(c.type)) {
       const t = c.type;
       for (const r of rows) {
@@ -410,7 +429,7 @@ export class ExternalRegistry {
       for (const p of parts) {
         for (const c of p.parsed.columns) {
           const old = byName.get(lower(c.name));
-          const type = isTemporal(c.type) ? c.type : undefined;
+          const type = isFormatType(c.type) ? c.type : undefined;
           if (!old) byName.set(lower(c.name), { name: c.name, declType: c.declType, ...(type ? { type } : {}) });
           else {
             if (old.declType !== c.declType) old.declType = [old.declType, c.declType].every((t) => t === 'INTEGER' || t === 'REAL') ? 'REAL' : 'ANY';

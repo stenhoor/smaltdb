@@ -16,6 +16,7 @@ import type { PlanExpr } from '../plan/expr.js';
 import type { DefaultDef, ExprDef, IndexDef, StorageType, TableDef } from '../plan/schema.js';
 import type { SqlValue } from '../values.js';
 import type { TemporalType } from '../../shared/temporal.js';
+import type { NestedTypeName } from '../../shared/nested-types.js';
 
 /** Version of the stored definitions; a file whose definitions are newer is refused. */
 export const DEFINITION_VERSION = 1;
@@ -32,7 +33,7 @@ export type StoredDef =
   /** A materialized view; the table its rows are stored in is in `smalt_matview` (its layout). */
   | { readonly kind: 'matview'; readonly language: string; readonly columns?: readonly string[]; readonly options: Readonly<Record<string, SqlValue>> }
   | { readonly kind: 'connection'; readonly options: Readonly<Record<string, SqlValue>>; readonly language?: string; readonly described?: true }
-  | { readonly kind: 'external'; readonly columns: readonly { readonly name: string; readonly declaredType: string; readonly type?: TemporalType }[]; readonly options: Readonly<Record<string, SqlValue>>; readonly language?: string; readonly described?: true };
+  | { readonly kind: 'external'; readonly columns: readonly { readonly name: string; readonly declaredType: string; readonly type?: TemporalType | NestedTypeName }[]; readonly options: Readonly<Record<string, SqlValue>>; readonly language?: string; readonly described?: true };
 
 /** Whether `def` was defined without source text: its catalog text is {@link describeDefinition}'s. */
 export function isDescribed(def: StoredDef | undefined): boolean {
