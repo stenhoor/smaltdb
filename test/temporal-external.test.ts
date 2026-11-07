@@ -22,6 +22,7 @@ function eventsPlugin(): SmaltPlugin {
       host.addFormat({
         name: 'events',
         extensions: ['events'],
+        options: ['nested'],
         access: 'bytes',
         async read(bytes, req) {
           const rows = JSON.parse(new TextDecoder().decode(bytes)) as unknown[][];
@@ -30,6 +31,7 @@ function eventsPlugin(): SmaltPlugin {
               { name: 'id', declType: 'INTEGER' },
               { name: 'day', declType: 'DATE', type: 'date' },
               { name: 'at', declType: 'TIMESTAMP', type: 'datetime' },
+              ...(req.options.nested ? [{ name: 'tags', declType: 'TEXT', type: 'list<text>' as const }, { name: 'pt', declType: 'TEXT', type: 'struct<x real, y real>' as const }] : []),
             ],
             rows: req.schemaOnly ? [] : (rows as never),
           };
@@ -99,5 +101,26 @@ describe('temporal columns from a format', () => {
     await db.callPlugin('events-plugin', 'put', ['b.events', JSON.stringify([[1, '2026-11-07', 0]])]);
     const scan = p.source('function', 'read_events', [p.lit('mem:b.events', 'text')], ['int', 'date', 'datetime']);
     await expect(db.queryPlanAsync(p.project(scan, [p.col(0, 1, 'date')]))).rejects.toThrow(/a date value must be an integer, not '2026-11-07'/);
+  });
+});
+
+describe('list and struct columns from a format (ADR 0020)', () => {
+  it('a format gives JS arrays and objects; the engine encodes them by the type', async () => {
+    const db = Database.openMemory({ plugins: [eventsPlugin()] });
+    const rows = JSON.stringify([
+      [1, 0, 0, ['a', 'b'], { x: 1, y: 2 }],
+      [2, null, null, [], null],
+    ]);
+    await db.callPlugin('events-plugin', 'put', ['n.events', rows]);
+    const types = ['int', 'date', 'datetime', 'list<text>', 'struct<x real, y real>'] as const;
+    const scan = p.source('function', 'read_events', [p.lit('mem:n.events', 'text')], [...types], { named: { nested: p.lit(1, 'int') } });
+    const r = await db.queryPlanAsync(p.project(scan, [p.col(0, 3, 'list<text>'), p.col(0, 4, 'struct<x real, y real>'), p.call('list_len', [p.col(0, 3, 'list<text>')], 'int')]));
+    expect(r.rows).toEqual([
+      [['a', 'b'], { x: 1, y: 2 }, 2],
+      [[], null, 0],
+    ]);
+    await db.callPlugin('events-plugin', 'put', ['bad.events', JSON.stringify([[1, 0, 0, [1], null]])]);
+    const bad = p.source('function', 'read_events', [p.lit('mem:bad.events', 'text')], [...types], { named: { nested: p.lit(1, 'int') } });
+    await expect(db.queryPlanAsync(p.project(bad, [p.col(0, 3, 'list<text>')]))).rejects.toThrow(/a text element cannot hold|column tags/);
   });
 });

@@ -40,8 +40,16 @@ function elementValue(t: string, v: unknown, where: string): SqlValue {
     if (v === 0 || v === 1) return v;
     throw new TypeError(`${where}: a bool is true or false, not ${JSON.stringify(v)}`);
   }
-  if (typeof v === 'number' || typeof v === 'bigint' || typeof v === 'string' || v instanceof Uint8Array) return v;
-  throw new TypeError(`${where}: a ${t} element cannot hold ${Array.isArray(v) ? 'an array' : typeof v}`);
+  // Each simple type holds its own values; `any` holds every engine value.
+  const ok =
+    t === 'text' ? typeof v === 'string'
+    : t === 'int' ? typeof v === 'bigint' || (typeof v === 'number' && Number.isInteger(v))
+    : t === 'real' || t === 'num' ? typeof v === 'number' || typeof v === 'bigint'
+    : t === 'blob' ? v instanceof Uint8Array
+    : typeof v === 'number' || typeof v === 'bigint' || typeof v === 'string' || v instanceof Uint8Array;
+  if (ok) return v as SqlValue;
+  const what = Array.isArray(v) ? 'an array' : v instanceof Uint8Array ? 'a blob' : typeof v === 'string' ? JSON.stringify(v) : typeof v === 'object' ? 'an object' : String(v);
+  throw new TypeError(`${where}: a ${t} element cannot hold ${what}`);
 }
 
 /**

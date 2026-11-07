@@ -125,10 +125,11 @@ export interface FormatColumn {
   declType: string;
   /**
    * Dates and times (ADR 0019): the column's values are integers of this type, days for `date` and µs for the others,
-   * and results give them as text (`2026-11-07`). Absent: the column is typed from `declType`. Optional since API
+   * and results give them as text (`2026-11-07`). Lists and structs (ADR 0020): a `list<…>` or `struct<…>` type, the
+   * values JS arrays and objects (or their bytes). Absent: the column is typed from `declType`. Optional since API
    * version 1 (engines before it ignore it).
    */
-  type?: 'date' | 'datetime' | 'time' | 'duration';
+  type?: 'date' | 'datetime' | 'time' | 'duration' | `list<${string}>` | `struct<${string}>`;
 }
 
 /** Random access to a file: its size and byte ranges (HTTP Range requests, Blob slices, file reads). */
