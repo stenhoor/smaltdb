@@ -2549,14 +2549,13 @@ function columnLength(c: ValueColumn | undefined): number {
   return (data as ArrayLike<unknown>).length;
 }
 
-/** Value `i` of a column of `values`: NULL where its bitmap says so, NaN as NULL, integers beyond 2^53 as bigints. */
+/** Value `i` of a column of `values`: NULL where its bitmap says so, integers beyond 2^53 as bigints. NaN is NaN (ADR 0018). */
 function columnReader(c: ValueColumn): (i: number) => SqlValue {
   const wrapped = !ArrayBuffer.isView(c) && !Array.isArray(c);
   const data = (wrapped ? (c as { data: ColumnArray | readonly SqlValue[] }).data : c) as ColumnArray | readonly SqlValue[];
   const nulls = wrapped ? (c as { nulls: Uint8Array }).nulls : null;
   let read: (i: number) => SqlValue;
   if (data instanceof BigInt64Array) read = (i) => normalizeInt(data[i]);
-  else if (data instanceof Float64Array || data instanceof Float32Array) read = (i) => (Number.isNaN(data[i]) ? null : data[i]);
   else if (ArrayBuffer.isView(data)) read = (i) => (data as Exclude<ColumnArray, BigInt64Array>)[i];
   else read = (i) => (data as readonly SqlValue[])[i] ?? null;
   return nulls ? (i) => (nulls[i >>> 3] & (1 << (i & 7)) ? null : read(i)) : read;

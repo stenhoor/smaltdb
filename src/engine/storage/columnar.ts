@@ -22,7 +22,7 @@
  *     ANY    per value: u8 tag (0 null, 1 f64, 2 i64, 3 text, 4 blob) | payload (f64, i64, u32 len + bytes)
  */
 import { CorruptionError } from '../errors.js';
-import type { SqlValue } from '../values.js';
+import { type SqlValue, compareNumeric } from '../values.js';
 import type { BTree } from './btree.js';
 import { decodeUtf8 } from './record.js';
 
@@ -304,6 +304,7 @@ function encodeChunk(vals: SqlValue[], w: ByteWriter, ce: ChunkEncoder): { bytes
   let allBlob = true;
   let numMin = Infinity;
   let numMax = -Infinity;
+  let nan = false;
   let textMin: string | undefined;
   let textMax: string | undefined;
   let textZone = true;
@@ -316,6 +317,7 @@ function encodeChunk(vals: SqlValue[], w: ByteWriter, ce: ChunkEncoder): { bytes
       allStr = allBlob = false;
       if (v < numMin) numMin = v;
       if (v > numMax) numMax = v;
+      if (v !== v) nan = true;
       if (!(v === (v | 0) && !Object.is(v, -0))) allInt32 = false;
     } else if (typeof v === 'string') {
       allNum = allInt32 = allBlob = false;
@@ -344,8 +346,9 @@ function encodeChunk(vals: SqlValue[], w: ByteWriter, ce: ChunkEncoder): { bytes
   else if (allBlob) enc = ENC_BLOB;
   else enc = ENC_ANY;
   if (enc === ENC_I32 || enc === ENC_F64) {
-    zone.numMin = numMin;
-    zone.numMax = numMax;
+    // NaN sorts after every number (ADR 0018): it is the maximum, and the minimum only when every value is NaN.
+    zone.numMin = numMin === Infinity && nan && numMax === -Infinity ? NaN : numMin;
+    zone.numMax = nan ? NaN : numMax;
   }
   if (enc === ENC_STR && textZone) {
     zone.textMin = textMin;
@@ -711,17 +714,20 @@ export function zoneMayMatch(z: Zone, rows: number, op: string, value: SqlValue,
         return true;
     }
   } else return true;
+  // Numbers in the engine's total order: NaN after every number, equal to itself (ADR 0018).
+  const n = (a: number, b: number): number => compareNumeric(a, b);
+  const [nl, nh, nx] = [lo as number, hi as number, x as number];
   switch (op) {
     case '=':
-      return x >= lo && x <= hi;
+      return n(nx, nl) >= 0 && n(nx, nh) <= 0;
     case '<':
-      return lo < x;
+      return n(nl, nx) < 0;
     case '<=':
-      return lo <= x;
+      return n(nl, nx) <= 0;
     case '>':
-      return hi > x;
+      return n(nh, nx) > 0;
     case '>=':
-      return hi >= x;
+      return n(nh, nx) >= 0;
     default:
       return true;
   }

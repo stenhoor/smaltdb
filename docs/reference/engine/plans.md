@@ -108,7 +108,7 @@ These operations are defined by order:
 one length, with `rows` empty. A column is a typed array (`Float64Array`, `Float32Array`, `Int32Array`, `Int16Array`,
 `Int8Array`, `Uint32Array`, `Uint16Array`, `Uint8Array`, or `BigInt64Array` for integers beyond 2^53), an array of values, or either as
 `{ data, nulls }` with a null bitmap (bit `i % 8` of byte `i >> 3` set when value `i` is NULL, as results carry them). NaN in a float
-array reads as NULL. The engine reads the values where they are. In JSON a typed array is `{"$typed": "f64", "data":
+array is NaN, a value of `real` that sorts after every number ([ADR 0018](../../adr/0018-bool-and-nan.md)). The engine reads the values where they are. In JSON a typed array is `{"$typed": "f64", "data":
 […]}`; through the client it crosses to the worker as binary data beside the plan's JSON (see [running
 plans](./running#through-the-client)).
 

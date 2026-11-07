@@ -19,7 +19,8 @@ import { CorruptionError } from '../errors.js';
  *          trailing all-zero groups dropped; byte = group << 1 | (1 if another group follows).
  *          No groups (a power of two) is the single byte 0x00. So 1..127 take 2 bytes, up to 2^14
  *          3 bytes, a double with a full mantissa 9 bytes, any int64 at most 10 bytes. Values are
- *          exact: int64 beyond 2^53 orders correctly against REALs. NaN is NULL, -0 is 0.
+ *          exact: int64 beyond 2^53 orders correctly against REALs. -0 is 0.
+ *   NaN    0x87: after every number, Infinity included, and equal to itself (ADR 0018)
  *   text   0x90 | collated UTF-8, 0x00 escaped as 00 FF | 00 00
  *   blob   0xA0 | bytes, 0x00 escaped as 00 FF | 00 00
  *
@@ -48,6 +49,7 @@ const TAG_ZERO = 0x44;
 const TAG_POS_TINY = 0x45;
 const TAG_POS_E0 = 0x46; // positive with exponent E: TAG_POS_E0 + E
 const TAG_POS_HUGE = 0x86;
+const TAG_NAN = 0x87;
 const TAG_TEXT = 0x90;
 const TAG_BLOB = 0xa0;
 const TINY_BIAS = 1100;
@@ -112,7 +114,7 @@ export class KeyEncoder {
 
   private addNumber(v: number): void {
     if (v !== v) {
-      this.putByte(TAG_NULL); // NaN
+      this.putByte(TAG_NAN);
       return;
     }
     if (v === 0) {
@@ -425,6 +427,9 @@ export function decodeKey(key: Uint8Array, cols?: readonly KeyColumn[]): SqlValu
     const tag = key[pos] ^ flip;
     if (tag === TAG_NULL) {
       out.push(null);
+      pos += 1;
+    } else if (tag === TAG_NAN) {
+      out.push(NaN);
       pos += 1;
     } else if (tag >= TAG_NEG_HUGE && tag <= TAG_POS_HUGE) {
       const u = flip === 0 ? decodeSmallPos(key, pos) : -1;

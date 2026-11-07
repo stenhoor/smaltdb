@@ -136,7 +136,8 @@ interior cell:  u32 child | u16 keyLen | key
 - Secondary indexes are B+trees on `(key columns…, rowid)`. Keys use a **memcmp-comparable encoding**
   (order-preserving byte strings), so a key comparison is a single `Uint8Array` compare loop.
 - Format 2 key encoding (`src/engine/storage/key-codec.ts`, ADR 0006):
-  - NULL `0x01`; TEXT `0x90` + escaped collated UTF-8 + `00 00`; BLOB `0xA0` + escaped bytes + `00 00`.
+  - NULL `0x01`; NaN `0x87`, after every number (Infinity included) and equal to itself (format 4, ADR 0018); TEXT
+    `0x90` + escaped collated UTF-8 + `00 00`; BLOB `0xA0` + escaped bytes + `00 00`.
   - Numbers: a tag for sign and binary exponent (`0x46 + E` for positive E in 0..63, mirrored
     below `0x44` = zero for negatives; values below 1 or at least 2^64 add a 2-byte exponent),
     then the mantissa in 7-bit groups with a continuation bit (negative payloads inverted).
@@ -159,7 +160,9 @@ interior cell:  u32 child | u16 keyLen | key
   Encodings: all-NULL, F64, I32, dictionary text (u16/u32 codes), plain text, blob (u32 offsets), and a tagged
   encoding for mixed types.
 - **Zone maps**: key `(rg, 0xFFFF)` holds the row count and, per column, the null count and numeric or BINARY text
-  (≤ 64 bytes) min/max. Scans skip row groups that cannot match a comparison with a constant or parameter.
+  (≤ 64 bytes) min/max. NaN orders after every number (ADR 0018): a chunk holding NaN has NaN as its numeric max, and
+  min only when every value is NaN. Scans skip row groups that cannot match a comparison with a constant or parameter,
+  comparing in that order.
 - **Header**: key `(0xFFFFFFFF, 0)` holds the number of row groups and rows.
 
 ## 6. Write-ahead log and durability
@@ -219,7 +222,10 @@ Original plan:
 
 ## 9. Format versioning
 
-- Current format: **3**. Format 1 used 11-byte numeric key components (ADR 0006); format 2 used 7-byte fixed leaf cell headers and no free blocks (ADR 0007).
+- Current format: **4.0**, unreleased (smaltdb 0.8.3 wrote format 3). Format 4 stores definitions instead of SQL text
+  (ADR 0015 step 7) and, before 0.9.0, gains ADR 0018's types: NaN's own key tag and zone maps that order it, then
+  the `BOOLEAN` storage type. Format 1 used 11-byte numeric key components (ADR 0006); format 2 used 7-byte fixed leaf
+  cell headers and no free blocks (ADR 0007); format 3 stored SQL text in the catalog.
 
 - A format version in the header. Engines refuse to write newer major versions, and minor versions must be backward compatible.
 - Logical import/export in v1: **CSV and JSON/NDJSON**. Later: SQL dump, SQLite file import, Arrow/Parquet.

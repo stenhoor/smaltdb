@@ -123,6 +123,31 @@ export function isCodegenRoot(e: BoundExpr): boolean {
   }
 }
 
+/**
+ * `x op y` for two numbers, in the engine's total order (ADR 0018): NaN equals NaN and sorts after every number. The
+ * NaN test runs only when the plain comparison is false, and is left out for an operand that is never NaN (a finite
+ * literal or an integer, `xNum` / `yNum`). `x` and `y` are side-effect free (temporaries, constants).
+ */
+function numericTest(op: string, x: string, y: string, xNum: boolean, yNum: boolean): string {
+  const xNaN = xNum ? null : `${x} !== ${x}`;
+  const yNaN = yNum ? null : `${y} !== ${y}`;
+  const or = (plain: string, nan: string | null): string => (nan === null ? `${plain}` : `(${plain} || ${nan})`);
+  switch (op) {
+    case '=':
+      return or(`${x} == ${y}`, xNaN && yNaN && `(${xNaN} && ${yNaN})`);
+    case '!=':
+      return xNaN && yNaN ? `(${x} != ${y} && (${x} === ${x} || ${y} === ${y}))` : `${x} != ${y}`;
+    case '<':
+      return or(`${x} < ${y}`, yNaN && (xNum ? yNaN : `(${yNaN} && ${x} === ${x})`));
+    case '<=':
+      return or(`${x} <= ${y}`, yNaN);
+    case '>':
+      return or(`${x} > ${y}`, xNaN && (yNum ? xNaN : `(${xNaN} && ${y} === ${y})`));
+    default:
+      return or(`${x} >= ${y}`, xNaN);
+  }
+}
+
 /** A call of a math function that generated code can emit inline. */
 function mathCall(e: BoundExpr): InlineMath | undefined {
   if (e.k !== 'call' || isEngineOperation(e.fn)) return undefined;
@@ -379,10 +404,9 @@ class Emitter {
   }
 
   private compare(op: string, a: Gen, b: Gen): Gen {
-    const jsOp = op === '=' ? '==' : op === '!=' ? '!=' : op;
     const v = this.tmp();
     const nul = orNull(nullOf(a), nullOf(b));
-    this.lines.push(`const ${v}n = ${nul}; const ${v} = ${v}n ? 0 : (${a.v} ${jsOp} ${b.v} ? 1 : 0);`);
+    this.lines.push(`const ${v}n = ${nul}; const ${v} = ${v}n ? 0 : (${numericTest(op, a.v, b.v, a.num === true || a.type === 'int', b.num === true || b.type === 'int')} ? 1 : 0);`);
     return { v, nul: `${v}n`, type: 'int' };
   }
 

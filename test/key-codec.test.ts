@@ -5,22 +5,26 @@ import { compareBytes } from '../src/engine/util/bytes.js';
 
 const enc = new TextEncoder();
 
-/** Reference: SQLite's value ordering (NaN treated as NULL, as SQLite does). */
+/** Reference: SQLite's value ordering, with NaN a number after every other one (ADR 0018). */
 function rank(v: SqlValue): number {
-  if (v === null || (typeof v === 'number' && Number.isNaN(v))) return 0;
+  if (v === null) return 0;
   if (typeof v === 'number' || typeof v === 'bigint') return 1;
   if (typeof v === 'string') return 2;
   return 3;
 }
 
 function cmpNumeric(a: number | bigint, b: number | bigint): number {
-  if (typeof a === 'number' && typeof b === 'number') return a < b ? -1 : a > b ? 1 : 0;
+  if (typeof a === 'number' && typeof b === 'number') {
+    if (Number.isNaN(a) || Number.isNaN(b)) return Number.isNaN(a) ? (Number.isNaN(b) ? 0 : 1) : -1;
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
   if (typeof a === 'bigint' && typeof b === 'bigint') return a < b ? -1 : a > b ? 1 : 0;
   const flip = typeof a === 'bigint';
   const n = (flip ? b : a) as number;
   const big = (flip ? a : b) as bigint;
   let r: number;
-  if (n === Infinity) r = 1;
+  if (Number.isNaN(n)) r = 1;
+  else if (n === Infinity) r = 1;
   else if (n === -Infinity) r = -1;
   else if (Number.isInteger(n)) r = BigInt(n) < big ? -1 : BigInt(n) > big ? 1 : 0;
   else r = BigInt(Math.floor(n)) < big ? -1 : 1;
@@ -118,7 +122,8 @@ describe('key codec', () => {
         for (let i = 0; i < values.length; i++) {
           const v = values[i];
           const d = decoded[i];
-          if (v === null || (typeof v === 'number' && Number.isNaN(v))) expect(d).toBeNull();
+          if (v === null) expect(d).toBeNull();
+          else if (typeof v === 'number' && Number.isNaN(v)) expect(d).toBeNaN();
           else if (typeof v === 'number' || typeof v === 'bigint') expect(cmpNumeric(v, d as number | bigint)).toBe(0);
           else expect(d).toEqual(v);
         }

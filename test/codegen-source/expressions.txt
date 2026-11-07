@@ -114,7 +114,7 @@ const v0 = K[0](r);
 return v0;
 --
 expression:
-const $c0 = K[0]; const v0n = (r[2] === null); const v0 = v0n ? 0 : (r[2] >= $c0 ? 1 : 0);
+const $c0 = K[0]; const v0n = (r[2] === null); const v0 = v0n ? 0 : ((r[2] >= $c0 || r[2] !== r[2]) ? 1 : 0);
 return (v0n ? null : v0);
 --
 expression:

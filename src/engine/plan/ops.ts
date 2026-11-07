@@ -24,7 +24,7 @@ export type ColumnArray = Float64Array | Float32Array | Int32Array | Int16Array 
 /**
  * A column of `values` given as data: a typed array (numbers; `BigInt64Array`: integers), an array of values, or
  * either with a null bitmap (`nulls`: bit `i % 8` of byte `i >> 3` set when value `i` is NULL, as results carry them).
- * NaN in a float array reads as NULL.
+ * NaN in a float array is NaN, a value of `real` (ADR 0018); NULL comes from the bitmap.
  */
 export type ValueColumn = ColumnArray | readonly SqlValue[] | { readonly data: ColumnArray | readonly SqlValue[]; readonly nulls: Uint8Array };
 

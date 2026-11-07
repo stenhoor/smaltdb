@@ -1,6 +1,6 @@
 # ADR 0018: `bool` and NaN
 
-- **Status:** proposed, with the owner's decisions of 2026-11-07 (below) already taken
+- **Status:** accepted (#142), with the owner's decisions of 2026-11-07 (below)
 - **Date:** 2026-11-07
 - **Builds on:** [ADR 0016](0016-plan-api-for-every-language.md) section 3 (types) and step 11, owner's decision 4
   (`bool` goes with a file-format change)
@@ -101,7 +101,9 @@ Where NaN is kept:
 - **Storage** keeps it, as now, and index keys now keep it too.
 - **Values from columns.** NaN in a float array is NaN. NULL comes from the null bitmap (`ValueColumn.nulls`) or a
   null in an array of values.
-- **Parameters** keep NaN. A language that wants NULL converts its own parameters.
+- **Parameters** keep NaN. A language that wants NULL converts its own parameters. *(Moved to step 6 when step 2
+  was done: the engine binds SQL text's parameters itself today, with no language hook, so keeping NaN there before
+  smaltql converts would change SQL's results. Step 6 adds the hook and the change together.)*
 - **Operations whose behaviour is IEEE keep a NaN result:**
   - `div_float`, `div_floor`, `mod_floor`, and `add_checked` / `sub_checked` / `mul_checked` on reals;
   - `cast_real` / `cast_real_strict` of a NaN;
@@ -132,16 +134,16 @@ still says format 3.
 One PR each:
 
 1. This ADR.
-2. **NaN in storage and order:** the total order (`compareNumeric`, `compareValues`), the key codec's NaN tag, zone
-   maps, `ValueColumn`, parameters, and STORAGE_FORMAT.md.
+2. **NaN in storage and order:** the total order (`compareNumeric`, `compareValues`, the comparison operations), the
+   key codec's NaN tag, zone maps, `ValueColumn`, and STORAGE_FORMAT.md.
 3. **NaN in operations:** the IEEE operations keep NaN, plus `sum_float` / `avg_float`, with tests that SQL's
    operations still give NULL.
 4. **`bool` in plans:** the plan type, typing of operations and logic nodes, the `int` declaration, literals, the
    validator, results as `true` / `false` in process and through the client, and values from columns.
 5. **`BOOLEAN` storage:** the storage type, stored definitions, coercion on write, the catalog, and the docs
    (`plans.md`, `schema.md`, `catalog.md`).
-6. **smaltql:** declares its comparisons and logic `int`, converts NaN parameters and results to NULL, and updates its
-   pin. sqllogictest stays at its pass rate.
+6. **smaltql:** declares its comparisons and logic `int`, converts NaN parameters and results to NULL (through a
+   language hook for parameters the engine binds, which this step adds), and updates its pin. sqllogictest stays at its pass rate.
 7. **smaltdf:** `bool` from the engine (its own 0 / 1 conversion goes), `BOOLEAN` in `createTable`, NaN from `div`,
    and the Polars comparison table updated (`0 / 0` stops differing).
 
