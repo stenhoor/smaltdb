@@ -1,6 +1,6 @@
 # ADR 0020: Lists and structs
 
-- **Status:** proposed: the owner's decisions are asked at the end, each with a recommendation
+- **Status:** accepted with the owner's decisions of 2026-11-07 (at the end: each as recommended)
 - **Date:** 2026-11-07
 - **Builds on:** [ADR 0016](0016-plan-api-for-every-language.md) section 3 (types), item 4 and section 4 (`explode`);
   [ADR 0018](0018-bool-and-nan.md) and [ADR 0019](0019-dates-and-times.md) (the pattern: a static type over values the
@@ -121,7 +121,9 @@ One PR each, after this ADR:
 5. smaltql: list and struct columns as JSON text.
 6. smaltdf: the types, `list` / `struct` methods, `explode`, `unnest`, and the comparison tests.
 
-## Questions for the owner
+## Owner's decisions (2026-11-07)
+
+Each as recommended. The questions as they were put, with the recommendation taken:
 
 1. **Representation.**
    - **Recommendation:** encoded bytes under a static type (section 1). Order, equality, hashing, keys, records, the
