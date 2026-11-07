@@ -849,6 +849,7 @@ class Validator {
       case 'or': {
         this.logicType(e.type);
         const args = this.list(e.args, 'args');
+        if (args.length === 0) this.fail('expected at least one argument', 'args');
         for (let i = 0; i < args.length; i++) this.exprAt(args[i] as PlanExpr, scopes, d, 'args', i);
         return;
       }

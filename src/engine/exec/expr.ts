@@ -212,10 +212,11 @@ function compileBound(e: BoundExpr, ctx: FunctionContext): Compiled {
       if (a.k === 'call' && ['like', 'glob', 'in_list'].includes(a.fn)) return compileSqlCall(a, ctx, true);
       return compileUnary('NOT', sub(a));
     }
+    // A logic node may have any number of arguments (`p.and(a, b, c)`): combined from the left.
     case 'and':
-      return and(sub(e.args[0]), sub(e.args[1]));
+      return e.args.map(sub).reduce((x, y) => and(x, y));
     case 'or':
-      return or(sub(e.args[0]), sub(e.args[1]));
+      return e.args.map(sub).reduce((x, y) => or(x, y));
     case 'isNull': {
       const x = sub(e.arg);
       const f = x.fn;

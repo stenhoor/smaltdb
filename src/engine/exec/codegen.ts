@@ -250,6 +250,9 @@ class Emitter {
         return this.literal(e.value, e.type);
       case 'and':
       case 'or':
+        // Any number of arguments (`p.and(a, b, c)`): combined from the left, two at a time.
+        if (e.args.length > 2) return this.gen({ ...e, args: [{ ...e, args: e.args.slice(0, -1) }, e.args[e.args.length - 1]!] } as BoundExpr);
+        if (e.args.length === 1) return this.gen(e.args[0]!);
         return this.logic(e.k === 'and' ? 'AND' : 'OR', e.args[0], e.args[1]);
       case 'not': {
         const a = this.gen(e.arg);
