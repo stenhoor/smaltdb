@@ -238,7 +238,7 @@ exists.
 
 1. **Names:** behaviour names, as section 1 proposes (`div_trunc`, `div_float`, `div_floor`, `mod_trunc`, `mod_floor`,
    `round_half_away`, `round_half_even`, `cmp_eq` …, `eq_strict` …), with the `sql.*` names as aliases until smaltql
-   has moved.
+   has moved. smaltql moved on 2026-11-07 (stenhoor/smaltql#17), and the aliases were removed.
 2. **Order:** the cheap guarantees always, the costly ones on request, as section 4 proposes.
 3. **Views from smaltdf:** stored as smaltdf's own serialized source and bound late by name (section 6).
 4. **Types and the file format:** `bool` is grouped with the next file-format change (section 3).

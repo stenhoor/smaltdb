@@ -47,7 +47,7 @@ export interface LitExpr extends ExprMeaning { readonly k: 'lit'; readonly value
 export interface ParamExpr extends ExprMeaning { readonly k: 'param'; readonly index: number; readonly type: PlanType }
 /** A registered function. `collation`: the explicit ordering rule of a comparison-like function. */
 export interface CallExpr<E> extends ExprMeaning { readonly k: 'call'; readonly fn: string; readonly args: readonly E[]; readonly type: PlanType; readonly collation?: CollationName }
-/** A conversion chosen by the language (`fn`, e.g. `sql.cast_integer`). */
+/** A conversion chosen by the language (`fn`, e.g. `cast_integer`). */
 export interface CastExpr<E> extends ExprMeaning { readonly k: 'cast'; readonly fn: string; readonly to: PlanType; readonly arg: E }
 /** Three-valued logic over 0 / 1 / NULL. */
 export interface LogicExpr<E> extends ExprMeaning { readonly k: 'and' | 'or'; readonly args: readonly E[] }

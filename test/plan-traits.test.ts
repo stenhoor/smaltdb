@@ -1,7 +1,7 @@
 /**
  * Traits, not names (ADR 0016 step 3): the planner and code generation recognise an operation by the traits it
  * declares. A function under a name the engine has never seen, declaring the traits of an equality, gets the same
- * index and rowid lookups, hash joins and zone maps as SQL's `sql.eq`; without the traits it gets none of them.
+ * index and rowid lookups, hash joins and zone maps as SQL's `cmp_eq`; without the traits it gets none of them.
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import { Database, plan as p } from '../src/engine/index.js';
@@ -70,12 +70,12 @@ describe('operations are recognised by their traits', () => {
     const d = db();
     const byIndex = p.filter(p.scan('t', [0, 1, 2]), eqWith('test_eq', k, p.lit(7)));
     expect(plan(d, byIndex)).toMatch(/SEARCH t USING INDEX t_k/);
-    expect(d.queryPlan(byIndex).rows).toEqual(d.queryPlan(p.filter(p.scan('t', [0, 1, 2]), eqWith('sql.eq', k, p.lit(7)))).rows);
+    expect(d.queryPlan(byIndex).rows).toEqual(d.queryPlan(p.filter(p.scan('t', [0, 1, 2]), eqWith('cmp_eq', k, p.lit(7)))).rows);
     expect(plan(d, p.filter(p.scan('t', [0, 1, 2]), eqWith('test_eq', id, p.lit(42))))).toMatch(/SEARCH t USING INTEGER PRIMARY KEY/);
     const joinOn = (fn: string) => p.join('inner', p.scan('t', [0, 1]), p.scan('u', [0, 1]), p.call(fn, [p.col(0, 1, 'int'), p.col(1, 1, 'int')], 'int'));
     expect(plan(d, joinOn('test_eq'))).toMatch(/HASH JOIN/);
     const sorted = (rows: unknown[][]) => rows.map((r) => JSON.stringify(r)).sort();
-    expect(sorted(d.queryPlan(joinOn('test_eq')).rows)).toEqual(sorted(d.queryPlan(joinOn('sql.eq')).rows));
+    expect(sorted(d.queryPlan(joinOn('test_eq')).rows)).toEqual(sorted(d.queryPlan(joinOn('cmp_eq')).rows));
   });
 
   it('zone maps for an equality under another name on a columnar table', () => {
@@ -91,7 +91,7 @@ describe('operations are recognised by their traits', () => {
     const d = db();
     const q = p.filter(p.scan('t', [0, 1, 2]), eqWith('test_eq_plain', k, p.lit(7)));
     expect(plan(d, q)).not.toMatch(/SEARCH/);
-    expect(d.queryPlan(q).rows).toEqual(d.queryPlan(p.filter(p.scan('t', [0, 1, 2]), eqWith('sql.eq', k, p.lit(7)))).rows);
+    expect(d.queryPlan(q).rows).toEqual(d.queryPlan(p.filter(p.scan('t', [0, 1, 2]), eqWith('cmp_eq', k, p.lit(7)))).rows);
     const j = p.join('inner', p.scan('t', [0, 1]), p.scan('u', [0, 1]), p.call('test_eq_plain', [p.col(0, 1, 'int'), p.col(1, 1, 'int')], 'int'));
     expect(plan(d, j)).not.toMatch(/HASH JOIN/);
   });
@@ -104,7 +104,7 @@ describe('operations are recognised by their traits', () => {
         [p.call(add, [k, p.lit(1)], 'int'), p.call(div, [id, p.lit(2)], 'int')],
       );
     const named = q('cmp_eq', 'add', 'div_trunc', 'in_list');
-    const aliased = q('sql.eq', 'sql.add', 'sql.div', 'sql.in_list');
+    const aliased = q('cmp_eq', 'add', 'div_trunc', 'in_list');
     expect(d.queryPlan(named).rows).toEqual(d.queryPlan(aliased).rows);
     expect(d.queryPlan(named).rows.length).toBeGreaterThan(0);
     expect(plan(d, named)).toBe(plan(d, aliased));

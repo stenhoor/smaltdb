@@ -11,7 +11,7 @@ import {
   truthy,
 } from './convert.js';
 import { currentTimeText } from './datetime.js';
-import { ARITHMETIC_FUNCTIONS, BITWISE_FUNCTIONS, COMPARISON_FUNCTIONS, arithImpl, canonicalName, isEngineOperation, negate, sqlFunction } from './sql-functions.js';
+import { ARITHMETIC_FUNCTIONS, BITWISE_FUNCTIONS, COMPARISON_FUNCTIONS, arithImpl, isEngineOperation, negate, sqlFunction } from './sql-functions.js';
 import { type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type CodegenHelpers, type FallbackNode, codegenEnabled, generate, generatedType, isCodegenRoot } from './codegen.js';
 import { WINDOW_ARITY } from './window.js';
@@ -207,7 +207,7 @@ function compileBound(e: BoundExpr, ctx: FunctionContext): Compiled {
     case 'not': {
       const a = e.arg;
       // NOT LIKE, NOT GLOB and NOT IN compile to one closure, as their own forms.
-      if (a.k === 'call' && ['like', 'glob', 'in_list'].includes(canonicalName(a.fn))) return compileSqlCall(a, ctx, true);
+      if (a.k === 'call' && ['like', 'glob', 'in_list'].includes(a.fn)) return compileSqlCall(a, ctx, true);
       return compileUnary('NOT', sub(a));
     }
     case 'and':
@@ -247,7 +247,7 @@ function compileBound(e: BoundExpr, ctx: FunctionContext): Compiled {
 function compileSqlCall(e: Extract<BoundExpr, { k: 'call' }>, ctx: FunctionContext, negated: boolean): Compiled {
   const sub = (x: BoundExpr): Compiled => compilePlanExpr(x, ctx);
   const args = e.args;
-  const name = canonicalName(e.fn);
+  const name = e.fn;
   switch (name) {
     case 'in_list':
       return compileInList(negated, sub(args[0]), args.slice(1).map(sub));
@@ -271,10 +271,10 @@ function compileSqlCall(e: Extract<BoundExpr, { k: 'call' }>, ctx: FunctionConte
       if (e.collation !== undefined) {
         // A comparison: its operands' affinity conversions run inside its closure, after the NULL checks.
         const ops = args.map((x) => {
-          if (x.k === 'call' && AFFINITY_CALLS.has(canonicalName(x.fn))) {
+          if (x.k === 'call' && AFFINITY_CALLS.has(x.fn)) {
             const inner = sub(x.args[0]);
             const real = inner.type === 'real';
-            const convert = canonicalName(x.fn) === 'affinity_numeric' ? applyNumericAffinity : (v: SqlValue) => applyTextAffinity(v, real);
+            const convert = x.fn === 'affinity_numeric' ? applyNumericAffinity : (v: SqlValue) => applyTextAffinity(v, real);
             return { c: inner, arg: { fn: inner.fn, type: inner.type, convert } };
           }
           const c = sub(x);
@@ -429,7 +429,7 @@ function call2(name: string, a: Compiled, b: Compiled): Compiled {
   return fold({ fn, type, collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: a.constant && b.constant });
 }
 
-/** A comparison: SQLite's collation and affinity rules pick the options of `sql.eq` and the others. */
+/** A comparison: SQLite's collation and affinity rules pick the options of `cmp_eq` and the others. */
 function comparison(op: string, a: Compiled, b: Compiled): Compiled {
   const coll = comparisonCollation(a, b);
   const [ca, cb] = comparisonConverters(a, b);

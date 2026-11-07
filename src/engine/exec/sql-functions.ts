@@ -36,7 +36,7 @@ export interface SqlArg {
   constant?: boolean;
   /**
    * An affinity conversion applied to this operand's non-NULL value before comparing (SQLite §4.2): the plan's
-   * `sql.affinity_numeric` / `sql.affinity_text` around the operand.
+   * `affinity_numeric` / `affinity_text` around the operand.
    */
   convert?: ((v: SqlValue) => SqlValue) | null;
 }
@@ -69,16 +69,16 @@ function isNumericType(t: StaticType): boolean {
 
 // ------------------------------------------------------------------ comparison
 
-/** Comparison operators by name; `sql.is` and `sql.is_not` treat NULL as a value. */
+/** Comparison operators by name; `cmp_is` and `cmp_is_not` treat NULL as a value. */
 export const COMPARISON_FUNCTIONS: Readonly<Record<string, string>> = {
-  '=': 'sql.eq',
-  '!=': 'sql.ne',
-  '<': 'sql.lt',
-  '<=': 'sql.le',
-  '>': 'sql.gt',
-  '>=': 'sql.ge',
-  IS: 'sql.is',
-  'IS NOT': 'sql.is_not',
+  '=': 'cmp_eq',
+  '!=': 'cmp_ne',
+  '<': 'cmp_lt',
+  '<=': 'cmp_le',
+  '>': 'cmp_gt',
+  '>=': 'cmp_ge',
+  IS: 'cmp_is',
+  'IS NOT': 'cmp_is_not',
 };
 
 function cmpTest(op: string): (c: number) => boolean {
@@ -187,7 +187,7 @@ function comparisonFn(op: string, a: SqlArg, b: SqlArg, coll: Collation): Fn {
 // ------------------------------------------------------------------ arithmetic
 
 /** Arithmetic operators by name. */
-export const ARITHMETIC_FUNCTIONS: Readonly<Record<string, string>> = { '+': 'sql.add', '-': 'sql.sub', '*': 'sql.mul', '/': 'sql.div', '%': 'sql.mod' };
+export const ARITHMETIC_FUNCTIONS: Readonly<Record<string, string>> = { '+': 'add', '-': 'sub', '*': 'mul', '/': 'div_trunc', '%': 'mod_trunc' };
 
 function num(v: SqlValue): number | bigint {
   return typeof v === 'number' || typeof v === 'bigint' ? v : (toNumeric(v) as number | bigint);
@@ -401,7 +401,7 @@ export function castToRealStrict(v: SqlValue): number | null {
 // ------------------------------------------------------------------ bit operators
 
 /** Bit operators by name. */
-export const BITWISE_FUNCTIONS: Readonly<Record<string, string>> = { '&': 'sql.bitand', '|': 'sql.bitor', '<<': 'sql.shl', '>>': 'sql.shr' };
+export const BITWISE_FUNCTIONS: Readonly<Record<string, string>> = { '&': 'bit_and', '|': 'bit_or', '<<': 'shift_left', '>>': 'shift_right' };
 
 function bitwiseFn(op: string, a: SqlArg, b: SqlArg): Fn {
   const fa = a.fn;
@@ -561,7 +561,7 @@ const NO_REGS: SqlValue[] = [];
 
 /**
  * `probe IN (list)`: 1, 0 or NULL. A list of constants becomes a hash set with the probe's affinity and collation
- * applied to the list values up front; otherwise each element is compared with `sql.eq`, whose closures arrive as
+ * applied to the list values up front; otherwise each element is compared with `cmp_eq`, whose closures arrive as
  * `args[1..]` (already compiled with their conversions).
  */
 function inListFn(args: SqlArg[], options: SqlCompileOptions): Fn {
@@ -609,48 +609,6 @@ function inListFn(args: SqlArg[], options: SqlCompileOptions): Fn {
 
 // ------------------------------------------------------------------ the registry
 
-/**
- * The engine's operations under their former `sql.*` names (ADR 0016 section 1): each is the same operation as its
- * behaviour name, traits included, so plans that use either mean the same. They stay until smaltql has moved to the
- * behaviour names.
- */
-export const SQL_ALIASES: Readonly<Record<string, string>> = {
-  'sql.eq': 'cmp_eq',
-  'sql.ne': 'cmp_ne',
-  'sql.lt': 'cmp_lt',
-  'sql.le': 'cmp_le',
-  'sql.gt': 'cmp_gt',
-  'sql.ge': 'cmp_ge',
-  'sql.is': 'cmp_is',
-  'sql.is_not': 'cmp_is_not',
-  'sql.add': 'add',
-  'sql.sub': 'sub',
-  'sql.mul': 'mul',
-  'sql.div': 'div_trunc',
-  'sql.mod': 'mod_trunc',
-  'sql.bitand': 'bit_and',
-  'sql.bitor': 'bit_or',
-  'sql.shl': 'shift_left',
-  'sql.shr': 'shift_right',
-  'sql.bitnot': 'bit_not',
-  'sql.neg': 'neg',
-  'sql.not': 'truth_not',
-  'sql.concat': 'text_concat',
-  'sql.like': 'like',
-  'sql.glob': 'glob',
-  'sql.in_list': 'in_list',
-  'sql.cast_integer': 'cast_integer',
-  'sql.cast_real': 'cast_real',
-  'sql.cast_text': 'cast_text',
-  'sql.cast_blob': 'cast_blob',
-  'sql.cast_numeric': 'cast_numeric',
-  'sql.affinity_numeric': 'affinity_numeric',
-  'sql.affinity_text': 'affinity_text',
-  'sql.current_date': 'current_date',
-  'sql.current_time': 'current_time',
-  'sql.current_timestamp': 'current_timestamp',
-};
-
 const fixed = (name: string, arity: SqlFunction['arity'], compile: SqlFunction['compile'], traits?: FnTraits): [string, SqlFunction] => [name, traits ? { name, arity, compile, traits } : { name, arity, compile }];
 
 /** The traits of SQL's comparison operators: all compare in SQLite's value order; IS / IS NOT are not inlined. */
@@ -674,11 +632,11 @@ const ARITHMETIC_TRAITS: Readonly<Record<string, FnTraits>> = {
 };
 
 const OPERATIONS: ReadonlyMap<string, SqlFunction> = new Map<string, SqlFunction>([
-  ...Object.entries(COMPARISON_FUNCTIONS).map(([op, alias]) => [op, SQL_ALIASES[alias]] as const).map(([op, name]) =>
+  ...Object.entries(COMPARISON_FUNCTIONS).map(([op, alias]) => [op, alias] as const).map(([op, name]) =>
     fixed(name, 2, (args, o) => ({ fn: comparisonFn(op, args[0], args[1], o.collation ?? Collation.Binary), type: 'int' }), COMPARISON_TRAITS[op]),
   ),
-  ...Object.entries(ARITHMETIC_FUNCTIONS).map(([op, alias]) => [op, SQL_ALIASES[alias]] as const).map(([op, name]) => fixed(name, 2, (args) => arithmeticFn(op, args[0], args[1]), ARITHMETIC_TRAITS[op])),
-  ...Object.entries(BITWISE_FUNCTIONS).map(([op, alias]) => [op, SQL_ALIASES[alias]] as const).map(([op, name]) => fixed(name, 2, (args) => ({ fn: bitwiseFn(op, args[0], args[1]), type: 'int' }))),
+  ...Object.entries(ARITHMETIC_FUNCTIONS).map(([op, alias]) => [op, alias] as const).map(([op, name]) => fixed(name, 2, (args) => arithmeticFn(op, args[0], args[1]), ARITHMETIC_TRAITS[op])),
+  ...Object.entries(BITWISE_FUNCTIONS).map(([op, alias]) => [op, alias] as const).map(([op, name]) => fixed(name, 2, (args) => ({ fn: bitwiseFn(op, args[0], args[1]), type: 'int' }))),
   fixed(
     'neg',
     1,
@@ -788,19 +746,13 @@ const OPERATIONS: ReadonlyMap<string, SqlFunction> = new Map<string, SqlFunction
 const COMPILED_OPERATIONS = new Set(['current_date', 'current_time', 'current_timestamp']);
 
 /**
- * The engine's own operations (ADR 0016 section 1), by behaviour name and by their former `sql.*` names: arithmetic,
- * comparisons, conversions and the other operations languages build plans from, besides the named scalar functions.
+ * The engine's own operations (ADR 0016 section 1), by behaviour name: arithmetic, comparisons, conversions and the
+ * other operations languages build plans from, besides the named scalar functions.
  */
-export const SQL_FUNCTIONS: ReadonlyMap<string, SqlFunction> = new Map<string, SqlFunction>([
-  ...OPERATIONS,
-  ...Object.entries(SQL_ALIASES).flatMap(([alias, name]) => (OPERATIONS.has(name) ? [[alias, OPERATIONS.get(name)!] as const] : [])),
-]);
-
-/** An operation's behaviour name: a former `sql.*` name resolved, any other name as it is. */
-export const canonicalName = (fn: string): string => SQL_ALIASES[fn] ?? fn;
+export const SQL_FUNCTIONS: ReadonlyMap<string, SqlFunction> = OPERATIONS;
 
 /** True for one of the engine's own operations (not a named scalar function), under either of its names. */
-export const isEngineOperation = (fn: string): boolean => SQL_FUNCTIONS.has(fn) || COMPILED_OPERATIONS.has(canonicalName(fn));
+export const isEngineOperation = (fn: string): boolean => SQL_FUNCTIONS.has(fn) || COMPILED_OPERATIONS.has(fn);
 
 /** The named function `name`; throws for a name the registry doesn't have (a bug in a front end). */
 export function sqlFunction(name: string): SqlFunction {

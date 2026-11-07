@@ -5,7 +5,7 @@
  */
 import { CollSrc, boundMetadata, compilePlanExpr } from '../exec/expr.js';
 import { type CompiledArg, type FunctionContext, aggregateFunctions, scalarFunctions } from '../exec/functions.js';
-import { SQL_ALIASES, SQL_FUNCTIONS, canonicalName } from '../exec/sql-functions.js';
+import { SQL_FUNCTIONS } from '../exec/sql-functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../exec/window.js';
 import type { Catalog, CatalogData, CatalogFunction, CatalogKey, CatalogSettings, CatalogTable, CatalogView, FunctionCatalog } from '../plan/catalog.js';
 import { declaredType, planTypeOfStorage } from '../plan/catalog.js';
@@ -141,12 +141,9 @@ function lazily(f: Omit<CatalogFunction, 'result'>, minArgs: number, ctx: Functi
 
 function describeFunctions(ctx: FunctionContext): CatalogFunction[] {
   const out: CatalogFunction[] = [];
-  const aliases = new Map<string, string[]>();
-  for (const [alias, name] of Object.entries(SQL_ALIASES)) aliases.set(name, [...(aliases.get(name) ?? []), alias]);
   for (const [name, op] of SQL_FUNCTIONS) {
-    if (canonicalName(name) !== name) continue;
     const [minArgs, max] = typeof op.arity === 'number' ? [op.arity, op.arity] : op.arity;
-    out.push(lazily({ name, kind: 'scalar', minArgs, maxArgs: max < 0 ? null : max, deterministic: true, operation: { aliases: aliases.get(name) ?? [] }, traits: traitData(op.traits) }, minArgs, ctx));
+    out.push(lazily({ name, kind: 'scalar', minArgs, maxArgs: max < 0 ? null : max, deterministic: true, operation: true, traits: traitData(op.traits) }, minArgs, ctx));
   }
   for (const [name, f] of scalarFunctions) {
     if (SQL_FUNCTIONS.has(name)) continue;
@@ -297,7 +294,6 @@ export const engineFunctions: FunctionCatalog = (() => {
       functions = describeFunctions(NO_DATABASE);
       byName = new Map();
       for (const f of functions) byName.set(f.name, [...(byName.get(f.name) ?? []), f]);
-      for (const [alias, name] of Object.entries(SQL_ALIASES)) if (byName.has(name)) byName.set(alias, byName.get(name)!);
     }
     return functions;
   };

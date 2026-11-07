@@ -69,7 +69,7 @@ describe('schema operations given as plan data are validated', () => {
     fails(db, createTable(tableDef({ keys: [{ kind: 'primaryKey', columns: [{ column: 5, desc: false, collation: 'binary' }] }] })), /keys\[0\]\.columns\[0\]\.column: no column 5/);
     const pk = { kind: 'primaryKey', columns: [{ column: 0, desc: false, collation: 'binary' }] };
     fails(db, createTable(tableDef({ keys: [pk, pk] })), /keys\[1\]: a table has at most one primary key/);
-    fails(db, createTable(tableDef({ checks: [{ text: 'c', expr: p.call('sql.gt', [p.col(0, 5, 'int'), p.lit(0)], 'int') }] })), /checks\[0\]\.expr\.args\[0\]/);
+    fails(db, createTable(tableDef({ checks: [{ text: 'c', expr: p.call('cmp_gt', [p.col(0, 5, 'int'), p.lit(0)], 'int') }] })), /checks\[0\]\.expr\.args\[0\]/);
     fails(db, createTable(tableDef({ columns: [column('a', 'INTEGER', { default: { text: 'a', expr: p.col(0, 0, 'int'), value: null } })] })), /default\.expr/);
     fails(db, createTable(tableDef({ foreignKeys: [{ columns: [9], table: 'u', onDelete: 'NO ACTION', onUpdate: 'NO ACTION', deferrable: false, isDeferrable: false }] })), /foreignKeys\[0\]\.columns\[0\]: no column 9/);
     fails(db, createTable(tableDef(), { source: { text: '' } }), /source\.language: expected a name/);
@@ -97,12 +97,12 @@ function seeds(): PlanStatementInput[] {
   const t = p.scan('t', [0, 1]);
   const u = p.scan('u', [0, 1]);
   return [
-    p.filter(t, p.call('sql.gt', [a, p.lit(1)], 'int')),
-    p.project(p.sort(t, [p.desc(a)]), [b, p.call('sql.mul', [a, p.lit(2)], 'int')]),
-    p.limit(p.join('left', t, u, p.call('sql.eq', [a, p.col(1, 0, 'int')], 'int')), 3),
+    p.filter(t, p.call('cmp_gt', [a, p.lit(1)], 'int')),
+    p.project(p.sort(t, [p.desc(a)]), [b, p.call('mul', [a, p.lit(2)], 'int')]),
+    p.limit(p.join('left', t, u, p.call('cmp_eq', [a, p.col(1, 0, 'int')], 'int')), 3),
     p.aggregate(t, [b], [p.agg('sum', [a], 'int'), p.agg('count', [], 'int', { star: true })]),
     p.distinct(p.setop('unionAll', p.project(t, [a]), p.project(u, [p.col(0, 0, 'int')]), 1), 1),
-    p.filter(t, p.exists(p.filter(u, p.call('sql.eq', [p.col(0, 0, 'int'), p.col(0, 0, 'int', 'binary', 1)], 'int')))),
+    p.filter(t, p.exists(p.filter(u, p.call('cmp_eq', [p.col(0, 0, 'int'), p.col(0, 0, 'int', 'binary', 1)], 'int')))),
     { op: 'source', kind: 'function', name: 'pragma_table_info', args: [p.lit('t')], types: Array(6).fill('any') } as never,
     { kind: 'write', plan: p.append('u', p.values([[p.lit(9), p.lit('z')]]), [0, 1]) },
     createTable(tableDef({ name: 'v' })),
@@ -124,7 +124,7 @@ function mutate(x: unknown, r: () => number): unknown {
   const pick = <T>(xs: T[]): T => xs[Math.floor(r() * xs.length)];
   let next: unknown;
   if (typeof old === 'number') next = pick([old + 1, old - 1, -1, 99, 2 ** 40, 0.5, NaN]);
-  else if (typeof old === 'string') next = pick(['', 'nope', 'int', 'INTEGER', 'nocase', 'sql.eq', 'inner']);
+  else if (typeof old === 'string') next = pick(['', 'nope', 'int', 'INTEGER', 'nocase', 'cmp_eq', 'inner']);
   else if (typeof old === 'boolean') next = !old;
   else if (Array.isArray(old)) next = pick([old.slice(1), [...old, old[0]], []]);
   else next = pick([null, undefined, 1, 'x', {}]);

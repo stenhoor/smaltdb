@@ -87,8 +87,8 @@ describe('functions', () => {
 
   it('describes operations, named functions, aggregates and window functions', () => {
     expect(c.function('cmp_eq')).toMatchObject({ name: 'cmp_eq', kind: 'scalar', minArgs: 2, maxArgs: 2, deterministic: true, result: 'int', traits: { compare: '=' } });
-    expect(c.function('cmp_eq')!.operation!.aliases).toContain('sql.eq');
-    expect(c.function('sql.eq')!.name).toBe('cmp_eq');
+    expect(c.function('cmp_eq')!.operation).toBe(true);
+    expect(c.function('sql.eq')).toBeUndefined();
     expect(c.function('upper')).toMatchObject({ kind: 'scalar', minArgs: 1, maxArgs: 1, deterministic: true, result: 'text' });
     expect(c.function('upper')!.operation).toBeUndefined();
     expect(c.function('coalesce')!.maxArgs).toBeNull();

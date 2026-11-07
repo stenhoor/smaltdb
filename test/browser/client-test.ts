@@ -77,7 +77,7 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
 
   // Plans over the worker protocol: SELECT name, qty FROM items WHERE id <= ? ORDER BY id DESC, as plan data.
   const id = p.col(0, 0, 'int');
-  const byId = p.project(p.sort(p.filter(p.scan('items', [0, 1, 3]), p.call('sql.le', [id, p.param(0, 'int')], 'int')), [p.desc(id)]), [p.col(0, 1, 'text'), p.col(0, 2, 'int')]);
+  const byId = p.project(p.sort(p.filter(p.scan('items', [0, 1, 3]), p.call('cmp_le', [id, p.param(0, 'int')], 'int')), [p.desc(id)]), [p.col(0, 1, 'text'), p.col(0, 2, 'int')]);
   const viaPlan = await db.queryPlan({ kind: 'query', plan: byId, columns: [{ name: 'name' }, { name: 'qty' }] }, [3], { rowMode: 'array' });
   const viaSql = await db.query('SELECT name, qty FROM items WHERE id <= ? ORDER BY id DESC', [3], { rowMode: 'array' });
   const prepared = await db.preparePlan(byId);
