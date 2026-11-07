@@ -77,6 +77,10 @@ form, on `queryPlan` and `streamPlan` in the client and on the engine's `query`,
 `'temporal'` needs a runtime with the `Temporal` API, and fails without one. A `Date` holds ms, so `'date'` drops a
 `datetime`'s µs.
 
+Lists and structs (`list<…>`, `struct<…>`) come back as JS arrays and plain objects, their elements given as their
+types are: a `bool` as `true` / `false`, a date or time as its text, a nested list or struct as an array or object
+([ADR 0020](../../adr/0020-lists-and-structs.md)). Through the client they travel as their bytes and are converted there.
+
 ```ts
 import { open } from 'smaltdb';
 import * as p from 'smaltdb/plan';

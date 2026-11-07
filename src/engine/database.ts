@@ -35,6 +35,7 @@ import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import { type TemporalForm, type TemporalType, datetimeFromDate, isTemporal, rowsInForm, temporalText } from '../shared/temporal.js';
+import { type NestedTypeName, isNestedType, nestedResult } from '../shared/nested.js';
 import type { ReaderSettings } from '../shared/protocol.js';
 import { describeTable, logicalCatalog } from './catalog/logical.js';
 import { outputTypes } from './plan/output.js';
@@ -546,7 +547,7 @@ export class Database implements FunctionContext {
    */
   preparePlan(stmt: PlanStatementInput): PlanStatement {
     this.checkOpen();
-    const bound = normalizeBound(toBoundStatement(stmt, (plan) => this.receivedPlan(plan), (plan) => outputTypes(plan, (t, db) => this.getTable(t, db)?.columns.map((c) => planTypeOfStorage(c.type)))));
+    const bound = normalizeBound(toBoundStatement(stmt, (plan) => this.receivedPlan(plan), (plan) => outputTypes(plan, (t, db) => this.getTable(t, db)?.columns.map((c) => planTypeOfStorage(c.type, c.declaredType)))));
     if (bound.kind === 'schema') validateSchemaOp(bound.op, this.validateCatalog);
     return new PlanStatement(this, bound, paramCount(bound));
   }
@@ -2170,7 +2171,7 @@ export class Database implements FunctionContext {
       views.push({
         name: t.name,
         plan: m.plan.plan,
-        types: t.columns.map((c) => (c.rowidAlias ? 'int' : staticTypeOfStorage(c.type))),
+        types: t.columns.map((c) => (c.rowidAlias ? 'int' : staticTypeOfStorage(c.type, c.declaredType))),
         collations: t.columns.map((c) => MATVIEW_COLLATIONS[c.collation ?? Collation.Binary]),
       });
     }
@@ -4939,6 +4940,8 @@ export class RowCursor {
    */
   private readonly bools: readonly number[];
   private readonly temporals: readonly [number, TemporalType][];
+  /** The list and struct columns (ADR 0020): given as JS arrays and objects. */
+  private readonly nested: readonly [number, NestedTypeName][];
 
   constructor(
     readonly db: Database,
@@ -4953,6 +4956,7 @@ export class RowCursor {
   ) {
     this.bools = boolColumns(columnTypes);
     this.temporals = temporalColumns(columnTypes);
+    this.nested = columnTypes.flatMap((t, i): [number, NestedTypeName][] => (isNestedType(t) ? [[i, t]] : []));
     if (plan) {
       try {
         plan.root.open(regs);
@@ -4972,7 +4976,7 @@ export class RowCursor {
     if (this.fixedRows) {
       if (this.i < this.fixedRows.length) {
         const row = this.fixedRows[this.i++];
-        return this.bools.length === 0 && this.temporals.length === 0 ? row : this.converted(row.slice());
+        return this.bools.length === 0 && this.temporals.length === 0 && this.nested.length === 0 ? row : this.converted(row.slice());
       }
       this.done = true;
       return null;
@@ -4996,13 +5000,14 @@ export class RowCursor {
     const r = this.regs;
     const row = new Array(out.length);
     for (let j = 0; j < out.length; j++) row[j] = r[out[j]];
-    return this.bools.length === 0 && this.temporals.length === 0 ? row : this.converted(row);
+    return this.bools.length === 0 && this.temporals.length === 0 && this.nested.length === 0 ? row : this.converted(row);
   }
 
   /** `row` with its bool and temporal columns as results give them. */
   private converted(row: SqlValue[]): SqlValue[] {
     if (this.bools.length) asBooleans(row, this.bools);
     for (const [c, t] of this.temporals) row[c] = temporalText(t, row[c]);
+    for (const [c, t] of this.nested) row[c] = nestedResult(t, row[c]) as SqlValue;
     return row;
   }
 
@@ -5108,6 +5113,8 @@ function fitsStorage(v: SqlValue, t: string): boolean {
     case 'TEXT':
       return typeof v === 'string';
     case 'BLOB':
+    case 'LIST':
+    case 'STRUCT':
       return v instanceof Uint8Array;
     default:
       return true;

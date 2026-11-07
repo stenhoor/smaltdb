@@ -1,5 +1,6 @@
 import { type ErrorDetails, SmaltError } from '../errors.js';
 import { parseDate, parseDatetime, parseTime } from '../../shared/temporal.js';
+import { type NestedTypeName, encodeNested } from '../../shared/nested.js';
 import type { PlanExpr } from '../plan/expr.js';
 import type { ConflictAction as PlanConflict } from '../plan/ops.js';
 import type { CheckDef, DefaultDef, ExprDef, FkAction, IndexDef, TableDef } from '../plan/schema.js';
@@ -293,6 +294,18 @@ export function coerceForColumn(v: SqlValue, col: ColumnSchema, table: string, i
     }
     case 'BLOB':
       if (v instanceof Uint8Array) return v;
+      break;
+    case 'LIST':
+    case 'STRUCT':
+      // A list or struct (ADR 0020): its bytes, or a JS array or object (a parameter) encoded by the declared type.
+      if (v instanceof Uint8Array) return v;
+      if (typeof v === 'object') {
+        try {
+          return encodeNested(col.declaredType as NestedTypeName, v, `${table}.${col.name}`);
+        } catch (e) {
+          throw new ConstraintError('SMALT_CONSTRAINT_DATATYPE', (e as Error).message, { constraint: 'datatype', table, columns: [col.name] });
+        }
+      }
       break;
     case 'NUMERIC': {
       if (typeof v === 'string') {

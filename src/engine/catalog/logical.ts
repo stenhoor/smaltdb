@@ -45,7 +45,7 @@ export function describeTable(t: TableSchema): CatalogTable {
     schema: t.temp ? 'temp' : 'main',
     columns: t.columns.map((c) => ({
       name: c.name,
-      type: planTypeOfStorage(c.type),
+      type: planTypeOfStorage(c.type, c.declaredType),
       storageType: c.type,
       declaredType: c.declaredType,
       collation: COLLATION_NAMES[c.collation],

@@ -19,7 +19,7 @@ import { type SqlValue, normalizeInt } from '../values.js';
  * `BOOLEAN` (ADR 0018) holds 0 and 1, and `DATE`, `TIME`, `DATETIME`, `DURATION` (ADR 0019) days and µs: each is
  * stored as an INTEGER is (fixed int64).
  */
-export type StorageType = 'INTEGER' | 'BOOLEAN' | 'DATE' | 'TIME' | 'DATETIME' | 'DURATION' | 'REAL' | 'TEXT' | 'BLOB' | 'ANY' | 'NUMERIC';
+export type StorageType = 'INTEGER' | 'BOOLEAN' | 'DATE' | 'TIME' | 'DATETIME' | 'DURATION' | 'LIST' | 'STRUCT' | 'REAL' | 'TEXT' | 'BLOB' | 'ANY' | 'NUMERIC';
 
 /** Stored as a fixed int64: INTEGER, and the types whose values are integers. */
 export const isInt64Storage = (t: StorageType | string): boolean => t === 'INTEGER' || t === 'BOOLEAN' || t === 'DATE' || t === 'TIME' || t === 'DATETIME' || t === 'DURATION';
