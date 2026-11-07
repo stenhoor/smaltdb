@@ -176,3 +176,18 @@ the "after" run repeated once to measure the machine's drift, and SQL from each 
   catalog API's expression descriptions (smaltql asks the engine to compile each expression it describes), not in
   execution.
 - **Storage micro-benchmarks** (`npm run bench`): unchanged (geometric mean 0.91, within noise).
+
+### Statement compile: accepted (2026-11-07)
+
+A compile-only measurement (every query of an SLT file prepared and run 25 times in one process, best pass) puts the
+cost at 0–18% by kind of statement: `random/expr` 52 → 63 ms, `random/aggregates` 141 → 166 ms, `select1` unchanged,
+`index/between/1` 815 → 846 ms. It is spread over the plan API's layers rather than one place: asking the catalog to
+describe expressions (about 1.5 ms of `random/expr`'s 11), function name and trait lookups (about 2 ms), and meaning
+fields added to nodes after they are built (about 2.7 ms: copies of nodes, such as the planner's `rebind`, see more
+object shapes).
+
+Two fixes were measured and not taken. Walking each described expression once and a `Map` for aliases removed what
+they targeted but changed nothing measurable. Giving every node all its meaning fields from creation (one shape per
+kind) recovered most of the aggregate cost but made `index/between/1` 4% slower than `main`, as every node grew. The
+owner accepted the cost: query execution is unchanged, and the compile cost is the price of the language-neutral
+plan API. A narrower shape fix (only the nodes a language marks) is the place to start if it is revisited.
