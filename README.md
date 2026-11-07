@@ -5,7 +5,11 @@
   </picture>
 </h1>
 
-**Small. Alternative. Fast.**
+<a href="https://smaltworks.dev/stability"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/brand/work-in-progress-on-dark.svg"><img alt="Work in progress. Come build with us." src="docs/brand/work-in-progress.svg" height="56"></picture></a>
+
+**Small. Alternative. Fast.** A fast alternative database for the browser, written in TypeScript.
+
+[Documentation](https://smaltdb.dev) · [smaltworks.dev](https://smaltworks.dev)
 
 **smaltdb** is an embedded database engine for web browsers, written in TypeScript. It stores data in the
 [Origin Private File System (OPFS)](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system),
@@ -116,4 +120,6 @@ See [docs/TESTING.md](docs/TESTING.md) for details.
 
 ## License
 
-[MIT](LICENSE)
+<a href="https://smaltworks.dev"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/brand/a-smaltworks-project-on-dark.svg"><img alt="A smaltworks project" src="docs/brand/a-smaltworks-project.svg" height="28"></picture></a>
+
+[MIT License](LICENSE).

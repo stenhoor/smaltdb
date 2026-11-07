@@ -125,6 +125,35 @@
   -webkit-text-fill-color: var(--vp-c-brand-1);
 }
 
+/* The product suffix in the hero name takes its layer's text colour (BRAND.md, "Colour by layer"):
+   <span class="suffix language">ql</span>. smaltdb's suffix stays in ink, with no span. */
+.VPHero .name .suffix.language { color: #981C89; -webkit-text-fill-color: #981C89; }
+.VPHero .name .suffix.kit      { color: #086A65; -webkit-text-fill-color: #086A65; }
+.VPHero .name .suffix.tool     { color: #0B6A91; -webkit-text-fill-color: #0B6A91; }
+.VPHero .name .suffix.ai       { color: #6141AE; -webkit-text-fill-color: #6141AE; }
+.dark .VPHero .name .suffix.language { color: #F57FE6; -webkit-text-fill-color: #F57FE6; }
+.dark .VPHero .name .suffix.kit      { color: #10C2B9; -webkit-text-fill-color: #10C2B9; }
+.dark .VPHero .name .suffix.tool     { color: #5CBDE8; -webkit-text-fill-color: #5CBDE8; }
+.dark .VPHero .name .suffix.ai       { color: #B8A1F2; -webkit-text-fill-color: #B8A1F2; }
+
+/* Light and dark copies of a badge: show the one for the current theme. */
+.sw-dark { display: none; }
+.dark .sw-light { display: none; }
+.dark .sw-dark { display: inline-block; }
+img.sw-light { display: inline-block; }
+
+/* The stage badge (smaltworks.ts): under the hero's text on the home page, above the content on other pages. */
+.sw-stage { margin: 0 0 20px; line-height: 0; }
+.VPHero .sw-stage { margin: 24px 0 0; }
+.sw-stage a { display: inline-block; }
+.sw-stage img { max-width: none; }
+
+/* "A smaltworks project" at the foot of pages with a sidebar (stage.ts), and in the footer elsewhere. */
+.sw-project { display: flex; align-items: center; gap: 12px; margin: 0 0 24px; font-size: 13px; color: var(--vp-c-text-2); }
+.sw-project a { display: inline-block; line-height: 0; }
+.VPFooter .message a { display: inline-block; line-height: 0; }
+.VPFooter .message img { vertical-align: middle; }
+
 /* Tagline: keep "Small. Alternative. Fast." on one line where there's room; balance it on phones. */
 .VPHero .text { text-wrap: balance; }
 @media (min-width: 640px) { .VPHero .text { font-size: 44px; line-height: 52px; } }

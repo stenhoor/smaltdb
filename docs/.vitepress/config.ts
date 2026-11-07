@@ -2,6 +2,7 @@ import { defineConfig } from 'vitepress'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { smaltLight, smaltDark } from './theme/shiki'
+import { smaltworksMenu, smaltworksFooter } from './theme/smaltworks'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const REPO = 'https://github.com/stenhoor/smaltdb'
@@ -48,7 +49,7 @@ export default defineConfig({
     nav: [
       { text: 'Engine', link: '/reference/engine/' },
       { text: 'API', link: '/reference/api/engine' },
-      { text: 'SQL (smaltql)', link: 'https://stenhoor.github.io/smaltql/' },
+      { text: 'smaltql · SQL', link: 'https://stenhoor.github.io/smaltql/' },
       {
         text: 'Internals',
         items: [
@@ -57,6 +58,7 @@ export default defineConfig({
           { text: 'Research', link: '/research/benchmark-methodology' },
         ],
       },
+      smaltworksMenu(),
     ],
     sidebar: [
       {
@@ -76,11 +78,11 @@ export default defineConfig({
           { text: 'Engine (smaltdb/engine)', link: '/reference/api/engine' },
           { text: 'Writing plugins', link: '/reference/api/plugins' },
           { text: 'Error codes', link: '/reference/api/errors' },
-          { text: 'Client (smaltql docs)', link: 'https://stenhoor.github.io/smaltql/reference/api/client' },
+          { text: 'Client · smaltql', link: 'https://stenhoor.github.io/smaltql/reference/api/client' },
         ],
       },
       {
-        text: 'SQL (smaltql docs)',
+        text: 'smaltql · SQL',
         items: [
           { text: 'Getting started', link: 'https://stenhoor.github.io/smaltql/guide/getting-started' },
           { text: 'SQL reference', link: 'https://stenhoor.github.io/smaltql/reference/sql/' },
@@ -155,6 +157,6 @@ export default defineConfig({
     socialLinks: [{ icon: 'github', link: REPO }],
     search: { provider: 'local' },
     outline: { level: [2, 3] },
-    footer: { message: 'MIT License', copyright: 'smaltdb' },
+    footer: smaltworksFooter('/'),
   },
 })

@@ -4,7 +4,7 @@ layout: home
 hero:
   name: 'sm<span class="alt">alt</span>db'
   text: Small. Alternative. Fast.
-  tagline: A fast database engine for the browser, written in TypeScript. It runs plans; languages such as SQL build them.
+  tagline: A fast alternative database for the browser, written in TypeScript.
   image:
     light: /grain-mark.svg
     dark: /grain-mark-on-dark.svg
@@ -26,7 +26,7 @@ features:
   - title: Durable on OPFS
     details: Data lives in the Origin Private File System. Commits are atomic and durable through a write-ahead log.
   - title: Multiple languages
-    details: 'The engine runs plans; languages build them. <a href="https://stenhoor.github.io/smaltql/">SQL</a> (smaltql) today; DataFrames and a typed API are planned. <a href="/reference/engine/languages">Write your own</a>.'
+    details: 'The engine runs plans; languages build them: <a href="https://stenhoor.github.io/smaltql/">smaltql</a> for SQL and <a href="https://stenhoor.github.io/smaltdf/">smaltdf</a> for dataframes, both in development, and a typed API, smaltts, planned. <a href="/reference/engine/languages">Write your own</a>.'
   - title: Analytics built in
     details: Columnar tables and materialized views with zone maps, spilling sorts and parallel readers.
   - title: External data
