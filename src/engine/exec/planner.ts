@@ -430,7 +430,7 @@ export class Planner {
       const outs: { reg: number; type: StaticType }[] = [];
       for (let i = 0; i < spec.decode.length; i += 2) {
         const t = table.columns[spec.decode[i]].type;
-        outs.push({ reg: spec.decode[i + 1], type: t === 'INTEGER' ? 'int' : t === 'REAL' ? 'real' : 'any' });
+        outs.push({ reg: spec.decode[i + 1], type: t === 'INTEGER' ? 'int' : t === 'BOOLEAN' ? 'bool' : t === 'REAL' ? 'real' : 'any' });
       }
       for (const reg of spec.rowidRegs) outs.push({ reg, type: 'int' });
       const fill = generateScanFilter(preds, outs, cap, () => access.loaderSpec(), helpers, pipelineCompiler(ctx));

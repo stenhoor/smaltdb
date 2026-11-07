@@ -558,7 +558,7 @@ function emitDecode(spec: LoaderSpec, L: string[], assign: Assign = toRegister, 
   L.push('const ko = off + (b[off + 1] < 128 ? 2 : 3); const vo = ko + b[off];');
   if (spec.decode.length > 0) {
     L.push(`const bm = vo + 3; const fx = bm + ${bitmap}; const vt = fx + ${spec.fixedSize};`);
-    const needsVar = spec.decode.some((_, i) => i % 2 === 0 && !(spec.types[spec.decode[i]] === 'INTEGER' || spec.types[spec.decode[i]] === 'REAL'));
+    const needsVar = spec.decode.some((_, i) => i % 2 === 0 && !(spec.types[spec.decode[i]] === 'INTEGER' || spec.types[spec.decode[i]] === 'BOOLEAN' || spec.types[spec.decode[i]] === 'REAL'));
     if (needsVar) L.push(`const wide = (b[vo] & 1) === 1; const vd = vt + ${spec.varCount} * (wide ? 4 : 2);`);
     const endOf = (j: number): string => `(wide ? dv.getUint32(vt + ${4 * j}, true) : (b[vt + ${2 * j}] | (b[vt + ${2 * j + 1}] << 8)))`;
     const bounds = (col: number): ColBounds => {
@@ -573,7 +573,7 @@ function emitDecode(spec: LoaderSpec, L: string[], assign: Assign = toRegister, 
       const sl = spec.slots[col];
       const isNull = `(b[bm + ${col >>> 3}] & ${1 << (col & 7)}) !== 0`;
       let value: string;
-      if (t === 'INTEGER') {
+      if (t === 'INTEGER' || t === 'BOOLEAN') {
         // Values that fit in int32 are produced as int32 so V8 keeps them as small integers (fast % and /).
         value =
           `{ const o = fx + ${sl}; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24);` +
