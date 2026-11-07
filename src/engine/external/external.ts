@@ -14,6 +14,7 @@ import { type FormatReader, PluginRegistry, type RandomAccessFile, type RandomFi
 import type { Zone } from '../storage/columnar.js';
 import type { SqlValue } from '../values.js';
 import { hivePartitions, isGlob, partitionValue } from './glob.js';
+import { type TemporalType, isTemporal } from '../../shared/temporal.js';
 
 /** A named endpoint (`CREATE CONNECTION`). */
 export interface ConnectionInfo {
@@ -25,6 +26,8 @@ export interface ConnectionInfo {
 export interface ExternalColumn {
   name: string;
   declType: string;
+  /** A temporal type the format gave the column (FormatColumn.type). */
+  type?: TemporalType;
 }
 
 /** What to fetch and how to read it: an external table, or one call of a table function such as `read_csv`. */
@@ -65,7 +68,7 @@ export interface ExternalSource {
 
 /** Rows read from a source. */
 export interface ExternalData {
-  columns: (ExternalColumn & { type: StaticType })[];
+  columns: (Omit<ExternalColumn, 'type'> & { type: StaticType })[];
   rows: SqlValue[][];
   /** ETag or Last-Modified of the source, when it has one. */
   validator: string | null;
@@ -160,6 +163,16 @@ function fits(v: SqlValue, t: StaticType): boolean {
 
 function typed(columns: ExternalColumn[], rows: SqlValue[][]): ExternalData['columns'] {
   return columns.map((c, i) => {
+    if (c.type !== undefined && isTemporal(c.type)) {
+      const t = c.type;
+      for (const r of rows) {
+        const v = r[i];
+        if (v !== null && v !== undefined && !(typeof v === 'bigint' || (typeof v === 'number' && Number.isInteger(v)))) {
+          throw new SmaltError('SMALT_ERROR', `column ${c.name}: a ${t} value must be an integer, not ${typeof v === 'string' ? `'${v}'` : typeof v}`);
+        }
+      }
+      return { ...c, type: t };
+    }
     const t = staticTypeOf(c.declType);
     return { ...c, type: rows.every((r) => fits(r[i], t)) ? t : 'any' };
   });
@@ -397,8 +410,13 @@ export class ExternalRegistry {
       for (const p of parts) {
         for (const c of p.parsed.columns) {
           const old = byName.get(lower(c.name));
-          if (!old) byName.set(lower(c.name), { name: c.name, declType: c.declType });
-          else if (old.declType !== c.declType) old.declType = [old.declType, c.declType].every((t) => t === 'INTEGER' || t === 'REAL') ? 'REAL' : 'ANY';
+          const type = isTemporal(c.type) ? c.type : undefined;
+          if (!old) byName.set(lower(c.name), { name: c.name, declType: c.declType, ...(type ? { type } : {}) });
+          else {
+            if (old.declType !== c.declType) old.declType = [old.declType, c.declType].every((t) => t === 'INTEGER' || t === 'REAL') ? 'REAL' : 'ANY';
+            // Files that disagree on a date or time type leave the column untyped.
+            if (old.type !== type) delete old.type;
+          }
         }
       }
       const names = new Set([...partitionNames, ...parts.flatMap((p) => p.partitions.map(([k]) => lower(k)))]);

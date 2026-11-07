@@ -239,11 +239,18 @@ them: a block is then never skipped for that column.
 
 ### FormatResult
 
-`{ columns: FormatColumn[]; rows: SqlValue[][] }`. A `FormatColumn` is `{ name: string; declType: string }`, where
-`declType` is a declared type such as `INTEGER`, `REAL`, `TEXT`, `BLOB` or `ANY`.
+`{ columns: FormatColumn[]; rows: SqlValue[][] }`. A `FormatColumn` is `{ name: string; declType: string; type?:
+'date' | 'datetime' | 'time' | 'duration' }`, where `declType` is a declared type such as `INTEGER`, `REAL`, `TEXT`,
+`BLOB` or `ANY`.
 
 - With `request.columns`, return those columns, in that order, and one value per column in each row.
 - The engine types the columns from `declType` by SQLite's affinity rules.
+- `type` gives a column of dates or times ([ADR 0019](../../adr/0019-dates-and-times.md)) instead. Its values are
+  integers: days since 1970-01-01 for `date`, µs for `datetime` (since 1970-01-01 00:00:00), `time` (since midnight)
+  and `duration`, `bigint` beyond 2^53. Results give them as text (`2026-11-07 12:30:00`). A value that isn't an
+  integer is an error. An external table whose columns come from the source keeps the type in its definition.
+  Engines before 0.9.0 ignore `type`: a format that sets it should give `declType` a type such as `DATE`, whose
+  integer values they then read as numbers.
 - Values are `SqlValue`s: `null`, `number`, `bigint` (integers beyond 2^53), `string` or `Uint8Array`.
 
 ## Sources
