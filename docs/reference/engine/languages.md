@@ -27,7 +27,7 @@ every database in the engine. That is what lets the engine keep objects written 
 
 A language is a `SmaltLanguage`. Besides its `name`, it provides the parts it uses: text it binds (`parse`,
 `parseOne`), the objects it stores (`bindView`, `viewReferences`, `viewDefinition`, `bindTableExprs`, `sourceEditor`),
-and words for errors (`errorMessage`). A language that writes no text has no parser; one whose views are its own
+words for errors (`errorMessage`), and how it binds parameters (`parameter`). A language that writes no text has no parser; one whose views are its own
 serialized source, not text it parses, provides the stored-object part alone. Using a part a language lacks is a
 `SMALT_MISUSE` error that names both (`the dotted language does not edit its objects' source text`).
 
@@ -41,6 +41,7 @@ serialized source, not text it parses, provides the stored-object part alone. Us
 | `bindTableExprs(table, ctx)` | The CHECK and DEFAULT expressions a stored table holds unbound, bound from its source (`table` as [the catalog](./catalog) describes it, its text in `table.source`). Needed only by a language whose tables keep expressions unbound. |
 | `errorMessage(error)` | Optional. The message for an error a statement written in the language raised, from its `code`, the engine's `message` and its [fields](../api/errors) (`constraint`, `table`, `columns`, `name`, `origin`): undefined keeps the engine's message. Each language words errors for its users; SQL's wording is SQLite's. |
 | `sourceEditor` | Edits the source texts kept beside definitions when ALTER TABLE renames a table or a column, adds or drops a column, and writes an external table's statement once its columns are known. ALTER TABLE edits every object's text, each with its own language's editor. Objects [defined without source text](./schema#definitions-without-source-text) need none. |
+| `parameter(value)` | Optional. A parameter of one of the language's statements as the language means it, after the engine's own conversions (booleans to 1 / 0, bigints checked). The engine keeps NaN, a value of `real` ([ADR 0018](../../adr/0018-bool-and-nan.md)); SQL gives it as NULL, as SQLite binds it. Without the hook, a language statement's NaN parameters are NULL for now; plans' parameters keep NaN. |
 
 A `LanguageStatement` (from `parse`) is `{ text, paramCount, paramNames, bind(ctx), externalCalls?() }`: `bind` gives a
 bound statement, the `PlanStatementInput` forms of [running plans](./running#statements) with the engine's column

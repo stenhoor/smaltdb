@@ -4831,6 +4831,10 @@ export class Statement extends PreparedStatement {
 
   protected bindParams(params: BindParams | undefined, regs: SqlValue[]): void {
     bindParamValues(this.parsed, params, regs);
+    // The statement's language converts its parameters as it means them (ADR 0018: SQL binds NaN as NULL). A language
+    // without the hook gets that conversion for now; the fallback goes once smaltql provides it.
+    const convert = this.prog().language?.parameter ?? nanAsNull;
+    for (let i = 0; i < this.parsed.paramCount; i++) regs[i] = convert(regs[i]);
   }
 
   protected readsMemoryObjects(): boolean {
@@ -4902,9 +4906,15 @@ function bindParamValues(parsed: Pick<LanguageStatement, 'paramCount' | 'paramNa
 const INT64_MIN = -(BigInt(2) ** BigInt(63));
 const INT64_MAX = BigInt(2) ** BigInt(63) - BigInt(1);
 
-/** A bound value as stored: booleans 1/0, undefined and NaN NULL (as SQLite binds NaN), bigints in 64-bit range. */
+/** NaN as NULL, as SQLite binds it: the parameters of a language statement whose language has no `parameter` hook. */
+const nanAsNull = (v: SqlValue): SqlValue => (typeof v === 'number' && v !== v ? null : v);
+
+/**
+ * A bound value as stored: booleans 1/0, undefined NULL, bigints in 64-bit range. NaN stays NaN, a value of `real`
+ * (ADR 0018); a language converts its own statements' parameters (`SmaltLanguage.parameter`).
+ */
 function normalizeParam(v: SqlValue | boolean | undefined, slot: number | string): SqlValue {
-  if (typeof v === 'number') return v === v ? v : null;
+  if (typeof v === 'number') return v;
   if (v === undefined) return null;
   if (typeof v === 'boolean') return v ? 1 : 0;
   if (typeof v === 'bigint') {
