@@ -88,3 +88,45 @@ describe('JSON text', () => {
     expect(over('list<text>', [['a"b', null]], 'cast_text', [], 'text')).toEqual(['["a\\"b",null]']);
   });
 });
+
+describe('explode', () => {
+  const src = () => p.fromColumns([[1, 2, 3, 4], [[10, 20], [], null, [30]], ['a', 'b', 'c', 'd']], ['int', L('list<int>'), 'text']);
+
+  it('one row per element, in the input order then the list order; as Polars, an empty list gives none, a NULL one NULL row', () => {
+    expect(db.queryPlan(p.explode(src(), 1, L('list<int>'))).rows).toEqual([
+      [1, 10, 'a'],
+      [1, 20, 'a'],
+      [3, null, 'c'],
+      [4, 30, 'd'],
+    ]);
+    const ids = (o: Parameters<typeof p.explode>[3]) => db.queryPlan(p.explode(src(), 1, L('list<int>'), o)).rows.map((x) => x[0]);
+    expect(ids({ emptyAsNull: true })).toEqual([1, 1, 2, 3, 4]);
+    expect(ids({ keepNulls: false })).toEqual([1, 1, 4]);
+    expect(ids({ emptyAsNull: true, keepNulls: false })).toEqual([1, 1, 2, 4]);
+    const r = db.queryPlan(p.explode(src(), 1, L('list<int>'), { position: true }));
+    expect(r.rows.map((x) => x[3])).toEqual([0, 1, 0, 0]);
+  });
+
+  it('nested lists and structs, and composed with other operations', () => {
+    const t = 'list<struct<k text, v int>>';
+    const nested = p.fromColumns([[[{ k: 'x', v: 1 }, { k: 'y', v: 2 }], [{ k: 'z', v: 3 }]]] as never, [L(t)]);
+    expect(db.queryPlan(p.explode(nested, 0, L(t))).rows).toEqual([[{ k: 'x', v: 1 }], [{ k: 'y', v: 2 }], [{ k: 'z', v: 3 }]]);
+    const exploded = p.explode(src(), 1, L('list<int>'));
+    const sum = p.aggregate(exploded, [], [p.agg('sum', [p.col(0, 1, 'int')], 'int')]);
+    expect(db.queryPlan(sum).rows).toEqual([[60]]);
+    // explode then implode gives the lists back (an empty list's row is gone; a NULL list's NULL row comes back as [null]).
+    const back = p.aggregate(exploded, [p.col(0, 0, 'int')], [p.agg('implode', [p.col(0, 1, 'int')], L('list<int>'))], { ordered: 'first' } as never);
+    expect(db.queryPlan(p.sort(back, [p.asc(p.col(0, 0, 'int'))])).rows).toEqual([[1, [10, 20]], [3, [null]], [4, [30]]]);
+  });
+
+  it('a long list', () => {
+    const xs = Array.from({ length: 2000 }, (_, i) => i);
+    const r = db.queryPlan(p.explode(p.fromColumns([[xs]] as never, [L('list<int>')]), 0, L('list<int>')));
+    expect(r.rows.map((x) => x[0])).toEqual(xs);
+  });
+
+  it('checks its column and type', () => {
+    expect(() => db.queryPlan(p.explode(src(), 5, L('list<int>')))).toThrow(/no column 5/);
+    expect(() => db.queryPlan(p.explode(src(), 1, 'int'))).toThrow(/expected a list type/);
+  });
+});

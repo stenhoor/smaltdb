@@ -12,6 +12,8 @@ import { lit, type PlanExpr, typeOf } from '../plan/expr.js';
 import type { AggCall, PlanOp, SortKey, WindowCall } from '../plan/ops.js';
 import { SmaltError } from '../errors.js';
 import { planWidth } from './planner.js';
+import { parseNested } from '../../shared/nested-types.js';
+import type { PlanType } from '../plan/types.js';
 
 type Op<K extends PlanOp['op']> = Extract<PlanOp, { op: K }>;
 
@@ -70,6 +72,9 @@ function rewriteAll(x: unknown): unknown {
     case 'unpivot':
       // Its rewrite is an ordered join: rewritten in turn.
       return rewriteAll(unpivotRows(op));
+    case 'explode':
+      // Its rewrite holds a window and an iteration: rewritten in turn.
+      return rewriteAll(explodeRows(op));
     default:
       return op;
   }
@@ -229,6 +234,42 @@ function unpivotRows(op: Op<'unpivot'>): PlanOp {
     type: op.type,
   };
   return { op: 'project', input: crossed, exprs: [...op.keep.map((i) => column(i)), column(w + 1, 'text'), value], ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+}
+
+/** Iteration ids for the rewrites' own recursive steps: above any a language numbers its own from. */
+let rewriteIterationId = 1 << 30;
+
+/**
+ * An explode (ADR 0020) as an iteration over each row's positions: the input numbered, each row given position 0, a
+ * step adding the next position while it is within the list, the rows sorted by number and position (the input's order,
+ * then the list's), and the list column read at each row's position. A row whose list is empty or NULL starts only
+ * where it gives a row (`emptyAsNull`, `keepNulls`): its one row at position 0, whose element is NULL (`list_get` out of
+ * range).
+ */
+function explodeRows(op: Op<'explode'>): PlanOp {
+  const w = planWidth(op.input);
+  const n = parseNested(op.type);
+  const element = (n && n.kind === 'list' ? n.of : 'any') as PlanType;
+  const id = rewriteIterationId++;
+  const list: PlanExpr = { k: 'col', input: 0, index: op.column, depth: 0, type: op.type, collation: 'binary' };
+  const pos = column(w + 1, 'int');
+  const next: PlanExpr = { k: 'call', fn: 'add', args: [pos, { k: 'lit', value: 1, type: 'int' }], type: 'int' };
+  const length: PlanExpr = { k: 'call', fn: 'list_len', args: [list], type: 'int' };
+  // Which rows start: those with elements, and the empty and NULL lists the options keep.
+  const starts: PlanExpr[] = [cmp('cmp_gt', length, { k: 'lit', value: 0, type: 'int' })];
+  if (op.emptyAsNull) starts.push(cmp('cmp_eq', length, { k: 'lit', value: 0, type: 'int' }));
+  if (op.keepNulls !== false) starts.push({ k: 'isNull', arg: list, not: false });
+  const anyOf = starts.reduce((x, y): PlanExpr => ({ k: 'or', args: [x, y] }));
+  const first: PlanOp = { op: 'filter', input: numbered(op.input), pred: anyOf };
+  const init: PlanOp = { op: 'project', input: first, exprs: [...range(0, w + 1), { k: 'lit', value: 0, type: 'int' }] };
+  const types: PlanType[] = [...Array.from({ length: w }, (_, i): PlanType => (i === op.column ? op.type : 'any')), 'int', 'int'];
+  const within: PlanExpr = cmp('cmp_lt', next, { k: 'call', fn: 'list_len', args: [list], type: 'int' });
+  const step: PlanOp = { op: 'project', input: { op: 'filter', input: { op: 'working', id, types }, pred: within }, exprs: [...range(0, w + 1), next] };
+  const rows: PlanOp = { op: 'iterate', id, name: 'explode', init, steps: [step], distinct: false, collations: types.map(() => 'binary') };
+  const key = (e: PlanExpr): SortKey => ({ expr: e, desc: false, nullsFirst: true, collation: 'binary' });
+  const sorted: PlanOp = { op: 'sort', input: rows, keys: [key(column(w, 'int')), key(pos)] };
+  const exprs = range(0, w).map((e, i): PlanExpr => (i === op.column ? { k: 'call', fn: 'list_get', args: [list, pos], type: element } : e));
+  return { op: 'project', input: sorted, exprs: op.position ? [...exprs, pos] : exprs, ...(op.origin !== undefined ? { origin: op.origin } : {}) };
 }
 
 /**

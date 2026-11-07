@@ -138,6 +138,19 @@ export const pivot = (input: PlanOp, keys: readonly PlanExpr[], on: PlanExpr, va
  * `input`'s `columns` as rows (a long form): each input row gives one row per column, in input order and then the
  * columns' order, with the `keep` columns, the column's name (from `names`) and its value (of `type`).
  */
+/**
+ * One row per element of list column `column` (typed `type`, a list type; ADR 0020). `position` adds the element's
+ * position; `emptyAsNull` gives an empty list a NULL row; `keepNulls: false` drops NULL lists.
+ */
+export const explode = (input: PlanOp, column: number, type: PlanType, options: { position?: boolean; emptyAsNull?: boolean; keepNulls?: boolean } = {}): Op<'explode'> => ({
+  op: 'explode',
+  input,
+  column,
+  type,
+  ...(options.position ? { position: true } : {}),
+  ...(options.emptyAsNull ? { emptyAsNull: true } : {}),
+  ...(options.keepNulls === false ? { keepNulls: false } : {}),
+});
 export const unpivot = (input: PlanOp, keep: readonly number[], columns: readonly number[], names: readonly string[], type: PlanType = 'any'): Op<'unpivot'> => ({ op: 'unpivot', input, keep, columns, names, type });
 /** Distinct rows of an input with `width` columns. */
 export const distinct = (input: PlanOp, width: number, collations?: readonly CollationName[], options: { ordered?: 'first'; on?: readonly number[]; keep?: 'first' | 'last' } = {}): Op<'distinct'> => ({

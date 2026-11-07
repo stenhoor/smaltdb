@@ -6,6 +6,7 @@
 import { typeOf } from './expr.js';
 import type { PlanOp } from './ops.js';
 import type { PlanType } from './types.js';
+import { parseNested } from '../../shared/nested-types.js';
 
 /** A table's column plan types, by name and schema; undefined when there is no such table. */
 export type TableTypes = (table: string, db?: 'main' | 'temp') => readonly PlanType[] | undefined;
@@ -43,6 +44,12 @@ export function outputTypes(op: PlanOp, tableTypes: TableTypes): PlanType[] {
     }
     case 'pivot':
       return [...op.keys.map((k) => typeOf(k.expr)), ...op.values.flatMap(() => op.aggs.map((a) => a.type))];
+    case 'explode': {
+      const t = outputTypes(op.input, tableTypes).slice();
+      const n = parseNested(op.type);
+      t[op.column] = n && n.kind === 'list' ? (n.of as PlanType) : 'any';
+      return op.position ? [...t, 'int'] : t;
+    }
     case 'unpivot': {
       const t = outputTypes(op.input, tableTypes);
       return [...op.keep.map((i) => t[i]), 'text', op.type];
