@@ -78,7 +78,8 @@ knows a value is a `bool` from its static type. It already tracks whether an int
 - A `ColumnDef` may say `type: 'BOOLEAN'`. Its plan type is `bool`.
 - Its values are stored as INTEGER values are: fixed int64 in rows, and the integer encodings in columnar chunks and
   index keys.
-- Writing into it accepts 0, 1 and NULL; any other value is an error (`SMALT_MISMATCH`).
+- Writing into it accepts 0, 1 and NULL; any other value is an error (`SMALT_CONSTRAINT_DATATYPE`, as for every
+  strict column; this record first said `SMALT_MISMATCH`).
 - A `bool` written to an `ANY` or `NUMERIC` column is stored as an integer and reads back as `int`. A value carries
   no type of its own: this is the cost of the static representation, and is documented.
 - smaltql's declared-type mapping (`BOOLEAN` → NUMERIC, as in SQLite) doesn't change. `BOOLEAN` storage is for tables

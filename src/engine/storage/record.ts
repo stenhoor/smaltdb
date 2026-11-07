@@ -15,7 +15,8 @@ import { type SqlValue, normalizeInt } from '../values.js';
  * others. All multi-byte fields are little-endian.
  */
 
-export type StorageType = 'INTEGER' | 'REAL' | 'TEXT' | 'BLOB' | 'ANY' | 'NUMERIC';
+/** `BOOLEAN` (ADR 0018) holds 0 and 1, stored as an INTEGER is. */
+export type StorageType = 'INTEGER' | 'BOOLEAN' | 'REAL' | 'TEXT' | 'BLOB' | 'ANY' | 'NUMERIC';
 
 const TAG_INT = 1;
 const TAG_REAL = 2;
@@ -30,7 +31,7 @@ const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
 function isFixed(t: StorageType): boolean {
-  return t === 'INTEGER' || t === 'REAL';
+  return t === 'INTEGER' || t === 'BOOLEAN' || t === 'REAL';
 }
 
 interface PartialLayout {
@@ -133,7 +134,7 @@ export class RecordEncoder {
         if (!layout.fixed[i]) this.varEnds[L.slot[i]] = pos - varDataStart;
         continue;
       }
-      if (t === 'INTEGER') {
+      if (t === 'INTEGER' || t === 'BOOLEAN') {
         writeInt64(dv, fixedStart + L.slot[i], v as number | bigint);
       } else if (t === 'REAL') {
         dv.setFloat64(fixedStart + L.slot[i], typeof v === 'bigint' ? Number(v) : (v as number), true);
@@ -317,7 +318,7 @@ export class RecordReader {
     if (b[bitmapStart + (i >>> 3)] & (1 << (i & 7))) return null;
     const t = this.layout.types[i];
     const slot = this.part.slot[i];
-    if (t === 'INTEGER') return readInt64(this.dv, this.fixedStart + slot);
+    if (t === 'INTEGER' || t === 'BOOLEAN') return readInt64(this.dv, this.fixedStart + slot);
     if (t === 'REAL') return this.dv.getFloat64(this.fixedStart + slot, true);
     const end = this.varDataStart + this.varEnd(slot);
     const start = slot === 0 ? this.varDataStart : this.varDataStart + this.varEnd(slot - 1);
@@ -341,7 +342,7 @@ export class RecordReader {
   isStoredReal(i: number): boolean {
     const t = this.layout.types[i];
     if (t === 'REAL') return !this.isNull(i);
-    if (t === 'INTEGER' || t === 'TEXT' || t === 'BLOB' || i >= this.n || this.isNull(i)) return false;
+    if (t === 'INTEGER' || t === 'BOOLEAN' || t === 'TEXT' || t === 'BLOB' || i >= this.n || this.isNull(i)) return false;
     const slot = this.part.slot[i];
     const start = slot === 0 ? this.varDataStart : this.varDataStart + this.varEnd(slot - 1);
     return this.b[start] === TAG_REAL;

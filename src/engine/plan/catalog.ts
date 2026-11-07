@@ -181,6 +181,8 @@ export function planTypeOfStorage(t: StorageType): PlanType {
   switch (t) {
     case 'INTEGER':
       return 'int';
+    case 'BOOLEAN':
+      return 'bool';
     case 'REAL':
       return 'real';
     case 'TEXT':
@@ -200,6 +202,7 @@ export function planTypeOfStorage(t: StorageType): PlanType {
 export function affinityOfStorage(t: StorageType): 'INTEGER' | 'REAL' | 'NUMERIC' | 'TEXT' | 'BLOB' {
   switch (t) {
     case 'INTEGER':
+    case 'BOOLEAN':
       return 'INTEGER';
     case 'REAL':
       return 'REAL';

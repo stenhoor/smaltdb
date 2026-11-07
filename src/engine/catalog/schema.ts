@@ -256,6 +256,11 @@ export function coerceForColumn(v: SqlValue, col: ColumnSchema, table: string, i
       }
       break;
     }
+    case 'BOOLEAN':
+      // 0 and 1 only (ADR 0018): a bool's values. A JS boolean (a parameter) is its number.
+      if (v === 0 || v === 1 || v === 0n || v === 1n) return Number(v);
+      if ((v as unknown) === true || (v as unknown) === false) return v ? 1 : 0;
+      break;
     case 'REAL': {
       if (typeof v === 'number') return v;
       if (typeof v === 'bigint') return Number(v);

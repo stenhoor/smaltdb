@@ -27,7 +27,8 @@ export interface DefaultDef extends ExprDef {
 }
 
 /** How values are stored: SQLite's type affinities, strictly (smaltdb tables are STRICT). */
-export type StorageType = 'INTEGER' | 'REAL' | 'TEXT' | 'BLOB' | 'ANY' | 'NUMERIC';
+/** `BOOLEAN` (ADR 0018) holds 0 and 1; its plan type is `bool`. */
+export type StorageType = 'INTEGER' | 'BOOLEAN' | 'REAL' | 'TEXT' | 'BLOB' | 'ANY' | 'NUMERIC';
 
 export interface ColumnDef {
   readonly name: string;

@@ -5067,6 +5067,8 @@ function fitsStorage(v: SqlValue, t: string): boolean {
   switch (t) {
     case 'INTEGER':
       return typeof v === 'bigint' || (typeof v === 'number' && Number.isInteger(v));
+    case 'BOOLEAN':
+      return v === 0 || v === 1;
     case 'REAL':
       return typeof v === 'number';
     case 'TEXT':

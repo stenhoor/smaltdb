@@ -886,7 +886,7 @@ class Validator {
 
 // ------------------------------------------------------------------ schema operations
 
-const STORAGE_TYPES = new Set(['INTEGER', 'REAL', 'TEXT', 'BLOB', 'ANY', 'NUMERIC']);
+const STORAGE_TYPES = new Set(['INTEGER', 'BOOLEAN', 'REAL', 'TEXT', 'BLOB', 'ANY', 'NUMERIC']);
 const FK_ACTIONS = new Set(['SET NULL', 'SET DEFAULT', 'CASCADE', 'RESTRICT', 'NO ACTION']);
 const DROP_OBJECTS = new Set(['table', 'index', 'view', 'materialized view', 'trigger', 'external table', 'connection']);
 const SCHEMA_OPS = new Set(['createTable', 'createIndex', 'createView', 'createConnection', 'createExternalTable', 'drop', 'alterTable']);

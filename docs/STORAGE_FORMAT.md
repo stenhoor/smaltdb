@@ -75,6 +75,7 @@
   - A slot directory sits at the page tail and the cells grow from the head. Records are found by binary search on the slot directory.
   - **Record format**: a null bitmap, then fixed-width columns at fixed offsets, then a variable-width offset table, then variable data.
     Unlike SQLite's varint serial types, fixed offsets let the executor decode a single column without parsing the whole record.
+    INTEGER, BOOLEAN (0 and 1, ADR 0018) and REAL columns are fixed-width (8 bytes); a BOOLEAN is stored as an INTEGER is.
   - Records carry the schema version so `ALTER TABLE ADD COLUMN` can be lazy.
 - Interior pages store **suffix-truncated** separator keys: the shortest prefix that separates two leaves.
 - **Leaf sibling pointers** support fast range scans in both directions.
