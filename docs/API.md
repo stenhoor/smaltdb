@@ -117,7 +117,7 @@ In-process (`smaltdb/engine`, Node and tests), statements over external data run
 `registerCredentials` (whose `headers` may be a function of the URL, sync or async) and `setFetch(fetchFn)` to replace
 the transport. `exportCSVAsync` / `exportJSONAsync` export queries over external data.
 
-Imports run as one prepared INSERT, in one transaction (or in a savepoint inside the caller's). Every constraint, type
+Imports run as one prepared plan that appends the rows, in one transaction (or in a savepoint inside the caller's); a table that `create` makes has no source text. `exportCSV` / `exportJSON` also take a plan statement in place of `sql`. Every constraint, type
 conversion and foreign key applies. On error the import is rolled back, including a table that `create` made, and the message names the CSV line or
-JSON item (`CSV line 3: NOT NULL constraint failed: t.v`). The same functions are exported from `smaltdb/engine`
+JSON item (`CSV line 3: t.v must not be null`). The same functions are exported from `smaltdb/engine`
 for direct use (`importCSV(db, table, text, opts)`, …).

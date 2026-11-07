@@ -208,7 +208,7 @@ await importCSV(db, 'people', 'name,age\nAnn,31\n', { create: true });
 console.log(await exportCSV(db, 'SELECT name, age FROM people')); // 'name,age\nAnn,31\n'
 ```
 
-Exports over external data fetch their sources first. The options and output rules are in [import and export](https://stenhoor.github.io/smaltql/guide/import-export).
+Import and export need no language: import writes through plans, and export takes a plan statement in place of the SQL query (`exportCSV(db, { kind: 'query', plan, columns })`). Exports over external data fetch their sources first. The options and output rules are in [import and export](https://stenhoor.github.io/smaltql/guide/import-export).
 
 ## VFS
 
