@@ -82,7 +82,8 @@ describe('a language provides what it uses', () => {
     d.exec('CREATE TABLE t(a INT)');
     run(d, view('v', { table: 't', columns: ['a'] }, 'bare'));
     expect(() => d.queryPlan(p.scan('v', [0]))).toThrow(/the bare language does not bind views/);
-    expect(() => d.query("SELECT view_definition FROM information_schema.views")).toThrow(/the bare language does not describe views/);
+    // A language that does not describe views leaves view_definition empty; the rest of the catalog still reads.
+    expect(d.query("SELECT table_name, view_definition FROM information_schema.views").rows).toEqual([['v', null]]);
     // ALTER TABLE edits every object's text, each by its language: one without an editor stops it.
     expect(() => d.exec('ALTER TABLE t RENAME TO t2')).toThrow(/the bare language does not edit its objects' source text/);
     d.exec('DROP VIEW v');

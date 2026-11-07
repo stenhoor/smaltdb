@@ -114,8 +114,8 @@ interior cell:  u32 child | u16 keyLen | key
   columns, partial WHERE) are in `exprs`, a JSON array, with their SQL metadata as `$sql` fields (`plan/codec.ts`); the
   definition refers to each by its position (`"x": 0`) beside its text. Integers beyond JSON's range, blobs and
   non-finite reals are tagged objects (`{"$bigint": "…"}`, `{"$blob": "hex"}`, `{"$real": "Infinity"}`). A key, CHECK
-  or foreign key declared on a column records it (`"ofColumn": 2`): DROP COLUMN drops it with the column. A table or
-  index whose source is not SQL records its language (`"language"`). An object defined without source text records
+  or foreign key declared on a column records it (`"ofColumn": 2`): DROP COLUMN drops it with the column. A table,
+  index, external table or connection whose source is not SQL records its language (`"language"`). An object defined without source text records
   `"described": true`, and its `smalt_schema.sql` is the engine's description of the definition (the definition as JSON,
   each expression as its text) rather than a language's statement. The table is not in the catalog, so
   `sqlite_schema` does not list it. A definition of another version is refused with `SMALT_FORMAT`.

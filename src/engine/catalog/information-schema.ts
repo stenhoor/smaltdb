@@ -9,9 +9,9 @@ import type { IndexSchema, TableSchema } from './schema.js';
 export interface CatalogSnapshot {
   tables: TableSchema[];
   /** Views: name, CREATE VIEW text, and the text of its query alone (view_definition). */
-  /** The text of a view's or materialized view's query alone, from its source. */
-  definition(source: { language: string; text: string }): string;
-  views: { name: string; sql: string; definition: string }[];
+  /** The text of a view's or materialized view's query alone, from its source; null when its language cannot give it (not registered here, or it does not describe views). */
+  definition(source: { language: string; text: string }): string | null;
+  views: { name: string; sql: string; definition: string | null }[];
   /** Result columns of a view (null when the view cannot be resolved, e.g. a dropped table). */
   viewColumns(name: string): { name: string; declType: string }[] | null;
   functions: { name: string; kind: 'FUNCTION' | 'AGGREGATE'; deterministic: boolean }[];

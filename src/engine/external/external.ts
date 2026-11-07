@@ -74,7 +74,7 @@ export interface ExternalData {
 /** Thrown when a statement needs external data that has not been loaded (run it with queryAsync / execAsync). */
 export class AsyncRequiredError extends SmaltError {
   constructor(readonly sources: ExternalSource[]) {
-    super('SMALT_ASYNC_REQUIRED', `statement reads external data (${sources.map((s) => s.label).join(', ')}): run it with queryAsync / execAsync, or through the worker client`);
+    super('SMALT_ASYNC_REQUIRED', `statement reads external data (${sources.map((s) => s.label).join(', ')}): run it with queryAsync / execAsync (queryPlanAsync for a plan), or through the worker client`);
     this.name = 'AsyncRequiredError';
   }
 }

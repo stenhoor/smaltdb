@@ -109,6 +109,8 @@ export class EngineServer {
   private readonly queue: Job[] = [];
   private readonly streams: Stream[] = [];
   private readonly statements = new Map<number, PreparedStatement>();
+  /** Statements prepared from plans that carry no data, with their plan text: a reader can run them as a plan request. */
+  private readonly preparedPlans = new WeakMap<PreparedStatement, { plan: string; planVersion: number }>();
   private nextStmt = 1;
   private txOwner: string | null = null;
   /** Sessions whose transaction a request of theirs ended (COMMIT or ROLLBACK), until they ask with 'endTransaction'. */
@@ -512,6 +514,7 @@ export class EngineServer {
         const st = this.requireDb().preparePlan(planInput(req));
         const sid = this.nextStmt++;
         this.statements.set(sid, st);
+        if (!req.data) this.preparedPlans.set(st, { plan: req.plan, planVersion: req.planVersion });
         const columns = this.readsExternal(st) ? this.columnsIfKnown(st) : st.columns;
         this.send(session, { id, kind: 'ok', stmt: sid, columns, columnTypes: this.typesIfKnown(st, columns), paramCount: st.paramCount });
         return;
@@ -540,10 +543,11 @@ export class EngineServer {
       case 'stmtQuery': {
         const st = this.statement(req.stmt);
         if (this.readsExternal(st)) return this.queryExternal(session, st, req);
-        // Morsels for any query; a whole statement goes to a reader as SQL text or a plan request, so prepared plans
-        // stay on the owner.
+        // Morsels for any query; a whole statement goes to a reader as SQL text or as its plan (ADR 0017 re-review).
         if (this.toMorsels(session, st, req)) return;
-        if (st instanceof Statement && this.toReader(session, st, { id: req.id, op: 'query', sql: st.sql, params: req.params, batchSize: req.batchSize, credit: req.credit })) return;
+        const asPlan = this.preparedPlans.get(st);
+        const forReader = st instanceof Statement ? { op: 'query' as const, sql: st.sql } : asPlan ? { op: 'queryPlan' as const, ...asPlan } : null;
+        if (forReader && this.toReader(session, st, { id: req.id, ...forReader, params: req.params, batchSize: req.batchSize, credit: req.credit } as { id: number } & ReaderRequest)) return;
         this.startStream(session, id, st.cursor(req.params as BindParams | undefined), req.batchSize ?? 4096, req.credit);
         return;
       }

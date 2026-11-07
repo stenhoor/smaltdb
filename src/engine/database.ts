@@ -303,7 +303,8 @@ export class Database implements FunctionContext {
       while (pending.length > 0) {
         // Views over other pending memory views wait for those (dependency order, not catalog order).
         const waiting = new Set(pending.map((t) => t.name.toLowerCase()));
-        const ready = pending.filter((t) => ![...this.matviewDeps(t.matview!)].some((d) => d !== t.name.toLowerCase() && waiting.has(d)));
+        // A view whose language cannot name what it reads (not registered here) waits for nothing; filling it fails.
+        const ready = pending.filter((t) => ![...(this.matviewDeps(t.matview!) ?? [])].some((d) => d !== t.name.toLowerCase() && waiting.has(d)));
         const batch = ready.length > 0 ? ready : pending; // a cycle: try the rest anyway
         for (const t of batch) {
           try {
@@ -587,14 +588,32 @@ export class Database implements FunctionContext {
   /** @internal Whether a plan statement reads memory-resident objects (as {@link usesMemoryObjects} for SQL). */
   planUsesMemoryObjects(bound: BoundStatement): boolean {
     if (bound.kind === 'setting') return true;
-    if (this.tempTables.size === 0 && this.memViews.size === 0) return false;
+    if (this.tempTables.size === 0 && this.tempViews.size === 0 && this.memViews.size === 0) return false;
     const walk = (x: unknown): boolean => {
       if (Array.isArray(x)) return x.some(walk);
       if (!x || typeof x !== 'object') return false;
       const o = x as Record<string, unknown>;
       if (o.op === 'scan' && typeof o.table === 'string') {
-        const t = this.getTable(o.table, o.db as 'main' | 'temp' | undefined);
+        const db = o.db as 'main' | 'temp' | undefined;
+        const t = this.getTable(o.table, db);
         if (t && (t.temp || t.rootPage >= MEM_BASE)) return true;
+        // A view, read by name (ADR 0016 section 6): a TEMP one, or one that reads a memory object (as SQL text's
+        // recording context sees through views). A view whose language cannot say what it reads stays here too.
+        const v = t ? undefined : this.getView(o.table, db);
+        if (v) {
+          if (this.tempViews.get(v.name.toLowerCase()) === v) return true;
+          let deps: Set<string>;
+          try {
+            deps = this.sourceDeps(v.source);
+          } catch {
+            return true;
+          }
+          for (const d of deps) {
+            if (this.tempTables.has(d) || this.tempViews.has(d)) return true;
+            const r = this.tables.get(d);
+            if (r && r.rootPage >= MEM_BASE) return true;
+          }
+        }
       }
       for (const k in o) if (walk(o[k])) return true;
       return false;
@@ -915,12 +934,23 @@ export class Database implements FunctionContext {
     return out.sort((a, b) => a[0] - b[0]).map((x) => x[1]);
   }
 
+  /** A view's query alone, as its language writes it; null when the language cannot (one view must not hide the rest). */
+  private viewDefinition(source: Source): string | null {
+    const language = registeredLanguage(source.language);
+    if (!language?.viewDefinition) return null;
+    try {
+      return language.viewDefinition(source);
+    } catch {
+      return null;
+    }
+  }
+
   private catalogSnapshot(): CatalogSnapshot {
     for (const t of this.tables.values()) if (t.matview) this.matviewPolicy(t.matview);
     return {
       tables: [...this.tables.values(), ...this.shadowedMain.values()],
-      views: [...this.views.values()].map((v) => ({ name: v.name, sql: v.source.text, definition: languagePart(this.languageOf(v.source.language), 'viewDefinition')(v.source) })),
-      definition: (source) => languagePart(this.languageOf(source.language), 'viewDefinition')(source),
+      views: [...this.views.values()].map((v) => ({ name: v.name, sql: v.source.text, definition: this.viewDefinition(v.source) })),
+      definition: (source) => this.viewDefinition(source),
       viewColumns: (name) => {
         const v = this.views.get(name.toLowerCase());
         if (!v) return null;
@@ -1795,7 +1825,7 @@ export class Database implements FunctionContext {
     if (stmt.concurrently && !stmt.withData) throw new SmaltError('SMALT_ERROR', 'REFRESH ... CONCURRENTLY cannot be used with WITH NO DATA');
     if (stmt.ifChanged) {
       const changed = this.refreshDecisions.get(mv.name.toLowerCase());
-      if (changed === undefined) throw new SmaltError('SMALT_ASYNC_REQUIRED', `REFRESH … IF CHANGED checks the sources of ${mv.name}: run it with execAsync, or through the worker client`);
+      if (changed === undefined) throw new SmaltError('SMALT_ASYNC_REQUIRED', `REFRESH … IF CHANGED checks the sources of ${mv.name}: run it asynchronously (execAsync, or queryPlanAsync for a plan), or through the worker client`);
       if (!changed) return { changes: 0, lastInsertRowid: this.lastRowid };
     }
     const memory = mv.rootPage >= MEM_BASE;
@@ -2118,6 +2148,8 @@ export class Database implements FunctionContext {
       if (!m?.populated || !m.fresh) continue;
       // A TEMP table or view shadowing something the view read: the query's names mean the temp object.
       const deps = this.matviewDeps(m);
+      // Its language cannot say what it reads (not registered here): it cannot be matched.
+      if (!deps) continue;
       if ([...deps].some((d) => this.tempTables.has(d) || this.tempViews.has(d))) continue;
       // A view over the table the statement writes (INSERT … SELECT into its base table).
       if (exclude !== null && deps.has(exclude)) continue;
@@ -2658,9 +2690,17 @@ export class Database implements FunctionContext {
     return out;
   }
 
-  /** What a materialized view reads (cached until the names it reads change). */
-  private matviewDeps(m: MatViewInfo): Set<string> {
-    return (m.deps ??= this.sourceDeps({ language: m.language, text: m.sql }));
+  /**
+   * What a materialized view reads (cached until the names it reads change), or null when its language cannot say: the
+   * language is not registered here, or reads no views' references. Nothing that every statement runs may fail on that.
+   */
+  private matviewDeps(m: MatViewInfo): Set<string> | null {
+    if (m.deps) return m.deps;
+    try {
+      return (m.deps = this.sourceDeps({ language: m.language, text: m.sql }));
+    } catch {
+      return null; // not cached: the language may be registered later
+    }
   }
 
   /** A registered language, by name (plan/language.ts `registerLanguage`). */
@@ -2701,7 +2741,10 @@ export class Database implements FunctionContext {
     let changed = false;
     for (const t of this.matviewTables()) {
       const m = t.matview!;
-      if (!m.fresh || !this.matviewDeps(m).has(lower)) continue;
+      if (!m.fresh) continue;
+      // A view whose reads are unknown (its language is not registered here) may read anything: it goes stale.
+      const deps = this.matviewDeps(m);
+      if (deps && !deps.has(lower)) continue;
       m.fresh = false;
       this.writeMatviewMeta(t.name, { populated: m.populated, refreshedAt: m.refreshedAt, fresh: false });
       changed = true;
@@ -2836,7 +2879,8 @@ export class Database implements FunctionContext {
   // ---------------------------------------------------------------- connections and external tables (M8)
 
   private createConnection(stmt: Extract<SchemaOp, { op: 'createConnection' }>): RunResult {
-    const stored: StoredDef = { kind: 'connection', options: stmt.options, ...(stmt.source ? {} : { described: true as const }) };
+    // Its language, as other objects record theirs (SQL is the default), so ALTER TABLE asks the right one about its text.
+    const stored: StoredDef = { kind: 'connection', options: stmt.options, ...(stmt.source ? (stmt.source.language !== 'sql' ? { language: stmt.source.language } : {}) : { described: true as const }) };
     const sql = stmt.source?.text ?? describeDefinition(stored);
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const lower = stmt.name.toLowerCase();
@@ -3510,6 +3554,43 @@ export class Database implements FunctionContext {
     return languagePart(l, 'sourceEditor');
   }
 
+  /**
+   * The editor of an object's source text for a rename in `table`, or null when its text cannot mention `table`. A
+   * language with an editor is always asked, as before. An object whose language has none (or is not registered here)
+   * needs one only when it can mention the table: the table itself, a table whose foreign keys reference it, an index on
+   * it, or a view whose language names it among the view's references. A rename elsewhere leaves such objects as they are.
+   */
+  private editorFor(def: StoredDef | undefined, key: string, text: string, table: string): SourceEditor | null {
+    if (isDescribed(def)) return UNCHANGED_TEXT;
+    const name = def && 'language' in def && def.language !== undefined ? def.language : 'sql';
+    const language = registeredLanguage(name);
+    if (language?.sourceEditor) return language.sourceEditor;
+    const t = table.toLowerCase();
+    const mentions = ((): boolean => {
+      switch (def?.kind) {
+        case 'table':
+          return key === t || def.table.foreignKeys.some((f) => f.table.toLowerCase() === t);
+        case 'index':
+          return def.index.table.toLowerCase() === t;
+        case 'connection':
+        case 'external':
+          return false;
+        case 'view':
+        case 'matview': {
+          if (!language?.viewReferences) return true;
+          try {
+            return language.viewReferences({ language: name, text }).some((r) => r.name.toLowerCase() === t);
+          } catch {
+            return true;
+          }
+        }
+        default:
+          return true;
+      }
+    })();
+    return mentions ? this.sourceEditor(def) : null;
+  }
+
   /** Column names per table, for resolving references while editing source text. */
   private columnsOf = (name: string): ReadonlySet<string> | undefined => {
     const t = this.tables.get(name.toLowerCase());
@@ -3546,7 +3627,8 @@ export class Database implements FunctionContext {
     }
     change.rows = (row) => {
       const ownRow = isOld(row.tbl_name);
-      const sql = row.sql === null ? null : this.sourceEditor(defs.get(Database.rowKey(row))).renameTable(row.sql, old, newName, this.columnsOf);
+      const editor = row.sql === null ? null : this.editorFor(defs.get(Database.rowKey(row)), Database.rowKey(row), row.sql, old);
+      const sql = row.sql === null || !editor ? row.sql : editor.renameTable(row.sql, old, newName, this.columnsOf);
       const name = row.type === 'table' && ownRow ? newName : row.type === 'index' && row.name.toLowerCase().startsWith(autoPrefix) ? autoIndexName(newName, Number(row.name.slice(autoPrefix.length))) : undefined;
       if (sql === row.sql && !ownRow) return null;
       return { name, tbl_name: ownRow ? newName : undefined, sql };
@@ -3575,7 +3657,10 @@ export class Database implements FunctionContext {
         change.defs.set(key, { ...d, index: { ...i, columns: i.columns.map((c) => (c.expr ? { ...c, expr: text(c.expr) } : c)), ...(i.where ? { where: text(i.where) } : {}) } });
       }
     }
-    change.rows = (row) => (row.sql === null ? null : { sql: this.sourceEditor(defs.get(Database.rowKey(row))).renameColumn(row.sql, table.name, old, newName, this.columnsOf) });
+    change.rows = (row) => {
+      const editor = row.sql === null ? null : this.editorFor(defs.get(Database.rowKey(row)), Database.rowKey(row), row.sql, table.name);
+      return row.sql === null || !editor ? null : { sql: editor.renameColumn(row.sql, table.name, old, newName, this.columnsOf) };
+    };
   }
 
   private hasRows(table: TableSchema): boolean {

@@ -1,6 +1,7 @@
 # ADR 0017: The remaining SQL dependencies in the engine, client and plugins
 
-- **Status:** proposed
+- **Status:** done: accepted with #131; steps 2–4 in #132, stenhoor/smaltdb-io#3, #133 and stenhoor/smaltql#16; the re-review's
+  findings fixed with the record below
 - **Date:** 2026-11-07
 - **Builds on:** [ADR 0015](0015-smaltql.md) (the engine carries no language), [ADR 0016](0016-plan-api-for-every-language.md)
   (the plan API for every language)
@@ -113,3 +114,58 @@ Each step is one PR into `main`, opened after the one before it has merged: no P
 - **Plugin API v1 is unchanged;** `@smaltdb/io` gains plan-based export alongside its SQL forms.
 - **ADR 0016's no-language check was narrower than it read:** this record's re-review step is the check it should have
   had.
+
+## Re-review (step 5)
+
+Done on `main` after steps 2–4 had merged (smaltdb `f95a3e4`, `@smaltdb/io` `1b6e4fc`, smaltql `0c539c6`), by the three
+methods the order of work names.
+
+- **The review repeated from the start.** Every path in the engine, client, worker server and runtime, and the two pinned plugins that names
+  SQL, runs text, or defaults a language was read again, and the doubtful ones were probed with no language registered.
+- **An independent reviewer.** A separate agent was given only the goal ("find any code in the engine, client, worker or
+  plugins that depends on SQL or smaltql") and the scope rules of [Not dependencies](#not-dependencies), and was told not to read this record or the git history. It probed its
+  findings itself, writing a file with a stand-in language named `sql` in one module instance and reopening it in a
+  fresh one with nothing registered.
+- **The no-SQL project and the gates, rerun:** `npm run check` (with the no-SQL project), `SMALT_NO_CODEGEN=1`,
+  `SMALT_PLAN_ROUNDTRIP=1`, the browser tests on Chromium, and smaltql's suite and `npm run slt` (122,333 / 122,334)
+  against this checkout.
+
+### What it found
+
+The first review checked statements run as plans, but not objects in a file whose language is missing, or made by a
+language without some parts. The independent reviewer found most of these; the repeated review found only 5, 6 and the error messages. Finding 1 was the worst.
+
+| # | Dependency | Where | Effect | Fix |
+|---|---|---|---|---|
+| 1 | Reopening a file rebuilds memory materialized views in dependency order, and asks each view's language what it reads, outside the guard around the rebuild | `database.ts` (`rebuildMemoryViews`, `matviewDeps`) | A file with one memory materialized view written in SQL could not be opened without smaltql | `matviewDeps` says "unknown" when the language cannot answer; such a view waits for nothing, and stays unpopulated |
+| 2 | Every write asks each fresh materialized view's language what it reads, to mark it stale; rewriting queries from views does the same | `database.ts` (`touchName`, `matviewRewritePlan`) | With one fresh SQL materialized view in the file, every write and DROP failed without smaltql, as would every query with `matview_rewrite` | A view whose reads are unknown goes stale on any write, and is not used to answer queries |
+| 3 | `information_schema` asks every view's language for its definition up front, whichever of its views is read (also while a plan is validated) | `database.ts` (`catalogSnapshot`) | One view in a missing language, or in a language without `viewDefinition`, made every `information_schema` view fail | `view_definition` is null for such a view |
+| 4 | A connection did not record its language, and ALTER TABLE takes a missing language to mean SQL | `database.ts` (`createConnection`), `catalog/stored.ts` | With a connection created in another language, renaming any table asked for SQL | Connections record their language, as other objects do |
+| 5 | Renaming a table or column asks every object's language to edit its text | `database.ts` (`renameTableDefs`, `renameColumnDefs`) | A view in a language without a source editor blocked every rename in the database, even of tables it does not read | A language with an editor is asked as before. An object without one is asked only when it can mention the table: the table itself, its foreign keys, an index on it, or a view whose language names the table among its references. Without its language, nothing can say what an object reads, so the rename fails with the clear error, as before |
+| 6 | Statements prepared from plans were never handed to reader workers; statements prepared from SQL text were | `server.ts` (`stmtQuery`) | Concurrent prepared plan queries ran on the owner only | A statement prepared from a plan with no data goes to a reader as a plan request |
+| 7 | Whether a plan reads memory objects looked only at scans of tables, not views read by name | `database.ts` (`planUsesMemoryObjects`) | A plan over a TEMP view, or a view over a memory materialized view, could be sent to a reader, which cannot see those objects | Views are followed to what they read; a view whose reads are unknown keeps the plan on the owner |
+
+Two error messages told plan users to call text methods only (`REFRESH … IF CHANGED` and external data: "run it with
+execAsync"); they now name `queryPlanAsync` too.
+
+`test/no-sql/missing-language.test.ts` covers each finding. With the fixes undone, all seven of its tests for them fail. One more
+test checks that a rename still fails clearly when a view's language is missing. `test/language-parts.test.ts`
+expected the old effect of finding 3 and now expects a null `view_definition`.
+
+### Not changed
+
+- **Engine error messages use SQL's words** ("PRAGMA compact needs a columnar table", "DROP … is not supported", "ALTER
+  TABLE is not supported for TEMP table"). They are wording, not dependencies: the statements run, and a language may
+  word errors itself (ADR 0016 section 10). A rewording of the engine's own messages in no language's terms is left for
+  its own change.
+- **Objects whose language is missing** cannot be read, refreshed or edited. That needs the language by design. What
+  changed is that nothing else does.
+
+### Mistakes in this record's own work
+
+- During step 2, a browser-test run's exit code was read through `tail`, and a pass was reported that CI then showed to be a failure
+  (readers refused EXPLAIN). Exit codes are now read from the command itself.
+- smaltdb's `main` stayed green with a smaltql pin that no longer built against it (it predated smaltql#14). CI reused a cached build of
+  the pin until a change to `packed.json` changed the cache key (#133). A pin that cannot build should fail on the
+  change that breaks it: CI's cache of packed builds should be keyed on the commit of smaltdb as well. That change is left for its own PR.
+

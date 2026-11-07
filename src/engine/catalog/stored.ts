@@ -30,7 +30,7 @@ export type StoredDef =
   | { readonly kind: 'view'; readonly language: string; readonly columns?: readonly string[] }
   /** A materialized view; the table its rows are stored in is in `smalt_matview` (its layout). */
   | { readonly kind: 'matview'; readonly language: string; readonly columns?: readonly string[]; readonly options: Readonly<Record<string, SqlValue>> }
-  | { readonly kind: 'connection'; readonly options: Readonly<Record<string, SqlValue>>; readonly described?: true }
+  | { readonly kind: 'connection'; readonly options: Readonly<Record<string, SqlValue>>; readonly language?: string; readonly described?: true }
   | { readonly kind: 'external'; readonly columns: readonly { readonly name: string; readonly declaredType: string }[]; readonly options: Readonly<Record<string, SqlValue>>; readonly language?: string; readonly described?: true };
 
 /** Whether `def` was defined without source text: its catalog text is {@link describeDefinition}'s. */
