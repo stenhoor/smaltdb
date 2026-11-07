@@ -30,7 +30,7 @@ import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from '.
 import { type PlanMorsels, planMorsels } from './exec/plan-morsel.js';
 import type { BoundQuery, BoundStatement, BoundTransaction, BoundWrite } from './plan/bound.js';
 import type { AlterAction, ColumnDef as ColumnDefinition, ExprDef, SchemaOp, Source, SourceEditor, TableDef } from './plan/schema.js';
-import { SYSTEM_TABLES, type StoredDef, type StoredText, type SystemTableName, decodeDef, describeDefinition, encodeDef, isDescribed, isSystemTable, systemTableSql } from './catalog/stored.js';
+import { SYSTEM_TABLES, type StoredDef, type StoredText, type SystemTableName, decodeDef, describeDefinition, encodeDef, isDescribed, isSystemTable, systemTableText } from './catalog/stored.js';
 import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
@@ -127,6 +127,9 @@ interface ExternalTableDef {
   columns: ExternalColumn[];
   options: Record<string, SqlValue>;
   sql: string;
+  /** The language of its text (absent: SQL), or that it was defined without source text (ADR 0016 section 6). */
+  language?: string;
+  described?: boolean;
 }
 
 /** For formats that read only what they need (Parquet), the source of its schema only (the footer): what planning and column inference need. */
@@ -629,18 +632,9 @@ export class Database implements FunctionContext {
     }
   }
 
-  /** `withExternal` for the async API; `REFRESH … IF CHANGED` first checks its view's sources. */
-  private async runExternal<T>(signal: AbortSignal | undefined, st: Statement, run: () => T): Promise<T> {
-    const view = refreshIfChanged(st);
-    if (view === null) return this.withExternal(signal, st, run);
-    // Revalidate the view's sources first (HEAD requests, stats): the refresh runs only if needed.
-    const key = view.toLowerCase();
-    this.refreshDecisions.set(key, await this.matviewChanged(view, signal));
-    try {
-      return await this.withExternal(signal, st, run);
-    } finally {
-      this.refreshDecisions.delete(key);
-    }
+  /** `withExternal` for the async text API. */
+  private runExternal<T>(signal: AbortSignal | undefined, st: Statement, run: () => T): Promise<T> {
+    return this.withExternal(signal, st, run);
   }
 
   /**
@@ -650,6 +644,20 @@ export class Database implements FunctionContext {
    */
   /** @internal (also used by the export functions) */
   async withExternal<T>(signal: AbortSignal | undefined, st: PreparedStatement, run: () => T): Promise<T> {
+    // `REFRESH … IF CHANGED`, in any language or as a plan: revalidate the view's sources first (HEAD requests,
+    // stats), so that the refresh runs only if needed.
+    const view = refreshIfChanged(st);
+    if (view === null) return this.loadAndRun(signal, st, run);
+    const key = view.toLowerCase();
+    this.refreshDecisions.set(key, await this.matviewChanged(view, signal));
+    try {
+      return await this.loadAndRun(signal, st, run);
+    } finally {
+      this.refreshDecisions.delete(key);
+    }
+  }
+
+  private async loadAndRun<T>(signal: AbortSignal | undefined, st: PreparedStatement, run: () => T): Promise<T> {
     const held = new Set<string>();
     const load = async (sources: ExternalSource[]): Promise<boolean> => {
       const need = sources.filter((s) => !held.has(s.key));
@@ -989,7 +997,7 @@ export class Database implements FunctionContext {
     this.connections.clear();
     this.externals.clear();
     this.catalogEntries.clear();
-    this.catalogTable = { ...tableSchemaFromDef(SYSTEM_TABLES.smalt_schema, systemTableSql('smalt_schema'), this.pager.catalogRoot).table, system: true };
+    this.catalogTable = { ...tableSchemaFromDef(SYSTEM_TABLES.smalt_schema, systemTableText('smalt_schema'), this.pager.catalogRoot).table, system: true };
     // Opening parses nothing: objects are read from their stored definitions (catalog/stored.ts).
     const rows = this.scanCatalog();
     const defs = this.scanDefinitions();
@@ -1013,7 +1021,7 @@ export class Database implements FunctionContext {
       this.catalogEntries.set(r.name.toLowerCase(), { type: r.type as CatalogEntry['type'], name: r.name, rowid: r.rowid });
       if (r.type === 'external') {
         const x = def(r.name.toLowerCase(), 'external');
-        this.externals.set(r.name.toLowerCase(), { name: r.name, columns: x.columns.map((c) => ({ name: c.name, declType: c.declaredType })), options: { ...x.options }, sql: r.sql! });
+        this.externals.set(r.name.toLowerCase(), { name: r.name, columns: x.columns.map((c) => ({ name: c.name, declType: c.declaredType })), options: { ...x.options }, sql: r.sql!, ...(x.language !== undefined ? { language: x.language } : {}), ...(isDescribed(x) ? { described: true } : {}) });
         continue;
       }
       if (r.type === 'view') {
@@ -1026,7 +1034,10 @@ export class Database implements FunctionContext {
       const t = stored ? stored.table : SYSTEM_TABLES[r.name.toLowerCase() as SystemTableName];
       if (t.storage === 'columnar') columnarTables.add(r.name.toLowerCase());
       const { table, implicitIndexes } = tableSchemaFromDef(t, r.sql!, r.rootpage);
-      if (isSystemTable(r.name)) table.system = true;
+      if (isSystemTable(r.name)) {
+        table.system = true;
+        table.described = true; // defined in code: its text, old or new, is never a language's to edit
+      }
       if (stored?.language !== undefined && stored.language !== 'sql') table.language = stored.language;
       if (isDescribed(stored)) table.described = true;
       implicitIndexes.forEach((spec, i) => {
@@ -1145,7 +1156,7 @@ export class Database implements FunctionContext {
   /** The definitions table's schema (its tree is created with the database). */
   private definitionTable(): TableSchema {
     const root = this.pager.definitionRoot;
-    if (this.defTable?.rootPage !== root) this.defTable = { ...tableSchemaFromDef(SYSTEM_TABLES.smalt_definition, systemTableSql('smalt_definition'), root).table, system: true };
+    if (this.defTable?.rootPage !== root) this.defTable = { ...tableSchemaFromDef(SYSTEM_TABLES.smalt_definition, systemTableText('smalt_definition'), root).table, system: true };
     return this.defTable;
   }
 
@@ -1437,7 +1448,8 @@ export class Database implements FunctionContext {
     const regs = new Registers(paramCount);
     const planner = new Planner(this.plannerDeps(this.rewritePolicy(bound)), regs);
     planner.sqlText = text;
-    const done = (p: Omit<Program, 'regCount'>): Program => ({ ...p, regCount: regs.count, rowAssumptions: planner.rowAssumptions, externals: planner.finishExternals() });
+    // Every program records what it compiles: statements given as plans and as a language's text alike.
+    const done = (p: Omit<Program, 'regCount'>): Program => ({ ...p, bound: given, regCount: regs.count, rowAssumptions: planner.rowAssumptions, externals: planner.finishExternals() });
     switch (bound.kind) {
       case 'query': {
         const plan = this.planQuery(bound, planner);
@@ -1759,7 +1771,7 @@ export class Database implements FunctionContext {
       this.createTable(systemTableOp('smalt_matview'), true);
     }
     const root = this.createTree(inMemory);
-    const { table } = tableSchemaFromDef(layout, layoutSql(layout), root);
+    const { table } = tableSchemaFromDef(layout, layoutText(layout), root);
     table.matview = { sql, language: stmt.source.language, storage, options: { ...opts }, populated: false, refreshedAt: null };
     // A memory-resident view's root is assigned at runtime: the catalog records a marker.
     this.addCatalogRow('matview', table.name, table.name, inMemory ? MEM_BASE : root, sql, undefined, { kind: 'matview', language: stmt.source.language, ...(stmt.columns ? { columns: stmt.columns } : {}), options: stmt.options ?? {} });
@@ -2159,6 +2171,36 @@ export class Database implements FunctionContext {
   /** Partial rows being merged: the `smalt_partials()` source of the merge plan. */
   private morsel: { rows: SqlValue[][]; keys: number; width: number; types: StaticType[] } | null = null;
 
+  /** A query as partial aggregates over rowid ranges and their merge, in any language or given as a plan; or null. */
+  private morselOf(st: PreparedStatement | string): MorselEntry | null {
+    if (typeof st === 'string') return this.morselQuery(st);
+    if (st instanceof Statement) return this.morselQuery(st.sql);
+    if (!(st instanceof PlanStatement) || st.bound.kind !== 'query') return null;
+    const hit = this.planMorsels.get(st);
+    if (hit !== undefined && hit.version === this.schemaVersion) return hit.entry;
+    let entry: MorselEntry | null = null;
+    try {
+      const bound = this.boundWithViews(st.bound);
+      if (bound.kind === 'query') {
+        const q = planMorsels(bound.plan, st.paramCount, (name, db) => this.morselTable(name, db));
+        if (q) entry = { version: this.schemaVersion, parsed: { paramCount: st.paramCount, paramNames: new Map() }, plan: bound.plan, columns: bound.columns, q, partial: encodePlan(q.partial), key: `${this.schemaVersion}:plan:${++this.planMorselIds}` };
+      }
+    } catch {
+      entry = null; // let the normal path report the error
+    }
+    this.planMorsels.set(st, { version: this.schemaVersion, entry });
+    return entry;
+  }
+
+  private readonly planMorsels = new WeakMap<PlanStatement, { version: number; entry: MorselEntry | null }>();
+  private planMorselIds = 0;
+
+  /** Whether readers can scan `name` for a morsel: they open the file, so memory objects and system tables stay here. */
+  private morselTable(name: string, db?: 'main' | 'temp'): boolean {
+    const t = this.getTable(name, db);
+    return !!t && !t.temp && !t.system && t.rootPage < MEM_BASE && !(t.matview && !t.matview.populated);
+  }
+
   /** `sql` as partial aggregates over rowid ranges and their merge (exec/plan-morsel.ts), or null. */
   private morselQuery(sql: string): MorselEntry | null {
     const hit = this.morselCache.get(sql);
@@ -2173,11 +2215,7 @@ export class Database implements FunctionContext {
       const parsed = this.parseOneSql(sql);
       const fe = this.receivedBound(parsed.bind(this.bindContext()));
       if (fe.kind === 'query') {
-        const q = planMorsels(fe.plan, parsed.paramCount, (name, db) => {
-          const t = this.getTable(name, db);
-          // Readers open the file: memory-resident objects and system tables stay on the owner.
-          return !!t && !t.temp && !t.system && t.rootPage < MEM_BASE && !(t.matview && !t.matview.populated);
-        });
+        const q = planMorsels(fe.plan, parsed.paramCount, (name, db) => this.morselTable(name, db));
         if (q) entry = { version: this.schemaVersion, parsed, plan: fe.plan, columns: fe.columns, q, partial: encodePlan(q.partial), key: `${this.schemaVersion}:${sql}` };
       }
     } catch {
@@ -2229,9 +2267,9 @@ export class Database implements FunctionContext {
    * aggregates merge exactly, rowid ranges for `parts` partial plans ({@link partialTask});
    * otherwise null (run it normally).
    */
-  parallelSplit(sql: string, parts: number, minRows = 200_000): { lo: number; hi: number }[] | null {
+  parallelSplit(st: PreparedStatement | string, parts: number, minRows = 200_000): { lo: number; hi: number }[] | null {
     if (parts < 2 || !this.parallelAggregates) return null;
-    const m = this.morselQuery(sql);
+    const m = this.morselOf(st);
     if (!m) return null;
     // A fresh materialized view answers it more cheaply than any split of the base table.
     if (this.matviewRewriteOn && this.matviewRewritePlan(m.plan) !== m.plan) return null;
@@ -2254,8 +2292,8 @@ export class Database implements FunctionContext {
    * What a reader needs to aggregate rowids [lo, hi) of `sql`: the partial plan (encoded, the same for every range),
    * a key that names it, and its parameters (the query's, then lo and hi).
    */
-  partialTask(sql: string, params: BindParams | undefined, lo: number, hi: number): { plan: EncodedPlan; key: string; params: SqlValue[] } {
-    const m = this.morselQuery(sql);
+  partialTask(st: PreparedStatement | string, params: BindParams | undefined, lo: number, hi: number): { plan: EncodedPlan; key: string; params: SqlValue[] } {
+    const m = this.morselOf(st);
     if (!m) throw new SmaltError('SMALT_ERROR', 'statement cannot run as partial aggregates');
     const values: SqlValue[] = new Array(m.parsed.paramCount + 2).fill(null);
     bindParamValues(m.parsed, params, values);
@@ -2284,8 +2322,8 @@ export class Database implements FunctionContext {
   private readonly partialPrograms = new Map<string, { version: number; program: Program }>();
 
   /** Merge partial rows (from {@link runPartial} over every range) into the result of `sql`. */
-  mergePartials(sql: string, params: BindParams | undefined, partials: SqlValue[][]): QueryResult {
-    const m = this.morselQuery(sql);
+  mergePartials(st: PreparedStatement | string, params: BindParams | undefined, partials: SqlValue[][]): QueryResult {
+    const m = this.morselOf(st);
     if (!m) throw new SmaltError('SMALT_ERROR', 'statement cannot run as partial aggregates');
     this.morsel = { rows: partials, keys: m.q.keyCount, width: m.q.types.length, types: m.q.types };
     try {
@@ -2336,7 +2374,7 @@ export class Database implements FunctionContext {
   }
 
   /** {@link parallelSplit} + {@link partialTask} + {@link runPartial} + {@link mergePartials} in this thread (tests). */
-  queryMorsels(sql: string, params?: BindParams, parts = 4, minRows = 0): QueryResult | null {
+  queryMorsels(sql: PreparedStatement | string, params?: BindParams, parts = 4, minRows = 0): QueryResult | null {
     const ranges = this.parallelSplit(sql, parts, minRows);
     if (!ranges) return null;
     const partials: SqlValue[][] = [];
@@ -2598,7 +2636,7 @@ export class Database implements FunctionContext {
       }
       const layout = decodeDef({ def: m.layout, exprs: null }, `${r.name} layout`);
       if (layout.kind !== 'table') throw new SmaltError('SMALT_CORRUPT', `layout of materialized view ${r.name} is not a table`);
-      const { table } = tableSchemaFromDef(layout.table, layoutSql(layout.table), root);
+      const { table } = tableSchemaFromDef(layout.table, layoutText(layout.table), root);
       const storage = String(def.options.storage ?? 'row').toLowerCase() as MatViewInfo['storage'];
       table.matview = { sql: r.sql!, language: def.language, options: { ...def.options }, storage, populated, refreshedAt, fresh };
       this.tables.set(table.name.toLowerCase(), table);
@@ -2849,7 +2887,7 @@ export class Database implements FunctionContext {
   }
 
   private createExternalTable(stmt: Extract<SchemaOp, { op: 'createExternalTable' }>): RunResult {
-    const described = stmt.source ? {} : { described: true as const };
+    const described = stmt.source ? (stmt.source.language !== 'sql' ? { language: stmt.source.language } : {}) : { described: true as const };
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const lower = stmt.name.toLowerCase();
     if (stmt.ifNotExists && this.externals.has(lower)) return none;
@@ -2884,7 +2922,7 @@ export class Database implements FunctionContext {
     text ??= describeDefinition(stored);
     this.dirtySchema = true;
     this.addCatalogRow('external', stmt.name, stmt.name, 0, text, undefined, stored);
-    this.externals.set(lower, { name: stmt.name, columns, options: stmt.options, sql: text });
+    this.externals.set(lower, { name: stmt.name, columns, options: stmt.options, sql: text, ...described });
     this.objectChanged(stmt.name);
     this.schemaChanged();
     return none;
@@ -3432,6 +3470,8 @@ export class Database implements FunctionContext {
     this.noteValidViews();
     const rows = change.rows;
     this.rewriteCatalog((row) => {
+      // System tables are defined in code: their text is not edited (files may hold an older engine's SQL text).
+      if (row.type === 'table' && isSystemTable(row.name)) return null;
       const r = rows(row);
       // Objects defined without source text: their description, of their new definition.
       const d = change.defs.get(Database.rowKey({ type: row.type, name: r?.name ?? row.name })) ?? defs.get(Database.rowKey(row));
@@ -4605,6 +4645,11 @@ export abstract class PreparedStatement {
     return this.prog().readonly;
   }
 
+  /** The kind of statement it binds to (`query`, `write`, `transaction`, …). */
+  get kind(): BoundStatement['kind'] | undefined {
+    return this.prog().bound?.kind;
+  }
+
   /** Reads TEMP tables or memory-resident views (parallel readers cannot see them). */
   get usesMemoryObjects(): boolean {
     // Memory objects come and go with DDL, which bumps the schema version.
@@ -4937,7 +4982,8 @@ const EMPTY_MEM_SNAPSHOT: MemSnapshot = { temps: [], views: [] };
 /** A query analyzed for morsel execution, with its compiled merge statement (per schema version). */
 interface MorselEntry {
   version: number;
-  parsed: LanguageStatement;
+  /** How the query's parameters are bound: positionally, or (a language's text) by name. */
+  parsed: Pick<LanguageStatement, 'paramCount' | 'paramNames'>;
   /** The query's plan and result columns. */
   plan: PlanOp;
   columns: ResultColumnInfo[];
@@ -5012,16 +5058,14 @@ function wholeTable(op: PlanOp): boolean {
   return op.op === 'scan' || (op.op === 'project' && wholeTable(op.input));
 }
 
-/** A system table's CREATE TABLE as the schema operation the engine runs: its definition, in code. */
+/** A system table's creation as the schema operation the engine runs: its definition, in code, with no source text. */
 function systemTableOp(name: SystemTableName): Extract<SchemaOp, { op: 'createTable' }> {
-  return { op: 'createTable', table: SYSTEM_TABLES[name], temp: false, ifNotExists: false, source: { language: 'sql', text: systemTableSql(name) } };
+  return { op: 'createTable', table: SYSTEM_TABLES[name], temp: false, ifNotExists: false };
 }
 
-/** The CREATE TABLE text of a materialized view's storage table (as `sqlite_schema`-style display). */
-function layoutSql(def: TableDef): string {
-  const q = (x: string): string => `"${x.replace(/"/g, '""')}"`;
-  const coll = (c: CollationName): string => (c === 'nocase' ? ' COLLATE NOCASE' : c === 'rtrim' ? ' COLLATE RTRIM' : '');
-  return `CREATE TABLE ${q(def.name)}(${def.columns.map((c) => `${q(c.name)} ${c.declaredType}${coll(c.collation)}`).join(', ')})`;
+/** The text of a materialized view's storage table: the engine's description of its layout, in no language. */
+function layoutText(def: TableDef): string {
+  return describeDefinition({ kind: 'table', table: def, described: true });
 }
 
 /** A definition's language, or that it has no source text (ADR 0016 section 6). */

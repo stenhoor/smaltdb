@@ -19,7 +19,7 @@ import { type TableSchema, isColumnar, tableSchemaFromDef } from './schema.js';
 export interface CatalogHost {
   /** Tables and materialized views, main and temp, without the system tables. */
   tables(): readonly TableSchema[];
-  externals(): readonly { name: string; sql: string; columns: readonly { name: string; declType: string }[] }[];
+  externals(): readonly { name: string; sql: string; columns: readonly { name: string; declType: string }[]; language?: string; described?: boolean }[];
   views(): readonly { name: string; source: Source; columns?: readonly string[]; temp: boolean }[];
   settings(): CatalogSettings;
   /** Changes whenever the schema does: descriptions are kept until then. */
@@ -80,7 +80,7 @@ export function describeTableDef(def: TableDef, source?: Source, schema: 'main' 
   return { ...d, keys, schema, storage: def.storage };
 }
 
-function describeExternal(x: { name: string; sql: string; columns: readonly { name: string; declType: string }[] }): CatalogTable {
+function describeExternal(x: { name: string; sql: string; columns: readonly { name: string; declType: string }[]; language?: string; described?: boolean }): CatalogTable {
   return {
     kind: 'external',
     name: x.name,
@@ -93,8 +93,8 @@ function describeExternal(x: { name: string; sql: string; columns: readonly { na
     indexes: [],
     storage: 'row',
     strict: false,
-    // External tables are stored as SQL text (written by the creating language's source editor).
-    source: { language: 'sql', text: x.sql },
+    // Its text in the language that created it (absent: SQL), or none when it was defined without source text.
+    ...(x.described ? {} : { source: { language: x.language ?? 'sql', text: x.sql } }),
   };
 }
 

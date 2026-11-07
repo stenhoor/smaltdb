@@ -173,8 +173,8 @@ export interface MatViewInfo {
   /** The definition bound to a plan for materialized-view matching (runtime only; null if it cannot be bound). */
   plan?: { version: number; plan: import('../plan/ops.js').PlanOp | null };
   /**
-   * Refresh policy (M8.1, `WITH (refresh_every = seconds, refresh_on_reconnect = true)`): run by the
-   * engine worker as `REFRESH … IF CHANGED`. Parsed from `sql` on first use.
+   * Refresh policy (M8.1: the view's `refresh_every` and `refresh_on_reconnect` options): run by the engine worker as
+   * a refresh that first checks the view's sources. Read from the stored options on first use.
    */
   policy?: { every: number | null; onReconnect: boolean };
   /** The last automatic refresh failed with this message (runtime only). */

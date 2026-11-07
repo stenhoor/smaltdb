@@ -13,6 +13,8 @@ export default defineConfig({
   test: {
     server: { deps: { inline: [/node_modules\/smaltql\//] } },
     include: ['test/**/*.test.ts'],
+    // test/no-sql runs with no language registered: vitest.no-sql.config.ts (ADR 0017).
+    exclude: ['test/no-sql/**', '**/node_modules/**'],
     setupFiles: ['test/setup-sql.ts'],
   },
 });

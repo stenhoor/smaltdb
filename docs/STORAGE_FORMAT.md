@@ -126,7 +126,10 @@ interior cell:  u32 child | u16 keyLen | key
   index's are compiled then), and a view's source, or a materialized view's query, is parsed by its language where it
   is first read.
 - The other system tables (`smalt_stat`, `smalt_matview`, `smalt_columnar`, `smalt_extcache`) are defined in code and
-  listed in the catalog. A materialized view's layout in `smalt_matview.layout` is a stored table definition.
+  listed in the catalog. Their `sql` is the engine's description of the definition (as for objects defined without
+  source text), so no language is needed to read or alter the schema around them (ADR 0017). Files made by earlier
+  engines hold a `CREATE TABLE` text there instead; ALTER TABLE leaves system tables' rows as they are, whatever they
+  hold. A materialized view's layout in `smalt_matview.layout` is a stored table definition.
 
 ## 4. Indexes
 
