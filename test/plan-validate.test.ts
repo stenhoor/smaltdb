@@ -1,7 +1,7 @@
 /** The plan validator (ADR 0015 step 5, plan/validate.ts): plans from an untrusted builder are checked first. */
 import { describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
-import { sqlLanguage } from 'smaltql';
+import { sqlLanguage } from '@smaltworks/smaltql';
 import type { BindContext } from '../src/engine/plan/bind-context.js';
 import { type ValidateCatalog, MAX_PLAN_DEPTH, validatePlan } from '../src/engine/plan/validate.js';
 import type { PlanOp } from '../src/engine/plan/ops.js';

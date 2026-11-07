@@ -78,7 +78,7 @@ statements and edits no text: it provides views alone.
 
 ```ts
 import { Collation, Database, plan as p, registerLanguage, type SmaltLanguage } from 'smaltdb/engine';
-import 'smaltql/register';
+import '@smaltworks/smaltql/register';
 
 const dotted: SmaltLanguage = {
   name: 'dotted',
@@ -128,4 +128,4 @@ const db = await open('app', { worker: () => new Worker(new URL('./db-worker.ts'
 ```
 
 A language usually exports both: its worker entry and an `open()` that uses it, as smaltql does
-(`import { open } from 'smaltql'`).
+(`import { open } from '@smaltworks/smaltql'`).

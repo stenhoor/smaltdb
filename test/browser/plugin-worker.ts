@@ -1,7 +1,7 @@
 // An application's engine worker with plugins (ADR 0012) and a language (ADR 0015): the pattern the docs describe.
 import external from '@smaltdb/external';
 import io from '@smaltdb/io';
-import { sqlLanguage } from 'smaltql';
+import { sqlLanguage } from '@smaltworks/smaltql';
 import { defineWorker } from '../../src/engine/worker-runtime.js';
 
 // SQL as given to defineWorker, marked so the page can tell it is the language this worker registered: it reads

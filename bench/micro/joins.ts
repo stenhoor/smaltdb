@@ -2,7 +2,7 @@
 // Run: npx esbuild bench/micro/joins.ts --bundle --platform=node --format=esm --outfile=.cache/joins.mjs --external:@sqlite.org/sqlite-wasm && node .cache/joins.mjs
 import sqliteInit from '@sqlite.org/sqlite-wasm';
 import { Database } from '../../src/engine/database.js';
-import 'smaltql/register';
+import '@smaltworks/smaltql/register';
 import { MemoryVfs } from '../../src/engine/vfs/memory.js';
 
 import { JOIN_DDL, JOIN_INDEXES, JOIN_QUERIES, JOIN_SIZES, joinRows } from '../shared/joins.js';

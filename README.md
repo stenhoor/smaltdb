@@ -26,11 +26,11 @@ The engine runs **plans**: queries and writes as plain data. It carries no query
 For a SQL database in a page, install smaltql with the engine:
 
 ```sh
-npm install smaltql smaltdb
+npm install @smaltworks/smaltql smaltdb
 ```
 
 ```js
-import { open } from 'smaltql';
+import { open } from '@smaltworks/smaltql';
 
 const db = await open('app'); // the engine runs in a worker, data lives in OPFS
 await db.exec('CREATE TABLE IF NOT EXISTS todo(id INTEGER PRIMARY KEY, title TEXT NOT NULL, done INT DEFAULT 0)');
