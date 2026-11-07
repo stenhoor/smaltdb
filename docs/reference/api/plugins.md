@@ -489,7 +489,7 @@ import only types from it. smaltdb's own plugins limit the range to the minor ve
 | `addTableFunction` | `read_csv` (TSV for `.tsv` locations), `read_json` | | `read_parquet` |
 | `addSource` | | `file` (`file:`), `http` (`http:`, `https:`), `s3` (`s3://`), `azure` (`az://`, `azure://`), `path` (plain paths, with `paths: true`). All share one `isPattern` and `list`; listing fails for HTTP URLs. | |
 | `addConnectionType` | | `http` (alias `https`), `s3`, `azure`, each with `validate` | |
-| `addMethod` | `importCSV`, `importJSON` (write with `ctx.db` in one transaction), `exportCSV`, `exportJSON` (read with `ctx.query`) | `registerFile`, `registerCredentials`, `setFetch` | |
+| `addMethod` | `importCSV`, `importJSON` (write plans with `ctx.db` in one transaction), `exportCSV`, `exportJSON` (read with `ctx.query`, or `ctx.queryPlan` for a plan) | `registerFile`, `registerCredentials`, `setFetch` | |
 | `onSessionClosed` | | Drops credentials whose functions live in the closed tab | |
 | `ask` | | Asks the registering tab for each request's credentials, with a 30-second timeout | |
 | `glob` | | `regExp` and `prefix` to list registered files, S3, Azure and Node directories | |

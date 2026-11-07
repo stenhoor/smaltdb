@@ -6,6 +6,7 @@
  */
 import external from '@smaltdb/external';
 import { registerFile } from '@smaltdb/external/client';
+import { exportCSV, exportJSON, importCSV, importJSON } from '@smaltdb/io/client';
 import io from '@smaltdb/io';
 import { afterEach, describe, expect, it } from 'vitest';
 import * as client from '../../src/client/index.js';
@@ -141,6 +142,18 @@ describe('the engine through plans', () => {
     expect(d.catalog.table('e2')!.source).toBeUndefined();
     expect((await d.queryPlanAsync({ op: 'source', kind: 'external', name: 'e2', args: [], types: ['int', 'text'] } as never)).rows).toEqual([[1, 'x'], [2, 'y']]);
   });
+  it('@smaltdb/io imports and exports through plans (ADR 0017 decision 7)', async () => {
+    const d = Database.openMemory({ plugins: [io] });
+    expect(await importCSV(d, 'm', 'a,b\n1,x\n2,y\n', { create: true })).toEqual({ rows: 2 });
+    expect(await importJSON(d, 'm', '[{"a":3,"b":"z"}]')).toEqual({ rows: 1 });
+    expect(d.catalog.table('m')!.source).toBeUndefined();
+    const q: PlanStatementInput = { kind: 'query', plan: p.project(p.scan('m', [0, 1]), [p.col(0, 0, 'int'), p.col(0, 1, 'text')]), columns: [{ name: 'a' }, { name: 'b' }] };
+    expect(await exportCSV(d, q)).toBe('a,b\n1,x\n2,y\n3,z\n');
+    expect(await exportJSON(d, q, [], { format: 'ndjson' })).toBe('{"a":1,"b":"x"}\n{"a":2,"b":"y"}\n{"a":3,"b":"z"}\n');
+    // A failing import rolls back as a whole.
+    await expect(importCSV(d, 'm', 'a,b\n4,w\n5\n')).rejects.toThrow(/CSV line 3/);
+    expect(rows(d, q).length).toBe(3);
+  });
 });
 
 describe('the client and worker server', () => {
@@ -155,7 +168,7 @@ describe('the client and worker server', () => {
         dispatch: (_s, req) => (this.offered.push(req.op === 'queryPlan' ? (JSON.parse(req.plan) as { kind?: string }).kind ?? 'query' : 'sql'), false),
         forward: () => false,
       };
-      this.server = new EngineServer((_s, msg) => setTimeout(() => this.onmessage?.({ data: structuredClone(msg) })), { open: () => Database.openMemory(), refreshTimer: false, ...(readers ? { readers: pool } : {}) });
+      this.server = new EngineServer((_s, msg) => setTimeout(() => this.onmessage?.({ data: structuredClone(msg) })), { open: () => Database.openMemory({ plugins: [io] }), refreshTimer: false, ...(readers ? { readers: pool } : {}) });
     }
     postMessage(req: Request): void {
       const r = structuredClone(req);
@@ -187,6 +200,12 @@ describe('the client and worker server', () => {
       }),
     ).rejects.toThrow('undo');
     expect([...(await db.queryPlan(p.scan('t', [0]), [], { rowMode: 'array' }))]).toEqual([[1]]);
+  });
+
+  it('@smaltdb/io through the client', async () => {
+    const { db } = await open();
+    expect(await importJSON(db, 'j', '[{"n":1},{"n":2}]', { create: true })).toEqual({ rows: 2 });
+    expect(await exportCSV(db, { kind: 'query', plan: p.scan('j', [0]), columns: [{ name: 'n' }] })).toBe('n\n1\n2\n');
   });
 
   it('scheduled refreshes run as plans (ADR 0017 decision 2)', async () => {
