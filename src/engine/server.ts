@@ -649,8 +649,8 @@ export class EngineServer {
    */
   private toReader(session: string, st: PreparedStatement, req: { id: number } & ReaderRequest): boolean {
     const pool = this.options.readers;
-    // Queries only: transaction, setting and maintenance statements change or read the owner's state.
-    if (!pool || this.txOwner !== null || this.db?.inTransaction || !st.readonly || st.kind !== 'query' || st.usesMemoryObjects) return false;
+    // Queries and EXPLAIN only: transaction, setting and maintenance statements change or read the owner's state.
+    if (!pool || this.txOwner !== null || this.db?.inTransaction || !st.readonly || (st.kind !== 'query' && st.kind !== 'explain') || st.usesMemoryObjects) return false;
     // A reader pays for a snapshot refresh and a hand-off: worth it only when other requests are
     // waiting behind this one (concurrent demand). Alone, the owner answers fastest.
     if (this.queue.length === 0) return false;

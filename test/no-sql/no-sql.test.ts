@@ -216,12 +216,15 @@ describe('the client and worker server', () => {
     send({ op: 'queryPlan', plan: plan({ kind: 'transaction', action: 'begin', mode: 'deferred' }), planVersion: 1 });
     send({ op: 'queryPlan', plan: plan({ kind: 'setting', name: 'work_mem' }), planVersion: 1 });
     send({ op: 'queryPlan', plan: plan({ kind: 'transaction', action: 'rollback' }), planVersion: 1 });
+    send({ op: 'queryPlan', plan: plan({ kind: 'explain', mode: 'plan', query: { kind: 'query', plan: p.values([[p.lit(1)]], ['int']) } } as PlanStatementInput), planVersion: 1 });
     send(q);
     send(q);
     await new Promise((r) => setTimeout(r, 50));
     expect(worker.offered.length).toBeGreaterThan(0);
     expect(worker.offered).not.toContain('transaction');
     expect(worker.offered).not.toContain('setting');
+    // EXPLAIN reads only data: readers may answer it, with the owner's settings.
+    expect(worker.offered).toContain('explain');
     expect(replies.filter((m) => m.kind === 'error')).toEqual([]);
   });
 });
