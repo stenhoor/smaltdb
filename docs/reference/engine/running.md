@@ -33,7 +33,7 @@ to `NONE`.
 
 ```ts
 import { Database, plan as p } from 'smaltdb/engine';
-import 'smaltql/register';
+import '@smaltworks/smaltql/register';
 
 const db = Database.openMemory();
 db.exec("CREATE TABLE fruit(id INTEGER PRIMARY KEY, name TEXT, qty INT); INSERT INTO fruit(name, qty) VALUES ('apple', 3), ('pear', 5), ('plum', 7)");
@@ -108,7 +108,7 @@ is wrong:
 
 ```ts
 import { Database, plan as p } from 'smaltdb/engine';
-import 'smaltql/register';
+import '@smaltworks/smaltql/register';
 
 const db = Database.openMemory();
 db.exec('CREATE TABLE fruit(id INTEGER PRIMARY KEY, name TEXT, qty INT)');

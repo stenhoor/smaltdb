@@ -41,7 +41,7 @@ For a SQL database in a page, use [smaltql](https://stenhoor.github.io/smaltql/)
 a worker with SQL registered.
 
 ```ts
-import { open } from 'smaltql';
+import { open } from '@smaltworks/smaltql';
 
 const db = await open('app'); // the engine runs in a worker, data lives in OPFS
 await db.exec('CREATE TABLE IF NOT EXISTS todo(id INTEGER PRIMARY KEY, title TEXT NOT NULL, done INT DEFAULT 0)');

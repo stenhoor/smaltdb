@@ -5,7 +5,7 @@
  * of them.
  *
  * Languages register with the engine (`registerLanguage`); engine code never imports one. smaltdb's entry points
- * The engine carries none: SQL is smaltql's, which registers itself (`import 'smaltql/register'`) or through a worker
+ * The engine carries none: SQL is smaltql's, which registers itself (`import '@smaltworks/smaltql/register'`) or through a worker
  * entry (`defineWorker({ languages })`), ADR 0015.
  */
 import { type ErrorToWord, SmaltError } from '../errors.js';

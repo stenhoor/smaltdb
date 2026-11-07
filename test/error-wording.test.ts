@@ -3,7 +3,7 @@
  * to the language's `errorMessage`, once, for errors leaving a statement written in it; plans keep the engine's words.
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { sqlLanguage } from 'smaltql';
+import { sqlLanguage } from '@smaltworks/smaltql';
 import { Database } from '../src/engine/database.js';
 import { SmaltError, type ErrorToWord } from '../src/engine/errors.js';
 import { plan as p } from '../src/engine/index.js';

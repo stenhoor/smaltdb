@@ -9,7 +9,7 @@ file is the shared starting point. smaltui has the matching file; keep the worki
 
 | Command | What it does | When |
 |---|---|---|
-| `npm ci && npm run deps` | Installs dependencies, then the pinned `@smaltdb/io`, `@smaltdb/external` and `smaltql` builds from `packed.json` (see below) | First, and again after every `npm ci` or `npm install` |
+| `npm ci && npm run deps` | Installs dependencies, then the pinned `@smaltdb/io`, `@smaltdb/external` and `@smaltworks/smaltql` builds from `packed.json` (see below) | First, and again after every `npm ci` or `npm install` |
 | `npm run check` | `npm run typecheck` then `npm test` (vitest): what CI's `test` job runs | Before every commit |
 | `npm run test:browser` | Builds `dist/`, then runs the browser integration tests (Playwright). CI runs them on Chromium, Firefox and WebKit | Changes to the client, worker, server, OPFS or multi-tab code |
 | `npm run slt` (in smaltql) | The sqllogictest subset (122k records), run in `stenhoor/smaltql` against a `--local` smaltdb | Changes to the planner, expressions or functions |
@@ -28,7 +28,7 @@ Playwright is resolved globally in local containers (see `test/browser/playwrigh
 - Plugins live in their own repositories ([ADR 0012](docs/adr/0012-plugins.md)): `stenhoor/smaltdb-io`,
   `stenhoor/smaltdb-external`, `stenhoor/smaltdb-parquet`. Core tests the plugin interface with test plugins in
   `test/plugins.test.ts`; never import a plugin from `src/`. Until 0.9.0 is on npm, `packed.json` pins `@smaltdb/io`
-  and `@smaltdb/external` to commits for the docs examples and browser tests, and `smaltql` for SQL in every test, and `scripts/fetch-packed.mjs` (the same
+  and `@smaltdb/external` to commits for the docs examples and browser tests, and `@smaltworks/smaltql` for SQL in every test, and `scripts/fetch-packed.mjs` (the same
   file in all four repositories) installs them without touching `package.json` or the lockfile. A change to the plugin
   interface lands here first; then the plugin repositories update their `smaltdb` pin. Plugin API version 1 is stable
   ([ADR 0013](docs/adr/0013-plugin-api-v1.md)): additive changes only, or a new API version.
@@ -44,7 +44,7 @@ Playwright is resolved globally in local containers (see `test/browser/playwrigh
   the TypeScript ones, so a docs or engine change can fail it. The SQL guide and references are smaltql's docs now, and
   run there.
 - **SQL is smaltql's.** The engine carries no language (`test/boundary.test.ts`). Tests, benchmarks and browser tests
-  take SQL from the `smaltql` pin; its imports of `smaltdb/*` resolve to this checkout's source
+  take SQL from the `@smaltworks/smaltql` pin; its imports of `smaltdb/*` resolve to this checkout's source
   (`scripts/self-alias.mjs`). A change smaltql needs from the engine goes into `smaltdb/language` here first.
 - **No fixed sleeps in tests.** Wait with `until()` / `pause()` from `test/helpers/wait.ts` (see TESTING.md).
 - **Probe tests** (`test/zz-*.test.ts`) are scratch files: delete them, never commit them. Don't reformat files with

@@ -11,7 +11,7 @@ export default defineConfig({
   // engine. vitest transforms smaltql (inline) so the aliases apply to it.
   resolve: { alias: selfAlias },
   test: {
-    server: { deps: { inline: [/node_modules\/smaltql\//] } },
+    server: { deps: { inline: [/node_modules\/@smaltworks\/smaltql\//] } },
     include: ['test/**/*.test.ts'],
     // test/no-sql runs with no language registered: vitest.no-sql.config.ts (ADR 0017).
     exclude: ['test/no-sql/**', '**/node_modules/**'],
