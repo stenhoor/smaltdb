@@ -27,6 +27,8 @@ import {
   truthy,
 } from './convert.js';
 import type { Fn } from './functions.js';
+import { arithOperandType, daysAsUs, isDateDifference, temporalArithType } from './temporal-ops.js';
+import { isTemporal, temporalText } from '../../shared/temporal.js';
 
 /** One compiled argument. */
 export interface SqlArg {
@@ -312,9 +314,23 @@ export function negate(v: SqlValue): SqlValue {
 function arithmeticFn(op: string, a: SqlArg, b: SqlArg): { fn: Fn; type: StaticType } {
   const fa = a.fn;
   const fb = b.fn;
-  const real = a.type === 'real' || b.type === 'real';
-  const type: StaticType = real ? 'real' : a.type === 'int' && b.type === 'int' ? 'int' : 'num';
+  const ta = arithOperandType(a.type);
+  const tb = arithOperandType(b.type);
+  const real = ta === 'real' || tb === 'real';
+  const type: StaticType = temporalArithType(op, a.type, b.type) ?? (real ? 'real' : ta === 'int' && tb === 'int' ? 'int' : 'num');
   const impl = arithImpl(op, real);
+  if (isDateDifference(op, a.type, b.type)) {
+    return {
+      fn: (r) => {
+        const x = fa(r);
+        if (x === null) return null;
+        const y = fb(r);
+        if (y === null) return null;
+        return daysAsUs(impl(x, y));
+      },
+      type,
+    };
+  }
   return {
     fn: (r) => {
       const x = fa(r);
@@ -342,8 +358,11 @@ function numberOperand(v: SqlValue, name: string): number | bigint {
 function checkedArithmeticFn(op: '+' | '-' | '*', name: string, a: SqlArg, b: SqlArg): { fn: Fn; type: StaticType } {
   const fa = a.fn;
   const fb = b.fn;
-  const real = a.type === 'real' || b.type === 'real';
-  const type: StaticType = real ? 'real' : a.type === 'int' && b.type === 'int' ? 'int' : 'num';
+  const ta = arithOperandType(a.type);
+  const tb = arithOperandType(b.type);
+  const real = ta === 'real' || tb === 'real';
+  const type: StaticType = temporalArithType(op, a.type, b.type) ?? (real ? 'real' : ta === 'int' && tb === 'int' ? 'int' : 'num');
+  const days = isDateDifference(op, a.type, b.type);
   return {
     fn: (r) => {
       const x0 = fa(r);
@@ -360,13 +379,13 @@ function checkedArithmeticFn(op: '+' | '-' | '*', name: string, a: SqlArg, b: Sq
       }
       if (typeof x === 'number' && typeof y === 'number') {
         const s = op === '+' ? x + y : op === '-' ? x - y : x * y;
-        if (Number.isSafeInteger(s)) return s === 0 ? 0 : s;
+        if (Number.isSafeInteger(s)) return days ? daysAsUs(s) : s === 0 ? 0 : s;
       }
       const bx = BigInt(x);
       const by = BigInt(y);
       const res = op === '+' ? bx + by : op === '-' ? bx - by : bx * by;
       if (res < I64_MIN || res > I64_MAX) throw new SmaltError('SMALT_RANGE', `integer overflow in ${name}`);
-      return normalizeInt(res);
+      return days ? daysAsUs(normalizeInt(res)) : normalizeInt(res);
     },
     type,
   };
@@ -711,7 +730,9 @@ const OPERATIONS: ReadonlyMap<string, SqlFunction> = new Map<string, SqlFunction
   }),
   fixed('cast_text', 1, ([x]) => {
     const f = x.fn;
-    const xr = x.type === 'real';
+    const xt = x.type;
+    if (isTemporal(xt)) return { fn: (r) => temporalText(xt, f(r)), type: 'text' };
+    const xr = xt === 'real';
     return { fn: (r) => toText(f(r), xr), type: 'text' };
   }),
   fixed('cast_blob', 1, ([x]) => {

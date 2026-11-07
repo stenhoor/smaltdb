@@ -4,6 +4,7 @@ import type { SqlValue } from '../values.js';
 import { isOpaque } from './sql-meta.js';
 import { type InlineForm, traitsOf, withoutComparisonConversion } from './traits.js';
 import { isEngineOperation } from './sql-functions.js';
+import { arithOperandType, isDateDifference, temporalArithType } from './temporal-ops.js';
 import { type StaticType, truthy } from './convert.js';
 import { type InlineMath, type MathFunction, inlineMath, roundingType } from './math.js';
 import { isInt64Storage } from '../storage/record.js';
@@ -33,6 +34,8 @@ export interface CodegenHelpers {
   /** arith['+'], arith['+R'] (forced REAL), ... — the closure compiler's slow paths. */
   arith: Record<string, (x: SqlValue, y: SqlValue) => SqlValue>;
   negate: (v: SqlValue) => SqlValue;
+  /** Days as µs (`date - date`). */
+  daysAsUs: (v: SqlValue) => SqlValue;
 }
 
 /**
@@ -414,9 +417,11 @@ class Emitter {
   }
 
   private arith(op: string, a: Gen, b: Gen): Gen {
-    const real = a.type === 'real' || b.type === 'real';
-    const bothInt = a.type === 'int' && b.type === 'int';
-    const type: StaticType = real ? 'real' : bothInt ? 'int' : 'num';
+    const ta = arithOperandType(a.type);
+    const tb = arithOperandType(b.type);
+    const real = ta === 'real' || tb === 'real';
+    const bothInt = ta === 'int' && tb === 'int';
+    const type: StaticType = temporalArithType(op, a.type, b.type) ?? (real ? 'real' : bothInt ? 'int' : 'num');
     const v = this.tmp();
     const vn = `${v}n`;
     const slowFn = `H.arith[${JSON.stringify(op + (real ? 'R' : ''))}]`;
@@ -450,6 +455,8 @@ class Emitter {
     const checks = [a.num ? '' : `typeof x === 'number'`, b.num ? '' : `typeof y === 'number'`].filter((c) => c);
     const body = checks.length ? `if (${checks.join(' && ')}) { ${fast} } else ${slow}` : fast;
     this.lines.push(`let ${vn} = ${orNull(nullOf(a), nullOf(b))}; let ${v} = 0; if (!${vn}) { const ${x} = ${a.v}; const ${y} = ${b.v}; ${body} }`);
+    // date - date is a duration: the days as µs.
+    if (isDateDifference(op, a.type, b.type)) this.lines.push(`if (!${vn}) ${v} = H.daysAsUs(${v});`);
     return { v, nul: vn, type };
   }
 }

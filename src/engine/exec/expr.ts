@@ -14,6 +14,7 @@ import { currentTimeText } from './datetime.js';
 import { ARITHMETIC_FUNCTIONS, BITWISE_FUNCTIONS, COMPARISON_FUNCTIONS, arithImpl, isEngineOperation, negate, sqlFunction } from './sql-functions.js';
 import { type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type CodegenHelpers, type FallbackNode, codegenEnabled, generate, generatedType, isCodegenRoot } from './codegen.js';
+import { daysAsUs } from './temporal-ops.js';
 import { WINDOW_ARITY } from './window.js';
 import { type SqlMeta, getMeta, setMeta } from './sql-meta.js';
 import { type BoundExpr, type ExprMeaning, call, lit, param, typeOf } from '../plan/expr.js';
@@ -136,6 +137,7 @@ export function planHasSubquery(e: BoundExpr): boolean {
 const CODEGEN_HELPERS: CodegenHelpers = {
   arith: Object.fromEntries(['+', '-', '*', '/', '%'].flatMap((op) => [[op, arithImpl(op, false)], [op + 'R', arithImpl(op, true)]])),
   negate: (v) => negate(v),
+  daysAsUs,
 };
 
 // ------------------------------------------------------------------ SQL metadata and compiling
@@ -492,6 +494,7 @@ export const CODEGEN_HELPERS_FOR_FUSION = {
     return CODEGEN_HELPERS.arith;
   },
   negate: (v: SqlValue) => negate(v),
+  daysAsUs,
   readInt64,
   utf8: decodeUtf8,
   tagged: decodeTagged,

@@ -44,12 +44,12 @@ export function daysFromCivil(y: number, m: number, d: number): number {
   return era * 146097 + doe - 719468;
 }
 
-const daysInMonth = (y: number, m: number): number => (m === 2 ? (y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0) ? 29 : 28) : [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]!);
+export const daysInMonth = (y: number, m: number): number => (m === 2 ? (y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0) ? 29 : 28) : [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]!);
 const pad = (n: number, w: number): string => String(n).padStart(w, '0');
 const year = (y: number): string => (y >= 0 && y <= 9999 ? pad(y, 4) : (y < 0 ? '-' : '+') + pad(Math.abs(y), 4));
 
 /** `us` as whole days and the µs left in the day (0 ≤ rest < one day). */
-function splitDays(us: number | bigint): { days: number; rest: number } {
+export function splitDays(us: number | bigint): { days: number; rest: number } {
   if (typeof us === 'bigint') {
     let days = us / BIG_US_PER_DAY;
     let rest = us % BIG_US_PER_DAY;

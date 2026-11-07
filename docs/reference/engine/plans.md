@@ -250,6 +250,43 @@ Patterns are JavaScript regular expressions in Unicode mode; the optional last a
 `s`. `length` counts code points. These operations are not inlined by code generation yet, nor are the checked and
 strict ones.
 
+**Dates and times** ([ADR 0019](../../adr/0019-dates-and-times.md)) have their own operations. A value's type
+says what its integer counts, so an operation takes the types it names, and anything else is an error (`SMALT_MISMATCH`)
+when the plan is compiled. NULL arguments give NULL.
+
+| Function | Arguments | Meaning |
+|---|---|---|
+| `year`, `month`, `day`, `weekday`, `day_of_year` | 1: a `date` or `datetime` | That part, an integer; `weekday` is ISO (Monday is 1, Sunday 7) |
+| `hour`, `minute`, `second`, `microsecond` | 1: a `datetime` or `time` | That part; `microsecond` is the µs within the second |
+| `make_date` | 3: year, month, day | A `date`; one that doesn't exist (`2025, 2, 29`) is an error (`SMALT_RANGE`) |
+| `make_datetime` | 3 to 7: year, month, day, hour, minute, second, µs | A `datetime`; the clock parts default to 0 |
+| `parse_date`, `parse_datetime` | 1 or 2: text, format | Text in the result format (`parse_datetime` also takes `T` between date and time, and a date alone), or read with a `strftime` format. NULL when it doesn't match or isn't a date |
+| `format_temporal` | 2: a `date`, `datetime` or `time`, format | Text written with a `strftime` format |
+| `trunc_temporal` | 2: a value, unit | The value truncated to `year`, `quarter`, `month`, `week` (to Monday), `day`, `hour`, `minute`, `second`, `millisecond` or `microsecond`. Its type is the value's |
+| `offset_by` | 2: a `date` or `datetime`, offset | The value moved by a `duration`, or by text such as `1mo`, `-2d` or `1y3mo`: units `y`, `q`, `mo`, `w`, `d`, `h`, `m`, `s`, `ms`, `us`. Months move on the calendar and keep the day of the month, or take the last day of a shorter one (`2026-01-31` and `1mo` give `2026-02-28`); then days and the clock. A `date` moves by whole days only |
+| `cast_date` | 1 | A `date` from a `datetime` (its day), from text in the result format, or from a number of days. Anything else is an error (`SMALT_MISMATCH`) |
+| `cast_datetime` | 1 | A `datetime` from a `date` (midnight), from text in the result format, or from a number of µs. Anything else is an error |
+
+`cast_text` of a temporal value gives its result text.
+
+Formats take `%Y` (year), `%y` (two digits: 69–99 are 1900s), `%m`, `%d`, `%e` (day, space-padded), `%j` (day of
+the year), `%H`, `%I` (12-hour), `%p` (`AM` or `PM`), `%M`, `%S`, `%f` (µs, six digits), `%a` and `%A` (weekday
+names), `%b` and `%B` (month names), `%u` (ISO weekday), `%w` (Sunday is 0), `%F` (`%Y-%m-%d`), `%T` (`%H:%M:%S`)
+and `%%`. Names are English. A format to parse needs a year; a missing month or day is 1, and a missing clock is
+midnight. Parsing reads `%f` to µs, cutting finer digits; it ignores the weekday names, and can't use `%u` or `%w`.
+
+**Arithmetic** on temporal values is the arithmetic on their integers (`add`, `sub`, `mul`, `div_trunc` and their
+checked forms), with these result types:
+
+| Operands | Result |
+|---|---|
+| `datetime - datetime`, `time - time`, `duration ± duration` | `duration` |
+| `date - date` | `duration`: the days between them as µs |
+| `datetime ± duration`, `duration + datetime` | `datetime` |
+| `duration * int`, `int * duration`, `duration / int` | `duration` |
+
+Other operands count as integers: `date + int` is an `int` (a day count).
+
 **Aggregate and window functions** are named the same way (`sum`, `rank`, …) in `AggCall` and `WindowCall`.
 
 ## Builders
