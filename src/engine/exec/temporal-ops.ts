@@ -17,6 +17,7 @@ import {
   parseDatetime,
   splitDays,
 } from '../../shared/temporal.js';
+import { zoneOffsetMs } from './zones.js';
 
 const US_PER_DAY = 86_400_000_000;
 const BIG_US_PER_DAY = 86_400_000_000n;
@@ -574,8 +575,73 @@ const CASTS: [string, ScalarFunction][] = [
   }),
 ];
 
+// ------------------------------------------------------------------ time zones
+
+/** ms (floored) of µs since the epoch. */
+const msOf = (v: number | bigint): number => (typeof v === 'number' ? Math.floor(v / 1000) : Number(v / 1000n - (v % 1000n < 0n ? 1n : 0n)));
+
+/** The offset of `zone` at the UTC instant `us`, in µs. */
+const offsetUs = (zone: string, us: number | bigint): number => zoneOffsetMs(zone, msOf(us)) * 1000;
+
+const zoneName = (v: SqlValue, fn: string): string => {
+  if (typeof v === 'string') return v;
+  throw mismatch(`${fn}: a time zone is text, such as 'Europe/Paris' or '+05:30'`);
+};
+
+/**
+ * The UTC instant of wall-clock time `local` in `zone`. A wall-clock time that occurs twice (clocks going back) is
+ * the earlier instant, or the later; one that doesn't occur (clocks going forward) moves forward by the gap
+ * (`compatible`, `later`) or back (`earlier`); `reject` makes either an error.
+ */
+function fromZone(local: number | bigint, zone: string, how: string): number | bigint {
+  const before = offsetUs(zone, addUs(local, -US_PER_DAY));
+  const after = offsetUs(zone, addUs(local, US_PER_DAY));
+  const fits: (number | bigint)[] = [];
+  for (const o of before === after ? [before] : [before, after]) {
+    const t = addUs(local, -o);
+    if (offsetUs(zone, t) === o) fits.push(t);
+  }
+  if (fits.length === 1) return fits[0]!;
+  if (how === 'reject') throw outOfRange(`from_zone: the time ${fits.length ? 'occurs twice' : 'does not occur'} in ${zone}`);
+  if (fits.length === 2) {
+    const [a, b] = fits[0]! < fits[1]! ? [fits[0]!, fits[1]!] : [fits[1]!, fits[0]!];
+    return how === 'later' ? b : a;
+  }
+  // In a gap: the offset before it moves the time forward by the gap, the one after moves it back.
+  return addUs(local, -(how === 'earlier' ? after : before));
+}
+
+const HOW = ['compatible', 'earlier', 'later', 'reject'];
+
+const ZONE_OPS: [string, ScalarFunction][] = [
+  op('to_zone', 2, 2, () => 'datetime', ([a]) => {
+    if (a!.type === 'null') return () => null;
+    argKind('to_zone', a!.type, ['datetime']);
+    return ([v, z]) => {
+      if (v === null || z === null) return null;
+      const x = temporalValue(v, 'to_zone');
+      return addUs(x, offsetUs(zoneName(z, 'to_zone'), x));
+    };
+  }),
+  op('from_zone', 2, 3, () => 'datetime', ([a]) => {
+    if (a!.type === 'null') return () => null;
+    argKind('from_zone', a!.type, ['datetime']);
+    return ([v, z, h]) => {
+      if (v === null || z === null) return null;
+      const how = h === undefined || h === null ? 'compatible' : String(h);
+      if (!HOW.includes(how)) throw mismatch(`from_zone: '${how}' is not compatible, earlier, later or reject`);
+      return fromZone(temporalValue(v, 'from_zone'), zoneName(z, 'from_zone'), how);
+    };
+  }),
+  op('zone_offset', 2, 2, () => 'duration', ([a]) => {
+    if (a!.type === 'null') return () => null;
+    argKind('zone_offset', a!.type, ['datetime']);
+    return ([v, z]) => (v === null || z === null ? null : offsetUs(zoneName(z, 'zone_offset'), temporalValue(v, 'zone_offset')));
+  }),
+];
+
 /** The date and time operations, for the scalar function registry. */
-export const TEMPORAL_FUNCTIONS: readonly [string, ScalarFunction][] = [...PARTS, ...BUILD, ...PARSE, ...MOVE, ...CASTS];
+export const TEMPORAL_FUNCTIONS: readonly [string, ScalarFunction][] = [...PARTS, ...BUILD, ...PARSE, ...MOVE, ...CASTS, ...ZONE_OPS];
 
 // ------------------------------------------------------------------ arithmetic
 
