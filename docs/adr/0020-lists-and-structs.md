@@ -37,18 +37,18 @@ what the type means at the boundary.
 ### 1. Values: encoded bytes under a static type
 
 A list or struct value is a **blob** at run time: its elements (a struct's fields, in their declared order) encoded
-as index-key components, then a `0x00` terminator.
+as index-key components, one after another (`encodeKey`).
 
 | Value | Bytes |
 |---|---|
-| `[1, 2]` | number(1) number(2) `00` |
-| `[]` | `00` |
-| `[1, null]` | number(1) null `00` |
-| `{a: 1, b: 'x'}` | number(1) text('x') `00` |
-| `[[1], []]` | list(number(1) `00`) list(`00`) `00`, a nested value escaped as blobs are (`00` → `00 FF`, end `00 00`), under its own tag |
+| `[1, 2]` | number(1) number(2) |
+| `[]` | no bytes |
+| `[1, null]` | number(1) null |
+| `{a: 1, b: 'x'}` | number(1) text('x') |
+| `[[1], []]` | blob(number(1)) blob(): a nested value is a blob component, escaped as blobs are (`00` → `00 FF`, end `00 00`) |
 
-- **Order and equality come free.** The byte order of these blobs is element-by-element order with a shorter list
-  first (`[1] < [1, 2] < [2]`), which is Polars' order. Equal values have equal bytes, so grouping, `unique`, joins on
+- **Order and equality come free.** Components are prefix-free, so the byte order of these blobs is element-by-element
+  order with a shorter list first (`[1] < [1, 2] < [2]`), which is Polars' order. Equal values have equal bytes, so grouping, `unique`, joins on
   lists, hash tables and index keys work unchanged.
 - **The type says what the bytes are.** `list<int>` and `struct<a int, b text>` are plan types. A value read without its
   type (in an `any` column) is a blob.
