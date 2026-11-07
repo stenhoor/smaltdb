@@ -155,3 +155,24 @@ Raw data: [bench/results/2026-11-01-chromium-5ba5455.json](../../bench/results/2
 Caveat on cold reads: in this run smaltdb's cold point lookups measured 97 ms (90–103) while running after the other engines. Re-run alone
 they measured 59–63 ms, matching earlier runs, and one standalone repetition spiked to 98 ms. Cold OPFS I/O in this shared container is noisy
 and sensitive to the I/O of preceding engines. Cold-read comparisons should be confirmed on dedicated hardware.
+
+## Baseline after the plan API and SQL split (Node, 2026-11-07)
+
+Raw data: [bench/results/2026-11-07-node-fabbd86.json](../../bench/results/2026-11-07-node-fabbd86.json) (`main` after
+ADR 0016's code, #104–#130, and ADR 0017, #131–#134) and [bench/results/2026-11-07-node-d94769b.json](../../bench/results/2026-11-07-node-d94769b.json)
+(the last `main` before them). Run on the same machine with `npm run bench:native -- --engines smaltdb,smaltdb-mem,native-wal,native-mem --reps 5`, with
+the "after" run repeated once to measure the machine's drift, and SQL from each commit's smaltql pin (`32c3de0` and
+`fca25f9`).
+
+- **Workloads:** over the 46 workloads, the geometric mean of after / before is 0.96 on file and 1.03 in memory.
+  Native SQLite drifted 0.98 and 1.01 over the same runs. A second comparison of smaltdb alone (7 repetitions, two
+  rounds each, alternating) gave 0.98 and 0.99. No workload was slower in every round, except one:
+- **The first query of a process** (`analytic: filter + sum (first run)`) is about 16% slower (about 2–3 ms, once). The
+  generated code is byte-for-byte the same. About 1 ms was the function catalog compiling every function on the
+  first lookup; that is fixed by computing result types when read. The rest is the first execution of the same
+  generated loop.
+- **Statement compile** (smaltql's `npm run slt`, which compiles a new statement for nearly every record) is 3.6%
+  slower in total: 38.8 s → 40.2 s (two runs each), with the same 122,333 / 122,334 passing. The cost is in the
+  catalog API's expression descriptions (smaltql asks the engine to compile each expression it describes), not in
+  execution.
+- **Storage micro-benchmarks** (`npm run bench`): unchanged (geometric mean 0.91, within noise).
