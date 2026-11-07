@@ -4923,6 +4923,8 @@ export class RowCursor {
   private open = false;
   private done = false;
   private i = 0;
+  /** Columns typed `bool` (ADR 0018): their 0 / 1 values come out as `false` / `true` from `next()`. */
+  private readonly bools: readonly number[];
 
   constructor(
     readonly db: Database,
@@ -4935,6 +4937,7 @@ export class RowCursor {
     /** A write's counts (null for a query). */
     readonly run: RunResult | null = null,
   ) {
+    this.bools = boolColumns(columnTypes);
     if (plan) {
       try {
         plan.root.open(regs);
@@ -4952,7 +4955,10 @@ export class RowCursor {
   next(): SqlValue[] | null {
     if (this.done) return null;
     if (this.fixedRows) {
-      if (this.i < this.fixedRows.length) return this.fixedRows[this.i++];
+      if (this.i < this.fixedRows.length) {
+        const row = this.fixedRows[this.i++];
+        return this.bools.length === 0 ? row : asBooleans(row.slice(), this.bools);
+      }
       this.done = true;
       return null;
     }
@@ -4975,7 +4981,7 @@ export class RowCursor {
     const r = this.regs;
     const row = new Array(out.length);
     for (let j = 0; j < out.length; j++) row[j] = r[out[j]];
-    return row;
+    return this.bools.length === 0 ? row : asBooleans(row, this.bools);
   }
 
   /**
@@ -4985,9 +4991,16 @@ export class RowCursor {
   nextBatch(max: number, cols: SqlValue[][]): number {
     let n = 0;
     if (this.fixedRows || !this.plan) {
-      for (let row = n < max ? this.next() : null; row !== null; row = n < max ? this.next() : null) {
+      // The wire carries bool columns as numbers (0 / 1), as it does a plan's; the client gives them as booleans.
+      const rows = this.fixedRows;
+      while (!this.done && n < max) {
+        if (!rows || this.i >= rows.length) {
+          this.done = true;
+          break;
+        }
+        const row = rows[this.i++];
         for (let j = 0; j < row.length; j++) cols[j].push(row[j]);
-        if (++n >= max) break;
+        n++;
       }
       return n;
     }
@@ -5021,6 +5034,22 @@ export class RowCursor {
   }
 }
 
+
+/** The indexes of the columns typed `bool`. */
+function boolColumns(types: readonly StaticType[]): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < types.length; i++) if (types[i] === 'bool') out.push(i);
+  return out;
+}
+
+/** `row` with its `bool` columns' 0 / 1 given as `false` / `true` (ADR 0018); NULL stays NULL. */
+function asBooleans(row: SqlValue[], cols: readonly number[]): SqlValue[] {
+  for (const c of cols) {
+    const v = row[c];
+    if (v !== null) (row as unknown[])[c] = v !== 0 && v !== 0n;
+  }
+  return row;
+}
 
 /** A value can be stored in a column of this type without conversion (materialized views keep query results exact). */
 function fitsStorage(v: SqlValue, t: string): boolean {

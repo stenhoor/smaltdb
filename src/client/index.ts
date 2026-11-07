@@ -839,12 +839,18 @@ function materialize(res: Collected, mode: RowMode): unknown {
 
 function materializeRows(columns: string[], columnTypes: PlanType[], batches: { length: number; cols: WireColumn[] }[], mode: RowMode): unknown {
   const width = columns.length;
+  // Columns typed bool (ADR 0018) travel as 0 / 1 and are given as false / true.
+  const bool = columnTypes.map((t) => t === 'bool');
+  const value = (col: WireColumn, c: number, i: number): SqlValue => {
+    const v = columnValue(col, i);
+    return bool[c] && v !== null ? ((v !== 0 && v !== 0n) as unknown as SqlValue) : v;
+  };
   if (mode === 'columnar') {
     let length = 0;
     for (const b of batches) length += b.length;
     const data: Record<string, Float64Array | SqlValue[]> = {};
     for (let c = 0; c < width; c++) {
-      const allNumeric = batches.every((b) => b.cols[c].t === 'f64' && (b.cols[c] as { nulls: Uint8Array | null }).nulls === null);
+      const allNumeric = !bool[c] && batches.every((b) => b.cols[c].t === 'f64' && (b.cols[c] as { nulls: Uint8Array | null }).nulls === null);
       if (allNumeric) {
         if (batches.length === 1) data[columns[c]] = (batches[0].cols[c] as { data: Float64Array }).data;
         else {
@@ -861,7 +867,7 @@ function materializeRows(columns: string[], columnTypes: PlanType[], batches: { 
         let off = 0;
         for (const b of batches) {
           const col = b.cols[c];
-          for (let i = 0; i < b.length; i++) out[off + i] = columnValue(col, i);
+          for (let i = 0; i < b.length; i++) out[off + i] = value(col, c, i);
           off += b.length;
         }
         data[columns[c]] = out;
@@ -876,11 +882,11 @@ function materializeRows(columns: string[], columnTypes: PlanType[], batches: { 
     const cols = b.cols;
     for (let i = 0; i < b.length; i++) {
       if (make) {
-        for (let c = 0; c < width; c++) vals[c] = columnValue(cols[c], i);
+        for (let c = 0; c < width; c++) vals[c] = value(cols[c], c, i);
         rows.push(make(vals));
       } else {
         const row: SqlValue[] = new Array(width);
-        for (let c = 0; c < width; c++) row[c] = columnValue(cols[c], i);
+        for (let c = 0; c < width; c++) row[c] = value(cols[c], c, i);
         rows.push(row);
       }
     }

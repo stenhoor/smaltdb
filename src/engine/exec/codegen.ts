@@ -88,7 +88,7 @@ const utf8Encoder = new TextEncoder();
  * number (checked by `binaryTextOperands`), so they compare the operands themselves.
  */
 const unconverted = (x: BoundExpr): BoundExpr => withoutComparisonConversion(x);
-const isNum = (t: StaticType): boolean => t === 'int' || t === 'real' || t === 'num';
+const isNum = (t: StaticType): boolean => t === 'int' || t === 'bool' || t === 'real' || t === 'num';
 
 let enabled: boolean | undefined;
 
@@ -406,7 +406,7 @@ class Emitter {
   private compare(op: string, a: Gen, b: Gen): Gen {
     const v = this.tmp();
     const nul = orNull(nullOf(a), nullOf(b));
-    this.lines.push(`const ${v}n = ${nul}; const ${v} = ${v}n ? 0 : (${numericTest(op, a.v, b.v, a.num === true || a.type === 'int', b.num === true || b.type === 'int')} ? 1 : 0);`);
+    this.lines.push(`const ${v}n = ${nul}; const ${v} = ${v}n ? 0 : (${numericTest(op, a.v, b.v, a.num === true || a.type === 'int' || a.type === 'bool', b.num === true || b.type === 'int' || b.type === 'bool')} ? 1 : 0);`);
     return { v, nul: `${v}n`, type: 'int' };
   }
 

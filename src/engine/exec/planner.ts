@@ -2557,7 +2557,12 @@ function columnReader(c: ValueColumn): (i: number) => SqlValue {
   let read: (i: number) => SqlValue;
   if (data instanceof BigInt64Array) read = (i) => normalizeInt(data[i]);
   else if (ArrayBuffer.isView(data)) read = (i) => (data as Exclude<ColumnArray, BigInt64Array>)[i];
-  else read = (i) => (data as readonly SqlValue[])[i] ?? null;
+  else
+    read = (i) => {
+      const v = (data as readonly (SqlValue | boolean)[])[i];
+      // JS booleans (a bool column, ADR 0018) are 1 / 0 at run time.
+      return typeof v === 'boolean' ? (v ? 1 : 0) : (v ?? null);
+    };
   return nulls ? (i) => (nulls[i >>> 3] & (1 << (i & 7)) ? null : read(i)) : read;
 }
 

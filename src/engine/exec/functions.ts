@@ -945,7 +945,7 @@ export const aggregateFunctions = new Map<string, AggregateFunction>([
     {
       minArgs: 1,
       maxArgs: 1,
-      resultType: (t) => (t[0] === 'int' ? 'int' : t[0] === 'real' ? 'real' : 'num'),
+      resultType: (t) => (t[0] === 'int' || t[0] === 'bool' ? 'int' : t[0] === 'real' ? 'real' : 'num'),
       create: (t) => new SumState('sum', t[0] === 'real'),
     },
   ],
@@ -957,7 +957,7 @@ export const aggregateFunctions = new Map<string, AggregateFunction>([
     {
       minArgs: 1,
       maxArgs: 1,
-      resultType: (t) => (t[0] === 'int' ? 'int' : t[0] === 'real' ? 'real' : 'num'),
+      resultType: (t) => (t[0] === 'int' || t[0] === 'bool' ? 'int' : t[0] === 'real' ? 'real' : 'num'),
       create: (t) => new SumState('sum', t[0] === 'real', true),
     },
   ],

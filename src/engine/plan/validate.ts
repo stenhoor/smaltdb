@@ -38,7 +38,7 @@ export interface ValidateCatalog {
 /** Deeper plans are refused (SQLite's expression depth limit is 1000). */
 export const MAX_PLAN_DEPTH = 1000;
 
-const TYPES = new Set(['int', 'real', 'num', 'text', 'blob', 'null', 'any']);
+const TYPES = new Set(['int', 'bool', 'real', 'num', 'text', 'blob', 'null', 'any']);
 const COLLATIONS = new Set(['binary', 'nocase', 'rtrim']);
 const AFFINITIES = new Set(['INTEGER', 'REAL', 'NUMERIC', 'TEXT', 'BLOB']);
 
@@ -86,7 +86,8 @@ class Validator {
         n = data.length;
         for (let j = 0; j < n; j++) {
           const v = data[j];
-          if (!(v === null || typeof v === 'number' || typeof v === 'bigint' || typeof v === 'string' || v instanceof Uint8Array)) this.fail(`expected a value at ${j}`, 'columns', i);
+          // A JS boolean is a value of a bool column (ADR 0018).
+          if (!(v === null || typeof v === 'number' || typeof v === 'bigint' || typeof v === 'string' || typeof v === 'boolean' || v instanceof Uint8Array)) this.fail(`expected a value at ${j}`, 'columns', i);
         }
       } else this.fail('expected a typed array, an array of values, or { data, nulls }', 'columns', i);
       if (wrapped) {
@@ -105,6 +106,11 @@ class Validator {
 
   private type(t: unknown, field: string): void {
     if (typeof t !== 'string' || !TYPES.has(t)) this.fail(`unknown type ${JSON.stringify(t)}`, field);
+  }
+
+  /** A logic node's optional type (ADR 0018): `bool` or `int`, the same 0 / 1 values. */
+  private logicType(t: unknown): void {
+    if (t !== undefined && t !== 'bool' && t !== 'int') this.fail(`a logic node's type is bool or int, not ${JSON.stringify(t)}`, 'type');
   }
 
   private collation(c: unknown, field: string): void {
@@ -831,14 +837,17 @@ class Validator {
         return;
       case 'and':
       case 'or': {
+        this.logicType(e.type);
         const args = this.list(e.args, 'args');
         for (let i = 0; i < args.length; i++) this.exprAt(args[i] as PlanExpr, scopes, d, 'args', i);
         return;
       }
       case 'not':
+        this.logicType(e.type);
         this.exprAt(e.arg, scopes, d, 'arg', undefined);
         return;
       case 'isNull':
+        this.logicType(e.type);
         if (typeof e.not !== 'boolean') this.fail('expected a boolean', 'not');
         this.exprAt(e.arg, scopes, d, 'arg', undefined);
         return;
