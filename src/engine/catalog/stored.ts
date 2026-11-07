@@ -31,7 +31,7 @@ export type StoredDef =
   /** A materialized view; the table its rows are stored in is in `smalt_matview` (its layout). */
   | { readonly kind: 'matview'; readonly language: string; readonly columns?: readonly string[]; readonly options: Readonly<Record<string, SqlValue>> }
   | { readonly kind: 'connection'; readonly options: Readonly<Record<string, SqlValue>>; readonly described?: true }
-  | { readonly kind: 'external'; readonly columns: readonly { readonly name: string; readonly declaredType: string }[]; readonly options: Readonly<Record<string, SqlValue>>; readonly described?: true };
+  | { readonly kind: 'external'; readonly columns: readonly { readonly name: string; readonly declaredType: string }[]; readonly options: Readonly<Record<string, SqlValue>>; readonly language?: string; readonly described?: true };
 
 /** Whether `def` was defined without source text: its catalog text is {@link describeDefinition}'s. */
 export function isDescribed(def: StoredDef | undefined): boolean {
@@ -197,10 +197,9 @@ export const SYSTEM_TABLES = {
 
 export type SystemTableName = keyof typeof SYSTEM_TABLES;
 
-/** The CREATE TABLE text shown for a system table. */
-export function systemTableSql(name: SystemTableName): string {
-  const def = SYSTEM_TABLES[name];
-  return `CREATE TABLE ${name}(${def.columns.map((c) => `${c.name} ${c.type}`).join(', ')})`;
+/** The text shown for a system table: the engine's description of its definition, in no language (ADR 0017). */
+export function systemTableText(name: SystemTableName): string {
+  return describeDefinition({ kind: 'table', table: SYSTEM_TABLES[name], described: true });
 }
 
 export function isSystemTable(name: string): name is SystemTableName {

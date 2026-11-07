@@ -31,7 +31,8 @@
   "scripts": {
     "deps": "node scripts/fetch-packed.mjs",
     "typecheck": "node scripts/fetch-packed.mjs --check && tsc -p tsconfig.json --noEmit",
-    "test": "node scripts/fetch-packed.mjs --check && vitest run",
+    "test": "node scripts/fetch-packed.mjs --check && vitest run && vitest run --config vitest.no-sql.config.ts",
+    "test:no-sql": "vitest run --config vitest.no-sql.config.ts",
     "test:watch": "vitest",
     "test:browser": "node scripts/build.mjs && node test/browser/run.mjs",
     "bench": "node bench/run-node.mjs",

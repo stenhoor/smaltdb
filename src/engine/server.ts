@@ -18,7 +18,7 @@
  *   transaction is rolled back.
  */
 import { type BindParams, Database, type PreparedStatement, RowCursor, Statement } from './database.js';
-import { decodeDataJSON } from './plan/codec.js';
+import { decodeDataJSON, encodeDataJSON } from './plan/codec.js';
 import type { PlanStatementInput } from './plan/statement.js';
 import { PLAN_FORMAT_VERSION, type PlanType as StaticType } from './plan/types.js';
 import { MisuseError, SmaltError, errorCode, errorDetails } from './errors.js';
@@ -172,7 +172,7 @@ export class EngineServer {
 
   private internalResult(msg: Response): void {
     const name = this.refreshJobs.get(msg.id);
-    if (name === undefined || (msg.kind !== 'ok' && msg.kind !== 'error')) return;
+    if (name === undefined || (msg.kind !== 'done' && msg.kind !== 'ok' && msg.kind !== 'error')) return;
     this.refreshJobs.delete(msg.id);
     // Shown in information_schema.materialized_views.last_refresh_error (offline, HTTP errors, …).
     this.db?.noteRefreshResult(name, msg.kind === 'error' ? msg.message : null);
@@ -204,7 +204,9 @@ export class EngineServer {
     this.lastRefreshAttempt.set(lower, now);
     const id = this.nextInternalId--;
     this.refreshJobs.set(id, name);
-    this.queue.push({ session: EngineServer.INTERNAL, req: { id, op: 'exec', sql: `REFRESH MATERIALIZED VIEW "${name.replace(/"/g, '""')}" IF CHANGED` }, blocked: false });
+    // A plan statement, not SQL text: scheduled refreshes run with no language registered (ADR 0017).
+    const refresh: PlanStatementInput = { kind: 'maintenance', action: 'refresh', view: name, concurrently: false, withData: true, ifChanged: true };
+    this.queue.push({ session: EngineServer.INTERNAL, req: { id, op: 'queryPlan', plan: encodeDataJSON(refresh), planVersion: PLAN_FORMAT_VERSION }, blocked: false });
     this.kick();
   }
 
@@ -491,7 +493,7 @@ export class EngineServer {
       case 'query': {
         const st = this.requireDb().prepare(req.sql);
         if (this.readsExternal(st)) return this.queryExternal(session, st, req);
-        if (this.toMorsels(session, st, req.sql, req)) return;
+        if (this.toMorsels(session, st, req)) return;
         if (this.toReader(session, st, req)) return;
         this.startStream(session, id, st.cursor(req.params as BindParams | undefined), req.batchSize ?? 4096, req.credit);
         return;
@@ -500,6 +502,8 @@ export class EngineServer {
         // A plan that carries data is not cached: its key would be the data.
         const st = req.data ? this.requireDb().preparePlan(planInput(req)) : this.requireDb().cachedPlan(planInput(req));
         if (this.readsExternal(st)) return this.queryExternal(session, st, req);
+        // Plans split into morsels as SQL text does (ADR 0017).
+        if (this.toMorsels(session, st, req)) return;
         if (this.toReader(session, st, req)) return;
         this.startStream(session, id, st.cursor(req.params as BindParams | undefined), req.batchSize ?? 4096, req.credit);
         return;
@@ -536,11 +540,10 @@ export class EngineServer {
       case 'stmtQuery': {
         const st = this.statement(req.stmt);
         if (this.readsExternal(st)) return this.queryExternal(session, st, req);
-        // Prepared plans run on the owner: readers and morsels take SQL text or a whole plan request.
-        if (st instanceof Statement) {
-          if (this.toMorsels(session, st, st.sql, req)) return;
-          if (this.toReader(session, st, { id: req.id, op: 'query', sql: st.sql, params: req.params, batchSize: req.batchSize, credit: req.credit })) return;
-        }
+        // Morsels for any query; a whole statement goes to a reader as SQL text or a plan request, so prepared plans
+        // stay on the owner.
+        if (this.toMorsels(session, st, req)) return;
+        if (st instanceof Statement && this.toReader(session, st, { id: req.id, op: 'query', sql: st.sql, params: req.params, batchSize: req.batchSize, credit: req.credit })) return;
         this.startStream(session, id, st.cursor(req.params as BindParams | undefined), req.batchSize ?? 4096, req.credit);
         return;
       }
@@ -646,7 +649,8 @@ export class EngineServer {
    */
   private toReader(session: string, st: PreparedStatement, req: { id: number } & ReaderRequest): boolean {
     const pool = this.options.readers;
-    if (!pool || this.txOwner !== null || this.db?.inTransaction || !st.readonly || st.usesMemoryObjects) return false;
+    // Queries and EXPLAIN only: transaction, setting and maintenance statements change or read the owner's state.
+    if (!pool || this.txOwner !== null || this.db?.inTransaction || !st.readonly || (st.kind !== 'query' && st.kind !== 'explain') || st.usesMemoryObjects) return false;
     // A reader pays for a snapshot refresh and a hand-off: worth it only when other requests are
     // waiting behind this one (concurrent demand). Alone, the owner answers fastest.
     if (this.queue.length === 0) return false;
@@ -658,18 +662,18 @@ export class EngineServer {
    * runs as partial aggregates over rowid ranges on the readers and is merged here. Writes wait
    * until every partial is back, so all morsels see the same commit.
    */
-  private toMorsels(session: string, st: Statement, sql: string, req: { id: number; params?: unknown; batchSize?: number; credit?: number }): boolean {
+  private toMorsels(session: string, st: PreparedStatement, req: { id: number; params?: unknown; batchSize?: number; credit?: number }): boolean {
     const pool = this.options.readers;
     const db = this.db;
     const job0 = this.current;
     if (!pool?.partial || !pool.idle || !db || job0 === null || job0.noMorsels || this.txOwner !== null || db.inTransaction || !st.readonly || st.usesMemoryObjects) return false;
     const idle = pool.idle();
     if (idle < 2) return false;
-    const ranges = db.parallelSplit(sql, idle);
+    const ranges = db.parallelSplit(st, idle);
     if (!ranges) return false;
     let tasks: Omit<PartialTask, 'settings'>[];
     try {
-      tasks = ranges.map((r) => db.partialTask(sql, req.params as BindParams | undefined, r.lo, r.hi));
+      tasks = ranges.map((r) => db.partialTask(st, req.params as BindParams | undefined, r.lo, r.hi));
     } catch {
       return false; // run it normally, which reports the error
     }
@@ -693,7 +697,7 @@ export class EngineServer {
         } else {
           try {
             // Precomputed rows: the stream holds no reads, so writes need not wait for its client.
-            const result = db.mergePartials(sql, req.params as BindParams | undefined, partials.flat());
+            const result = db.mergePartials(st, req.params as BindParams | undefined, partials.flat());
             this.morselQueries++;
             this.startStream(session, req.id, new RowCursor(db, null, result.rows, [], result.columns, st.columnTypes), req.batchSize ?? 4096, req.credit, ranges.length);
           } catch (err) {

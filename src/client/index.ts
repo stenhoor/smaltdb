@@ -688,7 +688,8 @@ export class Database implements Queryable {
   }
 
   private async runTransaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T> {
-    await this.rawExec('BEGIN', undefined);
+    // A plan statement, not SQL text: transactions work with no language registered (ADR 0017).
+    await this.rawQueryPlan({ kind: 'transaction', action: 'begin', mode: 'deferred' }, undefined, {});
     let active = true;
     const ended = (): SmaltdbError => new SmaltdbError('SMALT_MISUSE', 'the transaction has ended: use tx only while the transaction callback runs');
     const tx: Transaction = {
