@@ -5,6 +5,19 @@ in OPFS, and it runs plans. SQL (the SQLite dialect) is a separate package, `ste
 on npm as `smaltdb`. Several Claude Code sessions work on the smalt repos in parallel and cannot see each other: this
 file is the shared starting point. smaltui has the matching file; keep the working rules the same.
 
+## Brand: read smalt-brand first
+
+Before changing this repository's site, README, or how it describes the product, read smalt-brand's
+[BRAND.md](https://github.com/stenhoor/smalt-brand/blob/main/BRAND.md) (the family table, and "Sites and READMEs", the
+standard every product site and README follows) and
+[DECISIONS.md](https://github.com/stenhoor/smalt-brand/blob/main/DECISIONS.md). A newer decision there wins over any
+copy here: lines and roles change, and a copy taken before the change is out of date.
+
+- Copy brand files and the site kit (`themes/vitepress/`) unchanged. To change them, change smalt-brand first, then
+  copy them again.
+- A change to this product's status or to what it does comes with a smalt-brand PR that updates smaltworks.dev (its
+  status page and this product's page), linked with `Depends on:`.
+
 ## Commands
 
 | Command | What it does | When |
