@@ -27,7 +27,12 @@ export type ColumnArray = Float64Array | Float32Array | Int32Array | Int16Array 
  * NaN in a float array is NaN, a value of `real` (ADR 0018); NULL comes from the bitmap. An array may hold JS booleans,
  * the values of a `bool` column (1 / 0 at run time).
  */
-export type ValueColumn = ColumnArray | readonly (SqlValue | boolean)[] | { readonly data: ColumnArray | readonly (SqlValue | boolean)[]; readonly nulls: Uint8Array };
+/**
+ * A value in a column of values: an engine value, a JS boolean (a `bool` column, ADR 0018), a JS `Date` (a `datetime`,
+ * ADR 0019), or a JS array or object (a list or struct column, ADR 0020).
+ */
+export type ColumnValue = SqlValue | boolean | Date | readonly unknown[] | { readonly [field: string]: unknown };
+export type ValueColumn = ColumnArray | readonly ColumnValue[] | { readonly data: ColumnArray | readonly ColumnValue[]; readonly nulls: Uint8Array };
 
 export interface SortKey {
   readonly expr: PlanExpr;
@@ -200,6 +205,19 @@ export type PlanOp = OpMeaning & (
       /** The aggregates computed over each group's rows with each value: one output column per value and call. */
       readonly aggs: readonly AggCall[];
       readonly ordered?: 'first';
+    }
+  | {
+      /**
+       * One row per element of a list column (ADR 0020): the input's columns with `column` replaced by each element, in
+       * the input's order and then the list's. An empty or NULL list gives one row with NULL. With `position`, each row
+       * also has the element's position (from 0) as a last column.
+       */
+      readonly op: 'explode';
+      readonly input: PlanOp;
+      readonly column: number;
+      /** The list column's type (`list<T>`); the output column's is `T`. */
+      readonly type: PlanType;
+      readonly position?: boolean;
     }
   | {
       readonly op: 'unpivot';

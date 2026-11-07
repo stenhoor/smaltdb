@@ -26,6 +26,21 @@ function bytesOf(v: SqlValue, fn: string): Uint8Array {
   throw mismatch(`${fn} takes a list or struct value, not ${typeof v === 'string' ? 'text' : typeof v}`);
 }
 
+/**
+ * The elements of `bytes`, remembered for the last list decoded. `explode` reads one list's length and its elements
+ * position by position, the same bytes each time: without this, a list of n elements costs n decodes of n elements.
+ * Callers must not change the array.
+ */
+let lastBytes: Uint8Array | null = null;
+let lastValues: readonly SqlValue[] = [];
+function elements(bytes: Uint8Array): readonly SqlValue[] {
+  if (bytes !== lastBytes) {
+    lastValues = decodeKey(bytes);
+    lastBytes = bytes;
+  }
+  return lastValues;
+}
+
 function op(
   name: string,
   min: number,
@@ -101,13 +116,13 @@ const LIST_OPS: [string, ScalarFunction][] = [
   op('struct_of', 1, -1, (a) => `struct<${a.map((x, i) => `f${i} ${x.type === 'null' ? 'any' : x.type}`).join(', ')}>` as StaticType, () => (v) => encodeKey(v)),
   op('list_len', 1, 1, () => 'int', ([a]) => {
     listOf('list_len', a!.type);
-    return ([v]) => (v === null ? null : decodeKey(bytesOf(v, 'list_len')).length);
+    return ([v]) => (v === null ? null : elements(bytesOf(v, 'list_len')).length);
   }),
   op('list_get', 2, 2, elementOf('list_get'), ([a]) => {
     listOf('list_get', a!.type);
     return ([v, i]) => {
       if (v === null || i === null) return null;
-      const vals = decodeKey(bytesOf(v, 'list_get'));
+      const vals = elements(bytesOf(v, 'list_get'));
       const k = intArg(i, 'list_get', 'the index');
       const at = k < 0 ? vals.length + k : k;
       return at >= 0 && at < vals.length ? vals[at]! : null;
