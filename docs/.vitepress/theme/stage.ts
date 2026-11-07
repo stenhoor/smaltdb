@@ -11,21 +11,24 @@ const STAGES = {
 
 const WORKS = 'https://smaltworks.dev'
 
-/** The site's Layout, with the smalt badges in place. Switch `stage` to 'release' when the product reaches 1.0. */
-export function withSmaltworks(DefaultTheme: { Layout: any }, stage: keyof typeof STAGES = 'wip') {
+/**
+ * The site's Layout, with the smalt badges in place. Switch `stage` to 'release' when the product reaches 1.0. `dir` is
+ * the folder of the badge files in the site's public directory, if not its root ('/badges/').
+ */
+export function withSmaltworks(DefaultTheme: { Layout: any }, stage: keyof typeof STAGES = 'wip', dir = '/') {
   const { file, alt } = STAGES[stage]
   const badge = () =>
     h('div', { class: 'sw-stage' }, [
       h('a', { href: `${WORKS}/stability` }, [
-        h('img', { class: 'sw-light', src: withBase(`/${file}.svg`), alt, height: 56 }),
-        h('img', { class: 'sw-dark', src: withBase(`/${file}-on-dark.svg`), alt, height: 56 }),
+        h('img', { class: 'sw-light', src: withBase(`${dir}${file}.svg`), alt, height: 56 }),
+        h('img', { class: 'sw-dark', src: withBase(`${dir}${file}-on-dark.svg`), alt, height: 56 }),
       ]),
     ])
   const project = () =>
     h('div', { class: 'sw-project' }, [
       h('a', { href: `${WORKS}/` }, [
-        h('img', { class: 'sw-light', src: withBase('/a-smaltworks-project.svg'), alt: 'A smaltworks project', height: 28 }),
-        h('img', { class: 'sw-dark', src: withBase('/a-smaltworks-project-on-dark.svg'), alt: 'A smaltworks project', height: 28 }),
+        h('img', { class: 'sw-light', src: withBase(`${dir}a-smaltworks-project.svg`), alt: 'A smaltworks project', height: 28 }),
+        h('img', { class: 'sw-dark', src: withBase(`${dir}a-smaltworks-project-on-dark.svg`), alt: 'A smaltworks project', height: 28 }),
       ]),
       h('span', null, 'MIT License'),
     ])

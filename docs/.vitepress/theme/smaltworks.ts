@@ -25,10 +25,13 @@ export function smaltworksMenu() {
   }
 }
 
-/** The footer of every product site. `base` is the site's VitePress base ('/' or '/smaltql/'). */
-export function smaltworksFooter(base = '/') {
+/**
+ * The footer of every product site. `base` is the site's VitePress base ('/' or '/smaltql/'); `dir` is the folder of
+ * the badge files in the site's public directory, if not its root ('badges/').
+ */
+export function smaltworksFooter(base = '/', dir = '') {
   const img = (file: string, cls: string) =>
-    `<img class="${cls}" src="${base}${file}" alt="A smaltworks project" height="28">`
+    `<img class="${cls}" src="${base}${dir}${file}" alt="A smaltworks project" height="28">`
   return {
     message: `<a href="${WORKS}/">${img('a-smaltworks-project.svg', 'sw-light')}${img('a-smaltworks-project-on-dark.svg', 'sw-dark')}</a>`,
     copyright: 'MIT License',
