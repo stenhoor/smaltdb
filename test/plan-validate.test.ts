@@ -56,7 +56,7 @@ describe('plan validator', () => {
     bad(scan('nope'), /no such table: nope/);
     bad(scan('t', [0, 5]), /table t has no column 5/);
     bad(project(scan(), [{ k: 'call', fn: 'no_such_fn', args: [], type: 'any' }]), /no such function: no_such_fn/);
-    bad(project(scan(), [{ k: 'call', fn: 'sql.add', args: [lit(1)], type: 'int' }]), /wrong number of arguments to sql\.add: 1/);
+    bad(project(scan(), [{ k: 'call', fn: 'add', args: [lit(1)], type: 'int' }]), /wrong number of arguments to add: 1/);
     bad(project(scan(), [{ k: 'call', fn: 'abs', args: [lit(1), lit(2)], type: 'int' }]), /wrong number of arguments to abs: 2/);
     bad({ op: 'aggregate', input: scan(), keys: [], aggs: [{ fn: 'nope', args: [], star: false, distinct: false, collation: 'binary', type: 'int' }], carry: [] }, /no such aggregate function: nope/);
     bad(project(scan(), [{ k: 'lit', value: 1, type: 'bool' as never }]), /unknown type "bool"/);

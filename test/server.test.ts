@@ -58,7 +58,7 @@ describe('EngineServer', () => {
     t.send('local', { op: 'exec', sql: 'CREATE TABLE t(a INT, b TEXT); INSERT INTO t VALUES (1, \'x\'), (2, \'y\'), (3, \'z\')' });
     const wire = (stmt: unknown) => ({ plan: encodeDataJSON(stmt), planVersion: PLAN_FORMAT_VERSION });
     const a = p.col(0, 0, 'int');
-    const big = p.filter(p.scan('t', [0, 1]), p.call('sql.gt', [a, p.param(0, 'int')], 'int'));
+    const big = p.filter(p.scan('t', [0, 1]), p.call('cmp_gt', [a, p.param(0, 'int')], 'int'));
     const q = t.send('tab-b', { op: 'queryPlan', ...wire({ kind: 'query', plan: big, columns: [{ name: 'a' }, { name: 'b' }] }), params: [1] });
     await until('the plan query', () => t.done('tab-b', q));
     expect(t.of('tab-b', q).find((m) => m.kind === 'columns')).toMatchObject({ columns: ['a', 'b'] });

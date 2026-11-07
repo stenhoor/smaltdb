@@ -89,8 +89,8 @@ export interface CatalogFunction {
   readonly dateTime?: true;
   /** The result type when nothing is known of the arguments (`resultType` for given argument types). */
   readonly result: PlanType;
-  /** One of the engine's own operations (ADR 0016 section 1), with the former names it also answers to. */
-  readonly operation?: { readonly aliases: readonly string[] };
+  /** One of the engine's own operations (ADR 0016 section 1), not a named scalar function. */
+  readonly operation?: true;
   /** What the planner and code generation know about it (comparisons, offsets, patterns, …). */
   readonly traits: Readonly<Record<string, string | number | boolean>>;
 }

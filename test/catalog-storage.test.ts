@@ -36,7 +36,7 @@ describe('catalog storage', () => {
     expect(() => d.exec("INSERT INTO p(code) VALUES ('AB')")).toThrow(/UNIQUE/);
     expect(d.query('SELECT * FROM pv ORDER BY i').rows).toEqual([[1, 'AB'], [2, 'CD']]);
     const idx = d.getTable('c')!.indexes.find((i) => i.name === 'c_expr')!;
-    expect(idx.columns[0].expr).toMatchObject({ text: 'pid * 2', expr: { k: 'call', fn: 'sql.mul' } });
+    expect(idx.columns[0].expr).toMatchObject({ text: 'pid * 2', expr: { k: 'call', fn: 'mul' } });
     expect(idx.where).toMatchObject({ text: 'pid IS NOT NULL', expr: { k: 'isNull' } });
     expect(d.query('SELECT id FROM c INDEXED BY c_expr WHERE pid * 2 = 2 AND pid IS NOT NULL').rows).toEqual([[1]]);
     d.exec('REFRESH MATERIALIZED VIEW pm');
@@ -115,7 +115,7 @@ describe('catalog storage', () => {
     const i = decodeDef(defs.get('ti')!, 'ti');
     expect(i).toMatchObject({ kind: 'index', index: { name: 'ti', table: 't', unique: false, columns: [{ column: 2, desc: false, collation: 'nocase' }, { column: -1, desc: true, collation: 'binary', expr: { text: 'a * 2' } }] } });
     if (i.kind !== 'index') throw new Error('not an index');
-    expect(i.index.where?.expr).toMatchObject({ k: 'call', fn: 'sql.gt' });
+    expect(i.index.where?.expr).toMatchObject({ k: 'call', fn: 'cmp_gt' });
     // Encoding a decoded definition gives the same definition.
     const same = (a: StoredText, b: StoredText): void => expect([JSON.parse(a.def), a.exprs && JSON.parse(a.exprs)]).toEqual([JSON.parse(b.def), b.exprs && JSON.parse(b.exprs)]);
     same(encodeDef(decodeDef(t, 't')), t);

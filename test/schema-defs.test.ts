@@ -53,7 +53,7 @@ describe('schema definitions', () => {
     expect(t.checks.map((c) => [c.name, c.text, c.expr?.k])).toEqual([[undefined, 'a >= 0', 'call'], ['pos', 'length(b) < 9', 'call']]);
     expect(t.columns[2].default).toMatchObject({ text: "'x' || 'y'", expr: { k: 'call' }, value: null });
     const idx = t.indexes.find((i) => i.name === 'ta')!;
-    expect(idx.columns[0].expr).toMatchObject({ text: 'a * 2', expr: { k: 'call', fn: 'sql.mul' } });
+    expect(idx.columns[0].expr).toMatchObject({ text: 'a * 2', expr: { k: 'call', fn: 'mul' } });
     expect(idx.where).toMatchObject({ text: 'b IS NOT NULL', expr: { k: 'isNull' } });
     expect(db.query("PRAGMA table_info(t)").rows.map((r) => r[4])).toEqual([null, null, "'x' || 'y'"]);
   });

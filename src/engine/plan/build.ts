@@ -22,7 +22,7 @@ export const or = (...args: PlanExpr[]): PlanExpr => ({ k: 'or', args });
 export const not = (arg: PlanExpr): PlanExpr => ({ k: 'not', arg });
 export const isNull = (arg: PlanExpr): PlanExpr => ({ k: 'isNull', arg, not: false });
 export const isNotNull = (arg: PlanExpr): PlanExpr => ({ k: 'isNull', arg, not: true });
-/** A conversion: `fn` names it (e.g. `sql.cast_integer`). */
+/** A conversion: `fn` names it (e.g. `cast_integer`). */
 export const cast = (fn: string, arg: PlanExpr, to: PlanType): PlanExpr => ({ k: 'cast', fn, to, arg });
 /** Searched CASE: the first `when` that is true gives the value, else `otherwise` (default NULL). */
 export const caseWhen = (whens: readonly { when: PlanExpr; then: PlanExpr }[], type: PlanType, otherwise: PlanExpr = lit(null)): PlanExpr => ({ k: 'case', whens, else: otherwise, type });

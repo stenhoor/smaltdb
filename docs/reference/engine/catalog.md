@@ -37,8 +37,7 @@ language, bound where it is read.
 
 `functions()` lists every function a plan can call, and `function(name, kind?)` finds one. They are the same for every
 database: a language reads them where it has no database at hand from `engineFunctions` in `smaltdb/language`
-(`functions`, `function` and `resultType`). A former `sql.*` name finds
-its operation. A name can have one function of each kind: `min` and `max` are a scalar of several arguments and an
+(`functions`, `function` and `resultType`). A name can have one function of each kind: `min` and `max` are a scalar of several arguments and an
 aggregate.
 
 | Field | |
@@ -48,7 +47,7 @@ aggregate.
 | `deterministic` | the same arguments always give the same result: false for `random()` and for anything that reads the clock or time zone |
 | `dateTime` | set on the date and time functions: deterministic unless an argument asks for the current time (`'now'`), so allowed in index expressions and CHECK constraints, where reading the clock fails when it runs |
 | `result` | the result type when nothing is known of the arguments |
-| `operation` | set on the engine's own [operations](./plans#functions), with the former names they answer to (`aliases`) |
+| `operation` | `true` on the engine's own [operations](./plans#functions) |
 | `traits` | what the planner and code generation know of it: `compare`, `offset`, `inList`, `pattern`, … |
 
 ## Settings
