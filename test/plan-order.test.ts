@@ -2,7 +2,8 @@
  * Order guarantees (ADR 0016 section 4): `sort` is stable, in memory, as a top-N and when it spills, on row and
  * columnar tables and with an index on the key; `filter`, `project`, `limit` and a `window` without its own order keep
  * their input's order; `semi` and `anti` joins keep the left input's order, top-level and nested, with and without a
- * condition and with conditions that read an enclosing plan's row.
+ * condition and with conditions that read an enclosing plan's row; a `unionAll` gives its first input's rows, then its
+ * second's.
  */
 import { describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
@@ -165,6 +166,24 @@ describe('semi and anti joins keep the left order', () => {
     expect(w.queryPlan({ kind: 'write', plan: copied }).changes).toBe(2);
     expect(w.queryPlan(p.scan('r', [0])).rows).toEqual([[2], [4], [1], [3]]);
   });
+});
+
+describe("unionAll gives its first input's rows, then its second's, each in its order", () => {
+  for (const storage of ['row', 'columnar'] as const) {
+    it(storage, () => {
+      const d = table(storage);
+      // Two inputs in orders of their own (k descending; v ascending), over the same table.
+      const first = p.filter(p.sort(p.scan('t', [0, 1]), [p.desc(k)]), p.call('cmp_lt', [id, p.lit(500)], 'int'));
+      const second = p.project(p.sort(p.scan('t', [0, 2]), [p.asc(p.col(0, 1, 'int'))]), [id, p.col(0, 1, 'int')]);
+      const rows = d.queryPlan(p.setop('unionAll', first, second, 2)).rows;
+      const a = stableSorted(ids(499).map((i) => [i, i % 7]), (r) => r[1], true);
+      const b = stableSorted(ids(N).map((i) => [i, (i * 7919) % N]), (r) => r[1], false);
+      expect(rows).toEqual([...a, ...b]);
+      // Nested: a union of unions keeps the order of all its inputs.
+      const nested = d.queryPlan(p.setop('unionAll', p.setop('unionAll', first, first, 2), second, 2)).rows;
+      expect(nested).toEqual([...a, ...a, ...b]);
+    });
+  }
 });
 
 describe('order on request', () => {

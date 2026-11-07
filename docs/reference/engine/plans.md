@@ -79,6 +79,7 @@ it compares every pair of rows.
   spills to disk.
 - `filter`, `project` and `limit` keep their input's order, and so does a `window` without its own `order`.
 - `semi` and `anti` joins keep the left input's order.
+- A `setop` of kind `unionAll` gives its first input's rows, in their order, then its second's.
 
 Other operations keep an order when the plan asks, since keeping it costs time:
 
