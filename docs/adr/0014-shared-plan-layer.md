@@ -1,6 +1,6 @@
 # ADR 0014: A shared engine plan layer for several languages
 
-- **Status:** proposed (draft for the owner's review)
+- **Status:** accepted (owner's decisions below, 2026-11-03); carried out through ADR 0015 and ADR 0016
 - **Date:** 2026-11-03
 
 ## Context
