@@ -75,7 +75,7 @@ console.log(again.query('SELECT a FROM t').rows); // [['kept']]
 | Method | Description |
 |---|---|
 | `exec(sql: string, params?: BindParams): void` | Run one or more statements, discarding rows. With `params`, `sql` must be one statement (else `SMALT_MISUSE`). |
-| `query(sql: string, params?: BindParams): QueryResult` | Run one statement and return `{ columns, rows }`. |
+| `query(sql: string, params?: BindParams, options?: { temporal?: TemporalForm }): QueryResult` | Run one statement and return `{ columns, rows }`. `temporal` picks how dates and times come back. |
 | `run(sql: string, params?: BindParams): RunResult` | Run one statement for effect and return `{ changes, lastInsertRowid }`. |
 | `prepare(sql: string): Statement` | Compile one statement. See [Statement](#statement). |
 | `changes(): number` | Rows changed by the most recent `INSERT`, `UPDATE` or `DELETE`. |
@@ -128,8 +128,8 @@ A statement can also be given as plan data instead of SQL: the engine's own desc
 | Method | Description |
 |---|---|
 | `preparePlan(stmt: PlanStatementInput): PlanStatement` | Compile a statement given as plan data. A `PlanStatement` has the same members as a [`Statement`](#statement), but no `sql`. |
-| `queryPlan(stmt: PlanStatementInput, params?: SqlValue[]): QueryResult` | Run a statement given as plan data and return `{ columns, rows }`. Compiled plans are cached by their canonical form (see `statementCacheSize`). |
-| `queryPlanAsync(stmt, params?, options?: { signal?: AbortSignal }): Promise<QueryResult>` | `queryPlan` for a plan that reads [external data](#external-data). |
+| `queryPlan(stmt: PlanStatementInput, params?: SqlValue[], options?: { temporal?: TemporalForm }): QueryResult` | Run a statement given as plan data and return `{ columns, rows }`. `temporal` picks how dates and times come back ([in results](../engine/running#through-the-client)). Compiled plans are cached by their canonical form (see `statementCacheSize`). |
+| `queryPlanAsync(stmt, params?, options?: { signal?: AbortSignal; temporal?: TemporalForm }): Promise<QueryResult>` | `queryPlan` for a plan that reads [external data](#external-data). |
 
 The `plan` namespace holds the format's types, builders, the validator (`validatePlan`) and the codec (`planToJSON`, `planFromJSON`, `encodePlan`, `decodePlan`). `smaltdb/plan` exports the same without the validator. An invalid plan fails with [`SMALT_PLAN`](./errors#smalt-plan).
 

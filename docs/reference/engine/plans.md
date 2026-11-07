@@ -22,7 +22,7 @@ Three rules run through the format:
 | `int` | 64-bit integers: JavaScript numbers within ±(2^53 − 1), `bigint` beyond |
 | `bool` | truth values: 0 and 1 while a plan runs (an integer to every operation), `true` and `false` in results ([ADR 0018](../../adr/0018-bool-and-nan.md)) |
 | `date` | calendar dates: days since 1970-01-01 while a plan runs, text such as `2026-11-07` in results ([ADR 0019](../../adr/0019-dates-and-times.md)) |
-| `datetime` | dates and times: µs since 1970-01-01 00:00:00 (a `bigint` beyond 2^53: after 2255 or before 1685), text such as `2026-11-07 12:30:00.5` in results |
+| `datetime` | dates and times: µs since 1970-01-01 00:00:00 (a `bigint` beyond 2^53: after 2255 or before 1685), text such as `2026-11-07 12:30:00.500` in results |
 | `time` | times of day: µs since midnight, text such as `12:30:00` in results |
 | `duration` | spans of time: µs, ISO 8601 text such as `P1DT2H` in results |
 | `real` | 64-bit floating point |

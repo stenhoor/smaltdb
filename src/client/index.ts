@@ -8,11 +8,12 @@ import type { ErrorDetails } from '../engine/errors.js';
 import type { CatalogData } from '../engine/plan/catalog.js';
 import type { PlanStatementInput } from '../engine/plan/statement.js';
 import { PLAN_FORMAT_VERSION, type PlanType } from '../engine/plan/types.js';
-import { isTemporal, temporalText } from '../shared/temporal.js';
+import { type TemporalForm, isTemporal, temporalInForm, temporalText } from '../shared/temporal.js';
 import { type BusMessage, type Params, type Request, type RequestBody, type Response, type WireColumn, columnValue } from '../shared/protocol.js';
 
 /** A statement as plan data (the plan format is experimental): its types, builders and codec are in `smaltdb/plan`. */
 export type { SqlValue, Params, PlanStatementInput };
+export type { TemporalForm } from '../shared/temporal.js';
 
 /** A plan's parameters: positional. */
 export type PlanParams = readonly (SqlValue | boolean | undefined)[];
@@ -65,6 +66,8 @@ export type RowMode = 'object' | 'array' | 'columnar';
 
 export interface QueryOptions {
   rowMode?: RowMode;
+  /** Dates and times (ADR 0019): `text` (default), `date` (JS `Date` for date and datetime) or `temporal` (`Temporal` objects). */
+  temporal?: TemporalForm;
   /** Rows per batch sent from the worker (default 4096). */
   batchSize?: number;
   /** Cancel the request: queued requests and streams stop at once; running statements are interrupted when possible. */
@@ -455,13 +458,13 @@ export class Database implements Queryable {
   /** @internal Unlocked query (used inside transactions). */
   async rawQuery(sql: string, params: Params | undefined, options: QueryOptions): Promise<unknown> {
     const res = (await this.request({ op: 'query', sql, params, batchSize: options.batchSize }, options.signal)) as Collected;
-    return materialize(res, options.rowMode ?? 'object');
+    return materialize(res, options.rowMode ?? 'object', options.temporal);
   }
 
   /** @internal Unlocked plan query (used inside transactions). */
   async rawQueryPlan(stmt: PlanStatementInput, params: PlanParams | undefined, options: QueryOptions): Promise<unknown> {
     const res = (await this.request({ op: 'queryPlan', ...planRequest(stmt, options.transfer), params, batchSize: options.batchSize }, options.signal)) as Collected;
-    return materialize(res, options.rowMode ?? 'object');
+    return materialize(res, options.rowMode ?? 'object', options.temporal);
   }
 
   /**
@@ -560,7 +563,7 @@ export class Database implements Queryable {
         if (msg.kind === 'columns') {
           columns = msg.columns;
           types = msg.types;
-        } else if (msg.kind === 'batch') ready.push(materialize({ columns, types, batches: [{ length: msg.length, cols: msg.cols }] }, mode));
+        } else if (msg.kind === 'batch') ready.push(materialize({ columns, types, batches: [{ length: msg.length, cols: msg.cols }] }, mode, options.temporal));
         else if (msg.kind === 'done') finished = true;
         else if (msg.kind === 'error') {
           finished = true;
@@ -785,7 +788,7 @@ export class PreparedStatement {
   async rawQuery(params: Params | undefined, options: QueryOptions): Promise<unknown> {
     this.check();
     const res = (await this.db.request({ op: 'stmtQuery', stmt: this.id, params, batchSize: options.batchSize }, options.signal)) as Collected;
-    return materialize(res, options.rowMode ?? 'object');
+    return materialize(res, options.rowMode ?? 'object', options.temporal);
   }
 
   /** @internal */
@@ -829,8 +832,8 @@ interface Collected {
  * `res` in `mode`. A write's counts are `changes` and `lastInsertRowid` on the result, not enumerable, so rows compare
  * and serialize as before.
  */
-function materialize(res: Collected, mode: RowMode): unknown {
-  const out = materializeRows(res.columns, res.types ?? res.columns.map(() => 'any'), res.batches, mode);
+function materialize(res: Collected, mode: RowMode, temporal?: TemporalForm): unknown {
+  const out = materializeRows(res.columns, res.types ?? res.columns.map(() => 'any'), res.batches, mode, temporal);
   if (res.run) {
     Object.defineProperty(out, 'changes', { value: res.run.changes, enumerable: false });
     Object.defineProperty(out, 'lastInsertRowid', { value: res.run.lastInsertRowid, enumerable: false });
@@ -838,7 +841,7 @@ function materialize(res: Collected, mode: RowMode): unknown {
   return out;
 }
 
-function materializeRows(columns: string[], columnTypes: PlanType[], batches: { length: number; cols: WireColumn[] }[], mode: RowMode): unknown {
+function materializeRows(columns: string[], columnTypes: PlanType[], batches: { length: number; cols: WireColumn[] }[], mode: RowMode, form: TemporalForm = 'text'): unknown {
   const width = columns.length;
   // Columns typed bool (ADR 0018) travel as 0 / 1 and are given as false / true; temporal ones (ADR 0019) travel as
   // days or µs and are given as text.
@@ -849,7 +852,9 @@ function materializeRows(columns: string[], columnTypes: PlanType[], batches: { 
     if (v === null) return v;
     if (bool[c]) return (v !== 0 && v !== 0n) as unknown as SqlValue;
     const t = temporal[c];
-    return t ? temporalText(t, v) : v;
+    if (!t) return v;
+    const text = temporalText(t, v) as string;
+    return form === 'text' ? text : (temporalInForm(t, text, form) as SqlValue);
   };
   if (mode === 'columnar') {
     let length = 0;

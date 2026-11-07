@@ -187,3 +187,53 @@ export function parseTime(text: string): number | null {
 
 /** A JS Date as a `datetime` value: its ms as µs. */
 export const datetimeFromDate = (d: Date): number => d.getTime() * 1000;
+
+// ------------------------------------------------------------------ result forms
+
+/**
+ * How results give temporal values (ADR 0019 decision 3): `text` (the default), `date` (JS `Date` for `date` and
+ * `datetime`, ms; `time` and `duration` stay text, as JS has no type for them) or `temporal` (`Temporal.PlainDate`,
+ * `PlainDateTime`, `PlainTime`, `Duration`, where the runtime has `Temporal`).
+ */
+export type TemporalForm = 'text' | 'date' | 'temporal';
+
+interface TemporalApi {
+  PlainDate: { from(s: string): unknown };
+  PlainDateTime: { from(s: string): unknown };
+  PlainTime: { from(s: string): unknown };
+  Duration: { from(s: string): unknown };
+}
+
+/** The text of a temporal value (as `temporalText` gives it) in `form`. */
+export function temporalInForm(t: TemporalType, text: string, form: TemporalForm): unknown {
+  if (form === 'text') return text;
+  if (form === 'date') {
+    if (t === 'date') return new Date(parseDate(text)! * 86_400_000);
+    if (t === 'datetime') return new Date(Math.floor(Number(parseDatetime(text)!) / 1000));
+    return text;
+  }
+  const api = (globalThis as { Temporal?: TemporalApi }).Temporal;
+  if (!api) throw new Error('temporal: this runtime has no Temporal API; ask for text or date instead');
+  switch (t) {
+    case 'date':
+      return api.PlainDate.from(text);
+    case 'datetime':
+      return api.PlainDateTime.from(text.replace(' ', 'T'));
+    case 'time':
+      return api.PlainTime.from(text);
+    default:
+      return api.Duration.from(text);
+  }
+}
+
+/** `rows` (as results give them, temporal values as text) with their temporal columns in `form`. */
+export function rowsInForm<R extends unknown[]>(rows: R[], types: readonly string[], form: TemporalForm | undefined): R[] {
+  if (!form || form === 'text') return rows;
+  const cols: [number, TemporalType][] = [];
+  types.forEach((t, i) => {
+    if (isTemporal(t)) cols.push([i, t]);
+  });
+  if (cols.length === 0) return rows;
+  for (const r of rows) for (const [c, t] of cols) if (typeof r[c] === 'string') r[c] = temporalInForm(t, r[c] as string, form);
+  return rows;
+}

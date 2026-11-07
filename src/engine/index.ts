@@ -11,6 +11,7 @@ export { crc32c } from './storage/crc32c.js';
 export { Database, PreparedStatement, Statement, PlanStatement, RowCursor, type RunResult, type QueryResult, type BindParams, type DatabaseOptions } from './database.js';
 export * as plan from './plan/public.js';
 export type { PlanStatementInput, PlanColumn } from './plan/statement.js';
+export type { TemporalForm } from '../shared/temporal.js';
 // The engine carries no language: SQL is smaltql's (`import 'smaltql/register'`), ADR 0015.
 export { registerLanguage, type SmaltLanguage, type LanguageStatement, type ObjectReference } from './plan/language.js';
 export {
