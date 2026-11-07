@@ -355,7 +355,8 @@ function checkedArithmeticFn(op: '+' | '-' | '*', name: string, a: SqlArg, b: Sq
       if (real || !isIntValue(x) || !isIntValue(y)) {
         const fx = Number(x);
         const fy = Number(y);
-        return realResult(op === '+' ? fx + fy : op === '-' ? fx - fy : fx * fy);
+        // IEEE 754 on reals (ADR 0018): Inf - Inf and a NaN operand give NaN.
+        return op === '+' ? fx + fy : op === '-' ? fx - fy : fx * fy;
       }
       if (typeof x === 'number' && typeof y === 'number') {
         const s = op === '+' ? x + y : op === '-' ? x - y : x * y;

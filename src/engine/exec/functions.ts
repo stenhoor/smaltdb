@@ -292,16 +292,15 @@ const isInt = (v: number | bigint, t: StaticType): boolean => typeof v === 'bigi
 const twoNumberType = (args: readonly { type: StaticType }[]): StaticType =>
   args[0].type === 'int' && args[1].type === 'int' ? 'int' : args[0].type === 'real' || args[1].type === 'real' ? 'real' : 'num';
 
-/** x / y as a float always (7 / 2 = 3.5); y = 0 gives ±Infinity, and 0 / 0 gives NULL until NaN is a value (ADR 0016 §3). */
+/** x / y as a float always (7 / 2 = 3.5), IEEE 754: y = 0 gives ±Infinity, and 0 / 0 gives NaN (ADR 0018). */
 function divFloat(x: SqlValue, y: SqlValue): SqlValue {
   const a = numArg(x);
   const b = numArg(y);
   if (a === null || b === null) return null;
-  const r = Number(a) / Number(b);
-  return Number.isNaN(r) ? null : r;
+  return Number(a) / Number(b);
 }
 
-/** x / y rounded toward negative infinity: an integer for two integers (-7 // 2 = -4); y = 0 gives NULL. */
+/** x / y rounded toward negative infinity: an integer for two integers (-7 // 2 = -4); y = 0 gives NULL. NaN stays NaN. */
 function divFloor(x: SqlValue, y: SqlValue, types: readonly { type: StaticType }[]): SqlValue {
   const a = numArg(x);
   const b = numArg(y);
@@ -315,11 +314,10 @@ function divFloor(x: SqlValue, y: SqlValue, types: readonly { type: StaticType }
     return d >= -(2n ** 63n) && d < 2n ** 63n ? normalizeInt(d) : Number(d);
   }
   if (Number(b) === 0) return null;
-  const r = Math.floor(Number(a) / Number(b));
-  return Number.isNaN(r) ? null : r;
+  return Math.floor(Number(a) / Number(b));
 }
 
-/** The remainder of floor division, with the sign of the divisor (-7 mod 2 = 1); y = 0 gives NULL. */
+/** The remainder of floor division, with the sign of the divisor (-7 mod 2 = 1); y = 0 gives NULL. NaN stays NaN. */
 function modFloor(x: SqlValue, y: SqlValue, types: readonly { type: StaticType }[]): SqlValue {
   const a = numArg(x);
   const b = numArg(y);
@@ -336,7 +334,7 @@ function modFloor(x: SqlValue, y: SqlValue, types: readonly { type: StaticType }
   if (fb === 0) return null;
   let r = Number(a) % fb;
   if (r !== 0 && r < 0 !== fb < 0) r += fb;
-  return Number.isNaN(r) ? null : r;
+  return r;
 }
 
 /** `v` rounded to `n` decimal places with halves to even, decided on the exact binary value (0.125 → 0.12, 2.675 → 2.67). */
@@ -730,6 +728,8 @@ class SumState implements AggregateState {
   constructor(
     private readonly mode: 'sum' | 'total' | 'avg',
     private readonly argReal: boolean,
+    /** `sum_float` / `avg_float` (ADR 0018): a NaN result (a NaN term, Inf + -Inf) stays NaN instead of NULL. */
+    private readonly ieee = false,
   ) {}
 
   step(args: SqlValue[]): void {
@@ -798,6 +798,7 @@ class SumState implements AggregateState {
     this.removed++;
     const ax = Math.abs(x);
     if (ax > this.removedMax) this.removedMax = ax;
+    // False for a NaN sum too, so a frame that drops a NaN or infinite term is rebuilt.
     return Math.abs(this.real + this.comp) >= 1e9 * this.removed * Number.EPSILON * Number.EPSILON * this.removedMax;
   }
 
@@ -817,11 +818,11 @@ class SumState implements AggregateState {
 
   /**
    * The REAL sum. An infinite term makes the compensation NaN or infinite, and SQLite then leaves it out; a NaN sum
-   * (Inf + -Inf) is NULL, as SQLite stores every NaN result.
+   * (Inf + -Inf) is NULL, as SQLite stores every NaN result, except for the IEEE aggregates, which keep NaN.
    */
   private realSum(): number | null {
     const r = Number.isFinite(this.comp) ? this.real + this.comp : this.real;
-    return Number.isNaN(r) ? null : r;
+    return Number.isNaN(r) && !this.ieee ? null : r;
   }
 
   final(): SqlValue {
@@ -950,6 +951,17 @@ export const aggregateFunctions = new Map<string, AggregateFunction>([
   ],
   ['total', { minArgs: 1, maxArgs: 1, resultType: () => 'real', create: (t) => new SumState('total', t[0] === 'real') }],
   ['avg', { minArgs: 1, maxArgs: 1, resultType: () => 'real', create: (t) => new SumState('avg', t[0] === 'real') }],
+  // IEEE 754 sums (ADR 0018): as sum and avg, but a NaN term or Inf + -Inf gives NaN rather than NULL.
+  [
+    'sum_float',
+    {
+      minArgs: 1,
+      maxArgs: 1,
+      resultType: (t) => (t[0] === 'int' ? 'int' : t[0] === 'real' ? 'real' : 'num'),
+      create: (t) => new SumState('sum', t[0] === 'real', true),
+    },
+  ],
+  ['avg_float', { minArgs: 1, maxArgs: 1, resultType: () => 'real', create: (t) => new SumState('avg', t[0] === 'real', true) }],
   ['min', { minArgs: 1, maxArgs: 1, resultType: (t) => t[0], create: (_t, c) => new MinMaxState(1, c) }],
   ['max', { minArgs: 1, maxArgs: 1, resultType: (t) => t[0], create: (_t, c) => new MinMaxState(-1, c) }],
   ['first', { minArgs: 1, maxArgs: 3, resultType: (t) => t[0], create: (_t, c) => new FirstLastState(false, c) }],

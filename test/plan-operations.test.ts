@@ -25,7 +25,7 @@ describe('division and remainder', () => {
     expect(op('div_float', int(-7), int(2))).toBe(-3.5);
     expect(op('div_float', int(1), int(0))).toBe(Infinity);
     expect(op('div_float', int(-1), int(0))).toBe(-Infinity);
-    expect(op('div_float', int(0), int(0))).toBe(null); // NaN, until NaN is a value (ADR 0016 section 3)
+    expect(op('div_float', int(0), int(0))).toBeNaN(); // a value of real (ADR 0018)
     expect(op('div_float', nul, int(2))).toBe(null);
     expect(op('div_trunc', int(7), int(2))).toBe(3); // SQL's division, for comparison
   });

@@ -135,7 +135,9 @@ values give rows too.
 
 **Aggregates.** `keys` are `{ expr, collation }`. Each call (`AggCall`) is
 `{ fn, args, star, distinct, filter?, collation, type }`: `fn` names an aggregate function (`count`, `sum`, `avg`,
-`min`, `max`, `first`, `last`, `group_concat`, `total`, and the [others](https://stenhoor.github.io/smaltql/reference/functions/aggregate)); `star` is `count(*)`. `carry` passes
+`min`, `max`, `first`, `last`, `group_concat`, `total`, `sum_float`, `avg_float`, and the [others](https://stenhoor.github.io/smaltql/reference/functions/aggregate)); `star` is `count(*)`.
+`sum` and `avg` follow SQLite, where a NaN result (a NaN term, or `Infinity` and `-Infinity` together) is NULL; `sum_float` and
+`avg_float` are the same but keep it NaN ([ADR 0018](../../adr/0018-bool-and-nan.md)). `carry` passes
 input columns through, taken from one row of each group (SQL's bare columns). With no keys, an aggregate gives one row,
 also over no input rows.
 
@@ -217,12 +219,12 @@ picks the one it means. smaltdf, for example, divides with `div_float` where SQL
 
 | Function | Arguments | Meaning |
 |---|---|---|
-| `div_float` | 2 | Division as floats always (`7 / 2 = 3.5`). A non-zero value divided by zero is `Infinity` or `-Infinity`; `0 / 0` is NULL, until NaN is a value |
-| `div_floor` | 2 | Division rounded toward negative infinity (`-7, 2` gives `-4`): an integer for two integers, else REAL. Division by zero is NULL |
-| `mod_floor` | 2 | The remainder of `div_floor`, with the sign of the divisor (`-7, 2` gives `1`). By zero is NULL |
+| `div_float` | 2 | Division as floats always (`7 / 2 = 3.5`), IEEE 754: a non-zero value divided by zero is `Infinity` or `-Infinity`, and `0 / 0` is NaN ([ADR 0018](../../adr/0018-bool-and-nan.md)) |
+| `div_floor` | 2 | Division rounded toward negative infinity (`-7, 2` gives `-4`): an integer for two integers, else REAL, where NaN stays NaN. Division by zero is NULL |
+| `mod_floor` | 2 | The remainder of `div_floor`, with the sign of the divisor (`-7, 2` gives `1`); NaN stays NaN. By zero is NULL |
 | `round_half_even` | 1 or 2 | `x` rounded to `digits` places (default 0) with halves to even, decided on the exact binary value (`0.125` gives `0.12`, `2.675` gives `2.67`). REAL |
 | `round_half_away` | 1 or 2 | The same with halves away from zero: `round` |
-| `add_checked`, `sub_checked`, `mul_checked` | 2 | As `add`, `sub` and `mul`, except that an integer result outside the 64-bit range is an error (`SMALT_RANGE`) rather than a REAL, and a text operand is an error (`SMALT_MISMATCH`) rather than converted |
+| `add_checked`, `sub_checked`, `mul_checked` | 2 | As `add`, `sub` and `mul`, except that an integer result outside the 64-bit range is an error (`SMALT_RANGE`) rather than a REAL, and a text operand is an error (`SMALT_MISMATCH`) rather than converted. On REALs they are IEEE 754: a NaN result (`Infinity - Infinity`) stays NaN, where `add`, `sub` and `mul` give NULL |
 | `cast_integer_strict` | 1 | An integer: integers as they are, reals truncated toward zero when the result fits, text only when all of it is an integer in range. Anything else is an error (`SMALT_MISMATCH`, or `SMALT_RANGE` out of range), where `cast_integer` gives 0 or saturates. A `cast` node or a call |
 | `cast_real_strict` | 1 | A real: numbers, and text only when all of it is a number. Anything else is an error (`SMALT_MISMATCH`) |
 | `random_at` | 2 | A value in [0, 1) fixed by an integer `seed` and `index`: the same arguments always give the same value (`sample` ranks rows by it) |
