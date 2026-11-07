@@ -116,7 +116,8 @@ function comparisonFn(op: string, a: SqlArg, b: SqlArg, coll: Collation): Fn {
     };
   }
 
-  // Fast path: both operands statically numeric (no conversions or collation needed).
+  // Fast path: both operands statically numeric (no conversions or collation needed). NaN follows the total order
+  // (ADR 0018): equal to NaN, after every number; the NaN test runs only when the plain comparison fails.
   if (isNumericType(a.type) && isNumericType(b.type)) {
     switch (op) {
       case '=':
@@ -126,7 +127,7 @@ function comparisonFn(op: string, a: SqlArg, b: SqlArg, coll: Collation): Fn {
           const y = fb(r);
           if (y === null) return null;
           // eslint-disable-next-line eqeqeq
-          return (x as number) == (y as number) ? 1 : 0;
+          return (x as number) == (y as number) || (x !== x && y !== y) ? 1 : 0;
         };
       case '!=':
         return (r) => {
@@ -135,7 +136,7 @@ function comparisonFn(op: string, a: SqlArg, b: SqlArg, coll: Collation): Fn {
           const y = fb(r);
           if (y === null) return null;
           // eslint-disable-next-line eqeqeq
-          return (x as number) != (y as number) ? 1 : 0;
+          return (x as number) != (y as number) && (x === x || y === y) ? 1 : 0;
         };
       case '<':
         return (r) => {
@@ -143,7 +144,7 @@ function comparisonFn(op: string, a: SqlArg, b: SqlArg, coll: Collation): Fn {
           if (x === null) return null;
           const y = fb(r);
           if (y === null) return null;
-          return (x as number) < (y as number) ? 1 : 0;
+          return (x as number) < (y as number) || (y !== y && x === x) ? 1 : 0;
         };
       case '<=':
         return (r) => {
@@ -151,7 +152,7 @@ function comparisonFn(op: string, a: SqlArg, b: SqlArg, coll: Collation): Fn {
           if (x === null) return null;
           const y = fb(r);
           if (y === null) return null;
-          return (x as number) <= (y as number) ? 1 : 0;
+          return (x as number) <= (y as number) || y !== y ? 1 : 0;
         };
       case '>':
         return (r) => {
@@ -159,7 +160,7 @@ function comparisonFn(op: string, a: SqlArg, b: SqlArg, coll: Collation): Fn {
           if (x === null) return null;
           const y = fb(r);
           if (y === null) return null;
-          return (x as number) > (y as number) ? 1 : 0;
+          return (x as number) > (y as number) || (x !== x && y === y) ? 1 : 0;
         };
       default:
         return (r) => {
@@ -167,7 +168,7 @@ function comparisonFn(op: string, a: SqlArg, b: SqlArg, coll: Collation): Fn {
           if (x === null) return null;
           const y = fb(r);
           if (y === null) return null;
-          return (x as number) >= (y as number) ? 1 : 0;
+          return (x as number) >= (y as number) || x !== x ? 1 : 0;
         };
     }
   }

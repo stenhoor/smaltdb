@@ -35,15 +35,18 @@ export function typeRank(v: SqlValue): number {
   }
 }
 
-/** Exact numeric comparison across number and bigint. */
+/**
+ * Exact numeric comparison across number and bigint, in the engine's total order (ADR 0018): NaN equals NaN and
+ * sorts after every number, Infinity included.
+ */
 export function compareNumeric(a: number | bigint, b: number | bigint): number {
-  if (typeof a === 'number' && typeof b === 'number') return a < b ? -1 : a > b ? 1 : 0;
+  if (typeof a === 'number' && typeof b === 'number') return a < b ? -1 : a > b ? 1 : a === b ? 0 : nanOrder(a, b);
   if (typeof a === 'bigint' && typeof b === 'bigint') return a < b ? -1 : a > b ? 1 : 0;
   const flip = typeof a === 'bigint';
   const n = (flip ? b : a) as number;
   const big = (flip ? a : b) as bigint;
   let r: number;
-  if (Number.isNaN(n)) r = -1;
+  if (Number.isNaN(n)) r = 1;
   else if (n === Infinity) r = 1;
   else if (n === -Infinity) r = -1;
   else if (Number.isInteger(n)) {
@@ -51,6 +54,11 @@ export function compareNumeric(a: number | bigint, b: number | bigint): number {
     r = bn < big ? -1 : bn > big ? 1 : 0;
   } else r = BigInt(Math.floor(n)) < big ? -1 : 1;
   return flip ? -r : r;
+}
+
+/** The order of two numbers neither less nor greater than the other, so at least one is NaN: NaN sorts last. */
+function nanOrder(a: number, b: number): number {
+  return a !== a ? (b !== b ? 0 : 1) : -1;
 }
 
 export function compareBlobs(a: Uint8Array, b: Uint8Array): number {

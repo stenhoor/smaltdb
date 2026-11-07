@@ -1,6 +1,6 @@
 > SELECT count(*) FROM k WHERE v > 10
 expression:
-const $c0 = K[0]; const v0n = (r[2] === null); const v0 = v0n ? 0 : (r[2] > $c0 ? 1 : 0);
+const $c0 = K[0]; const v0n = (r[2] === null); const v0 = v0n ? 0 : ((r[2] > $c0 || r[2] !== r[2]) ? 1 : 0);
 return (v0n ? null : v0);
 --
 pipeline(H, K, T):
@@ -14,7 +14,7 @@ try {
       const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);
       let c2 = 0, c2n = true;
       if ((b[off] < 128 && (b[off + 1] & 1) === 0 && (b[off + 1] < 128 || b[off + 2] < 128)) && (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 1] | (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 2] << 8)) === 5) { const ko = off + (b[off + 1] < 128 ? 2 : 3); const vo = ko + b[off]; const bm = vo + 3; const fx = bm + 1; const vt = fx + 32; if ((b[bm + 0] & 4) !== 0) { c2n = true; c2 = 0; } else { c2n = false; c2 = dv.getFloat64(fx + 16, true); } } else { H.slow(f, off, r); { const t = r[2]; c2n = t === null; c2 = c2n ? 0 : t; } }
-      const v0n = c2n; const v0 = v0n ? 0 : (c2 > (10) ? 1 : 0);
+      const v0n = c2n; const v0 = v0n ? 0 : ((c2 > (10) || c2 !== c2) ? 1 : 0);
       if (!(!v0n && v0 != 0)) continue;
       { S0.n++; }
     }
@@ -37,7 +37,7 @@ for (let g = 0; g < ng; g++) {
     for (let i = 0; i < n; i++) {
       if (dm !== null && dm[i] === 1) continue;
       const c2n = false; const c2 = nv0[i];
-      const v0n = c2n; const v0 = v0n ? 0 : (c2 > (10) ? 1 : 0);
+      const v0n = c2n; const v0 = v0n ? 0 : ((c2 > (10) || c2 !== c2) ? 1 : 0);
       if (!(!v0n && v0 != 0)) continue;
       { S0.n++; }
     }
@@ -46,7 +46,7 @@ for (let g = 0; g < ng; g++) {
       if (dm !== null && dm[i] === 1) continue;
       let c2 = 0, c2n = true;
       if (nb0 !== null && (nb0[i >>> 3] & (1 << (i & 7))) !== 0) { c2n = true; c2 = 0; } else { const x = nv0 !== null ? nv0[i] : dc0 !== null ? dc0[cd0[i]] : vs0 !== null ? vs0[i] : null; if (x === null) { c2n = true; c2 = 0; } else { c2n = false; c2 = x; } }
-      const v0n = c2n; const v0 = v0n ? 0 : (c2 > (10) ? 1 : 0);
+      const v0n = c2n; const v0 = v0n ? 0 : ((c2 > (10) || c2 !== c2) ? 1 : 0);
       if (!(!v0n && v0 != 0)) continue;
       { S0.n++; }
     }

@@ -12,10 +12,10 @@ import type { PlanOp } from '../src/engine/plan/ops.js';
 import { EngineServer } from '../src/engine/server.js';
 import type { Request, Response } from '../src/shared/protocol.js';
 
-/** id INT, name TEXT (row 2 NULL by its bitmap), qty REAL (NaN reads as NULL), big INT (beyond 2^53). */
+/** id INT, name TEXT and qty REAL (row 2 NULL by their bitmaps), big INT (beyond 2^53). */
 function frame(): PlanOp {
   const nulls = new Uint8Array([0b010]);
-  return p.fromColumns([new Int32Array([1, 2, 3]), { data: ['a', 'b', 'c'], nulls }, new Float64Array([1.5, NaN, 3]), new BigInt64Array([1n, 2n ** 60n, 3n])], ['int', 'text', 'real', 'int']);
+  return p.fromColumns([new Int32Array([1, 2, 3]), { data: ['a', 'b', 'c'], nulls }, { data: new Float64Array([1.5, 0, 3]), nulls }, new BigInt64Array([1n, 2n ** 60n, 3n])], ['int', 'text', 'real', 'int']);
 }
 const ROWS = [[1, 'a', 1.5, 1], [2, null, null, 2n ** 60n], [3, 'c', 3, 3]];
 
