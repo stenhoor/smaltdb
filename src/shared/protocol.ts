@@ -77,8 +77,11 @@ export interface ReaderSettings {
 
 /** Owner worker <-> parallel reader worker. */
 export type ReaderMessage =
-  /** `proxy`: the reader reads the owner's files through the owner over this channel (vfs/proxy.ts, ADR 0021). */
-  | { type: 'init'; name: string; pageSize?: number; cacheSizeBytes?: number; reader: number; port: MessagePort; bus?: string; interrupt?: SharedArrayBuffer; proxy?: SharedArrayBuffer }
+  /**
+   * `proxy`: the reader reads the owner's files through the owner over this channel (vfs/proxy.ts, ADR 0021);
+   * `cache`: the block cache it shares with the owner and the other readers (vfs/shared-cache.ts).
+   */
+  | { type: 'init'; name: string; pageSize?: number; cacheSizeBytes?: number; reader: number; port: MessagePort; bus?: string; interrupt?: SharedArrayBuffer; proxy?: SharedArrayBuffer; cache?: SharedArrayBuffer }
   /** A proxied reader is waiting for the owner to answer its channel. */
   | { type: 'io'; reader: number }
   /** `settings`: the owner's, for a query (credits and cancels for a running query carry none). */

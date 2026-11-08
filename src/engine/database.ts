@@ -356,6 +356,11 @@ export class Database implements FunctionContext {
     if (this.pager.refreshSnapshot()) this.loadSchemaIfChanged();
   }
 
+  /** Bytes of the WAL up to its last commit (0 without a WAL): the log does not change below this until a checkpoint. */
+  walCommittedBytes(): number {
+    return this.pager.walSize;
+  }
+
   /** Parallel readers: checkpoints are skipped while `gate` returns false. */
   setCheckpointGate(gate: (() => boolean) | null): void {
     this.pager.checkpointGate = gate;
