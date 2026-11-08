@@ -282,7 +282,7 @@ It is raised when a statement is planned or run, or when a plugin method is call
 
 ## SMALT_EXTERNAL
 
-Reading [external data](https://stenhoor.github.io/smaltql/guide/external-data) failed. Plugins raise it: a format or source plugin that throws a plain `Error` is reported as `SMALT_EXTERNAL` (see [Writing plugins](./plugins#errors)). The message starts with the source (`read_csv('file:x.csv'): …`, a URL, an external table) and says why: no file registered under that name, an HTTP error, a network failure, a file that does not parse, a missing optional package (`this file uses a codec that needs the hyparquet-compressors package`), or credentials that could not be obtained (a credentials callback that failed, did not answer within 30 seconds, or whose tab closed).
+Reading [external data](https://stenhoor.github.io/smaltql/guide/external-data) failed. Plugins raise it: a format or source plugin that throws a plain `Error` is reported as `SMALT_EXTERNAL` (see [Writing plugins](./plugins#errors)). The message starts with the source (`read_csv('file:x.csv'): …`, a URL, an external table) and says why: no file registered under that name, an HTTP error, a network failure, a file that does not parse, a Parquet codec that could not be loaded (`this file's codec could not be loaded`), or credentials that could not be obtained (a credentials callback that failed, did not answer within 30 seconds, or whose tab closed).
 
 **Remedy:** depends on the cause. Network and HTTP errors are often temporary and can be retried.
 
