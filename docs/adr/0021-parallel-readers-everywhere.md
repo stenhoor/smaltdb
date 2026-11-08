@@ -1,6 +1,6 @@
 # ADR 0021: Parallel readers everywhere (M9)
 
-- **Status:** accepted with #171; step 1 in progress
+- **Status:** accepted with #171; step 1 in #172; step 2 in progress
 - **Date:** 2026-11-08
 - **Builds on:** [ADR 0009](0009-concurrency.md) section 7 (parallel readers on Chromium) and
   [WORKER_MODEL.md](../WORKER_MODEL.md) section 3 (the parallel mode)
@@ -66,18 +66,23 @@ busy owner. Readers pay off when most of their reads are answered without the ow
    - **Testing:** the browser test runs the client test a second time with proxy readers, on every browser (on
      Chromium, where readers otherwise open the files themselves, too).
 
-3. **Step 2: a shared page cache.** A `SharedArrayBuffer` of page frames that the owner and every reader can read.
-   - **Keyed by where the bytes are, not by page number:** (file, generation, byte offset). A committed WAL frame never
-     changes within a log generation. The database file changes only at checkpoints, which run while no reader is
-     busy and start a new generation. So an entry never needs invalidating; a new generation makes the old entries
-     unreachable, and eviction reclaims them.
-   - **Filled by the owner:** with the pages it reads from the file, and with the frames it writes to the WAL at
-     commit, so readers find fresh commits there without a round trip.
-   - **Used by readers:** a proxy file looks in the shared cache before it asks the owner, and copies a hit into the
-     reader's own frame (a 4 KiB copy against a round trip to the owner).
-   - **Concurrency:** an open-addressing table in an `Int32Array` with striped locks taken with `Atomics`; clock
-     eviction with pin counts in shared memory. No reader holds a lock while it waits for the owner.
-   - **Size:** a setting next to `cacheMB`, chosen from step 4's measurements.
+3. **Step 2: a shared block cache** (`vfs/shared-cache.ts`). A `SharedArrayBuffer` of 64 KiB file blocks that the
+   owner and every reader can read.
+   - **Keyed by where the bytes are, not by page number:** (file, block, generation). Only bytes that cannot change
+     while cached go in: whole blocks of the database file, and whole blocks of the WAL below its last commit (the
+     log only grows until a checkpoint). Any write to the database file and any truncation (checkpoints, which wait
+     for idle readers) move the generation on, so earlier entries stop matching and eviction reclaims them.
+   - **Filled by the owner:** with the blocks it reads from the database file for its own queries, and with the
+     blocks it sends readers.
+   - **Used by readers:** a proxy file copies whole blocks from the cache and asks the owner only on a miss. A miss
+     right after the previous run reads ahead (twice as long each time, up to 1 MiB), and the owner answers from the
+     cache when another reader has just filled the blocks asked for: readers scanning the same table at once
+     otherwise all miss on the same blocks. Each reader keeps the last part block it got (the end of the log, never
+     cached) until its next snapshot.
+   - **Concurrency:** only the owner writes entries, so there are no locks. Each slot has a sequence number that is
+     odd while it is written (a seqlock); a reader checks it before and after copying. Sets of 8 ways, clock
+     replacement, readers marking what they hit.
+   - **Size:** twice the owner's page cache (32 MiB by default) for now; step 4 chooses.
    - **On by default** where readers cannot open the files themselves, once a cold burst of concurrent queries
      measures no slower than on the owner alone.
 

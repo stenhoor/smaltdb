@@ -32,6 +32,7 @@ import type { SqlValue } from './values.js';
 import { detectCapabilities } from './vfs/capabilities.js';
 import { OpfsVfs } from './vfs/opfs.js';
 import { OwnedVfs, ProxyServer, ProxyVfs, createChannel } from './vfs/proxy.js';
+import { SharedCache } from './vfs/shared-cache.js';
 import type { SmaltPlugin } from './plugin.js';
 import { registerLanguage, type SmaltLanguage } from './plan/language.js';
 import type { BusMessage, ReaderMessage, ReaderSettings, Request, Response } from '../shared/protocol.js';
@@ -44,9 +45,9 @@ export interface ServeOptions {
   /**
    * Parallel reader workers. `'auto'` (the default) starts them where they can open the files themselves (OPFS
    * `readwrite-unsafe` handles: Chromium). `'proxy'` starts them wherever the page is cross-origin isolated, reading
-   * the owner's files through it (ADR 0021): not yet the default, because until the shared page cache (ADR 0021
-   * step 2) each reader reads every page it needs through the owner, which makes a burst of cold queries slower than
-   * the owner alone. `'off'` runs every query on the owner.
+   * the owner's files through it, with a block cache they share (ADR 0021): not yet the default, as a burst of
+   * queries on fresh readers is still slower than on the owner alone (as with shared handles). `'off'` runs every
+   * query on the owner.
    */
   parallelReaders?: 'auto' | 'proxy' | 'off';
 }
@@ -68,7 +69,7 @@ export function serve(options: ServeOptions = {}): void {
   function readerVfs(init: Extract<ReaderMessage, { type: 'init' }>): OpfsVfs | ProxyVfs {
     if (!init.proxy) return new OpfsVfs();
     const wake = { type: 'io', reader: init.reader } satisfies ReaderMessage;
-    return new ProxyVfs(init.proxy, `${init.name}.db`, () => scope.postMessage(wake), new OpfsVfs());
+    return new ProxyVfs(init.proxy, `${init.name}.db`, () => scope.postMessage(wake), new OpfsVfs(), init.cache ?? null);
   }
 
   function startReader(init: Extract<ReaderMessage, { type: 'init' }>): void {
@@ -194,7 +195,7 @@ export function serve(options: ServeOptions = {}): void {
         // The client's end of the direct result channel.
         scope.postMessage({ id: 0, kind: 'port', port: ch.port1 } satisfies Response, [ch.port1]);
         w.postMessage(
-          { type: 'init', name: open.name, pageSize: open.pageSize, cacheSizeBytes: open.cacheSizeBytes, reader: i + 1, port: ch.port2, bus: open.bus, interrupt: open.interrupt, proxy: channel } satisfies ReaderMessage,
+          { type: 'init', name: open.name, pageSize: open.pageSize, cacheSizeBytes: open.cacheSizeBytes, reader: i + 1, port: ch.port2, bus: open.bus, interrupt: open.interrupt, proxy: channel, cache: proxy?.cacheBuffer } satisfies ReaderMessage,
           [ch.port2],
         );
       }
@@ -250,7 +251,12 @@ export function serve(options: ServeOptions = {}): void {
         const files = proxied ? new OwnedVfs(new OpfsVfs()) : new OpfsVfs();
         const db = await Database.open(files, path, { ...base, sharedHandles: shared });
         db.setCheckpointGate(() => readers.active === 0);
-        if (proxied) proxy = new ProxyServer(files as OwnedVfs, path);
+        if (proxied) {
+          // The block cache shared by the owner and its readers (ADR 0021 step 2): twice the owner's page cache.
+          const cache = SharedCache.create(2 * (req.cacheSizeBytes ?? 16 * 1024 * 1024));
+          proxy = new ProxyServer(files as OwnedVfs, path, cache);
+          proxy.walCommitted = () => db.walCommittedBytes();
+        }
         readers.start(Math.min(3, cores - 1), req, proxy);
         return db;
       },

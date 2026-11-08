@@ -47,3 +47,33 @@ One run, so only large differences count.
 - **Cold:** 1.1× slower on Firefox, 1.2× on WebKit (Chromium: 2×).
 - **Morsels:** no gain on Firefox, and 1.4× slower than the owner alone on WebKit, where the owner's aggregate is
   fast. Step 4's routing has to take this into account per browser, not only whether readers exist.
+
+## Step 2: the shared block cache (2026-11-08)
+
+A cache of 64 KiB file blocks in a `SharedArrayBuffer` (`vfs/shared-cache.ts`), twice the owner's page cache by
+default (32 MiB), filled by the owner from its own reads of the database file and from the blocks it sends readers.
+Readers look blocks up without locks and ask the owner only on a miss.
+
+**The cache alone did not help at first:** the cold burst stayed at 326 ms (321–393). Counting showed why: the three
+readers scan the same table at the same time, each missing on the same block before any of them had filled it (about
+10 hits in 190 reads per reader). Two changes fixed that:
+
+- **Read-ahead:** a miss right after the previous run asks for a run twice as long, up to 1 MiB (16 blocks). A scan
+  of the 12 MB table takes about a dozen round trips instead of 180.
+- **The owner answers from the cache** when another reader's request has just filled the blocks asked for, instead
+  of reading the file again.
+- And each reader keeps the last part block it got (the log's end, which the shared cache never holds) until its
+  next snapshot: a second reader's cold query then asks the owner 4 times (three sizes and that block), not about 10.
+
+Chromium, same setup as step 1 (five runs each, median and range in ms):
+
+| Workload | Owner alone | Shared handles | Through the owner, step 1 | Through the owner, step 2 |
+|---|---|---|---|---|
+| 8 queries at once, first run | 150 (145–167) | 200 (184–211) | 310 (307–331) | 196 (160–226) |
+| 8 queries at once, warm (two rounds) | 144, 148 | 91, 81 | 107, 94 | 96, 87 |
+| Large aggregate (owner / morsels) | 167 | 46 | 44 | 42 |
+| Prepared lookup round trip (µs) | 96 | 91 | 98 | 96 |
+
+**Readers through the owner now match readers with their own handles** (Chromium's default since M6), cold and warm.
+Both are still slower than the owner alone on a first burst (1.3×, ranges barely overlapping): the cost of fresh
+readers (opening, loading the schema, compiling each query once), not of reading through the owner.
