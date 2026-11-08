@@ -31,3 +31,19 @@ the owner being busy.
 test runs the client test with them on every browser. Step 2's shared page cache reads each page once for every
 reader, which is what the cold case needs; it turns them on by default when it measures no slower than the owner
 alone when cold.
+
+**Firefox and WebKit (CI, one run each).** The browser tests' timings from CI on this PR (Playwright 1.64.1 in its
+Docker image, 4 cores; neither browser has `readwrite-unsafe`, so without `'proxy'` every query runs on the owner).
+One run, so only large differences count.
+
+| Workload | Firefox: owner alone | Firefox: through the owner | WebKit: owner alone | WebKit: through the owner |
+|---|---|---|---|---|
+| 8 queries at once, first run | 215 | 239 | 412 | 495 |
+| 8 queries at once, warm (two rounds) | 216, 217 | 125, 150 | 385, 397 | 297, 283 |
+| Large aggregate (owner / morsels) | 87 | 83 | 60 | 82 |
+| Prepared lookup round trip (µs) | 201 | 185 | 161 | 171 |
+
+- **Warm:** 1.4–1.7× faster on Firefox, 1.3–1.4× on WebKit.
+- **Cold:** 1.1× slower on Firefox, 1.2× on WebKit (Chromium: 2×).
+- **Morsels:** no gain on Firefox, and 1.4× slower than the owner alone on WebKit, where the owner's aggregate is
+  fast. Step 4's routing has to take this into account per browser, not only whether readers exist.
