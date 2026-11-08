@@ -114,3 +114,31 @@ serial time, WebKit 0.83–0.94). Warm, concurrent queries took 0.59–0.78 of t
 WebKit. The machines differ between runs (Firefox's second run was twice as fast), so compare within a row. In the
 owner-only runs of steps 1 and 2, the burst took 0.88–0.97 of the serial time (Firefox 0.96–0.97, WebKit 0.88–0.89),
 so cold, readers are a small gain on Firefox and about even on WebKit; warm is where they pay.
+
+## Step 3: the shared WAL index (2026-11-08)
+
+**Measured first.** A browser benchmark on Chromium with readers through the owner (`parallelReaders: 'proxy'`): a
+200,000-row table, 10 rounds of 8 concurrent queries (three aggregates and a point lookup, twice), with 0, 10 or 100
+small commits on the owner before each round. Temporary instrumentation timed each reader's snapshot refresh against
+its whole query.
+
+| Commits before each round | Refresh per reader query | Share of reader query time |
+|---|---|---|
+| 0 | 3.8 ms | 18% |
+| 10 | 4.5 ms | 22% |
+| 100 | 8.0 ms | 17% |
+
+With nothing new, a refresh still asked the owner for the log's size, and waited for an owner busy with its own
+queries; with commits, it also read and checksummed every new frame through the owner.
+
+**With the shared WAL index** (the owner publishes its log's index in shared memory; ADR 0021, decision 4), same
+benchmark, two runs:
+
+| Commits before each round | Refresh per reader query | Share of reader query time |
+|---|---|---|
+| 0 | 0.01 ms | 0.1% |
+| 10 | 1.6 ms | 11% |
+| 100 | 2.1–2.2 ms | 3% |
+
+A round of 8 concurrent queries with no commits went from about 51 ms (42–60) to about 40 ms (35–62). With commits, a
+refresh still reads the database header page from the end of the log (one round trip), which is most of what is left.
