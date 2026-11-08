@@ -1,6 +1,6 @@
 # ADR 0021: Parallel readers everywhere (M9)
 
-- **Status:** proposed
+- **Status:** accepted with #171; step 1 in progress
 - **Date:** 2026-11-08
 - **Builds on:** [ADR 0009](0009-concurrency.md) section 7 (parallel readers on Chromium) and
   [WORKER_MODEL.md](../WORKER_MODEL.md) section 3 (the parallel mode)

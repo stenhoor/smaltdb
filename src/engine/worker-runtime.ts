@@ -17,11 +17,13 @@
  *
  * - **Owner** (default): owns the database files (OPFS sync access handles are only available in
  *   dedicated workers) and serves the client that created it, plus other tabs over a
- *   BroadcastChannel when it is the multi-tab leader (server.ts, ADR 0009). Where shared
- *   (`readwrite-unsafe`) handles exist, it also starts parallel reader workers and hands them
- *   read-only queries.
- * - **Reader** (started by an owner with an 'init' message): opens the same files read-only and
- *   answers the queries it is given from a snapshot of the latest commit, straight to the client.
+ *   BroadcastChannel when it is the multi-tab leader (server.ts, ADR 0009). It also starts
+ *   parallel reader workers and hands them read-only queries: where shared (`readwrite-unsafe`)
+ *   handles exist (ADR 0009), or where the page is cross-origin isolated (ADR 0021).
+ * - **Reader** (started by an owner with an 'init' message): opens the same files read-only, or
+ *   reads them through the owner over a shared-memory channel where it cannot open them
+ *   (vfs/proxy.ts), and answers the queries it is given from a snapshot of the latest commit,
+ *   straight to the client.
  */
 import { Database } from './database.js';
 import { SmaltError, errorCode, errorDetails } from './errors.js';
@@ -29,6 +31,7 @@ import { EngineServer, type PartialTask, type ReaderPool, defaultOpen } from './
 import type { SqlValue } from './values.js';
 import { detectCapabilities } from './vfs/capabilities.js';
 import { OpfsVfs } from './vfs/opfs.js';
+import { OwnedVfs, ProxyServer, ProxyVfs, createChannel } from './vfs/proxy.js';
 import type { SmaltPlugin } from './plugin.js';
 import { registerLanguage, type SmaltLanguage } from './plan/language.js';
 import type { BusMessage, ReaderMessage, ReaderSettings, Request, Response } from '../shared/protocol.js';
@@ -38,6 +41,14 @@ export interface ServeOptions {
   languages?: readonly SmaltLanguage[];
   /** Plugins to install in this worker's engine (and its parallel readers). */
   plugins?: readonly SmaltPlugin[];
+  /**
+   * Parallel reader workers. `'auto'` (the default) starts them where they can open the files themselves (OPFS
+   * `readwrite-unsafe` handles: Chromium). `'proxy'` starts them wherever the page is cross-origin isolated, reading
+   * the owner's files through it (ADR 0021): not yet the default, because until the shared page cache (ADR 0021
+   * step 2) each reader reads every page it needs through the owner, which makes a burst of cold queries slower than
+   * the owner alone. `'off'` runs every query on the owner.
+   */
+  parallelReaders?: 'auto' | 'proxy' | 'off';
 }
 
 let serving = false;
@@ -52,6 +63,13 @@ export function serve(options: ServeOptions = {}): void {
   const scope = self as unknown as DedicatedWorkerGlobalScope;
 
   // ------------------------------------------------------------------ reader role
+
+  /** The reader's files: its own handles, or the owner's read through the owner (ADR 0021). */
+  function readerVfs(init: Extract<ReaderMessage, { type: 'init' }>): OpfsVfs | ProxyVfs {
+    if (!init.proxy) return new OpfsVfs();
+    const wake = { type: 'io', reader: init.reader } satisfies ReaderMessage;
+    return new ProxyVfs(init.proxy, `${init.name}.db`, () => scope.postMessage(wake), new OpfsVfs());
+  }
 
   function startReader(init: Extract<ReaderMessage, { type: 'init' }>): void {
     const port = init.port;
@@ -69,7 +87,7 @@ export function serve(options: ServeOptions = {}): void {
         }
       },
       // Readers never refresh materialized views (the owner's scheduler does).
-      { open: () => Database.openReader(new OpfsVfs(), `${init.name}.db`, { pageSize: init.pageSize, cacheSizeBytes: init.cacheSizeBytes, spillPath: `${init.name}.db-spill-r${init.reader}`, plugins }), refreshTimer: false },
+      { open: () => Database.openReader(readerVfs(init), `${init.name}.db`, { pageSize: init.pageSize, cacheSizeBytes: init.cacheSizeBytes, spillPath: `${init.name}.db-spill-r${init.reader}`, plugins }), refreshTimer: false },
     );
     // Open (with the shared interrupt flag); the 'ok' goes to id 0, which the client ignores.
     server.receive(EngineServer.LOCAL, { id: 0, op: 'open', name: init.name, storage: 'opfs', interrupt: init.interrupt });
@@ -141,15 +159,19 @@ export function serve(options: ServeOptions = {}): void {
       return this.workers.filter((r) => r.job !== null).length;
     }
 
-    start(count: number, open: Extract<Request, { op: 'open' }>): void {
+    /** Start `count` readers; with `proxy`, they read this owner's files through it. */
+    start(count: number, open: Extract<Request, { op: 'open' }>, proxy: ProxyServer | null): void {
       for (let i = 0; i < count; i++) {
         const w = new Worker(scope.location.href, { type: 'module', name: `smaltdb-reader-${i + 1}` });
         const entry = { w, ready: false, job: null as ReaderJob | null };
         this.workers.push(entry);
         const ch = new MessageChannel();
+        const channel = proxy ? createChannel() : undefined;
+        if (channel) proxy!.add(channel);
         w.onmessage = (e: MessageEvent<ReaderMessage>) => {
           const m = e.data;
-          if (m.type === 'ready') entry.ready = true;
+          if (m.type === 'io') proxy!.service();
+          else if (m.type === 'ready') entry.ready = true;
           else if (m.type === 'idle') entry.job = null;
           else if (m.type === 'failed') entry.ready = false;
           else if (m.type === 'partialDone') {
@@ -172,7 +194,7 @@ export function serve(options: ServeOptions = {}): void {
         // The client's end of the direct result channel.
         scope.postMessage({ id: 0, kind: 'port', port: ch.port1 } satisfies Response, [ch.port1]);
         w.postMessage(
-          { type: 'init', name: open.name, pageSize: open.pageSize, cacheSizeBytes: open.cacheSizeBytes, reader: i + 1, port: ch.port2, bus: open.bus, interrupt: open.interrupt } satisfies ReaderMessage,
+          { type: 'init', name: open.name, pageSize: open.pageSize, cacheSizeBytes: open.cacheSizeBytes, reader: i + 1, port: ch.port2, bus: open.bus, interrupt: open.interrupt, proxy: channel } satisfies ReaderMessage,
           [ch.port2],
         );
       }
@@ -201,6 +223,8 @@ export function serve(options: ServeOptions = {}): void {
   }
 
   const readers = new Readers();
+  /** Answers proxied readers' file requests (ADR 0021), when they read through this owner. */
+  let proxy: ProxyServer | null = null;
 
   const server = new EngineServer(
     (session: string, msg: Response, transfer: Transferable[] = []) => {
@@ -209,16 +233,29 @@ export function serve(options: ServeOptions = {}): void {
     },
     {
       open: async (req) => {
-        // Parallel readers need shared handles, which give up the file lock: only under the
-        // multi-tab leader lock (one owner per database), for OPFS files, where supported.
         const caps = detectCapabilities();
-        const parallel = !!req.bus && req.storage === 'opfs' && caps.readwriteUnsafe && (caps.hardwareConcurrency ?? 1) > 1;
-        if (!parallel) return defaultOpen(() => new OpfsVfs(), plugins)(req);
-        const db = await Database.open(new OpfsVfs(), `${req.name}.db`, { pageSize: req.pageSize, cacheSizeBytes: req.cacheSizeBytes, syncOnCommit: req.syncOnCommit, sharedHandles: true, plugins });
+        const mode = options.parallelReaders ?? 'auto';
+        const cores = caps.hardwareConcurrency ?? 1;
+        const base = { pageSize: req.pageSize, cacheSizeBytes: req.cacheSizeBytes, syncOnCommit: req.syncOnCommit, plugins };
+        // Shared handles give up the file lock: only under the multi-tab leader lock (one owner
+        // per database), for OPFS files, where supported (ADR 0009).
+        const file = req.storage === 'opfs' && req.name !== ':memory:';
+        const shared = mode === 'auto' && !!req.bus && file && caps.readwriteUnsafe && cores > 1;
+        // Readers that read through the owner, which keeps its exclusive handles: they need shared
+        // memory and Atomics.wait in workers (a cross-origin isolated page), ADR 0021. Asked for
+        // only, until the shared page cache (step 2) keeps cold bursts from being slower.
+        const proxied = mode === 'proxy' && file && caps.crossOriginIsolated && caps.sharedArrayBuffer && caps.atomicsWait && cores > 1;
+        if (!shared && !proxied) return defaultOpen(() => new OpfsVfs(), plugins)(req);
+        const path = `${req.name}.db`;
+        const files = proxied ? new OwnedVfs(new OpfsVfs()) : new OpfsVfs();
+        const db = await Database.open(files, path, { ...base, sharedHandles: shared });
         db.setCheckpointGate(() => readers.active === 0);
-        readers.start(Math.min(3, (caps.hardwareConcurrency ?? 2) - 1), req);
+        if (proxied) proxy = new ProxyServer(files as OwnedVfs, path);
+        readers.start(Math.min(3, cores - 1), req, proxy);
         return db;
       },
+      // Proxied readers wait for this owner: answer them while its statements run, too.
+      background: () => proxy?.service(),
       capabilities: () => ({ ...detectCapabilities(), plugins: installed }),
       // Another tab holds a lock named after its session for as long as it lives: when we are
       // granted that lock, the tab is gone.

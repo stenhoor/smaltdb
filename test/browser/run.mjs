@@ -77,6 +77,18 @@ for (const name of names) {
   } else if (result.ok) {
     result.checks.push({ name: 'client test ran', ok: false, detail: client.error });
   }
+  // Run the client test again with readers that read the owner's files through it (ADR 0021): on Chromium, where
+  // readers otherwise open the files themselves, and on the other browsers, where there are no readers otherwise.
+  {
+    await page.goto(server.url + '/client.html?readers=proxy');
+    const proxied = (await waitFor(() => window.__clientResult !== undefined, 'client result (proxy readers)'))
+      ? await page.evaluate(() => window.__clientResult)
+      : { ok: false, error: 'no result from the client test (proxy readers)' };
+    if (proxied.ok) {
+      result.checks?.push(...proxied.checks.map((c) => ({ ...c, name: 'client (proxy readers): ' + c.name })));
+      Object.assign(result.timings ?? {}, Object.fromEntries(Object.entries(proxied.timings).map(([k, v]) => ['client-proxy.' + k, v])));
+    } else result.checks?.push({ name: 'client test ran (proxy readers)', ok: false, detail: proxied.error });
+  }
   // Multi-tab: several pages of one context share a database through the leader's engine worker.
   try {
     for (const c of await multiTab(context, server.url)) result.checks?.push({ ...c, name: 'tabs: ' + c.name });
