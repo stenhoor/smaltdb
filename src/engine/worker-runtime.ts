@@ -266,7 +266,9 @@ export function serve(options: ServeOptions = {}): void {
         }
         const path = `${req.name}.db`;
         const files = proxied ? new OwnedVfs(new OpfsVfs()) : new OpfsVfs();
-        sharedWal = proxied ? SharedWalIndex.create() : undefined;
+        // The owner's WAL index in shared memory (ADR 0021 step 3): every reader refreshes its snapshot from it, also
+        // readers with their own handles, where the page can share memory.
+        sharedWal = proxied || (caps.crossOriginIsolated && caps.sharedArrayBuffer) ? SharedWalIndex.create() : undefined;
         const db = await Database.open(files, path, { ...base, sharedHandles: shared, sharedWal: sharedWal ? { index: new SharedWalIndex(sharedWal), owner: true } : undefined });
         db.setCheckpointGate(() => readers.active === 0);
         readerKind = proxied ? 'proxy' : 'shared';

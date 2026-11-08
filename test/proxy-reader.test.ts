@@ -217,6 +217,26 @@ describe('the shared WAL index', () => {
     expect(r.query('PRAGMA integrity_check').rows).toEqual([['ok']]);
   });
 
+  it('serves readers with their own handles too', async () => {
+    // As on Chromium: the reader opens the files itself (shared handles) and refreshes from the index.
+    const vfs = new MemoryVfs();
+    const wal = SharedWalIndex.create();
+    const w = await Database.open(vfs, 'db', { sharedHandles: true, walAutoCheckpointBytes: 1 << 30, sharedWal: { index: new SharedWalIndex(wal), owner: true } });
+    w.exec('CREATE TABLE t(id INTEGER PRIMARY KEY, v INT)');
+    w.exec('INSERT INTO t VALUES (1, 10), (2, 20)');
+    const r = await Database.openReader(vfs, 'db', { sharedWal: { index: new SharedWalIndex(wal), owner: false } });
+    r.refreshSnapshot();
+    expect(r.query('SELECT sum(v) FROM t').rows).toEqual([[30]]);
+    w.exec('UPDATE t SET v = 0 WHERE id = 1');
+    expect(r.query('SELECT sum(v) FROM t').rows).toEqual([[30]]);
+    r.refreshSnapshot();
+    expect(r.query('SELECT sum(v) FROM t').rows).toEqual([[20]]);
+    w.checkpoint();
+    w.exec('INSERT INTO t VALUES (3, 5)');
+    r.refreshSnapshot();
+    expect(r.query('SELECT sum(v) FROM t').rows).toEqual([[25]]);
+  });
+
   it('publishes a reopened owner’s log', async () => {
     const files = new OwnedVfs(new MemoryVfs());
     const w = await Database.open(files, 'db', { walAutoCheckpointBytes: 1 << 30 });
