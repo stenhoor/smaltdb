@@ -130,6 +130,7 @@ export default defineConfig({
           { text: '0018 bool and NaN', link: '/adr/0018-bool-and-nan' },
           { text: '0019 Dates and times', link: '/adr/0019-dates-and-times' },
           { text: '0020 Lists and structs', link: '/adr/0020-lists-and-structs' },
+          { text: '0021 Parallel readers everywhere', link: '/adr/0021-parallel-readers-everywhere' },
         ],
       },
       {
