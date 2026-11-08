@@ -77,3 +77,22 @@ Chromium, same setup as step 1 (five runs each, median and range in ms):
 **Readers through the owner now match readers with their own handles** (Chromium's default since M6), cold and warm.
 Both are still slower than the owner alone on a first burst (1.3×, ranges barely overlapping): the cost of fresh
 readers (opening, loading the schema, compiling each query once), not of reading through the owner.
+
+**Firefox and WebKit (CI on #173, one run each)**, readers through the owner against the owner alone:
+
+| Workload | Firefox: owner alone | Firefox: through the owner | WebKit: owner alone | WebKit: through the owner |
+|---|---|---|---|---|
+| 8 queries at once, first run | 220 | **190** | 396 | 444 |
+| 8 queries at once, warm (two rounds) | 221, 222 | 127, 158 | 352, 364 | 352, 278 |
+| Large aggregate (owner / morsels) | 96 | 102 | 63 | 90 |
+| Prepared lookup round trip (µs) | 211 | 202 | 166 | 174 |
+
+Cold, the burst is now 1.16× faster than the owner alone on Firefox (it was 1.1× slower in step 1) and 1.1× slower
+on WebKit (1.2×). Warm, 1.4–1.75× faster on Firefox; on WebKit the same, then 1.3× faster. Morsels still don't pay on
+either.
+
+## Step 4, first decisions (2026-11-08)
+
+The owner chose, from the numbers above: readers that read through the owner are on by default where readers cannot
+open the files themselves, and they take no morsels (ADR 0021, decision 5). The browser test checks both: every
+isolated browser starts readers, and a large aggregate stays on the owner with readers that read through it.

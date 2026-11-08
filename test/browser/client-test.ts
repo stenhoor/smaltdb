@@ -202,8 +202,12 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   timings.serial8WarmMs = performance.now() - t0;
   check('concurrent queries return the same results', JSON.stringify(parallel) === JSON.stringify(serial));
   const caps = (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated;
-  // Readers that read through the owner run in every cross-origin isolated browser (ADR 0021).
-  if (readers === 'proxy' && caps && navigator.hardwareConcurrency > 1) check('parallel readers serve concurrent queries', timings.servedByReaders > 0, timings.servedByReaders);
+  // Parallel readers run in every cross-origin isolated browser (ADR 0021): readers that open the files themselves
+  // where OPFS shares handles (Chromium), readers that read through the owner elsewhere.
+  if (caps && navigator.hardwareConcurrency > 1) {
+    check(`parallel readers started (${db.stats.readers})`, readers === 'proxy' ? db.stats.readers === 'proxy' : db.stats.readers !== 'none', db.stats.readers);
+    check('parallel readers serve concurrent queries', timings.servedByReaders > 0, timings.servedByReaders);
+  }
   if (timings.servedByReaders > 0) {
     // Snapshot isolation: a reader's stream keeps its snapshot while the owner commits.
     // A second request queued behind the stream is concurrent demand: the stream goes to a reader.
@@ -271,6 +275,13 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
       }
       return null;
     };
+    if (db.stats.readers === 'proxy') {
+      // Readers that read through the owner leave large aggregates to it (measured no faster, or slower: ADR 0021).
+      const m0 = db.stats.morselQueries;
+      const rows = await db.query(aggSql, undefined, { rowMode: 'array' });
+      check('morsels: readers that read through the owner leave a large aggregate to it', db.stats.morselQueries === m0 && rounded(rows) === rounded(ownerRows), db.stats.morselQueries - m0);
+      await db.exec('DROP TABLE huge');
+    } else {
     await morselRun(); // warm-up
     let morselRows: unknown[][] = [];
     let usedMorsels = 0;
@@ -290,6 +301,7 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
     await db.exec('PRAGMA parallel_aggregates = 1');
     check('morsels: a large aggregate is split across readers and merged', usedMorsels === 3 && rounded(morselRows) === rounded(ownerRows), [usedMorsels, morselRows.length]);
     await db.exec('DROP TABLE huge');
+    }
   } else check(`parallel readers not available here (isolated: ${caps})`, true);
   await db.exec('DROP TABLE big');
   await db.close();

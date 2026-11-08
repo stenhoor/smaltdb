@@ -12,6 +12,11 @@ class FakeReaders implements ReaderPool {
   busy = 0;
   ran = 0;
   failNext = false;
+  /** False: like readers that read through the owner, which take no morsels (ADR 0021). */
+  morsels = true;
+  takesMorsels(): boolean {
+    return this.morsels;
+  }
   constructor(
     private readonly readers: Database[],
     private readonly delay = 5,
@@ -91,6 +96,17 @@ describe('morsel parallelism in the server', () => {
     await until('the owner query', () => ended(t, 'local', s));
     expect(t.rows('local', s)).toEqual([[10]]);
     expect(t.server.morselQueries).toBe(1);
+  });
+
+  it('leaves aggregates to the owner when the readers take no morsels', async () => {
+    const t = await setup();
+    t.readers.morsels = false;
+    const want = t.db.query(SQL).rows;
+    const q = t.send('local', { op: 'query', sql: SQL });
+    await until('the query', () => ended(t, 'local', q));
+    expect(t.rows('local', q)).toEqual(want);
+    expect(t.server.morselQueries).toBe(0);
+    expect(t.readers.ran).toBe(0);
   });
 
   it('holds writes until every morsel is back, so all see one commit', async () => {

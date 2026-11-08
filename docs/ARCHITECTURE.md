@@ -69,7 +69,9 @@ See [WORKER_MODEL.md](WORKER_MODEL.md) for details.
 - Tabs and windows on the same origin find the owner through the Web Locks API (leader election), then talk to it over `MessagePort`s.
 - Concurrency **inside** the engine (proposed):
   - Single writer and multiple readers under MVCC snapshot isolation, using the WAL.
-  - Optional **reader worker pool** for parallel query execution. This requires `SharedArrayBuffer` and therefore cross-origin isolation **[Q-4]**.
+  - Optional **reader worker pool** for parallel query execution: on Chromium readers open the files with shared
+    OPFS handles (ADR 0009); elsewhere they read them through the owner, with a shared block cache, which needs
+    `SharedArrayBuffer` and therefore cross-origin isolation (ADR 0021).
 
 ## 5. Module layout
 
