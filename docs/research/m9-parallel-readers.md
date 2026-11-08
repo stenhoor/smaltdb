@@ -96,3 +96,21 @@ either.
 The owner chose, from the numbers above: readers that read through the owner are on by default where readers cannot
 open the files themselves, and they take no morsels (ADR 0021, decision 5). The browser test checks both: every
 isolated browser starts readers, and a large aggregate stays on the owner with readers that read through it.
+
+**More samples (CI on #174, 2026-11-08).** With readers through the owner on by default, Firefox and WebKit have no
+owner-only run left in the browser test, so each run is compared with the same 8 queries run one after another on the
+owner (serial, all on the owner). Two workflow runs, each running the client test twice (by default, and with
+`'proxy'`; on these browsers both use readers through the owner); ms.
+
+| Sample | Firefox cold: at once / serial | Firefox warm: at once (two rounds) / serial | WebKit cold | WebKit warm |
+|---|---|---|---|---|
+| Run 1, default | 203 / 228 | 143, 162 / 217 | 315 / 365 | 233, 217 / 281 |
+| Run 1, `'proxy'` | 189 / 231 | 125, 160 / 212 | 321 / 375 | 244, 232 / 287 |
+| Run 2, default | 112 / 122 | 81, 78 / 116 | 388 / 466 | 290, 258 / 339 |
+| Run 2, `'proxy'` | 111 / 126 | 75, 91 / 117 | 403 / 428 | 334, 308 / 346 |
+
+In every sample, cold, the concurrent burst beat the same queries run one after another (Firefox 0.82–0.92 of the
+serial time, WebKit 0.83–0.94). Warm, concurrent queries took 0.59–0.78 of the serial time on Firefox and 0.76–0.97 on
+WebKit. The machines differ between runs (Firefox's second run was twice as fast), so compare within a row. In the
+owner-only runs of steps 1 and 2, the burst took 0.88–0.97 of the serial time (Firefox 0.96–0.97, WebKit 0.88–0.89),
+so cold, readers are a small gain on Firefox and about even on WebKit; warm is where they pay.
