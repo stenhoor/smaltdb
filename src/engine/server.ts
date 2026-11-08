@@ -63,6 +63,11 @@ export interface ServerOptions {
   readers?: ReaderPool;
   /** Run materialized views' refresh policies on a one-second timer (default true; tests drive `refreshTick`). */
   refreshTimer?: boolean;
+  /**
+   * Work the owner does while its statements run, every few hundred page fetches: answering proxied readers' file
+   * requests (ADR 0021), which would otherwise wait until the statement ends.
+   */
+  background?: () => void;
 }
 
 /** Parallel readers as seen by the owner's server. */
@@ -426,15 +431,17 @@ export class EngineServer {
           (this.refreshTimer as { unref?: () => void }).unref?.(); // Node: do not keep the process alive
         }
         const flag = this.interruptFlag;
+        const background = this.options.background;
         if (flag) {
           this.db.setInterruptCheck(() => {
+            background?.();
             const cur = this.current;
             if (cur && cur.session === EngineServer.LOCAL && Atomics.load(flag, 0) === cur.req.id) {
               Atomics.store(flag, 0, 0);
               throw new SmaltError('SMALT_INTERRUPT', 'interrupted');
             }
           });
-        }
+        } else if (background) this.db.setInterruptCheck(background);
         this.send(session, { id, kind: 'ok', capabilities: this.options.capabilities?.() });
         return;
       }

@@ -11,7 +11,11 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   const timings: Record<string, number> = {};
   const check = (name: string, ok: boolean, detail?: unknown) => checks.push({ name, ok, detail: detail === undefined ? undefined : JSON.stringify(detail) });
 
-  const db = await open('client-test', { worker: () => new Worker(new URL('./plugin-worker.js', location.href), { type: 'module' }) });
+  // `?readers=proxy`: parallel readers read the owner's files through it even where they could open them (ADR 0021).
+  const readers = new URLSearchParams(location.search).get('readers');
+  const workerUrl = new URL(`./plugin-worker.js${readers ? `?readers=${readers}` : ''}`, location.href);
+  const name = readers ? `client-test-${readers}` : 'client-test';
+  const db = await open(name, { worker: () => new Worker(workerUrl, { type: 'module' }) });
   const lang = await db.query('SELECT smalt_worker_language()', undefined, { rowMode: 'array' });
   check('worker: a language given to defineWorker is the one the engine reads', JSON.stringify(lang) === JSON.stringify([['defineWorker']]), lang);
   await db.exec('DROP TABLE IF EXISTS items');
@@ -198,6 +202,8 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   timings.serial8WarmMs = performance.now() - t0;
   check('concurrent queries return the same results', JSON.stringify(parallel) === JSON.stringify(serial));
   const caps = (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated;
+  // Readers that read through the owner run in every cross-origin isolated browser (ADR 0021).
+  if (readers === 'proxy' && caps && navigator.hardwareConcurrency > 1) check('parallel readers serve concurrent queries', timings.servedByReaders > 0, timings.servedByReaders);
   if (timings.servedByReaders > 0) {
     // Snapshot isolation: a reader's stream keeps its snapshot while the owner commits.
     // A second request queued behind the stream is concurrent demand: the stream goes to a reader.
@@ -289,7 +295,7 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   await db.close();
 
   // Reopen: data persisted in OPFS.
-  const db2 = await open('client-test', { worker: new URL('./plugin-worker.js', location.href) });
+  const db2 = await open(name, { worker: workerUrl });
   const n = await db2.query('SELECT count(*) AS n FROM items');
   check('persisted across close/reopen', n[0].n === 2000, n);
   await db2.exec('DROP TABLE items');

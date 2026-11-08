@@ -9,4 +9,7 @@ import { defineWorker } from '../../src/engine/worker-runtime.js';
 const mark = (text: string): string => text.replaceAll('smalt_worker_language()', "'defineWorker'");
 const sql = { ...sqlLanguage, parse: (text: string) => sqlLanguage.parse!(mark(text)), parseOne: (text: string) => sqlLanguage.parseOne!(mark(text)) };
 
-defineWorker({ languages: [sql], plugins: [external, io] });
+// `?readers=proxy` (the client test's second run): readers read the owner's files through it (ADR 0021);
+// `?readers=off`: no parallel readers (measurements).
+const readers = new URL(self.location.href).searchParams.get('readers');
+defineWorker({ languages: [sql], plugins: [external, io], parallelReaders: readers === 'proxy' || readers === 'off' ? readers : 'auto' });
