@@ -1,6 +1,7 @@
 # ADR 0021: Parallel readers everywhere (M9)
 
-- **Status:** accepted with #171; step 1 in #172; step 2 in #173; step 4's first decisions in #174; step 3 in progress
+- **Status:** done: accepted with #171; step 1 in #172, step 2 in #173, step 4's first decisions in #174, step 3 in
+  #176, and step 4's last in the PR that marks M9 done
 - **Date:** 2026-11-08
 - **Builds on:** [ADR 0009](0009-concurrency.md) section 7 (parallel readers on Chromium) and
   [WORKER_MODEL.md](../WORKER_MODEL.md) section 3 (the parallel mode)
@@ -118,8 +119,20 @@ busy owner. Readers pay off when most of their reads are answered without the ow
      each), 1.3× slower on Chromium, the same as Chromium's readers with their own handles; warm, 1.3–1.75× faster.
    - **They take no morsels.** Splitting a large aggregate across them was no faster than the owner alone on Firefox
      and 1.4× slower on WebKit. Readers with their own handles keep taking them (Chromium: 3.6× faster).
-   - Still open in step 4: more than one run per browser, routing beyond morsels, the cache's size, and whether
-     Chromium should use the shared cache too.
+   - **Four samples per browser** (CI on #174): cold, a burst of concurrent queries beat the same queries run one
+     after another in every sample (Firefox 0.82–0.92 of the serial time, WebKit 0.83–0.94).
+
+   **Decided after step 3 (owner, 2026-11-08):**
+   - **Chromium's readers keep their own handles and refresh from the shared WAL index** where the page is
+     cross-origin isolated. Measured on Chromium (three runs): refreshing took 1.7–2.2 ms per reader query with no
+     commits (10–12% of reader time) and 6.6–7.9 ms with 100, and 0.0 and 0.7–1.2 ms with the index; a cold burst of
+     concurrent queries, warm queries, morsels and prepared lookups did not change (five runs, overlapping ranges).
+     They do not use the shared block cache: reading pages through the owner would add round trips to readers that
+     can read the files themselves.
+   - **The cache's size stays at twice the owner's page cache** (32 MiB by default): no measurement showed misses
+     from eviction; the misses measured came from readers scanning the same table at once, which read-ahead fixed.
+   - **No more routing rules** without a workload that needs them: readers take a query only when others wait, and
+     readers through the owner take no morsels.
 
 ## Steps
 

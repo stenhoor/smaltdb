@@ -142,3 +142,35 @@ benchmark, two runs:
 
 A round of 8 concurrent queries with no commits went from about 51 ms (42–60) to about 40 ms (35–62). With commits, a
 refresh still reads the database header page from the end of the log (one round trip), which is most of what is left.
+
+## Step 4: Chromium's readers and the shared WAL index (2026-11-08)
+
+Chromium's readers open the files themselves (shared handles) and rescan the log before each query. Same benchmark as
+step 3, with Chromium's default readers, three runs each:
+
+| Commits before each round | Refresh per reader query, without the index | With the shared WAL index |
+|---|---|---|
+| 0 | 1.7–2.2 ms (10–12% of reader time) | 0.0 ms (0.1%) |
+| 10 | 2.8–3.0 ms (11–12%) | 0.6–0.8 ms (4–5%) |
+| 100 | 6.6–7.9 ms (8–9%) | 0.7–1.2 ms (1%) |
+
+And the client test's timings, five runs each (median and range, ms):
+
+| | Without the index | With it |
+|---|---|---|
+| 8 queries at once, first run | 193 (179–216) | 203 (193–220) |
+| 8 queries at once, warm (two rounds) | 95, 83 | 99, 84 |
+| Large aggregate as morsels | 41 | 44 |
+| Prepared lookup round trip (µs) | 95 | 95 |
+
+No clear difference there (every range overlaps), and refreshing is nearly free: Chromium's readers now refresh from
+the index too, where the page is cross-origin isolated. They keep reading pages with their own handles.
+
+## Summary
+
+- Parallel readers run in every cross-origin isolated browser: with their own handles where OPFS allows it
+  (Chromium), and through the owner with a shared block cache elsewhere (Firefox, Safari).
+- Warm, concurrent queries run 1.3–1.7× faster than on the owner alone; cold, a burst is about even (WebKit) to a
+  little faster (Firefox) than the same queries run one after another.
+- Refreshing a snapshot costs almost nothing with no new commits, on every browser.
+- Large aggregates are split across readers only where they open the files themselves (Chromium, 3.6× faster).
