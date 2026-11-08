@@ -1,6 +1,6 @@
 # ADR 0021: Parallel readers everywhere (M9)
 
-- **Status:** accepted with #171; step 1 in #172; step 2 in progress
+- **Status:** accepted with #171; step 1 in #172; step 2 in #173; step 4's first decisions (below) in progress
 - **Date:** 2026-11-08
 - **Builds on:** [ADR 0009](0009-concurrency.md) section 7 (parallel readers on Chromium) and
   [WORKER_MODEL.md](../WORKER_MODEL.md) section 3 (the parallel mode)
@@ -97,6 +97,17 @@ busy owner. Readers pay off when most of their reads are answered without the ow
      browser.
    - **Chromium:** keep shared handles, or use the shared cache there too.
    - **Defaults:** the shared cache's size.
+
+   **Decided after step 2 (owner, 2026-11-08), from the measurements in
+   [research](../research/m9-parallel-readers.md):**
+   - **Readers that read through the owner are the default** (`'auto'`) wherever readers cannot open the files
+     themselves and the page is cross-origin isolated (Firefox, Safari; Chromium without the multi-tab lock). A cold
+     burst of concurrent queries was 1.16× faster than the owner alone on Firefox and 1.1× slower on WebKit (one run
+     each), 1.3× slower on Chromium, the same as Chromium's readers with their own handles; warm, 1.3–1.75× faster.
+   - **They take no morsels.** Splitting a large aggregate across them was no faster than the owner alone on Firefox
+     and 1.4× slower on WebKit. Readers with their own handles keep taking them (Chromium: 3.6× faster).
+   - Still open in step 4: more than one run per browser, routing beyond morsels, the cache's size, and whether
+     Chromium should use the shared cache too.
 
 ## Steps
 

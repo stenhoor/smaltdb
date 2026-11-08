@@ -86,6 +86,8 @@ export interface ReaderPool {
    * `done` receives its rows, or an error message. False when no reader is idle.
    */
   partial?(task: PartialTask, done: (err: string | null, rows: SqlValue[][] | null) => void): boolean;
+  /** False when the readers should not take morsels (readers that read through the owner, ADR 0021 step 4). */
+  takesMorsels?(): boolean;
 }
 
 /** One morsel of a parallel aggregate: the partial plan, the key readers cache its program by, and its parameters. */
@@ -677,7 +679,7 @@ export class EngineServer {
     const pool = this.options.readers;
     const db = this.db;
     const job0 = this.current;
-    if (!pool?.partial || !pool.idle || !db || job0 === null || job0.noMorsels || this.txOwner !== null || db.inTransaction || !st.readonly || st.usesMemoryObjects) return false;
+    if (!pool?.partial || !pool.idle || pool.takesMorsels?.() === false || !db || job0 === null || job0.noMorsels || this.txOwner !== null || db.inTransaction || !st.readonly || st.usesMemoryObjects) return false;
     const idle = pool.idle();
     if (idle < 2) return false;
     const ranges = db.parallelSplit(st, idle);

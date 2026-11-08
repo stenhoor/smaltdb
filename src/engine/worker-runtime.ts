@@ -43,11 +43,11 @@ export interface ServeOptions {
   /** Plugins to install in this worker's engine (and its parallel readers). */
   plugins?: readonly SmaltPlugin[];
   /**
-   * Parallel reader workers. `'auto'` (the default) starts them where they can open the files themselves (OPFS
-   * `readwrite-unsafe` handles: Chromium). `'proxy'` starts them wherever the page is cross-origin isolated, reading
-   * the owner's files through it, with a block cache they share (ADR 0021): not yet the default, as a burst of
-   * queries on fresh readers is still slower than on the owner alone (as with shared handles). `'off'` runs every
-   * query on the owner.
+   * Parallel reader workers (ADR 0021). `'auto'` (the default) starts readers that open the files themselves where
+   * OPFS has `readwrite-unsafe` handles and the multi-tab leader lock is held (Chromium), and elsewhere, in a
+   * cross-origin isolated page, readers that read the owner's files through it, with a block cache they share
+   * (Firefox, Safari). `'proxy'` uses readers that read through the owner even where they could open the files
+   * (tests and measurements). `'off'` runs every query on the owner.
    */
   parallelReaders?: 'auto' | 'proxy' | 'off';
 }
@@ -140,6 +140,12 @@ export function serve(options: ServeOptions = {}): void {
     private readonly workers: { w: Worker; ready: boolean; job: ReaderJob | null }[] = [];
     private readonly partials = new Map<number, (err: string | null, rows: SqlValue[][] | null) => void>();
     private nextTask = 1;
+    /** Whether readers take morsels: not readers that read through the owner (ADR 0021 step 4). */
+    private morsels = true;
+
+    takesMorsels(): boolean {
+      return this.morsels;
+    }
 
     idle(): number {
       return this.workers.filter((r) => r.ready && r.job === null).length;
@@ -162,6 +168,10 @@ export function serve(options: ServeOptions = {}): void {
 
     /** Start `count` readers; with `proxy`, they read this owner's files through it. */
     start(count: number, open: Extract<Request, { op: 'open' }>, proxy: ProxyServer | null): void {
+      // Measured on Firefox and WebKit (docs/research/m9-parallel-readers.md): morsels on readers that read through
+      // the owner were no faster than the owner alone (Firefox) or 1.4x slower (WebKit). Their readers still take
+      // concurrent queries, which do pay.
+      this.morsels = proxy === null;
       for (let i = 0; i < count; i++) {
         const w = new Worker(scope.location.href, { type: 'module', name: `smaltdb-reader-${i + 1}` });
         const entry = { w, ready: false, job: null as ReaderJob | null };
@@ -226,6 +236,8 @@ export function serve(options: ServeOptions = {}): void {
   const readers = new Readers();
   /** Answers proxied readers' file requests (ADR 0021), when they read through this owner. */
   let proxy: ProxyServer | null = null;
+  /** Which parallel readers this owner started (reported to clients as `capabilities.readers`). */
+  let readerKind: 'shared' | 'proxy' | 'none' = 'none';
 
   const server = new EngineServer(
     (session: string, msg: Response, transfer: Transferable[] = []) => {
@@ -242,15 +254,18 @@ export function serve(options: ServeOptions = {}): void {
         // per database), for OPFS files, where supported (ADR 0009).
         const file = req.storage === 'opfs' && req.name !== ':memory:';
         const shared = mode === 'auto' && !!req.bus && file && caps.readwriteUnsafe && cores > 1;
-        // Readers that read through the owner, which keeps its exclusive handles: they need shared
-        // memory and Atomics.wait in workers (a cross-origin isolated page), ADR 0021. Asked for
-        // only, until the shared page cache (step 2) keeps cold bursts from being slower.
-        const proxied = mode === 'proxy' && file && caps.crossOriginIsolated && caps.sharedArrayBuffer && caps.atomicsWait && cores > 1;
-        if (!shared && !proxied) return defaultOpen(() => new OpfsVfs(), plugins)(req);
+        // Elsewhere readers that read through the owner, which keeps its exclusive handles: they
+        // need shared memory and Atomics.wait in workers (a cross-origin isolated page), ADR 0021.
+        const proxied = !shared && mode !== 'off' && file && caps.crossOriginIsolated && caps.sharedArrayBuffer && caps.atomicsWait && cores > 1;
+        if (!shared && !proxied) {
+          readerKind = 'none';
+          return defaultOpen(() => new OpfsVfs(), plugins)(req);
+        }
         const path = `${req.name}.db`;
         const files = proxied ? new OwnedVfs(new OpfsVfs()) : new OpfsVfs();
         const db = await Database.open(files, path, { ...base, sharedHandles: shared });
         db.setCheckpointGate(() => readers.active === 0);
+        readerKind = proxied ? 'proxy' : 'shared';
         if (proxied) {
           // The block cache shared by the owner and its readers (ADR 0021 step 2): twice the owner's page cache.
           const cache = SharedCache.create(2 * (req.cacheSizeBytes ?? 16 * 1024 * 1024));
@@ -262,7 +277,7 @@ export function serve(options: ServeOptions = {}): void {
       },
       // Proxied readers wait for this owner: answer them while its statements run, too.
       background: () => proxy?.service(),
-      capabilities: () => ({ ...detectCapabilities(), plugins: installed }),
+      capabilities: () => ({ ...detectCapabilities(), plugins: installed, readers: readerKind }),
       // Another tab holds a lock named after its session for as long as it lives: when we are
       // granted that lock, the tab is gone.
       watchSession: (session) => {

@@ -202,7 +202,8 @@ export async function open(name: string, options: OpenOptions = {}): Promise<Dat
   };
   if (multiTab) await db.attachShared(name, options, openReq);
   else db.attachWorker(makeWorker(options), openReq, undefined);
-  await db.request(openReq);
+  const opened = (await db.request(openReq)) as { capabilities?: { readers?: 'shared' | 'proxy' | 'none' } };
+  db.stats.readers = opened.capabilities?.readers ?? 'none';
   return db;
 }
 
@@ -258,8 +259,12 @@ export class Database implements Queryable {
   epoch = 0;
   /** Multi-tab: this tab owns the engine worker. */
   isLeader = true;
-  /** Queries answered by parallel reader workers / by the owner (diagnostics). */
-  readonly stats = { readerQueries: 0, ownerQueries: 0, morselQueries: 0 };
+  /**
+   * Diagnostics: queries answered by parallel reader workers, by the owner and as morsels; and which parallel readers
+   * the engine worker started (`'shared'`: they open the files themselves; `'proxy'`: they read through the engine
+   * worker; `'none'`).
+   */
+  readonly stats = { readerQueries: 0, ownerQueries: 0, morselQueries: 0, readers: 'none' as 'shared' | 'proxy' | 'none' };
   /** Set while this client's transaction runs: other calls on this Database wait for it. */
   private txRunning: Promise<void> | null = null;
   private onClose: (() => void)[] = [];
