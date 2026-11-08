@@ -58,8 +58,13 @@ busy owner. Readers pay off when most of their reads are answered without the ow
      checkpoint gate work as in ADR 0009. They read through `VfsFile` and do not know where the bytes come from.
    - **One owner without the leader lock.** The owner keeps its exclusive handles. Unlike shared handles, these keep
      the file lock, so proxied readers do not need the multi-tab leader lock.
-   - **Testing on Chromium:** an internal open setting forces proxy readers on Chromium too. The browser test runs
-     both ways, and CI runs Firefox and WebKit, where proxy readers are the only kind.
+   - **Off by default until step 2.** Measured in step 1 ([research](../research/m9-parallel-readers.md)): warm, they
+     run 8 concurrent queries 1.4–1.6× faster than the owner alone, and a large aggregate 3.5× faster. But the first
+     burst of concurrent queries is 2× slower, because every reader reads the same pages through the owner, one
+     request at a time. So step 1 ships them behind a worker setting, `defineWorker({ parallelReaders: 'proxy' })`,
+     and step 2 turns them on.
+   - **Testing:** the browser test runs the client test a second time with proxy readers, on every browser (on
+     Chromium, where readers otherwise open the files themselves, too).
 
 3. **Step 2: a shared page cache.** A `SharedArrayBuffer` of page frames that the owner and every reader can read.
    - **Keyed by where the bytes are, not by page number:** (file, generation, byte offset). A committed WAL frame never
@@ -73,6 +78,8 @@ busy owner. Readers pay off when most of their reads are answered without the ow
    - **Concurrency:** an open-addressing table in an `Int32Array` with striped locks taken with `Atomics`; clock
      eviction with pin counts in shared memory. No reader holds a lock while it waits for the owner.
    - **Size:** a setting next to `cacheMB`, chosen from step 4's measurements.
+   - **On by default** where readers cannot open the files themselves, once a cold burst of concurrent queries
+     measures no slower than on the owner alone.
 
 4. **Step 3, if step 2's measurements call for it: a shared WAL index.** Before each query a reader reads the frames
    committed since its last query to find which pages changed (`Wal.scan`). The owner already knows. It can publish,
@@ -90,10 +97,10 @@ busy owner. Readers pay off when most of their reads are answered without the ow
 
 One PR each, with its measurements in the PR and in `docs/research/`.
 
-1. Proxy files and the owner's answering, readers on Firefox and Safari, the forced setting for Chromium. Tests: the
-   channel protocol in Node (a reader over a proxied in-memory database, answered in the same thread), the browser
-   test on Chromium both ways, and CI on Firefox and WebKit.
-2. The shared page cache.
+1. Proxy files and the owner's answering, behind `parallelReaders: 'proxy'`. Tests: the channel protocol in Node (a
+   reader over a proxied in-memory database, answered in the same thread), and the browser test with proxy readers
+   on every browser.
+2. The shared page cache, and proxy readers on by default.
 3. The shared WAL index, if needed.
 4. Measurements on the three browsers, routing and defaults. WORKER_MODEL.md and ARCHITECTURE.md describe what was
    built.
@@ -103,7 +110,8 @@ One PR each, with its measurements in the PR and in `docs/research/`.
 - Concurrent read-only queries run in parallel on every browser that supports OPFS, when the page is cross-origin
   isolated. Without isolation, nothing changes: reads run on the owner.
 - A reader's cache miss costs a round trip to the owner until step 2, and waits while the owner is in a stretch of
-  work with no page fetches (a commit's flush, a large sort in memory). Step 2 exists to make those misses rare.
+  work with no page fetches (a commit's flush, a large sort in memory). Step 2 exists to make those misses rare, and
+  proxy readers stay off by default until it does.
 - With step 2, memory for cached pages is shared rather than copied per reader.
 - The engine gains a cross-worker protocol on shared memory. Its tests run in Node with the owner's side called
   directly, and in the browsers for real.
