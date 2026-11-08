@@ -1,6 +1,7 @@
 import { CorruptionError } from '../errors.js';
 import type { VfsFile } from '../vfs/types.js';
 import { crc32c } from './crc32c.js';
+import type { SharedWalIndex } from './shared-wal.js';
 
 /**
  * Write-ahead log (docs/STORAGE_FORMAT.md §6). A commit appends every changed page (including the
@@ -44,6 +45,15 @@ export class Wal {
   private committedPageCount = 0;
   private writeBuf = new Uint8Array(0);
   readonly stats: WalStats = { commits: 0, framesWritten: 0, checkpoints: 0, recoveredFrames: 0 };
+  /**
+   * The owner's index in shared memory (ADR 0021 step 3): the owner publishes to it, a reader refreshes from it.
+   * `sharedGen` / `sharedCount`: what a reader last took from it; `fromShared`: its index came from there (not
+   * from scanning the file, so it has no checksum chain to continue a scan from).
+   */
+  private shared: { index: SharedWalIndex; owner: boolean } | null = null;
+  private sharedGen = -1;
+  private sharedCount = 0;
+  private fromShared = false;
 
   private constructor(
     readonly file: VfsFile,
@@ -82,11 +92,26 @@ export class Wal {
     return v.getUint32(12, true);
   }
 
-  /** Open a WAL file and recover every committed frame. */
-  static open(file: VfsFile, pageSize: number): Wal {
+  /**
+   * Open a WAL file and recover every committed frame. With `shared`, the owner publishes its index there, or a
+   * reader refreshes from it (ADR 0021 step 3).
+   */
+  static open(file: VfsFile, pageSize: number, shared?: { index: SharedWalIndex; owner: boolean }): Wal {
     const wal = new Wal(file, pageSize);
     wal.recover();
+    if (shared) {
+      wal.shared = shared;
+      if (shared.owner) wal.publishAll();
+    }
     return wal;
+  }
+
+  /** Owner: publish the whole index as a new generation (at open). */
+  private publishAll(): void {
+    const sh = this.shared!.index;
+    sh.newGeneration();
+    const entries = [...this.index].sort((a, b) => a[1] - b[1]);
+    sh.append(entries.map((e) => e[0]), entries.map((e) => e[1]), this.end, this.committedPageCount);
   }
 
   private recover(): void {
@@ -157,6 +182,11 @@ export class Wal {
    * checkpointed and restarted (a new generation): then every cached page may be stale.
    */
   refresh(): Set<number> | null | 'no-log' {
+    const shared = this.shared;
+    if (shared !== null && !shared.owner) {
+      const r = this.refreshShared(shared.index);
+      if (r !== undefined) return r;
+    }
     const h = new Uint8Array(WAL_HEADER_SIZE);
     const valid = this.file.read(h, 0) === WAL_HEADER_SIZE && this.headerValid(h);
     const v = new DataView(h.buffer);
@@ -177,6 +207,48 @@ export class Wal {
     const changed = new Set<number>();
     this.scan(changed);
     return changed;
+  }
+
+  /**
+   * A reader's refresh from the owner's shared index: no I/O when nothing changed. Undefined when the index
+   * overflowed (the log outgrew it): then the log file is scanned, as without it.
+   */
+  private refreshShared(sh: SharedWalIndex): Set<number> | null | 'no-log' | undefined {
+    for (;;) {
+      const s = sh.state();
+      if (s.overflow) {
+        if (!this.fromShared) return undefined;
+        // The index so far came from shared memory: rebuild it from the file, then scan as usual.
+        this.index.clear();
+        this.committedPageCount = 0;
+        this.fromShared = false;
+        this.sharedGen = -1;
+        this.recover();
+        return null;
+      }
+      const fresh = s.generation !== this.sharedGen;
+      if (!fresh && s.count === this.sharedCount) return new Set(); // nothing new (and no checkpoint: same file)
+      const changed = new Set<number>();
+      if (fresh) this.index.clear();
+      const from = fresh ? 0 : this.sharedCount;
+      for (let i = from; i < s.count; i++) {
+        const pg = sh.pgno(i);
+        this.index.set(pg, sh.offset(i));
+        changed.add(pg);
+      }
+      // Entries are rewritten only by a new generation (a checkpoint, which waits for idle readers): read again if one
+      // started meanwhile.
+      if (sh.generation !== s.generation) continue;
+      this.end = s.end;
+      this.committedPageCount = s.pageCount;
+      this.sharedGen = s.generation;
+      this.sharedCount = s.count;
+      this.fromShared = true;
+      if (!fresh) return changed;
+      // A new log: every cached page may be stale (null), unless there is no log at all ('no-log': the caller
+      // compares the file's change counter, as after a checkpoint).
+      return s.end === 0 ? 'no-log' : null;
+    }
   }
 
   private headerValid(h: Uint8Array): boolean {
@@ -266,6 +338,15 @@ export class Wal {
     this.end = start + pages.length * fs;
     this.lastCrc = crc;
     this.committedPageCount = pageCount;
+    if (this.shared?.owner) {
+      const pgnos = new Array<number>(pages.length);
+      const offsets = new Array<number>(pages.length);
+      for (let i = 0; i < pages.length; i++) {
+        pgnos[i] = pages[i].pgno;
+        offsets[i] = start + i * fs;
+      }
+      this.shared.index.append(pgnos, offsets, this.end, pageCount);
+    }
     this.stats.commits++;
     this.stats.framesWritten += pages.length;
   }
@@ -314,6 +395,7 @@ export class Wal {
     this.startFresh(this.seq + 1);
     this.file.truncate(0);
     this.file.flush();
+    if (this.shared?.owner) this.shared.index.newGeneration();
     this.stats.checkpoints++;
   }
 

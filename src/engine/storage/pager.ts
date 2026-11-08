@@ -1,6 +1,7 @@
 import { CorruptionError, MisuseError, SmaltError } from '../errors.js';
 import type { VfsFile } from '../vfs/types.js';
 import { crc32c } from './crc32c.js';
+import type { SharedWalIndex } from './shared-wal.js';
 import { Wal, type WalStats } from './wal.js';
 import {
   DB_HEADER_SIZE,
@@ -51,6 +52,11 @@ export class Frame {
 }
 
 export interface PagerOptions {
+  /**
+   * The owner's WAL index in shared memory (ADR 0021 step 3): the owner (`owner: true`) publishes to it; a reader that
+   * reads through the owner refreshes its snapshot from it instead of scanning the log.
+   */
+  sharedWal?: { index: SharedWalIndex; owner: boolean };
   /** Page size for a new database (power of two, 512..65536). Ignored for existing files. */
   pageSize?: number;
   /** Buffer-pool budget in bytes (default 16 MiB). The pool grows past it only when every frame is pinned or dirty. */
@@ -196,7 +202,7 @@ export class Pager {
     if (pageSize === null && walFile) pageSize = Wal.probePageSize(walFile);
     if (pageSize === null) pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
     validatePageSize(pageSize);
-    const wal = walFile ? Wal.open(walFile, pageSize) : null;
+    const wal = walFile ? Wal.open(walFile, pageSize, options.sharedWal) : null;
 
     const header = new Uint8Array(pageSize);
     let found = false;

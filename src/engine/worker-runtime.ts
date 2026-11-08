@@ -33,6 +33,7 @@ import { detectCapabilities } from './vfs/capabilities.js';
 import { OpfsVfs } from './vfs/opfs.js';
 import { OwnedVfs, ProxyServer, ProxyVfs, createChannel } from './vfs/proxy.js';
 import { SharedCache } from './vfs/shared-cache.js';
+import { SharedWalIndex } from './storage/shared-wal.js';
 import type { SmaltPlugin } from './plugin.js';
 import { registerLanguage, type SmaltLanguage } from './plan/language.js';
 import type { BusMessage, ReaderMessage, ReaderSettings, Request, Response } from '../shared/protocol.js';
@@ -88,7 +89,7 @@ export function serve(options: ServeOptions = {}): void {
         }
       },
       // Readers never refresh materialized views (the owner's scheduler does).
-      { open: () => Database.openReader(readerVfs(init), `${init.name}.db`, { pageSize: init.pageSize, cacheSizeBytes: init.cacheSizeBytes, spillPath: `${init.name}.db-spill-r${init.reader}`, plugins }), refreshTimer: false },
+      { open: () => Database.openReader(readerVfs(init), `${init.name}.db`, { pageSize: init.pageSize, cacheSizeBytes: init.cacheSizeBytes, sharedWal: init.wal ? { index: new SharedWalIndex(init.wal), owner: false } : undefined, spillPath: `${init.name}.db-spill-r${init.reader}`, plugins }), refreshTimer: false },
     );
     // Open (with the shared interrupt flag); the 'ok' goes to id 0, which the client ignores.
     server.receive(EngineServer.LOCAL, { id: 0, op: 'open', name: init.name, storage: 'opfs', interrupt: init.interrupt });
@@ -205,7 +206,7 @@ export function serve(options: ServeOptions = {}): void {
         // The client's end of the direct result channel.
         scope.postMessage({ id: 0, kind: 'port', port: ch.port1 } satisfies Response, [ch.port1]);
         w.postMessage(
-          { type: 'init', name: open.name, pageSize: open.pageSize, cacheSizeBytes: open.cacheSizeBytes, reader: i + 1, port: ch.port2, bus: open.bus, interrupt: open.interrupt, proxy: channel, cache: proxy?.cacheBuffer } satisfies ReaderMessage,
+          { type: 'init', name: open.name, pageSize: open.pageSize, cacheSizeBytes: open.cacheSizeBytes, reader: i + 1, port: ch.port2, bus: open.bus, interrupt: open.interrupt, proxy: channel, cache: proxy?.cacheBuffer, wal: sharedWal } satisfies ReaderMessage,
           [ch.port2],
         );
       }
@@ -236,6 +237,8 @@ export function serve(options: ServeOptions = {}): void {
   const readers = new Readers();
   /** Answers proxied readers' file requests (ADR 0021), when they read through this owner. */
   let proxy: ProxyServer | null = null;
+  /** The owner's WAL index in shared memory, which proxied readers refresh from (ADR 0021 step 3). */
+  let sharedWal: SharedArrayBuffer | undefined;
   /** Which parallel readers this owner started (reported to clients as `capabilities.readers`). */
   let readerKind: 'shared' | 'proxy' | 'none' = 'none';
 
@@ -263,7 +266,8 @@ export function serve(options: ServeOptions = {}): void {
         }
         const path = `${req.name}.db`;
         const files = proxied ? new OwnedVfs(new OpfsVfs()) : new OpfsVfs();
-        const db = await Database.open(files, path, { ...base, sharedHandles: shared });
+        sharedWal = proxied ? SharedWalIndex.create() : undefined;
+        const db = await Database.open(files, path, { ...base, sharedHandles: shared, sharedWal: sharedWal ? { index: new SharedWalIndex(sharedWal), owner: true } : undefined });
         db.setCheckpointGate(() => readers.active === 0);
         readerKind = proxied ? 'proxy' : 'shared';
         if (proxied) {

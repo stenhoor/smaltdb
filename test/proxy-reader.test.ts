@@ -8,11 +8,17 @@ import { Database } from '../src/engine/database.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
 import { OwnedVfs, ProxyServer, ProxyVfs, createChannel } from '../src/engine/vfs/proxy.js';
 import { BLOCK, SharedCache } from '../src/engine/vfs/shared-cache.js';
+import { SharedWalIndex } from '../src/engine/storage/shared-wal.js';
 
-/** An owner and a reader of its files over a channel with `dataBytes` of data area, and a shared cache if `cached`. */
-async function setup(dataBytes?: number, cached = false) {
+/**
+ * An owner and a reader of its files over a channel with `dataBytes` of data area, a shared cache if `cached`, and
+ * the owner's WAL index in shared memory if `walIndex` (its capacity, in frames).
+ */
+async function setup(dataBytes?: number, cached = false, walIndex?: number) {
   const files = new OwnedVfs(new MemoryVfs());
-  const w = await Database.open(files, 'db', { walAutoCheckpointBytes: 1 << 30 });
+  const wal = walIndex === undefined ? undefined : SharedWalIndex.create(walIndex);
+  const sharedWal = (owner: boolean) => (wal === undefined ? undefined : { index: new SharedWalIndex(wal), owner });
+  const w = await Database.open(files, 'db', { walAutoCheckpointBytes: 1 << 30, sharedWal: sharedWal(true) });
   w.exec('CREATE TABLE t(id INTEGER PRIMARY KEY, v INT, s TEXT)');
   w.exec("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000) INSERT INTO t SELECT i, i, hex(i) FROM n");
   const cache = cached ? SharedCache.create(4 * 1024 * 1024) : undefined;
@@ -21,19 +27,19 @@ async function setup(dataBytes?: number, cached = false) {
   const channel = createChannel(dataBytes);
   server.add(channel);
   const local = new MemoryVfs();
-  const reader = async (spillPath: string) => Database.openReader(new ProxyVfs(channel, 'db', () => server.service(), local, cache ?? null), 'db', { spillPath });
+  const reader = async (spillPath: string) => Database.openReader(new ProxyVfs(channel, 'db', () => server.service(), local, cache ?? null), 'db', { spillPath, sharedWal: sharedWal(false) });
   const r = await reader('db-spill-r1');
   return { files, w, r, server, local, reader };
 }
 
 const sum = (db: Database): unknown => db.query('SELECT count(*), sum(v) FROM t').rows[0];
 
-// The default data area, one smaller than a page (every read is split into several round trips), and with the shared
-// block cache (step 2).
-for (const [dataBytes, cached] of [[undefined, false], [1000, false], [undefined, true]] as const) {
-  describe(`proxied readers (data area ${dataBytes ?? 'default'}${cached ? ', shared cache' : ''})`, () => {
+// The default data area, one smaller than a page (every read is split into several round trips), with the shared
+// block cache (step 2), and with the owner's WAL index in shared memory too (step 3).
+for (const [dataBytes, cached, walIndex] of [[undefined, false, undefined], [1000, false, undefined], [undefined, true, undefined], [undefined, true, 64 * 1024]] as const) {
+  describe(`proxied readers (data area ${dataBytes ?? 'default'}${cached ? ', shared cache' : ''}${walIndex ? ', shared WAL index' : ''})`, () => {
     it('read the snapshot, and see commits after refreshSnapshot', async () => {
-      const { w, r, server } = await setup(dataBytes, cached);
+      const { w, r, server } = await setup(dataBytes, cached, walIndex);
       expect(sum(r)).toEqual([3000, 4501500]);
       expect(server.answered).toBeGreaterThan(0);
       w.exec('UPDATE t SET v = v + 1 WHERE id <= 100');
@@ -43,7 +49,7 @@ for (const [dataBytes, cached] of [[undefined, false], [1000, false], [undefined
     });
 
     it('keep an open cursor on its snapshot while the owner commits', async () => {
-      const { w, r } = await setup(dataBytes, cached);
+      const { w, r } = await setup(dataBytes, cached, walIndex);
       const c = r.prepare('SELECT v FROM t ORDER BY id').cursor();
       let total = c.next()![0] as number;
       w.exec('UPDATE t SET v = -1');
@@ -59,7 +65,7 @@ for (const [dataBytes, cached] of [[undefined, false], [1000, false], [undefined
     });
 
     it('pick up schema changes and survive checkpoints', async () => {
-      const { w, r } = await setup(dataBytes, cached);
+      const { w, r } = await setup(dataBytes, cached, walIndex);
       w.exec('CREATE TABLE u(x); INSERT INTO u VALUES (42); CREATE INDEX t_v ON t(v)');
       r.refreshSnapshot();
       expect(r.query('SELECT x FROM u').rows).toEqual([[42]]);
@@ -73,7 +79,7 @@ for (const [dataBytes, cached] of [[undefined, false], [1000, false], [undefined
     });
 
     it('cannot write', async () => {
-      const { r } = await setup(dataBytes, cached);
+      const { r } = await setup(dataBytes, cached, walIndex);
       expect(() => r.exec('INSERT INTO t VALUES (99999, 1, 1)')).toThrow(/read-only/);
       expect(sum(r)).toEqual([3000, 4501500]);
     });
@@ -180,5 +186,52 @@ describe('the shared block cache', () => {
     let cached = 0;
     for (let b = 0; b < 8; b++) if (c.read(0, b, 0, 1, out, 0)) cached++;
     expect(cached).toBe(7);
+  });
+});
+
+describe('the shared WAL index', () => {
+  it('refreshes a snapshot without asking the owner when nothing changed', async () => {
+    const { w, r, server } = await setup(undefined, true, 64 * 1024);
+    r.refreshSnapshot();
+    sum(r);
+    const asked = server.answered;
+    for (let i = 0; i < 5; i++) r.refreshSnapshot();
+    expect(server.answered).toBe(asked);
+    // A commit: the reader learns its pages from the index; it reads only what the query needs.
+    w.exec('UPDATE t SET v = v + 1 WHERE id = 1');
+    r.refreshSnapshot();
+    expect(sum(r)).toEqual([3000, 4501501]);
+  });
+
+  it('falls back to scanning the log when the index overflows, and back after a checkpoint', async () => {
+    const { w, r } = await setup(undefined, true, 8); // room for 8 frames: the first commits overflow it
+    for (let i = 0; i < 4; i++) {
+      w.exec(`UPDATE t SET v = v + 1 WHERE id % 4 = ${i}`);
+      r.refreshSnapshot();
+      expect(r.query('SELECT sum(v) FROM t').rows).toEqual(w.query('SELECT sum(v) FROM t').rows);
+    }
+    w.checkpoint(); // a new generation, empty: it fits again
+    w.exec('UPDATE t SET v = 0 WHERE id = 2');
+    r.refreshSnapshot();
+    expect(r.query('SELECT sum(v) FROM t').rows).toEqual(w.query('SELECT sum(v) FROM t').rows);
+    expect(r.query('PRAGMA integrity_check').rows).toEqual([['ok']]);
+  });
+
+  it('publishes a reopened owner’s log', async () => {
+    const files = new OwnedVfs(new MemoryVfs());
+    const w = await Database.open(files, 'db', { walAutoCheckpointBytes: 1 << 30 });
+    w.exec('CREATE TABLE t(id INTEGER PRIMARY KEY, v INT)');
+    w.exec('INSERT INTO t VALUES (1, 10), (2, 20)');
+    // A second owner on the same files (as after a tab took over) recovers the log and publishes it.
+    const wal = SharedWalIndex.create();
+    const w2 = await Database.open(files, 'db', { walAutoCheckpointBytes: 1 << 30, sharedWal: { index: new SharedWalIndex(wal), owner: true } });
+    expect(new SharedWalIndex(wal).state().count).toBeGreaterThan(0);
+    const server = new ProxyServer(files, 'db', SharedCache.create(1 << 20));
+    server.walCommitted = () => w2.walCommittedBytes();
+    const channel = createChannel();
+    server.add(channel);
+    const r = await Database.openReader(new ProxyVfs(channel, 'db', () => server.service(), new MemoryVfs()), 'db', { sharedWal: { index: new SharedWalIndex(wal), owner: false } });
+    r.refreshSnapshot();
+    expect(r.query('SELECT sum(v) FROM t').rows).toEqual([[30]]);
   });
 });

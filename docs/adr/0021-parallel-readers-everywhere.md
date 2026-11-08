@@ -1,6 +1,6 @@
 # ADR 0021: Parallel readers everywhere (M9)
 
-- **Status:** accepted with #171; step 1 in #172; step 2 in #173; step 4's first decisions (below) in progress
+- **Status:** accepted with #171; step 1 in #172; step 2 in #173; step 4's first decisions in #174; step 3 in progress
 - **Date:** 2026-11-08
 - **Builds on:** [ADR 0009](0009-concurrency.md) section 7 (parallel readers on Chromium) and
   [WORKER_MODEL.md](../WORKER_MODEL.md) section 3 (the parallel mode)
@@ -90,6 +90,18 @@ busy owner. Readers pay off when most of their reads are answered without the ow
    committed since its last query to find which pages changed (`Wal.scan`). The owner already knows. It can publish,
    per commit, the pages and frame offsets in a `SharedArrayBuffer` (as SQLite's wal-index does), and readers read
    that instead of the frames. Only if refreshing turns out to cost readers more than it saves.
+
+   **Measured, and built** ([research](../research/m9-parallel-readers.md)): with readers through the owner, refreshing
+   took 18% of their query time even with no commits in between, as asking the owner for the log's size waits for a
+   busy owner, and 17–22% with commits. `storage/shared-wal.ts`:
+   - **Published by the owner:** at open, after each commit (the commit's pages and frame offsets, appended; then the
+     log's committed end and page count), and after each checkpoint (a new, empty generation). Only the owner writes;
+     a sequence number guards the header (a seqlock), and entries are written before the header publishes them.
+   - **Read by readers that read through the owner:** a refresh with nothing new does no I/O; new commits come from
+     the entries, without reading or checksumming their frames; a new generation rebuilds the index.
+   - **Capacity:** 64 Ki frames per log generation (768 KiB). A log that outgrows it marks the index as overflowed,
+     and readers scan the log file as before until the next checkpoint.
+   - **No format change:** the index lives in memory only and is rebuilt from the log when an owner opens it.
 
 5. **Step 4: measure, then route.** The browser test's concurrent-query timings on all three browsers, against the
    owner alone, and on Chromium against readers with their own handles. Then:
