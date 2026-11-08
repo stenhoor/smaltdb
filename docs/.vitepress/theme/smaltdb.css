@@ -154,7 +154,8 @@ img.sw-light { display: inline-block; }
 .VPFooter .message a { display: inline-block; line-height: 0; }
 .VPFooter .message img { vertical-align: middle; }
 
-/* Tagline: keep "Small. Alternative. Fast." on one line where there's room; balance it on phones. */
+/* Tagline: "Small. Alternative." on one line and the product's word on the next, on every site. The break is in each
+   site's hero text ('Small. Alternative.<br>Fast.'), so it never depends on the word's length or the window's width. */
 .VPHero .text { text-wrap: balance; }
 @media (min-width: 640px) { .VPHero .text { font-size: 44px; line-height: 52px; } }
 @media (min-width: 960px) { .VPHero .text { font-size: 50px; line-height: 58px; } }

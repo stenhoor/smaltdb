@@ -19,4 +19,4 @@ Colours: smalt `#003399`, chip `#7B97D4`, ink `#151922`; on dark, `#9DB4F5`, `#D
 Don't recolour, rotate, outline or add effects to the marks, and keep the light files off dark backgrounds.
 
 The stage badge (`work-in-progress.svg`, `-on-dark`) and the family badge (`a-smaltworks-project.svg`, `-on-dark`) are
-copied from smalt-brand `badges/` (commit `d9b0097`), for the site and the README.
+copied from smalt-brand `badges/` (commit `3ee6e11`), for the site and the README.
