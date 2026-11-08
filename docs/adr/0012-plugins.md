@@ -2,8 +2,10 @@
 
 - **Status:** accepted (2026-11-02); amended 2026-11-02: one repository per plugin, and the full interface (sources,
   connection types, methods, questions to client sessions); amended 2026-11-03: installing before the first publish,
-  the docs examples split by plugin, and API version 1 declared stable in [ADR 0013](0013-plugin-api-v1.md). See the
-  implementation plan for progress.
+  the docs examples split by plugin, and API version 1 declared stable in [ADR 0013](0013-plugin-api-v1.md); amended
+  2026-11-08: a plugin carries the outside code its feature needs as ordinary dependencies, so `hyparquet-compressors`
+  is a dependency of `@smaltdb/parquet`, no longer an optional peer each application installs (the owner's decision,
+  smalt-brand DECISIONS.md, "Outside code: ask first, and plugins carry it"). See the implementation plan for progress.
 - **Date:** 2026-11-02
 
 ## Context
@@ -45,7 +47,7 @@ The project owner decided these questions on 2026-11-02:
 | `smaltdb` (core) | Client, engine, worker runtime, storage, SQL, all built-in functions, columnar tables, materialized views, spilling, parallel readers, `information_schema`. **Also the external-table framework**: the SQL syntax (`CREATE CONNECTION`, `CREATE EXTERNAL TABLE`, `read_*` calls), catalog entries, the async fetch phase, the scan operator, projection and partition / row-group pruning hooks, cache validators and refresh policies. | none |
 | `@smaltdb/external` | Sources: `file:` (registered files), Node paths, HTTP(S), S3, Azure Blob Storage; SigV4 and Azure Shared Key signing; credential providers; glob listing and Hive partitions. Client helpers `registerFile`, `registerCredentials`. | none |
 | `@smaltdb/io` | The CSV, TSV, JSON and NDJSON formats: parsers and type inference, used by external tables and `read_csv` / `read_json`. Import and export: `importCSV`, `importJSON`, `exportCSV`, `exportJSON`. | none |
-| `@smaltdb/parquet` | The Parquet format: footer and schema reading, ranged column-chunk reads, row-group statistics, `read_parquet`. | `hyparquet`; optional `hyparquet-compressors` |
+| `@smaltdb/parquet` | The Parquet format: footer and schema reading, ranged column-chunk reads, row-group statistics, `read_parquet`. | `hyparquet`; `hyparquet-compressors` (an optional peer until the 2026-11-08 amendment) |
 
 **Why columnar tables and materialized views stay in core:** they change the database file. A database that uses
 them could not be opened, or recovered after a crash, without the plugin. They are also our own code, with no

@@ -153,8 +153,8 @@ DROP CONNECTION [IF EXISTS] api;          -- fails while an external table uses 
 - **Formats:** `csv`, `tsv`, `json` (an array of objects, or of arrays with declared columns), `ndjson`, `parquet`
   (M8.3); taken from `format` or the file extension. `read_parquet(location, …)` reads Parquet ad hoc.
 - **Parquet** (M8.3) is the `@smaltdb/parquet` plugin (ADR 0012), which reads with
-  [hyparquet](https://github.com/hyparam/hyparquet) (plus `hyparquet-compressors` for gzip, zstd, brotli and lz4;
-  Snappy is built in). Without it, Parquet sources fail with `SMALT_PLUGIN_MISSING`.
+  [hyparquet](https://github.com/hyparam/hyparquet) and its dependency `hyparquet-compressors` (gzip, zstd, brotli and lz4;
+  Snappy is built into hyparquet). Without it, Parquet sources fail with `SMALT_PLUGIN_MISSING`.
   - *Reads only what the statement needs:* the footer (the first 16 KB from the end), then only the column chunks of
     the columns the statement uses, by HTTP Range requests (S3, Azure and HTTP), Blob slices or file reads; files under
     64 KB are read in one request. Columns that are not read are NULL to the scan.
