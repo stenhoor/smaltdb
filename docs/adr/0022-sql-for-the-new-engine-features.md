@@ -1,6 +1,6 @@
 # ADR 0022: SQL for the new engine features
 
-- **Status:** proposed; the owner's decisions are open (at the end)
+- **Status:** proposed; the owner's decisions 2–5 are open (at the end); decision 1 follows from the brand
 - **Date:** 2026-11-09
 - **Builds on:** [ADR 0015](0015-smaltql.md) (smaltql), [ADR 0016](0016-plan-api-for-every-language.md) (the plan API
   and its operations), [ADR 0018](0018-bool-and-nan.md), [ADR 0019](0019-dates-and-times.md) and
@@ -145,13 +145,13 @@ the engine, and get their own record.
 
 ## Owner's decisions (open)
 
-Each with a recommendation:
+Decision 1 is settled by the brand; 2–5 are open, each with a recommendation:
 
-1. **A superset of SQLite.** smaltql's rule is that SQL results match SQLite's. Steps 3–7 add syntax SQLite doesn't
-   have; none of it changes what valid SQLite means (rule 4).
-   - **Recommendation:** extensions on by default, documented as smaltdb's, as SQLite's own extensions (`REGEXP`,
-     `->>`) are.
-   - **Alternative:** behind a setting (`PRAGMA extensions = on`), so strict SQLite users see errors for them.
+1. **A superset of SQLite: decided by the brand.** smaltql's rule is that SQL results match SQLite's, and steps 3–7
+   add syntax SQLite doesn't have. The brand already answers this: "familiar SQL always works. It can grow its own
+   syntax, but only by adding to SQL, never by changing what working SQL means" (smalt-brand `BRAND.md`, and the
+   superset promise in `DECISIONS.md`). Rule 4 keeps that promise, so the extensions are on by default, with no
+   setting.
 2. **Hide engine names (rule 3 and the allow-list).** SQL can call the 54 functions today, undocumented.
    - **Recommendation:** hide every name this record doesn't list, in step 1. Nothing documented breaks.
    - **Alternative:** keep them callable, and document them all under their engine names.
@@ -174,5 +174,5 @@ Each with a recommendation:
 - SQL stops leaking the engine's run-time forms, and the functions reference lists everything SQL can call.
 - SQL users get the Postgres and DuckDB spellings for what smaltdf already does, over the same plan operations: no new
   engine operations except `cast_time` (step 8).
-- smaltql becomes a superset of SQLite (decision 1). sqllogictest stays at its pass rate, since nothing valid in SQLite
-  changes.
+- smaltql becomes a superset of SQLite, as the brand promises (decision 1). sqllogictest stays at its pass rate,
+  since nothing valid in SQLite changes.
