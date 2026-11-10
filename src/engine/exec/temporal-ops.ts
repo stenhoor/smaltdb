@@ -15,6 +15,7 @@ import {
   isTemporal,
   parseDate,
   parseDatetime,
+  parseTime,
   splitDays,
 } from '../../shared/temporal.js';
 import { zoneOffsetMs } from './zones.js';
@@ -548,6 +549,21 @@ function daysOf(v: SqlValue): number {
   throw mismatch('cast_date takes text or a number, not a blob');
 }
 
+/** µs since midnight of text `HH:MM[:SS[.f]]` or a number of µs, within the day. */
+function timeUsOf(v: SqlValue): number {
+  if (typeof v === 'string') {
+    const us = parseTime(v);
+    if (us === null) throw mismatch(`cast_time: ${quoted(v)} is not a time`);
+    return us;
+  }
+  if (typeof v === 'number' || typeof v === 'bigint') {
+    const n = integerOf(v, 'cast_time');
+    if (typeof n === 'bigint' || n < 0 || n >= 86_400_000_000) throw outOfRange(`cast_time: ${n} µs is not within a day`);
+    return n;
+  }
+  throw mismatch('cast_time takes text or a number, not a blob');
+}
+
 function usOf(v: SqlValue): number | bigint {
   if (typeof v === 'string') {
     const us = parseDatetime(v);
@@ -572,6 +588,13 @@ const CASTS: [string, ScalarFunction][] = [
     if (t === 'datetime') return ([v]) => v;
     if (t === 'date') return ([v]) => (v === null ? null : exactUs(Number(temporalValue(v, 'cast_datetime')), 0));
     return ([v]) => (v === null ? null : usOf(v));
+  }),
+  op('cast_time', 1, 1, () => 'time', ([a]) => {
+    const t = a!.type;
+    if (t === 'date' || t === 'duration') throw mismatch(`cast_time takes a time, datetime, text or a number, not ${t}`);
+    if (t === 'time') return ([v]) => v;
+    if (t === 'datetime') return ([v]) => (v === null ? null : Number(splitDays(temporalValue(v, 'cast_time')).rest));
+    return ([v]) => (v === null ? null : timeUsOf(v));
   }),
 ];
 

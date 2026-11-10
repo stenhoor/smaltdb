@@ -279,6 +279,7 @@ when the plan is compiled. NULL arguments give NULL.
 | `zone_offset` | 2: a `datetime` (a UTC instant), zone | The zone's offset from UTC at that instant, a `duration` |
 | `cast_date` | 1 | A `date` from a `datetime` (its day), from text in the result format, or from a number of days. Anything else is an error (`SMALT_MISMATCH`) |
 | `cast_datetime` | 1 | A `datetime` from a `date` (midnight), from text in the result format, or from a number of µs. Anything else is an error |
+| `cast_time` | 1 | A `time` from a `datetime` (its time of day), from text (`HH:MM[:SS[.f]]`), or from a number of µs within a day. Anything else is an error |
 
 `cast_text` of a temporal value gives its result text.
 

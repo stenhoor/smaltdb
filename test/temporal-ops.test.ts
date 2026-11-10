@@ -169,6 +169,18 @@ describe('casts', () => {
     expect(() => call('cast_date', [time(1)], 'date')).toThrow(/not time/);
   });
 
+  it('cast_time: a time of day from text, a datetime or µs; strict', () => {
+    expect(call('cast_time', [text('12:30:00')], 'time')).toBe('12:30:00');
+    expect(call('cast_time', [text('08:05')], 'time')).toBe('08:05:00');
+    expect(call('cast_time', [datetime(2026, 11, 7, 13, 4, 5)], 'time')).toBe('13:04:05');
+    expect(call('cast_time', [datetime(1969, 12, 31, 23, 59)], 'time')).toBe('23:59:00');
+    expect(call('cast_time', [int(1_500_000)], 'time')).toBe('00:00:01.500');
+    expect(call('cast_time', [p.lit(null, 'text')], 'time')).toBeNull();
+    expect(() => call('cast_time', [text('noon')], 'time')).toThrow(/'noon' is not a time/);
+    expect(() => call('cast_time', [int(86_400_000_000)], 'time')).toThrow(/not within a day/);
+    expect(() => call('cast_time', [date(2026, 1, 1)], 'time')).toThrow(/not date/);
+  });
+
   it('cast_text gives the result text', () => {
     expect(call('cast_text', [datetime(2026, 11, 7, 12, 0, 0, 500_000)], 'text')).toBe('2026-11-07 12:00:00.500');
     expect(call('cast_text', [p.lit(DAY + 1e6, 'duration')], 'text')).toBe('P1DT1S');
