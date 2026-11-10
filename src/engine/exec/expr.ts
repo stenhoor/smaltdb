@@ -303,7 +303,10 @@ function compileScalarCall(e: Extract<BoundExpr, { k: 'call' }>, ctx: FunctionCo
   const def = scalarFunctions.get(e.fn)!;
   const args = e.args.map((a) => compilePlanExpr(a, ctx));
   const compiledArgs: CompiledArg[] = args.map((a) => ({ fn: a.fn, type: a.type, collation: a.collation }));
-  const { fn, type } = def.compile(compiledArgs, ctx);
+  const { fn, type: own } = def.compile(compiledArgs, ctx);
+  // Where the function can't tell its type from its arguments' (struct_field's field, by index), the type the language
+  // declared on the call stands (ADR 0020 section 4, ADR 0022).
+  const type = own === 'any' && e.type !== 'any' ? e.type : own;
   return fold({ fn, type, collation: 0, collSrc: CollSrc.None, affinity: 'NONE', constant: def.deterministic && args.every((a) => a.constant) });
 }
 

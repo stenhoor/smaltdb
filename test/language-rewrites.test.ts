@@ -27,3 +27,15 @@ it("a language's sample is planned", () => {
   d.exec('INSERT INTO t VALUES (1), (2), (3), (4), (5)');
   expect(d.query('SELECT i FROM t').rows).toHaveLength(2);
 });
+
+it("a call's declared type stands where the function can't tell its own (struct_field)", async () => {
+  const d = Database.openMemory();
+  const type = 'struct<name text, tags list<text>>';
+  const col = { name: 's', declaredType: type, type: 'STRUCT', notNull: false, collation: 'binary' } as const;
+  await d.queryPlanAsync({ kind: 'schema', op: { op: 'createTable', table: { name: 't', columns: [col], keys: [], checks: [], foreignKeys: [], storage: 'row' }, temp: false, ifNotExists: false } } as never);
+  await d.queryPlanAsync({ kind: 'write', plan: { op: 'append', table: 't', db: 'main', input: { op: 'values', rows: [], types: [type], columns: [[{ name: 'a', tags: ['x', 'y'] }]] }, columns: [0], upserts: [] } } as never);
+  // The tags field, declared list<text> on the call, read as a list: its JSON text and its length.
+  const field = { k: 'call', fn: 'struct_field', args: [{ k: 'col', input: 0, index: 0, depth: 0, type, collation: 'binary' }, { k: 'lit', value: 1, type: 'int' }], type: 'list<text>' };
+  const r = (await d.queryPlanAsync({ kind: 'query', plan: { op: 'project', input: { op: 'scan', table: 't', columns: [0] }, exprs: [{ k: 'call', fn: 'cast_text', args: [field], type: 'text' }, { k: 'call', fn: 'list_len', args: [field], type: 'int' }] } } as never)) as { rows: unknown[][] };
+  expect(r.rows).toEqual([['["x","y"]', 2]]);
+});
