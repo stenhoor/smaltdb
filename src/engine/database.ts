@@ -3350,6 +3350,12 @@ export class Database implements FunctionContext {
     const existing = this.catalogEntries.get(lower);
     const kindOf = (t: CatalogEntry['type']): string => (t === 'matview' ? 'materialized view' : t === 'external' ? 'external table' : t);
     if (stmt.objectType === 'connection') return this.dropConnection(stmt);
+    // The schema table and the engine's own objects (smalt_*, sqlite_*: names reserved at creation) are never dropped,
+    // IF EXISTS or not: dropping one corrupts the database. As ALTER TABLE, and SQLite ('table sqlite_master may not be
+    // dropped'). Here in the engine, so plans and every language are covered.
+    if (CATALOG_NAMES.has(lower) || lower.startsWith('smalt_') || lower.startsWith('sqlite_')) {
+      throw new SmaltError('SMALT_ERROR', `${stmt.objectType} ${CATALOG_NAMES.has(lower) ? 'sqlite_master' : stmt.name} may not be dropped`);
+    }
     if (existing && stmt.objectType !== 'index' && existing.type !== 'index' && kindOf(existing.type) !== stmt.objectType) {
       throw new SmaltError('SMALT_ERROR', `use DROP ${kindOf(existing.type).toUpperCase()} to delete ${kindOf(existing.type)} ${existing.name}`);
     }
