@@ -1261,7 +1261,11 @@ export class Database implements FunctionContext {
   private received<T extends { plan: PlanOp }>(fe: T): T {
     const r = roundTripOn() ? { ...fe, plan: planFromJSON(planToJSON(fe.plan)) } : fe;
     validatePlan(r.plan, this.validateCatalog);
-    return r;
+    // A language's plan may hold operations the planner plans only after rewriting (sample, pivot, explode, as-of
+    // joins, …), as plan statements do (smaltdb ADR 0022). Plans without them are left exactly as given.
+    if (!needsRewrite(r.plan)) return r;
+    const write = r.plan.op === 'append' || r.plan.op === 'update' || r.plan.op === 'delete';
+    return { ...r, plan: write ? normalizeWrite(r.plan) : normalizePlan(r.plan) };
   }
 
   private readonly validateCatalog: ValidateCatalog = {
@@ -5330,4 +5334,29 @@ function refreshIfChanged(st: PreparedStatement): string | null {
     return null; // not a refresh: running it reports the error
   }
   return b?.kind === 'maintenance' && b.action === 'refresh' && b.ifChanged ? b.view : null;
+}
+
+/** Whether `v` (a plan, or any part of one) holds an operation that normalizePlan rewrites into others. */
+function needsRewrite(v: unknown): boolean {
+  if (v === null || typeof v !== 'object') return false;
+  if (Array.isArray(v)) return v.some(needsRewrite);
+  const o = v as Record<string, unknown>;
+  switch (o.op) {
+    case 'sample':
+    case 'pivot':
+    case 'unpivot':
+    case 'explode':
+      return true;
+    case 'join':
+      if (o.kind === 'asof') return true;
+      break;
+    case 'distinct':
+      if (o.on !== undefined || o.keep !== undefined) return true;
+      break;
+    case 'limit':
+      if (o.fromEnd) return true;
+      break;
+  }
+  for (const k in o) if (needsRewrite(o[k])) return true;
+  return false;
 }
