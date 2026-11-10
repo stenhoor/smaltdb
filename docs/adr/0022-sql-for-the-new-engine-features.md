@@ -1,6 +1,8 @@
 # ADR 0022: SQL for the new engine features
 
-- **Status:** accepted with the owner's decisions of 2026-11-10 (at the end); decision 1 follows from the brand
+- **Status:** done: accepted with the owner's decisions of 2026-11-10 (#181, #182); steps 1–8 in stenhoor/smaltql#33,
+  #34, #35, #36, #37, #38, #39, #40, #41, #42, #43, #44, #45, #46, #47, with the engine's #183, #184 and #185. Differences
+  from the proposal are under "Done" at the end
 - **Date:** 2026-11-09
 - **Builds on:** [ADR 0015](0015-smaltql.md) (smaltql), [ADR 0016](0016-plan-api-for-every-language.md) (the plan API
   and its operations), [ADR 0018](0018-bool-and-nan.md), [ADR 0019](0019-dates-and-times.md) and
@@ -170,3 +172,18 @@ the engine, and get their own record.
   engine operations except `cast_time` (step 8).
 - smaltql becomes a superset of SQLite, as the brand promises (decision 1). sqllogictest stays at its pass rate,
   since nothing valid in SQLite changes.
+
+## Done (2026-11-10)
+
+Where the work differs from the proposal:
+
+- **No `date ± int`** (step 3). A `DATE` column read by SQL keeps SQLite's text arithmetic (ADR 0019 §6), so `d + 1` is
+  `2027`; `+ INTERVAL '1 day'` moves by days.
+- **`PIVOT` and `UNPIVOT` take the SQL-standard `FROM`-clause form** (`FROM t PIVOT (sum(v) FOR c IN (…))`,
+  `FROM t UNPIVOT (v FOR n IN (a, b))`), which DuckDB also takes, rather than DuckDB's statement form. `UNPIVOT`
+  leaves out NULL values unless `INCLUDE NULLS`.
+- **The engine:** a language's plans with `sample`, `pivot`, `unpivot`, `explode`, as-of joins, `distinct` with
+  `on` / `keep` or a `limit` from the end are rewritten on receipt, as plan statements are (#183); a call's declared
+  type stands where its function can't tell its own, for `struct_field` (#184); `cast_time` (#185).
+- **Not done:** `(s).*`; DuckDB's `USING SAMPLE`; `INTERVAL` on a `time` (the engine's `offset_by` takes dates and
+  date-times); `implode` stays callable from SQL, since `array_agg` compiles to it.
