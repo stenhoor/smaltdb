@@ -1,6 +1,6 @@
 # ADR 0022: SQL for the new engine features
 
-- **Status:** proposed; the owner's decisions 2–5 are open (at the end); decision 1 follows from the brand
+- **Status:** accepted with the owner's decisions of 2026-11-10 (at the end); decision 1 follows from the brand
 - **Date:** 2026-11-09
 - **Builds on:** [ADR 0015](0015-smaltql.md) (smaltql), [ADR 0016](0016-plan-api-for-every-language.md) (the plan API
   and its operations), [ADR 0018](0018-bool-and-nan.md), [ADR 0019](0019-dates-and-times.md) and
@@ -77,6 +77,7 @@ types. Each of these is a syntax error or `no such function` today: `x REGEXP p`
 | `cast_date`, `cast_datetime` | `DATE '…'`, `TIMESTAMP '…'` | SQL standard |
 | `parse_date`, `parse_datetime` | `strptime(text, format)` | DuckDB |
 | `make_datetime` | also `make_timestamp` | Postgres |
+| `round_half_even` | `round_even(x, digits)`; `round` stays SQLite's | DuckDB |
 | `current_timestamp` | also `now()` | Postgres |
 | `regex_match`, `regex_find`, `regex_replace`, `regex_replace_all` | `x REGEXP p`, `regexp_like`, `regexp_substr`, `regexp_replace` (every match with the `g` flag) | SQLite; Postgres 15 |
 | NaN in the total order | `isnan(x)` | DuckDB |
@@ -100,7 +101,7 @@ Not in SQL:
 - `AT TIME ZONE`: without a zoned type its direction is ambiguous. `to_zone` and `from_zone` say which.
 - Building structs (`struct_of`): SQL has no struct type (ADR 0020 decision 3).
 - A dynamic pivot: a plan needs the values, so `PIVOT` takes an `IN` list.
-- `div_float`, `div_floor`, `mod_floor`, `round_half_even`, `round_half_away`, `random_at`, `sum_float`,
+- `div_float`, `div_floor`, `mod_floor`, `round_half_away`, `random_at`, `sum_float`,
   `avg_float`: other languages' meanings (rule 3).
 - `limit` from the end: `ORDER BY … DESC LIMIT n` serves.
 
@@ -143,31 +144,24 @@ Steps 2–5 and 7 are independent once step 1 lands. Step 6 carries the most ris
 that reads the items before it. SQLite's JSON functions (`json_*`, `->`, `->>`) are a feature of SQLite's own, not of
 the engine, and get their own record.
 
-## Owner's decisions (open)
+## Owner's decisions (2026-11-10)
 
-Decision 1 is settled by the brand; 2–5 are open, each with a recommendation:
-
-1. **A superset of SQLite: decided by the brand.** smaltql's rule is that SQL results match SQLite's, and steps 3–7
-   add syntax SQLite doesn't have. The brand already answers this: "familiar SQL always works. It can grow its own
-   syntax, but only by adding to SQL, never by changing what working SQL means" (smalt-brand `BRAND.md`, and the
-   superset promise in `DECISIONS.md`). Rule 4 keeps that promise, so the extensions are on by default, with no
-   setting.
-2. **Hide engine names (rule 3 and the allow-list).** SQL can call the 54 functions today, undocumented.
-   - **Recommendation:** hide every name this record doesn't list, in step 1. Nothing documented breaks.
-   - **Alternative:** keep them callable, and document them all under their engine names.
-3. **Empty and NULL lists in `unnest`.**
-   - **Recommendation:** Postgres's two forms (section 4). smaltdf's default (an empty list gives no row, a NULL list
-     one) isn't reachable from SQL; `WHERE` and `coalesce` cover what wants it.
-   - **Alternative:** an option on `unnest` for smaltdf's behaviour.
-4. **`LATERAL`.**
-   - **Recommendation:** a special case for `unnest` in `FROM` (after a comma, or in `LEFT JOIN … ON true`). General
-     `LATERAL` opens correlated subqueries in `FROM` everywhere, and gets its own record if it's wanted.
-   - **Alternative:** general `LATERAL` in step 6.
-5. **`unnest(a, b)` and `unnest` in the select list.**
-   - **Recommendation:** neither, for now (`SMALT_UNSUPPORTED`). Several lists need `explode` to take several columns,
-     padded to the longest as Postgres does: an engine change. A set-returning select list changes how many rows a
-     select gives, which nothing else in SQLite does.
-   - **Alternative:** add several-list `explode` here first, then `unnest(a, b)`.
+1. **A superset of SQLite: settled by the brand.** smalt-brand's `BRAND.md` says smaltql "can grow its own syntax, but
+   only by adding to SQL, never by changing what working SQL means", and rule 4 keeps that. The extensions are on by
+   default, with no setting.
+2. **Engine names: an allow-list.** SQL calls only SQL's names: SQLite's, the spellings of section 3, and the names
+   documented as smaltdb extensions. The nine left out were reviewed one by one: `round_half_even` joins, as DuckDB's
+   `round_even`; `div_float`, `div_floor`, `mod_floor`, `round_half_away`, `random_at`, `sum_float`, `avg_float` and
+   `struct_of` stay out, since SQL spells each meaning another way or has no type for it. An engine name with a SQL
+   spelling (`list_len`, `trunc_temporal`) is hidden in favour of the spelling.
+3. **Empty and NULL lists in `unnest`:** Postgres's two forms (section 4).
+4. **`unnest` is a special case, not general `LATERAL`.** `FROM t, unnest(t.tags)` compiles to the same `explode`
+   operation smaltdf's `explode()` builds, with other options, so SQL and smaltdf share one plan. General `LATERAL`
+   would be SQL-only (correlated nested plans, with no smaltdf equivalent) and gets its own record if it's wanted.
+5. **Neither `unnest(a, b)` nor `unnest` in the select list, for now** (`SMALT_UNSUPPORTED`). Neither language can
+   explode several lists (the engine's `explode` takes one column), and the dialects disagree: Polars requires equal
+   lengths, Postgres pads with NULLs. A select-list `unnest` has no smaltdf equivalent. If several lists are wanted
+   later, the engine's `explode` takes several columns first, for both languages.
 
 ## Consequences
 
