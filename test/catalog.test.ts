@@ -67,6 +67,64 @@ describe('tables and views', () => {
     expect(d.catalog.table('t')).toBeUndefined();
   });
 
+  it('lists foreign keys, CHECKs and defaults as the table definition has them, round-tripping to it (#189)', () => {
+    const d = Database.openMemory();
+    d.exec(`
+      CREATE TABLE parent(id INTEGER PRIMARY KEY, code TEXT UNIQUE);
+      CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        parent_id INT REFERENCES parent(id) ON DELETE CASCADE,
+        code TEXT,
+        qty INT DEFAULT 1 CHECK (qty >= 0),
+        made TEXT DEFAULT (datetime('now')),
+        CONSTRAINT by_code FOREIGN KEY (code) REFERENCES parent(code) ON UPDATE SET NULL DEFERRABLE INITIALLY DEFERRED,
+        CONSTRAINT positive CHECK (id > 0)
+      );
+    `);
+    const t = d.catalog.table('child')!;
+    expect(t.foreignKeys.map(({ name, columns, table, refColumns, onDelete, onUpdate, deferrable }) => ({ name, columns, table, refColumns, onDelete, onUpdate, deferrable }))).toEqual([
+      { name: undefined, columns: [1], table: 'parent', refColumns: ['id'], onDelete: 'CASCADE', onUpdate: 'NO ACTION', deferrable: false },
+      { name: 'by_code', columns: [2], table: 'parent', refColumns: ['code'], onDelete: 'NO ACTION', onUpdate: 'SET NULL', deferrable: true },
+    ]);
+    expect(t.checks.map((c) => [c.name, c.text])).toEqual([
+      [undefined, 'qty >= 0'],
+      ['positive', 'id > 0'],
+    ]);
+    expect(t.checks.every((c) => c.expr !== undefined)).toBe(true);
+    const qty = t.columns.find((c) => c.name === 'qty')!;
+    const made = t.columns.find((c) => c.name === 'made')!;
+    // A constant default: a literal, with its value. A computed one: an expression.
+    expect(qty.default).toMatchObject({ text: '1', value: 1, expr: { k: 'lit', value: 1 } });
+    expect(made.default).toMatchObject({ text: "datetime('now')" });
+    expect(made.default!.expr!.k).not.toBe('lit');
+    expect(t.columns.find((c) => c.name === 'code')!.default).toBeUndefined();
+    expect(d.catalog.table('parent')!.foreignKeys).toEqual([]);
+
+    // Round trip: a table made by a schema operation from the catalog's entry is described the same.
+    const def: TableDef = {
+      name: 'child2',
+      columns: t.columns.map((c) => ({ name: c.name, declaredType: c.declaredType, type: c.storageType, notNull: c.notNull, collation: c.collation, ...(c.default ? { default: c.default } : {}) })),
+      keys: [{ kind: 'primaryKey', columns: [{ column: 0, desc: false, collation: 'binary' }] }],
+      checks: t.checks,
+      foreignKeys: t.foreignKeys,
+      storage: t.storage,
+    };
+    d.queryPlan({ kind: 'schema', op: { op: 'createTable', temp: false, ifNotExists: false, table: def } } as never);
+    const again = d.catalog.table('child2')!;
+    expect(again.foreignKeys).toEqual(t.foreignKeys);
+    expect(again.checks).toEqual(t.checks);
+    expect(again.columns.map((c) => c.default)).toEqual(t.columns.map((c) => c.default));
+    // The constraints hold on the new table too.
+    d.exec("INSERT INTO parent VALUES (1, 'a')");
+    expect(() => d.exec('INSERT INTO child2(id, parent_id, qty) VALUES (1, 1, -1)')).toThrow(/CHECK/);
+    expect(() => d.exec('INSERT INTO child2(id, parent_id) VALUES (2, 9)')).toThrow(/FOREIGN KEY/);
+    d.exec('INSERT INTO child2(id, parent_id) VALUES (3, 1)');
+    expect(d.query('SELECT qty, made IS NOT NULL FROM child2').rows).toEqual([[1, 1]]);
+    // describeTableDef (a definition described before it is made) gives the same.
+    expect(describeTableDef(def).foreignKeys).toEqual(t.foreignKeys);
+    expect(describeTableDef(def).checks).toEqual(t.checks);
+  });
+
   it('maps declared types as the engine stores them', () => {
     expect(['INT', 'BIGINT', 'VARCHAR(5)', 'BLOB', 'DOUBLE', 'DECIMAL(10,2)', 'BOOLEAN', '', 'ANY'].map((t) => p.declaredType(t))).toEqual([
       { storageType: 'INTEGER', type: 'int', affinity: 'INTEGER' },
@@ -180,6 +238,9 @@ describe('the same catalog everywhere', () => {
     const reply = log.find((m) => m.msg.id === 2)!.msg as { kind: string; value: CatalogData };
     expect(reply.kind).toBe('ok');
     expect(reply.value.tables.map((t) => t.name).sort()).toEqual(['c', 'mv', 'pair', 't']);
+    // Through the client too: defaults, CHECKs and foreign keys (#189).
+    expect(reply.value.tables.find((t) => t.name === 't')!.columns[2]!.default).toMatchObject({ text: '0', value: 0 });
+    expect(reply.value.tables.find((t) => t.name === 't')!).toMatchObject({ checks: [], foreignKeys: [] });
     expect(reply.value.functions.find((f) => f.name === 'cmp_eq')!.traits).toEqual({ compare: '=', inline: '=' });
   });
 });

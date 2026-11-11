@@ -53,6 +53,7 @@ export function describeTable(t: TableSchema): CatalogTable {
       notNull: c.notNull,
       rowid: c.rowidAlias,
       hasDefault: c.default !== undefined,
+      ...(c.default !== undefined ? { default: c.default } : {}),
     })),
     keys,
     indexes: t.indexes.map((ix) => ({
@@ -61,6 +62,8 @@ export function describeTable(t: TableSchema): CatalogTable {
       unique: ix.unique,
       partial: ix.where !== undefined,
     })),
+    foreignKeys: t.foreignKeys.map((fk) => ({ ...fk, columns: [...fk.columns], ...(fk.refColumns ? { refColumns: [...fk.refColumns] } : {}) })),
+    checks: t.checks.map((c) => ({ ...c })),
     storage: isColumnar(t) ? 'columnar' : 'row',
     strict: t.strict,
     ...(t.described && !t.matview ? {} : { source: { language: t.matview?.language ?? t.language ?? 'sql', text: t.matview?.sql ?? t.sql } }),
@@ -94,6 +97,8 @@ function describeExternal(x: { name: string; sql: string; columns: readonly { na
     }),
     keys: [],
     indexes: [],
+    foreignKeys: [],
+    checks: [],
     storage: 'row',
     strict: false,
     // Its text in the language that created it (absent: SQL), or none when it was defined without source text.
