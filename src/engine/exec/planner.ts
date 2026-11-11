@@ -620,7 +620,14 @@ export class Planner {
     const root = this.planFromShape(from, where, scope, null, b);
     const rowid = b.fromRow[op.rowid];
     b.useOf(rowid)();
-    const colRegs = table.columns.map((_c, i) => b.fromRow[i].reg);
+    // Each table column's register in the input row: where the target's scan reads it (the scan may read the columns in
+    // any order, the rowid among them). The row is read again into these before the sets run on it. A column the scan
+    // doesn't read gets a register of its own: no expression reads it.
+    const scanned = (from[0].op as Extract<PlanOp, { op: 'scan' }>).columns;
+    const colRegs = table.columns.map((_c, i) => {
+      const at = scanned.indexOf(i);
+      return at >= 0 ? b.fromRow[at].reg : this.regs.alloc();
+    });
     // Target rowids are collected and sorted before any change: scan order is not observable.
     if (!op.from) markUnordered(root);
     const sets = op.sets.map((x) => ({ column: x.column, c: compileBoundExpr(b.bind(x.value, b.fromSlot), this.env.funcCtx) }));
