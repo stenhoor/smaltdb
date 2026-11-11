@@ -185,6 +185,19 @@ export function parseTime(text: string): number | null {
   return parseClock(text.trim());
 }
 
+/**
+ * µs of a duration as `formatDuration` writes it (`[-]P[nD][T[nH][nM][n[.f]S]]`, ISO 8601 with days as the largest
+ * unit), or null. Each part is optional but at least one is given, and a `T` has at least one part after it.
+ */
+export function parseDuration(text: string): number | bigint | null {
+  const m = /^(-)?P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)(?:\.(\d{1,6}))?S)?)?$/.exec(text.trim());
+  if (!m || text.trim().endsWith('T') || m.slice(2, 6).every((x) => x === undefined)) return null;
+  const [, sign, d, h, min, s, f] = m;
+  const us = BigInt(d ?? 0) * BIG_US_PER_DAY + BigInt(h ?? 0) * 3_600_000_000n + BigInt(min ?? 0) * 60_000_000n + BigInt(s ?? 0) * 1_000_000n + BigInt((f ?? '').padEnd(6, '0') || 0);
+  const v = sign ? -us : us;
+  return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v;
+}
+
 /** A JS Date as a `datetime` value: its ms as µs. */
 export const datetimeFromDate = (d: Date): number => d.getTime() * 1000;
 

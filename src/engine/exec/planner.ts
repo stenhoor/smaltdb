@@ -87,7 +87,7 @@ import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
 import { type BoundExpr, type PlanExpr, lit } from '../plan/expr.js';
 import type { AggCall, ColumnArray, JoinKind, PlanOp, SortKey as PlanSortKey, ValueColumn } from '../plan/ops.js';
 import type { CollationName } from '../plan/types.js';
-import { datetimeFromDate, isTemporal, parseDate, parseDatetime, parseTime } from '../../shared/temporal.js';
+import { datetimeFromDate, isTemporal, parseDate, parseDatetime, parseDuration, parseTime } from '../../shared/temporal.js';
 import { encodeNested, isNested } from '../../shared/nested.js';
 import { planTypeOfStorage } from '../plan/catalog.js';
 import type { ExternalSource } from '../external/external.js';
@@ -2585,7 +2585,7 @@ function temporalFromDate(type: string, d: Date): SqlValue {
 
 /** A temporal value given as text in a column of values (ADR 0019): parsed, or an error naming the text. */
 function temporalFromText(type: string, text: string): SqlValue {
-  const v = type === 'date' ? parseDate(text) : type === 'time' ? parseTime(text) : type === 'datetime' ? parseDatetime(text) : null;
+  const v = type === 'date' ? parseDate(text) : type === 'time' ? parseTime(text) : type === 'datetime' ? parseDatetime(text) : type === 'duration' ? parseDuration(text) : null;
   if (v === null) throw new SmaltError('SMALT_MISMATCH', `cannot read ${JSON.stringify(text)} as a ${type}`);
   return v;
 }
