@@ -139,6 +139,34 @@ describe('columnar tables', () => {
     expect(r.query('SELECT count(*), min(id) FROM c').rows).toEqual([[19900, 101]]);
   });
 
+  it('can be renamed: segments, delta rows and deletions move with them, and stay after a reopen (#193)', async () => {
+    const { vfs, db } = await setup(20000);
+    db.exec('PRAGMA compact(c)');
+    both(db, 'INSERT INTO T SELECT id + 100000, g, s, x, b FROM T WHERE id <= 50'); // delta rows
+    both(db, 'DELETE FROM T WHERE id % 1000 = 0'); // deletions
+    const before = same(db, 'SELECT count(*), sum(g), min(id), max(id), count(s) FROM T');
+    db.exec('ALTER TABLE c RENAME TO c2');
+    expect(() => db.query('SELECT 1 FROM c')).toThrow(/no such table/);
+    expect(db.query('SELECT count(*), sum(g), min(id), max(id), count(s) FROM c2').rows).toEqual(before);
+    expect(db.query('SELECT name FROM smalt_columnar').rows).toEqual([['c2']]);
+    expect(db.catalog.table('c2')?.storage).toBe('columnar');
+    // Written, deleted from and compacted under its new name.
+    db.exec("INSERT INTO c2 VALUES (500000, 1, 'z', 1.5, NULL)");
+    db.exec('DELETE FROM c2 WHERE id = 7');
+    db.exec('PRAGMA compact(c2)');
+    expect(db.query('SELECT count(*) FROM c2').rows).toEqual([[before[0]![0] as number]]);
+    expect(db.query('PRAGMA integrity_check').rows).toEqual([['ok']]);
+    db.close();
+    const again = await Database.open(vfs, 'db');
+    expect(again.query('SELECT count(*), max(id) FROM c2').rows).toEqual([[before[0]![0] as number, 500000]]);
+    expect(again.query('PRAGMA integrity_check').rows).toEqual([['ok']]);
+    // The schema operation, as the issue has it: a columnar table renamed through alterTable.
+    again.queryPlan({ kind: 'schema', op: { op: 'createTable', temp: false, ifNotExists: false, table: { name: 't', storage: 'columnar', columns: [{ name: 'v', declaredType: 'INTEGER', type: 'INTEGER', notNull: false, collation: 'binary' }], keys: [], checks: [], foreignKeys: [] } } } as never);
+    again.queryPlan({ kind: 'schema', op: { op: 'alterTable', table: 't', action: { kind: 'renameTable', newName: 'u' } } } as never);
+    expect(again.catalog.table('u')?.storage).toBe('columnar');
+    again.close();
+  });
+
   it('reject what they do not support', async () => {
     const db = Database.openMemory();
     expect(() => db.exec("CREATE TABLE a(x UNIQUE) WITH (storage = 'columnar')")).toThrow(/UNIQUE/);
@@ -146,7 +174,9 @@ describe('columnar tables', () => {
     expect(() => db.exec("CREATE TABLE a(x) WITH (shape = 'columnar')")).toThrow(/unknown table option/);
     db.exec("CREATE TABLE a(id INTEGER PRIMARY KEY, x) WITH (storage = 'columnar')");
     expect(() => db.exec('CREATE INDEX ax ON a(x)')).toThrow(/cannot be indexed/);
-    expect(() => db.exec('ALTER TABLE a ADD COLUMN y')).toThrow(/columnar/);
+    expect(() => db.exec('ALTER TABLE a ADD COLUMN y')).toThrow(/columnar table a yet, except RENAME TO/);
+    expect(() => db.exec('ALTER TABLE a RENAME COLUMN x TO y')).toThrow(/columnar/);
+    expect(() => db.exec('ALTER TABLE a DROP COLUMN x')).toThrow(/columnar/);
     expect(() => db.exec('CREATE TABLE child(a_id REFERENCES a(id))')).toThrow(/columnar/);
     expect(() => db.exec('CREATE TEMP TABLE t2(x) WITH (storage = \'columnar\')')).toThrow(/TEMP/);
     db.exec('INSERT INTO a(x) VALUES (1), (2)');
