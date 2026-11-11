@@ -3506,7 +3506,8 @@ export class Database implements FunctionContext {
     // TEMP tables have no stored definitions (main.t reaches a shadowed main table).
     if (table.temp) throw new SmaltError('SMALT_UNSUPPORTED', `ALTER TABLE is not supported for TEMP table ${table.name}`);
     if (table.matview) throw new SmaltError('SMALT_ERROR', `materialized view ${table.name} may not be altered`);
-    if (table.columnar) throw new SmaltError('SMALT_UNSUPPORTED', `ALTER TABLE is not supported for columnar table ${table.name} yet`);
+    // A columnar table can be renamed (its segments move to the new name); its columns can't change yet.
+    if (table.columnar && a.kind !== 'renameTable') throw new SmaltError('SMALT_UNSUPPORTED', `ALTER TABLE is not supported for columnar table ${table.name} yet, except RENAME TO`);
     const defs = this.storedDefinitions();
     const own = defs.get(table.name.toLowerCase());
     if (own?.kind !== 'table') throw new SmaltError('SMALT_CORRUPT', `missing definition of table ${table.name}`);
@@ -3547,6 +3548,12 @@ export class Database implements FunctionContext {
       else this.deleteDefinition(key);
     }
     if (a.kind !== 'renameColumn') this.deleteStats(table.name);
+    // A columnar table's segment and deletion roots are kept by its name (smalt_columnar): they move with it.
+    if (a.kind === 'renameTable' && table.columnar) {
+      const { segRoot, delRoot } = table.columnar;
+      this.writeColumnarMeta(table.name, null);
+      this.writeColumnarMeta(a.newName, { segRoot, delRoot });
+    }
     const oldTable = table;
     this.loadSchema();
     this.checkViewsAfterAlter(viewSuffix);

@@ -126,7 +126,8 @@ failure rolls it back.
   rollback, since the keys of rolled-back row groups get reused.
 
 **Not supported yet:** secondary indexes, UNIQUE constraints other than INTEGER PRIMARY KEY, foreign keys to or
-from columnar tables, ALTER TABLE, TEMP columnar tables and ANALYZE statistics. Each fails with a clear error.
+from columnar tables, ALTER TABLE other than RENAME TO (renaming came on 2026-11-11, #193), TEMP columnar tables and
+ANALYZE statistics. Each fails with a clear error.
 
 ### 4. Morsel parallelism on reader workers (M7.4)
 
