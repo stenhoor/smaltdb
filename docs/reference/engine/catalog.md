@@ -32,8 +32,17 @@ first, when it shadows a main one; `schema` picks `main` or `temp`). Each `Catal
 | `strict` | values must match the column types |
 | `source` | `{ language, text }`: its definition, in the language it was written in; absent for a table [defined without source text](./schema#definitions-without-source-text) |
 
-`views()` and `view(name, schema?)` give `{ name, schema, language, text, columns? }`: a view is source text in its
-language, bound where it is read.
+`views()` and `view(name, schema?)` give `{ name, schema, language, text, columns?, interface?, reflects? }`: a view is
+source text in its language, bound where it is read.
+
+A view's `interface` ([ADR 0027](../../adr/0027-view-interfaces.md)) is the columns it gives, as
+`{ name, type, notNull }`: the names are the view's own (its column list, else the names its query gives), `type` is
+the plan type, and `notNull` says the column is proven never NULL. The proof is conservative: a NOT NULL column or an
+integer primary key carried through filters, projections, sorts, inner joins, groupings and unions, a literal, or a
+`count`. Anything else counts as possibly NULL. The interface is captured when the view is created. A view that can't
+bind yet, because it reads a table not created yet or gives the wrong number of columns for its names, has no
+`interface` until a later schema operation lets it bind, and its interface is captured then. A view made before
+interfaces has `reflects: true` and no interface: it reflects what it reads, as before.
 
 ## Functions
 

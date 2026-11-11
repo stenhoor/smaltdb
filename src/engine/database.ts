@@ -39,7 +39,8 @@ import { type NestedTypeName, isNestedType, nestedResult } from '../shared/neste
 import type { ReaderSettings } from '../shared/protocol.js';
 import { describeTable, logicalCatalog } from './catalog/logical.js';
 import { outputTypes } from './plan/output.js';
-import { type Catalog, type CatalogTable, planTypeOfStorage } from './plan/catalog.js';
+import { type Catalog, type CatalogTable, type ViewInterfaceColumn, planTypeOfStorage } from './plan/catalog.js';
+import { notNullColumns } from './plan/nullability.js';
 import {
   AsyncRequiredError,
   type ConnectionInfo,
@@ -116,6 +117,10 @@ export interface ViewSchema {
   name: string;
   source: Source;
   columns?: string[];
+  /** Its interface (ADR 0027), captured the first time it bound. */
+  interface?: ViewInterfaceColumn[];
+  /** Made with interfaces, and not bound yet. Neither field: made before interfaces, so it reflects what it reads. */
+  pending?: boolean;
 }
 
 /** A compiled ON CONFLICT clause (target -1 = rowid, n = index position, null = any constraint). */
@@ -1064,7 +1069,7 @@ export class Database implements FunctionContext {
       }
       if (r.type === 'view') {
         const v = def(r.name.toLowerCase(), 'view');
-        this.views.set(r.name.toLowerCase(), { name: r.name, source: { language: v.language, text: r.sql! }, ...(v.columns ? { columns: [...v.columns] } : {}) });
+        this.views.set(r.name.toLowerCase(), { name: r.name, source: { language: v.language, text: r.sql! }, ...(v.columns ? { columns: [...v.columns] } : {}), ...viewInterfaceFields(v) });
         continue;
       }
       if (r.type !== 'table') continue;
@@ -1547,7 +1552,17 @@ export class Database implements FunctionContext {
 
   /** A schema operation's program (plan/schema.ts). */
   private compileSchemaOp(op: SchemaOp): Omit<Program, 'regCount'> {
-    const run = (f: () => RunResult): Omit<Program, 'regCount'> => ({ exec: f, readonly: false, columns: [], columnTypes: [] });
+    // A view made with interfaces that didn't bind can only start to after a schema operation: try it then (ADR 0027).
+    const run = (f: () => RunResult): Omit<Program, 'regCount'> => ({
+      exec: () => {
+        const r = f();
+        this.capturePendingInterfaces();
+        return r;
+      },
+      readonly: false,
+      columns: [],
+      columnTypes: [],
+    });
     switch (op.op) {
       case 'createTable':
         return run(() => this.createTable(op));
@@ -3061,6 +3076,7 @@ export class Database implements FunctionContext {
         throw new SmaltError('SMALT_ERROR', `view ${stmt.name} already exists`);
       }
       const view: ViewSchema = { name: stmt.name, source: stmt.source, ...(columns ? { columns } : {}) };
+      this.captureInterface(view);
       this.tempViews.set(lower, view);
       this.tempSeq.set(view, this.nextTempSeq++);
       this.schemaVersion++; // re-plan statements; nothing is stored
@@ -3070,8 +3086,10 @@ export class Database implements FunctionContext {
     this.checkNewName(stmt.name, 'view');
     this.dirtySchema = true;
     // Like SQLite, the body is not resolved until the view is used (it may reference tables created later).
-    this.addCatalogRow('view', stmt.name, stmt.name, 0, sql, undefined, { kind: 'view', language: stmt.source.language, ...(columns ? { columns } : {}) });
-    this.views.set(stmt.name.toLowerCase(), { name: stmt.name, source: stmt.source, ...(columns ? { columns } : {}) });
+    const view: ViewSchema = { name: stmt.name, source: stmt.source, ...(columns ? { columns } : {}) };
+    this.captureInterface(view);
+    this.addCatalogRow('view', stmt.name, stmt.name, 0, sql, undefined, viewDef(view));
+    this.views.set(stmt.name.toLowerCase(), view);
     this.objectChanged(stmt.name);
     this.schemaChanged();
     return none;
@@ -3818,6 +3836,43 @@ export class Database implements FunctionContext {
       const next = [row.type, change.name ?? row.name, change.tbl_name ?? row.tbl_name, row.rootpage, change.sql === undefined ? row.sql : change.sql];
       w.deleteRow(row.rowid);
       w.writeRow(next, row.rowid);
+    }
+  }
+
+  /**
+   * Capture `view`'s interface (ADR 0027) if it binds and plans now: the columns it gives, by name (the view's own
+   * names first), plan type and whether they are proven never NULL. Otherwise it is marked pending, and captured after
+   * a later schema operation lets it bind.
+   */
+  private captureInterface(view: ViewSchema): boolean {
+    try {
+      const { env, catalog } = this.viewCheckEnv();
+      const fe = this.received(languagePart(this.languageOf(view.source.language), 'bindView')(view.source, catalog));
+      if (view.columns && view.columns.length !== fe.columns.length) throw new SmaltError('SMALT_ERROR', 'column count');
+      const planner = new Planner(env, new Registers(0));
+      planner.sqlText = view.source.text;
+      this.planView(view.source, planner, catalog);
+      const nn = notNullColumns(fe.plan, (name, db) => {
+        const t = db === 'temp' ? this.tempTables.get(name.toLowerCase()) : this.getTable(name, db);
+        return t?.columns.map((c, i) => c.notNull || i === t.rowidAlias);
+      });
+      view.interface = fe.columns.map((c, i) => ({ name: view.columns?.[i] ?? c.name, type: c.type, notNull: nn[i] === true }));
+      delete view.pending;
+      return true;
+    } catch {
+      view.pending = true;
+      return false;
+    }
+  }
+
+  /** Capture the interfaces of views still pending; a stored view's definition is written again with its interface. */
+  private capturePendingInterfaces(): void {
+    for (const v of this.tempViews.values()) if (v.pending) this.captureInterface(v);
+    for (const v of this.views.values()) {
+      if (!v.pending || !this.captureInterface(v)) continue;
+      this.dirtySchema = true;
+      this.writeDefinition(v.name.toLowerCase(), viewDef(v));
+      this.schemaVersion++;
     }
   }
 
@@ -5395,4 +5450,14 @@ function needsRewrite(v: unknown): boolean {
   }
   for (const k in o) if (needsRewrite(o[k])) return true;
   return false;
+}
+
+/** A view's stored definition. */
+function viewDef(v: ViewSchema): StoredDef {
+  return { kind: 'view', language: v.source.language, ...(v.columns ? { columns: v.columns } : {}), ...(v.interface ? { interface: v.interface } : v.pending ? { pending: true } : {}) };
+}
+
+/** A stored view's interface fields, as `ViewSchema` keeps them. */
+function viewInterfaceFields(def: { readonly interface?: readonly ViewInterfaceColumn[]; readonly pending?: true }): Pick<ViewSchema, 'interface' | 'pending'> {
+  return def.interface ? { interface: def.interface.map((c) => ({ ...c })) } : def.pending ? { pending: true } : {};
 }
