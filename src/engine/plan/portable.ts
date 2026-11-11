@@ -48,5 +48,7 @@ export {
   planTypeOfStorage,
   storageTypeFor,
 } from './catalog.js';
+/** The conversion table (ADR 0027): how a value of one plan type becomes one of another, and whether losslessly. */
+export { type Conversion, conversion, isLossless } from './conversions.js';
 /** List and struct types (ADR 0020): parsing and checking their text. */
 export { type NestedType, type NestedTypeName, isNested, isNestedType, isPlanTypeName, parseNested } from '../../shared/nested-types.js';
