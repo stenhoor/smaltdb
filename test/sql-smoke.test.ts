@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
+import * as operators from '../src/engine/exec/operators.js';
+import { Window } from '../src/engine/exec/window.js';
 
 function db() {
   return Database.openFile(new MemoryVfs().openSync('t.db'));
@@ -104,5 +106,24 @@ describe('SQL smoke', () => {
     // The instrumented operators were restored: the same SQL still runs normally.
     expect(d.query(sql).rows.length).toBe(40);
     expect(d.query('EXPLAIN ANALYZE ' + sql).rows[0][5]).toBe(40);
+  });
+
+  it('EXPLAIN ANALYZE names operators without their class names, which bundles minify', () => {
+    const d = db();
+    d.exec('CREATE TABLE t(id INTEGER PRIMARY KEY, g INT, v INT)');
+    for (let i = 1; i <= 20; i++) d.exec(`INSERT INTO t VALUES (${i}, ${i % 3}, ${i})`);
+    const sql = 'EXPLAIN ANALYZE SELECT g, v + 1, sum(v) OVER (PARTITION BY g) FROM t WHERE v % 2 = 0 LIMIT 5';
+    const plain = d.query(sql).rows.map((r) => r[2]);
+    const classes = ([...Object.values(operators), Window] as unknown[]).filter((c): c is Function => typeof c === 'function' && /^[A-Z]/.test(c.name));
+    const names = classes.map((c) => c.name);
+    try {
+      classes.forEach((c, i) => Object.defineProperty(c, 'name', { value: 'YG' + i }));
+      const minified = d.query(sql).rows.map((r) => r[2]);
+      expect(minified).toEqual(plain);
+      expect(minified.some((x) => /^YG/.test(String(x)))).toBe(false);
+    } finally {
+      classes.forEach((c, i) => Object.defineProperty(c, 'name', { value: names[i] }));
+    }
+    expect(plain).toEqual(expect.arrayContaining(['LIMIT', 'PROJECT', 'WINDOW']));
   });
 });

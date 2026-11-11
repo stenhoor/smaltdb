@@ -25,6 +25,11 @@ export interface Operator {
   close(): void;
   /** EXPLAIN QUERY PLAN line for this node. */
   readonly detail: string;
+  /**
+   * EXPLAIN ANALYZE's name for an operator whose detail is empty. Fixed text, because class names
+   * are minified in bundled builds (Project arrived as "YG" over the worker).
+   */
+  readonly kind?: string;
   readonly children: Operator[];
 }
 
@@ -789,6 +794,7 @@ export class ColumnarTableScan implements Operator {
 // ------------------------------------------------------------------ relational operators
 
 export class Filter implements Operator {
+  readonly kind = 'FILTER';
   readonly children: Operator[];
   private r!: SqlValue[];
   constructor(
@@ -844,6 +850,7 @@ export class CountRows implements Operator {
 
 /** Emits exactly one empty row (SELECT without FROM). */
 export class SingleRow implements Operator {
+  readonly kind = 'SINGLE ROW';
   readonly children: Operator[] = [];
   readonly detail = '';
   private done = false;
@@ -859,6 +866,7 @@ export class SingleRow implements Operator {
 }
 
 export class NestedLoopJoin implements Operator {
+  readonly kind = 'NESTED LOOP JOIN';
   readonly children: Operator[];
   private r!: SqlValue[];
   private needOuter = true;
@@ -1061,6 +1069,7 @@ export class Materialize implements Operator {
 }
 
 export class Project implements Operator {
+  readonly kind = 'PROJECT';
   readonly children: Operator[];
   readonly detail = '';
   private r!: SqlValue[];
@@ -1124,6 +1133,7 @@ const AGG_MAX_LEVEL = 6;
  * again, with another hash, if it is still too big).
  */
 export class HashAggregate implements Operator {
+  readonly kind = 'HASH AGGREGATE';
   readonly children: Operator[];
   private r!: SqlValue[];
   private groups: Group[] = [];
@@ -1661,6 +1671,7 @@ export class Distinct implements Operator {
 }
 
 export class Limit implements Operator {
+  readonly kind = 'LIMIT';
   readonly children: Operator[];
   readonly detail = '';
   private remaining = 0;
@@ -2232,7 +2243,7 @@ export function explainAnalyze(root: Operator, r: SqlValue[], estimates: WeakMap
   const now = (): number => performance.now();
   let id = 0;
   const walk = (op: Operator, parent: number): void => {
-    const row: AnalyzeRow = { id: ++id, parent, detail: op.detail || op.constructor.name.replace(/([a-z])([A-Z])/g, '$1 $2').toUpperCase(), estRows: estimates.get(op) ?? null, loops: 0, rows: 0, timeMs: 0 };
+    const row: AnalyzeRow = { id: ++id, parent, detail: op.detail || op.kind || op.constructor.name.replace(/([a-z])([A-Z])/g, '$1 $2').toUpperCase(), estRows: estimates.get(op) ?? null, loops: 0, rows: 0, timeMs: 0 };
     out.push(row);
     const o = op as { open: Operator['open']; next: Operator['next'] };
     const open = o.open;

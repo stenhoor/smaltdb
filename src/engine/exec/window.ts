@@ -103,6 +103,7 @@ function offsetValue(fn: Fn | undefined, r: SqlValue[], which: 'starting' | 'end
 }
 
 export class Window implements Operator {
+  readonly kind = 'WINDOW';
   readonly children: Operator[];
   private r!: SqlValue[];
   /** Snapshot register j of input row i at snaps[i * snapRegs.length + j]. */
