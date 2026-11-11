@@ -1,6 +1,6 @@
 # ADR 0028: Pluggable storage engines
 
-- **Status:** proposed (2026-11-11). The owner's decisions below are open
+- **Status:** proposed (2026-11-11), with the owner's direction of 2026-11-11 recorded below; two decisions are open
 - **Date:** 2026-11-11
 - **Assigned to:** Andrew Beers
 - **Research:** [Pluggable storage engines](../research/pluggable-engines.md) (the full design, sizes and comparable
@@ -28,6 +28,22 @@ statement's projection and block filters. This ADR generalizes that idea to stor
 
 ## Decision
 
+**The owner's direction (2026-11-11).** smaltdb has one unified plan interface, and its data storage and index
+components must be pluggable, so that future updates are integrated in an interoperable fashion. What that means for
+this design:
+
+- **One plan interface above storage.** Every language builds the same plans (ADR 0016), and no plan operation names a
+  storage or index engine. A new engine adds no language-specific path and no new plan dialect: it serves the plans
+  languages already build, through the claims in point 4.
+- **Every storage and index component is pluggable, the built-in ones included.** The core reaches row tables, columnar
+  tables and B+tree indexes only through the table-engine and index-engine interfaces, exactly as it reaches a plugin's
+  engine. Once E1–E3 are done, no storage-specific branch (`isColumnar` and the like) is left in the planner, the
+  operators or `database.ts`.
+- **Interoperable.** Engines combine without knowing of each other: a table of one engine joins a table of another in
+  one plan; any index engine works over any table engine that can fetch rows by rowid; one transaction commits the
+  pages of every engine it touched. An engine from a later release or another plugin slots in without changes to the
+  core or to the engines already there.
+
 1. **Two kinds of engine.** A **table engine** holds a table's rows (today `row` and `columnar`). An **index engine**
    holds a secondary access structure over a table's rows (today B+tree indexes; later adjacency, vectors, full text,
    spatial). Most new engines are index engines, which keeps them small.
@@ -51,7 +67,8 @@ statement's projection and block filters. This ADR generalizes that idea to stor
    row. Writes (insert, update, delete by rowid) run in the core's transactions and savepoints; NOT NULL, CHECK and
    foreign keys stay in the core; unique keys stay an index engine's job. `ALTER TABLE` operations are offered to the
    engine, which may refuse; the core then rebuilds or fails with `SMALT_UNSUPPORTED`.
-7. **Installation.** `row` (the B+tree, which the catalog needs) stays in the core. Plugins add engines with
+7. **Installation.** `row` tables and B+tree indexes ship in the core package, because the catalog is stored in them,
+   but they are registered through the same interfaces as any other engine. Plugins add engines with
    `host.addTableEngine(engine)` and `host.addIndexEngine(engine)`, installed through `defineWorker({ plugins })` like
    any plugin. Tables and indexes name their engine (`WITH (storage = 'graph')`, `CREATE INDEX … USING adjacency`) as
    plan data and in each language. A database whose tables need a missing engine opens, but reading those tables fails
@@ -65,22 +82,30 @@ Each step is a separate PR.
 
 | Step | What | Gate | Rough size |
 |---|---|---|---|
-| E1 | The table-engine interface in the core; columnar and row tables behind it | No regression against `bench/results/` (storage and browser benchmarks); full suite and sqllogictest green | 2,000–3,000 lines touched, mostly moved |
+| E1 | The table-engine interface in the core; columnar and row tables behind it | No regression against `bench/results/` (storage and browser benchmarks); full suite and sqllogictest green; no table-storage branches left outside the engines | 2,000–3,000 lines touched, mostly moved |
 | E2 | Negotiation in the physical planner; columnar's zone maps and fused aggregates become its claims | Plan-shape corpus (ADR 0014 step 2) and benchmarks unchanged; differential test (negotiation on and off) | 800–1,200 new lines |
-| E3 | The index-engine interface, B+tree indexes behind it | As E1 | 800–1,200 new lines |
-| E4 | Plugin entry points `addTableEngine` and `addIndexEngine`, with a test engine in `test/plugins.test.ts` | Conformance suite for engine plugins | about 300 lines |
+| E3 | The index-engine interface, B+tree indexes behind it | As E1, for index branches | 800–1,200 new lines |
+| E4 | Plugin entry points `addTableEngine` and `addIndexEngine`, with a test engine in `test/plugins.test.ts` | Conformance suite for engine plugins, including plans that mix the test engine with row and columnar tables and B+tree indexes | about 300 lines |
 | E5 | The first new engine as a plugin: the adjacency index claiming `paths` (graph research G5), or a vector index | Its own tests and the conformance suite | 1,500–2,500 lines |
 
-### The owner's decisions (open)
+### The owner's decisions
 
-1. **Columnar:** stays built in behind the interface, or moves to a plugin?
+Decided (2026-11-11): one unified plan interface; storage and index components pluggable and interoperable (above).
+
+Open:
+
+1. **Where columnar ships:** it is pluggable either way. Does it stay in the core package, or move to its own plugin
+   package, as the formats did (ADR 0012)?
 2. **Plugin API:** the engine entry points as an additive change to version 1 (ADR 0013), or a version 2?
 3. **Timing:** before or after 1.0? Before is recommended: the catalog record naming a table's engine and format version
    is a file-format change, and the format freezes at 1.0.
 
 ## Consequences
 
-- New data engines are sized by their own data structures, not by integration work in the core.
+- New data engines are sized by their own data structures, not by integration work in the core, and reach every
+  language at once through the plan interface.
+- Engines interoperate by construction: they meet only in plans, the page store and the core's transaction, so a new
+  engine works with the ones already installed.
 - Durability stays in one place: an engine plugin can't break transactions, recovery or parallel readers, because it
   has no file handling of its own.
 - The core gains an interface on its hottest paths (fused pipelines, point lookups, prepared statements). Batches and
