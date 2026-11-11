@@ -21,8 +21,32 @@ it when ALTER TABLE changes the definition. Views need one; every other operatio
 | `drop` | `objectType` (`table`, `index`, `view`, `materialized view`, `trigger`, `external table`, `connection`), `name`, `schema?`, `ifExists` |
 | `alterTable` | `table`, `schema?`, `action` (`renameTable`, `renameColumn`, `addColumn`, `dropColumn`), `source?` |
 
-A view is kept as its language's source, not as a plan: it is bound by its language where it is read, so it follows
-later changes to the tables it reads (see [writing a language](./languages#views)).
+A view is kept as its language's source, not as a plan: it is bound by its language where it is read (see
+[writing a language](./languages#views)).
+
+### View interfaces
+
+A view keeps the columns it gave when it was made: its interface, which the [catalog](./catalog#tables-and-views)
+shows ([ADR 0027](../../adr/0027-view-interfaces.md)). After `createTable`, `createView`, `drop` and `alterTable`, the
+engine binds every view with an interface again and refuses the operation (rolling the statement back) when one:
+
+- no longer binds: a table or view it reads was dropped, or shadowed by a TEMP one without its columns;
+- gives fewer columns, or more for a view with a column list (a view over `*` keeps the columns it had: one added to
+  the table doesn't reach it);
+- gives a column whose type isn't the interface's and doesn't convert to it losslessly (`isLossless` in the
+  [conversion table](./plans#conversions)): `schema change breaks the interface of view v: column n: int → real is not
+  lossless`;
+- gives a column that can be NULL where the interface's can't.
+
+A rename of what a view reads holds: the view's text is edited, and its columns keep the interface's names. A
+column whose type changed losslessly gives the interface's type: the engine converts it where it expands the view
+(a plan's `scan` of the view), and `getView` gives the interface to a language that binds the view's text itself.
+
+Inside a transaction, the check waits for COMMIT, as deferred foreign keys do: changing a column's type rebuilds the
+table (create a copy, drop the table, rename the copy), and the views are whole again only at the end. A COMMIT that
+finds a broken interface fails and leaves the transaction open, to be rolled back. A view whose language isn't
+registered in the database is not checked there (it can't be read there either), and views made before interfaces
+reflect what they read, as before.
 
 ## Tables
 
