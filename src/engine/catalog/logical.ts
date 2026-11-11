@@ -64,6 +64,7 @@ export function describeTable(t: TableSchema): CatalogTable {
     })),
     foreignKeys: t.foreignKeys.map((fk) => ({ ...fk, columns: [...fk.columns], ...(fk.refColumns ? { refColumns: [...fk.refColumns] } : {}) })),
     checks: t.checks.map((c) => ({ ...c })),
+    ...(t.exprLanguage !== undefined ? { exprLanguage: t.exprLanguage } : {}),
     storage: isColumnar(t) ? 'columnar' : 'row',
     strict: t.strict,
     ...(t.described && !t.matview ? {} : { source: { language: t.matview?.language ?? t.language ?? 'sql', text: t.matview?.sql ?? t.sql } }),

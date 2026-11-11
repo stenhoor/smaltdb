@@ -111,6 +111,8 @@ export interface TableSchema {
   language?: string;
   /** Defined without source text (ADR 0016 section 6): its catalog text describes the definition. */
   described?: boolean;
+  /** The language of its expression texts, for a table defined without source text (TableDef.exprLanguage). */
+  exprLanguage?: string;
   /** Statistics from ANALYZE (absent until analyzed). */
   stats?: import('../exec/stats.js').TableStats;
   /** Set for materialized views: the table holds the view's stored rows. */
@@ -435,6 +437,7 @@ export function tableSchemaFromDef(
     strict: true,
     indexes: [],
     checks: [...def.checks],
+    ...(def.exprLanguage !== undefined ? { exprLanguage: def.exprLanguage } : {}),
     foreignKeys: def.foreignKeys.map((f) => ({ ...f, columns: [...f.columns], refColumns: f.refColumns ? [...f.refColumns] : undefined })),
     sql,
     layout: new RecordLayout(columns.map((c) => c.type)),
