@@ -563,6 +563,9 @@ export class EngineServer {
       case 'catalog':
         this.send(session, { id, kind: 'ok', value: this.requireDb().catalog.snapshot() });
         return;
+      case 'boundPlan':
+        this.send(session, { id, kind: 'ok', value: encodeDataJSON(this.requireDb().boundPlan(req.text)) });
+        return;
       case 'finalize':
         this.statements.delete(req.stmt);
         this.send(session, { id, kind: 'ok' });

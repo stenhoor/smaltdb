@@ -121,3 +121,34 @@ export function paramCount(stmt: unknown): number {
 
 /** SQLite's limit on parameters (SQLITE_MAX_VARIABLE_NUMBER). */
 export const MAX_PARAMS = 32766;
+
+const COLLATION_NAMES: Readonly<Record<number, CollationName>> = { [Collation.Binary]: 'binary', [Collation.NoCase]: 'nocase', [Collation.RTrim]: 'rtrim' };
+
+/** A result column in public terms: the inverse of resultColumn. */
+function planColumn(c: ResultColumnInfo): PlanColumn {
+  return {
+    name: c.name,
+    type: c.type,
+    ...(c.declType ? { declaredType: c.declType } : {}),
+    collation: COLLATION_NAMES[c.collation] ?? 'binary',
+    affinity: c.affinity,
+  };
+}
+
+/**
+ * A bound statement as plan data (ADR 0022): the inverse of {@link toBoundStatement}, so what a language bound can be
+ * shown, stored or given back to `queryPlan`. A query's and a write's columns are described in public terms; any other
+ * statement is plain data already.
+ */
+export function toPlanStatement(b: BoundStatement): PlanStatementInput {
+  switch (b.kind) {
+    case 'query':
+      return { kind: 'query', plan: b.plan, columns: b.columns.map(planColumn) };
+    case 'write':
+      return { kind: 'write', plan: b.plan, ...(b.returning ? { returning: b.returning } : {}), ...(b.source ? { source: b.source.map(planColumn) } : {}) };
+    case 'explain':
+      return { kind: 'explain', mode: b.mode, query: { kind: 'query', plan: b.query.plan, columns: b.query.columns.map(planColumn) } };
+    default:
+      return b;
+  }
+}

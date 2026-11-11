@@ -3,7 +3,7 @@
  * See docs/API.md.
  */
 import type { SqlValue } from '../engine/values.js';
-import { encodeDataJSON } from '../engine/plan/codec.js';
+import { decodeDataJSON, encodeDataJSON } from '../engine/plan/codec.js';
 import type { ErrorDetails } from '../engine/errors.js';
 import type { CatalogData } from '../engine/plan/catalog.js';
 import type { PlanStatementInput } from '../engine/plan/statement.js';
@@ -495,6 +495,15 @@ export class Database implements Queryable {
    */
   async catalog(): Promise<CatalogData> {
     return ((await this.request({ op: 'catalog' })) as { value: CatalogData }).value;
+  }
+
+  /**
+   * The plan statement the database's language (SQL, through smaltql) binds `text` to, without running it (ADR 0022):
+   * what it submits to the engine, as plan data, before the engine's own rewrites. One statement. It can be shown,
+   * stored, or run with `queryPlan`.
+   */
+  async boundPlan(text: string): Promise<PlanStatementInput> {
+    return decodeDataJSON(((await this.request({ op: 'boundPlan', text })) as { value: string }).value) as PlanStatementInput;
   }
 
   /** Prepare a statement given as plan data (see queryPlan). Its parameters are positional. */

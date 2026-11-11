@@ -87,6 +87,9 @@ async function run(): Promise<{ checks: Check[]; timings: Record<string, number>
   const prepared = await db.preparePlan(byId);
   const preparedRows = await prepared.query([2], { rowMode: 'array' });
   await prepared.finalize();
+  const bound = await db.boundPlan('SELECT name, qty FROM items WHERE id = 3');
+  const boundRows = await db.queryPlan(bound, [], { rowMode: 'array' });
+  check('boundPlan: what SQL binds a statement to, over the worker, runs again through queryPlan', (bound as { kind?: string }).kind === 'query' && JSON.stringify([...boundRows]) === JSON.stringify([['item-3', 3]]), [bound, boundRows]);
   const inTx = await db.transaction((tx) => tx.queryPlan(p.aggregate(p.scan('items', [0]), [], [p.agg('count', [], 'int', { star: true })]), [], { rowMode: 'array' }));
   check(
     'plans: queryPlan, preparePlan and tx.queryPlan over the worker',
