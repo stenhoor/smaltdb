@@ -747,11 +747,13 @@ class Validator {
         str(o.name, 'name');
         schema(o.schema);
         bool(o.ifExists, 'ifExists');
+        if (o.cascade !== undefined) bool(o.cascade, 'cascade');
         return;
       }
       case 'alterTable': {
         str(o.table, 'table');
         schema(o.schema);
+        if (o.cascade !== undefined) bool(o.cascade, 'cascade');
         optSource(o.source);
         const width = this.tableWidth(o.table, o.schema);
         this.under('action', undefined, () => {

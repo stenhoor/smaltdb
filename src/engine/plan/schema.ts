@@ -165,8 +165,12 @@ export type SchemaOp =
       readonly options: Readonly<Record<string, SqlValue>>;
       readonly source?: Source;
     }
-  | { readonly op: 'drop'; readonly objectType: DropObject; readonly name: string; readonly schema?: string; readonly ifExists: boolean }
-  | { readonly op: 'alterTable'; readonly table: string; readonly schema?: string; readonly action: AlterAction; readonly source?: Source };
+  /**
+   * `cascade` (ADR 0027, decision 4): the views whose interface the operation breaks are dropped with it (and listed in
+   * its result as `cascaded`); without it, the operation is refused.
+   */
+  | { readonly op: 'drop'; readonly objectType: DropObject; readonly name: string; readonly schema?: string; readonly ifExists: boolean; readonly cascade?: boolean }
+  | { readonly op: 'alterTable'; readonly table: string; readonly schema?: string; readonly action: AlterAction; readonly source?: Source; readonly cascade?: boolean };
 
 /** A language's statement check that the engine reports after its own (which come first, as SQLite orders them). */
 export interface DeferredError {

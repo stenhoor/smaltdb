@@ -1,6 +1,6 @@
 # ADR 0027: View interfaces in the engine
 
-- **Status:** accepted (2026-11-11); steps 1 to 3 done. The owner's answers are below
+- **Status:** accepted (2026-11-11); steps 1 to 3 done, step 4 in the engine. The owner's answers are below
 - **Date:** 2026-11-11
 - **Issue:** #188 (proposal E10 from smaltts)
 - **Builds on:** [ADR 0015](0015-smaltql.md) (smaltql, §8: no new SQL syntax), [ADR 0016](0016-plan-api-for-every-language.md)
@@ -85,6 +85,10 @@ language bypasses smaltts. Only the engine sees every schema operation, so only 
    result); without it, the operation is refused as in decision 2. A view with an interface can itself be dropped, or
    replaced by one with the same interface, like any view: the contract binds what the view reads, not the view's
    owner. smaltql would map `DROP … CASCADE` to `cascade` (a smaltql change, step 4).
+
+   As built: `cascade` drops at once, inside a transaction too (the operation asked for it), and repeats until no
+   view's interface is broken (a view dropped breaks the views that read it). The dropped views are listed in the
+   in-process run result (`cascaded`). Grandfathered views are not dropped: they keep today's behaviour.
 5. **Materialized views keep their stored columns' types.** An interface materialized view is checked as a plain one;
    its stored rows already have the interface's types, and a refresh converts with the same casts. A grandfathered
    materialized view whose shape changes is refused as today.

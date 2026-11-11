@@ -70,6 +70,8 @@ import type { Vfs, VfsFile } from './vfs/types.js';
 export interface RunResult {
   changes: number;
   lastInsertRowid: number | bigint;
+  /** A `drop` or `alterTable` with `cascade`: the views it dropped because it broke their interface (ADR 0027). */
+  cascaded?: string[];
 }
 
 export interface QueryResult {
@@ -1587,10 +1589,14 @@ export class Database implements FunctionContext {
     // A view made with interfaces that didn't bind can only start to after a schema operation: try it then (ADR 0027).
     const run = (f: () => RunResult): Omit<Program, 'regCount'> => ({
       exec: () => {
-        const r = f();
+        let r = f();
         // An index, a connection or a new external table changes nothing a view gives. Inside a transaction the check
         // waits for COMMIT, as deferred foreign keys do: a rebuild drops a table and renames another into its place.
-        if (op.op === 'createTable' || op.op === 'createView' || op.op === 'drop' || op.op === 'alterTable') {
+        // With `cascade`, the views the operation breaks are dropped with it, now.
+        if ((op.op === 'drop' || op.op === 'alterTable') && op.cascade) {
+          const cascaded = this.dropBrokenInterfaces();
+          if (cascaded.length > 0) r = { ...r, cascaded };
+        } else if (op.op === 'createTable' || op.op === 'createView' || op.op === 'drop' || op.op === 'alterTable') {
           if (this.autocommit) this.checkInterfaces();
           else this.interfaceCheckDue = true;
         }
@@ -3630,7 +3636,8 @@ export class Database implements FunctionContext {
     }
     const oldTable = table;
     this.loadSchema();
-    this.checkViewsAfterAlter(viewSuffix);
+    // With `cascade`, the views whose interface the change breaks are dropped after it, not refused here.
+    this.checkViewsAfterAlter(viewSuffix, op.cascade === true);
     if (a.kind === 'dropColumn') this.rewriteRowsWithout(oldTable, findColumn(oldTable, a.column));
     // ADD COLUMN: existing rows keep their shorter records, and readers fill in the new column's constant default.
     this.schemaChanged();
@@ -3916,6 +3923,23 @@ export class Database implements FunctionContext {
     }
   }
 
+  /**
+   * Drop every view whose interface no longer holds (ADR 0027, decision 4: an operation with `cascade`), and the views
+   * that dropping it breaks in turn; their names, in the order dropped.
+   */
+  private dropBrokenInterfaces(): string[] {
+    const dropped: string[] = [];
+    for (;;) {
+      const broken = [...this.tempViews.values(), ...this.views.values()].filter((v) => v.interface && registeredLanguage(v.source.language) && this.interfaceProblem(v, v.interface) !== null);
+      if (broken.length === 0) return dropped;
+      for (const v of broken) {
+        const temp = this.tempViews.get(v.name.toLowerCase()) === v;
+        this.drop({ op: 'drop', objectType: 'view', name: v.name, schema: temp ? 'temp' : 'main', ifExists: true });
+        dropped.push(v.name);
+      }
+    }
+  }
+
   /** What breaks `iface`, the interface of `view`, as the view binds now; null when nothing does. */
   private interfaceProblem(view: ViewSchema, iface: readonly ViewInterfaceColumn[]): string | null {
     let got: ViewInterfaceColumn[];
@@ -3979,8 +4003,9 @@ export class Database implements FunctionContext {
   }
 
   /** Views that planned before the ALTER must still plan, reported the way SQLite does ("error in view v …"). */
-  private checkViewsAfterAlter(suffix: string): void {
+  private checkViewsAfterAlter(suffix: string, skipInterfaces = false): void {
     for (const v of this.views.values()) {
+      if (skipInterfaces && v.interface) continue;
       try {
         const { env, catalog } = this.viewCheckEnv();
         const planner = new Planner(env, new Registers(0));

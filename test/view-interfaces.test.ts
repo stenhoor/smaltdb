@@ -225,3 +225,48 @@ describe('views as a language reads them (getView)', () => {
     expect(getView(d, 's')!.reshaped).toBe(true);
   });
 });
+
+describe('cascade (ADR 0027 step 4)', () => {
+  const run = (d: Database, op: object) => d.preparePlan({ kind: 'schema', op } as never).run();
+
+  it('drops the views a drop breaks, and the views those break, listing them', () => {
+    const d = Database.openMemory();
+    d.exec(`${SETUP} CREATE VIEW a AS SELECT name FROM t; CREATE VIEW b AS SELECT name FROM a; CREATE VIEW keep AS SELECT id FROM u`);
+    const r = run(d, { op: 'drop', objectType: 'table', name: 't', ifExists: false, cascade: true });
+    expect(r.cascaded).toEqual(['a', 'b']);
+    expect(d.catalog.views().map((v) => v.name)).toEqual(['keep']);
+    expect(d.catalog.table('t')).toBeUndefined();
+  });
+
+  it('drops the views an alterTable breaks', () => {
+    const d = Database.openMemory();
+    d.exec(`${SETUP} CREATE VIEW a AS SELECT score FROM t; CREATE VIEW keep AS SELECT name FROM t`);
+    const r = run(d, { op: 'alterTable', table: 't', action: { kind: 'dropColumn', column: 'score' }, cascade: true });
+    expect(r.cascaded).toEqual(['a']);
+    expect(d.catalog.views().map((v) => v.name)).toEqual(['keep']);
+    expect(d.catalog.table('t')!.columns.map((c) => c.name)).toEqual(['id', 'name']);
+  });
+
+  it('drops nothing when nothing breaks, and inside a transaction drops at once', () => {
+    const d = Database.openMemory();
+    d.exec(`${SETUP} CREATE VIEW a AS SELECT name FROM t`);
+    expect(run(d, { op: 'drop', objectType: 'table', name: 'u', ifExists: false, cascade: true }).cascaded).toBeUndefined();
+    d.exec('BEGIN');
+    expect(run(d, { op: 'drop', objectType: 'table', name: 't', ifExists: false, cascade: true }).cascaded).toEqual(['a']);
+    d.exec('ROLLBACK');
+    expect(d.catalog.view('a')).toBeDefined();
+  });
+
+  it('refuses as before without it', () => {
+    const d = Database.openMemory();
+    d.exec(`${SETUP} CREATE VIEW a AS SELECT score FROM t`);
+    expect(() => run(d, { op: 'alterTable', table: 't', action: { kind: 'dropColumn', column: 'score' } })).toThrow();
+    expect(d.catalog.view('a')).toBeDefined();
+  });
+
+  it('is checked by the plan validator', () => {
+    const d = Database.openMemory();
+    d.exec(SETUP);
+    expect(() => run(d, { op: 'drop', objectType: 'table', name: 't', ifExists: false, cascade: 'yes' })).toThrow(/cascade/);
+  });
+});

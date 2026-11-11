@@ -18,8 +18,8 @@ it when ALTER TABLE changes the definition. Views need one; every other operatio
 | `createView` | `name`, `schema?`, `temp`, `ifNotExists`, `columns?` (result column names), `materialized`, `options?` and `withData?` (materialized views), `source` |
 | `createConnection` | `name`, `ifNotExists`, `options`, `source?` |
 | `createExternalTable` | `name`, `ifNotExists`, `columns` (empty: read from the source), `options`, `source?` |
-| `drop` | `objectType` (`table`, `index`, `view`, `materialized view`, `trigger`, `external table`, `connection`), `name`, `schema?`, `ifExists` |
-| `alterTable` | `table`, `schema?`, `action` (`renameTable`, `renameColumn`, `addColumn`, `dropColumn`), `source?` |
+| `drop` | `objectType` (`table`, `index`, `view`, `materialized view`, `trigger`, `external table`, `connection`), `name`, `schema?`, `ifExists`, `cascade?` |
+| `alterTable` | `table`, `schema?`, `action` (`renameTable`, `renameColumn`, `addColumn`, `dropColumn`), `source?`, `cascade?` |
 
 A view is kept as its language's source, not as a plan: it is bound by its language where it is read (see
 [writing a language](./languages#views)).
@@ -41,6 +41,11 @@ engine binds every view with an interface again and refuses the operation (rolli
 A rename of what a view reads holds: the view's text is edited, and its columns keep the interface's names. A
 column whose type changed losslessly gives the interface's type: the engine converts it where it expands the view
 (a plan's `scan` of the view), and `getView` gives the interface to a language that binds the view's text itself.
+
+With `cascade: true`, a `drop` or `alterTable` drops the views whose interface it breaks instead of failing, and
+then the views that dropping those breaks. It does so at once, inside a transaction too, and `run()` lists them in
+its result as `cascaded` (in process; a client reads what is left from the catalog). Views made before interfaces are
+not dropped.
 
 Inside a transaction, the check waits for COMMIT, as deferred foreign keys do: changing a column's type rebuilds the
 table (create a copy, drop the table, rename the copy), and the views are whole again only at the end. A COMMIT that
