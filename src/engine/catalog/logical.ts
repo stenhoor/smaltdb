@@ -68,6 +68,7 @@ export function describeTable(t: TableSchema): CatalogTable {
     storage: isColumnar(t) ? 'columnar' : 'row',
     strict: t.strict,
     ...(t.described && !t.matview ? {} : { source: { language: t.matview?.language ?? t.language ?? 'sql', text: t.matview?.sql ?? t.sql } }),
+    ...(t.matview?.interface ? { interface: t.matview.interface.map((c) => ({ ...c })) } : {}),
   };
 }
 

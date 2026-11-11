@@ -166,6 +166,10 @@ export interface MatViewInfo {
   storage: 'row' | 'columnar';
   /** False after `WITH NO DATA` until the first REFRESH; reading it is an error. */
   populated: boolean;
+  /** The column names given with it, if any. */
+  columns?: string[];
+  /** Its interface (ADR 0027): captured when it was created; absent for one made before interfaces. */
+  interface?: import('../plan/catalog.js').ViewInterfaceColumn[];
   /** ISO timestamp of the last refresh, null if never refreshed. */
   refreshedAt: string | null;
   /** Columnar storage: reader (with its decoded-chunk cache) for the current segments; reset on refresh. */
