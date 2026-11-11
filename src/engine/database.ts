@@ -1013,6 +1013,30 @@ export class Database implements FunctionContext {
     return this.tempViews.get(name.toLowerCase()) ?? this.views.get(name.toLowerCase());
   }
 
+  /**
+   * A view as a language reads it (BindContext.getView): with `reshaped` when its query no longer gives exactly its
+   * interface (ADR 0027): a column's type changed losslessly, or a view over `*` gained a column. A language that binds
+   * the view's text itself then reads the interface's columns, converted (`conversion`). Worked out once per schema.
+   */
+  private languageView(name: string, schema?: string): (ViewSchema & { reshaped?: true }) | undefined {
+    const v = this.getView(name, schema);
+    if (!v?.interface) return v;
+    let r = this.reshapedViews.get(v);
+    if (r?.version !== this.schemaVersion) {
+      let reshaped = false;
+      try {
+        const now = this.boundInterface(v);
+        reshaped = now.length !== v.interface.length || now.some((c, i) => c.type !== v.interface![i]!.type);
+      } catch {
+        // A view that doesn't bind is reported where it is read.
+      }
+      this.reshapedViews.set(v, (r = { version: this.schemaVersion, reshaped }));
+    }
+    return r.reshaped ? { ...v, reshaped: true } : v;
+  }
+
+  private reshapedViews = new WeakMap<ViewSchema, { version: number; reshaped: boolean }>();
+
   tableNames(): string[] {
     return [...this.tables.values()].map((t) => t.name);
   }
@@ -1372,7 +1396,7 @@ export class Database implements FunctionContext {
       table: (n, schema) => this.described(this.plannedTable(n, schema)),
       writeTable: (n, schema) => this.described(this.targetTable(n, schema))!,
       indexTable: (n, schema) => this.described(this.indexTarget(n, schema))!,
-      getView: (n, schema) => this.getView(n, schema),
+      getView: (n, schema) => this.languageView(n, schema),
       isExternal: (n) => this.externals.has(n.toLowerCase()),
       externalColumns: (n) => this.externalTableScan(n)?.columns,
       externalFunctionColumns: (n, args, named) => this.externalFunctionScan(n, args, named)?.columns,
@@ -1473,7 +1497,7 @@ export class Database implements FunctionContext {
       writeTable: (n, schema) => (note(n, schema), base.writeTable(n, schema)),
       getView: (n, schema) => {
         const v = base.getView?.(n, schema);
-        if (v && this.tempViews.get(v.name.toLowerCase()) === v) memory = true;
+        if (v && this.tempViews.get(v.name.toLowerCase()) === this.getView(n, schema)) memory = true;
         return v;
       },
     };
