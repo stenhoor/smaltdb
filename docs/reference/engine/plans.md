@@ -48,6 +48,42 @@ the comparisons, `truth_not`, `like`, `glob`, `in_list` and `regex_match`, and a
 | `nocase` | ignoring the case of ASCII letters |
 | `rtrim` | ignoring trailing spaces |
 
+### Conversions
+
+`conversion(from, to)` is the engine's conversion table ([ADR 0027](../../adr/0027-view-interfaces.md)): how a value
+of plan type `from` becomes one of plan type `to`, decided by the two types alone. It gives `{ loss, fn? }`, or
+undefined when there is no conversion. `fn` names the operation that converts, applied as a call
+(`call(fn, [value], to)`); without it, the value is kept as it is. `loss` is `none` when every value converts exactly,
+and `possible` when some change or fail. `isLossless(from, to)` is `conversion(from, to)?.loss === 'none'`: the
+changes a view's interface accepts.
+
+| From | Lossless | Possible loss |
+|---|---|---|
+| any type | itself; NULL (`null`) to anything | |
+| `int` | `num`, `any`; `text` (`cast_text`) | `real` (`cast_real`) |
+| `real` | `num`, `any`; `text` | `int` (`cast_integer_strict`) |
+| `num` | `any`; `text` | `int`, `real` (`cast_real_strict`) |
+| `bool` | `int`, `num`, `any`; `real` (`cast_real`), `text` | |
+| `text` | `any`; `blob` (`cast_blob`) | `int`, `real`, `num` (`cast_numeric`), `date`, `datetime`, `time` (`cast_date`, …) |
+| `blob` | `any` | |
+| `date` | `datetime` (`cast_datetime`), `text`, `any` (as text) | |
+| `datetime` | `text`, `any` (as text) | `date`, `time` |
+| `time`, `duration` | `text`, `any` (as text) | |
+| `list<T>`, `struct<…>` | `text`, `any` (JSON text); a list or struct whose elements or fields (the same names, in order) are kept as they are | |
+| `any` | | `num`, `text`, `blob` |
+
+A temporal value, a list or a struct becomes `any` as its text: kept as it is, it would read as the integer or blob
+underneath. INTEGER to REAL loses precision beyond 2^53, so it is not lossless; DURATION to INTEGER has no conversion.
+
+```ts
+import { plan as p } from 'smaltdb/engine';
+
+p.conversion('int', 'num'); // { loss: 'none' }
+p.conversion('date', 'datetime'); // { loss: 'none', fn: 'cast_datetime' }
+p.conversion('real', 'int'); // { loss: 'possible', fn: 'cast_integer_strict' }
+p.isLossless('list<int>', 'list<num>'); // true
+```
+
 ## Operations
 
 Each operation's output columns, in order:
