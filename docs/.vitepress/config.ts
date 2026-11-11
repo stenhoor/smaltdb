@@ -155,6 +155,7 @@ export default defineConfig({
           { text: 'Plan layer implementation', link: '/research/plan-layer-implementation' },
           { text: 'M9 parallel readers', link: '/research/m9-parallel-readers' },
           { text: 'Graphs on the plan API', link: '/research/graph-on-plans' },
+          { text: 'Pluggable storage engines', link: '/research/pluggable-engines' },
         ],
       },
     ],
