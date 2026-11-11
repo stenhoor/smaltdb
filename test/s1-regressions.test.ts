@@ -106,14 +106,15 @@ describe('S1-4: materialized-view freshness', () => {
 
   it('DROP TABLE + CREATE TABLE makes the view stale', async () => {
     const db = await setup();
-    db.exec('DROP TABLE t; CREATE TABLE t(x INT)');
+    // In one transaction: the view's interface (ADR 0027) holds what it reads, checked at COMMIT.
+    db.exec('BEGIN; DROP TABLE t; CREATE TABLE t(x INT); COMMIT');
     expect(fresh(db)).toBe('NO');
     expect(db.query('SELECT count(*) FROM t').rows).toEqual([[0]]);
   });
 
   it('RENAME onto the base name makes the view stale', async () => {
     const db = await setup();
-    db.exec('CREATE TABLE u(x INT); INSERT INTO u VALUES (9); DROP TABLE t; ALTER TABLE u RENAME TO t');
+    db.exec('BEGIN; CREATE TABLE u(x INT); INSERT INTO u VALUES (9); DROP TABLE t; ALTER TABLE u RENAME TO t; COMMIT');
     expect(fresh(db)).toBe('NO');
     expect(db.query('SELECT count(*) FROM t').rows).toEqual([[1]]);
   });
@@ -123,7 +124,7 @@ describe('S1-4: materialized-view freshness', () => {
     db.exec('CREATE TABLE a(x); INSERT INTO a VALUES (1), (2); CREATE TABLE other(x); INSERT INTO other VALUES (1)');
     db.exec('CREATE VIEW v AS SELECT x FROM a; CREATE MATERIALIZED VIEW mv AS SELECT count(*) AS n FROM v');
     db.exec('INSERT INTO a VALUES (3); REFRESH MATERIALIZED VIEW mv'); // dependencies computed and cached
-    db.exec('DROP VIEW v; CREATE VIEW v AS SELECT x FROM other');
+    db.exec('BEGIN; DROP VIEW v; CREATE VIEW v AS SELECT x FROM other; COMMIT');
     expect(fresh(db)).toBe('NO');
     db.exec('REFRESH MATERIALIZED VIEW mv');
     expect(fresh(db)).toBe('YES');
@@ -150,7 +151,7 @@ describe('S1-4: materialized-view freshness', () => {
   it('dropping a materialized view makes views over it stale', async () => {
     const db = await setup();
     db.exec('CREATE MATERIALIZED VIEW over_mv AS SELECT n FROM mv');
-    db.exec('DROP MATERIALIZED VIEW mv; CREATE TABLE mv(n INT)');
+    db.exec('BEGIN; DROP MATERIALIZED VIEW mv; CREATE TABLE mv(n INT); COMMIT');
     expect(fresh(db, 'over_mv')).toBe('NO');
   });
 });

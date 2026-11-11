@@ -49,8 +49,10 @@ not dropped.
 
 Inside a transaction, the check waits for COMMIT, as deferred foreign keys do: changing a column's type rebuilds the
 table (create a copy, drop the table, rename the copy), and the views are whole again only at the end. A COMMIT that
-finds a broken interface fails and leaves the transaction open, to be rolled back. A view whose language isn't
-registered in the database is not checked there (it can't be read there either), and views made before interfaces
+finds a broken interface fails and leaves the transaction open, to be rolled back. Materialized views have interfaces too, checked the same way;
+a refresh converts and keeps their columns as a view's read does, so their stored rows keep the interface's types. A
+view over external data that isn't loaded can't be bound when the check runs, and is not checked then. A view whose
+language isn't registered in the database is not checked there (it can't be read there either), and views made before interfaces
 reflect what they read, as before.
 
 ## Tables

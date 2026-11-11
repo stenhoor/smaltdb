@@ -1,6 +1,6 @@
 # ADR 0027: View interfaces in the engine
 
-- **Status:** accepted (2026-11-11); steps 1 to 3 done, step 4 in the engine. The owner's answers are below
+- **Status:** accepted (2026-11-11); steps 1 to 5 done (smaltql's `DROP … CASCADE` in review). The owner's answers are below
 - **Date:** 2026-11-11
 - **Issue:** #188 (proposal E10 from smaltts)
 - **Builds on:** [ADR 0015](0015-smaltql.md) (smaltql, §8: no new SQL syntax), [ADR 0016](0016-plan-api-for-every-language.md)
@@ -92,6 +92,12 @@ language bypasses smaltts. Only the engine sees every schema operation, so only 
 5. **Materialized views keep their stored columns' types.** An interface materialized view is checked as a plain one;
    its stored rows already have the interface's types, and a refresh converts with the same casts. A grandfathered
    materialized view whose shape changes is refused as today.
+
+   As built (step 5): a materialized view always binds when it is created, so its interface is captured then. A refresh
+   reads only the interface's columns, converted, as a reshaped view's read does. A view (plain or materialized) over
+   external data that isn't loaded when the check runs can't be bound then, and is not checked: its columns are the
+   data's. Some engine tests that dropped a table under a materialized view now do it in a transaction (checked at
+   COMMIT), or drop the view first.
 6. **The catalog shows interfaces.** `CatalogView` and a materialized view's `CatalogTable` gain `interface`: its
    columns with names, types and nullability. A view's definition still round-trips (ADR 0016 §7).
 

@@ -1427,13 +1427,25 @@ export class Database implements FunctionContext {
   private viewCheckEnv(): { env: PhysicalEnv; catalog: BindContext } {
     const getTable = (n: string): TableSchema | undefined => this.getTable(n);
     return {
-      env: { getTable, openTree: (root) => this.tree(root), funcCtx: this, state: this.state },
+      env: {
+        getTable,
+        openTree: (root) => this.tree(root),
+        funcCtx: this,
+        state: this.state,
+        // External sources, where their data is loaded (AsyncRequiredError otherwise).
+        externalTable: (n) => this.externalTableScan(n),
+        externalFunction: (n, args, named) => (this.external.plugins.isExternalFunction(n) ? this.externalFunctionScan(n, args, named) : undefined),
+      },
       catalog: {
         table: (n) => this.described(getTable(n)),
         writeTable: (n, schema) => this.described(this.targetTable(n, schema))!,
         indexTable: (n, schema) => this.described(this.indexTarget(n, schema))!,
         getView: (n) => this.getView(n),
         isExternal: (n) => this.externals.has(n.toLowerCase()),
+        externalColumns: (n) => this.externalTableScan(n)?.columns,
+        externalFunctionColumns: (n, args, named) => this.externalFunctionScan(n, args, named)?.columns,
+        isExternalFunction: (n) => this.external.plugins.isExternalFunction(n),
+        virtualTable: (schema, n) => this.virtualTable(schema, n),
         catalog: this.catalog,
         funcCtx: this,
       },
@@ -1453,8 +1465,9 @@ export class Database implements FunctionContext {
    * A top-level SELECT through the plan layer (ADR 0014), against `catalog` (the planner's tables), with
    * materialized-view matching on its plan under the statement's policy (exec/plan-mv-match.ts).
    */
-  private planView(source: Source, planner: Planner, catalog: BindContext = this.bindContext()): QueryPlan {
-    const fe = this.received(languagePart(this.languageOf(source.language), 'bindView')(source, catalog));
+  private planView(source: Source, planner: Planner, catalog: BindContext = this.bindContext(), iface?: readonly ViewInterfaceColumn[]): QueryPlan {
+    const bound = this.received(languagePart(this.languageOf(source.language), 'bindView')(source, catalog));
+    const fe = iface ? asInterface(bound, iface) : bound;
     const rewrite = planner.env.rewritePlan;
     const p = planner.planPlan(rewrite ? rewrite(fe.plan) : fe.plan, fe.columns);
     if (!p) throw new SmaltError('SMALT_INTERNAL', `the physical planner declined a query\n  in: ${source.text}`);
@@ -1886,14 +1899,16 @@ export class Database implements FunctionContext {
     this.checkNewName(stmt.name, 'materialized view');
     this.dirtySchema = true;
     const layout = this.matviewLayout(stmt.name, stmt.source, stmt.columns ? [...stmt.columns] : undefined);
+    // Its interface (ADR 0027): it binds now, or the layout above has failed.
+    const iface = this.boundInterface({ name: stmt.name, source: stmt.source, ...(stmt.columns ? { columns: [...stmt.columns] } : {}) });
     if (!this.tables.has('smalt_matview')) {
       this.createTable(systemTableOp('smalt_matview'), true);
     }
     const root = this.createTree(inMemory);
     const { table } = tableSchemaFromDef(layout, layoutText(layout), root);
-    table.matview = { sql, language: stmt.source.language, storage, options: { ...opts }, populated: false, refreshedAt: null };
+    table.matview = { sql, language: stmt.source.language, storage, options: { ...opts }, populated: false, refreshedAt: null, ...(stmt.columns ? { columns: [...stmt.columns] } : {}), interface: iface };
     // A memory-resident view's root is assigned at runtime: the catalog records a marker.
-    this.addCatalogRow('matview', table.name, table.name, inMemory ? MEM_BASE : root, sql, undefined, { kind: 'matview', language: stmt.source.language, ...(stmt.columns ? { columns: stmt.columns } : {}), options: stmt.options ?? {} });
+    this.addCatalogRow('matview', table.name, table.name, inMemory ? MEM_BASE : root, sql, undefined, { kind: 'matview', language: stmt.source.language, ...(stmt.columns ? { columns: stmt.columns } : {}), options: stmt.options ?? {}, interface: iface });
     if (inMemory) {
       this.memViews.set(table.name.toLowerCase(), { root, indexRoots: new Map(), populated: false, refreshedAt: null, fresh: false });
       this.memDirty = true;
@@ -1957,7 +1972,7 @@ export class Database implements FunctionContext {
     let rowid = 0;
     let sources: ExternalSource[] = [];
     try {
-      sources = this.runQuery({ language: info.language, text: info.sql }, (r, outRegs) => {
+      sources = this.runQuery({ language: info.language, text: info.sql }, info.interface, (r, outRegs) => {
         if (outRegs.length !== ncols) throw new SmaltError('SMALT_ERROR', `materialized view ${mv.name}: the query now returns ${outRegs.length} columns, the view has ${ncols}`);
         for (let i = 0; i < ncols; i++) {
           const v = r[outRegs[i]];
@@ -2159,11 +2174,11 @@ export class Database implements FunctionContext {
 
   /** Run a query to completion; `emit` reads each result row from the registers `r[outRegs[i]]`. */
   /** Run a view's query, passing each row to `emit`; returns the external sources it read (M8). */
-  private runQuery(source: Source, emit: (r: SqlValue[], outRegs: number[]) => void): ExternalSource[] {
+  private runQuery(source: Source, iface: readonly ViewInterfaceColumn[] | undefined, emit: (r: SqlValue[], outRegs: number[]) => void): ExternalSource[] {
     const regs = new Registers(0);
     const planner = new Planner(this.plannerDeps(), regs);
     planner.sqlText = source.text;
-    const plan = this.planView(source, planner);
+    const plan = this.planView(source, planner, undefined, iface);
     const externals = planner.finishExternals();
     const r: SqlValue[] = new Array(regs.count).fill(null);
     const root = plan.root;
@@ -2759,7 +2774,7 @@ export class Database implements FunctionContext {
       if (layout.kind !== 'table') throw new SmaltError('SMALT_CORRUPT', `layout of materialized view ${r.name} is not a table`);
       const { table } = tableSchemaFromDef(layout.table, layoutText(layout.table), root);
       const storage = String(def.options.storage ?? 'row').toLowerCase() as MatViewInfo['storage'];
-      table.matview = { sql: r.sql!, language: def.language, options: { ...def.options }, storage, populated, refreshedAt, fresh };
+      table.matview = { sql: r.sql!, language: def.language, options: { ...def.options }, storage, populated, refreshedAt, fresh, ...(def.columns ? { columns: [...def.columns] } : {}), ...(def.interface ? { interface: def.interface.map((c) => ({ ...c })) } : {}) };
       this.tables.set(table.name.toLowerCase(), table);
     }
   }
@@ -3915,11 +3930,9 @@ export class Database implements FunctionContext {
    * A view whose language isn't registered in this database is not checked.
    */
   private checkInterfaces(): void {
-    for (const v of [...this.tempViews.values(), ...this.views.values()]) {
-      // A view whose language isn't registered here can't be bound here, or read: it is checked where it is.
-      if (!v.interface || !registeredLanguage(v.source.language)) continue;
-      const problem = this.interfaceProblem(v, v.interface);
-      if (problem) throw new SmaltError('SMALT_ERROR', `schema change breaks the interface of view ${v.name}: ${problem}`);
+    for (const { view, iface, kind } of this.interfaceObjects()) {
+      const problem = this.interfaceProblem(view, iface);
+      if (problem) throw new SmaltError('SMALT_ERROR', `schema change breaks the interface of ${kind} ${view.name}: ${problem}`);
     }
   }
 
@@ -3930,14 +3943,29 @@ export class Database implements FunctionContext {
   private dropBrokenInterfaces(): string[] {
     const dropped: string[] = [];
     for (;;) {
-      const broken = [...this.tempViews.values(), ...this.views.values()].filter((v) => v.interface && registeredLanguage(v.source.language) && this.interfaceProblem(v, v.interface) !== null);
+      const broken = this.interfaceObjects().filter((o) => this.interfaceProblem(o.view, o.iface) !== null);
       if (broken.length === 0) return dropped;
-      for (const v of broken) {
-        const temp = this.tempViews.get(v.name.toLowerCase()) === v;
-        this.drop({ op: 'drop', objectType: 'view', name: v.name, schema: temp ? 'temp' : 'main', ifExists: true });
-        dropped.push(v.name);
+      for (const { view, kind, temp } of broken) {
+        this.drop({ op: 'drop', objectType: kind, name: view.name, schema: temp ? 'temp' : 'main', ifExists: true });
+        dropped.push(view.name);
       }
     }
+  }
+
+  /**
+   * The views and materialized views with an interface (ADR 0027) whose language is registered here: a view in another
+   * language can't be bound here, or read, and is checked where it is.
+   */
+  private interfaceObjects(): { view: ViewSchema; iface: readonly ViewInterfaceColumn[]; kind: 'view' | 'materialized view'; temp: boolean }[] {
+    const out: { view: ViewSchema; iface: readonly ViewInterfaceColumn[]; kind: 'view' | 'materialized view'; temp: boolean }[] = [];
+    for (const v of this.tempViews.values()) if (v.interface && registeredLanguage(v.source.language)) out.push({ view: v, iface: v.interface, kind: 'view', temp: true });
+    for (const v of this.views.values()) if (v.interface && registeredLanguage(v.source.language)) out.push({ view: v, iface: v.interface, kind: 'view', temp: false });
+    for (const t of this.tables.values()) {
+      const m = t.matview;
+      if (!m?.interface || !registeredLanguage(m.language)) continue;
+      out.push({ view: { name: t.name, source: { language: m.language, text: m.sql }, ...(m.columns ? { columns: m.columns } : {}) }, iface: m.interface, kind: 'materialized view', temp: false });
+    }
+    return out;
   }
 
   /** What breaks `iface`, the interface of `view`, as the view binds now; null when nothing does. */
@@ -3946,6 +3974,8 @@ export class Database implements FunctionContext {
     try {
       got = this.boundInterface(view);
     } catch (e) {
+      // A view over external data that isn't loaded can't be bound now: its shape is the data's, checked where read.
+      if (e instanceof AsyncRequiredError) return null;
       return `it no longer binds (${(e as Error).message})`;
     }
     // A view without a column list over `*` gives a column added to what it reads: it keeps the columns it had.
@@ -5570,4 +5600,20 @@ function viewDef(v: ViewSchema): StoredDef {
 /** A stored view's interface fields, as `ViewSchema` keeps them. */
 function viewInterfaceFields(def: { readonly interface?: readonly ViewInterfaceColumn[]; readonly pending?: true }): Pick<ViewSchema, 'interface' | 'pending'> {
   return def.interface ? { interface: def.interface.map((c) => ({ ...c })) } : def.pending ? { pending: true } : {};
+}
+
+/**
+ * A view's bound query read as its interface says (ADR 0027): only the interface's columns (a view over `*` keeps the
+ * ones it had), each converted to the interface's type where the query now gives another.
+ */
+function asInterface(q: BoundQuery, iface: readonly ViewInterfaceColumn[]): BoundQuery {
+  const cols = q.columns.slice(0, iface.length);
+  if (cols.length === q.columns.length && cols.every((c, i) => c.type === iface[i]!.type)) return q;
+  const exprs = cols.map((c, i): PlanExpr => {
+    const col: PlanExpr = { k: 'col', input: 0, index: i, depth: 0, type: c.type, collation: 'binary' };
+    const want = iface[i]!.type;
+    const fn = c.type === want ? undefined : conversion(c.type, want)?.fn;
+    return fn ? { k: 'call', fn, args: [col], type: want } : col;
+  });
+  return { ...q, plan: { op: 'project', input: q.plan, exprs }, columns: cols.map((c, i) => (c.type === iface[i]!.type ? c : { ...c, type: iface[i]!.type, declType: undefined })) };
 }

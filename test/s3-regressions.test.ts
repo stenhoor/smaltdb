@@ -35,7 +35,8 @@ describe('S3-20: rebuilding memory views at open', () => {
     db.exec("CREATE MATERIALIZED VIEW m1 WITH (location = 'memory') AS SELECT x FROM t");
     db.exec("CREATE MATERIALIZED VIEW m2 WITH (location = 'memory') AS SELECT count(*) AS n FROM m1");
     // Re-created m1 comes after m2 in the catalog.
-    db.exec("DROP MATERIALIZED VIEW m1; CREATE MATERIALIZED VIEW m1 WITH (location = 'memory') AS SELECT x FROM t");
+    // In one transaction: m2's interface (ADR 0027) holds m1, checked at COMMIT.
+    db.exec("BEGIN; DROP MATERIALIZED VIEW m1; CREATE MATERIALIZED VIEW m1 WITH (location = 'memory') AS SELECT x FROM t; COMMIT");
     db.close();
     const again = await Database.open(vfs, 'db');
     expect(again.query('SELECT n FROM m2').rows).toEqual([[2]]);
