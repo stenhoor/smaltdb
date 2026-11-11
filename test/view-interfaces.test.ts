@@ -270,3 +270,42 @@ describe('cascade (ADR 0027 step 4)', () => {
     expect(() => run(d, { op: 'drop', objectType: 'table', name: 't', ifExists: false, cascade: 'yes' })).toThrow(/cascade/);
   });
 });
+
+describe('materialized views (ADR 0027 step 5)', () => {
+  it('have an interface, kept across a reopen', () => {
+    const vfs = new MemoryVfs();
+    let d = Database.openFile(vfs.openSync('p.db'), {}, vfs.openSync('p.db-wal'));
+    d.exec(`${SETUP} CREATE MATERIALIZED VIEW mv AS SELECT id, name, score FROM t`);
+    const want = [col('id', 'int', true), col('name', 'text', true), col('score', 'real', false)];
+    expect(d.catalog.table('mv')!.interface).toEqual(want);
+    d.close();
+    d = Database.openFile(vfs.openSync('p.db'), {}, vfs.openSync('p.db-wal'));
+    expect(d.catalog.table('mv')!.interface).toEqual(want);
+  });
+
+  it('hold what they read: a drop is refused, or cascades', () => {
+    const d = Database.openMemory();
+    d.exec(`${SETUP} CREATE MATERIALIZED VIEW mv AS SELECT name FROM t`);
+    expect(() => d.exec('DROP TABLE t')).toThrow('schema change breaks the interface of materialized view mv: it no longer binds (no such table: t)');
+    const r = d.preparePlan({ kind: 'schema', op: { op: 'drop', objectType: 'table', name: 't', ifExists: false, cascade: true } }).run();
+    expect(r.cascaded).toEqual(['mv']);
+    expect(d.catalog.table('mv')).toBeUndefined();
+  });
+
+  it('refresh with the lossless conversion after a type change', () => {
+    const d = Database.openMemory();
+    d.exec(`CREATE TABLE t(code TEXT); INSERT INTO t VALUES ('42'); CREATE MATERIALIZED VIEW mv AS SELECT code FROM t`);
+    rebuild(d, 'code INTEGER', 'CAST(code AS INTEGER)');
+    d.exec("INSERT INTO t VALUES (7); REFRESH MATERIALIZED VIEW mv");
+    expect(d.query('SELECT code FROM mv ORDER BY code').rows).toEqual([['42'], ['7']]);
+  });
+
+  it('over * keep the columns they had when one is added, and refresh', () => {
+    const d = Database.openMemory();
+    d.exec(`CREATE TABLE t(a INTEGER, b TEXT); INSERT INTO t VALUES (1, 'x'); CREATE MATERIALIZED VIEW mv AS SELECT * FROM t`);
+    d.exec("ALTER TABLE t ADD COLUMN c TEXT; INSERT INTO t VALUES (2, 'y', 'z'); REFRESH MATERIALIZED VIEW mv");
+    const r = d.query('SELECT * FROM mv ORDER BY a');
+    expect(r.columns).toEqual(['a', 'b']);
+    expect(r.rows).toEqual([[1, 'x'], [2, 'y']]);
+  });
+});

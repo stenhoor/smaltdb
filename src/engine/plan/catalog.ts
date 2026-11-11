@@ -72,6 +72,8 @@ export interface CatalogTable {
   readonly strict: boolean;
   /** Its definition, in the language it was written in; absent for a table defined without source text (ADR 0016 section 6). */
   readonly source?: Source;
+  /** A materialized view's interface (ADR 0027), as a view's; absent for one made before interfaces. */
+  readonly interface?: readonly ViewInterfaceColumn[];
 }
 
 /** A view: its language and source text, bound where it is read. */

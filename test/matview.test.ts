@@ -80,8 +80,11 @@ describe('materialized views (row storage)', () => {
     db.exec('COMMIT');
     db.exec('REFRESH MATERIALIZED VIEW v');
     expect(db.query('SELECT count(*) FROM v WHERE amount IS NULL').rows).toEqual([[1]]);
-    db.exec('DROP TABLE sales');
-    expect(() => db.exec('REFRESH MATERIALIZED VIEW v')).toThrow(/no such table/);
+    // The view's interface (ADR 0027) holds sales: it can't be dropped. A duplicate under a unique index of the view
+    // fails the refresh instead.
+    expect(() => db.exec('DROP TABLE sales')).toThrow(/breaks the interface of materialized view v/);
+    db.exec("CREATE UNIQUE INDEX v_amount_u ON v(amount); INSERT INTO sales(day, amount) VALUES ('d3', 7)");
+    expect(() => db.exec('REFRESH MATERIALIZED VIEW v')).toThrow(/UNIQUE/);
     expect(db.query('SELECT count(*) FROM v').rows).toEqual([[3]]);
     expect(db.query('PRAGMA integrity_check').rows).toEqual([['ok']]);
   });
