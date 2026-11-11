@@ -63,7 +63,9 @@ describe('tables and views', () => {
     expect(d.catalog.table('w')).toMatchObject({ schema: 'temp', columns: [{ name: 'b' }] });
     expect(d.catalog.table('w', 'main')).toMatchObject({ schema: 'main', columns: [{ name: 'a' }] });
     expect(d.catalog.view('tv')!.schema).toBe('temp');
-    d.exec('DROP TABLE t');
+    // View v reads t, and its interface holds it (ADR 0027): t is dropped after v.
+    expect(() => d.exec('DROP TABLE t')).toThrow(/breaks the interface of view v/);
+    d.exec('DROP VIEW v; DROP TABLE t');
     expect(d.catalog.table('t')).toBeUndefined();
   });
 

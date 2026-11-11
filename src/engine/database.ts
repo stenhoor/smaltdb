@@ -41,6 +41,7 @@ import { describeTable, logicalCatalog } from './catalog/logical.js';
 import { outputTypes } from './plan/output.js';
 import { type Catalog, type CatalogTable, type ViewInterfaceColumn, planTypeOfStorage } from './plan/catalog.js';
 import { notNullColumns } from './plan/nullability.js';
+import { conversion, isLossless } from './plan/conversions.js';
 import {
   AsyncRequiredError,
   type ConnectionInfo,
@@ -1295,7 +1296,7 @@ export class Database implements FunctionContext {
   private viewWidth(name: string, schema?: string): number | undefined {
     const v = this.getView(name, schema);
     if (!v) return undefined;
-    return v.columns?.length ?? languagePart(this.languageOf(v.source.language), 'bindView')(v.source, this.bindContext()).columns.length;
+    return v.columns?.length ?? v.interface?.length ?? languagePart(this.languageOf(v.source.language), 'bindView')(v.source, this.bindContext()).columns.length;
   }
 
   /**
@@ -1354,7 +1355,14 @@ export class Database implements FunctionContext {
     if (scan.columns.some((c) => c < 0)) throw new SmaltError('SMALT_ERROR', `view ${v.name} has no rowid`);
     const bound = this.received(languagePart(this.languageOf(v.source.language), 'bindView')(v.source, this.bindContext()));
     const query = this.expandViews(bound.plan, depth + 1);
-    const exprs = scan.columns.map((c): PlanExpr => ({ k: 'col', input: 0, index: c, depth: 0, type: 'any', collation: 'binary' }));
+    // A column whose type changed losslessly since the view's interface was captured gives the interface's type.
+    const exprs = scan.columns.map((c): PlanExpr => {
+      const col: PlanExpr = { k: 'col', input: 0, index: c, depth: 0, type: 'any', collation: 'binary' };
+      const want = v.interface?.[c]?.type;
+      const now = bound.columns[c]?.type;
+      const fn = want !== undefined && now !== undefined && now !== want ? conversion(now, want)?.fn : undefined;
+      return fn ? { k: 'call', fn, args: [{ ...col, type: now! }], type: want! } : col;
+    });
     return normalizePlan({ op: 'project', input: query, exprs, ...(scan.origin !== undefined ? { origin: scan.origin } : {}) });
   }
 
@@ -1556,6 +1564,12 @@ export class Database implements FunctionContext {
     const run = (f: () => RunResult): Omit<Program, 'regCount'> => ({
       exec: () => {
         const r = f();
+        // An index, a connection or a new external table changes nothing a view gives. Inside a transaction the check
+        // waits for COMMIT, as deferred foreign keys do: a rebuild drops a table and renames another into its place.
+        if (op.op === 'createTable' || op.op === 'createView' || op.op === 'drop' || op.op === 'alterTable') {
+          if (this.autocommit) this.checkInterfaces();
+          else this.interfaceCheckDue = true;
+        }
         this.capturePendingInterfaces();
         return r;
       },
@@ -1687,12 +1701,19 @@ export class Database implements FunctionContext {
     throw new SmaltError('SMALT_ERROR', `no such savepoint: ${name}`);
   }
 
+  /** A schema operation in the open transaction may have broken a view's interface: checked at COMMIT (ADR 0027). */
+  private interfaceCheckDue = false;
+
   /** @internal How the last explicit transaction ended (the server reports it to `db.transaction()`). */
   lastTransactionEnd: 'commit' | 'rollback' | null = null;
 
   private commitTransaction(): void {
-    // Deferred foreign-key violations keep the transaction open, as in SQLite.
+    // Deferred foreign-key violations keep the transaction open, as in SQLite; so does a broken view interface.
     this.fk.checkCommit();
+    if (this.interfaceCheckDue) {
+      this.checkInterfaces();
+      this.interfaceCheckDue = false;
+    }
     this.lastTransactionEnd = 'commit';
     if (this.sqlSavepoints.length) this.tx.releaseSavepoint(1);
     this.sqlSavepoints.length = 0;
@@ -1705,6 +1726,7 @@ export class Database implements FunctionContext {
 
   private rollbackTransaction(): void {
     this.lastTransactionEnd = 'rollback';
+    this.interfaceCheckDue = false;
     this.fk.deferred = 0;
     this.sqlSavepoints.length = 0;
     this.txnFromSavepoint = false;
@@ -3846,23 +3868,62 @@ export class Database implements FunctionContext {
    */
   private captureInterface(view: ViewSchema): boolean {
     try {
-      const { env, catalog } = this.viewCheckEnv();
-      const fe = this.received(languagePart(this.languageOf(view.source.language), 'bindView')(view.source, catalog));
-      if (view.columns && view.columns.length !== fe.columns.length) throw new SmaltError('SMALT_ERROR', 'column count');
-      const planner = new Planner(env, new Registers(0));
-      planner.sqlText = view.source.text;
-      this.planView(view.source, planner, catalog);
-      const nn = notNullColumns(fe.plan, (name, db) => {
-        const t = db === 'temp' ? this.tempTables.get(name.toLowerCase()) : this.getTable(name, db);
-        return t?.columns.map((c, i) => c.notNull || i === t.rowidAlias);
-      });
-      view.interface = fe.columns.map((c, i) => ({ name: view.columns?.[i] ?? c.name, type: c.type, notNull: nn[i] === true }));
+      view.interface = this.boundInterface(view);
       delete view.pending;
       return true;
     } catch {
       view.pending = true;
       return false;
     }
+  }
+
+  /**
+   * Check every view with an interface against what it gives now (ADR 0027, decision 2), after a schema operation:
+   * the operation is refused (the statement rolls back) when a view no longer binds, gives another number of columns,
+   * a column whose type changed other than losslessly, or one that can now be NULL where its interface says it can't.
+   * A view whose language isn't registered in this database is not checked.
+   */
+  private checkInterfaces(): void {
+    for (const v of [...this.tempViews.values(), ...this.views.values()]) {
+      // A view whose language isn't registered here can't be bound here, or read: it is checked where it is.
+      if (!v.interface || !registeredLanguage(v.source.language)) continue;
+      const problem = this.interfaceProblem(v, v.interface);
+      if (problem) throw new SmaltError('SMALT_ERROR', `schema change breaks the interface of view ${v.name}: ${problem}`);
+    }
+  }
+
+  /** What breaks `iface`, the interface of `view`, as the view binds now; null when nothing does. */
+  private interfaceProblem(view: ViewSchema, iface: readonly ViewInterfaceColumn[]): string | null {
+    let got: ViewInterfaceColumn[];
+    try {
+      got = this.boundInterface(view);
+    } catch (e) {
+      return `it no longer binds (${(e as Error).message})`;
+    }
+    // A view without a column list over `*` gives a column added to what it reads: it keeps the columns it had.
+    if (got.length < iface.length || (got.length > iface.length && view.columns)) return `it gives ${got.length} columns, not ${iface.length}`;
+    for (let i = 0; i < iface.length; i++) {
+      const want = iface[i]!;
+      const now = got[i]!;
+      if (now.type !== want.type && !isLossless(now.type, want.type)) return `column ${want.name}: ${want.type} → ${now.type} is not lossless`;
+      if (want.notNull && !now.notNull) return `column ${want.name} can now be NULL`;
+    }
+    return null;
+  }
+
+  /** The columns `view` gives as it binds and plans now, by its own names; throws when it doesn't bind or plan. */
+  private boundInterface(view: ViewSchema): ViewInterfaceColumn[] {
+    const { env, catalog } = this.viewCheckEnv();
+    const fe = this.received(languagePart(this.languageOf(view.source.language), 'bindView')(view.source, catalog));
+    if (view.columns && view.columns.length !== fe.columns.length) throw new SmaltError('SMALT_ERROR', `expected ${view.columns.length} columns for '${view.name}' but got ${fe.columns.length}`);
+    const planner = new Planner(env, new Registers(0));
+    planner.sqlText = view.source.text;
+    this.planView(view.source, planner, catalog);
+    const nn = notNullColumns(fe.plan, (name, db) => {
+      const t = db === 'temp' ? this.tempTables.get(name.toLowerCase()) : this.getTable(name, db);
+      return t?.columns.map((c, i) => c.notNull || i === t.rowidAlias);
+    });
+    return fe.columns.map((c, i) => ({ name: view.columns?.[i] ?? c.name, type: c.type, notNull: nn[i] === true }));
   }
 
   /** Capture the interfaces of views still pending; a stored view's definition is written again with its interface. */

@@ -5,6 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
+import { plan as p } from '../src/engine/index.js';
 
 const SETUP = `
   CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL);
@@ -123,5 +124,82 @@ describe('view interfaces', () => {
     expect(d.catalog.view('old')!.interface).toBeUndefined();
     d.exec('CREATE TABLE other(x)');
     expect(d.catalog.view('old')!.interface).toBeUndefined();
+  });
+});
+
+/** Rebuild t in one transaction, as a language changes a column's type: copy into t2, drop t, rename t2 to t. */
+const rebuild = (d: Database, columns: string, select: string): void =>
+  d.exec(`BEGIN; CREATE TABLE t2(${columns}); INSERT INTO t2 SELECT ${select} FROM t; DROP TABLE t; ALTER TABLE t2 RENAME TO t; COMMIT`);
+
+describe('schema operations against view interfaces (ADR 0027 step 3)', () => {
+  it('refuse dropping a table a view reads, changing nothing', () => {
+    const d = Database.openMemory();
+    d.exec(`${SETUP} INSERT INTO t VALUES (1, 'a', 2.5); CREATE VIEW v AS SELECT name FROM t`);
+    expect(() => d.exec('DROP TABLE t')).toThrow('schema change breaks the interface of view v: it no longer binds (no such table: t)');
+    expect(d.query('SELECT name FROM v').rows).toEqual([['a']]);
+    d.exec('DROP VIEW v; DROP TABLE t');
+    expect(d.catalog.table('t')).toBeUndefined();
+  });
+
+  it('refuse dropping a view another view reads', () => {
+    const d = Database.openMemory();
+    d.exec(`${SETUP} CREATE VIEW inner_v AS SELECT name FROM t; CREATE VIEW outer_v AS SELECT name FROM inner_v`);
+    expect(() => d.exec('DROP VIEW inner_v')).toThrow(/breaks the interface of view outer_v: it no longer binds/);
+  });
+
+  it('refuse a TEMP table that shadows what a view reads with other columns', () => {
+    const d = Database.openMemory();
+    d.exec(`${SETUP} CREATE VIEW v AS SELECT name FROM t`);
+    expect(() => d.exec('CREATE TEMP TABLE t(x)')).toThrow(/breaks the interface of view v/);
+  });
+
+  it('allow a rename of what a view reads', () => {
+    const d = Database.openMemory();
+    d.exec(`${SETUP} INSERT INTO t VALUES (1, 'a', 2.5); CREATE VIEW v AS SELECT name FROM t`);
+    d.exec('ALTER TABLE t RENAME COLUMN name TO title; ALTER TABLE t RENAME TO t_new');
+    expect(d.query('SELECT * FROM v').rows).toEqual([['a']]);
+    expect(d.catalog.view('v')!.interface).toEqual([col('name', 'text', true)]);
+  });
+
+  it('keep a view over * to the columns it had when a column is added', () => {
+    const d = Database.openMemory();
+    d.exec(`${SETUP} INSERT INTO t VALUES (1, 'a', 2.5); CREATE VIEW v AS SELECT * FROM t`);
+    d.exec('ALTER TABLE t ADD COLUMN extra TEXT');
+    expect(d.catalog.view('v')!.interface!.map((c) => c.name)).toEqual(['id', 'name', 'score']);
+    // Read through the plan API, the engine expands the view: the interface's columns.
+    expect(d.queryPlan(p.scan('v', [0, 1, 2])).rows).toEqual([[1, 'a', 2.5]]);
+  });
+
+  it('check a rebuild at COMMIT: a lossless type change is converted where the engine expands the view', () => {
+    const d = Database.openMemory();
+    d.exec(`CREATE TABLE t(code TEXT); INSERT INTO t VALUES ('42'); CREATE VIEW v AS SELECT code FROM t`);
+    rebuild(d, 'code INTEGER', 'CAST(code AS INTEGER)');
+    expect(d.catalog.view('v')!.interface).toEqual([col('code', 'text', false)]);
+    const r = d.queryPlan(p.scan('v', [0]));
+    expect(r.rows).toEqual([['42']]);
+  });
+
+  it('refuse at COMMIT a change that is not lossless, keeping the transaction open', () => {
+    const d = Database.openMemory();
+    d.exec(`CREATE TABLE t(n INTEGER); INSERT INTO t VALUES (7); CREATE VIEW v AS SELECT n FROM t`);
+    expect(() => rebuild(d, 'n REAL', 'n')).toThrow('schema change breaks the interface of view v: column n: int → real is not lossless');
+    expect(d.inTransaction).toBe(true);
+    d.exec('ROLLBACK');
+    expect(d.catalog.table('t')!.columns[0]!.type).toBe('int');
+    expect(d.query('SELECT n FROM v').rows).toEqual([[7]]);
+  });
+
+  it('refuse a column that can now be NULL where the interface says it cannot', () => {
+    const d = Database.openMemory();
+    d.exec(`CREATE TABLE t(name TEXT NOT NULL); CREATE VIEW v AS SELECT name FROM t`);
+    expect(() => rebuild(d, 'name TEXT', 'name')).toThrow('schema change breaks the interface of view v: column name can now be NULL');
+    d.exec('ROLLBACK');
+  });
+
+  it('leave views without an interface as they were', () => {
+    const d = Database.openMemory();
+    d.exec(`${SETUP} CREATE VIEW later AS SELECT z FROM not_yet`);
+    d.exec('DROP TABLE t');
+    expect(d.catalog.view('later')!.interface).toBeUndefined();
   });
 });

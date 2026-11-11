@@ -7,7 +7,7 @@
 import type { StaticType } from '../exec/convert.js';
 import type { FunctionContext } from '../exec/functions.js';
 import type { SqlValue } from '../values.js';
-import type { Catalog, CatalogTable } from './catalog.js';
+import type { Catalog, CatalogTable, ViewInterfaceColumn } from './catalog.js';
 import type { Source } from './schema.js';
 
 export interface BindContext {
@@ -26,8 +26,12 @@ export interface BindContext {
    * external table, a columnar table, a TEMP index on a main table).
    */
   indexTable(name: string, schema?: string): CatalogTable;
-  /** A view: its source in its language (bound where the view is read) and the column names given with it. */
-  getView?(name: string, schema?: string): { name: string; source: Source; columns?: readonly string[] } | undefined;
+  /**
+   * A view: its source in its language (bound where the view is read), the column names given with it, and its
+   * interface (ADR 0027). Where a column's type has changed losslessly since the interface was captured, a language
+   * that binds the view's source itself converts the column to the interface's type (`conversion` in plan/conversions.ts).
+   */
+  getView?(name: string, schema?: string): { name: string; source: Source; columns?: readonly string[]; interface?: readonly ViewInterfaceColumn[] } | undefined;
   /** True for an external table. */
   isExternal?(name: string): boolean;
   /** The columns of an external table. */

@@ -1,6 +1,6 @@
 # ADR 0027: View interfaces in the engine
 
-- **Status:** accepted (2026-11-11); steps 1 and 2 done. The owner's answers are below
+- **Status:** accepted (2026-11-11); steps 1 to 3 done. The owner's answers are below
 - **Date:** 2026-11-11
 - **Issue:** #188 (proposal E10 from smaltts)
 - **Builds on:** [ADR 0015](0015-smaltql.md) (smaltql, §8: no new SQL syntax), [ADR 0016](0016-plan-api-for-every-language.md)
@@ -61,6 +61,18 @@ language bypasses smaltts. Only the engine sees every schema operation, so only 
    Anything else refuses the operation, before it changes anything, with an error that names the view, the column and
    the change (`schema change breaks the interface of view daily: column total: real → integer is not lossless`). The
    existing check for grandfathered views (they must still plan) stays as it is.
+
+   As built (step 3):
+   - **Inside a transaction the check waits for COMMIT**, as deferred foreign keys do. A type change is a rebuild
+     (create a copy, drop the table, rename the copy into its place: SQL has no other way, and smaltts rebuilds so),
+     and the views read the table again only once the rename is done. A COMMIT that finds a broken interface fails and
+     leaves the transaction open; in autocommit, the statement is refused.
+   - **A view without a column list may give more columns than its interface**: a view over `*` gains a column added
+     to the table, and keeps the ones it had (Consequences). The engine reads only the interface's columns.
+   - **A view whose language isn't registered** in a database can't be bound there, or read: it is not checked there.
+   - **Where a column is converted:** the engine casts it where it expands a view (a plan's `scan` of the view).
+     smaltql binds a view's SQL itself, so it applies the casts from the interface `getView` now gives (a smaltql
+     change); until then a SQL read of such a view gives the column's new type.
 3. **The engine owns the conversion table, decided by types alone.** Which type changes are lossless is a property of
    the two types, never of the rows a table holds (smaltts DESIGN.md §8.3): the same type; INTEGER or REAL to NUMERIC;
    INTEGER, REAL, BOOLEAN, the temporal types, LIST and STRUCT to TEXT (the result format); TEXT to BLOB; BOOLEAN to
