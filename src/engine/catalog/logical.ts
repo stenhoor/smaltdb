@@ -7,7 +7,7 @@ import { CollSrc, boundMetadata, compilePlanExpr } from '../exec/expr.js';
 import { type CompiledArg, type FunctionContext, aggregateFunctions, scalarFunctions } from '../exec/functions.js';
 import { SQL_FUNCTIONS } from '../exec/sql-functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../exec/window.js';
-import type { Catalog, CatalogData, CatalogFunction, CatalogKey, CatalogSettings, CatalogTable, CatalogView, FunctionCatalog } from '../plan/catalog.js';
+import type { Catalog, CatalogData, CatalogFunction, CatalogKey, CatalogSettings, CatalogTable, CatalogView, FunctionCatalog, ViewInterfaceColumn } from '../plan/catalog.js';
 import type { TemporalType } from '../../shared/temporal.js';
 import type { NestedTypeName } from '../../shared/nested-types.js';
 import type { StorageType } from '../plan/schema.js';
@@ -23,7 +23,7 @@ export interface CatalogHost {
   /** Tables and materialized views, main and temp, without the system tables. */
   tables(): readonly TableSchema[];
   externals(): readonly { name: string; sql: string; columns: readonly { name: string; declType: string }[]; language?: string; described?: boolean }[];
-  views(): readonly { name: string; source: Source; columns?: readonly string[]; temp: boolean }[];
+  views(): readonly { name: string; source: Source; columns?: readonly string[]; interface?: readonly ViewInterfaceColumn[]; pending?: boolean; temp: boolean }[];
   settings(): CatalogSettings;
   /** Changes whenever the schema does: descriptions are kept until then. */
   schemaVersion(): number;
@@ -331,7 +331,7 @@ export function logicalCatalog(host: CatalogHost): Catalog {
     const described = host.tables().map(describeTable);
     // TEMP first: the one a name finds when it shadows a main table.
     tables = [...described.filter((t) => t.schema === 'temp'), ...described.filter((t) => t.schema === 'main'), ...host.externals().map(describeExternal)];
-    views = host.views().map((x) => ({ name: x.name, schema: x.temp ? 'temp' : 'main', language: x.source.language, text: x.source.text, ...(x.columns ? { columns: [...x.columns] } : {}) }));
+    views = host.views().map((x) => ({ name: x.name, schema: x.temp ? 'temp' : 'main', language: x.source.language, text: x.source.text, ...(x.columns ? { columns: [...x.columns] } : {}), ...(x.interface ? { interface: x.interface.map((c) => ({ ...c })) } : x.pending ? {} : { reflects: true as const }) }));
   };
   const find = <T extends { name: string; schema: 'main' | 'temp' }>(xs: readonly T[], name: string, schema?: 'main' | 'temp'): T | undefined => {
     const lower = name.toLowerCase();

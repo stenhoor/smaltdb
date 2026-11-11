@@ -1,7 +1,6 @@
 # ADR 0027: View interfaces in the engine
 
-- **Status:** proposed; the owner answered its open points on 2026-11-11 (below: every new view gets an interface;
-  views made before are grandfathered; nullability recorded; no typed lists in SQL; smaltts refuses rather than cascades)
+- **Status:** accepted (2026-11-11); steps 1 and 2 done. The owner's answers are below
 - **Date:** 2026-11-11
 - **Issue:** #188 (proposal E10 from smaltts)
 - **Builds on:** [ADR 0015](0015-smaltql.md) (smaltql, §8: no new SQL syntax), [ADR 0016](0016-plan-api-for-every-language.md)
@@ -38,6 +37,16 @@ language bypasses smaltts. Only the engine sees every schema operation, so only 
    and stores each column's name, plan type and whether it can be NULL, as the view gives them then. A column list
    (`createView.columns`) names the columns; without one, the names are those the query gives. No new syntax in any
    language (ADR 0015 §8), and no typed lists in SQL: the types always come from the view's query.
+
+   A view that can't bind when it is created (it reads a table created later, or gives the wrong number of columns
+   for its names, which SQL allows until the view is read) is **pending**: it is created as before, and its interface
+   is captured after the first schema operation that lets it bind (the owner's decision, 2026-11-11). Only a schema
+   operation can change whether a view binds, so the interface is always captured and stored inside one.
+
+   **Nullability is conservative** (the owner's decision, 2026-11-11): a column is recorded NOT NULL only when that is
+   proven (a NOT NULL column or integer primary key carried through filters, projections, sorts, inner joins,
+   groupings and unions; a literal; a `count`). Anything else can be NULL, so a change is never refused because the
+   analysis missed that a column can't be NULL.
 
    **Views made before are grandfathered:** a view stored without an interface keeps today's behaviour, reflecting
    what it reads, until it is dropped and created again (which captures one).
@@ -104,3 +113,5 @@ result from smaltql and from smaltts.
 4. **smaltts refuses** a change that would break an interface view, rather than dropping the view (with or without
    `prune`); the views are dropped first, by hand. The engine's `cascade` (decision 4) stays for languages whose users
    ask for it (SQL's `DROP … CASCADE`).
+5. **A view that can't bind when created** gets its interface the first time it binds (decision 1).
+6. **Nullability** is proven conservatively (decision 1).

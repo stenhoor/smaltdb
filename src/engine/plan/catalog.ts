@@ -82,6 +82,21 @@ export interface CatalogView {
   readonly text: string;
   /** The column names given with it, if any. */
   readonly columns?: readonly string[];
+  /**
+   * Its interface (ADR 0027): the columns it gives, by name, type and whether they can be NULL, captured the first
+   * time it bound. Absent while it hasn't bound yet, and for a view made before interfaces (`reflects`).
+   */
+  readonly interface?: readonly ViewInterfaceColumn[];
+  /** A view made before interfaces (ADR 0027): it reflects what it reads, as views did. */
+  readonly reflects?: true;
+}
+
+/** A column of a view's interface (ADR 0027). */
+export interface ViewInterfaceColumn {
+  readonly name: string;
+  readonly type: PlanType;
+  /** Proven never NULL when the interface was captured (conservatively: see plan/nullability.ts). */
+  readonly notNull: boolean;
 }
 
 /** A registered function or operation a plan can call. */

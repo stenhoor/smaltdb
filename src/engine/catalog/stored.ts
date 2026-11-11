@@ -14,6 +14,7 @@ import { SmaltError } from '../errors.js';
 import { decodeDataJSON, encodeDataJSON, valueFromJSON } from '../plan/codec.js';
 import type { PlanExpr } from '../plan/expr.js';
 import type { DefaultDef, ExprDef, IndexDef, StorageType, TableDef } from '../plan/schema.js';
+import type { ViewInterfaceColumn } from '../plan/catalog.js';
 import type { SqlValue } from '../values.js';
 import type { TemporalType } from '../../shared/temporal.js';
 import type { NestedTypeName } from '../../shared/nested-types.js';
@@ -29,7 +30,11 @@ export type StoredDef =
    */
   | { readonly kind: 'table'; readonly table: TableDef; readonly language?: string; readonly described?: true }
   | { readonly kind: 'index'; readonly index: IndexDef; readonly language?: string; readonly described?: true }
-  | { readonly kind: 'view'; readonly language: string; readonly columns?: readonly string[] }
+  /**
+   * A view. `interface`: the columns it gives, captured the first time it bound (ADR 0027); `pending`: made with
+   * interfaces, not bound yet. Neither: made before interfaces, so it reflects what it reads.
+   */
+  | { readonly kind: 'view'; readonly language: string; readonly columns?: readonly string[]; readonly interface?: readonly ViewInterfaceColumn[]; readonly pending?: true }
   /** A materialized view; the table its rows are stored in is in `smalt_matview` (its layout). */
   | { readonly kind: 'matview'; readonly language: string; readonly columns?: readonly string[]; readonly options: Readonly<Record<string, SqlValue>> }
   | { readonly kind: 'connection'; readonly options: Readonly<Record<string, SqlValue>>; readonly language?: string; readonly described?: true }
