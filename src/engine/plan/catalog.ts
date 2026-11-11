@@ -65,6 +65,8 @@ export interface CatalogTable {
   readonly foreignKeys: readonly ForeignKeyDef[];
   /** Its CHECK constraints, as its definition has them (name, text and expression over the row). */
   readonly checks: readonly CheckDef[];
+  /** For a table defined without source text, the language of its expression texts (`TableDef.exprLanguage`). */
+  readonly exprLanguage?: string;
   readonly storage: 'row' | 'columnar';
   /** Values must match the column types (no conversion on write). */
   readonly strict: boolean;

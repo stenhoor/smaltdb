@@ -3581,6 +3581,19 @@ export class Database implements FunctionContext {
   }
 
   /** The editor of an object's source text, by its language. */
+  /**
+   * The editor of a table's expression texts (CHECKs, defaults, its indexes' expressions) for a column rename. A table
+   * defined without source text uses the language its definition names (`exprLanguage`), when that language is
+   * registered and has an editor; otherwise its texts stay as they are.
+   */
+  private exprEditor(def: StoredDef | undefined): SourceEditor {
+    if (isDescribed(def) && def?.kind === 'table' && def.table.exprLanguage !== undefined) {
+      const editor = registeredLanguage(def.table.exprLanguage)?.sourceEditor;
+      if (editor) return editor;
+    }
+    return this.sourceEditor(def);
+  }
+
   private sourceEditor(def: StoredDef | undefined): SourceEditor {
     // An object defined without source text: its catalog text is described again from its new definition (alterTable).
     if (isDescribed(def)) return UNCHANGED_TEXT;
@@ -3677,7 +3690,7 @@ export class Database implements FunctionContext {
     const dup = findColumn(table, newName);
     if (dup >= 0 && dup !== ci) throw new SmaltError('SMALT_ERROR', `error in table ${table.name} after rename: duplicate column name: ${newName}`);
     const old = table.columns[ci].name;
-    const editor = this.sourceEditor(own);
+    const editor = this.exprEditor(own);
     const isTable = (n: string): boolean => n.toLowerCase() === table.name.toLowerCase();
     const text = <E extends ExprDef>(e: E): E => withText(e, editor.renameColumnInExpr(e.text, table.name, old, newName));
     for (const [key, d] of defs) {

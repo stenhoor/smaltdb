@@ -94,6 +94,12 @@ export interface TableDef {
   readonly checks: readonly CheckDef[];
   readonly foreignKeys: readonly ForeignKeyDef[];
   readonly storage: 'row' | 'columnar';
+  /**
+   * For a table defined without source text: the registered language its expression texts (CHECKs, defaults, and its
+   * indexes' expressions) are written in. A column rename edits them with that language's `sourceEditor`
+   * (`renameColumnInExpr`); without one they stay as given (the expressions, bound by column position, still hold).
+   */
+  readonly exprLanguage?: string;
 }
 
 /** An index column: a table column (`column` ≥ 0) or an expression over the row (`column` -1). */

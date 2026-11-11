@@ -34,6 +34,7 @@ later changes to the tables it reads (see [writing a language](./languages#views
 | `checks` | CHECK constraints, `CheckDef[]` |
 | `foreignKeys` | `ForeignKeyDef[]` |
 | `storage` | `row` or `columnar` |
+| `exprLanguage` | Optional, for a table [defined without source text](#definitions-without-source-text): the language its expression texts are written in |
 
 | `ColumnDef` | |
 |---|---|
@@ -83,6 +84,11 @@ renamed column).
 Such a definition's expressions must be bound (`expr` on every CHECK, DEFAULT and index expression): there is no text to
 bind them from later, so the validator refuses an expression without one, and so does ALTER TABLE ADD COLUMN on such a
 table. Each expression's `text` is kept for display.
+
+A column rename keeps the bound expressions right (they read columns by position), but the texts stay as written,
+naming the old column, unless the definition names their language: with `exprLanguage`, a registered language's
+`sourceEditor.renameColumnInExpr` edits the CHECK and index expression texts on a rename, so what is shown follows.
+The catalog gives `exprLanguage` back with the table.
 
 ```ts
 import { Database, plan } from 'smaltdb/engine';
