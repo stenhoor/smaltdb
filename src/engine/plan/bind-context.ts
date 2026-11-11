@@ -28,10 +28,11 @@ export interface BindContext {
   indexTable(name: string, schema?: string): CatalogTable;
   /**
    * A view: its source in its language (bound where the view is read), the column names given with it, and its
-   * interface (ADR 0027). Where a column's type has changed losslessly since the interface was captured, a language
-   * that binds the view's source itself converts the column to the interface's type (`conversion` in plan/conversions.ts).
+   * interface (ADR 0027). `reshaped`: its query no longer gives exactly its interface (a column's type changed
+   * losslessly, or a view over `*` gained a column). A language that binds the view's source itself then reads the
+   * interface's columns only, each converted to the interface's type (`conversion`).
    */
-  getView?(name: string, schema?: string): { name: string; source: Source; columns?: readonly string[]; interface?: readonly ViewInterfaceColumn[] } | undefined;
+  getView?(name: string, schema?: string): { name: string; source: Source; columns?: readonly string[]; interface?: readonly ViewInterfaceColumn[]; reshaped?: true } | undefined;
   /** True for an external table. */
   isExternal?(name: string): boolean;
   /** The columns of an external table. */

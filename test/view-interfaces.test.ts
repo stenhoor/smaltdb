@@ -203,3 +203,25 @@ describe('schema operations against view interfaces (ADR 0027 step 3)', () => {
     expect(d.catalog.view('later')!.interface).toBeUndefined();
   });
 });
+
+describe('views as a language reads them (getView)', () => {
+  const getView = (d: Database, name: string) => (d as unknown as { bindContext(): { getView(n: string): { interface?: unknown; reshaped?: true } | undefined } }).bindContext().getView(name);
+
+  it('give the interface, and reshaped once the query no longer gives exactly it', () => {
+    const d = Database.openMemory();
+    d.exec(`CREATE TABLE t(code TEXT); CREATE VIEW v AS SELECT code FROM t; CREATE VIEW s AS SELECT * FROM t`);
+    expect(getView(d, 'v')).toMatchObject({ interface: [col('code', 'text', false)] });
+    expect(getView(d, 'v')!.reshaped).toBeUndefined();
+    rebuild(d, 'code INTEGER', 'CAST(code AS INTEGER)');
+    expect(getView(d, 'v')!.reshaped).toBe(true);
+    expect(getView(d, 's')!.reshaped).toBe(true);
+  });
+
+  it('give reshaped for a view over * that gained a column', () => {
+    const d = Database.openMemory();
+    d.exec(`CREATE TABLE t(a INT); CREATE VIEW s AS SELECT * FROM t`);
+    expect(getView(d, 's')!.reshaped).toBeUndefined();
+    d.exec('ALTER TABLE t ADD COLUMN b TEXT');
+    expect(getView(d, 's')!.reshaped).toBe(true);
+  });
+});

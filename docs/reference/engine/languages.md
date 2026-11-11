@@ -62,11 +62,17 @@ fields](./plans#expressions), the collation a comparison of them uses and the co
 
 ## Views
 
-A view stays in its language: `bindView` binds it where it is read, so a view follows later changes to the tables it
-reads. A plan reads a view as it reads a table, with `scan` naming it: the engine binds the view with its language when
+A view stays in its language: `bindView` binds it where it is read. A view made since
+[ADR 0027](../../adr/0027-view-interfaces.md) keeps its interface, the columns it gave when it was made, and the
+engine refuses schema changes that would break it ([view interfaces](./schema#view-interfaces)). A plan reads a view
+as it reads a table, with `scan` naming it: the engine binds the view with its language when
 it compiles the plan (again after the schema changes), and the columns `scan` lists are the view's. A view has no
 rowid (`-1`).
 
+- A language that reads a view by binding its text itself (as SQL does) gets the view's `interface` from `getView`.
+  When `getView` also gives `reshaped`, the view's query no longer gives exactly its interface: a column's type
+  changed losslessly, or a view over `*` gained a column. The language then reads only the interface's columns, each
+  converted to the interface's type with `conversion(now, interface)` from `smaltdb/language` (a call to its `fn`).
 - SQL reads views written in SQL only, since it reads a view by parsing its text. A view in another language is read by
   plans, or through a materialized view, whose rows the engine fills by binding it with its language.
 - The plan `bindView` returns for a materialized view must be in the shape the planner reads: a projection over the
