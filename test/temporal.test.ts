@@ -14,7 +14,7 @@ import type { ColumnDef } from '../src/engine/plan/schema.js';
 import { EngineServer } from '../src/engine/server.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
 import type { Request, Response } from '../src/shared/protocol.js';
-import { formatDate, formatDatetime, formatDuration, formatTime, parseDate, parseDatetime, parseTime } from '../src/shared/temporal.js';
+import { formatDate, formatDatetime, formatDuration, formatTime, parseDate, parseDatetime, parseDuration, parseTime } from '../src/shared/temporal.js';
 
 const DAY = 86_400_000_000;
 
@@ -53,6 +53,24 @@ describe('text', () => {
     for (const bad of ['2026-02-29', '2026-13-01', '2026-1-1', 'x']) expect(parseDate(bad), bad).toBeNull();
     for (const bad of ['24:00', '12:60', '12']) expect(parseTime(bad), bad).toBeNull();
   });
+
+  it('durations read back from their text (#191)', () => {
+    expect(parseDuration('PT1H30M')).toBe(5_400_000_000);
+    expect(parseDuration('P1DT1H2M3.5S')).toBe(DAY + 3_723_500_000);
+    expect(parseDuration('-PT0.000001S')).toBe(-1);
+    expect(parseDuration('PT0S')).toBe(0);
+    expect(parseDuration('P2D')).toBe(2 * DAY);
+    for (const bad of ['', 'P', 'PT', 'P1DT', '1H', 'PT1.5H', 'PT1.1234567S', 'P1W', 'P-1D', 'PT1S2M', 'x']) expect(parseDuration(bad), bad).toBeNull();
+    // Every duration the engine writes reads back to itself, past 2^53 µs too.
+    fc.assert(
+      fc.property(fc.bigInt({ min: -(2n ** 62n), max: 2n ** 62n }), (us) => {
+        const v = parseDuration(formatDuration(us));
+        expect(BigInt(v as number | bigint)).toBe(us);
+        expect(typeof v).toBe(Number.isSafeInteger(Number(us)) ? 'number' : 'bigint');
+      }),
+      { numRuns: 5000 },
+    );
+  });
 });
 
 const d = (y: number, m: number, day: number) => Math.round(Date.UTC(y, m - 1, day) / 86_400_000);
@@ -80,6 +98,17 @@ describe('in process', () => {
     expect(r.rows).toEqual(ROWS);
     expect(r.columnTypes).toEqual(['int', 'date', 'datetime', 'time', 'duration']);
     expect(() => Database.openMemory().queryPlan(p.fromColumns([['2026-02-30']], ['date']))).toThrow(/cannot read "2026-02-30" as a date/);
+  });
+
+  it("a duration's text in values from columns: what a result gives back writes back (#191)", () => {
+    const db = Database.openMemory();
+    const durations = [['PT1H30M', 'P1DT1S', '-PT0.5S', 'PT0S', null]] as never;
+    expect(db.queryPlan(p.fromColumns(durations, ['duration'])).rows).toEqual([['PT1H30M'], ['P1DT1S'], ['-PT0.5S'], ['PT0S'], [null]]);
+    // Into a table and out again, as the issue has it.
+    db.queryPlan({ kind: 'schema', op: { op: 'createTable', temp: false, ifNotExists: false, table: { name: 't', storage: 'row', columns: [{ name: 'v', declaredType: 'DURATION', type: 'DURATION', notNull: false, collation: 'binary' }], keys: [], checks: [], foreignKeys: [] } } } as never);
+    db.queryPlan({ kind: 'write', plan: p.append('t', p.fromColumns([['PT1H30M']] as never, ['duration']), [0]) } as never);
+    expect(db.queryPlan(p.scan('t', [0])).rows).toEqual([['PT1H30M']]);
+    expect(() => db.queryPlan(p.fromColumns([['90 minutes']] as never, ['duration']))).toThrow(/cannot read "90 minutes" as a duration/);
   });
 
   it('sort and compare in time order, as their numbers do', () => {
