@@ -8,7 +8,7 @@
  */
 import type { SqlValue } from '../values.js';
 import type { BoundExpr, ExprMeaning } from './expr.js';
-import type { Source, StorageType } from './schema.js';
+import type { CheckDef, DefaultDef, ForeignKeyDef, Source, StorageType } from './schema.js';
 import type { CollationName, PlanType } from './types.js';
 import { isNestedType } from '../../shared/nested-types.js';
 
@@ -28,6 +28,11 @@ export interface CatalogColumn {
   readonly rowid: boolean;
   /** It has a default value. */
   readonly hasDefault: boolean;
+  /**
+   * Its DEFAULT, as its definition has it: the text, the expression (over no columns) and the value when constant. A
+   * default that is an expression has an `expr` other than a literal.
+   */
+  readonly default?: DefaultDef;
 }
 
 /** A primary key or unique constraint: column positions. */
@@ -56,6 +61,10 @@ export interface CatalogTable {
   /** The primary key first, then unique constraints. A table without a declared primary key has a rowid. */
   readonly keys: readonly CatalogKey[];
   readonly indexes: readonly CatalogIndex[];
+  /** Its foreign keys, as its definition has them (child column positions, the parent table and columns, the actions). */
+  readonly foreignKeys: readonly ForeignKeyDef[];
+  /** Its CHECK constraints, as its definition has them (name, text and expression over the row). */
+  readonly checks: readonly CheckDef[];
   readonly storage: 'row' | 'columnar';
   /** Values must match the column types (no conversion on write). */
   readonly strict: boolean;

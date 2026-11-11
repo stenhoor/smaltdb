@@ -23,9 +23,11 @@ first, when it shadows a main one; `schema` picks `main` or `temp`). Each `Catal
 |---|---|
 | `kind` | `table`, `materializedView` or `external`; while a language binds, also `system` for the engine's own tables |
 | `name`, `schema` | its name, and `main` or `temp` |
-| `columns` | `{ name, type, storageType, declaredType, collation, notNull, rowid, hasDefault }`, in position order: `type` is the plan type of its values, `rowid` marks an integer primary key |
+| `columns` | `{ name, type, storageType, declaredType, collation, notNull, rowid, hasDefault, default? }`, in position order: `type` is the plan type of its values, `rowid` marks an integer primary key, `default` is its DEFAULT as the [definition](./schema) has it (`text`, `expr`, and `value` when constant: an `expr` other than a literal is a computed default) |
 | `keys` | the primary key, then unique constraints, as column positions |
 | `indexes` | `{ name, columns, unique, partial }`, `column` -1 for an indexed expression |
+| `foreignKeys` | as the definition's `ForeignKeyDef`s: `{ name?, columns, table, refColumns?, onDelete, onUpdate, deferrable, isDeferrable }` (child column positions, the parent's name and column names) |
+| `checks` | as the definition's `CheckDef`s: `{ name?, text, expr }`, the expression over the row |
 | `storage` | `row` or `columnar` |
 | `strict` | values must match the column types |
 | `source` | `{ language, text }`: its definition, in the language it was written in; absent for a table [defined without source text](./schema#definitions-without-source-text) |
