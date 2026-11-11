@@ -26,7 +26,7 @@ describe('language boundary', () => {
   // ADR 0017: code that runs without SQL must not reach it at run time either. Importing nothing is not enough.
   it('only the text API reaches SQL', () => {
     // The text API: SQL text is parsed by SQL (prepare, exec, …). Nothing else may name the SQL language or parse with it.
-    const TEXT_API = ['prepare', 'sql', 'parseSql', 'parseOneSql', 'isScript', 'exec', 'execAsync', 'planOf', 'compile', 'morselQuery'];
+    const TEXT_API = ['prepare', 'sql', 'parseSql', 'parseOneSql', 'isScript', 'exec', 'execAsync', 'planOf', 'boundPlan', 'compile', 'morselQuery'];
     const reaches = /\bthis\.(?:sql|parseSql|parseOneSql)\b|languageOf\('sql'\)/;
     const found: string[] = [];
     for (const f of files(SRC)) {

@@ -129,6 +129,23 @@ table's column count (rowid not included), or undefined. It returns the plan's o
 Errors in a language's own terms (an unknown name, an ambiguous column) come from the language, before it builds a
 plan: a plan names nothing that has to be resolved.
 
+## What a language submits
+
+`db.boundPlan(text)`, in process and on the client (`await db.boundPlan(text)`), gives the plan statement the
+database's language binds one statement to, without running it: what SQL hands the engine, before the engine's own
+rewrites (sample, pivot, explode, as-of joins). A query comes back as `{ kind: 'query', plan, columns }`, a write as
+`{ kind: 'write', plan, … }`, and other statements as plain data. `queryPlan` runs it, so a bound plan can be shown,
+stored or edited and run again.
+
+```ts
+import { Database } from 'smaltdb/engine';
+
+const db = Database.openMemory();
+db.exec('CREATE TABLE t(x INTEGER)');
+const stmt = db.boundPlan('SELECT x + 1 AS y FROM t'); // { kind: 'query', plan: { op: 'project', … }, columns: [{ name: 'y', … }] }
+db.queryPlan(stmt);
+```
+
 ## Plans as JSON
 
 | Function | |

@@ -16,7 +16,7 @@ import { MisuseError, SmaltError, constraintMessage, withDetails, wordError } fr
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
 import type { ConflictAction, PlanOp } from './plan/ops.js';
 import { type EncodedPlan, canonicalJSON, decodeData, decodePlan, encodeData, encodePlan, planFromJSON, planToJSON } from './plan/codec.js';
-import { type PlanStatementInput, paramCount, toBoundStatement } from './plan/statement.js';
+import { type PlanStatementInput, paramCount, toBoundStatement, toPlanStatement } from './plan/statement.js';
 import { normalizePlan, normalizeWrite } from './exec/plan-normalize.js';
 import { type ValidateCatalog, validatePlan, validateSchemaOp } from './plan/validate.js';
 import { type PlanExpr, forEachCol, typeOf } from './plan/expr.js';
@@ -1250,6 +1250,16 @@ export class Database implements FunctionContext {
     planner.sqlText = ps.text;
     const plan = this.planQuery(bound, planner);
     return { root: plan.root, columns: plan.columns.map((c) => ({ name: c.name, type: c.type })), subplans: planner.subplans, estimates: planner.estimates };
+  }
+
+  /**
+   * The plan statement a language binds `text` to, without running it (ADR 0022): what it submits to the engine, as
+   * plan data, before the engine's own rewrites. The language is the database's (SQL unless another is registered as
+   * the default). The result can be shown, stored, or run with `queryPlan`.
+   */
+  boundPlan(text: string): PlanStatementInput {
+    this.checkOpen();
+    return toPlanStatement(this.parseOneSql(text).bind(this.bindContext()));
   }
 
   /** What the SQL front end (ADR 0014, step 5) reads of the catalog (it reads the database's state when called). */

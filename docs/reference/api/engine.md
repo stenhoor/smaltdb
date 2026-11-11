@@ -130,6 +130,7 @@ A statement can also be given as plan data instead of SQL: the engine's own desc
 | `preparePlan(stmt: PlanStatementInput): PlanStatement` | Compile a statement given as plan data. A `PlanStatement` has the same members as a [`Statement`](#statement), but no `sql`. |
 | `queryPlan(stmt: PlanStatementInput, params?: SqlValue[], options?: { temporal?: TemporalForm }): QueryResult` | Run a statement given as plan data and return `{ columns, rows }`. `temporal` picks how dates and times come back ([in results](../engine/running#through-the-client)). Compiled plans are cached by their canonical form (see `statementCacheSize`). |
 | `queryPlanAsync(stmt, params?, options?: { signal?: AbortSignal; temporal?: TemporalForm }): Promise<QueryResult>` | `queryPlan` for a plan that reads [external data](#external-data). |
+| `boundPlan(text: string): PlanStatementInput` | The plan statement the database's language (SQL) binds `text` to, without running it: what it submits to the engine, before the engine's own rewrites. One statement; `queryPlan` runs it ([ADR 0022](../../adr/0022-sql-for-the-new-engine-features)). |
 
 The `plan` namespace holds the format's types, builders, the validator (`validatePlan`) and the codec (`planToJSON`, `planFromJSON`, `encodePlan`, `decodePlan`). `smaltdb/plan` exports the same without the validator. An invalid plan fails with [`SMALT_PLAN`](./errors#smalt-plan).
 

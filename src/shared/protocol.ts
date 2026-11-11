@@ -48,6 +48,8 @@ export type Request = { id: number } & (
   | { op: 'finalize'; stmt: number }
   /** The logical catalog as plain data (engine/plan/catalog.ts `CatalogData`), in the reply's `value`. */
   | { op: 'catalog' }
+  /** The plan statement the database's language binds `text` to, without running it, as plan JSON (`encodeDataJSON`) in the reply's `value` (ADR 0022). */
+  | { op: 'boundPlan'; text: string }
   /**
    * End this session's transaction (db.transaction()): COMMIT (`commit`) or ROLLBACK. If a request of
    * the session already ended it, the reply's `ended` says how instead.
