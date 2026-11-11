@@ -74,6 +74,16 @@ export interface CatalogTable {
   readonly source?: Source;
   /** A materialized view's interface (ADR 0027), as a view's; absent for one made before interfaces. */
   readonly interface?: readonly ViewInterfaceColumn[];
+  /** An external table's options (`createExternalTable.options`): its location, format, connection and the rest. */
+  readonly options?: Readonly<Record<string, SqlValue>>;
+}
+
+/** A connection (`createConnection`): its options, as created (type, url, credentials and the rest). */
+export interface CatalogConnection {
+  readonly name: string;
+  readonly options: Readonly<Record<string, SqlValue>>;
+  /** Its definition, in the language it was written in; absent for one defined without source text. */
+  readonly source?: Source;
 }
 
 /** A view: its language and source text, bound where it is read. */
@@ -140,6 +150,7 @@ export interface CatalogSettings {
 export interface CatalogData {
   readonly tables: readonly CatalogTable[];
   readonly views: readonly CatalogView[];
+  readonly connections: readonly CatalogConnection[];
   readonly functions: readonly CatalogFunction[];
   readonly settings: CatalogSettings;
 }
@@ -152,6 +163,9 @@ export interface Catalog {
   table(name: string, schema?: 'main' | 'temp'): CatalogTable | undefined;
   views(): CatalogView[];
   view(name: string, schema?: 'main' | 'temp'): CatalogView | undefined;
+  /** Connections, and one by name. */
+  connections(): CatalogConnection[];
+  connection(name: string): CatalogConnection | undefined;
   functions(): CatalogFunction[];
   /**
    * A function by name (a former `sql.*` name finds its operation). A name can have one function of each kind (`min`

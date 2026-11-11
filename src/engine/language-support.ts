@@ -7,7 +7,7 @@
  * Published as `smaltdb/language`; a language (smaltql) imports the engine only through it.
  */
 export type { BindContext } from './plan/bind-context.js';
-export type { Catalog, CatalogData, CatalogFunction, CatalogTable, FunctionCatalog, ViewInterfaceColumn } from './plan/catalog.js';
+export type { Catalog, CatalogConnection, CatalogData, CatalogFunction, CatalogTable, FunctionCatalog, ViewInterfaceColumn } from './plan/catalog.js';
 export { type Conversion, conversion, isLossless } from './plan/conversions.js';
 export { describeTableDef, engineFunctions } from './catalog/logical.js';
 export type { BoundQuery, BoundStatement } from './plan/bound.js';

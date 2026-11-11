@@ -312,3 +312,42 @@ describe('comparison rules', () => {
     expect(comparisonRule(textLit, textLit)).toEqual({ collation: 'binary', left: null, right: null });
   });
 });
+
+describe('connections and external tables', () => {
+  it('lists connections with their options, and external tables with theirs', async () => {
+    const { default: external } = await import('@smaltdb/external');
+    const { default: io } = await import('@smaltdb/io');
+    const { registerFile } = await import('@smaltdb/external/client');
+    const d = Database.openMemory({ plugins: [external, io] });
+    d.exec("CREATE CONNECTION web WITH (type = 'https', url = 'https://x.org/')");
+    await registerFile(d, 'x.csv', 'a,b\n1,p\n');
+    await d.execAsync("CREATE EXTERNAL TABLE p WITH (location = 'file:x.csv', format = 'csv')");
+    expect(d.catalog.connections()).toEqual([{ name: 'web', options: { type: 'https', url: 'https://x.org/' }, source: { language: 'sql', text: expect.stringContaining('CREATE CONNECTION') } }]);
+    expect(d.catalog.connection('WEB')?.name).toBe('web');
+    expect(d.catalog.connection('none')).toBeUndefined();
+    const p = d.catalog.table('p')!;
+    expect(p).toMatchObject({ kind: 'external', options: { location: 'file:x.csv', format: 'csv' } });
+    expect(p.columns.map((c) => c.name)).toEqual(['a', 'b']);
+    expect(d.catalog.snapshot().connections.map((c) => c.name)).toEqual(['web']);
+    d.exec('DROP CONNECTION web');
+    expect(d.catalog.connections()).toEqual([]);
+  });
+
+  it('lists ones defined without source text without a source', async () => {
+    const { default: external } = await import('@smaltdb/external');
+    const d = Database.openMemory({ plugins: [external] });
+    d.queryPlan({ kind: 'schema', op: { op: 'createConnection', name: 'c', ifNotExists: false, options: { type: 'http', url: 'https://x.org/' } } });
+    expect(d.catalog.connection('c')).toEqual({ name: 'c', options: { type: 'http', url: 'https://x.org/' } });
+  });
+
+  it('keeps them as they were across a reopen', async () => {
+    const { default: external } = await import('@smaltdb/external');
+    const { MemoryVfs } = await import('../src/engine/vfs/memory.js');
+    const vfs = new MemoryVfs();
+    let d = Database.openFile(vfs.openSync('c.db'), { plugins: [external] }, vfs.openSync('c.db-wal'));
+    d.queryPlan({ kind: 'schema', op: { op: 'createConnection', name: 'c', ifNotExists: false, options: { type: 'http', url: 'https://x.org/' } } });
+    d.close();
+    d = Database.openFile(vfs.openSync('c.db'), { plugins: [external] }, vfs.openSync('c.db-wal'));
+    expect(d.catalog.connections()).toEqual([{ name: 'c', options: { type: 'http', url: 'https://x.org/' } }]);
+  });
+});

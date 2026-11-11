@@ -7,7 +7,7 @@ import { CollSrc, boundMetadata, compilePlanExpr } from '../exec/expr.js';
 import { type CompiledArg, type FunctionContext, aggregateFunctions, scalarFunctions } from '../exec/functions.js';
 import { SQL_FUNCTIONS } from '../exec/sql-functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../exec/window.js';
-import type { Catalog, CatalogData, CatalogFunction, CatalogKey, CatalogSettings, CatalogTable, CatalogView, FunctionCatalog, ViewInterfaceColumn } from '../plan/catalog.js';
+import type { Catalog, CatalogConnection, CatalogData, CatalogFunction, CatalogKey, CatalogSettings, CatalogTable, CatalogView, FunctionCatalog, ViewInterfaceColumn } from '../plan/catalog.js';
 import type { TemporalType } from '../../shared/temporal.js';
 import type { NestedTypeName } from '../../shared/nested-types.js';
 import type { StorageType } from '../plan/schema.js';
@@ -22,7 +22,8 @@ import { type TableSchema, isColumnar, tableSchemaFromDef } from './schema.js';
 export interface CatalogHost {
   /** Tables and materialized views, main and temp, without the system tables. */
   tables(): readonly TableSchema[];
-  externals(): readonly { name: string; sql: string; columns: readonly { name: string; declType: string }[]; language?: string; described?: boolean }[];
+  externals(): readonly { name: string; sql: string; columns: readonly { name: string; declType: string }[]; options: Readonly<Record<string, SqlValue>>; language?: string; described?: boolean }[];
+  connections(): readonly { name: string; sql: string; options: Readonly<Record<string, SqlValue>>; language?: string; described?: boolean }[];
   views(): readonly { name: string; source: Source; columns?: readonly string[]; interface?: readonly ViewInterfaceColumn[]; pending?: boolean; temp: boolean }[];
   settings(): CatalogSettings;
   /** Changes whenever the schema does: descriptions are kept until then. */
@@ -88,7 +89,7 @@ export function describeTableDef(def: TableDef, source?: Source, schema: 'main' 
   return { ...d, keys, schema, storage: def.storage };
 }
 
-function describeExternal(x: { name: string; sql: string; columns: readonly { name: string; declType: string; type?: TemporalType | NestedTypeName }[]; language?: string; described?: boolean }): CatalogTable {
+function describeExternal(x: { name: string; sql: string; columns: readonly { name: string; declType: string; type?: TemporalType | NestedTypeName }[]; options: Readonly<Record<string, SqlValue>>; language?: string; described?: boolean }): CatalogTable {
   return {
     kind: 'external',
     name: x.name,
@@ -105,7 +106,13 @@ function describeExternal(x: { name: string; sql: string; columns: readonly { na
     strict: false,
     // Its text in the language that created it (absent: SQL), or none when it was defined without source text.
     ...(x.described ? {} : { source: { language: x.language ?? 'sql', text: x.sql } }),
+    options: { ...x.options },
   };
+}
+
+/** A connection as the catalog describes it. */
+function describeConnection(c: { name: string; sql: string; options: Readonly<Record<string, SqlValue>>; language?: string; described?: boolean }): CatalogConnection {
+  return { name: c.name, options: { ...c.options }, ...(c.described ? {} : { source: { language: c.language ?? 'sql', text: c.sql } }) };
 }
 
 // ------------------------------------------------------------------ functions
@@ -325,6 +332,7 @@ export function logicalCatalog(host: CatalogHost): Catalog {
   let version = -1;
   let tables: CatalogTable[] = [];
   let views: CatalogView[] = [];
+  let connections: CatalogConnection[] = [];
   const fresh = (): void => {
     const v = host.schemaVersion();
     if (v === version) return;
@@ -332,6 +340,7 @@ export function logicalCatalog(host: CatalogHost): Catalog {
     const described = host.tables().map(describeTable);
     // TEMP first: the one a name finds when it shadows a main table.
     tables = [...described.filter((t) => t.schema === 'temp'), ...described.filter((t) => t.schema === 'main'), ...host.externals().map(describeExternal)];
+    connections = host.connections().map(describeConnection);
     views = host.views().map((x) => ({ name: x.name, schema: x.temp ? 'temp' : 'main', language: x.source.language, text: x.source.text, ...(x.columns ? { columns: [...x.columns] } : {}), ...(x.interface ? { interface: x.interface.map((c) => ({ ...c })) } : x.pending ? {} : { reflects: true as const }) }));
   };
   const find = <T extends { name: string; schema: 'main' | 'temp' }>(xs: readonly T[], name: string, schema?: 'main' | 'temp'): T | undefined => {
@@ -343,10 +352,12 @@ export function logicalCatalog(host: CatalogHost): Catalog {
     table: (name, schema) => (fresh(), find(tables, name, schema)),
     views: () => (fresh(), [...views]),
     view: (name, schema) => (fresh(), find(views, name, schema)),
+    connections: () => (fresh(), [...connections]),
+    connection: (name) => (fresh(), connections.find((c) => c.name.toLowerCase() === name.toLowerCase())),
     functions: engineFunctions.functions,
     function: engineFunctions.function,
     settings: () => host.settings(),
-    snapshot: (): CatalogData => (fresh(), { tables: [...tables], views: [...views], functions: engineFunctions.functions(), settings: host.settings() }),
+    snapshot: (): CatalogData => (fresh(), { tables: [...tables], views: [...views], connections: [...connections], functions: engineFunctions.functions(), settings: host.settings() }),
     resultType: engineFunctions.resultType,
     typeOf: (expr) => {
       if (!compilable(expr)) return typeOf(expr);

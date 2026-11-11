@@ -35,6 +35,7 @@ export { encodePlan, decodePlan, planToJSON, planFromJSON, type EncodedPlan } fr
 export {
   type Catalog,
   type CatalogColumn,
+  type CatalogConnection,
   type CatalogData,
   type CatalogFunction,
   type CatalogIndex,
