@@ -171,3 +171,30 @@ describe('plan API', () => {
     }
   });
 });
+
+describe('update: the input row in any layout', () => {
+  // A plan's set values read the input row (plan/ops.ts): its scan may read the table's columns in any order, the
+  // rowid among them. The engine reads each target row again before the sets run, into the input's registers.
+  const table = () => {
+    const d = Database.openMemory();
+    const c = (name: string, type: 'INTEGER' | 'REAL' | 'BOOLEAN') => ({ name, declaredType: type, type, notNull: false, collation: 'binary' as const });
+    d.queryPlan({ kind: 'schema', op: { op: 'createTable', temp: false, ifNotExists: false, table: { name: 't', storage: 'row', columns: [c('id', 'INTEGER'), c('total', 'REAL'), c('paid', 'BOOLEAN')], keys: [], checks: [], foreignKeys: [] } } });
+    d.queryPlan({ kind: 'write', plan: p.append('t', p.fromColumns([[1, 2], [10, 80], [null, true]], ['int', 'real', 'bool']), [0, 1, 2]) });
+    return d;
+  };
+  const rows = (d: Database) => d.queryPlan(p.scan('t', [0, 1, 2])).rows;
+
+  it('the rowid first', () => {
+    const d = table();
+    const input = p.filter(p.scan('t', [-1, 0, 1, 2]), p.call('cmp_eq', [p.col(0, 1, 'int'), p.lit(2)], 'bool'));
+    d.queryPlan({ kind: 'write', plan: p.update('t', input, 0, [{ column: 1, value: p.call('mul', [p.col(0, 2, 'real'), p.lit(2)], 'num') }]) });
+    expect(rows(d)).toEqual([[1, 10, null], [2, 160, true]]);
+  });
+
+  it('the columns out of order, and some left out', () => {
+    const d = table();
+    const input = p.scan('t', [1, -1]);
+    d.queryPlan({ kind: 'write', plan: p.update('t', input, 1, [{ column: 1, value: p.call('add', [p.col(0, 0, 'real'), p.lit(1)], 'num') }]) });
+    expect(rows(d)).toEqual([[1, 11, null], [2, 81, true]]);
+  });
+});
