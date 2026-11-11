@@ -143,7 +143,65 @@ side, it becomes `SCAN r (recursive step)` then `SEARCH edge USING INDEX edge_sr
 table has one row per step. `CROSS JOIN` does not force the order either. This is G1, and it is worth an issue of its
 own.
 
-## 5. Recommendations
+## 5. A native graph store beside B+trees and columnar storage
+
+**Yes, all three can run under the one plan, because storage is physical, not logical.** The precedent is columnar
+storage (M5, M7):
+- A table chooses its storage (`TableDef.storage: 'row' | 'columnar'`, `WITH (storage = 'columnar')`).
+- Plans never mention it: `scan`, `join` and `aggregate` read the same either way.
+- The physical planner branches on it (`isColumnar(table)`: columnar scans, zone maps, fused pipelines).
+
+A graph store would follow the same pattern:
+- **Where it plugs in:** a third storage kind for edge tables (`storage: 'graph'`), or an adjacency index kind on an
+  ordinary edge table, holding each node's neighbours together (CSR segments).
+- **What the planner gains:** physical operators ("expand neighbours", traversals from G5's `paths`), chosen by cost
+  where a plan joins on an edge's endpoints or asks for paths. The logical plan doesn't change, so a query can mix
+  graph, columnar and B+tree tables, because every store still yields rows.
+- **What it must keep:** like columnar segments, it must live in pager pages, not files of its own. Then atomic
+  commits, the WAL, crash recovery, snapshots and M9's parallel readers come for free, as they did for columnar
+  storage.
+
+## 6. How big the graph items are
+
+**Recent precedent.** Recent plan operations each took 60–110 lines of source, plus about 60 lines of tests, in one
+PR each:
+
+| Operation | Source lines | Test lines |
+|---|---|---|
+| `unpivot` | 62 | 61 |
+| `pivot` | 74 | 57 |
+| `asof` join | 109 | 61 |
+| `sample` | 99 | 69 |
+
+They're small because normalization rewrites each into existing operations, so no new executor code is needed. Two of
+the graph items do need new execution.
+
+**Estimates** (source lines in this repository; tests about the same again):
+
+| Item | Plan API | Execution and planner | Catalog | Estimate | PRs |
+|---|---|---|---|---|---|
+| G1 recursive join order (bug) | none | cost of the working side | none | 20–50 | 1 |
+| G2 keyed `iterate` (`key`, `maxDepth`) | 2 optional fields: ops, build, validate, print | `RecursiveCte`: deduplicate on the key, keep the best with `order` | none | 120–160 | 1 |
+| G3 `loop`, a set-at-a-time fixpoint | 1 operation | a new operator that keeps each round (spilling when large), a convergence test and a round limit; planner support | none | 350–450 | 1–2 |
+| G4 property graph | 2 schema operations (create, drop) | none | a stored record, loading, `information_schema`, `BindContext`, dependencies (a table in a graph can't be dropped) | 300–400 | 1, plus a format bump |
+| G5 `paths` | 1 operation: modes and selectors | lowered to G2's `iterate`; the path as `list<struct>` | none | 250–350 | 1–2 |
+| **G1–G5 in the engine** | | | | **about 1,000–1,400**, plus tests of about the same | **5–7** |
+
+So G3, G4 and G5 are each 3–5 times a recent operation. The whole set is about 3–4 times ADR 0016 step 10's four
+operations together (344 lines of source).
+
+**Outside this repository:**
+- **A graph language:**
+  - SQL/PGQ's `GRAPH_TABLE … MATCH` in smaltql: the parser, binding patterns to joins and `paths`, and DDL for
+    property graphs. Likely 1,000–2,000 lines.
+  - A separate GQL/Cypher-style package: more than that, as it needs its own parser and result shapes.
+- **A native graph store (section 5)** is the large piece. Columnar storage is about 1,100 lines of storage code
+  (`storage/columnar.ts`, `exec/columnar-table.ts`, `exec/zones.ts`), plus its scans and pipelines in the planner
+  and code generation. A CSR adjacency store with a delta for updates would be comparable: about 1,500–2,500 lines.
+  It should come only when measurements show B+tree hops are too slow, which they are not at smaltdb's sizes
+  (section 4).
+
+## 7. Recommendations
 
 1. **Fix G1 now, independently of any graph work.** It affects every recursive query that joins a large table, in
    any language.
