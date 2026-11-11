@@ -183,7 +183,7 @@ Each step is a separate PR. Steps 1 and 2 prove the interface on today's engines
 - **Plugin trust.** An engine runs inside the engine worker with access to the page store. Plugins already run there
   (ADR 0012). The page-store interface limits an engine to its own pages, which the core allocates and records, so
   one engine can't overwrite another's or the catalog's.
-- **Scope.** This is a significant change to the core, and it should get its own ADR before E1, with the owner's
+- **Scope.** This is a significant change to the core: [ADR 0028](../adr/0028-pluggable-storage-engines.md) proposes it, with the owner's
   decisions:
   - whether columnar moves to a plugin or stays built in;
   - plugin API v1 additive or v2;
