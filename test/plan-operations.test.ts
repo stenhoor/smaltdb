@@ -100,7 +100,10 @@ describe('text', () => {
 });
 
 describe('languages share them', () => {
-  it('SQL can call them as named functions', () => {
-    expect(db.query("SELECT div_float(7, 2), div_floor(-7, 2), mod_floor(-7, 2), round_half_even(2.5), regex_find('x12', '\\d+')").rows).toEqual([[3.5, -4, 1, 2, '12']]);
+  // SQL calls the engine's operations it spells (ADR 0022, decision 2): round_even is round_half_even, regex_find is
+  // SQL's too. The others stay the plans' (div_float, div_floor, mod_floor), and are not SQL.
+  it('SQL calls them by its own spellings', () => {
+    expect(db.query("SELECT round_even(2.5), regex_find('x12', '\\d+')").rows).toEqual([[2, '12']]);
+    expect(() => db.query('SELECT div_float(7, 2)')).toThrow(/no such function: div_float/);
   });
 });
