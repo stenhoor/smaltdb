@@ -11,6 +11,7 @@ export const FAMILY = [
   { text: 'smaltui · query workbench', link: 'https://stenhoor.github.io/smaltui/' },
   { text: 'smaltbi · reports', link: 'https://stenhoor.github.io/smaltbi/' },
   { text: 'smaltnb · notebooks', link: 'https://stenhoor.github.io/smaltnb/' },
+  { text: 'smaltfl · pipelines', link: 'https://stenhoor.github.io/smaltfl/' },
 ]
 
 /** The last item of every product site's top nav. */
