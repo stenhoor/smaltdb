@@ -2563,16 +2563,24 @@ function columnReader(c: ValueColumn, type: string): (i: number) => SqlValue {
   else
     read = (i) => {
       const v = (data as readonly (SqlValue | boolean | Date)[])[i];
-      // JS booleans (a bool column, ADR 0018) are 1 / 0 at run time; JS Dates are µs, and the text results give
-      // parses, in a temporal column (ADR 0019).
+      // JS booleans (a bool column, ADR 0018) are 1 / 0 at run time; a JS Date is its UTC day in a date column
+      // and µs elsewhere, and the text results give parses, in a temporal column (ADR 0019).
       if (typeof v === 'boolean') return v ? 1 : 0;
-      if (v instanceof Date) return datetimeFromDate(v);
+      if (v instanceof Date) return temporalFromDate(type, v);
       if (typeof v === 'string' && isTemporal(type)) return temporalFromText(type, v);
       // A JS array or object in a list or struct column (ADR 0020): its bytes.
       if (typeof v === 'object' && v !== null && !(v instanceof Uint8Array) && isNested(type)) return encodeNested(type, v, 'values');
       return v ?? null;
     };
   return nulls ? (i) => (nulls[i >>> 3] & (1 << (i & 7)) ? null : read(i)) : read;
+}
+
+/**
+ * A JS Date in a column of values: in a `date` column its UTC day, as a `date` reads back as a Date at UTC midnight
+ * (ADR 0019) and as a list's or struct's dates take one (shared/nested.ts); elsewhere its ms as µs, a `datetime`.
+ */
+function temporalFromDate(type: string, d: Date): SqlValue {
+  return type === 'date' ? Math.floor(d.getTime() / 86_400_000) : datetimeFromDate(d);
 }
 
 /** A temporal value given as text in a column of values (ADR 0019): parsed, or an error naming the text. */

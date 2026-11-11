@@ -82,6 +82,21 @@ describe('in process', () => {
     expect(() => Database.openMemory().queryPlan(p.fromColumns([['2026-02-30']], ['date']))).toThrow(/cannot read "2026-02-30" as a date/);
   });
 
+  it('a JS Date in a date column is its UTC day (#192)', () => {
+    const db = Database.openMemory();
+    const days = [new Date('2026-11-10T00:00:00Z'), new Date('1969-12-31T00:00:00Z'), new Date('0001-01-01T00:00:00Z'), null];
+    expect(db.queryPlan(p.fromColumns([days] as never, ['date'])).rows).toEqual([['2026-11-10'], ['1969-12-31'], ['0001-01-01'], [null]]);
+    // Into a table and out again, as the issue has it.
+    db.queryPlan({ kind: 'schema', op: { op: 'createTable', temp: false, ifNotExists: false, table: { name: 't', storage: 'row', columns: [{ name: 'v', declaredType: 'DATE', type: 'DATE', notNull: false, collation: 'binary' }], keys: [], checks: [], foreignKeys: [] } } } as never);
+    db.queryPlan({ kind: 'write', plan: p.append('t', p.fromColumns([[new Date('2026-11-10T00:00:00Z')]] as never, ['date']), [0]) } as never);
+    expect(db.queryPlan(p.scan('t', [0])).rows).toEqual([['2026-11-10']]);
+    // A time of day goes: the UTC day it falls in, as a list's dates take a Date (before 1970 too).
+    expect(db.queryPlan(p.fromColumns([[new Date('2026-11-10T23:59:59.999Z'), new Date('1969-12-31T12:00:00Z')]] as never, ['date'])).rows).toEqual([['2026-11-10'], ['1969-12-31']]);
+    expect(db.queryPlan(p.fromColumns([[[new Date('2026-11-10T12:00:00Z')]]] as never, ['list<date>'])).rows).toEqual([[['2026-11-10']]]);
+    // A datetime still takes a Date as its ms in µs.
+    expect(db.queryPlan(p.fromColumns([[new Date('2026-11-10T12:00:00Z')]] as never, ['datetime'])).rows).toEqual([['2026-11-10 12:00:00']]);
+  });
+
   it('sort and compare in time order, as their numbers do', () => {
     const db = Database.openMemory();
     expect(db.queryPlan(p.project(p.sort(frame(), [p.asc(p.col(0, 1, 'date'))]), [p.col(0, 0, 'int')])).rows).toEqual([[3], [2], [1]]);
