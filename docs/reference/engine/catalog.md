@@ -32,6 +32,11 @@ first, when it shadows a main one; `schema` picks `main` or `temp`). Each `Catal
 | `strict` | values must match the column types |
 | `source` | `{ language, text }`: its definition, in the language it was written in; absent for a table [defined without source text](./schema#definitions-without-source-text) |
 | `interface` | a materialized view's interface, as a view's (below); absent for one made before interfaces |
+| `options` | an external table's options: its `location`, `format`, `connection` and the format's own, as created |
+
+`connections()` and `connection(name)` give each connection's `{ name, options, source? }`: its options as created
+(`type`, `url`, `credentials` and the type's own), and its definition's source, absent for one defined without
+source text. `snapshot()` lists them as `connections`.
 
 `views()` and `view(name, schema?)` give `{ name, schema, language, text, columns?, interface?, reflects? }`: a view is
 source text in its language, bound where it is read.

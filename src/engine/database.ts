@@ -216,7 +216,8 @@ export class Database implements FunctionContext {
   private readonly catalogEntries = new Map<string, CatalogEntry>();
   private readonly views = new Map<string, ViewSchema>();
   /** M8: connections and external tables (lower-cased names). */
-  private readonly connections = new Map<string, ConnectionInfo & { sql: string }>();
+  /** Connections, with their catalog text, its language (absent: SQL), and whether they were defined without source text. */
+  private readonly connections = new Map<string, ConnectionInfo & { sql: string; language?: string; described?: boolean }>();
   private readonly externals = new Map<string, ExternalTableDef>();
   /** M8: registered files, credential providers and the data loaded for running statements. */
   /** External data (M8): registered files and credentials, loaded sources, and plugin formats (ADR 0012). */
@@ -1051,6 +1052,7 @@ export class Database implements FunctionContext {
     return (this.logical ??= logicalCatalog({
       tables: () => [...this.tables.values(), ...this.shadowedMain.values()].filter((t) => !t.system && !/^(smalt|sqlite)_/i.test(t.name)),
       externals: () => [...this.externals.values()],
+      connections: () => [...this.connections.values()],
       views: () => [...[...this.tempViews.values()].map((v) => ({ ...v, temp: true })), ...[...this.views.values()].map((v) => ({ ...v, temp: false }))],
       settings: () => ({ foreignKeys: this.fk.enabled, workMem: this.spill.workMem, matviewRewrite: this.matviewRewriteOn, parallelAggregates: this.parallelAggregates }),
       schemaVersion: () => this.schemaVersion,
@@ -1085,7 +1087,7 @@ export class Database implements FunctionContext {
       if (r.type === 'connection') {
         const c = def(connectionKey(r.name), 'connection');
         this.catalogEntries.set(connectionKey(r.name), { type: 'connection', name: r.name, rowid: r.rowid });
-        this.connections.set(r.name.toLowerCase(), { name: r.name, options: { ...c.options }, sql: r.sql! });
+        this.connections.set(r.name.toLowerCase(), { name: r.name, options: { ...c.options }, sql: r.sql!, ...(c.language !== undefined ? { language: c.language } : {}), ...(isDescribed(c) ? { described: true } : {}) });
         continue;
       }
       this.catalogEntries.set(r.name.toLowerCase(), { type: r.type as CatalogEntry['type'], name: r.name, rowid: r.rowid });
@@ -2996,7 +2998,7 @@ export class Database implements FunctionContext {
     this.external.plugins.checkConnection(stmt.name, stmt.options);
     this.dirtySchema = true;
     this.addCatalogRow('connection', stmt.name, stmt.name, 0, sql, connectionKey(stmt.name), stored);
-    this.connections.set(lower, { name: stmt.name, options: stmt.options, sql });
+    this.connections.set(lower, { name: stmt.name, options: stmt.options, sql, ...(stmt.source && stmt.source.language !== 'sql' ? { language: stmt.source.language } : {}), ...(stmt.source ? {} : { described: true }) });
     this.schemaChanged();
     return none;
   }
