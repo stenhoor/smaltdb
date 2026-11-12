@@ -23,12 +23,12 @@ copy here: lines and roles change, and a copy taken before the change is out of 
 | Command | What it does | When |
 |---|---|---|
 | `npm ci && npm run deps` | Installs dependencies, then the pinned `@smaltdb/io`, `@smaltdb/external` and `@smaltworks/smaltql` builds from `packed.json` (see below) | First, and again after every `npm ci` or `npm install` |
-| `npm run check` | `npm run typecheck` then `npm test` (vitest): what CI's `test` job runs | Before every commit |
+| `npm run check` | `npm run typecheck` (TypeScript 7, the `typescript7` dev dependency) then `npm test` (vitest): what CI's `test` job runs | Before every commit |
 | `npm run test:browser` | Builds `dist/`, then runs the browser integration tests (Playwright). CI runs them on Chromium, Firefox and WebKit | Changes to the client, worker, server, OPFS or multi-tab code |
 | `npm run slt` (in smaltql) | The sqllogictest subset (122k records), run in `stenhoor/smaltql` against a `--local` smaltdb | Changes to the planner, expressions or functions |
 | `npm run bench` | Storage micro-benchmarks in Node (`bench:browser` compares engines in a browser against SQLite WASM; `bench:native` in Node against native SQLite) | Performance work; compare with `bench/results/` |
 | `npm run docs:dev` | The docs site (VitePress) with live reload; `npm run docs:build` fails on dead links | Docs changes |
-| `npm run build` | `dist/` (client, worker, engine) and type declarations | Packaging and release checks |
+| `npm run build` | `dist/` (client, worker, engine) and type declarations (emitted by TypeScript 6.0.3, `npx tsc`) | Packaging and release checks |
 
 Playwright is resolved globally in local containers (see `test/browser/playwright.mjs`); do not run
 `playwright install` locally.
