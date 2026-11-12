@@ -17,7 +17,7 @@
 | `npm test` | Unit, property, and model-based tests in Node (Vitest + fast-check) against `MemoryVfs` |
 | `BTREE_SEEDS=200 npm test -- btree` | Longer B+tree stress run: 200 seeds × 6,000 random operations, with reopen-from-storage checks |
 | `DIFF_QUERIES=20000 DIFF_DML=3000 npm test -- differential` | Differential testing against SQLite WASM (in Node): random queries and random writes; results and table contents must match |
-| `npm run typecheck` | `tsc --noEmit` over `src`, `test`, and `bench` |
+| `npm run typecheck` | `tsc --noEmit` over `src`, `test`, and `bench`, with TypeScript 7 (`typescript7`; `npm run build` still emits declarations with TypeScript 6.0.3) |
 | `npm run slt` | sqllogictest subset (122k records) against the engine; see [research/sqllogictest.md](research/sqllogictest.md) |
 | `npm run test:browser` | Builds, then runs the OPFS storage test and the client API test (main thread → engine worker → OPFS) in a real browser (Playwright). `BROWSERS=chromium,firefox,webkit` picks the browsers. WebKit runs with a persistent profile, because Playwright's default (ephemeral) WebKit contexts have no OPFS; `PERSISTENT_CONTEXT=1` uses one for every browser |
 | `npm run bench` | Storage micro-benchmarks in Node |
