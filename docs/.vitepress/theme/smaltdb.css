@@ -131,10 +131,12 @@
 .VPHero .name .suffix.kit      { color: #086A65; -webkit-text-fill-color: #086A65; }
 .VPHero .name .suffix.tool     { color: #0B6A91; -webkit-text-fill-color: #0B6A91; }
 .VPHero .name .suffix.ai       { color: #6141AE; -webkit-text-fill-color: #6141AE; }
+.VPHero .name .suffix.family   { color: #A33A12; -webkit-text-fill-color: #A33A12; } /* kiln: smaltty */
 .dark .VPHero .name .suffix.language { color: #F57FE6; -webkit-text-fill-color: #F57FE6; }
 .dark .VPHero .name .suffix.kit      { color: #10C2B9; -webkit-text-fill-color: #10C2B9; }
 .dark .VPHero .name .suffix.tool     { color: #5CBDE8; -webkit-text-fill-color: #5CBDE8; }
 .dark .VPHero .name .suffix.ai       { color: #B8A1F2; -webkit-text-fill-color: #B8A1F2; }
+.dark .VPHero .name .suffix.family   { color: #FF8A5C; -webkit-text-fill-color: #FF8A5C; }
 
 /* Light and dark copies of a badge: show the one for the current theme. */
 .sw-dark { display: none; }
@@ -159,3 +161,97 @@ img.sw-light { display: inline-block; }
 .VPHero .text { text-wrap: balance; }
 @media (min-width: 640px) { .VPHero .text { font-size: 44px; line-height: 52px; } }
 @media (min-width: 960px) { .VPHero .text { font-size: 50px; line-height: 58px; } }
+
+/* Syntax diagrams (railroad.ts): keywords in rounded smalt boxes, rules in square boxes in the language layer's colour
+   that expand in place, lines in the third text colour. Box widths are measured for Martian Mono at 13px. */
+.sw-rr-figure { margin: 16px 0; }
+.sw-rr-rule, .sw-rr-expansion { margin: 0 0 8px; overflow-x: auto; }
+.sw-rr-expansion { margin: 4px 0 8px 16px; padding-left: 12px; border-left: 2px solid var(--vp-c-divider); }
+.sw-rr-name { font-family: var(--smalt-brand-font); font-size: 13px; color: var(--vp-c-text-2); }
+.vp-doc .sw-rr-name a { text-decoration: none; color: inherit; }
+svg.sw-rr { display: block; max-width: none; }
+.sw-rr text { font-family: var(--smalt-brand-font); font-size: 13px; text-anchor: middle; }
+.sw-rr .sw-rr-line { fill: none; stroke: var(--vp-c-text-3); stroke-width: 1.5; }
+.sw-rr .sw-rr-end { fill: var(--vp-c-text-3); }
+.sw-rr .sw-rr-term rect { fill: var(--vp-c-brand-soft); stroke: var(--vp-c-brand-1); stroke-width: 1.5; }
+.sw-rr .sw-rr-term text { fill: var(--vp-c-brand-1); font-weight: 600; }
+.sw-rr .sw-rr-ref rect { fill: var(--vp-c-bg); stroke: #981C89; stroke-width: 1.5; }
+.sw-rr .sw-rr-ref text { fill: #981C89; }
+.sw-rr .sw-rr-ref[data-rule] { cursor: pointer; }
+.sw-rr .sw-rr-ref[data-rule]:hover rect, .sw-rr .sw-rr-ref[aria-expanded='true'] rect { fill: rgba(152, 28, 137, 0.08); }
+.sw-rr .sw-rr-ref:focus-visible { outline: none; }
+.sw-rr .sw-rr-ref:focus-visible rect { stroke-width: 3; }
+.sw-rr .sw-rr-undefined rect { stroke-dasharray: 4 3; }
+.dark .sw-rr .sw-rr-ref rect { stroke: #F57FE6; }
+.dark .sw-rr .sw-rr-ref text { fill: #F57FE6; }
+.dark .sw-rr .sw-rr-ref[data-rule]:hover rect, .dark .sw-rr .sw-rr-ref[aria-expanded='true'] rect { fill: rgba(245, 127, 230, 0.12); }
+.sw-rr-ebnf summary { font-family: var(--smalt-brand-font); font-size: 13px; color: var(--vp-c-text-2); cursor: pointer; }
+.sw-rr-ebnf pre { margin: 8px 0 0; padding: 12px 16px; border-radius: 8px; background: var(--vp-code-block-bg); overflow-x: auto; }
+.sw-rr-ebnf code { font-size: 14px; }
+
+/* Playgrounds (playground.ts): the example, a toolbar, and its result. smaltkit's editor and grid read --sk-*, set here
+   from the theme's colours so they follow light and dark. */
+.sw-play {
+  margin: 16px 0;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 8px;
+  overflow: hidden;
+  --sk-font: var(--vp-font-family-base);
+  --sk-font-mono: var(--vp-font-family-mono);
+  --sk-text: var(--vp-c-text-1);
+  --sk-muted: var(--vp-c-text-3);
+  --sk-surface: var(--vp-c-bg);
+  --sk-border: var(--vp-c-divider);
+  --sk-panel: var(--vp-code-block-bg);
+  --sk-accent: var(--vp-c-brand-1);
+  --sk-focus: var(--vp-c-brand-1);
+  --sk-danger: var(--vp-c-danger-1);
+  --sk-tk-keyword: #003399; --sk-tk-function: #1F5F8B; --sk-tk-string: #A33A12; --sk-tk-number: #5B3FA8;
+  --sk-tk-comment: #5C6375; --sk-tk-punct: #3F4656; --sk-tk-ident: #3F4656; --sk-num: #5B3FA8;
+}
+.dark .sw-play {
+  --sk-tk-keyword: #9DB4F5; --sk-tk-function: #7FD1E8; --sk-tk-string: #FF8A5C; --sk-tk-number: #D3A6FF;
+  --sk-tk-comment: #9096A3; --sk-tk-punct: #B9BEC9; --sk-tk-ident: #B9BEC9; --sk-num: #D3A6FF;
+}
+.vp-doc .sw-play div[class*='language-'] { margin: 0; border-radius: 0; }
+.sw-play-editor { border-bottom: 1px solid var(--vp-c-divider); }
+.sw-play-editor .sk-editor { min-height: 80px; }
+.sw-play-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 12px;
+  background: var(--vp-c-bg-alt); border-top: 1px solid var(--vp-c-divider); border-bottom: 1px solid var(--vp-c-divider);
+}
+.sw-play:not(.sw-play-ready) .sw-play-bar button { visibility: hidden; }
+.sw-play-bar button, .sw-play-bar a {
+  font: 500 13px/1 var(--vp-font-family-base); padding: 7px 12px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--vp-c-divider); background: var(--vp-c-bg); color: var(--vp-c-text-1); text-decoration: none;
+}
+.sw-play-bar button:hover, .sw-play-bar a:hover { border-color: var(--vp-c-brand-1); color: var(--vp-c-brand-1); }
+.sw-play-bar .sw-play-run { background: var(--vp-button-brand-bg); border-color: var(--vp-button-brand-bg); color: var(--vp-button-brand-text); }
+.sw-play-bar .sw-play-run:hover { background: var(--vp-button-brand-hover-bg); color: var(--vp-button-brand-hover-text); }
+.sw-play-bar [hidden] { display: none; }
+.sw-play-status { margin-left: auto; font-family: var(--smalt-brand-font); font-size: 12px; color: var(--vp-c-text-2); }
+.sw-play[aria-busy='true'] .sw-play-status::before { content: '● '; color: var(--vp-c-brand-1); }
+.sw-play-result { padding: 0 12px; }
+.sw-play-result[data-tested]::before {
+  content: 'Tested result'; display: block; padding-top: 10px;
+  font-family: var(--smalt-brand-font); font-size: 12px; color: var(--vp-c-text-3);
+}
+.vp-doc .sw-play-result[data-tested] table { margin: 8px 0 12px; }
+/* The grid is smaltkit's: keep VitePress's table styles off it. */
+.vp-doc .sw-play-grid table { display: table; margin: 0; overflow: visible; border-collapse: separate; }
+.vp-doc .sw-play-grid tr { border: 0; background: none; }
+.vp-doc .sw-play-grid :is(th, td) { border-top: 0; border-left: 0; font-size: inherit; line-height: normal; }
+.sw-play-grid { position: relative; display: flex; margin: 12px 0; border: 1px solid var(--vp-c-divider); }
+.sw-play-note { font-size: 15px; color: var(--vp-c-text-2); }
+.sw-play-error { margin: 12px 0; padding: 10px 12px; border-radius: 6px; font-size: 14px; color: var(--vp-c-danger-1); background: var(--vp-c-danger-soft); }
+.sw-play-error strong { font-family: var(--smalt-brand-font); font-size: 13px; }
+/* At rest, an example that runs in place looks like any example: its code, a small Run button and its tested result.
+   Run or Edit makes it live, with the toolbar and the frame above. */
+.sw-play:not(.sw-play-live) { border: 0; border-radius: 0; overflow: visible; }
+.vp-doc .sw-play:not(.sw-play-live) div[class*='language-'] { border-radius: 8px; }
+.sw-play:not(.sw-play-live) .sw-play-bar { padding: 6px 0 0; background: none; border: 0; }
+.sw-play:not(.sw-play-live) .sw-play-bar > :not(.sw-play-run):not(.sw-play-status) { display: none; }
+.sw-play:not(.sw-play-live) .sw-play-run { padding: 5px 10px; font-size: 12px; }
+.sw-play:not(.sw-play-live) .sw-play-run::before { content: '▶ '; font-size: 10px; }
+.sw-play:not(.sw-play-live) .sw-play-result { padding: 0; }
+.sw-play-fails { margin: 8px 0 12px; font-size: 14px; color: var(--vp-c-text-2); }
