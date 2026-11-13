@@ -7,21 +7,22 @@ import {
   affinityOfStorage,
   applyNumericAffinity,
   applyTextAffinity,
+  hashKey,
   staticTypeOfStorage,
   truthy,
 } from './convert.js';
 import { currentTimeText } from './datetime.js';
 import { ARITHMETIC_FUNCTIONS, BITWISE_FUNCTIONS, COMPARISON_FUNCTIONS, arithImpl, isEngineOperation, negate, sqlFunction } from './sql-functions.js';
-import { type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
+import { type AggregateState, type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type CodegenHelpers, type FallbackNode, codegenEnabled, generate, generatedType, isCodegenRoot } from './codegen.js';
 import { daysAsUs } from './temporal-ops.js';
 import { WINDOW_ARITY } from './window.js';
 import { type SqlMeta, getMeta, setMeta } from './sql-meta.js';
-import { type BoundExpr, type ExprMeaning, call, lit, param, typeOf } from '../plan/expr.js';
+import { type BoundExpr, type ExprMeaning, call, eachParts, lit, param, typeOf } from '../plan/expr.js';
 import type { CollationName } from '../plan/types.js';
 import type { PlanOp } from '../plan/ops.js';
 import { decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
-import { readRowidKey } from '../storage/key-codec.js';
+import { decodeKey, encodeKey, readRowidKey } from '../storage/key-codec.js';
 
 export type { Fn };
 
@@ -129,6 +130,8 @@ export function planHasSubquery(e: BoundExpr): boolean {
     case 'subquery':
     case 'inSubquery':
       return true;
+    case 'each':
+      return eachParts(e).some(planHasSubquery);
     default:
       return false;
   }
@@ -241,9 +244,170 @@ function compileBound(e: BoundExpr, ctx: FunctionContext): Compiled {
       };
       return { fn, type: typeOf(e), collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
     }
+    case 'each':
+      return compileEach(e, ctx);
+    case 'element': {
+      const f = frameAt(e.depth, e.k);
+      const t = e.type;
+      if (e.part === 'position') return { fn: () => f.position, type: 'int', collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
+      return { fn: () => f.value, type: t, collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
+    }
+    case 'eachAgg': {
+      const f = frameAt(e.depth, e.k);
+      const i = e.index;
+      return { fn: () => f.aggs[i]!, type: e.type, collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false };
+    }
     case 'col':
       throw new SmaltError('SMALT_INTERNAL', `plan expression ${e.k} cannot be compiled yet`);
   }
+}
+
+// ------------------------------------------------------------------ each (ADR 0031, section 4)
+
+/** What an `each` gives its body while it runs: the element, its position, and (`agg`) its aggregates' results. */
+interface EachFrame {
+  value: SqlValue;
+  position: number;
+  aggs: SqlValue[];
+}
+
+/** The frames of the `each` expressions being compiled, the innermost last: `element` and `eachAgg` read one. */
+const compiling: EachFrame[] = [];
+
+function frameAt(depth: number, k: string): EachFrame {
+  const f = compiling[compiling.length - 1 - depth];
+  if (f === undefined) throw new SmaltError('SMALT_INTERNAL', `${k} outside an each`);
+  return f;
+}
+
+/** `body` compiled with `frame` as the innermost `each`'s. */
+function inFrame<T>(frame: EachFrame, body: () => T): T {
+  compiling.push(frame);
+  try {
+    return body();
+  } finally {
+    compiling.pop();
+  }
+}
+
+function listBytes(v: SqlValue): Uint8Array {
+  if (v instanceof Uint8Array) return v;
+  throw new SmaltError('SMALT_MISMATCH', `each takes a list, not ${typeof v === 'string' ? 'text' : typeof v}`);
+}
+
+/**
+ * An `each`: the list is decoded once per row, then `body` runs for each element with the frame set to it (`map`,
+ * `filter`), or the aggregates step over the elements and `body` runs once over their results (`agg`).
+ */
+function compileEach(e: Extract<BoundExpr, { k: 'each' }>, ctx: FunctionContext): Compiled {
+  const list = compilePlanExpr(e.list, ctx).fn;
+  const frame: EachFrame = { value: null, position: 0, aggs: [] };
+  const base = { type: e.type, collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE' as Affinity, constant: false };
+  if (e.mode === 'agg') {
+    const calls = inFrame(frame, () =>
+      (e.aggs ?? []).map((a) => {
+        const def = aggregateFunctions.get(a.fn);
+        if (!def) throw new SmaltError('SMALT_ERROR', `no such aggregate function: ${a.fn}`);
+        const args = a.args.map((x) => compileBoundExpr(x, ctx));
+        return {
+          def,
+          args: args.map((x) => x.fn),
+          argTypes: a.star ? [] : args.map((x) => x.type),
+          filter: a.filter === undefined ? undefined : compileBoundExpr(a.filter, ctx).fn,
+          distinct: a.distinct,
+          collation: collationId(a.collation),
+          buf: new Array<SqlValue>(a.args.length).fill(null),
+        };
+      }),
+    );
+    const results: SqlValue[] = new Array(calls.length).fill(null);
+    // The body reads the aggregates' results, not the element: its frame is a second one with them.
+    const outer: EachFrame = { value: null, position: 0, aggs: results };
+    const body = inFrame(outer, () => compileBoundExpr(e.body, ctx)).fn;
+    const nc = calls.length;
+    const states: AggregateState[] = new Array(nc);
+    const seen: (Set<unknown> | null)[] = new Array(nc).fill(null);
+    const anyDistinct = calls.some((c) => c.distinct);
+    // One argument, no filter, no DISTINCT: step1 straight from the argument.
+    const simple = calls.map((c) => c.args.length === 1 && c.filter === undefined && !c.distinct);
+    return {
+      ...base,
+      fn: (r) => {
+        const v = list(r);
+        if (v === null) return null;
+        const xs = decodeKey(listBytes(v));
+        for (let i = 0; i < nc; i++) {
+          const c = calls[i]!;
+          states[i] = c.def.create(c.argTypes, c.collation);
+          if (anyDistinct) seen[i] = c.distinct ? new Set<unknown>() : null;
+        }
+        const n = xs.length;
+        for (let p = 0; p < n; p++) {
+          frame.value = xs[p]!;
+          frame.position = p;
+          for (let i = 0; i < nc; i++) {
+            const c = calls[i]!;
+            const st = states[i]!;
+            if (simple[i] && st.step1 !== undefined) {
+              st.step1(c.args[0]!(r));
+              continue;
+            }
+            if (c.filter !== undefined && !isTrue(c.filter(r))) continue;
+            const buf = c.buf;
+            for (let j = 0; j < buf.length; j++) buf[j] = c.args[j]!(r);
+            const s = seen[i];
+            if (s !== null) {
+              if (buf[0] === null) continue;
+              const k = hashKey(buf[0]!, c.collation);
+              if (s.has(k)) continue;
+              s.add(k);
+            }
+            st.step(buf);
+          }
+        }
+        for (let i = 0; i < nc; i++) results[i] = states[i]!.final();
+        return body(r);
+      },
+    };
+  }
+  const body = inFrame(frame, () => compileBoundExpr(e.body, ctx)).fn;
+  if (e.mode === 'map') {
+    return {
+      ...base,
+      fn: (r) => {
+        const v = list(r);
+        if (v === null) return null;
+        const xs = decodeKey(listBytes(v));
+        const n = xs.length;
+        for (let p = 0; p < n; p++) {
+          frame.value = xs[p]!;
+          frame.position = p;
+          xs[p] = body(r);
+        }
+        return encodeKey(xs);
+      },
+    };
+  }
+  return {
+    ...base,
+    fn: (r) => {
+      const v = list(r);
+      if (v === null) return null;
+      const bytes = listBytes(v);
+      const xs = decodeKey(bytes);
+      const n = xs.length;
+      let k = 0;
+      for (let p = 0; p < n; p++) {
+        const x = xs[p]!;
+        frame.value = x;
+        frame.position = p;
+        if (isTrue(body(r))) xs[k++] = x;
+      }
+      if (k === n) return bytes;
+      xs.length = k;
+      return encodeKey(xs);
+    },
+  };
 }
 
 /** A call of an `sql.*` function: the closure the SQL rules always built for that operator. */

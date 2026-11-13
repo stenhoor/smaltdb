@@ -84,7 +84,7 @@ import {
 } from './operators.js';
 import { type ColumnStore, ROW_GROUP_ROWS, type Zone, zoneMayMatch } from '../storage/columnar.js';
 import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
-import { type BoundExpr, type PlanExpr, lit } from '../plan/expr.js';
+import { type BoundExpr, eachParts, lit, mapEach, type PlanExpr } from '../plan/expr.js';
 import type { AggCall, ColumnArray, JoinKind, PlanOp, SortKey as PlanSortKey, ValueColumn } from '../plan/ops.js';
 import type { CollationName } from '../plan/types.js';
 import { datetimeFromDate, isTemporal, parseDate, parseDatetime, parseDuration, parseTime } from '../../shared/temporal.js';
@@ -267,6 +267,9 @@ function forEachSlot(e: BoundExpr, f: (reg: number) => void): void {
       return;
     case 'inSubquery':
       forEachSlot(e.probe, f);
+      return;
+    case 'each':
+      for (const x of eachParts(e)) forEachSlot(x, f);
       return;
     default:
       return;
@@ -2801,6 +2804,11 @@ function readsRows(e: BoundExpr, level: number): boolean {
       return level >= 0 && supportedPlan(e.plan, level + 1);
     case 'inSubquery':
       return level >= 0 && readsRows(e.probe, level) && supportedPlan(e.plan, level + 1);
+    case 'each':
+      return eachParts(e).every((x) => readsRows(x, level));
+    case 'element':
+    case 'eachAgg':
+      return true;
     default:
       return false;
   }
@@ -2851,6 +2859,8 @@ function hasNested(e: BoundExpr): boolean {
       return hasNested(e.arg);
     case 'case':
       return e.whens.some((w) => hasNested(w.when) || hasNested(w.then)) || hasNested(e.else);
+    case 'each':
+      return eachParts(e).some(hasNested);
     default:
       return false;
   }
@@ -2909,6 +2919,8 @@ function rebind(e: BoundExpr, f: (c: ColRef) => BoundExpr, sub?: (n: BoundExpr, 
     case 'inSubquery':
       if (sub) return sub(e, f);
       return { k: 'inSubquery', probe: r(e.probe), plan: PLACEHOLDER, collation: 'binary' };
+    case 'each':
+      return mapEach(e, r);
     default:
       return e;
   }

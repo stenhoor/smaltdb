@@ -1,4 +1,4 @@
-// Lists (ADR 0031): explode against a function of one list, through the plan API, in process. A table of N rows with
+// Lists (ADR 0031): explode and `each` against a function of one list, through the plan API, in process. A table of N rows with
 // an id and a list<int> of 10 elements on six rows in seven (empty on the rest); each query's result is one row.
 // Run (N rows, default 100,000; rounds, default 5):
 //   npx esbuild bench/micro/nested.ts --bundle --platform=node --format=esm --outfile=.cache/nested-bench.mjs \
@@ -27,6 +27,7 @@ for (let at = 0; at < N; at += 5000) {
 
 const t = (): PlanOp => p.scan('t', [0, 1]);
 const v = p.col(0, 1, LIST);
+const el = p.element('int');
 const count = (input: PlanOp): PlanOp => p.aggregate(input, [], [p.agg('count', [], 'int', { star: true })]);
 const QUERIES: [string, PlanOp][] = [
   ['sum(list_sum(v))', p.aggregate(t(), [], [p.agg('sum', [p.call('list_sum', [v], 'int')], 'int')])],
@@ -34,6 +35,10 @@ const QUERIES: [string, PlanOp][] = [
   ['explode(v), sum by id, count', count(p.aggregate(p.explode(t(), 1, LIST), [p.col(0, 0, 'int')], [p.agg('sum', [p.col(0, 1, 'int')], 'int')]))],
   ['count where list_contains(v, 5)', count(p.filter(t(), p.call('list_contains', [v, p.lit(5)], 'bool')))],
   ['count of explode(v) where element = 5', count(p.filter(p.explode(t(), 1, LIST), p.call('cmp_eq', [p.col(0, 1, 'int'), p.lit(5)], 'bool')))],
+  // The same work by `each` (ADR 0031 step 5), over each row's list, with no explode.
+  ['sum(each agg sum(v))', p.aggregate(t(), [], [p.agg('sum', [p.listAgg(v, [{ fn: 'sum', args: [el], star: false, distinct: false, collation: 'binary', type: 'int' }], p.aggResult(0, 'int'))], 'int')])],
+  ['sum(list_len(each filter v = 5))', p.aggregate(t(), [], [p.agg('sum', [p.call('list_len', [p.listFilter(v, p.call('cmp_eq', [el, p.lit(5)], 'bool'))], 'int')], 'int')])],
+  ['sum(list_sum(each map v * 2))', p.aggregate(t(), [], [p.agg('sum', [p.call('list_sum', [p.listMap(v, p.call('mul', [el, p.lit(2)], 'int'))], 'int')], 'int')])],
 ];
 
 function median(xs: number[]): number {

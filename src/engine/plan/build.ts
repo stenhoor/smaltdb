@@ -7,7 +7,8 @@
  * plan/expr.ts.
  */
 import type { SqlValue } from '../values.js';
-import { call, col, lit, param, type PlanExpr, typeOf } from './expr.js';
+import { call, col, type EachAggCall, lit, param, type PlanExpr, typeOf } from './expr.js';
+import { parseNested } from '../../shared/nested-types.js';
 import type { AggCall, ConflictAction, JoinKind, PlanOp, SortKey, ValueColumn, WindowCall, WindowFrame } from './ops.js';
 import type { CollationName, PlanType } from './types.js';
 
@@ -34,6 +35,24 @@ export const scalar = (plan: PlanOp, type: PlanType, collation: CollationName = 
 export const exists = (plan: PlanOp): PlanExpr => ({ k: 'subquery', mode: 'exists', plan, type: 'int', collation: 'binary' });
 /** Whether `probe` is in the nested plan's single column: 1, 0 or NULL. */
 export const inPlan = (probe: PlanExpr, plan: PlanOp, collation: CollationName = 'binary'): PlanExpr => ({ k: 'inSubquery', probe, plan, collation });
+
+/** The element type of list type `t` (`any` when `t` is not a list type). */
+export function elementType(t: PlanType): PlanType {
+  const n = parseNested(t);
+  return n?.kind === 'list' ? (n.of as PlanType) : 'any';
+}
+/** In an `each` body: the element of the `each` `depth` levels out (0: the innermost). */
+export const element = (type: PlanType, depth = 0): PlanExpr => ({ k: 'element', part: 'value', depth, type });
+/** In an `each` body: the element's position, from 0. */
+export const elementPosition = (depth = 0): PlanExpr => ({ k: 'element', part: 'position', depth, type: 'int' });
+/** In a `listAgg` body: the result of its aggregate `index`. */
+export const aggResult = (index: number, type: PlanType, depth = 0): PlanExpr => ({ k: 'eachAgg', index, depth, type });
+/** The list of `body` for each element of `list` (ADR 0031). */
+export const listMap = (list: PlanExpr, body: PlanExpr): PlanExpr => ({ k: 'each', mode: 'map', list, body, type: `list<${typeOf(body) === 'null' ? 'any' : typeOf(body)}>` as PlanType });
+/** The elements of `list` for which `pred` is true, in order. */
+export const listFilter = (list: PlanExpr, pred: PlanExpr): PlanExpr => ({ k: 'each', mode: 'filter', list, body: pred, type: typeOf(list) });
+/** `body` over the results of aggregates `aggs` run over the elements of `list` (read them with `aggResult`). */
+export const listAgg = (list: PlanExpr, aggs: readonly EachAggCall<PlanExpr>[], body: PlanExpr): PlanExpr => ({ k: 'each', mode: 'agg', list, aggs, body, type: typeOf(body) });
 
 /** A sort key: ascending with NULLs first unless `options` say otherwise. */
 export const asc = (expr: PlanExpr, options: { nullsFirst?: boolean; collation?: CollationName } = {}): SortKey => ({ expr, desc: false, nullsFirst: options.nullsFirst ?? true, collation: options.collation ?? 'binary' });

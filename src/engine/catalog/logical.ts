@@ -12,7 +12,7 @@ import type { TemporalType } from '../../shared/temporal.js';
 import type { NestedTypeName } from '../../shared/nested-types.js';
 import type { StorageType } from '../plan/schema.js';
 import { declaredType, planTypeOfStorage } from '../plan/catalog.js';
-import { type BoundExpr, typeOf } from '../plan/expr.js';
+import { type BoundExpr, eachParts, mapEach, typeOf } from '../plan/expr.js';
 import type { Source, TableDef } from '../plan/schema.js';
 import type { CollationName, PlanType } from '../plan/types.js';
 import { Collation, type SqlValue } from '../values.js';
@@ -214,6 +214,8 @@ function onlyConstants(e: BoundExpr): boolean {
       return onlyConstants(e.arg);
     case 'case':
       return e.whens.every((w) => onlyConstants(w.when) && onlyConstants(w.then)) && onlyConstants(e.else);
+    case 'each':
+      return eachParts(e).every(onlyConstants);
     default:
       return false;
   }
@@ -237,6 +239,8 @@ function compilable(e: BoundExpr): boolean {
       return compilable(e.arg);
     case 'case':
       return e.whens.every((w) => compilable(w.when) && compilable(w.then)) && compilable(e.else);
+    case 'each':
+      return eachParts(e).every(compilable);
     default:
       return true;
   }
@@ -272,6 +276,8 @@ function asRegisters(e: BoundExpr): BoundExpr {
       const els = asRegisters(e.else);
       return whens === e.whens && els === e.else ? e : { ...e, whens, else: els };
     }
+    case 'each':
+      return mapEach(e, asRegisters);
     default:
       return e;
   }

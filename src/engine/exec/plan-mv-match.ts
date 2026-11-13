@@ -86,6 +86,8 @@ function plain(e: PlanExpr): boolean {
       return plain(e.arg);
     case 'case':
       return e.whens.every((w) => plain(w.when) && plain(w.then)) && plain(e.else);
+    case 'each':
+      return false; // not matched against views yet
     default:
       return true;
   }
@@ -141,6 +143,8 @@ function mapExpr(e: PlanExpr, f: (e: PlanExpr) => PlanExpr | null | undefined): 
     case 'case':
       out = { ...e, whens: e.whens.map((w) => ({ when: m(w.when), then: m(w.then) })), else: m(e.else) };
       break;
+    case 'each':
+      return null; // not matched against views yet: the rewrite fails
     default:
       out = e;
   }

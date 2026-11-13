@@ -8,7 +8,7 @@
  *
  * SQL's plans have this layering already and are not normalized.
  */
-import { lit, type PlanExpr, typeOf } from '../plan/expr.js';
+import { eachParts, lit, mapEach, type PlanExpr, typeOf } from '../plan/expr.js';
 import type { AggCall, PlanOp, SortKey, WindowCall } from '../plan/ops.js';
 import { SmaltError } from '../errors.js';
 import { planWidth } from './planner.js';
@@ -146,6 +146,8 @@ function readsInput(e: PlanExpr): boolean {
       return e.args.some(readsInput);
     case 'case':
       return e.whens.some((w) => readsInput(w.when) || readsInput(w.then)) || readsInput(e.else);
+    case 'each':
+      return eachParts(e).some(readsInput);
     default:
       return false;
   }
@@ -340,6 +342,8 @@ function joinedColumns(e: PlanExpr, at: number): PlanExpr {
     case 'subquery':
     case 'inSubquery':
       throw new SmaltError('SMALT_UNSUPPORTED', 'an asof join whose keys hold a subquery is not supported yet');
+    case 'each':
+      return mapEach(e, (x) => joinedColumns(x, at));
     default:
       return e;
   }
@@ -403,6 +407,8 @@ function correlated(e: PlanExpr, depth: number): PlanExpr {
     case 'subquery':
     case 'inSubquery':
       throw new SmaltError('SMALT_UNSUPPORTED', 'a semi or anti join whose condition holds a subquery is not supported yet');
+    case 'each':
+      return mapEach(e, (x) => correlated(x, depth));
     default:
       return e;
   }
@@ -476,6 +482,8 @@ function shift(e: PlanExpr, by: number): PlanExpr {
       return { ...e, arg: shift(e.arg, by) };
     case 'case':
       return { ...e, whens: e.whens.map((w) => ({ when: shift(w.when, by), then: shift(w.then, by) })), else: shift(e.else, by) };
+    case 'each':
+      return mapEach(e, (x) => shift(x, by));
     default:
       return e;
   }
@@ -501,6 +509,8 @@ function readsFrom(e: PlanExpr, width: number): boolean {
       return readsFrom(e.arg, width);
     case 'case':
       return e.whens.some((w) => readsFrom(w.when, width) || readsFrom(w.then, width)) || readsFrom(e.else, width);
+    case 'each':
+      return eachParts(e).some((x) => readsFrom(x, width));
     default:
       return false;
   }
@@ -521,6 +531,8 @@ function hasSubquery(e: PlanExpr): boolean {
       return hasSubquery(e.arg);
     case 'case':
       return e.whens.some((w) => hasSubquery(w.when) || hasSubquery(w.then)) || hasSubquery(e.else);
+    case 'each':
+      return eachParts(e).some(hasSubquery);
     default:
       return false;
   }
@@ -604,6 +616,8 @@ function expr(e: PlanExpr): PlanExpr {
       return { ...e, arg: expr(e.arg) };
     case 'case':
       return { ...e, whens: e.whens.map((w) => ({ when: expr(w.when), then: expr(w.then) })), else: expr(e.else) };
+    case 'each':
+      return mapEach(e, expr);
     default:
       return e;
   }

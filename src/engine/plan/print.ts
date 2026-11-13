@@ -39,6 +39,14 @@ export function printExpr(e: BoundExpr): string {
       return `${e.mode}(<${e.plan.op}>)`;
     case 'inSubquery':
       return `${printExpr(e.probe)} in (<${e.plan.op}>)`;
+    case 'each': {
+      const aggs = (e.aggs ?? []).map((a) => `${a.fn}(${a.distinct ? 'distinct ' : ''}${a.star ? '*' : a.args.map(printExpr).join(', ')})${a.filter ? ` filter ${printExpr(a.filter)}` : ''}`);
+      return `each ${e.mode}(${printExpr(e.list)}${aggs.length ? ` aggs [${aggs.join(', ')}]` : ''}: ${printExpr(e.body)})`;
+    }
+    case 'element':
+      return `@${e.part === 'value' ? 'value' : 'position'}${e.depth ? `^${e.depth}` : ''}`;
+    case 'eachAgg':
+      return `@agg${e.index}${e.depth ? `^${e.depth}` : ''}`;
     case 'slot':
       return `r${e.reg}`;
     case 'native':
