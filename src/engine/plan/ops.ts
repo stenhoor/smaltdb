@@ -211,13 +211,16 @@ export type PlanOp = OpMeaning & (
        * One row per element of a list column (ADR 0020): the input's columns with `column` replaced by each element, in
        * the input's order and then the list's. As Polars' `explode`: an empty list gives no row (one row with NULL with
        * `emptyAsNull`), a NULL list one row with NULL (none with `keepNulls: false`). With `position`, each row also has
-       * the element's position (from 0) as a last column.
+       * the element's position (from 0) as a last column. `also` names more list columns exploded with `column`, zipped
+       * by position: in each row they must have as many elements as `column`'s list (a NULL list matching only NULL),
+       * else it is an error (`SMALT_RANGE`).
        */
       readonly op: 'explode';
       readonly input: PlanOp;
       readonly column: number;
       /** The list column's type (`list<T>`); the output column's is `T`. */
       readonly type: PlanType;
+      readonly also?: readonly { readonly column: number; readonly type: PlanType }[];
       readonly position?: boolean;
       readonly emptyAsNull?: boolean;
       readonly keepNulls?: boolean;

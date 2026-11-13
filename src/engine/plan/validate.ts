@@ -417,6 +417,21 @@ class Validator {
         const n = typeof o.type === 'string' ? parseNested(o.type) : null;
         if (!n || n.kind !== 'list') this.fail(`expected a list type, not ${JSON.stringify(o.type)}`, 'type');
         for (const f of ['position', 'emptyAsNull', 'keepNulls'] as const) if (o[f] !== undefined && typeof o[f] !== 'boolean') this.fail('expected true or false', f);
+        if (o.also !== undefined) {
+          const seen = new Set<number>([o.column]);
+          const also = this.list(o.also, 'also');
+          for (let i = 0; i < also.length; i++) {
+            const a = also[i] as { column: unknown; type: unknown };
+            this.under('also', i, () => {
+              this.object(a);
+              if (!Number.isInteger(a.column) || (a.column as number) < 0 || (a.column as number) >= w) this.fail(`no column ${String(a.column)}`, 'column');
+              if (seen.has(a.column as number)) this.fail(`column ${String(a.column)} is exploded twice`, 'column');
+              seen.add(a.column as number);
+              const m = typeof a.type === 'string' ? parseNested(a.type) : null;
+              if (!m || m.kind !== 'list') this.fail(`expected a list type, not ${JSON.stringify(a.type)}`, 'type');
+            });
+          }
+        }
         return w + (o.position ? 1 : 0);
       }
       case 'unpivot': {

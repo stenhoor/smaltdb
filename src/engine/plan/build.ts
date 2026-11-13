@@ -159,13 +159,20 @@ export const pivot = (input: PlanOp, keys: readonly PlanExpr[], on: PlanExpr, va
  */
 /**
  * One row per element of list column `column` (typed `type`, a list type; ADR 0020). `position` adds the element's
- * position; `emptyAsNull` gives an empty list a NULL row; `keepNulls: false` drops NULL lists.
+ * position; `emptyAsNull` gives an empty list a NULL row; `keepNulls: false` drops NULL lists. `also` explodes more list
+ * columns with it, zipped by position (their lists must be as long as its).
  */
-export const explode = (input: PlanOp, column: number, type: PlanType, options: { position?: boolean; emptyAsNull?: boolean; keepNulls?: boolean } = {}): Op<'explode'> => ({
+export const explode = (
+  input: PlanOp,
+  column: number,
+  type: PlanType,
+  options: { position?: boolean; emptyAsNull?: boolean; keepNulls?: boolean; also?: readonly { column: number; type: PlanType }[] } = {},
+): Op<'explode'> => ({
   op: 'explode',
   input,
   column,
   type,
+  ...(options.also?.length ? { also: options.also } : {}),
   ...(options.position ? { position: true } : {}),
   ...(options.emptyAsNull ? { emptyAsNull: true } : {}),
   ...(options.keepNulls === false ? { keepNulls: false } : {}),

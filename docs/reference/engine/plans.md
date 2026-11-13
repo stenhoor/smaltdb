@@ -100,7 +100,7 @@ Each operation's output columns, in order:
 | `sample` | `input`, `count?` or `fraction?`, `replace`, `seed` | its input's |
 | `pivot` | `input`, `keys`, `on`, `collation`, `values`, `aggs`, `ordered?` | its keys, then one column per value and aggregate call (value by value) |
 | `unpivot` | `input`, `keep` (columns kept), `columns` (columns that become rows), `names` (one per column), `type` (of the values) | the kept columns, then each row's column name (`text`), then its value |
-| `explode` | `input`, `column` (a list column), `type` (its `list<T>` type), `position?`, `emptyAsNull?`, `keepNulls?` | the input's columns, `column` holding each element (`T`), then its position (`int`) with `position` |
+| `explode` | `input`, `column` (a list column), `type` (its `list<T>` type), `position?`, `emptyAsNull?`, `keepNulls?`, `also?` (more list columns, `{ column, type }`, zipped by position) | the input's columns, `column` and each `also` column holding their elements (`T`), then its position (`int`) with `position`. Lists zipped in a row must be as long as each other (NULL only as long as NULL), else `SMALT_RANGE` |
 | `distinct` | `input`, `collations` (one per column), `ordered?` (`'first'`), `on?`, `keep?` (`'first'` / `'last'`) | its input's |
 | `join` | `kind`, `inputs` (left, right), `on?`, `ordered?` (`true`), `asof?` (kind `asof`) | the left input's, then the right's (`semi` / `anti`: the left's only) |
 | `aggregate` | `input`, `keys`, `aggs`, `carry`, `ordered?` (`'first'`) | its keys, then one per aggregate call, then the carried columns |
@@ -375,6 +375,7 @@ be typed `list<…>` (an error when the plan is compiled otherwise); NULL lists 
 | `list_sample` | 2 to 4: a list, n, withReplacement, seed | `n` elements chosen at random: without replacement in the list's order (more than it has is an error), with replacement in the order drawn. A `seed` gives the same choice each time |
 | `list_item` | 1 | The element of a list of one; any other length is an error (`SMALT_RANGE`) |
 | `list_union`, `list_intersect`, `list_except`, `list_symmetric_except` | 2 | The set operation: each element once (NULL is one value), in first-appearance order, the left list's then the right's |
+| `list_same_lengths` | 2 or more: lists | The first list, when every list has as many elements (a NULL list matching only NULL); else an error (`SMALT_RANGE`). `explode`'s `also` checks each row with it |
 
 `cast_text` of a list or struct gives its JSON text: `[1,2]`, `{"name":"a","score":2.5}`, dates and times as their text,
 `bool` as `true` / `false`, integers beyond 2^53 with every digit.
@@ -390,7 +391,7 @@ NULLs first). They check nothing: the engine validates every plan it is given, b
 |---|---|
 | Expressions | `col(input, index, type, collation?, depth?)`, `lit(value, type?)`, `value(v)`, `param(index, type?)`, `call(fn, args, type, collation?)`, `cast(fn, arg, to)`, `and(...)`, `or(...)`, `not(x)`, `isNull(x)`, `isNotNull(x)`, `typed(logic, 'bool' | 'int')`, `caseWhen(whens, type, otherwise?)`, `scalar(plan, type, collation?)`, `exists(plan)`, `inPlan(probe, plan, collation?)` |
 | Sort keys, aggregates | `asc(expr, options?)`, `desc(expr, options?)`, `agg(fn, args, type, options?)` |
-| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `asofJoin(left, right, leftKey, rightKey, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `sample(input, { count } or { fraction }, options?)`, `pivot(input, keys, on, values, aggs, options?)`, `unpivot(input, keep, columns, names, type?)`, `explode(input, column, type, { position?, emptyAsNull?, keepNulls? })`, `setop(kind, left, right, width)` |
+| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `asofJoin(left, right, leftKey, rightKey, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `sample(input, { count } or { fraction }, options?)`, `pivot(input, keys, on, values, aggs, options?)`, `unpivot(input, keep, columns, names, type?)`, `explode(input, column, type, { position?, emptyAsNull?, keepNulls?, also? })`, `setop(kind, left, right, width)` |
 | Windows | `window(input, calls, options?)` (`partition`, `collations`, `order`, `frame`; the frame defaults to the partition's rows up to the current row and its peers), `windowCall(fn, args, type, options?)`, `frame(unit, start, end, exclude?)` with `unboundedPreceding`, `preceding(n)`, `currentRow`, `following(n)`, `unboundedFollowing` |
 | Sources and recursion | `source(kind, name, args, types, options?)`, `iterate(id, name, init, steps, options?)`, `working(id, types)` |
 | Writes | `append(table, input, columns, options?)`, `update(table, input, rowid, sets, options?)`, `remove(table, input, rowid, options?)` |

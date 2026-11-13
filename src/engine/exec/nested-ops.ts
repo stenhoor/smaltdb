@@ -27,18 +27,21 @@ function bytesOf(v: SqlValue, fn: string): Uint8Array {
 }
 
 /**
- * The elements of `bytes`, remembered for the last list decoded. `explode` reads one list's length and its elements
- * position by position, the same bytes each time: without this, a list of n elements costs n decodes of n elements.
- * Callers must not change the array.
+ * The elements of `bytes`, remembered for the last few lists decoded. An `explode` of zipped lists reads each list's
+ * elements position by position, the same bytes each time: without this, a list of n elements costs n decodes of n
+ * elements. Callers must not change the array.
  */
-let lastBytes: Uint8Array | null = null;
-let lastValues: readonly SqlValue[] = [];
+const CACHED = 4;
+const cachedBytes: (Uint8Array | null)[] = new Array(CACHED).fill(null);
+const cachedValues: (readonly SqlValue[])[] = new Array(CACHED).fill([]);
+let nextSlot = 0;
 function elements(bytes: Uint8Array): readonly SqlValue[] {
-  if (bytes !== lastBytes) {
-    lastValues = decodeKey(bytes);
-    lastBytes = bytes;
-  }
-  return lastValues;
+  for (let i = 0; i < CACHED; i++) if (cachedBytes[i] === bytes) return cachedValues[i]!;
+  const values = decodeKey(bytes);
+  cachedBytes[nextSlot] = bytes;
+  cachedValues[nextSlot] = values;
+  nextSlot = (nextSlot + 1) % CACHED;
+  return values;
 }
 
 function op(
@@ -237,6 +240,20 @@ const diffType = (el: string): StaticType => {
 };
 
 const MORE_LIST_OPS: [string, ScalarFunction][] = [
+  // The first list, when every list has as many elements as it (a NULL list matching only NULL); else an error. An
+  // explode of zipped lists checks each row with it.
+  op('list_same_lengths', 2, -1, sameAsFirst, (args) => {
+    for (const a of args) listOf('list_same_lengths', a.type);
+    return (vals) => {
+      const size = (v: SqlValue): number | null => (v === null ? null : elements(bytesOf(v, 'list_same_lengths')).length);
+      const first = size(vals[0]!);
+      for (let i = 1; i < vals.length; i++) {
+        const n = size(vals[i]!);
+        if (n !== first) throw new SmaltError('SMALT_RANGE', `lists zipped together have different lengths: ${first ?? 'null'} and ${n ?? 'null'}`);
+      }
+      return vals[0]!;
+    };
+  }),
   // Statistics: over the non-null numbers, NULL when there are none (or too few).
   unary('list_median', 1, 1, () => 'real', (xs) => median(numbersOf(xs, 'list_median'))),
   unary('list_var', 1, 2, () => 'real', (xs, [d]) => variance(numbersOf(xs, 'list_var'), ddofOf(d, 'list_var'))),
