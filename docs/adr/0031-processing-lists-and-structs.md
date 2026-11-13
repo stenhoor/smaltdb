@@ -2,6 +2,9 @@
 
 - **Status:** accepted with the owner's decisions of 2026-11-13 (at the end): decision 1 takes the alternative, a new
   expression kind (section 4); the others as recommended
+- **Progress (2026-11-13):** steps 1, 3, 4, 5 and 6 done (#221, #222, #224, #223; smaltdf#29, smaltdf#30,
+  smaltdf#31, with `explode` of several columns on #225); step 7 in review (smaltql#71); step 2 (smaltdf's building
+  and struct methods) to do
 - **Date:** 2026-11-12
 - **Builds on:** [ADR 0020](0020-lists-and-structs.md) (the types, their values and first operations, `explode`);
   [ADR 0022](0022-sql-for-the-new-engine-features.md) (SQL's `ARRAY[…]`, `unnest`, `array_agg`);
