@@ -232,8 +232,15 @@ integer primary key, `null` any).
 | `case` | `whens` (`{ when, then }`), `else`, `type` | the `then` of the first `when` that is 1, else `else` |
 | `subquery` | `mode` (`scalar` / `exists`), `plan`, `type`, `collation` | the first column of the nested plan's first row (NULL if none), or whether it has a row |
 | `inSubquery` | `probe`, `plan`, `collation` | whether `probe` is in the nested plan's single column: 1, 0, or NULL |
+| `each` | `list`, `mode` (`map` / `filter` / `agg`), `body`, `aggs?`, `type` | `body` over the elements of `list` ([ADR 0031](../../adr/0031-processing-lists-and-structs.md)): `map` gives the list of `body` per element (`list<T>`), `filter` the elements whose `body` is true, in order; `agg` runs `aggs` (aggregate calls, as an `aggregate`'s) over the elements, then gives `body` over their results. A NULL list gives NULL; an empty one `[]`, or the aggregates of no rows |
+| `element` | `part` (`value` / `position`), `depth`, `type` | in an `each` body: the element, or its position from 0, of the `each` `depth` levels out (0 the innermost). Not in an `agg` body outside its aggregates |
+| `eachAgg` | `index`, `depth`, `type` | in an `agg` body: the result of aggregate `index` |
 
-**Meaning fields.** Any expression may also say how it takes part in comparisons and code generation, and any
+A body reads the row's columns as any expression does (`col`), so `each` compares elements with their row's values.
+The list is decoded once per row and the body compiled once; nothing runs per element as a plan. Bodies nest, and
+a nested plan (`subquery`) inside one doesn't read its elements.
+
+**Meaning fields. Any expression may also say how it takes part in comparisons and code generation, and any
 operation whether decorrelation applies to it. They are optional; a language that states every collation and
 conversion on its calls needs none of them.
 
@@ -389,7 +396,7 @@ NULLs first). They check nothing: the engine validates every plan it is given, b
 
 | | Builders |
 |---|---|
-| Expressions | `col(input, index, type, collation?, depth?)`, `lit(value, type?)`, `value(v)`, `param(index, type?)`, `call(fn, args, type, collation?)`, `cast(fn, arg, to)`, `and(...)`, `or(...)`, `not(x)`, `isNull(x)`, `isNotNull(x)`, `typed(logic, 'bool' | 'int')`, `caseWhen(whens, type, otherwise?)`, `scalar(plan, type, collation?)`, `exists(plan)`, `inPlan(probe, plan, collation?)` |
+| Expressions | `col(input, index, type, collation?, depth?)`, `lit(value, type?)`, `value(v)`, `param(index, type?)`, `call(fn, args, type, collation?)`, `cast(fn, arg, to)`, `and(...)`, `or(...)`, `not(x)`, `isNull(x)`, `isNotNull(x)`, `typed(logic, 'bool' | 'int')`, `caseWhen(whens, type, otherwise?)`, `scalar(plan, type, collation?)`, `exists(plan)`, `inPlan(probe, plan, collation?)`, `listMap(list, body)`, `listFilter(list, predicate)`, `listAgg(list, aggs, body)`, `element(type, depth?)`, `elementPosition(depth?)`, `aggResult(index, type, depth?)` |
 | Sort keys, aggregates | `asc(expr, options?)`, `desc(expr, options?)`, `agg(fn, args, type, options?)` |
 | Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `asofJoin(left, right, leftKey, rightKey, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `sample(input, { count } or { fraction }, options?)`, `pivot(input, keys, on, values, aggs, options?)`, `unpivot(input, keep, columns, names, type?)`, `explode(input, column, type, { position?, emptyAsNull?, keepNulls?, also? })`, `setop(kind, left, right, width)` |
 | Windows | `window(input, calls, options?)` (`partition`, `collations`, `order`, `frame`; the frame defaults to the partition's rows up to the current row and its peers), `windowCall(fn, args, type, options?)`, `frame(unit, start, end, exclude?)` with `unboundedPreceding`, `preceding(n)`, `currentRow`, `following(n)`, `unboundedFollowing` |
