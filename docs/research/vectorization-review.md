@@ -25,7 +25,7 @@
    amortize interpretation overhead and to let C++ compilers emit SIMD. smaltdb already removed interpretation overhead by
    generating code. V8 does **not** auto-vectorize JS loops into SIMD instructions, so materializing intermediate vectors is pure extra
    memory traffic (about 4.8× slower than V3).
-4. **The big win is columnar storage plus generated fused loops (V3): about 8× over today, about 15× over SQLite** for scan-heavy math.
+4. **The big win is columnar storage plus generated fused loops (V3): about 8× over today** for scan-heavy math.
    Typed arrays keep values unboxed and contiguous, the predicate becomes a tight loop producing a selection vector, and the
    arithmetic runs over selected rows only. This is the design target for M7 columnar tables.
 5. **SIMD would need WebAssembly.** JS has no SIMD API, and V8 does not auto-vectorize. WASM SIMD (128-bit) could add perhaps another 2–4× on
@@ -83,6 +83,6 @@ Apache Arrow remains interesting as an **interchange format** (zero-copy result 
 ## Follow-up: recommendation 2 done (2026-11-01)
 
 Fusion now also covers scan + filter feeding any consumer (rows handed over in batches of 256) and GROUP BY (key computation,
-hash lookup and aggregate steps inline). Node, 200k rows: GROUP BY 16.3 → 8.3 ms (7.4× faster than SQLite), filtered GROUP BY with
-arithmetic 11.3 → 5.1 ms, filter + arithmetic projection 7.2 → 4.7 ms (9.7× faster than SQLite). The next step is recommendation 3,
+hash lookup and aggregate steps inline). Node, 200k rows: GROUP BY 16.3 → 8.3 ms, filtered GROUP BY with
+arithmetic 11.3 → 5.1 ms, filter + arithmetic projection 7.2 → 4.7 ms. The next step is recommendation 3,
 columnar tables (M7).

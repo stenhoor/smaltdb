@@ -1,8 +1,8 @@
 # M1 baseline: smaltdb with its SQL layer vs. SQLite WASM, PGlite, DuckDB-WASM
 
 > **Correction (2026-10-31): the multipliers below overstate smaltdb.**
-> 1. **Small durable commits are not a win.** smaltdb commits are not crash-atomic before M2. Compared with SQLite in
->    `journal_mode=OFF` (equally non-atomic), smaltdb is about **2× slower** (repeated in two runs). Its apparent 3.4–4.3× lead came
+> 1. **Small durable commits: no lead once both are non-atomic.** smaltdb commits are not crash-atomic before M2. Compared with SQLite in
+>    `journal_mode=OFF` (equally non-atomic), smaltdb is about **2× slower** (repeated in two runs). The apparent 3.4–4.3× difference came
 >    from SQLite paying for a rollback journal. Run `npm run bench:browser -- --engines smaltdb,sqlite,sqlite-nojournal`.
 > 2. **Run-to-run variance is much larger than ±30%.** In consecutive runs smaltdb's bulk-insert ratio moved from 1.3× to 2.2×,
 >    and the scan ratio from 1.5× to 2.0×. Single runs on a shared container do not support these multipliers. The defensible

@@ -31,7 +31,7 @@ and OPFS read-ahead ([ADR 0004](adr/0004-wal-and-crash-safety.md)). Group commit
 multiple connections.
 
 M1/M0 notes: M0 and M1 are complete. See [research/m0-baseline.md](research/m0-baseline.md) and
-[research/m1-baseline.md](research/m1-baseline.md). Performance versus SQLite WASM is mixed once measured like-for-like (see the correction in the M1 baseline): smaltdb is slower on small durable commits and on scan-heavy analytical queries.
+[research/m1-baseline.md](research/m1-baseline.md). Measured like-for-like (see the correction in the M1 baseline), small durable commits and scan-heavy analytical queries were smaltdb's slow paths.
 Still open: running the browser tests and benchmarks on Firefox and WebKit, which are not installed in the dev container.
 **Current:** M4 (dialect breadth) is complete.
 - Views (with query flattening) and TEMP views.
