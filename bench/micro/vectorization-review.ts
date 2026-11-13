@@ -1,5 +1,5 @@
 // Vectorization review prototype (docs/research/vectorization-review.md).
-// Run: npx esbuild bench/micro/vectorization-review.ts --bundle --platform=node --format=esm --outfile=.cache/vr.mjs --external:@sqlite.org/sqlite-wasm && node .cache/vr.mjs 1000000
+// Run: npm run bench:micro -- vectorization-review 1000000
 import sqliteInit from '@sqlite.org/sqlite-wasm';
 import { Database } from '../../src/engine/database.js';
 import '@smaltworks/smaltql/register';

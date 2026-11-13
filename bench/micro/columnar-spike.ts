@@ -1,7 +1,7 @@
 // Spike: how much faster could a columnar segment format make analytical scans than the current
 // row store (B+tree records + generated fused pipelines)? Same data as the browser analytic
 // workload plus a clustered "ts" column; both engines in memory, Node.
-//   npx tsx bench/micro/columnar-spike.ts [rows]
+//   npm run bench:micro -- columnar-spike [rows]
 import { Database } from '../../src/engine/database.js';
 import '@smaltworks/smaltql/register';
 import { MemoryVfs } from '../../src/engine/vfs/memory.js';

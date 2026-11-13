@@ -26,7 +26,7 @@ copy here: lines and roles change, and a copy taken before the change is out of 
 | `npm run check` | `npm run typecheck` (TypeScript 7, the `typescript7` dev dependency) then `npm test` (vitest): what CI's `test` job runs | Before every commit |
 | `npm run test:browser` | Builds `dist/`, then runs the browser integration tests (Playwright). CI runs them on Chromium, Firefox and WebKit | Changes to the client, worker, server, OPFS or multi-tab code |
 | `npm run slt` (in smaltql) | The sqllogictest subset (122k records), run in `stenhoor/smaltql` against a `--local` smaltdb | Changes to the planner, expressions or functions |
-| `npm run bench` | Storage micro-benchmarks in Node (`bench:browser` compares engines in a browser against SQLite WASM; `bench:native` in Node against native SQLite) | Performance work; compare with `bench/results/` |
+| `npm run bench` | Storage micro-benchmarks in Node (`bench:micro -- <name>` runs one of `bench/micro/`; `bench:browser` compares engines in a browser against SQLite WASM; `bench:native` in Node against native SQLite) | Performance work; compare with `bench/results/` |
 | `npm run docs:dev` | The docs site (VitePress) with live reload; `npm run docs:build` fails on dead links | Docs changes |
 | `npm run build` | `dist/` (client, worker, engine) and type declarations (emitted by TypeScript 6.0.3, `npx tsc`) | Packaging and release checks |
 

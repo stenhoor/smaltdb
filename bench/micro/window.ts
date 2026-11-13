@@ -1,8 +1,7 @@
 // Window functions: cost per row in smaltdb and in SQLite's WASM build, for ranking, navigation and aggregates over
 // growing, sliding and RANGE frames. Each query sums the window results, so the result set is one row.
 // Run (N rows, default 100,000):
-//   npx esbuild bench/micro/window.ts --bundle --platform=node --format=esm --outfile=.cache/window-bench.mjs \
-//     --external:@sqlite.org/sqlite-wasm && node .cache/window-bench.mjs 100000
+//   npm run bench:micro -- window 100000
 import sqliteInit from '@sqlite.org/sqlite-wasm';
 import { Database } from '../../src/engine/database.js';
 import '@smaltworks/smaltql/register';

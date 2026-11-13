@@ -1,5 +1,5 @@
 // Index workloads (same as the browser harness's index section): smaltdb vs SQLite WASM, Node, in memory.
-//   npx tsx bench/micro/indexes.ts
+//   npm run bench:micro -- indexes
 import sqliteInit from '@sqlite.org/sqlite-wasm';
 import { Database } from '../../src/engine/database.js';
 import '@smaltworks/smaltql/register';

@@ -2,8 +2,7 @@
 // in smaltdb (row and columnar tables), next to sum() and avg(), and in SQLite's WASM build where it has the function
 // (median and the percentiles; for variance, the sum-of-squares formula one writes without var_samp).
 // Run (N rows, default 1,000,000):
-//   npx esbuild bench/micro/stats.ts --bundle --platform=node --format=esm --outfile=.cache/stats-bench.mjs \
-//     --external:@sqlite.org/sqlite-wasm && node .cache/stats-bench.mjs 1000000
+//   npm run bench:micro -- stats 1000000
 import sqliteInit from '@sqlite.org/sqlite-wasm';
 import { Database } from '../../src/engine/database.js';
 import '@smaltworks/smaltql/register';
