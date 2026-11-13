@@ -696,6 +696,13 @@ class Validator {
           foreignKeys(t.foreignKeys, width, 'foreignKeys');
           if (t.storage !== 'row' && t.storage !== 'columnar') this.fail(`unknown storage ${JSON.stringify(t.storage)}`, 'storage');
         });
+        if (o.rows !== undefined)
+          this.under('rows', undefined, () => {
+            if (!o.rows || typeof o.rows !== 'object') this.fail('expected a query plan');
+            const n = this.op(o.rows as PlanOp, [], 0, null);
+            const width = (o.table as { columns: unknown[] }).columns.length;
+            if (n !== width) this.fail(`the plan produces ${n} column(s), the table has ${width}`);
+          });
         return;
       }
       case 'createIndex': {

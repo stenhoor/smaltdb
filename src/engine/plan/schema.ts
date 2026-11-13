@@ -7,7 +7,7 @@
  */
 import type { SqlValue } from '../values.js';
 import type { PlanExpr } from './expr.js';
-import type { ConflictAction } from './ops.js';
+import type { ConflictAction, PlanOp } from './ops.js';
 import type { CollationName } from './types.js';
 
 /** An expression of a definition: its plan expression and its text. */
@@ -139,7 +139,20 @@ export type DropObject = 'table' | 'index' | 'view' | 'materialized view' | 'tri
  * bind them from later.
  */
 export type SchemaOp =
-  | { readonly op: 'createTable'; readonly table: TableDef; readonly schema?: string; readonly temp: boolean; readonly ifNotExists: boolean; readonly source?: Source }
+  | {
+      readonly op: 'createTable';
+      readonly table: TableDef;
+      readonly schema?: string;
+      readonly temp: boolean;
+      readonly ifNotExists: boolean;
+      readonly source?: Source;
+      /**
+       * Rows to fill the new table with (SQL's CREATE TABLE … AS SELECT): a query plan with one output column per
+       * table column, appended in the same statement, so a failure leaves no table. Not with `ifNotExists` when the
+       * table exists: then nothing is created or appended.
+       */
+      readonly rows?: PlanOp;
+    }
   | { readonly op: 'createIndex'; readonly index: IndexDef; readonly schema?: string; readonly ifNotExists: boolean; readonly source?: Source }
   | {
       readonly op: 'createView';

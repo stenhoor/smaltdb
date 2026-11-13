@@ -198,3 +198,60 @@ describe('update: the input row in any layout', () => {
     expect(rows(d)).toEqual([[1, 11, null], [2, 81, true]]);
   });
 });
+
+describe('createTable with rows (CREATE TABLE … AS SELECT)', () => {
+  const col = (name: string, type: 'INTEGER' | 'TEXT') => ({ name, declaredType: type === 'INTEGER' ? 'INT' : 'TEXT', type, notNull: false, collation: 'binary' as const });
+  const create = (rows: PlanStatementInput & object, extra: { ifNotExists?: boolean; temp?: boolean } = {}): PlanStatementInput => ({
+    kind: 'schema',
+    op: { op: 'createTable', table: { name: 'u', columns: [col('name', 'TEXT'), col('n', 'INTEGER')], keys: [], checks: [], foreignKeys: [], storage: 'row' }, temp: extra.temp ?? false, ifNotExists: extra.ifNotExists ?? false, rows: rows as never },
+  });
+  const over = (min: number | null) => p.project(p.filter(p.scan('t', [1, 2]), p.call('cmp_gt', [p.col(0, 1, 'int'), min === null ? p.param(0, 'int') : p.lit(min)], 'int')), [p.col(0, 0, 'text'), p.col(0, 1, 'int')]);
+
+  it('creates the table and fills it in one statement', () => {
+    const d = db();
+    const r = d.preparePlan(create(over(15) as never)).run();
+    expect(r.changes).toBe(2);
+    expect(d.query('SELECT name, n FROM u ORDER BY n').rows).toEqual([['b', 20], ['c', 30]]);
+  });
+
+  it('reads parameters', () => {
+    const d = db();
+    d.preparePlan(create(over(null) as never)).run([25]);
+    expect(d.query('SELECT name FROM u').rows).toEqual([['c']]);
+  });
+
+  it('works for TEMP tables', () => {
+    const d = db();
+    d.preparePlan(create(over(15) as never, { temp: true })).run();
+    expect(d.query('SELECT count(*) FROM temp.u').rows).toEqual([[2]]);
+  });
+
+  it('leaves no table when filling fails', () => {
+    const d = db();
+    const table = { name: 'u', columns: [col('name', 'TEXT'), { ...col('n', 'INTEGER'), notNull: true }], keys: [], checks: [], foreignKeys: [], storage: 'row' as const };
+    // Row 4 has a NULL n: NOT NULL fails, and the table goes with it.
+    const rows = p.project(p.scan('t', [1, 2]), [p.col(0, 0, 'text'), p.col(0, 1, 'int')]);
+    expect(() => d.preparePlan({ kind: 'schema', op: { op: 'createTable', table, temp: false, ifNotExists: false, rows } }).run()).toThrow(/must not be null/);
+    expect(() => d.query('SELECT * FROM u')).toThrow(/no such table/);
+    // Inside a transaction too: the statement is undone, the transaction goes on.
+    d.exec('BEGIN');
+    d.exec("INSERT INTO t VALUES (5, 'e', 50)");
+    expect(() => d.preparePlan({ kind: 'schema', op: { op: 'createTable', table, temp: false, ifNotExists: false, rows } }).run()).toThrow(/must not be null/);
+    expect(() => d.query('SELECT * FROM u')).toThrow(/no such table/);
+    d.exec('COMMIT');
+    expect(d.query('SELECT count(*) FROM t').rows).toEqual([[5]]);
+  });
+
+  it('with ifNotExists, leaves an existing table as it is', () => {
+    const d = db();
+    d.preparePlan(create(over(15) as never)).run();
+    const r = d.preparePlan(create(over(0) as never, { ifNotExists: true })).run();
+    expect(r.changes).toBe(0);
+    expect(d.query('SELECT count(*) FROM u').rows).toEqual([[2]]);
+  });
+
+  it('refuses rows whose width is not the table’s', () => {
+    const d = db();
+    expect(() => d.preparePlan(create(p.scan('t', [0, 1, 2]) as never))).toThrow(/produces 3 column\(s\), the table has 2/);
+  });
+});
