@@ -1566,6 +1566,9 @@ export class Database implements FunctionContext {
         return this.received(b);
       case 'explain':
         return { ...b, query: this.received(b.query) };
+      case 'schema':
+        // CREATE TABLE … AS SELECT: its rows are a plan like any other.
+        return b.op.op === 'createTable' && b.op.rows ? { ...b, op: { ...b.op, rows: this.received({ plan: b.op.rows }).plan } } : b;
       default:
         return b;
     }
@@ -1621,16 +1624,16 @@ export class Database implements FunctionContext {
             throw new SmaltError('SMALT_UNSUPPORTED', 'vacuum statements are not supported yet');
         }
       case 'schema':
-        return done(this.compileSchemaOp(bound.op));
+        return done(this.compileSchemaOp(bound.op, paramCount));
     }
   }
 
   /** A schema operation's program (plan/schema.ts). */
-  private compileSchemaOp(op: SchemaOp): Omit<Program, 'regCount'> {
+  private compileSchemaOp(op: SchemaOp, paramCount: number): Omit<Program, 'regCount'> {
     // A view made with interfaces that didn't bind can only start to after a schema operation: try it then (ADR 0027).
-    const run = (f: () => RunResult): Omit<Program, 'regCount'> => ({
-      exec: () => {
-        let r = f();
+    const run = (f: (regs: SqlValue[]) => RunResult): Omit<Program, 'regCount'> => ({
+      exec: (regs) => {
+        let r = f(regs);
         // An index, a connection or a new external table changes nothing a view gives. Inside a transaction the check
         // waits for COMMIT, as deferred foreign keys do: a rebuild drops a table and renames another into its place.
         // With `cascade`, the views the operation breaks are dropped with it, now.
@@ -1650,7 +1653,7 @@ export class Database implements FunctionContext {
     });
     switch (op.op) {
       case 'createTable':
-        return run(() => this.createTable(op));
+        return run((regs) => (op.rows ? this.createTableAs(op, op.rows, regs, paramCount) : this.createTable(op)));
       case 'createIndex':
         return run(() => this.createIndex(op));
       case 'createConnection':
@@ -3234,6 +3237,24 @@ export class Database implements FunctionContext {
     this.tables.set(table.name.toLowerCase(), table);
     this.schemaChanged();
     return none;
+  }
+
+  /**
+   * A table created and filled with `rows` (CREATE TABLE … AS SELECT): the table, then an `append` of the plan's rows,
+   * planned once the table exists. Both run in this statement, so a failure leaves no table. With `ifNotExists`, an
+   * existing table is left as it is and nothing is appended.
+   */
+  private createTableAs(stmt: Extract<SchemaOp, { op: 'createTable' }>, rows: PlanOp, regs: SqlValue[], paramCount: number): RunResult {
+    const temp = stmt.temp || stmt.schema?.toLowerCase() === 'temp';
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    if (stmt.ifNotExists && (temp ? this.tempTables.has(stmt.table.name.toLowerCase()) : this.catalogEntries.has(stmt.table.name.toLowerCase()))) return none;
+    this.createTable(stmt);
+    const columns = stmt.table.columns.map((_, i) => i);
+    const append: PlanOp = { op: 'append', table: stmt.table.name, db: temp ? 'temp' : 'main', input: rows, columns, upserts: [] };
+    const prog = this.compileBound({ kind: 'write', plan: append }, paramCount, stmt.source?.text ?? '');
+    const inner: SqlValue[] = new Array(prog.regCount).fill(null);
+    for (let i = 0; i < paramCount; i++) inner[i] = regs[i];
+    return prog.exec!(inner);
   }
 
   /**

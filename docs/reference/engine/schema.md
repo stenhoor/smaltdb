@@ -13,7 +13,7 @@ it when ALTER TABLE changes the definition. Views need one; every other operatio
 
 | `op` | Fields |
 |---|---|
-| `createTable` | `table` (a `TableDef`), `schema?`, `temp`, `ifNotExists`, `source?` |
+| `createTable` | `table` (a `TableDef`), `schema?`, `temp`, `ifNotExists`, `source?`, `rows?` (a query plan whose rows fill the new table, as SQL's `CREATE TABLE … AS SELECT`: one output column per table column, appended in the same statement, so a failure leaves no table; with `ifNotExists` and an existing table, nothing is appended) |
 | `createIndex` | `index` (an `IndexDef`), `schema?`, `ifNotExists`, `source?` |
 | `createView` | `name`, `schema?`, `temp`, `ifNotExists`, `columns?` (result column names), `materialized`, `options?` and `withData?` (materialized views), `source` |
 | `createConnection` | `name`, `ifNotExists`, `options`, `source?` |
