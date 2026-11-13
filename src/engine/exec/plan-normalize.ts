@@ -73,7 +73,7 @@ function rewriteAll(x: unknown): unknown {
       // Its rewrite is an ordered join: rewritten in turn.
       return rewriteAll(unpivotRows(op));
     case 'explode':
-      // Its rewrite holds a window and an iteration: rewritten in turn.
+      // Its rewrite is an ordered join: rewritten in turn.
       return rewriteAll(explodeRows(op));
     default:
       return op;
@@ -116,6 +116,10 @@ function unordered<T extends { ordered?: unknown }>(op: T): T {
  */
 function orderedJoin(op: Op<'join'>): PlanOp {
   const [left, right] = op.inputs;
+  // A lateral source (a table function whose arguments read the left row, as `explode`'s `list_elements`) is joined
+  // after the left input and run once per left row, so its rows already come in the left order, then its own:
+  // numbering it would put a window between it and the row its arguments read.
+  if ((op.kind === 'inner' || op.kind === 'left' || op.kind === 'cross') && right.op === 'source' && right.args.some(readsInput)) return unordered(op);
   const l = planWidth(left);
   const r = planWidth(right);
   const joined: PlanOp = { ...unordered(op), inputs: [numbered(left), numbered(right)] };
@@ -124,6 +128,27 @@ function orderedJoin(op: Op<'join'>): PlanOp {
     { expr: column(l + 1 + r, 'int'), desc: false, nullsFirst: true, collation: 'binary' },
   ];
   return { op: 'project', input: { op: 'sort', input: joined, keys }, exprs: [...range(0, l), ...range(l + 1, l + 1 + r)] };
+}
+
+/** Whether `e` reads a column of the operation's own input (depth 0), outside any nested plan. */
+function readsInput(e: PlanExpr): boolean {
+  switch (e.k) {
+    case 'col':
+      return e.depth === 0;
+    case 'call':
+      return e.args.some(readsInput);
+    case 'cast':
+    case 'not':
+    case 'isNull':
+      return readsInput(e.arg);
+    case 'and':
+    case 'or':
+      return e.args.some(readsInput);
+    case 'case':
+      return e.whens.some((w) => readsInput(w.when) || readsInput(w.then)) || readsInput(e.else);
+    default:
+      return false;
+  }
 }
 
 const call = (fn: string, args: PlanExpr[] = [], star = false): WindowCall => ({ fn, args, star, collation: 'binary', type: 'int' });
@@ -236,40 +261,23 @@ function unpivotRows(op: Op<'unpivot'>): PlanOp {
   return { op: 'project', input: crossed, exprs: [...op.keep.map((i) => column(i)), column(w + 1, 'text'), value], ...(op.origin !== undefined ? { origin: op.origin } : {}) };
 }
 
-/** Iteration ids for the rewrites' own recursive steps: above any a language numbers its own from. */
-let rewriteIterationId = 1 << 30;
-
 /**
- * An explode (ADR 0020) as an iteration over each row's positions: the input numbered, each row given position 0, a
- * step adding the next position while it is within the list, the rows sorted by number and position (the input's order,
- * then the list's), and the list column read at each row's position. A row whose list is empty or NULL starts only
- * where it gives a row (`emptyAsNull`, `keepNulls`): its one row at position 0, whose element is NULL (`list_get` out of
- * range).
+ * `explode` (ADR 0020 step 3) as a lateral join of its input with `list_elements` of the list column (ADR 0031, section
+ * 2): each input row, then its elements in order, the element in the list's place. The join is ordered, so rows keep
+ * the input's order and then the list's; `list_elements` gives the empty and NULL lists' rows the options keep. One
+ * decode per list, no sort.
  */
 function explodeRows(op: Op<'explode'>): PlanOp {
   const w = planWidth(op.input);
   const n = parseNested(op.type);
   const element = (n && n.kind === 'list' ? n.of : 'any') as PlanType;
-  const id = rewriteIterationId++;
   const list: PlanExpr = { k: 'col', input: 0, index: op.column, depth: 0, type: op.type, collation: 'binary' };
-  const pos = column(w + 1, 'int');
-  const next: PlanExpr = { k: 'call', fn: 'add', args: [pos, { k: 'lit', value: 1, type: 'int' }], type: 'int' };
-  const length: PlanExpr = { k: 'call', fn: 'list_len', args: [list], type: 'int' };
-  // Which rows start: those with elements, and the empty and NULL lists the options keep.
-  const starts: PlanExpr[] = [cmp('cmp_gt', length, { k: 'lit', value: 0, type: 'int' })];
-  if (op.emptyAsNull) starts.push(cmp('cmp_eq', length, { k: 'lit', value: 0, type: 'int' }));
-  if (op.keepNulls !== false) starts.push({ k: 'isNull', arg: list, not: false });
-  const anyOf = starts.reduce((x, y): PlanExpr => ({ k: 'or', args: [x, y] }));
-  const first: PlanOp = { op: 'filter', input: numbered(op.input), pred: anyOf };
-  const init: PlanOp = { op: 'project', input: first, exprs: [...range(0, w + 1), { k: 'lit', value: 0, type: 'int' }] };
-  const types: PlanType[] = [...Array.from({ length: w }, (_, i): PlanType => (i === op.column ? op.type : 'any')), 'int', 'int'];
-  const within: PlanExpr = cmp('cmp_lt', next, { k: 'call', fn: 'list_len', args: [list], type: 'int' });
-  const step: PlanOp = { op: 'project', input: { op: 'filter', input: { op: 'working', id, types }, pred: within }, exprs: [...range(0, w + 1), next] };
-  const rows: PlanOp = { op: 'iterate', id, name: 'explode', init, steps: [step], distinct: false, collations: types.map(() => 'binary') };
-  const key = (e: PlanExpr): SortKey => ({ expr: e, desc: false, nullsFirst: true, collation: 'binary' });
-  const sorted: PlanOp = { op: 'sort', input: rows, keys: [key(column(w, 'int')), key(pos)] };
-  const exprs = range(0, w).map((e, i): PlanExpr => (i === op.column ? { k: 'call', fn: 'list_get', args: [list, pos], type: element } : e));
-  return { op: 'project', input: sorted, exprs: op.position ? [...exprs, pos] : exprs, ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+  const flag = (on: boolean): PlanExpr => ({ k: 'lit', value: on ? 1 : 0, type: 'int' });
+  const elements: PlanOp = { op: 'source', kind: 'function', name: 'list_elements', args: [list, flag(!!op.emptyAsNull), flag(op.keepNulls !== false)], types: [element, 'int'] };
+  const joined: PlanOp = { op: 'join', kind: 'inner', inputs: [op.input, elements], ordered: true };
+  const exprs = range(0, w).map((e, i): PlanExpr => (i === op.column ? { k: 'col', input: 0, index: w, depth: 0, type: element, collation: 'binary' } : e));
+  if (op.position) exprs.push({ k: 'col', input: 0, index: w + 1, depth: 0, type: 'int', collation: 'binary' });
+  return { op: 'project', input: joined, exprs, ...(op.origin !== undefined ? { origin: op.origin } : {}) };
 }
 
 /**
