@@ -1,6 +1,7 @@
 # ADR 0031: Processing lists and structs
 
-- **Status:** proposed
+- **Status:** accepted with the owner's decisions of 2026-11-13 (at the end): decision 1 takes the alternative, a new
+  expression kind (section 4); the others as recommended
 - **Date:** 2026-11-12
 - **Builds on:** [ADR 0020](0020-lists-and-structs.md) (the types, their values and first operations, `explode`);
   [ADR 0022](0022-sql-for-the-new-engine-features.md) (SQL's `ARRAY[…]`, `unnest`, `array_agg`);
@@ -101,26 +102,36 @@ gives null; null elements count as elements, and the numeric functions skip them
 | Options of existing functions | `list_sort` nulls last; `list_join` keeping nulls; `list_contains` with null not equal to null; `list_get` failing out of range |
 | Structs | none: `struct_of` and `struct_field` build every struct change (section 5) |
 
-### 4. Expressions over elements: correlated subqueries over `list_elements`
+### 4. Expressions over elements: a new expression kind
 
-`list.eval(expr)`, `list.filter(pred)` and `list.agg(expr)` need an expression evaluated per element. Rather than a new
-expression kind, each is a correlated scalar subquery over `list_elements` of the outer row's list, which the plan
-language already has:
+`list.eval(expr)`, `list.filter(pred)` and `list.agg(expr)` evaluate an expression per element. The plan language gets
+one new expression kind, `each`, and a reference inside it, `element` (owner's decision 1):
 
-| Method | Plan |
-| --- | --- |
-| `list.eval(e)` | `(implode(e) over list_elements(v), ordered by position)` |
-| `list.filter(p)` | `(implode(element) over list_elements(v) where p, ordered by position)` |
-| `list.agg(a)` | `(a over list_elements(v))` |
+```ts
+{ k: 'each', list: PlanExpr, mode: 'map', body: PlanExpr, type }                         // list.eval: a list
+{ k: 'each', list: PlanExpr, mode: 'filter', body: PlanExpr, type }                      // list.filter: a list
+{ k: 'each', list: PlanExpr, mode: 'agg', aggs: AggCall[], body: PlanExpr, type }        // list.agg: one value
+{ k: 'element', part: 'value' | 'position', depth: number, type }                        // in a body
+{ k: 'eachAgg', index: number, depth: number, type }                                     // an agg's result, in an 'agg' body
+```
 
-The element is the subquery's column 0 (its position, column 1); the outer row is depth 1. Everything an expression can
-do works on elements: functions, `case`, aggregates, even a window over the elements.
+- **`map`** gives a list of `body` for each element, in order: `list<typeOf(body)>`. **`filter`** keeps the elements
+  for which `body` (a `bool`) is true, in order. **`agg`** runs `aggs` (the aggregate operation's own `AggCall`s, any of
+  the engine's aggregates) over the elements, then `body` over their results: `list.agg(element().sum().div(len()))`.
+  A null list gives null in every mode; an empty list gives `[]`, `[]`, and the aggregates of no rows.
+- **What a body reads** (owner's decision 1a): the element and its position (`element`), and the enclosing row's
+  columns (`col`), so `list.filter(element().gt(col('threshold')))` works.
+- **Nesting** (decision 1c): a body may contain `each` of its own. `element` with `depth` 0 is the innermost list's
+  element, `depth` 1 the next one out, and so on.
+- **Running it:** `exec/expr.ts` and `codegen.ts` compile a body once; at run time `each` decodes the list once (with the
+  `elements()` cache of `nested-ops.ts`), binds each element to the body's register and evaluates it. `agg` feeds the
+  elements to the aggregates' step functions, as the aggregate operator does. There is no subquery and no per-row plan.
+- **Everywhere an expression goes:** the validator, the plan codec (`print.ts`, the plan JSON), types (`output.ts`),
+  `smaltdb/plan`'s builders and the catalog's description of expressions learn `each`, `element` and `eachAgg`. A
+  language that never builds them is unaffected.
 
-The engine's part: a correlated subquery over `list_elements` is **not decorrelated**. It runs per outer row, which here
-is what's wanted: each run decodes one list. The work is making that per-row run cheap: the subquery's plan compiled once,
-`list_elements` reading the outer value without copying it, and `implode` writing the result directly. A benchmark gates
-it (Order of work, step 5): `list.eval(element() * 10)` within 3 times `list_sum` on the table above. If it doesn't
-reach that, a fused native form of the three shapes above is the fallback, with no change to the plan language.
+`list_elements` (section 2) stays: it is `explode`'s and `unnest`'s source, and SQL's correlated subqueries over
+`unnest` keep working for element work in the meantime.
 
 ### 5. smaltdf
 
@@ -129,16 +140,17 @@ reach that, a fused native form of the three shapes above is the fallback, with 
   `struct.drop`, `struct.select` (Polars' `struct.eval`) and `struct.jsonEncode` (`cast_text`). `list.toStruct(fields)`
   is `list_get` per field.
 - **The functions of section 3** as `list` methods, with Polars' names in camel case.
-- **`element()`**, and `list.eval`, `list.filter` and `list.agg` as in section 4.
+- **`element()`** (with `element().position()`), and `list.eval`, `list.filter` and `list.agg` as in section 4; `col` in a
+  body reads the row.
 - **`explode` of several list columns**, zipped (Polars' `explode([a, b])`): a lateral join with `list_elements` of
   each, matched on position.
 - Each method has its reference page, grammar rule and Polars comparison case (smaltdf's documentation standard).
 
 ### 6. SQL
 
-smaltql exposes section 3's functions under its own names, and decides in its own record whether SQL gets an element
-syntax (lambdas, as `list_transform(v, x -> x * 10)`) or keeps to correlated subqueries over `unnest`, which work as soon
-as sections 2 and 4 are in: `SELECT (SELECT array_agg(x * 10) FROM unnest(t.v) AS u(x)) FROM t`.
+smaltql exposes section 3's functions under its own names now. Whether SQL gets syntax for element expressions (lambdas,
+as `list_transform(v, x -> x * 10)`) it decides in its own record, later (owner's decision 5). Until then,
+correlated subqueries over `unnest` do element work: `SELECT (SELECT array_agg(x * 10) FROM unnest(t.v) AS u(x)) FROM t`.
 
 ## Order of work
 
@@ -150,41 +162,39 @@ One PR each, unless the size says more. Sizes: S is one PR, M two or three.
 | 2 | smaltdf | Building and changing structs and lists (section 5, first two items), and the Polars comparison case for `list.get` out of range | S | |
 | 3 | smaltdb | `list_elements`; `explode` as a lateral join on it; the recursive rewrite removed; a benchmark in `bench/` | M | 1 |
 | 4 | smaltdb | The functions of section 3 | M | |
-| 5 | smaltdb | Correlated subqueries over `list_elements` run per row, cheaply; the benchmark gate of section 4 | M | 3 |
-| 6 | smaltdf | The methods for step 4; `element()`, `list.eval`, `list.filter`, `list.agg`; `explode` of several columns | M | 4, 5 |
-| 7 | smaltql | Section 3's functions in SQL, and its own record on element syntax | M | 4 |
+| 5 | smaltdb | `each`, `element` and `eachAgg` (section 4): plan types, validator, codec, builders, the closure compiler and codegen; a benchmark in `bench/` against `list_sum` | M | |
+| 6 | smaltdf | The methods for step 4; `element()`, `list.eval`, `list.filter`, `list.agg`; `explode` of several columns | M | 3, 4, 5 |
+| 7 | smaltql | Section 3's functions in SQL | M | 4 |
 | 8 | smaltdb, smaltdf | The roadmap and status pages; this record's status | S | 6 |
 
-Steps 1, 2 and 4 can run side by side: none depends on another.
+Steps 1, 2, 4 and 5 can run side by side: none depends on another. Step 1 goes first (owner's decision 6).
 
-## Open points for the owner
+## Owner's decisions (2026-11-13)
+
+The questions as they were put, with what was decided:
 
 1. **How expressions over elements run.**
-   - **Recommendation:** correlated subqueries over `list_elements` (section 4). Nothing new in the plan language, and
-     every expression works on elements, aggregates and windows included. Risk: per-row overhead, which the step 5
-     benchmark gates, with a native fallback.
-   - **Alternative:** a new expression kind (`{ k: 'each', list, body }`, with an `element` reference) compiled into the
-     expression evaluator. Fastest, but a plan-language change every language and the codec must learn, and aggregates
-     over elements would need their own path.
-2. **`explode` on `list_elements`.**
-   - **Recommendation:** yes (section 2): one path for `explode`, SQL's `unnest` and section 4.
-   - **Alternative:** keep the rewrite and make it cheaper (no sort, no length re-read). Smaller change, but two ways
-     to reach elements.
-3. **`list.get` out of range.** Polars 2.1 fails by default (`null_on_oob=False`); smaltdf gives null, and its
-   comparison test hides the difference by passing `null_on_oob=True`.
-   - **Recommendation:** keep null (ragged lists make out-of-range normal data), and list the difference in smaltdf's
-     "Compared with Polars".
-   - **Alternative:** fail by default, as owner's decision E fails on overflow, with `nullOnOob` to get null.
-4. **The set functions' order.** Polars doesn't promise one.
-   - **Recommendation:** first-appearance order, left list then right, as `list_unique` already does: results are
-     stable and testable.
-   - **Alternative:** sorted.
+   - **Decided: a new expression kind** (section 4), the alternative. Fastest, and nothing runs per row as a plan.
+   - **Recommended, not taken:** correlated subqueries over `list_elements`, with nothing new in the plan language.
+   - Follow-ups, each as recommended:
+     - **(a) What a body reads:** the element, its position and the enclosing row's columns, not the element only.
+     - **(b) `list.agg`:** any of the engine's aggregates over the elements, not only the `list_*` functions.
+     - **(c) Nesting:** bodies nest; `element` refers to the innermost list, with an explicit `depth` for outer ones.
+2. **`explode` on `list_elements`:** yes, as recommended (section 2). One path for `explode` and SQL's `unnest`; the
+   recursive rewrite goes.
+3. **`list.get` out of range:** null, as recommended, with the difference from Polars 2.1 (which fails unless
+   `null_on_oob=True`) in smaltdf's "Compared with Polars".
+4. **The set functions' order:** first appearance, left list then right, as recommended.
+5. **SQL syntax for element expressions:** later, in smaltql's own record, as recommended.
+6. **Where to start:** step 1, the semi and anti join fix.
+7. **Tracking:** ADR 0031 gets a row in smalt-brand's WORK.md.
 
 ## Consequences
 
-- smaltdf can build and change structs, process lists in place, and run any expression on elements, with the cost of one
-  list decode per row instead of an explode, a group and a join.
+- smaltdf can build and change structs, process lists in place, and run any expression or aggregate on elements, with
+  the cost of one list decode per row instead of an explode, a group and a join.
 - Semi and anti joins stop being quadratic for every language, lists or not.
 - `explode` and SQL's `unnest` get faster and lose the recursive rewrite.
-- The plan language gains one table function and the functions of section 3, and nothing else, unless open point 1's
-  alternative is chosen.
+- The plan language gains one table function, the functions of section 3, and three expression kinds (`each`,
+  `element`, `eachAgg`): every place that reads plan expressions learns them, and a language that doesn't build them
+  is unaffected.
