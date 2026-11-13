@@ -40,7 +40,7 @@ Known limitation: DuckDB-WASM's OPFS tables did not survive terminate + reopen i
 | Analytic: GROUP BY (100 groups) | 25.5 (24.7–30.3) | 67.5 (66.1–78.4) | 67.9 | 66.4 | **2.6× faster** |
 | Analytic: arithmetic filter + aggregate | 20.9 (20.5–26.5) | 8.3 (8.2–12.0) | 8.7 | 8.3 | **2.5× slower** |
 
-**Honest summary:** smaltdb is faster at bulk loading, warm scans, and hash GROUP BY. It is on par for warm point lookups. It is
+**Summary:** smaltdb is faster at bulk loading, warm scans, and hash GROUP BY. It is on par for warm point lookups. It is
 **slower** on durable small commits, cold reads, and scan-heavy filtering/arithmetic. This replaces the earlier
 "beats SQLite on every workload" claim, which compared against a crash-safe SQLite and used single runs.
 
@@ -136,8 +136,7 @@ full scan now compile into one generated function per pipeline. Versus the faste
 | GROUP BY (100 groups) (not fused) | **3.33× faster** | **3.72× faster** |
 | Arithmetic filter + aggregate | 8.4 vs 8.7 ms: tie (ranges overlap) | 4.0 vs 8.1 ms: **2.01× faster** |
 
-All other workloads are unchanged (1.2–4.8× faster). smaltdb is now faster than or tied with crash-safe SQLite WASM on every workload in the
-suite. See also [vectorization-review.md](vectorization-review.md).
+All other workloads are unchanged (1.2–4.8× faster). No workload in the suite has a longer median in smaltdb than in crash-safe SQLite WASM. See also [vectorization-review.md](vectorization-review.md).
 
 ## Update: fused pipelines for scan + filter and GROUP BY (2026-11-01)
 
@@ -150,7 +149,7 @@ Raw data: [bench/results/2026-11-01-chromium-5ba5455.json](../../bench/results/2
 | GROUP BY (100 groups) | **5.44× faster** (was 3.37×) | **8.08× faster** (was 3.49×) |
 | Arithmetic filter + aggregate | **1.24× faster** (was a tie) | **2.29× faster** |
 
-**smaltdb is now faster than crash-safe SQLite WASM on every workload in the suite, including first runs, with non-overlapping ranges.**
+Every workload's range, first runs included, now lies below crash-safe SQLite WASM's, with no overlap (tables above).
 
 Caveat on cold reads: in this run smaltdb's cold point lookups measured 97 ms (90–103) while running after the other engines. Re-run alone
 they measured 59–63 ms, matching earlier runs, and one standalone repetition spiked to 98 ms. Cold OPFS I/O in this shared container is noisy

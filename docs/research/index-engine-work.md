@@ -57,7 +57,7 @@ do not overlap. All engines returned identical results in every run.
 
 The non-index workloads (OLTP, analytic, joins) are unchanged within run-to-run noise.
 
-## Still behind SQLite, CPU-only
+## Longer than SQLite, CPU-only
 
 - **UPDATE (3×) and DELETE (1.8×).** The cost is spread across several places:
   - UPDATE runs in two passes: collect rowids, then re-read each row by rowid;

@@ -74,7 +74,7 @@
 - Leaf pages hold **slotted records**:
   - A slot directory sits at the page tail and the cells grow from the head. Records are found by binary search on the slot directory.
   - **Record format**: a null bitmap, then fixed-width columns at fixed offsets, then a variable-width offset table, then variable data.
-    Unlike SQLite's varint serial types, fixed offsets let the executor decode a single column without parsing the whole record.
+    Fixed offsets, rather than varint serial types, let the executor decode a single column without parsing the whole record.
     INTEGER, BOOLEAN (0 and 1, ADR 0018), DATE, DATETIME, TIME, DURATION (days and µs, ADR 0019) and REAL columns are
     fixed-width (8 bytes); the BOOLEAN and temporal columns are stored as an INTEGER is. LIST and STRUCT columns
     (ADR 0020) are variable-width and stored as an ANY column holding a BLOB is (tag byte and bytes): their value is a

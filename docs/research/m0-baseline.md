@@ -40,8 +40,7 @@ Every M1+ milestone reruns this suite.
 
 - **SQLite:** with the default `locking_mode=NORMAL`, point lookups took about 725 µs each, because every autocommit read
   re-validates its cache. `EXCLUSIVE` is the usual recommendation for opfs-sahpool, which supports only one connection anyway, so we benchmark that.
-- **PGlite:** about 0.75 ms per query even inside a single read-only transaction. This looks like per-query overhead
-  in its async query path. Bulk insert uses multi-row `INSERT`; `COPY` would probably be faster.
+- **PGlite:** about 0.75 ms per query even inside a single read-only transaction. Bulk insert uses multi-row `INSERT`.
 - **DuckDB-WASM:** it is an analytics engine behind its own worker, so per-statement round trips dominate point lookups.
   Its strengths (vectorized aggregates and joins over columnar data) are not exercised here. The TPC-H suite (M3/M7)
   is the right comparison for it.

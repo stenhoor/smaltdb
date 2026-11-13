@@ -1,4 +1,4 @@
-# smaltdb against SQLite WASM and native SQLite (2026-11-04)
+# Timings: smaltdb, SQLite WASM and native SQLite (2026-11-04)
 
 Two comparisons over the same workloads (`bench/shared/workloads.ts`), with the same cross-engine result checks:
 every engine returned identical results for every read workload in all four runs.
@@ -20,15 +20,15 @@ Raw data: [chromium OPFS](../../bench/results/2026-11-04-chromium-5e5f9df.json),
 
 ## Summary
 
-**Against SQLite WASM in the browser, smaltdb is faster or even on almost every workload.**
+**Browser: smaltdb and SQLite WASM on the same workloads.**
 - **Durable (OPFS):** most workloads are 1.2–39× faster than SQLite WAL; the 39× is cold point lookups. Most
   analytic, materialized-view and join repeats are 2.5–14× faster. Warm point lookups and indexed equality, range and
   composite lookups are even.
 - **First runs of short statements:** J2, J3 and J5 are 2.6–3.6× slower on their first run, because planning and
-  code generation dominate a 1–9 ms statement. They win once repeated.
-- **In memory:** SQLite WASM is ahead on these workloads:
+  code generation dominate a 1–9 ms statement. Repeated, they take less time than SQLite's.
+- **In memory:** these workloads take longer in smaltdb:
 
-  | Workload | SQLite WASM ahead by |
+  | Workload | smaltdb's time, × SQLite WASM's |
   |---|---|
   | UPDATE of an indexed column (10k rows, 3 indexes) | 3.3× |
   | Building a projection | 2.8× |
@@ -38,15 +38,15 @@ Raw data: [chromium OPFS](../../bench/results/2026-11-04-chromium-5e5f9df.json),
   | Indexed range lookups | 1.3× |
   | First runs of joins J3 and J5 | 2.3–3.1× |
 
-  The OPFS numbers hide these because SQLite's durable writes are slower there.
+  On OPFS, durable writes dominate both engines' times, so these differences don't show there.
 
-**Against native SQLite, smaltdb wins on analytics and loses on row-at-a-time work by 1.5–5×.**
-- **Where smaltdb wins:** scans, repeated aggregates, materialized views and joins, by 1.5–9.5×. First runs of the
-  simple analytic queries lose 1.6–1.8×. Native SQLite's row-at-a-time
-  executor doesn't benefit from smaltdb's fused, generated pipelines and columnar projections.
-- **Where it loses:**
+**Node: smaltdb and native SQLite on the same workloads.**
+- **Shorter in smaltdb:** scans, repeated aggregates, materialized views and joins, by 1.5–9.5×. First runs of the
+  simple analytic queries take 1.6–1.8× longer. smaltdb runs these as fused, generated pipelines over columnar
+  projections.
+- **Longer in smaltdb:**
 
-  | Workload | Native SQLite ahead by |
+  | Workload | smaltdb's time, × native SQLite's |
   |---|---|
   | Prepared point lookups (warm, cold) | 2.3–4.5× |
   | Bulk loads (inserts, analytic and join tables) | 2.1–2.8× |
@@ -59,14 +59,13 @@ Raw data: [chromium OPFS](../../bench/results/2026-11-04-chromium-5e5f9df.json),
   decoding are the work.
 - **`synchronous=NORMAL`:** native SQLite skips the fsync per commit, which smaltdb always does. That makes its
   single-row commits about 47× faster. The two are not comparable on durability.
-- **WASM costs SQLite 1.2–6.6× against native,** about 3–4× on bulk loads and point lookups (Node, in memory). That
-  is why, in the browser, smaltdb is even with SQLite WASM or ahead on the same workloads.
+- **WASM costs SQLite 1.2–6.6× against native,** about 3–4× on bulk loads and point lookups (Node, in memory).
 
 **What to work on, from these numbers:**
-1. **First-run cost of short statements.** J2, J3 and J5 first runs lose 5–14× to native, even though their repeats
-   win. This is the planning and code generation per new statement that #69–#71 reduced. The remaining step is
+1. **First-run cost of short statements.** J2, J3 and J5 first runs take 5–14× native's time, though their repeats take
+   less. This is the planning and code generation per new statement that #69–#71 reduced. The remaining step is
    compiling straight from the plan once the AST path is deleted.
-2. **Bulk load and index maintenance:** about 2.5× behind native, and behind WASM in memory on indexed UPDATE/DELETE.
+2. **Bulk load and index maintenance:** about 2.5× native's time, and longer than WASM in memory on indexed UPDATE/DELETE.
    The record encoder, key encoder and B-tree insert path are the place to look.
 3. **Prepared point lookups:** 2.3–4.5× behind native, and even with WASM in the browser.
 

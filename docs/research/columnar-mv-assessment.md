@@ -13,7 +13,7 @@ users a way to get analytical performance without changing their base tables?
 ## Measurement
 
 The spike compares today's row store with a columnar layout. The row store is B+tree records with
-generated fused scan/filter/aggregate pipelines, and it already beats SQLite WASM on these queries.
+generated fused scan/filter/aggregate pipelines.
 The columnar layout is one typed array per column plus per-4096-row min/max zone maps. Both run in
 memory, in Node, and report the median of 21 runs. The data is the browser harness's analytic table
 plus a clustered `ts` column (insertion order, like a timestamp).
