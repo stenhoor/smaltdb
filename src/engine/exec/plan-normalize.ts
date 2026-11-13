@@ -273,11 +273,25 @@ function explodeRows(op: Op<'explode'>): PlanOp {
   const w = planWidth(op.input);
   const n = parseNested(op.type);
   const element = (n && n.kind === 'list' ? n.of : 'any') as PlanType;
-  const list: PlanExpr = { k: 'col', input: 0, index: op.column, depth: 0, type: op.type, collation: 'binary' };
+  const column = (index: number, type: PlanType): PlanExpr => ({ k: 'col', input: 0, index, depth: 0, type, collation: 'binary' });
+  const also = op.also ?? [];
+  // Lists zipped with it: the source reads its list once their lengths are checked, and each row reads their element
+  // at the source's position.
+  // The check's errors name where the explode came from, as its other errors do.
+  const list: PlanExpr = also.length
+    ? { k: 'call', fn: 'list_same_lengths', args: [column(op.column, op.type), ...also.map((a) => column(a.column, a.type))], type: op.type, ...(op.origin !== undefined ? { origin: op.origin } : {}) }
+    : column(op.column, op.type);
   const flag = (on: boolean): PlanExpr => ({ k: 'lit', value: on ? 1 : 0, type: 'int' });
   const elements: PlanOp = { op: 'source', kind: 'function', name: 'list_elements', args: [list, flag(!!op.emptyAsNull), flag(op.keepNulls !== false)], types: [element, 'int'] };
   const joined: PlanOp = { op: 'join', kind: 'inner', inputs: [op.input, elements], ordered: true };
-  const exprs = range(0, w).map((e, i): PlanExpr => (i === op.column ? { k: 'col', input: 0, index: w, depth: 0, type: element, collation: 'binary' } : e));
+  const zipped = new Map(also.map((a) => [a.column, a.type]));
+  const exprs = range(0, w).map((e, i): PlanExpr => {
+    if (i === op.column) return column(w, element);
+    const t = zipped.get(i);
+    if (t === undefined) return e;
+    const m = parseNested(t);
+    return { k: 'call', fn: 'list_get', args: [column(i, t), column(w + 1, 'int')], type: (m && m.kind === 'list' ? m.of : 'any') as PlanType };
+  });
   if (op.position) exprs.push({ k: 'col', input: 0, index: w + 1, depth: 0, type: 'int', collation: 'binary' });
   return { op: 'project', input: joined, exprs, ...(op.origin !== undefined ? { origin: op.origin } : {}) };
 }

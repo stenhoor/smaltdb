@@ -2050,6 +2050,9 @@ export class Planner {
   private externalScan(item: PlanLeaf, scope: Scope, planArgs: BoundExpr[], planNamed?: Record<string, BoundExpr>): ExternalScan | undefined {
     if (item.kind === 'function') {
       if (!this.env.externalFunction) return undefined;
+      // The engine's own table functions (list_elements) aren't external, and their arguments may read the row of a
+      // lateral join: they aren't constants to evaluate here.
+      if (this.env.virtualTable?.(undefined, item.name)) return undefined;
       const v = (b: BoundExpr): SqlValue => compileBoundExpr(b, this.env.funcCtx).fn([]);
       const named: Record<string, SqlValue> = {};
       for (const [k, b] of Object.entries(planNamed ?? {})) named[k] = v(b);

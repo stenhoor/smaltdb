@@ -7,6 +7,7 @@ import { Database } from '../src/engine/database.js';
 import { plan as p } from '../src/engine/index.js';
 import type { PlanExpr } from '../src/engine/plan/expr.js';
 import type { PlanType } from '../src/engine/plan/types.js';
+import { printPlan } from '../src/engine/plan/print.js';
 
 const db = Database.openMemory();
 const L = (t: string) => t as PlanType;
@@ -117,6 +118,47 @@ describe('explode', () => {
     // explode then implode gives the lists back (an empty list's row is gone; a NULL list's NULL row comes back as [null]).
     const back = p.aggregate(exploded, [p.col(0, 0, 'int')], [p.agg('implode', [p.col(0, 1, 'int')], L('list<int>'))], { ordered: 'first' } as never);
     expect(db.queryPlan(p.sort(back, [p.asc(p.col(0, 0, 'int'))])).rows).toEqual([[1, [10, 20]], [3, [null]], [4, [30]]]);
+  });
+
+  it('several list columns zipped by position, as long as each other in each row', () => {
+    const zip = () => p.fromColumns([[1, 2, 3, 4], [[10, 20], [], null, [30]], [['a', 'b'], [], null, ['c']], [[true, false], [], null, [null]]], ['int', L('list<int>'), L('list<text>'), L('list<bool>')]);
+    const also = [{ column: 2, type: L('list<text>') }, { column: 3, type: L('list<bool>') }];
+    const r = db.queryPlan(p.explode(zip(), 1, L('list<int>'), { also, position: true }));
+    expect(r.rows).toEqual([
+      [1, 10, 'a', true, 0],
+      [1, 20, 'b', false, 1],
+      [3, null, null, null, 0],
+      [4, 30, 'c', null, 0],
+    ]);
+    expect(r.columnTypes).toEqual(['int', 'int', 'text', 'bool', 'int']);
+    const ids = (o: Parameters<typeof p.explode>[3]) => db.queryPlan(p.explode(zip(), 1, L('list<int>'), { also, ...o })).rows.map((x) => x[0]);
+    expect(ids({ emptyAsNull: true })).toEqual([1, 1, 2, 3, 4]);
+    expect(ids({ keepNulls: false })).toEqual([1, 1, 4]);
+    expect(printPlan(p.explode(zip(), 1, L('list<int>'), { also }))).toMatch(/^explode 1 list<int>, 2 list<text>, 3 list<bool>/);
+  });
+
+  it('zipped lists of different lengths are an error; a NULL list matches only NULL', () => {
+    const run = (b: unknown[]) => () => db.queryPlan(p.explode(p.fromColumns([[[1, 2], [3]], b] as never, [L('list<int>'), L('list<int>')]), 0, L('list<int>'), { also: [{ column: 1, type: L('list<int>') }] }));
+    expect(run([[1], [3]])).toThrow(/lists zipped together have different lengths: 2 and 1/);
+    expect(run([[1, 2, 3], [3]])).toThrow(/different lengths: 2 and 3/);
+    expect(run([[1, 2], null])).toThrow(/different lengths: 1 and null/);
+    expect(run([[1, 2], [4]])).not.toThrow();
+    // The error carries the explode's origin.
+    const withOrigin = { ...p.explode(p.fromColumns([[[1, 2]], [[1]]] as never, [L('list<int>'), L('list<int>')]), 0, L('list<int>'), { also: [{ column: 1, type: L('list<int>') }] }), origin: { step: 'explode' } };
+    let err: unknown;
+    try {
+      db.queryPlan(withOrigin as never);
+    } catch (e) {
+      err = e;
+    }
+    expect((err as { origin?: unknown }).origin).toEqual({ step: 'explode' });
+  });
+
+  it('checks the zipped columns', () => {
+    const one = (also: unknown) => () => db.queryPlan(p.explode(src(), 1, L('list<int>'), { also } as never));
+    expect(one([{ column: 9, type: L('list<int>') }])).toThrow(/also\[0\]\.column: no column 9/);
+    expect(one([{ column: 1, type: L('list<int>') }])).toThrow(/column 1 is exploded twice/);
+    expect(one([{ column: 2, type: 'text' }])).toThrow(/also\[0\]\.type: expected a list type/);
   });
 
   it('a long list', () => {

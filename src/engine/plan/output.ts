@@ -48,6 +48,10 @@ export function outputTypes(op: PlanOp, tableTypes: TableTypes): PlanType[] {
       const t = outputTypes(op.input, tableTypes).slice();
       const n = parseNested(op.type);
       t[op.column] = n && n.kind === 'list' ? (n.of as PlanType) : 'any';
+      for (const a of op.also ?? []) {
+        const m = parseNested(a.type);
+        t[a.column] = m && m.kind === 'list' ? (m.of as PlanType) : 'any';
+      }
       return op.position ? [...t, 'int'] : t;
     }
     case 'unpivot': {

@@ -92,7 +92,7 @@ export function printPlan(op: PlanOp, depth = 0): string {
     case 'pivot':
       return `${pad}pivot ${printExpr(op.on)} in (${op.values.map((v) => JSON.stringify(typeof v === 'bigint' ? String(v) : v)).join(', ')}) by [${op.keys.map((k) => printExpr(k.expr)).join(', ')}]\n${sub(op.input)}`;
     case 'explode':
-      return `${pad}explode ${op.column} ${op.type}${op.position ? ' with position' : ''}\n${sub(op.input)}`;
+      return `${pad}explode ${op.column} ${op.type}${(op.also ?? []).map((a) => `, ${a.column} ${a.type}`).join('')}${op.position ? ' with position' : ''}\n${sub(op.input)}`;
     case 'unpivot':
       return `${pad}unpivot keep [${op.keep.join(', ')}] columns [${op.columns.map((c, i) => `${c} as ${JSON.stringify(op.names[i])}`).join(', ')}]\n${sub(op.input)}`;
     case 'distinct':
