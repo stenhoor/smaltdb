@@ -52,6 +52,16 @@ describe('subquery decorrelation', () => {
       'SELECT id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k AND EXISTS (SELECT 1 FROM o AS o3 WHERE o3.k = i.k))',
       'SELECT id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k > o.k)', // not decorrelatable: stays correct
       'SELECT id, (SELECT v FROM i WHERE i.k = o.k ORDER BY v LIMIT 1) FROM o',
+      // Derived FROM items (ADR 0031, section 1): decorrelated too, with the derived columns' collations and affinity.
+      'SELECT id FROM o WHERE EXISTS (SELECT 1 FROM (SELECT k FROM i GROUP BY k) AS g WHERE g.k = o.k)',
+      'SELECT id FROM o WHERE NOT EXISTS (SELECT 1 FROM (SELECT k FROM i GROUP BY k) AS g WHERE g.k = o.k)',
+      'SELECT id FROM o WHERE EXISTS (SELECT 1 FROM (SELECT s FROM i WHERE v > 5 GROUP BY s) AS g WHERE g.s = o.s)',
+      'SELECT id FROM o WHERE EXISTS (SELECT 1 FROM (SELECT s FROM i WHERE v > 5 GROUP BY s) AS g WHERE o.s = g.s)',
+      'SELECT id FROM o WHERE EXISTS (SELECT 1 FROM (SELECT t FROM i GROUP BY t) AS g WHERE g.t = o.t)',
+      'SELECT id FROM o WHERE EXISTS (SELECT 1 FROM (SELECT n FROM i GROUP BY n) AS g WHERE g.n = o.k)',
+      'SELECT id FROM o WHERE EXISTS (SELECT 1 FROM (SELECT k FROM i UNION ALL SELECT k FROM o) AS g WHERE g.k = o.k AND o.id > 1)',
+      'SELECT id, (SELECT count(*) FROM (SELECT k, v FROM i WHERE v IS NOT NULL GROUP BY k, v) AS g WHERE g.k = o.k) FROM o',
+      'SELECT id, (SELECT sum(v) FROM (SELECT k, v FROM i UNION ALL SELECT k, v FROM i) AS g WHERE g.k = o.k) FROM o',
     ];
     for (const q of qs) {
       const a = JSON.stringify(lite.selectArrays(q).map((r) => r.map(canon).join('|')).sort());
