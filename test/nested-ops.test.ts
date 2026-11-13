@@ -143,6 +143,15 @@ describe('explode', () => {
     expect(run([[1, 2, 3], [3]])).toThrow(/different lengths: 2 and 3/);
     expect(run([[1, 2], null])).toThrow(/different lengths: 1 and null/);
     expect(run([[1, 2], [4]])).not.toThrow();
+    // The error carries the explode's origin.
+    const withOrigin = { ...p.explode(p.fromColumns([[[1, 2]], [[1]]] as never, [L('list<int>'), L('list<int>')]), 0, L('list<int>'), { also: [{ column: 1, type: L('list<int>') }] }), origin: { step: 'explode' } };
+    let err: unknown;
+    try {
+      db.queryPlan(withOrigin as never);
+    } catch (e) {
+      err = e;
+    }
+    expect((err as { origin?: unknown }).origin).toEqual({ step: 'explode' });
   });
 
   it('checks the zipped columns', () => {

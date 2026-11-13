@@ -277,7 +277,10 @@ function explodeRows(op: Op<'explode'>): PlanOp {
   const also = op.also ?? [];
   // Lists zipped with it: the source reads its list once their lengths are checked, and each row reads their element
   // at the source's position.
-  const list: PlanExpr = also.length ? { k: 'call', fn: 'list_same_lengths', args: [column(op.column, op.type), ...also.map((a) => column(a.column, a.type))], type: op.type } : column(op.column, op.type);
+  // The check's errors name where the explode came from, as its other errors do.
+  const list: PlanExpr = also.length
+    ? { k: 'call', fn: 'list_same_lengths', args: [column(op.column, op.type), ...also.map((a) => column(a.column, a.type))], type: op.type, ...(op.origin !== undefined ? { origin: op.origin } : {}) }
+    : column(op.column, op.type);
   const flag = (on: boolean): PlanExpr => ({ k: 'lit', value: on ? 1 : 0, type: 'int' });
   const elements: PlanOp = { op: 'source', kind: 'function', name: 'list_elements', args: [list, flag(!!op.emptyAsNull), flag(op.keepNulls !== false)], types: [element, 'int'] };
   const joined: PlanOp = { op: 'join', kind: 'inner', inputs: [op.input, elements], ordered: true };
