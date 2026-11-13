@@ -1,8 +1,7 @@
 // Math functions (sqrt, ln, pow, sin, exp, floor, …): cost per row in smaltdb (row and columnar tables) and in
 // SQLite's WASM build on the same data and queries, next to plain arithmetic and abs() as baselines.
 // Run (N rows, default 1,000,000):
-//   npx esbuild bench/micro/math.ts --bundle --platform=node --format=esm --outfile=.cache/math-bench.mjs \
-//     --external:@sqlite.org/sqlite-wasm && node .cache/math-bench.mjs 1000000
+//   npm run bench:micro -- math 1000000
 import sqliteInit from '@sqlite.org/sqlite-wasm';
 import { Database } from '../../src/engine/database.js';
 import '@smaltworks/smaltql/register';

@@ -2,7 +2,7 @@
 // layer (ADR 0014) adds passes between parsing and operators; this is its budget check for small queries (compare
 // with bench/results/ and docs/research/plan-layer-implementation.md).
 // Run (ROUNDS, default 7):
-//   npx esbuild bench/micro/prepare.ts --bundle --platform=node --format=esm --outfile=.cache/prepare-bench.mjs && node .cache/prepare-bench.mjs
+//   npm run bench:micro -- prepare
 import { Database } from '../../src/engine/database.js';
 import '@smaltworks/smaltql/register';
 import { MemoryVfs } from '../../src/engine/vfs/memory.js';

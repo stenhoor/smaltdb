@@ -1,8 +1,7 @@
 // Lists (ADR 0031): explode and `each` against a function of one list, through the plan API, in process. A table of N rows with
 // an id and a list<int> of 10 elements on six rows in seven (empty on the rest); each query's result is one row.
 // Run (N rows, default 100,000; rounds, default 5):
-//   npx esbuild bench/micro/nested.ts --bundle --platform=node --format=esm --outfile=.cache/nested-bench.mjs \
-//     && node .cache/nested-bench.mjs 100000
+//   npm run bench:micro -- nested 100000
 import { Database } from '../../src/engine/database.js';
 import { plan as p } from '../../src/engine/index.js';
 import type { PlanOp } from '../../src/engine/plan/ops.js';

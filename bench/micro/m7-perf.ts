@@ -1,6 +1,6 @@
 // M7 code-review performance items (docs/research/m7-code-review.md, "Performance"), Node, file
 // database on MemoryVfs:
-//   npx tsx bench/micro/m7-perf.ts
+//   npm run bench:micro -- m7-perf
 // Each case reports the median of `reps` runs in ms.
 import { Database } from '../../src/engine/database.js';
 import '@smaltworks/smaltql/register';

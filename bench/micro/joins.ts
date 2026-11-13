@@ -1,5 +1,5 @@
 // Join workloads: smaltdb vs SQLite WASM in Node (both in memory). Used to drive M3 (optimizer).
-// Run: npx esbuild bench/micro/joins.ts --bundle --platform=node --format=esm --outfile=.cache/joins.mjs --external:@sqlite.org/sqlite-wasm && node .cache/joins.mjs
+// Run: npm run bench:micro -- joins
 import sqliteInit from '@sqlite.org/sqlite-wasm';
 import { Database } from '../../src/engine/database.js';
 import '@smaltworks/smaltql/register';
