@@ -1043,8 +1043,10 @@ export class Planner {
     if (kind === 'scalar' && (s.limit || s.sort)) return null;
     if (kind === 'exists' && s.limit && !(s.limit.count.k === 'lit' && typeof s.limit.count.value === 'number' && s.limit.count.value >= 1)) return null;
     if (kind === 'exists' && a) return null;
+    // FROM items may be tables or derived inputs (a semi join's right side is often a filter, a grouping or an explode):
+    // the inner side is planned once below, and refused there if it reads the enclosing row.
     for (const l of s.from) {
-      if (l.op.op !== 'scan' || (l.join !== null && l.join !== 'inner' && l.join !== 'cross')) return null;
+      if (l.join !== null && l.join !== 'inner' && l.join !== 'cross') return null;
       if (l.on && !['inner', 'none'].includes(sideOf(l.on))) return null;
     }
     const pairs: { inner: PlanExpr; outer: PlanExpr; innerLeft: boolean }[] = [];
