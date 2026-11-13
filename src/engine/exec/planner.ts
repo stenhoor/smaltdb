@@ -1278,7 +1278,11 @@ export class Planner {
       // Filters local to this source (depend only on it and outer scopes).
       let leaf = access.leaf;
       const local = candidates.filter((c) => c.deps!.size === 1 && !c.placed);
+      // A local filter that reads an enclosing query's row makes the leaf's rows depend on it (issue #230).
+      let localReadsOuter = false;
       for (const c of local) {
+        if (planHasSubquery(c.bound)) localReadsOuter = true;
+        else forEachSlot(c.bound, (reg) => (this.slotSource(reg, scope) ? undefined : (localReadsOuter = true)));
         leaf = filterOnConjunct(leaf, c, ctx);
         c.placed = true;
       }
@@ -1306,8 +1310,10 @@ export class Planner {
             const correlated = scope.correlated;
             root = new HashJoin(root, leaf, hash.build, hash.probe, hash.colls, innerRegs, isLeft, this.env.state, correlated, this.andAll(residual, ctx));
           } else {
-            // Nested loop: materialize an uncorrelated inner side once instead of re-reading it per outer row.
-            const inner = (src.sub && !src.sub.correlated) || (!src.sub && !scope.correlated) ? new Materialize(leaf, innerRegs, this.env.state, false) : leaf;
+            // Nested loop: materialize an uncorrelated inner side once instead of re-reading it per outer row. Not when a
+            // filter on it reads an enclosing query's row: its rows would be the first enclosing row's (issue #230).
+            const uncorrelated = src.sub ? !src.sub.correlated && !localReadsOuter : !scope.correlated;
+            const inner = uncorrelated ? new Materialize(leaf, innerRegs, this.env.state, false) : leaf;
             root = new NestedLoopJoin(root, inner, isLeft, innerRegs, this.andAll(rest, ctx));
             rest.forEach((c) => (c.placed = true));
           }
