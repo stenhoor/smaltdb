@@ -352,15 +352,29 @@ be typed `list<…>` (an error when the plan is compiled otherwise); NULL lists 
 | `struct_of` | 1 or more | A struct of the arguments, as the fields of the call's declared type (`struct<name text, score real>`) |
 | `struct_field` | 2: a struct, field index | The field's value (from 0); declare the field's type on the call. A field it doesn't have is an error (`SMALT_RANGE`) |
 | `list_len` | 1 | The number of elements |
-| `list_get` | 2: a list, index | The element at `index` (from 0; negative from the end), or NULL out of range |
-| `list_contains` | 2: a list, value | Whether an element equals `value` (NULL: whether there is a NULL element): `bool` |
+| `list_get` | 2 or 3: a list, index, strict | The element at `index` (from 0; negative from the end), or NULL out of range; with `strict` true, out of range is an error (`SMALT_RANGE`) |
+| `list_contains` | 2 or 3: a list, value, nullsEqual | Whether an element equals `value` (NULL: whether there is a NULL element; with `nullsEqual` false, NULL): `bool` |
 | `list_slice` | 2 or 3: a list, offset, length | The elements from `offset` (negative from the end), `length` of them or to the end |
 | `list_concat` | 2 | The two lists one after the other |
-| `list_join` | 2: a list, separator | Its non-NULL elements as text, joined by `separator` |
-| `list_sort` | 1 or 2: a list, descending | Its elements sorted, NULLs first |
+| `list_join` | 2 or 3: a list, separator, keepNulls | Its non-NULL elements as text, joined by `separator`; with `keepNulls` true, NULL if an element is NULL |
+| `list_sort` | 1 to 3: a list, descending, nullsLast | Its elements sorted, NULLs first (last with `nullsLast` true) |
 | `list_unique` | 1 | Its elements without repeats, the first of each, in order |
 | `list_reverse` | 1 | Its elements in reverse order |
 | `list_sum`, `list_mean`, `list_min`, `list_max` | 1 | Over the non-NULL numbers: the sum (0 for none), the mean, the least and greatest (NULL for none) |
+| `list_median` | 1 | The median of the non-NULL numbers (NULL for none): `real` |
+| `list_var`, `list_std` | 1 or 2: a list, ddof | The variance and standard deviation of the non-NULL numbers, `ddof` (default 1) degrees of freedom taken away; NULL when there are no more numbers than `ddof` |
+| `list_n_unique` | 1 | The number of distinct elements, NULL counting as one |
+| `list_arg_min`, `list_arg_max` | 1 | The position of the least or greatest non-NULL element, the first of equals (NULL for none) |
+| `list_count_matches` | 2: a list, value | The number of elements equal to `value` (NULL: of NULL elements) |
+| `list_all`, `list_any` | 1 | Whether every or any non-NULL element is true (`all` of none is true, `any` false): `bool` |
+| `list_drop_nulls` | 1 | Its non-NULL elements |
+| `list_shift` | 1 or 2: a list, n | Its elements moved `n` places later (default 1; negative earlier), NULLs filling the places left |
+| `list_diff` | 1 or 2: a list, n | Each element less the one `n` places before it (default 1); NULL for the first `n` and where either is NULL |
+| `list_gather` | 2 or 3: a list, a list of indexes, strict | The elements at those indexes (negative from the end; NULL out of range, or an error with `strict` true) |
+| `list_gather_every` | 2 or 3: a list, n, offset | Every `n`-th element from `offset` (default 0) |
+| `list_sample` | 2 to 4: a list, n, withReplacement, seed | `n` elements chosen at random: without replacement in the list's order (more than it has is an error), with replacement in the order drawn. A `seed` gives the same choice each time |
+| `list_item` | 1 | The element of a list of one; any other length is an error (`SMALT_RANGE`) |
+| `list_union`, `list_intersect`, `list_except`, `list_symmetric_except` | 2 | The set operation: each element once (NULL is one value), in first-appearance order, the left list's then the right's |
 
 `cast_text` of a list or struct gives its JSON text: `[1,2]`, `{"name":"a","score":2.5}`, dates and times as their text,
 `bool` as `true` / `false`, integers beyond 2^53 with every digit.
