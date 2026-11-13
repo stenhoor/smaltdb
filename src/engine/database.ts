@@ -115,6 +115,31 @@ export interface DatabaseOptions extends PagerOptions {
 
 const CATALOG_NAMES = new Set(['smalt_schema', 'sqlite_schema', 'sqlite_master']);
 
+/**
+ * `list_elements(list [, emptyAsNull [, keepNulls]])` (ADR 0031, section 2): one row per element of a list value, the
+ * element and its position (from 0), in order. A NULL list and an empty one give no row, unless `keepNulls` (a NULL
+ * list) or `emptyAsNull` (an empty one) is true: then one row, a NULL element at position 0. A table function, so its argument may read
+ * the row of the join's left input (a lateral source): `explode` is a join with it. The element's static type is
+ * `any` here; a plan's `source` gives its type.
+ */
+const LIST_ELEMENTS: { columns: { name: string; type: StaticType }[]; rows: (args: SqlValue[]) => SqlValue[][] } = {
+  columns: [
+    { name: 'element', type: 'any' },
+    { name: 'position', type: 'int' },
+  ],
+  rows: (args) => {
+    const list = args[0];
+    const on = (v: SqlValue | undefined): boolean => v !== undefined && v !== null && v !== 0 && v !== 0n;
+    if (list === null || list === undefined) return on(args[2]) ? [[null, 0]] : [];
+    if (!(list instanceof Uint8Array)) throw new SmaltError('SMALT_MISMATCH', 'list_elements takes a list');
+    const values = decodeKey(list);
+    if (values.length === 0) return on(args[1]) ? [[null, 0]] : [];
+    const out: SqlValue[][] = new Array(values.length);
+    for (let i = 0; i < values.length; i++) out[i] = [values[i], i];
+    return out;
+  },
+};
+
 /** A view: its source in its language, bound where the view is read (the SQL front end merges it into the query). */
 export interface ViewSchema {
   name: string;
@@ -918,6 +943,7 @@ export class Database implements FunctionContext {
     }
     // As in SQLite, a schema qualifier on a pragma function (main.pragma_table_info) changes nothing.
     const lower = name.toLowerCase().replace(/^(main|temp)\./, '');
+    if (schema === undefined && lower === 'list_elements') return LIST_ELEMENTS;
     if (!lower.startsWith('pragma_')) return undefined;
     const pragma = lower.slice('pragma_'.length);
     let current: SqlValue[] = [];
