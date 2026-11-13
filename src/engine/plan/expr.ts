@@ -65,8 +65,40 @@ export interface SubqueryExpr extends ExprMeaning { readonly k: 'subquery'; read
 /** Membership of `probe` in the nested plan's single column: 1, 0 or NULL. */
 export interface InSubqueryExpr<E> extends ExprMeaning { readonly k: 'inSubquery'; readonly probe: E; readonly plan: NestedPlan; readonly collation: CollationName }
 
+/**
+ * An expression over a list's elements (ADR 0031, section 4). `map` gives the list of `body` for each element
+ * (`list<typeOf(body)>`), `filter` the elements for which `body` (a `bool`) is true, and `agg` the value of `body` over
+ * the results of `aggs`, the engine's aggregates run over the elements. `body` reads each element through `element`,
+ * the aggregates' results (`agg` only) through `eachAgg`, and the row's columns as any expression does. A NULL list
+ * gives NULL; an empty one `[]` (`map`, `filter`) or the aggregates of no rows (`agg`).
+ */
+export interface EachExpr<E> extends ExprMeaning {
+  readonly k: 'each';
+  readonly list: E;
+  readonly mode: 'map' | 'filter' | 'agg';
+  readonly body: E;
+  readonly aggs?: readonly EachAggCall<E>[];
+  readonly type: PlanType;
+}
+/** An aggregate of an `agg`-mode `each`: as an aggregate operation's call, its arguments over the elements. */
+export interface EachAggCall<E> {
+  readonly fn: string;
+  readonly args: readonly E[];
+  readonly star: boolean;
+  readonly distinct: boolean;
+  readonly filter?: E;
+  readonly collation: CollationName;
+  readonly type: PlanType;
+}
+/** In an `each` body: the element (`value`) or its position from 0 (`position`) of the `each` `depth` levels out (0 the innermost). */
+export interface ElementExpr extends ExprMeaning { readonly k: 'element'; readonly part: 'value' | 'position'; readonly depth: number; readonly type: PlanType }
+/** In an `agg`-mode `each` body: the result of aggregate `index` of the `each` `depth` levels out. */
+export interface EachAggExpr extends ExprMeaning { readonly k: 'eachAgg'; readonly index: number; readonly depth: number; readonly type: PlanType }
+
 /** A plan expression: what languages produce and plans carry. Serializable, with no closures. */
-export type PlanExpr = ColExpr | LitExpr | ParamExpr | CallExpr<PlanExpr> | CastExpr<PlanExpr> | LogicExpr<PlanExpr> | NotExpr<PlanExpr> | IsNullExpr<PlanExpr> | CaseExpr<PlanExpr> | SubqueryExpr | InSubqueryExpr<PlanExpr>;
+export type PlanExpr =
+  | ColExpr | LitExpr | ParamExpr | CallExpr<PlanExpr> | CastExpr<PlanExpr> | LogicExpr<PlanExpr> | NotExpr<PlanExpr> | IsNullExpr<PlanExpr>
+  | CaseExpr<PlanExpr> | SubqueryExpr | InSubqueryExpr<PlanExpr> | EachExpr<PlanExpr> | ElementExpr | EachAggExpr;
 
 /**
  * An expression bound for compilation (`exec/`, never in a plan): a plan expression whose columns may be replaced by
@@ -74,7 +106,8 @@ export type PlanExpr = ColExpr | LitExpr | ParamExpr | CallExpr<PlanExpr> | Cast
  */
 export type BoundExpr =
   | ColExpr | LitExpr | ParamExpr | CallExpr<BoundExpr> | CastExpr<BoundExpr> | LogicExpr<BoundExpr> | NotExpr<BoundExpr>
-  | IsNullExpr<BoundExpr> | CaseExpr<BoundExpr> | SubqueryExpr | InSubqueryExpr<BoundExpr> | SlotExpr | NativeExpr;
+  | IsNullExpr<BoundExpr> | CaseExpr<BoundExpr> | SubqueryExpr | InSubqueryExpr<BoundExpr> | EachExpr<BoundExpr> | ElementExpr | EachAggExpr
+  | SlotExpr | NativeExpr;
 
 /**
  * A value the planner keeps in a register (a column of a source, a GROUP BY key, an aggregate or window result).
@@ -159,7 +192,26 @@ export function forEachCol(e: BoundExpr, f: (c: ColExpr) => void): void {
     case 'inSubquery':
       forEachCol(e.probe, f);
       return;
+    case 'each':
+      for (const x of eachParts(e)) forEachCol(x, f);
+      return;
     default:
       return;
   }
+}
+
+/** The expressions inside an `each`: its list, its body, and its aggregates' arguments and filters. */
+export function eachParts<E>(e: EachExpr<E>): E[] {
+  const out: E[] = [e.list, e.body];
+  for (const a of e.aggs ?? []) {
+    out.push(...a.args);
+    if (a.filter !== undefined) out.push(a.filter);
+  }
+  return out;
+}
+
+/** `e` with each expression inside it mapped by `f` (as `eachParts` lists them). */
+export function mapEach<E, F>(e: EachExpr<E>, f: (x: E) => F): EachExpr<F> {
+  const aggs = e.aggs?.map((a) => ({ ...a, args: a.args.map(f), ...(a.filter !== undefined ? { filter: f(a.filter) } : {}) }));
+  return { ...e, list: f(e.list), body: f(e.body), ...(aggs ? { aggs } : {}) } as EachExpr<F>;
 }

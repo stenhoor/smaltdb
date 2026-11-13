@@ -18,7 +18,7 @@
  * partials of a group meet by value); no bare columns, joins, subqueries or window functions.
  */
 import type { AggCall, PlanOp } from '../plan/ops.js';
-import { type PlanExpr, typeOf } from '../plan/expr.js';
+import { eachParts, type PlanExpr, typeOf } from '../plan/expr.js';
 import type { PlanType } from '../plan/types.js';
 
 type Aggregate = Extract<PlanOp, { op: 'aggregate' }>;
@@ -59,6 +59,8 @@ function plain(e: PlanExpr | undefined): boolean {
       return plain(e.arg);
     case 'case':
       return e.whens.every((w) => plain(w.when) && plain(w.then)) && plain(e.else);
+    case 'each':
+      return false; // no morsel plan for expressions over list elements yet
     default:
       return true;
   }
@@ -220,6 +222,8 @@ function hasParam(e: PlanExpr): boolean {
       return hasParam(e.arg);
     case 'case':
       return e.whens.some((w) => hasParam(w.when) || hasParam(w.then)) || hasParam(e.else);
+    case 'each':
+      return eachParts(e).some(hasParam);
     default:
       return false;
   }

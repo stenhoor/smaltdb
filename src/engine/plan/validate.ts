@@ -21,7 +21,7 @@ import { SmaltError } from '../errors.js';
 import { aggregateFunctions, scalarFunctions } from '../exec/functions.js';
 import { SQL_FUNCTIONS, isEngineOperation } from '../exec/sql-functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../exec/window.js';
-import type { ExprMeaning, PlanExpr } from './expr.js';
+import { type ExprMeaning, type PlanExpr, typeOf } from './expr.js';
 import type { PlanOp } from './ops.js';
 
 /** What the validator asks of the catalog. */
@@ -785,6 +785,22 @@ class Validator {
     }
   }
 
+  /**
+   * The `each` expressions around the one being checked (the innermost last): whether their element can be read, and
+   * how many aggregates (`-1`: none to read). A nested plan starts with none: its expressions don't read the elements.
+   */
+  private frames: { element: boolean; aggs: number }[] = [];
+
+  private nested<T>(f: () => T): T {
+    const saved = this.frames;
+    this.frames = [];
+    try {
+      return f();
+    } finally {
+      this.frames = saved;
+    }
+  }
+
   private aggCall(a: { fn: unknown; args: unknown; star: unknown; filter?: PlanExpr; collation: unknown; type: unknown }, scopes: readonly Scope[], depth: number, window: boolean): void {
     if (typeof a.fn !== 'string') this.fail('expected a function name', 'fn');
     const args = this.list(a.args, 'args');
@@ -888,7 +904,7 @@ class Validator {
       }
       case 'subquery': {
         if (e.mode !== 'scalar' && e.mode !== 'exists') this.fail(`unknown subquery mode ${JSON.stringify(e.mode)}`, 'mode');
-        const w = this.under('plan', undefined, () => this.op(e.plan, scopes, d, null));
+        const w = this.under('plan', undefined, () => this.nested(() => this.op(e.plan, scopes, d, null)));
         if (e.mode === 'scalar' && w < 1) this.fail('a scalar subquery needs a column', 'plan');
         this.type(e.type, 'type');
         this.collation(e.collation, 'collation');
@@ -896,9 +912,51 @@ class Validator {
       }
       case 'inSubquery':
         this.exprAt(e.probe, scopes, d, 'probe', undefined);
-        this.under('plan', undefined, () => this.op(e.plan, scopes, d, null));
+        this.under('plan', undefined, () => this.nested(() => this.op(e.plan, scopes, d, null)));
         this.collation(e.collation, 'collation');
         return;
+      case 'each': {
+        if (e.mode !== 'map' && e.mode !== 'filter' && e.mode !== 'agg') this.fail(`unknown each mode ${JSON.stringify(e.mode)}`, 'mode');
+        this.type(e.type, 'type');
+        this.exprAt(e.list, scopes, d, 'list', undefined);
+        const lt = typeOf(e.list);
+        if (!(lt === 'any' || (typeof lt === 'string' && parseNested(lt)?.kind === 'list'))) this.fail(`each reads a list, not ${JSON.stringify(lt)}`, 'list');
+        if (e.mode === 'agg') {
+          const aggs = this.list(e.aggs, 'aggs');
+          this.frames.push({ element: true, aggs: -1 });
+          for (let i = 0; i < aggs.length; i++) {
+            const a = aggs[i] as NonNullable<typeof e.aggs>[number];
+            this.under('aggs', i, () => {
+              this.object(a);
+              if (a.distinct !== undefined && typeof a.distinct !== 'boolean') this.fail('expected a boolean', 'distinct');
+              this.aggCall(a, scopes, d, false);
+            });
+          }
+          this.frames.pop();
+          this.frames.push({ element: false, aggs: aggs.length });
+        } else {
+          if (e.aggs !== undefined) this.fail(`a ${e.mode} has no aggregates`, 'aggs');
+          this.frames.push({ element: true, aggs: -1 });
+        }
+        this.exprAt(e.body, scopes, d, 'body', undefined);
+        this.frames.pop();
+        if (e.mode === 'map' && !(e.type === 'any' || parseNested(e.type)?.kind === 'list')) this.fail(`a map gives a list, not ${JSON.stringify(e.type)}`, 'type');
+        if (e.mode === 'filter' && e.type !== lt && e.type !== 'any') this.fail(`a filter gives its list's type ${JSON.stringify(lt)}, not ${JSON.stringify(e.type)}`, 'type');
+        return;
+      }
+      case 'element':
+      case 'eachAgg': {
+        if (!Number.isInteger(e.depth) || e.depth < 0 || e.depth >= this.frames.length) this.fail(`${e.k} of each ${String(e.depth)} levels out, which does not exist`, 'depth');
+        const f = this.frames[this.frames.length - 1 - e.depth];
+        if (e.k === 'element') {
+          if (e.part !== 'value' && e.part !== 'position') this.fail(`unknown element part ${JSON.stringify(e.part)}`, 'part');
+          if (!f.element) this.fail('an agg body reads its aggregates, not the element', 'depth');
+        } else if (!Number.isInteger(e.index) || e.index < 0 || e.index >= f.aggs) {
+          this.fail(f.aggs < 0 ? 'eachAgg outside an agg body' : `aggregate ${String(e.index)} of ${f.aggs}`, 'index');
+        }
+        this.type(e.type, 'type');
+        return;
+      }
       default:
         this.fail(`unknown expression ${JSON.stringify((e as { k?: unknown }).k)}`);
     }
