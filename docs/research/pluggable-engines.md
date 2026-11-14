@@ -265,3 +265,14 @@ only components a future engine needs, and some components should never be plugi
 
 ADR 0028 can stay about storage and indexes. Functions and extension types are a second, smaller decision, and are
 better kept in an ADR of their own, so each can be accepted or deferred separately.
+
+## 7. Outcome (2026-11-14)
+
+The owner closed this idea out for now: [ADR 0028](../adr/0028-pluggable-storage-engines.md) is deferred, and its
+Outcome section has the reasons. In short:
+- B+tree and columnar storage are enough within smaltdb's target size (about 1 GB, about 10 million rows).
+- Growth is likely to be new index kinds (vector, full text, spatial, graph adjacency), added to the core when one is
+  needed, with the functions and plan operations that use it.
+- Graph at this scale needs the plan work (G1–G5), not a new index: B+tree indexes on an edge table's endpoints are
+  fast enough, and G1, the recursive-join bug, was the slow part.
+- Sections 1–6 stay as the design to start from if a third engine or outside engines are ever needed.

@@ -133,7 +133,7 @@ export default defineConfig({
           { text: '0020 Lists and structs', link: '/adr/0020-lists-and-structs' },
           { text: '0021 Parallel readers everywhere', link: '/adr/0021-parallel-readers-everywhere' },
           { text: '0022 SQL for the new engine features', link: '/adr/0022-sql-for-the-new-engine-features' },
-          { text: '0028 Pluggable storage engines', link: '/adr/0028-pluggable-storage-engines' },
+          { text: '0028 Pluggable storage engines (deferred)', link: '/adr/0028-pluggable-storage-engines' },
         ],
       },
       {
