@@ -9,6 +9,7 @@ export const FAMILY = [
   { text: 'smaltdf · dataframes', link: 'https://stenhoor.github.io/smaltdf/' },
   { text: 'smaltts · typed API', link: `${WORKS}/products/smaltts` },
   { text: 'smaltcy · Cypher', link: 'https://stenhoor.github.io/smaltcy/' },
+  { text: 'smaltml · machine learning', link: 'https://stenhoor.github.io/smaltml/' },
   { text: 'smaltty · TypeScript implementation', link: 'https://stenhoor.github.io/smaltty/' },
   { text: 'smaltui · query workbench', link: 'https://stenhoor.github.io/smaltui/' },
   { text: 'smaltbi · reports', link: 'https://stenhoor.github.io/smaltbi/' },
