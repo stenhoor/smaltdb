@@ -1,6 +1,7 @@
 # ADR 0028: Pluggable storage engines
 
-- **Status:** proposed (2026-11-11), with the owner's direction of 2026-11-11 recorded below; two decisions are open
+- **Status:** deferred (2026-11-14): closed out for now by the owner. See [Outcome](#outcome-2026-11-14) at the end; the
+  proposal below is kept as it was
 - **Date:** 2026-11-11
 - **Assigned to:** Andrew Beers
 - **Research:** [Pluggable storage engines](../research/pluggable-engines.md) (the full design, sizes and comparable
@@ -118,3 +119,43 @@ Open:
 - Engine plugins run in the engine worker with page-store access, as plugins already do (ADR 0012); the page-store
   interface confines each to its own pages.
 - E1 is the largest refactor since ADR 0016, and it competes with the 1.0 work in [ROADMAP.md](../ROADMAP.md).
+
+## Outcome (2026-11-14)
+
+The owner closed this idea out for now, after the follow-up questions of 2026-11-14 (section 6 of the
+[research note](../research/pluggable-engines.md) and the discussion that followed). Nothing in E1–E5 is scheduled.
+
+**Why.**
+- **B+tree and columnar storage are enough.** Within smaltdb's target size (about 1 GB, about 10 million rows,
+  [ADR 0001](0001-initial-design-decisions.md)) they cover transactional and analytical work. The other layouts
+  databases use are variations on them: time series and append-only logs suit columnar storage, and a graph's edges
+  are rows.
+- **Future growth is new index kinds, not table layouts.** Vector (nearest neighbours), full text, spatial and graph
+  adjacency answer questions a B+tree index can't. Each needs the functions or plan operations that use it
+  (`distance()`, `match()`, `paths`).
+- **Graph doesn't need a new index at this scale.** Ten million edges is a few hundred MB, and a B+tree index on an
+  edge table's endpoints (`(src, dst)`, which needs no table read) finds a node's neighbours in microseconds. In
+  [Graphs on the plan API](../research/graph-on-plans.md), the slow cases were the plan, not storage: G1, the
+  recursive-join bug, made reachability take 49 s against 139 ms. Graph work is G1–G5 in the plan API; an adjacency
+  index waits until measurements on real workloads ask for it.
+- **A general engine framework costs before it pays.** E1 alone is a 2,000–3,000-line refactor on the hot paths, and an
+  interface designed from two engines would likely be wrong for the third. Runtime plugins also cost at call sites
+  that see several engine classes (V8 stops specializing them), which batching hides except on point lookups.
+
+**Ways to extend storage, if it is ever needed, fastest first:**
+
+| Option | Performance | When |
+|---|---|---|
+| 1. Built in, no extension point (as columnar was added) | Fastest: specialized and inlined | The default for the next index kind |
+| 2. An internal engine interface, unpublished | As today, if generated code still specializes per engine | Once three engines exist to design it from |
+| 3. Engines that contribute generated code to the query's loop | As fast as built in | Only if outside developers must add engines |
+| 4. Runtime plugins (the proposal above) | A cost per batch, more on point lookups | Not planned |
+
+**Revisit when** a third engine or index kind is needed (most likely vector search or full text), or when outside
+developers need to add their own.
+
+**Recommended, not decided:**
+- Before 1.0, reserve a catalog field that records each table's and index's engine name and format version. It is the
+  only part that would be costly to add after the file format freezes.
+- Plugin-registered functions and a VFS option in `defineWorker` are small, don't touch the hot paths, and stand on
+  their own (research note, section 6).
