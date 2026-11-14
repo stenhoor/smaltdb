@@ -188,3 +188,80 @@ Each step is a separate PR. Steps 1 and 2 prove the interface on today's engines
   - whether columnar moves to a plugin or stays built in;
   - plugin API v1 additive or v2;
   - whether to do it before or after 1.0. Before is better: the catalog's engine record is a format change.
+
+## 5. Graph, and relational and graph together (owner's question, 2026-11-14)
+
+**Yes. The design supports graph storage, and hybrid relational/graph use falls out of it rather than needing its own
+mode.** The pieces are already named: the plan extensions G1–G5 in [Graphs on the plan API](./graph-on-plans.md), and
+engines E1–E5 here.
+
+- **A graph is a view of tables.** G4's property-graph object names vertex and edge tables. The rows stay ordinary
+  rows, so the same data is read relationally (`scan`, `join`, `aggregate`) and as a graph (G5's `paths`), in one plan
+  and one transaction. A path's result is rows too, so it joins back to any table.
+- **The usual shape is an index engine.** An adjacency index (CSR) over an ordinary edge table:
+  - The edge rows stay in a B+tree or columnar table, so relational queries over edges work unchanged.
+  - The index claims `paths` and joins on an edge's endpoints.
+  - Writes are ordinary inserts, updates and deletes, and the index follows them in the same transaction.
+
+  That is hybrid by construction.
+- **A graph table engine is the other option.** It suits large, read-mostly graphs, where the edges live only in CSR
+  segments. It must still serve plain scans (every table engine does), so relational queries over its edges keep
+  working, only without the B+tree's point lookups.
+
+**What the interfaces must guarantee for hybrid use.** All of it is in section 2:
+- claims for a whole operation (`operation: paths`) and for joins on endpoints;
+- index engines over any table engine that fetches by rowid, columnar included;
+- statistics an engine reports for costing (degree distributions for graphs);
+- one commit across every engine.
+
+**What pluggability doesn't provide.** Graph queries need G1–G5 in the plan API first: G1 is a planner bug in recursive
+joins, and G2–G5 are new plan operations and a catalog object. Those are plan work in the core. An engine can only
+make a plan operation fast; it can't add one. So the graph track is: G1–G5 in the core, E1–E4 for the interfaces, then
+the adjacency index as E5.
+
+## 6. Beyond table storage and indexes: what else should be a plugin (owner's question, 2026-11-14)
+
+Table storage and indexes are the right first pair: they are where new data engines differ. But they are not the
+only components a future engine needs, and some components should never be plugins.
+
+### What is pluggable today
+
+| Component | How | Since |
+|---|---|---|
+| Languages (SQL, and smaltdf's DataFrames) | `registerLanguage`, `defineWorker({ languages })` | ADR 0015 |
+| External formats, table functions, sources, connection types, methods | `host.addFormat`, `addTableFunction`, `addSource`, `addConnectionType`, `addMethod` | ADR 0012, 0013 |
+
+### Candidates
+
+| Component | Today | Recommendation |
+|---|---|---|
+| **Functions** (scalar, aggregate, window) | Two fixed maps in `exec/functions.ts` (`scalarFunctions`, `aggregateFunctions`, 983 lines). No plugin can add one | **Yes, first.** New engines come with functions: a vector index needs `distance(…)`, full text needs `match(…)`, geo needs `st_within(…)`. An index engine claims predicates on its own functions (section 2.3). Small: a registry, purity and determinism flags, the result type, and the generic call path in code generation (built-ins stay inlined). About 300–500 lines |
+| **Types and collations** | Closed: `PlanType` (`StaticType`), and three collations (`binary`, `nocase`, `rtrim`) hard-coded in `values.ts` and the key codec | **Yes, after functions, as extension types.** A name over an existing physical type (a vector over `list<real>` or a blob; a geometry over a blob), with its functions and conversions. That needs no record-format change. A plugin collation must also supply its key encoding, or indexes can't order by it (ICU and locale collations). About 800–1,200 lines; collations are the costly part |
+| **File system (VFS)** | The `Vfs` / `VfsFile` interface exists (`vfs/types.ts`, synchronous file operations), but the worker runtime always opens OPFS (`worker-runtime.ts`) | **Yes, small.** A VFS option in `defineWorker`. Uses: encryption at rest (a VFS that wraps another and encrypts pages), an IndexedDB fallback, test and Node backends. The WAL, checksums and parallel readers sit above it and don't change. About 100–200 lines |
+| **Change feed** | None. Commits aren't observable outside the engine | **Later, as a core feature that plugins subscribe to.** For sync and replication, and live updates in smaltui and smaltbi. The core emits committed changes per table; plugins read them and never write through them. About 400–600 lines, with the sync work that needs it |
+| Compression and encodings in columnar segments | Inside the columnar engine | **Part of the columnar engine,** not a plugin kind of its own. Once columnar is behind the engine interface (E1), its codecs are its own business |
+| Spill and memory policy | Core (M7) | **No for now.** A setting, not a plugin |
+
+### What stays in the core
+
+- **The pager, WAL, transactions, recovery, snapshots and parallel readers.** Durability lives in one place. This is
+  why engines get pages, not files (section 2.2).
+- **The catalog and the file format,** including the record of which engines a database needs.
+- **The planner, optimizer and cost model.** Engines take part through claims and statistics (section 2.3). Letting
+  plugins add optimizer rules (Calcite-style) can be revisited after 1.0, once claims have proven themselves: a bad
+  rule breaks every query, not only one engine's.
+- **Plan operations and the operators that run them.** A new operation, such as `paths`, is a plan change, decided in
+  an ADR and built in the core; engines then accelerate it.
+- **Constraints:** NOT NULL, CHECK and foreign keys. Unique keys stay an index engine's job.
+- **The worker protocol and the client.**
+
+### Order
+
+1. **Functions,** since engines need them. Its own small ADR, additive to plugin API v1.
+2. **ADR 0028's E1–E4** (table and index engines).
+3. **The VFS option,** at any time. It is independent and small.
+4. **Extension types and collations,** after functions, and before 1.0 if a type must reach the file format.
+5. **The change feed,** with the sync work that needs it.
+
+ADR 0028 can stay about storage and indexes. Functions and extension types are a second, smaller decision, and are
+better kept in an ADR of their own, so each can be accepted or deferred separately.
