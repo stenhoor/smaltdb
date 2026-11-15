@@ -1,7 +1,7 @@
 # ADR 0036: User-defined functions from plugins, with predict as the first
 
-- **Status:** proposed, 2026-11-15, for the owner's review. The owner's direction of that day is recorded under
-  Context; the points under "Still to decide" are open.
+- **Status:** accepted, 2026-11-15 (the owner). The points under "Still to decide" are settled during implementation
+  (the owner, 2026-11-15), each in the pull request of the step that needs it.
 - **Date:** 2026-11-15
 - **Builds on:** [ADR 0012](0012-plugins.md) (plugins; section 4 named `addScalarFunction` and `addAggregateFunction`
   and left them out of the first version), [ADR 0013](0013-plugin-api-v1.md) (plugin API version 1: new `PluginHost`
@@ -170,12 +170,12 @@ it.
   databases openable without the plugin.
 - **A model's version matters to a query's result.** Pinning a version (`'churn@3'`) gives repeatable results; the
   latest version changes as models are saved, like any table.
-- **smaltml's ADR 0024, item 6** ("how `predict()` reaches the query languages") is answered by this record once
-  it is accepted: through a plugin function, for every language.
+- **smaltml's ADR 0024, item 6** ("how `predict()` reaches the query languages") is answered by this record: through
+  a plugin function, for every language.
 
 ## Steps
 
-1. This record, and the owner's decisions on "Still to decide".
+1. This record (accepted 2026-11-15).
 2. smaltdb: `addScalarFunction` with per-row `fn` only, in the catalog, with section 4's missing-plugin behaviour,
    tested with a test plugin (`test/plugins.test.ts`) from every language's pin (smaltql at least).
 3. smaltdb: `bind`, `prepare` (with `ctx.query` in the statement's snapshot) and `batch`, and the batched step in the
@@ -187,6 +187,8 @@ it.
    from queries; smaltml's ADR 0024 item 6 marked answered.
 
 ## Still to decide
+
+Settled during implementation, in the pull request of the step that needs each one (the owner, 2026-11-15).
 
 1. **The predict plugin's name and repository:** `smaltdb-ml` (a smaltdb plugin, named as smaltdb's are) or
    `smaltml-predict` (named for the library it carries). Either way it is shown as smaltdb's infrastructure plugins are
