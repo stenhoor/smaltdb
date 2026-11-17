@@ -151,7 +151,29 @@ first version (section 5.2).
    turn history on for all its tables.
 4a. **ALTER TABLE on history tables** (done): their versions or log follow a renamed table (with its horizon) and
    added, renamed and dropped columns.
-5. **Step 7** benchmarks both and picks the default.
+5. **Step 7** benchmarks both and picks the default: **`versions`** (2026-11-17, below).
+
+**Step 7: the methods measured** (`npm run bench:micro -- history N COMMITS`, Node, in-memory files with a WAL, median
+of 3 runs; `bench/results/2026-11-17-node-history-810484b.json`). 100,000 rows; 2,000 single-row inserts; then COMMITS
+commits each updating a tenth of the rows; then a delete of a tenth. Times in ms; the file after a checkpoint.
+
+| 20 update commits | Bulk insert | Single inserts | Updates | Delete | Read now | Read, recent past | Read, far past | File |
+|---|---|---|---|---|---|---|---|---|
+| No history | 257 | 96 | 740 | 35 | 1.4 | | | 4.4 MiB |
+| `versions` | 349 | 165 | 1,711 | 85 | 1.3 | 49 | 15 | 23.4 MiB |
+| `log` | 641 | 300 | 1,815 | 127 | 1.5 | 38 | 186 | 32.5 MiB |
+
+With 50 update commits the pattern holds: `versions` 22 ms for the far past against `log`'s 248, 47 MiB against 61; the
+log is faster for the recent past (30 ms against 50).
+
+- **Current reads don't change** with either method, as designed.
+- **`versions` writes less and reads the past evenly:** about 1.4× the inserts' time and 2.3× the updates' and deletes'
+  (the section 5.1 estimate said none extra on inserts; the small `since` row costs that), and a read of any past costs
+  about the same. The log writes more (its two indexes) and a read costs more the further back it goes.
+- **Default: `versions`.** Languages use it when their syntax names no method (smaltcy's history, smaltql's
+  step 6a). `log` stays, for change tracking (`track_changes` will read it) and for tables mostly read near the present.
+- **Not measured yet:** the same in the browser (`bench:browser`), and smaltcy's own benchmarks on both engines (step 8,
+  which runs its suites against both).
 
 ## 4. Cypher on smaltdb
 
@@ -178,7 +200,7 @@ benchmarked. Each finding cites the code; findings marked *(inferred)* need conf
 | G2, G5 | None, if the optional fields are checked once when the operator is built, not per row *(inferred)* | `key` with "lowest wins" needs a heap that can lower a key; the current one breaks ties by sequence only (`exec/operators.ts:2114-2125`) |
 | Graph tables | None | Each relationship insert writes 3 B+trees (the row and two endpoint indexes); a node with *n* labels writes *n* label-index entries, or *n* rows with per-label copies |
 | Catch-all column | None | Undeclared properties are decoded from a blob to be read, and can't be indexed except by an expression index on one key |
-| History | One branch per write, on a per-table flag, as foreign keys are checked today (`exec/write.ts:296-320`) | (a): about 2× writes on updates and deletes. (b): one append per change, and slow reads of the far past without snapshots. Both grow the file until a retention policy removes old versions |
+| History | One branch per write, on a per-table flag, as foreign keys are checked today (`exec/write.ts:296-320`); measured: no difference (step 6, part 2) | (a): about 2× writes on updates and deletes. (b): one append per change, and slow reads of the far past without snapshots. Both grow the file until a retention policy removes old versions. Measured in step 7 (section 3): (a) 1.4× inserts, 2.3× updates and deletes; (b) slower to write and to read far back |
 | Codegen | None: codegen only specializes numeric types (`exec/codegen.ts:95-97`); lists and structs already take the generic path | Same |
 
 **Benchmarks required before history's default is chosen and before step 7 ships:** writes (insert, update, delete),

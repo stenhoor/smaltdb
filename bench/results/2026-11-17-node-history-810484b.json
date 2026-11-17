@@ -1,0 +1,8 @@
+{
+  "benchmark": "bench/micro/history.ts (ADR 0033 step 7)",
+  "environment": "Node 22, in-memory VFS with WAL, cache 1 GiB; median of 3 fresh runs; ms, file in KiB after checkpoint",
+  "runs": [
+    {"n":100000,"single":2000,"commits":20,"rounds":3,"results":{"none":{"bulkInsert":257.4,"singleInserts":96,"updates":739.5,"deletes":35.2,"readCurrent":1.4,"readRecent":null,"readFarPast":null,"fileKiB":4536},"versions":{"bulkInsert":349,"singleInserts":164.6,"updates":1711,"deletes":85,"readCurrent":1.3,"readRecent":48.7,"readFarPast":15.3,"fileKiB":23984},"log":{"bulkInsert":641.3,"singleInserts":299.8,"updates":1815.3,"deletes":127,"readCurrent":1.5,"readRecent":37.7,"readFarPast":186.3,"fileKiB":33256}}},
+    {"n":100000,"single":2000,"commits":50,"rounds":3,"results":{"none":{"bulkInsert":231.7,"singleInserts":81.5,"updates":1778.5,"deletes":35.7,"readCurrent":1.3,"readRecent":null,"readFarPast":null,"fileKiB":4536},"versions":{"bulkInsert":344.3,"singleInserts":161.7,"updates":4227.7,"deletes":84,"readCurrent":1.3,"readRecent":49.7,"readFarPast":22.1,"fileKiB":48304},"log":{"bulkInsert":583.1,"singleInserts":234.9,"updates":4817,"deletes":103.8,"readCurrent":1.4,"readRecent":30.2,"readFarPast":248.1,"fileKiB":62352}}}
+  ]
+}
