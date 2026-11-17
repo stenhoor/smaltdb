@@ -142,7 +142,7 @@ first version (section 5.2).
    write a version and change the small row. Every commit that writes such a table records itself in `smalt_commits`,
    so a time maps to a commit. `asOf` on a `scan` (a commit id or a time) is rewritten into the current rows that
    existed then and the versions valid then.
-3. **Method (b), the commit log**: `history: 'log'`. Each insert, update and delete appends the operation, the rowid,
+3. **Method (b), the commit log** (done): `history: 'log'`. Each insert, update and delete appends the operation, the rowid,
    the commit and the row before it. A past state is the current rows untouched since, and for the others the row
    before their first change after it (none if that change was the insert): no replay, one pass over the log since.
    The same log serves `track_changes`.

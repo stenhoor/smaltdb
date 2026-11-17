@@ -172,7 +172,7 @@ table:
 | `checks` | CHECK constraints, `CheckDef[]` |
 | `foreignKeys` | `ForeignKeyDef[]` |
 | `storage` | `row` or `columnar` |
-| `history` | Optional, `versions`: the table keeps its past versions, read with `asOf` on a scan. See [history](#history) |
+| `history` | Optional, `versions` or `log`: the table keeps its past versions, read with `asOf` on a scan. See [history](#history) |
 | `exprLanguage` | Optional, for a table [defined without source text](#definitions-without-source-text): the language its expression texts are written in |
 
 | `ColumnDef` | |
@@ -197,20 +197,27 @@ that does not exist yet): the table's language binds it from `text` where it is 
 <a id="history"></a>
 ### History
 
-A table created with `history: 'versions'` keeps its past versions ([ADR 0033](../../adr/0033-property-graphs-and-history.md),
+A table created with `history: 'versions'` or `history: 'log'` keeps its past versions ([ADR 0033](../../adr/0033-property-graphs-and-history.md),
 step 6), and a plan reads it as it was after any commit, or at any time, with `asOf` on a `scan`
 ([plans](./plans)). It is set when the table is created, for row tables in `main`.
 
 - **Versions are commits:** a version is valid from the commit that wrote it until the one that changed or deleted it.
   Changes within one transaction make one version: the states in between were never committed. A rolled-back
   transaction leaves no history.
-- **Where it lives:** two tables beside it, written in the same transaction as each change: `smalt_since_<table>`
-  (when each current row's version started) and `smalt_versions_<table>` (the earlier versions, with the commits
-  they were valid between). Only the engine writes them, and they are dropped with the table.
+- **Two methods** (ADR 0033 step 7 benchmarks them and picks the default):
+  - **`versions`:** two tables beside it, `smalt_since_<table>` (when each current row's version started) and
+    `smalt_versions_<table>` (the earlier versions, with the commits they were valid between). Reading any past state
+    costs about the same.
+  - **`log`:** one table, `smalt_log_<table>`, with each change: its commit, the operation, the rowid and the row before
+    it. A past state is the current rows unchanged since, and the row before each other row's first change since: the
+    further back, the more of the log it reads. The same log will serve change tracking.
+- **Written with the change:** in the same transaction. Only the engine writes these tables, and they are dropped with
+  the table.
 - **Times:** every commit that writes such a table is recorded in `smalt_commits` with its time, so `asOf` a time reads
   the last commit at or before it.
-- **Cost:** the table and its current reads don't change. An insert writes one small row more; an update or a delete
-  writes the old version and one small row. Tables without history pay nothing.
+- **Cost:** the table and its current reads don't change. With `versions`, an insert writes one small row more, and an
+  update or a delete the old version and one small row; with `log`, each change writes one log row. Tables without
+  history pay nothing.
 - **Not yet:** `ALTER TABLE` on such a table is refused; history is kept until a forget command (coming) drops it.
 - **The file:** once a table keeps history, an engine that doesn't keep it refuses the file.
 

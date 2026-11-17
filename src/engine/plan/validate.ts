@@ -750,7 +750,7 @@ class Validator {
           checks(t.checks, width, 'checks');
           foreignKeys(t.foreignKeys, width, 'foreignKeys');
           if (t.storage !== 'row' && t.storage !== 'columnar') this.fail(`unknown storage ${JSON.stringify(t.storage)}`, 'storage');
-          if (t.history !== undefined && t.history !== 'versions') this.fail(`unknown history ${JSON.stringify(t.history)} (versions)`, 'history');
+          if (t.history !== undefined && t.history !== 'versions' && t.history !== 'log') this.fail(`unknown history ${JSON.stringify(t.history)} (versions or log)`, 'history');
         });
         if (o.rows !== undefined)
           this.under('rows', undefined, () => {

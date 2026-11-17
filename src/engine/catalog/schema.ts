@@ -108,7 +108,7 @@ export interface TableSchema {
   /** System tables cannot be modified by user DML. */
   system?: boolean;
   /** It keeps its past versions (TableDef.history): in `smalt_versions_<name>`, with `smalt_since_<name>`. */
-  history?: 'versions';
+  history?: 'versions' | 'log';
   /** The language of its source `sql` (absent: SQL). */
   language?: string;
   /** Defined without source text (ADR 0016 section 6): its catalog text describes the definition. */
