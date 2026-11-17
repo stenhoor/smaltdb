@@ -91,7 +91,7 @@ Each operation's output columns, in order:
 
 | Operation | Fields | Output |
 |---|---|---|
-| `scan` | `table`, `columns` (table column indexes, -1 the rowid), `db?` (`main` / `temp`), `indexedBy?` | the listed columns. `table` may name a view: its query, bound by its language when the plan is compiled ([views](./languages#views)) |
+| `scan` | `table`, `columns` (table column indexes, -1 the rowid), `db?` (`main` / `temp`), `indexedBy?`, `asOf?` | the listed columns. `table` may name a view: its query, bound by its language when the plan is compiled ([views](./languages#views)). `asOf` (`{ commit }` or `{ time }`, an expression over no columns) reads a table that [keeps history](./schema#history) as it was after that commit, or after the last commit at or before that time (milliseconds since 1970); before its first commit, it is empty |
 | `values` | `rows` (expressions over no columns), `types`, `columns?` (the values as data: see below) | one column per value |
 | `source` | `kind` (`function` / `virtual` / `external`), `name`, `schema?`, `args`, `named?`, `types` | the source's columns (a table function, `information_schema.*`, an external table). The engine's own table functions are `list_elements` (what `explode` uses) and `range(start, stop [, step])`: the integers from `start` to `stop`, both included, `step` apart (default 1, negative to count down), in one column `value`; made as they are read, so a long range costs no memory. A NULL argument gives no rows; a step of 0 is an error (`SMALT_RANGE`) |
 | `filter` | `input`, `pred` | its input's |

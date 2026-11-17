@@ -95,6 +95,12 @@ export interface TableDef {
   readonly foreignKeys: readonly ForeignKeyDef[];
   readonly storage: 'row' | 'columnar';
   /**
+   * Keep the table's past versions (ADR 0033, decision 8; set when it is created): `versions` keeps each row's earlier
+   * versions with the commits they were valid between, so plans can read the table as of a commit or a time (`asOf`
+   * on a scan). Row tables in main only.
+   */
+  readonly history?: 'versions';
+  /**
    * For a table defined without source text: the registered language its expression texts (CHECKs, defaults, and its
    * indexes' expressions) are written in. A column rename edits them with that language's `sourceEditor`
    * (`renameColumnInExpr`); without one they stay as given (the expressions, bound by column position, still hold).

@@ -56,7 +56,7 @@
 | 40 | u32 | catalog root page (`smalt_schema`) |
 | 44 | u32 | definitions root page (`smalt_definition`, format 4) |
 | 48 | u64 | last checkpoint LSN |
-| 56 | u32 | required features: bits an engine must know to open the file; an engine that finds one it doesn't know refuses the file with `SMALT_FORMAT`. `0x1`: the database has (or had) property graphs (ADR 0033); bits are never cleared |
+| 56 | u32 | required features: bits an engine must know to open the file; an engine that finds one it doesn't know refuses the file with `SMALT_FORMAT`. `0x1`: the database has (or had) property graphs (ADR 0033); `0x2`: it has (or had) a table that keeps history (ADR 0033 step 6, `smalt_since_<t>` and `smalt_versions_<t>`); bits are never cleared |
 | 60 | u32 | reserved (zero) |
 | 64 | u64 | commit id: 1 for the first commit, one more for each after; doesn't wrap |
 | 72 | u64 | commit time: milliseconds since the Unix epoch, never earlier than the commit before |

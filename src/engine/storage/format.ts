@@ -66,5 +66,7 @@ export const DH_COMMIT_TIME = 72; // u64
 
 /** Required feature: the file has property graphs (ADR 0033, G4), whose tables' invariants an engine must keep. */
 export const FEATURE_PROPERTY_GRAPHS = 0x1;
+/** Required feature: the file has tables that keep history (ADR 0033 step 6), which every write must maintain. */
+export const FEATURE_HISTORY = 0x2;
 /** The required-feature bits this engine knows. */
-export const KNOWN_FEATURES = FEATURE_PROPERTY_GRAPHS;
+export const KNOWN_FEATURES = FEATURE_PROPERTY_GRAPHS | FEATURE_HISTORY;

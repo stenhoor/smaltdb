@@ -136,7 +136,7 @@ first version (section 5.2).
    something and carries either records them, with its id and time, in the system table `smalt_commits` (rowid = commit
    id), in the same transaction. The pager fixes a transaction's commit id and time the first time it is asked
    (`nextCommit`), so what is recorded is what the header gets. A commit without them writes nothing extra.
-2. **History tables, method (a)** (next): `history: 'versions'` on a table, set when it is created. A system table per
+2. **History tables, method (a)** (done): `history: 'versions'` on a table, set when it is created. A system table per
    table holds closed versions (the row, its rowid, `valid_from`, `valid_to`), and a small one holds each current row's
    `valid_from`, so the table itself and its reads don't change. Inserts write one small row more; updates and deletes
    write a version and change the small row. Every commit that writes such a table records itself in `smalt_commits`,
