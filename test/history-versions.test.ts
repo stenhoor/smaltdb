@@ -161,13 +161,14 @@ describe('the table', () => {
     db.close();
   });
 
-  it('its history tables are the engine\'s: not written, dropped or altered by users, and dropped with it', () => {
+  it('its history tables are the engine\'s: not written or dropped by users, and dropped with it', () => {
     const db = fresh();
     commit(db, "INSERT INTO t VALUES (1, 'a', 0)");
     expect(() => db.exec('DELETE FROM smalt_since_t')).toThrow(/may not be modified/);
     expect(() => db.exec('INSERT INTO smalt_versions_t VALUES (1, 1, 2, 1, 1, 1)')).toThrow(/may not be modified/);
     expect(() => db.exec('DROP TABLE smalt_versions_t')).toThrow(/may not be dropped/);
-    expect(() => db.exec('ALTER TABLE t ADD COLUMN w')).toThrow(/keeps history: ALTER TABLE isn't supported/);
+    // ALTER TABLE works on it, and its history follows (test/history-alter.test.ts).
+    db.exec('ALTER TABLE t ADD COLUMN w');
     db.exec('DROP TABLE t');
     expect(db.catalog.table('smalt_since_t')).toBeUndefined();
     expect(db.catalog.table('smalt_versions_t')).toBeUndefined();

@@ -225,7 +225,9 @@ step 6), and a plan reads it as it was after any commit, or at any time, with `a
   part of the transaction.
 - **Graphs:** a property graph with `history` keeps it for all its tables: each must keep history that way, and the
   tables it makes on first use (and its label index) are created with it.
-- **Not yet:** `ALTER TABLE` on such a table is refused.
+- **`ALTER TABLE`:** its history follows the change. A renamed table keeps its history and horizon; an added column
+  reads NULL in versions from before it (it didn't exist then); a renamed column keeps its past values; a dropped
+  column's past values are dropped with it.
 - **The file:** once a table keeps history, an engine that doesn't keep it refuses the file.
 
 ## Indexes

@@ -3693,8 +3693,12 @@ export class Database implements FunctionContext {
       if (HISTORY_COLUMN_NAMES.has(c.name.toLowerCase())) throw new SmaltError('SMALT_ERROR', `table ${table.name} keeps history: its column ${c.name} has a name history uses`);
     }
     const own: ColumnDefinition[] = table.columns.map((c) => ({ name: c.name, declaredType: c.declaredType, type: c.type, notNull: false, collation: collationName(c.collation) }));
-    const index = (on: string, suffix: string, column: number) =>
-      this.createIndex({ op: 'createIndex', index: { name: `${on}_${suffix}`, table: on, columns: [{ column, desc: false, collation: 'binary' }], unique: false }, ifNotExists: false }, true);
+    // Index names don't follow a table rename: take the first free one.
+    const index = (on: string, suffix: string, column: number) => {
+      let name = `${on}_${suffix}`;
+      for (let n = 2; this.indexes.has(name.toLowerCase()) || this.catalogEntries.has(name.toLowerCase()); n++) name = `${on}_${suffix}_${n}`;
+      this.createIndex({ op: 'createIndex', index: { name, table: on, columns: [{ column, desc: false, collation: 'binary' }], unique: false }, ifNotExists: false }, true);
+    };
     if (table.history === 'log') {
       const log = logTableName(table.name);
       this.createTable(def(log, [...LOG_COLUMNS.map(int), ...own]), true);
@@ -4124,12 +4128,12 @@ export class Database implements FunctionContext {
    * (`sqlite_schema.sql`, expression texts) are edited by their language's {@link SourceEditor}, as SQLite edits its
    * stored statements. Views, kept as source, are checked again afterwards.
    */
-  private alterTable(op: Extract<SchemaOp, { op: 'alterTable' }>): RunResult {
+  private alterTable(op: Extract<SchemaOp, { op: 'alterTable' }>, internal = false): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     if (op.schema && !['main', 'temp'].includes(op.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${op.schema}`);
     const lower = op.table.toLowerCase();
     const a = op.action;
-    if (CATALOG_NAMES.has(lower) || lower.startsWith('smalt_') || lower.startsWith('sqlite_')) {
+    if (!internal && (CATALOG_NAMES.has(lower) || lower.startsWith('smalt_') || lower.startsWith('sqlite_'))) {
       throw new SmaltError('SMALT_ERROR', `table ${CATALOG_NAMES.has(lower) ? 'sqlite_master' : op.table} may not be altered`);
     }
     if (this.views.has(lower)) {
@@ -4141,8 +4145,6 @@ export class Database implements FunctionContext {
     // TEMP tables have no stored definitions (main.t reaches a shadowed main table).
     if (table.temp) throw new SmaltError('SMALT_UNSUPPORTED', `ALTER TABLE is not supported for TEMP table ${table.name}`);
     if (table.matview) throw new SmaltError('SMALT_ERROR', `materialized view ${table.name} may not be altered`);
-    // Its versions have its columns: changing them isn't supported yet (ADR 0033 step 6).
-    if (table.history) throw new SmaltError('SMALT_UNSUPPORTED', `table ${table.name} keeps history: ALTER TABLE isn't supported for it yet`);
     // A graph names its tables and their id, endpoint and props columns: those can't be renamed or dropped under it.
     const graphUser = this.graphUsing(table.name.toLowerCase());
     if (graphUser) {
@@ -4161,7 +4163,7 @@ export class Database implements FunctionContext {
     let viewSuffix = '';
     switch (a.kind) {
       case 'renameTable':
-        this.renameTableDefs(table, a.newName, defs, change);
+        this.renameTableDefs(table, a.newName, defs, change, internal);
         break;
       case 'renameColumn':
         this.renameColumnDefs(table, own, a.column, a.newName, defs, change);
@@ -4207,7 +4209,57 @@ export class Database implements FunctionContext {
     if (a.kind === 'dropColumn') this.rewriteRowsWithout(oldTable, findColumn(oldTable, a.column));
     // ADD COLUMN: existing rows keep their shorter records, and readers fill in the new column's constant default.
     this.schemaChanged();
+    if (oldTable.history) this.alterHistoryTables(oldTable, a);
     return none;
+  }
+
+  /**
+   * A history table's companions follow its change (ADR 0033 step 6, part 4a): they are renamed with it, and its
+   * versions or log gain, rename and lose the columns it does (after their own leading columns, so positions line up).
+   * A dropped column's past values go with it. `smalt_since_<t>` holds no columns of `t`: it is only renamed.
+   */
+  private alterHistoryTables(table: TableSchema, a: AlterAction): void {
+    const rows = table.history === 'log' ? logTableName : versionsTableName;
+    const companions = table.history === 'log' ? [logTableName] : [versionsTableName, sinceTableName];
+    const alter = (name: string, action: AlterAction) => this.alterTable({ op: 'alterTable', table: name, action }, true);
+    switch (a.kind) {
+      case 'renameTable':
+        for (const n of companions) alter(n(table.name), { kind: 'renameTable', newName: n(a.newName) });
+        this.renameHorizon(table.name, a.newName);
+        return;
+      case 'addColumn': {
+        // Versions from before the column read NULL in it, whatever its default: it didn't exist then.
+        const { default: _d, ...column } = a.column;
+        alter(rows(table.name), { kind: 'addColumn', column: { ...column, notNull: false }, checks: [], foreignKeys: [], text: '' });
+        return;
+      }
+      case 'renameColumn':
+      case 'dropColumn':
+        alter(rows(table.name), a);
+        return;
+    }
+  }
+
+  /** A renamed history table keeps its horizon (smalt_history). */
+  private renameHorizon(from: string, to: string): void {
+    const h = this.horizons.get(from.toLowerCase());
+    const t = this.tables.get('smalt_history');
+    if (h === undefined || !t) return;
+    const reader = new RecordReader(t.layout, t.recordDefaults);
+    const c = this.tree(t.rootPage).cursor();
+    let rowid: number | bigint | null = null;
+    for (let ok = c.first(); ok; ok = c.next()) {
+      c.loadValue();
+      reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+      if (String(reader.column(0)).toLowerCase() === from.toLowerCase()) {
+        c.loadKey();
+        rowid = readRowidKey(c.keyBytes, c.keyOffset);
+      }
+    }
+    c.close();
+    if (rowid !== null) new TableWriter(t, this.pager, (root) => this.tree(root)).writeRow([to, h], rowid);
+    this.horizons.delete(from.toLowerCase());
+    this.horizons.set(to.toLowerCase(), h);
   }
 
   /** Every stored definition, by catalog key. */
@@ -4290,9 +4342,9 @@ export class Database implements FunctionContext {
     return row.type === 'connection' ? connectionKey(row.name) : row.type === 'graph' ? graphKey(row.name) : row.name.toLowerCase();
   }
 
-  private renameTableDefs(table: TableSchema, newName: string, defs: Map<string, StoredDef>, change: AlterChange): void {
+  private renameTableDefs(table: TableSchema, newName: string, defs: Map<string, StoredDef>, change: AlterChange, internal = false): void {
     const lowerNew = newName.toLowerCase();
-    if (lowerNew.startsWith('smalt_') || lowerNew.startsWith('sqlite_')) throw new SmaltError('SMALT_ERROR', `object name reserved for internal use: ${newName}`);
+    if (!internal && (lowerNew.startsWith('smalt_') || lowerNew.startsWith('sqlite_'))) throw new SmaltError('SMALT_ERROR', `object name reserved for internal use: ${newName}`);
     if (this.catalogEntries.has(lowerNew) && lowerNew !== table.name.toLowerCase()) {
       throw new SmaltError('SMALT_ERROR', `there is already another table or index with this name: ${newName}`);
     }
