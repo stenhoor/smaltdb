@@ -2648,6 +2648,11 @@ export function planWidth(op: PlanOp): number {
     case 'update':
     case 'append':
       return op.returning?.length ?? 0;
+    default: {
+      // Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
+      const unhandled: never = op;
+      throw new Error(`planWidth: unknown operation ${(unhandled as { op: string }).op}`);
+    }
   }
 }
 
@@ -2784,8 +2789,30 @@ function supportedLeaf(op: PlanOp, level: number): boolean {
       return true;
     case 'iterate':
       return supportedPlan(op.init, level) && op.steps.every((x) => supportedPlan(x, level)) && [op.limit, op.offset].every((e) => e === undefined || readsRows(e, -1));
-    default:
+    // Nested plans, which supportedPlan checks.
+    case 'values':
+    case 'project':
+    case 'filter':
+    case 'sort':
+    case 'limit':
+    case 'distinct':
+    case 'aggregate':
+    case 'window':
+    case 'setop':
+    case 'join':
+    case 'sample':
+    case 'pivot':
+    case 'unpivot':
+    case 'explode':
+    case 'append':
+    case 'update':
+    case 'delete':
       return supportedPlan(op, level);
+    default: {
+      // Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
+      const unhandled: never = op;
+      return supportedPlan(unhandled, level);
+    }
   }
 }
 

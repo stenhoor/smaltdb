@@ -75,8 +75,26 @@ function rewriteAll(x: unknown): unknown {
     case 'explode':
       // Its rewrite is an ordered join: rewritten in turn.
       return rewriteAll(explodeRows(op));
-    default:
+    // Operations with no rewrite of their own (their inputs were rewritten above).
+    case 'scan':
+    case 'source':
+    case 'iterate':
+    case 'working':
+    case 'values':
+    case 'project':
+    case 'filter':
+    case 'sort':
+    case 'window':
+    case 'setop':
+    case 'append':
+    case 'update':
+    case 'delete':
       return op;
+    default: {
+      // Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
+      const unhandled: never = op;
+      return unhandled;
+    }
   }
 }
 
@@ -602,8 +620,28 @@ function from(op: PlanOp): PlanOp {
     case 'values':
       // A single empty row is SQL's FROM-less SELECT; other VALUES are blocks of their own.
       return op.rows.length === 1 && op.rows[0].length === 0 ? op : block(op);
-    default:
+    // Every other operation is a nested block.
+    case 'project':
+    case 'filter':
+    case 'sort':
+    case 'limit':
+    case 'distinct':
+    case 'aggregate':
+    case 'window':
+    case 'setop':
+    case 'sample':
+    case 'pivot':
+    case 'unpivot':
+    case 'explode':
+    case 'append':
+    case 'update':
+    case 'delete':
       return block(op);
+    default: {
+      // Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
+      const unhandled: never = op;
+      return block(unhandled);
+    }
   }
 }
 

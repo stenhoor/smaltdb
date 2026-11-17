@@ -549,8 +549,11 @@ class Validator {
         }
         return returning(o.returning, n);
       }
-      default:
-        return this.fail(`unknown operation ${JSON.stringify((o as { op?: unknown }).op)}`);
+      default: {
+        // Plans arrive as JSON, so an unknown operation is an error here. Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
+        const unhandled: never = o;
+        return this.fail(`unknown operation ${JSON.stringify((unhandled as { op?: unknown }).op)}`);
+      }
     }
   }
 

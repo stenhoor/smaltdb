@@ -52,4 +52,17 @@ export const DH_CHANGE_COUNTER = 36; // u32
 export const DH_CATALOG_ROOT = 40; // u32
 export const DH_DEFINITION_ROOT = 44; // u32 (format 4: root of the stored definitions, 0 = none yet)
 export const DH_CHECKPOINT_LSN = 48; // u64
-// 56..127 reserved (future: encryption salt/KDF params, application id, ...)
+/**
+ * Features the file uses that an engine must know to open it (u32 bits, ADR 0033 step 0). An engine that finds a bit
+ * it doesn't know refuses the file with SMALT_FORMAT, instead of reading or writing data it would misunderstand.
+ */
+export const DH_REQUIRED_FEATURES = 56; // u32
+// 60..63 reserved (zero)
+/** The latest commit's id: 1 for the first commit, one more for each after; never reused (u64). */
+export const DH_COMMIT_ID = 64; // u64
+/** The latest commit's time, in milliseconds since the Unix epoch; never earlier than the commit before it (u64). */
+export const DH_COMMIT_TIME = 72; // u64
+// 80..127 reserved (future: encryption salt/KDF params, application id, ...)
+
+/** The required-feature bits this engine knows. None are defined yet: ADR 0033's graphs and history add the first. */
+export const KNOWN_FEATURES = 0;

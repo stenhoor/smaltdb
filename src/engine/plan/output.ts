@@ -66,7 +66,10 @@ export function outputTypes(op: PlanOp, tableTypes: TableTypes): PlanType[] {
     case 'update':
     case 'delete':
       return (op.returning ?? []).map(typeOf);
-    default:
-      return [];
+    default: {
+      // Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
+      const unhandled: never = op;
+      throw new Error(`outputTypes: unknown operation ${(unhandled as { op: string }).op}`);
+    }
   }
 }

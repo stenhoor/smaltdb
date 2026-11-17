@@ -56,7 +56,11 @@
 | 40 | u32 | catalog root page (`smalt_schema`) |
 | 44 | u32 | definitions root page (`smalt_definition`, format 4) |
 | 48 | u64 | last checkpoint LSN |
-| 56–127 | | reserved (encryption salt and KDF parameters, application id, …) |
+| 56 | u32 | required features: bits an engine must know to open the file; an engine that finds one it doesn't know refuses the file with `SMALT_FORMAT` (none are defined yet) |
+| 60 | u32 | reserved (zero) |
+| 64 | u64 | commit id: 1 for the first commit, one more for each after; doesn't wrap |
+| 72 | u64 | commit time: milliseconds since the Unix epoch, never earlier than the commit before |
+| 80–127 | | reserved (encryption salt and KDF parameters, application id, …) |
 
 ### Page types
 
@@ -228,7 +232,8 @@ Original plan:
 
 - Current format: **4.0**, unreleased (smaltdb 0.8.3 wrote format 3). Format 4 stores definitions instead of SQL text
   (ADR 0015 step 7) and, before 0.9.0, gains ADR 0018's types: NaN's own key tag and zone maps that order it, then
-  the `BOOLEAN` storage type, the date and time storage types (ADR 0019), and `LIST` and `STRUCT` (ADR 0020). Format 1 used 11-byte numeric key components (ADR 0006); format 2 used 7-byte fixed leaf
+  the `BOOLEAN` storage type, the date and time storage types (ADR 0019), and `LIST` and `STRUCT` (ADR 0020), and the
+  header's required-feature bits, commit id and commit time (ADR 0033 step 0). Format 1 used 11-byte numeric key components (ADR 0006); format 2 used 7-byte fixed leaf
   cell headers and no free blocks (ADR 0007); format 3 stored SQL text in the catalog.
 
 - A format version in the header. Engines refuse to write newer major versions, and minor versions must be backward compatible.
