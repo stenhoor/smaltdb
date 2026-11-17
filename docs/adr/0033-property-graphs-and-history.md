@@ -149,8 +149,8 @@ first version (section 5.2).
 4. **Forgetting and graphs** (done): an explicit command (`forget`) drops versions older than a commit and records
    the limit (`smalt_history`), below which `asOf` is an error, checked when the statement runs. A property graph can
    turn history on for all its tables.
-4a. **ALTER TABLE on history tables** (next): their history tables follow added, renamed and dropped columns; refused
-   until then.
+4a. **ALTER TABLE on history tables** (done): their versions or log follow a renamed table (with its horizon) and
+   added, renamed and dropped columns.
 5. **Step 7** benchmarks both and picks the default.
 
 ## 4. Cypher on smaltdb

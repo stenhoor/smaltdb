@@ -128,7 +128,8 @@ describe('the log', () => {
     db = open();
     expect(asOf(db, 't', c1)).toEqual([[1, 'a']]);
     expect(() => db.exec('DELETE FROM smalt_log_t')).toThrow(/may not be modified/);
-    expect(() => db.exec('ALTER TABLE t ADD COLUMN w')).toThrow(/keeps history/);
+    // ALTER TABLE works on it, and its log follows (test/history-alter.test.ts).
+    db.exec('ALTER TABLE t ADD COLUMN w');
     db.exec('DROP TABLE t');
     expect(db.catalog.table('smalt_log_t')).toBeUndefined();
     db.close();
