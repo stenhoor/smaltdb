@@ -1685,6 +1685,8 @@ export class Database implements FunctionContext {
         return run(() => this.createConnection(op));
       case 'createPropertyGraph':
         return run(() => this.createPropertyGraph(op));
+      case 'alterPropertyGraph':
+        return run(() => this.alterPropertyGraph(op));
       case 'createExternalTable':
         return run(() => this.createExternalTable(op));
       case 'createView':
@@ -3082,16 +3084,14 @@ export class Database implements FunctionContext {
     return out;
   }
 
-  private createPropertyGraph(stmt: Extract<SchemaOp, { op: 'createPropertyGraph' }>): RunResult {
-    const none = { changes: 0, lastInsertRowid: this.lastRowid };
-    const g = stmt.graph;
+  /**
+   * A graph's definition checked against the catalog (ADR 0033, G4): its tables are row tables in main, each listed
+   * once and in no other graph than `self`; node ids are INTEGER PRIMARY KEYs, endpoints INTEGER, props MAP. Normalized.
+   */
+  private checkGraph(g: PropertyGraphDef, self?: string): PropertyGraphDef {
     const fail = (message: string): never => {
       throw new SmaltError('SMALT_ERROR', `property graph ${g.name}: ${message}`);
     };
-    if (this.graphs.has(g.name.toLowerCase())) {
-      if (stmt.ifNotExists) return none;
-      throw new SmaltError('SMALT_ERROR', `property graph ${g.name} already exists`);
-    }
     if (g.nodes.length === 0) fail('a graph needs at least one node table');
     const seen = new Map<string, string>();
     const unique = (what: string, name: string) => {
@@ -3104,7 +3104,8 @@ export class Database implements FunctionContext {
       if (!t) return fail(`no such table: ${name}`);
       if (t.kind !== 'table') fail(`${name} is not a table (a ${t.kind === 'materializedView' ? 'materialized view' : t.kind === 'external' ? 'external table' : 'system table'})`);
       if (t.storage !== 'row') fail(`table ${name} is columnar: a graph's tables are row tables`);
-      if (this.graphUsing(name.toLowerCase())) fail(`table ${name} is already used by property graph ${this.graphUsing(name.toLowerCase())}`);
+      const user = this.graphUsing(name.toLowerCase());
+      if (user && user.toLowerCase() !== self) fail(`table ${name} is already used by property graph ${user}`);
       return t;
     };
     const column = (t: ReturnType<typeof tableOf>, name: string, role: string, want: 'INTEGER' | 'MAP') => {
@@ -3129,11 +3130,24 @@ export class Database implements FunctionContext {
       column(t, e.end, 'end', 'INTEGER');
       if (e.props !== undefined) column(t, e.props, 'props', 'MAP');
     }
-    const def: PropertyGraphDef = {
+    return {
       name: g.name,
       nodes: g.nodes.map((n) => ({ label: n.label, table: n.table, id: n.id, ...(n.props !== undefined ? { props: n.props } : {}) })),
       edges: g.edges.map((e) => ({ type: e.type, table: e.table, start: e.start, end: e.end, ...(e.props !== undefined ? { props: e.props } : {}) })),
     };
+  }
+
+  private createPropertyGraph(stmt: Extract<SchemaOp, { op: 'createPropertyGraph' }>): RunResult {
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    const g = stmt.graph;
+    const fail = (message: string): never => {
+      throw new SmaltError('SMALT_ERROR', `property graph ${g.name}: ${message}`);
+    };
+    if (this.graphs.has(g.name.toLowerCase())) {
+      if (stmt.ifNotExists) return none;
+      throw new SmaltError('SMALT_ERROR', `property graph ${g.name} already exists`);
+    }
+    const def = this.checkGraph(g);
     const stored: StoredDef = { kind: 'graph', graph: def, ...(stmt.source ? (stmt.source.language !== 'sql' ? { language: stmt.source.language } : {}) : { described: true as const }) };
     const sql = stmt.source?.text ?? describeDefinition(stored);
     this.dirtySchema = true;
@@ -3141,6 +3155,56 @@ export class Database implements FunctionContext {
     this.pager.requireFeatures(FEATURE_PROPERTY_GRAPHS);
     this.addCatalogRow('graph', g.name, g.name, 0, sql, graphKey(g.name), stored);
     this.graphs.set(g.name.toLowerCase(), { graph: def, sql, ...(stmt.source && stmt.source.language !== 'sql' ? { language: stmt.source.language } : {}), ...(stmt.source ? {} : { described: true }) });
+    this.schemaChanged();
+    return none;
+  }
+
+  /**
+   * A label or relationship type added to a graph (ADR 0033, decision 11: made on first use). Its table, by default
+   * named after it, is created when there is none: `id INTEGER PRIMARY KEY` and `props map<text, any>` for a label;
+   * `start`, `end` and `props`, with indexes on `start` and on `end`, for a type. An existing table is checked as
+   * createPropertyGraph checks one. One transaction: the table, its indexes and the graph's new record.
+   */
+  private alterPropertyGraph(stmt: Extract<SchemaOp, { op: 'alterPropertyGraph' }>): RunResult {
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    const entry = this.graphs.get(stmt.name.toLowerCase());
+    if (!entry) throw new SmaltError('SMALT_ERROR', `no such property graph: ${stmt.name}`);
+    const g = entry.graph;
+    const a = stmt.action;
+    const isLabel = a.kind === 'addLabel';
+    const name = isLabel ? a.label : a.type;
+    const have = isLabel ? g.nodes.some((n) => n.label.toLowerCase() === name.toLowerCase()) : g.edges.some((e) => e.type.toLowerCase() === name.toLowerCase());
+    if (have) {
+      if (stmt.ifNotExists) return none;
+      throw new SmaltError('SMALT_ERROR', `property graph ${g.name} already has ${isLabel ? 'label' : 'relationship type'} ${name}`);
+    }
+    const tableName = a.table ?? name;
+    const existing = this.catalog.table(tableName, 'main');
+    let next: PropertyGraphDef;
+    if (existing) {
+      // Adopt it: the columns are the conventional ones, checked as any graph's are.
+      next = isLabel ? { ...g, nodes: [...g.nodes, { label: name, table: existing.name, id: 'id', ...(existing.columns.some((c) => c.name.toLowerCase() === 'props') ? { props: 'props' } : {}) }] } : { ...g, edges: [...g.edges, { type: name, table: existing.name, start: 'start', end: 'end', ...(existing.columns.some((c) => c.name.toLowerCase() === 'props') ? { props: 'props' } : {}) }] };
+      next = this.checkGraph(next, g.name.toLowerCase());
+    } else {
+      const col = (n: string, type: 'INTEGER' | 'MAP', declaredType = type === 'MAP' ? 'map<text, any>' : 'INTEGER') => ({ name: n, declaredType, type, notNull: false, collation: 'binary' as const });
+      const key = (column: number) => ({ column, desc: false, collation: 'binary' as const });
+      const table: TableDef = isLabel
+        ? { name: tableName, columns: [col('id', 'INTEGER'), col('props', 'MAP')], keys: [{ kind: 'primaryKey', columns: [key(0)], ofColumn: 0 }], checks: [], foreignKeys: [], storage: 'row' }
+        : { name: tableName, columns: [col('start', 'INTEGER'), col('end', 'INTEGER'), col('props', 'MAP')], keys: [], checks: [], foreignKeys: [], storage: 'row' };
+      next = isLabel ? { ...g, nodes: [...g.nodes, { label: name, table: tableName, id: 'id', props: 'props' }] } : { ...g, edges: [...g.edges, { type: name, table: tableName, start: 'start', end: 'end', props: 'props' }] };
+      this.createTable({ op: 'createTable', table, temp: false, ifNotExists: false });
+      if (!isLabel) {
+        for (const [i, c] of ['start', 'end'].entries()) this.createIndex({ op: 'createIndex', index: { name: `${tableName}_${c}`, table: tableName, columns: [key(i)], unique: false }, ifNotExists: false });
+      }
+      next = this.checkGraph(next, g.name.toLowerCase());
+    }
+    // The graph's record, replaced. Its source text no longer says what it is: it is described from now on.
+    const stored: StoredDef = { kind: 'graph', graph: next, described: true };
+    const sql = describeDefinition(stored);
+    this.dirtySchema = true;
+    this.removeCatalogRow(g.name, graphKey(g.name));
+    this.addCatalogRow('graph', g.name, g.name, 0, sql, graphKey(g.name), stored);
+    this.graphs.set(g.name.toLowerCase(), { graph: next, sql, described: true });
     this.schemaChanged();
     return none;
   }

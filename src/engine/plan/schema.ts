@@ -182,6 +182,17 @@ export type SchemaOp =
     }
   /** A property graph over existing tables (ADR 0033, G4). */
   | { readonly op: 'createPropertyGraph'; readonly graph: PropertyGraphDef; readonly ifNotExists: boolean; readonly source?: Source }
+  /**
+   * A label or relationship type added to a graph: the table a language writes it to the first time (ADR 0033,
+   * decision 11). The engine creates the table when there is none (see the schema reference). `ifNotExists`: a no-op
+   * when the graph has it already.
+   */
+  | {
+      readonly op: 'alterPropertyGraph';
+      readonly name: string;
+      readonly action: { readonly kind: 'addLabel'; readonly label: string; readonly table?: string } | { readonly kind: 'addType'; readonly type: string; readonly table?: string };
+      readonly ifNotExists?: boolean;
+    }
   | { readonly op: 'createConnection'; readonly name: string; readonly ifNotExists: boolean; readonly options: Readonly<Record<string, SqlValue>>; readonly source?: Source }
   | {
       readonly op: 'createExternalTable';
