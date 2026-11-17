@@ -39,8 +39,12 @@ export interface BoundWrite {
 }
 
 export type BoundTransaction =
-  | { readonly kind: 'transaction'; readonly action: 'begin'; readonly mode: 'deferred' | 'immediate' | 'exclusive' }
-  | { readonly kind: 'transaction'; readonly action: 'commit' }
+  /**
+   * `author` and `message` (ADR 0033, decision 17) describe the transaction's commit: given on `begin`, on `commit`, or
+   * both (`commit`'s win), they are recorded in `smalt_commits` with the commit's id and time.
+   */
+  | { readonly kind: 'transaction'; readonly action: 'begin'; readonly mode: 'deferred' | 'immediate' | 'exclusive'; readonly author?: string; readonly message?: string }
+  | { readonly kind: 'transaction'; readonly action: 'commit'; readonly author?: string; readonly message?: string }
   | { readonly kind: 'transaction'; readonly action: 'rollback'; readonly savepoint?: string }
   | { readonly kind: 'transaction'; readonly action: 'savepoint' | 'release'; readonly name: string };
 

@@ -1795,12 +1795,17 @@ export class Database implements FunctionContext {
     switch (stmt.action) {
       case 'begin':
         if (!this.autocommit) throw new SmaltError('SMALT_ERROR', 'cannot start a transaction within a transaction');
+        this.commitInfo = commitInfoOf(stmt);
         this.txnMem = this.snapshotMem();
         this.autocommit = false;
         this.txnFromSavepoint = false;
         break;
       case 'commit':
         if (this.autocommit) throw new SmaltError('SMALT_ERROR', 'cannot commit - no transaction is active');
+        {
+          const more = commitInfoOf(stmt);
+          if (more) this.commitInfo = { ...this.commitInfo, ...more };
+        }
         this.commitTransaction();
         break;
       case 'rollback':
@@ -1858,13 +1863,32 @@ export class Database implements FunctionContext {
     this.sqlSavepoints.length = 0;
     this.memSnapshots.length = 0;
     this.txnMem = null;
+    this.recordCommit();
     this.tx.commit();
     this.autocommit = true;
     this.txnFromSavepoint = false;
   }
 
+  /** The open transaction's author and message (ADR 0033, decision 17), recorded when it commits. */
+  private commitInfo: { author?: string; message?: string } | null = null;
+
+  /**
+   * Record the commit about to happen in `smalt_commits`, when it changes something and carries an author or message:
+   * its id and time as the pager will stamp them. In the transaction, so a failed commit records nothing.
+   */
+  private recordCommit(): void {
+    const info = this.commitInfo;
+    this.commitInfo = null;
+    if (!info || !this.pager.inTransaction) return;
+    if (!this.tables.has('smalt_commits')) this.createTable(systemTableOp('smalt_commits'), true);
+    const t = this.tables.get('smalt_commits')!;
+    const { id, time } = this.pager.nextCommit();
+    new TableWriter(t, this.pager, (root) => this.tree(root)).writeRow([id, time, info.author ?? null, info.message ?? null], id);
+  }
+
   private rollbackTransaction(): void {
     this.lastTransactionEnd = 'rollback';
+    this.commitInfo = null;
     this.interfaceCheckDue = false;
     this.fk.deferred = 0;
     this.sqlSavepoints.length = 0;
@@ -4403,7 +4427,7 @@ export class Database implements FunctionContext {
   private targetTable(name: string, schema?: string): TableSchema {
     if (schema && !['main', 'temp'].includes(schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${schema}`);
     const lower = name.toLowerCase();
-    if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat' || lower === 'smalt_matview' || lower === 'smalt_columnar' || lower === 'smalt_extcache') throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
+    if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat' || lower === 'smalt_matview' || lower === 'smalt_columnar' || lower === 'smalt_extcache' || lower === 'smalt_commits') throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
     const t = this.getTable(lower, schema);
     if (!t) {
       if (this.views.has(lower)) throw new SmaltError('SMALT_ERROR', `cannot modify ${name} because it is a view`);
@@ -5798,6 +5822,15 @@ function wholeTable(op: PlanOp): boolean {
 }
 
 /** A system table's creation as the schema operation the engine runs: its definition, in code, with no source text. */
+/** A transaction statement's author and message, checked: null when it gives neither. */
+function commitInfoOf(stmt: { author?: unknown; message?: unknown }): { author?: string; message?: string } | null {
+  for (const k of ['author', 'message'] as const) {
+    if (stmt[k] !== undefined && typeof stmt[k] !== 'string') throw new SmaltError('SMALT_PLAN', `a transaction's ${k} must be text`);
+  }
+  if (stmt.author === undefined && stmt.message === undefined) return null;
+  return { ...(stmt.author !== undefined ? { author: stmt.author as string } : {}), ...(stmt.message !== undefined ? { message: stmt.message as string } : {}) };
+}
+
 function systemTableOp(name: SystemTableName): Extract<SchemaOp, { op: 'createTable' }> {
   return { op: 'createTable', table: SYSTEM_TABLES[name], temp: false, ifNotExists: false };
 }

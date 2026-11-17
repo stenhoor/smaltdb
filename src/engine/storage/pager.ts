@@ -432,11 +432,24 @@ export class Pager {
     if ((cur | bits) !== cur) this.setHeaderU32(DH_REQUIRED_FEATURES, (cur | bits) >>> 0);
   }
 
+  private pending: { id: number; time: number } | null = null;
+
+  /**
+   * The id and time the open transaction will commit with: fixed the first time they are asked for, so what the
+   * transaction records (`smalt_commits`, history) is what the header gets. Gaps in ids are allowed: a rollback gives
+   * its id up.
+   */
+  nextCommit(): { readonly id: number; readonly time: number } {
+    return (this.pending ??= { id: this.commitId + 1, time: Math.max(Date.now(), this.commitTime) });
+  }
+
   /** Every commit: count it, give it the next id, and stamp its time (never earlier than the commit before). */
   private stampCommit(): void {
+    const next = this.nextCommit();
+    this.pending = null;
     this.hv.setUint32(DH_CHANGE_COUNTER, (this.changeCounter + 1) >>> 0, true);
-    writeU64(this.hv, DH_COMMIT_ID, this.commitId + 1);
-    writeU64(this.hv, DH_COMMIT_TIME, Math.max(Date.now(), this.commitTime));
+    writeU64(this.hv, DH_COMMIT_ID, next.id);
+    writeU64(this.hv, DH_COMMIT_TIME, next.time);
   }
 
   /** True when there are uncommitted changes. */
@@ -901,6 +914,7 @@ export class Pager {
   rollback(): void {
     this.checkOpen();
     this.savepoints.length = 0;
+    this.pending = null;
     for (const f of this.dirtyList) {
       if (f.dirty && f.pins > 0) throw new MisuseError(`rollback with pinned page ${f.pgno}`);
     }
@@ -921,6 +935,7 @@ export class Pager {
     this.dirtyCount = 0;
     this.header.set(this.committedHeader);
     this.headerDirty = false;
+    this.pending = null;
     this.trimOverflowFrames();
   }
 

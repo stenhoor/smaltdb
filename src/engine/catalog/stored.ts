@@ -202,6 +202,8 @@ export const SYSTEM_TABLES = {
   smalt_matview: systemTableDef('smalt_matview', [['name', 'TEXT'], ['layout', 'TEXT'], ['populated', 'INTEGER'], ['refreshed_at', 'TEXT']]),
   smalt_columnar: systemTableDef('smalt_columnar', [['name', 'TEXT'], ['seg_root', 'INTEGER'], ['del_root', 'INTEGER']]),
   smalt_extcache: systemTableDef('smalt_extcache', [['name', 'TEXT'], ['sources', 'TEXT']]),
+  /** Commits that carried an author or message (ADR 0033, decision 17): rowid and `id` are the commit id. */
+  smalt_commits: systemTableDef('smalt_commits', [['id', 'INTEGER'], ['time', 'INTEGER'], ['author', 'TEXT'], ['message', 'TEXT']]),
 } as const;
 
 export type SystemTableName = keyof typeof SYSTEM_TABLES;
