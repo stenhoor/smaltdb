@@ -2257,11 +2257,13 @@ export class VirtualScan implements Operator {
   readonly children: Operator[] = [];
   private rows: SqlValue[][] = [];
   private i = 0;
+  /** The rows of a producer that gives an iterable but not an array (read as they come). */
+  private it: Iterator<SqlValue[]> | null = null;
   private r!: SqlValue[];
 
   constructor(
     readonly label: string,
-    private readonly produce: (r: SqlValue[]) => SqlValue[][],
+    private readonly produce: (r: SqlValue[]) => Iterable<SqlValue[]>,
     private readonly regs: number[],
   ) {}
 
@@ -2272,13 +2274,27 @@ export class VirtualScan implements Operator {
 
   open(r: SqlValue[]): void {
     this.r = r;
-    this.rows = this.produce(r);
+    const rows = this.produce(r);
+    if (Array.isArray(rows)) {
+      this.rows = rows;
+      this.it = null;
+    } else {
+      this.rows = [];
+      this.it = rows[Symbol.iterator]();
+    }
     this.i = 0;
   }
 
   next(): boolean {
-    if (this.i >= this.rows.length) return false;
-    const row = this.rows[this.i++];
+    let row: SqlValue[];
+    if (this.it !== null) {
+      const n = this.it.next();
+      if (n.done) return false;
+      row = n.value;
+    } else {
+      if (this.i >= this.rows.length) return false;
+      row = this.rows[this.i++]!;
+    }
     const regs = this.regs;
     for (let j = 0; j < regs.length; j++) this.r[regs[j]] = row[j] ?? null;
     return true;
@@ -2286,6 +2302,7 @@ export class VirtualScan implements Operator {
 
   close(): void {
     this.rows = [];
+    this.it = null;
   }
 }
 

@@ -142,6 +142,36 @@ const LIST_ELEMENTS: { columns: { name: string; type: StaticType }[]; rows: (arg
   },
 };
 
+/**
+ * `range(start, stop [, step])` (ADR 0033 step 5): the integers from `start` to `stop`, both included, `step` apart
+ * (default 1; negative counts down), as Cypher's `range` and PostgreSQL's `generate_series` give them. One column,
+ * `value`. Rows are made as they are read, so a long range costs no memory. A NULL argument gives no rows; a step of 0,
+ * or an argument that isn't a whole number, is an error.
+ */
+const RANGE: { columns: { name: string; type: StaticType }[]; rows: (args: SqlValue[]) => Iterable<SqlValue[]> } = {
+  columns: [{ name: 'value', type: 'int' }],
+  rows: (args) => {
+    if (args.length < 2 || args.length > 3) throw new SmaltError('SMALT_ERROR', `range takes 2 or 3 arguments, not ${args.length}`);
+    const [a, b, c = 1] = args;
+    if (a === null || b === null || c === null || a === undefined || b === undefined) return [];
+    const whole = (v: SqlValue, what: string): bigint => {
+      if (typeof v === 'bigint') return v;
+      if (typeof v === 'number' && Number.isInteger(v)) return BigInt(v);
+      throw new SmaltError('SMALT_MISMATCH', `range: the ${what} must be a whole number, not ${typeof v === 'number' ? String(v) : typeof v === 'string' ? JSON.stringify(v) : 'a blob'}`);
+    };
+    const start = whole(a, 'start');
+    const stop = whole(b, 'stop');
+    const step = whole(c, 'step');
+    if (step === 0n) throw new SmaltError('SMALT_RANGE', 'range: the step must not be 0');
+    const small = (x: bigint): SqlValue => (x >= -(2n ** 53n) && x <= 2n ** 53n ? Number(x) : x);
+    return {
+      *[Symbol.iterator]() {
+        for (let x = start; step > 0n ? x <= stop : x >= stop; x += step) yield [small(x)];
+      },
+    };
+  },
+};
+
 /** A view: its source in its language, bound where the view is read (the SQL front end merges it into the query). */
 export interface ViewSchema {
   name: string;
@@ -939,7 +969,7 @@ export class Database implements FunctionContext {
   }
 
   /** @internal Virtual tables for the planner: information_schema views and pragma_*() functions. */
-  virtualTable(schema: string | undefined, name: string): { columns: { name: string; type: StaticType }[]; rows: (args: SqlValue[]) => SqlValue[][] } | undefined {
+  virtualTable(schema: string | undefined, name: string): { columns: { name: string; type: StaticType }[]; rows: (args: SqlValue[]) => Iterable<SqlValue[]> } | undefined {
     if (schema === undefined && name.toLowerCase() === 'smalt_partials' && this.morsel !== null) {
       // The partial aggregates being merged (morsel parallelism).
       const m = this.morsel;
@@ -961,6 +991,7 @@ export class Database implements FunctionContext {
     // As in SQLite, a schema qualifier on a pragma function (main.pragma_table_info) changes nothing.
     const lower = name.toLowerCase().replace(/^(main|temp)\./, '');
     if (schema === undefined && lower === 'list_elements') return LIST_ELEMENTS;
+    if (schema === undefined && lower === 'range') return RANGE;
     if (!lower.startsWith('pragma_')) return undefined;
     const pragma = lower.slice('pragma_'.length);
     let current: SqlValue[] = [];

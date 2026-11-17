@@ -104,7 +104,8 @@ export interface PhysicalEnv {
    * Virtual tables: `information_schema.<name>` (schema 'information_schema') and table-valued
    * functions such as `pragma_table_info(t)` (schema undefined). Rows are computed at open.
    */
-  virtualTable?(schema: string | undefined, name: string): { columns: { name: string; type: StaticType }[]; rows: (args: SqlValue[]) => SqlValue[][] } | undefined;
+  /** A virtual table or table function: its rows are an array, or any iterable (read lazily, as `range`'s). */
+  virtualTable?(schema: string | undefined, name: string): { columns: { name: string; type: StaticType }[]; rows: (args: SqlValue[]) => Iterable<SqlValue[]> } | undefined;
   openTree(rootPage: number): BTree;
   /** On-demand statistics for a table without ANALYZE results (sampled; cached by the database). */
   sampledStats?(table: TableSchema): TableStats | undefined;
