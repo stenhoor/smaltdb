@@ -7,6 +7,7 @@ import { SmaltError } from '../errors.js';
 import { decodeKey, encodeKey } from '../storage/key-codec.js';
 import { Collation, type SqlValue, compareValues, normalizeInt } from '../values.js';
 import { type NestedTypeName, isNested, parseNested } from '../../shared/nested-types.js';
+import { compareCodePoints } from '../../shared/nested.js';
 import { isTemporal, temporalText } from '../../shared/temporal.js';
 import { type StaticType, hashKey, toText, truthy } from './convert.js';
 import type { AggregateFunction, AggregateState, CompiledArg, ScalarFunction } from './functions.js';
@@ -511,8 +512,173 @@ const LIST_OPS: [string, ScalarFunction][] = [
   ),
 ];
 
-/** The list and struct operations, for the scalar function registry. */
-export const NESTED_FUNCTIONS: readonly [string, ScalarFunction][] = [...LIST_OPS, ...MORE_LIST_OPS, LIST_SAMPLE];
+// ------------------------------------------------------------------ maps (ADR 0038 step 2)
+
+/** The value type of map type `t`, or an error naming `fn`. */
+function mapOf(fn: string, t: StaticType): string {
+  if (t === 'null') return 'null';
+  const n = isNested(t) ? parseNested(t) : null;
+  if (!n || n.kind !== 'map') throw mismatch(`${fn} takes a map, not ${t}`);
+  return n.of;
+}
+
+/** A map type of values of type `v` (`any` when unknown). */
+const mapType = (v: string): StaticType => `map<text, ${v === 'null' ? 'any' : v}>` as StaticType;
+
+/** A key argument: text, or an error. */
+function keyArg(v: SqlValue, fn: string): string {
+  if (typeof v === 'string') return v;
+  throw mismatch(`${fn}: a map's keys are text, not ${v === null ? 'NULL' : typeof v === 'object' ? 'a blob' : typeof v}`);
+}
+
+/** The keys and values of a map's bytes, in key order. */
+function entriesOf(v: SqlValue, fn: string): { keys: string[]; vals: SqlValue[] } {
+  const flat = elements(bytesOf(v, fn));
+  const keys: string[] = [];
+  const vals: SqlValue[] = [];
+  for (let i = 0; i + 1 < flat.length; i += 2) {
+    keys.push(flat[i] as string);
+    vals.push(flat[i + 1]!);
+  }
+  return { keys, vals };
+}
+
+/** A map's bytes from entries in any order: sorted by key, the last of a repeated key kept. */
+function encodeEntries(entries: [string, SqlValue][]): Uint8Array {
+  const byKey = new Map<string, SqlValue>();
+  for (const [k, v] of entries) byKey.set(k, v);
+  const keys = [...byKey.keys()].sort(compareCodePoints);
+  const flat: SqlValue[] = [];
+  for (const k of keys) flat.push(k, byKey.get(k)!);
+  return encodeKey(flat);
+}
+
+/** The index of `key` in sorted `keys`, or -1. */
+function findKey(keys: readonly string[], key: string): number {
+  let lo = 0;
+  let hi = keys.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const c = compareCodePoints(keys[mid]!, key);
+    if (c === 0) return mid;
+    if (c < 0) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return -1;
+}
+
+const valueOfMap = (fn: string) => (a: readonly Pick<CompiledArg, 'type'>[]): StaticType => {
+  const v = mapOf(fn, a[0]!.type);
+  return (v === 'null' ? 'any' : v) as StaticType;
+};
+
+const MAP_OPS: [string, ScalarFunction][] = [
+  // map_of(k1, v1, k2, v2, …): a repeated key keeps its last value.
+  op('map_of', 0, -1, (a) => mapType(common(a.filter((_, i) => i % 2 === 1).map((x) => x.type))), (args) => {
+    if (args.length % 2 !== 0) throw mismatch('map_of takes keys and values in pairs');
+    return (v) => {
+      const entries: [string, SqlValue][] = [];
+      for (let i = 0; i < v.length; i += 2) entries.push([keyArg(v[i]!, 'map_of'), v[i + 1]!]);
+      return encodeEntries(entries);
+    };
+  }),
+  // map_from_entries(list<struct<key text, value V>>): NULL entries are skipped; a repeated key keeps its last value.
+  op(
+    'map_from_entries',
+    1,
+    1,
+    (a) => {
+      const el = listOf('map_from_entries', a[0]!.type);
+      const n = isNested(el) ? parseNested(el) : null;
+      return mapType(n && n.kind === 'struct' && n.fields.length === 2 ? n.fields[1]!.type : 'any');
+    },
+    ([a]) => {
+      const el = listOf('map_from_entries', a!.type);
+      const n = el === 'null' ? null : isNested(el) ? parseNested(el) : null;
+      if (el !== 'null' && el !== 'any' && (!n || n.kind !== 'struct' || n.fields.length !== 2)) throw mismatch(`map_from_entries takes a list of key and value structs, not ${a!.type}`);
+      return ([v]) => {
+        if (v === null) return null;
+        const entries: [string, SqlValue][] = [];
+        for (const e of decodeKey(bytesOf(v, 'map_from_entries'))) {
+          if (e === null) continue;
+          const kv = decodeKey(bytesOf(e, 'map_from_entries'));
+          if (kv.length !== 2) throw mismatch('map_from_entries takes structs of a key and a value');
+          entries.push([keyArg(kv[0]!, 'map_from_entries'), kv[1]!]);
+        }
+        return encodeEntries(entries);
+      };
+    },
+  ),
+  // map_get(m, key): the key's value, NULL when it is missing.
+  op('map_get', 2, 2, valueOfMap('map_get'), ([a]) => {
+    mapOf('map_get', a!.type);
+    return ([m, k]) => {
+      if (m === null || k === null) return null;
+      const { keys, vals } = entriesOf(m, 'map_get');
+      const i = findKey(keys, keyArg(k, 'map_get'));
+      return i < 0 ? null : vals[i]!;
+    };
+  }),
+  op('map_contains_key', 2, 2, () => 'bool', ([a]) => {
+    mapOf('map_contains_key', a!.type);
+    return ([m, k]) => (m === null || k === null ? null : findKey(entriesOf(m, 'map_contains_key').keys, keyArg(k, 'map_contains_key')) >= 0 ? 1 : 0);
+  }),
+  op('map_len', 1, 1, () => 'int', ([a]) => {
+    mapOf('map_len', a!.type);
+    return ([m]) => (m === null ? null : elements(bytesOf(m, 'map_len')).length / 2);
+  }),
+  op('map_keys', 1, 1, () => 'list<text>' as StaticType, ([a]) => {
+    mapOf('map_keys', a!.type);
+    return ([m]) => (m === null ? null : encodeKey(entriesOf(m, 'map_keys').keys));
+  }),
+  op('map_values', 1, 1, (a) => `list<${(() => { const v = mapOf('map_values', a[0]!.type); return v === 'null' ? 'any' : v; })()}>` as StaticType, ([a]) => {
+    mapOf('map_values', a!.type);
+    return ([m]) => (m === null ? null : encodeKey(entriesOf(m, 'map_values').vals));
+  }),
+  // map_entries(m): list<struct<key text, value V>>, in key order: ADR 0020's form of a map.
+  op('map_entries', 1, 1, (a) => `list<struct<key text, value ${(() => { const v = mapOf('map_entries', a[0]!.type); return v === 'null' ? 'any' : v; })()}>>` as StaticType, ([a]) => {
+    mapOf('map_entries', a!.type);
+    return ([m]) => {
+      if (m === null) return null;
+      const { keys, vals } = entriesOf(m, 'map_entries');
+      return encodeKey(keys.map((k, i) => encodeKey([k, vals[i]!])));
+    };
+  }),
+  // map_merge(a, b): b's entries win (Cypher's SET n += map).
+  op('map_merge', 2, 2, (a) => {
+    const x = mapOf('map_merge', a[0]!.type);
+    const y = mapOf('map_merge', a[1]!.type);
+    return mapType(x === 'null' ? y : y === 'null' ? x : x === y ? x : 'any');
+  }, ([a, b]) => {
+    mapOf('map_merge', a!.type);
+    mapOf('map_merge', b!.type);
+    return ([x, y]) => {
+      if (x === null || y === null) return null;
+      const ex = entriesOf(x, 'map_merge');
+      const ey = entriesOf(y, 'map_merge');
+      const entries: [string, SqlValue][] = ex.keys.map((k, i) => [k, ex.vals[i]!]);
+      ey.keys.forEach((k, i) => entries.push([k, ey.vals[i]!]));
+      return encodeEntries(entries);
+    };
+  }),
+  // map_remove(m, keys): m without the keys listed (list<text>).
+  op('map_remove', 2, 2, (a) => mapType(mapOf('map_remove', a[0]!.type)), ([a, b]) => {
+    mapOf('map_remove', a!.type);
+    listOf('map_remove', b!.type);
+    return ([m, ks]) => {
+      if (m === null) return null;
+      if (ks === null) return m;
+      const drop = new Set(decodeKey(bytesOf(ks, 'map_remove')).filter((k) => k !== null).map((k) => keyArg(k, 'map_remove')));
+      const { keys, vals } = entriesOf(m, 'map_remove');
+      const flat: SqlValue[] = [];
+      keys.forEach((k, i) => (drop.has(k) ? undefined : flat.push(k, vals[i]!)));
+      return encodeKey(flat);
+    };
+  }),
+];
+
+/** The list, struct and map operations, for the scalar function registry. */
+export const NESTED_FUNCTIONS: readonly [string, ScalarFunction][] = [...LIST_OPS, ...MORE_LIST_OPS, LIST_SAMPLE, ...MAP_OPS];
 
 // ------------------------------------------------------------------ implode
 
