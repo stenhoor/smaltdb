@@ -843,7 +843,7 @@ export class Planner {
         })
       : null;
     const bind = (e: BoundExpr): Fn => compileBoundExpr(rebind(e, NO_COLUMNS, (m, f) => this.subqueryExpr(m, f)), this.env.funcCtx).fn;
-    const root = new RecursiveCte(op.name, initPlan.root, steps, outRegs, scan, op.distinct, columns.map((c) => c.collation), order, op.limit ? bind(op.limit) : undefined, op.offset ? bind(op.offset) : undefined);
+    const root = new RecursiveCte(op.name, initPlan.root, steps, outRegs, scan, op.distinct, columns.map((c) => c.collation), order, op.limit ? bind(op.limit) : undefined, op.offset ? bind(op.offset) : undefined, op.key ?? null, op.maxDepth ?? -1);
     return { root, outRegs, columns, correlated };
   }
 

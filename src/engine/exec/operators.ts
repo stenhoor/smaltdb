@@ -2027,16 +2027,29 @@ export class WorkingScan implements Operator {
  * queueing their results. UNION (not ALL) discards rows already seen. An ORDER BY on the CTE makes
  * the queue a priority queue (FIFO among equal keys); LIMIT stops the recursion, OFFSET skips output.
  */
+/** A row waiting in a recursive CTE's queue: `depth` steps from the initial rows; `pos` and `key` when keyed by order. */
+interface CteItem {
+  row: SqlValue[];
+  seq: number;
+  depth: number;
+  pos: number;
+  key: string;
+}
+
 export class RecursiveCte implements Operator {
   readonly children: Operator[];
   private r!: SqlValue[];
-  private queue: { row: SqlValue[]; seq: number }[] = [];
+  private queue: CteItem[] = [];
   private head = 0;
   private seq = 0;
   private seen = new Set<string>();
+  /** Keyed with an order (ADR 0033 G2): the queued row of each key, which a lower row replaces. */
+  private best = new Map<string, CteItem>();
   private produced = 0;
   private skip = 0;
   private limit = -1;
+  private readonly keyCollations: Collation[] | null;
+  private readonly keyBuf: SqlValue[];
 
   constructor(
     private readonly name: string,
@@ -2049,12 +2062,20 @@ export class RecursiveCte implements Operator {
     private readonly order: { index: number; desc: boolean; nullsFirst: boolean; collation: Collation }[] | null,
     private readonly limitFn?: Fn,
     private readonly offsetFn?: Fn,
+    /** Deduplicate on these columns instead of the whole row: the first wins, or with `order` the lowest. */
+    private readonly key: readonly number[] | null = null,
+    /** Run the steps only for rows fewer than this many steps from the initial rows (-1: no limit). */
+    private readonly maxDepth = -1,
   ) {
     this.children = [initial, ...recursive];
+    this.keyCollations = key ? key.map((i) => collations[i]) : null;
+    this.keyBuf = new Array(key?.length ?? 0).fill(null);
   }
 
   get detail(): string {
-    return `RECURSIVE CTE ${this.name}${this.distinct ? ' (UNION)' : ''}`;
+    const key = this.key ? ` KEY (${this.key.join(', ')})` : '';
+    const depth = this.maxDepth >= 0 ? ` MAX DEPTH ${this.maxDepth}` : '';
+    return `RECURSIVE CTE ${this.name}${this.distinct ? ' (UNION)' : ''}${key}${depth}`;
   }
 
   open(r: SqlValue[]): void {
@@ -2063,6 +2084,7 @@ export class RecursiveCte implements Operator {
     this.head = 0;
     this.seq = 0;
     this.seen = new Set();
+    this.best = new Map();
     this.produced = 0;
     this.limit = -1;
     this.skip = 0;
@@ -2075,43 +2097,76 @@ export class RecursiveCte implements Operator {
       this.skip = typeof v === 'number' || typeof v === 'bigint' ? Math.max(0, Number(v)) : 0;
     }
     if (this.limit === 0) return;
-    this.runInto(this.initial);
+    this.runInto(this.initial, 0);
   }
 
-  private runInto(op: Operator): void {
+  private runInto(op: Operator, depth: number): void {
     const r = this.r;
     try {
       op.open(r);
-      while (op.next()) this.add(this.outRegs.map((g) => r[g]));
+      while (op.next()) this.add(this.outRegs.map((g) => r[g]), depth);
     } finally {
       op.close();
     }
   }
 
-  private add(row: SqlValue[]): void {
-    if (this.distinct) {
-      const k = hashKeyMulti(row, this.collations);
-      if (this.seen.has(k)) return;
-      this.seen.add(k);
+  private add(row: SqlValue[], depth: number): void {
+    let k = '';
+    if (this.key) {
+      const buf = this.keyBuf;
+      for (let i = 0; i < buf.length; i++) buf[i] = row[this.key[i]];
+      k = hashKeyMulti(buf, this.keyCollations!);
+      if (this.order) {
+        // The lowest row per key: a key already taken from the queue is final; a queued one is replaced by a lower row.
+        if (this.seen.has(k)) return;
+        const cur = this.best.get(k);
+        if (cur !== undefined) {
+          const cand: CteItem = { row, seq: this.seq++, depth, pos: -1, key: k };
+          if (this.cmp(cand, cur) >= 0) return;
+          cur.row = row;
+          cur.seq = cand.seq;
+          cur.depth = depth;
+          this.siftUp(cur.pos);
+          return;
+        }
+      } else {
+        if (this.seen.has(k)) return;
+        this.seen.add(k);
+      }
+    } else if (this.distinct) {
+      const h = hashKeyMulti(row, this.collations);
+      if (this.seen.has(h)) return;
+      this.seen.add(h);
     }
-    const item = { row, seq: this.seq++ };
+    const item: CteItem = { row, seq: this.seq++, depth, pos: -1, key: k };
     if (!this.order) {
       this.queue.push(item);
       return;
     }
     // Binary heap on the CTE's ORDER BY, insertion order breaking ties.
+    if (this.key) this.best.set(k, item);
     const q = this.queue;
+    item.pos = q.length;
     q.push(item);
-    let i = q.length - 1;
+    this.siftUp(item.pos);
+  }
+
+  private siftUp(i: number): void {
+    const q = this.queue;
+    const keyed = this.key !== null;
     while (i > 0) {
       const p = (i - 1) >> 1;
       if (this.cmp(q[i], q[p]) >= 0) break;
-      [q[i], q[p]] = [q[p], q[i]];
+      const a = q[i];
+      q[i] = q[p];
+      q[p] = a;
+      // Positions are kept only where a lower row can replace a queued one (keyed with an order).
+      if (keyed) (q[i].pos = i), (a.pos = p);
       i = p;
     }
   }
 
-  private cmp(a: { row: SqlValue[]; seq: number }, b: { row: SqlValue[]; seq: number }): number {
+  private cmp(a: CteItem, b: CteItem): number {
     for (const k of this.order!) {
       const x = a.row[k.index];
       const y = b.row[k.index];
@@ -2125,22 +2180,24 @@ export class RecursiveCte implements Operator {
     return a.seq - b.seq;
   }
 
-  private pop(): SqlValue[] | null {
+  private pop(): CteItem | null {
     if (!this.order) {
       if (this.head >= this.queue.length) return null;
-      const row = this.queue[this.head++].row;
+      const item = this.queue[this.head++];
       if (this.head > 1024 && this.head * 2 > this.queue.length) {
         this.queue = this.queue.slice(this.head);
         this.head = 0;
       }
-      return row;
+      return item;
     }
     const q = this.queue;
     if (q.length === 0) return null;
     const top = q[0];
     const last = q.pop()!;
     if (q.length > 0) {
+      const keyed = this.key !== null;
       q[0] = last;
+      if (keyed) last.pos = 0;
       let i = 0;
       for (;;) {
         const l = 2 * i + 1;
@@ -2149,20 +2206,30 @@ export class RecursiveCte implements Operator {
         if (l < q.length && this.cmp(q[l], q[m]) < 0) m = l;
         if (rr < q.length && this.cmp(q[rr], q[m]) < 0) m = rr;
         if (m === i) break;
-        [q[i], q[m]] = [q[m], q[i]];
+        const a = q[i];
+        q[i] = q[m];
+        q[m] = a;
+        if (keyed) (q[i].pos = i), (a.pos = m);
         i = m;
       }
     }
-    return top.row;
+    if (this.key) {
+      this.best.delete(top.key);
+      this.seen.add(top.key);
+    }
+    return top;
   }
 
   next(): boolean {
     for (;;) {
       if (this.limit >= 0 && this.produced >= this.limit) return false;
-      const row = this.pop();
-      if (row === null) return false;
-      this.working.row = row;
-      for (const op of this.recursive) this.runInto(op);
+      const item = this.pop();
+      if (item === null) return false;
+      const row = item.row;
+      if (this.maxDepth < 0 || item.depth < this.maxDepth) {
+        this.working.row = row;
+        for (const op of this.recursive) this.runInto(op, item.depth + 1);
+      }
       if (this.skip > 0) {
         this.skip--;
         continue;
@@ -2180,6 +2247,7 @@ export class RecursiveCte implements Operator {
     for (const op of this.recursive) op.close();
     this.queue = [];
     this.seen = new Set();
+    this.best = new Map();
     this.working.row = null;
   }
 }

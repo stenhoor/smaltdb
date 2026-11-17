@@ -65,7 +65,7 @@ export function printPlan(op: PlanOp, depth = 0): string {
     case 'source':
       return `${pad}${op.kind} ${op.schema ? `${op.schema}.` : ''}${op.name}(${[list(op.args), ...Object.entries(op.named ?? {}).map(([k, e]) => `${k} => ${printExpr(e)}`)].filter((x) => x).join(', ')})`;
     case 'iterate':
-      return [`${pad}iterate #${op.id}${op.distinct ? ' distinct' : ''}${op.limit ? ` limit ${printExpr(op.limit)}` : ''}`, sub(op.init), ...op.steps.map(sub)].join('\n');
+      return [`${pad}iterate #${op.id}${op.distinct ? ' distinct' : ''}${op.key ? ` key [${op.key.join(', ')}]` : ''}${op.maxDepth !== undefined ? ` maxDepth ${op.maxDepth}` : ''}${op.limit ? ` limit ${printExpr(op.limit)}` : ''}`, sub(op.init), ...op.steps.map(sub)].join('\n');
     case 'working':
       return `${pad}working #${op.id}`;
     case 'values':

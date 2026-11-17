@@ -246,14 +246,15 @@ export const source = (kind: Op<'source'>['kind'], name: string, args: readonly 
 
 /**
  * Recursion: `init`'s rows, then each step's over the rows the previous one gave (read with `working(id, types)`),
- * until a step gives none. `distinct` drops rows already given (by `collations`).
+ * until a step gives none. `distinct` drops rows already given (by `collations`); with `key`, rows whose key columns were
+ * already given (the first wins, or the lowest by `order`). `maxDepth` stops the steps that many steps from `init`.
  */
 export const iterate = (
   id: number,
   name: string,
   init: PlanOp,
   steps: readonly PlanOp[],
-  options: { distinct?: boolean; collations?: readonly CollationName[]; order?: readonly SortKey[]; limit?: PlanExpr | number; offset?: PlanExpr | number } = {},
+  options: { distinct?: boolean; collations?: readonly CollationName[]; order?: readonly SortKey[]; limit?: PlanExpr | number; offset?: PlanExpr | number; key?: readonly number[]; maxDepth?: number } = {},
 ): Op<'iterate'> => ({
   op: 'iterate',
   id,
@@ -265,6 +266,8 @@ export const iterate = (
   ...(options.order ? { order: options.order } : {}),
   ...(options.limit !== undefined ? { limit: expr(options.limit) } : {}),
   ...(options.offset !== undefined ? { offset: expr(options.offset) } : {}),
+  ...(options.key ? { key: options.key } : {}),
+  ...(options.maxDepth !== undefined ? { maxDepth: options.maxDepth } : {}),
 });
 /** Inside `iterate` `id`: the rows the previous step gave. */
 export const working = (id: number, types: readonly PlanType[]): Op<'working'> => ({ op: 'working', id, types });
