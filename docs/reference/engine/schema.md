@@ -204,7 +204,8 @@ step 6), and a plan reads it as it was after any commit, or at any time, with `a
 - **Versions are commits:** a version is valid from the commit that wrote it until the one that changed or deleted it.
   Changes within one transaction make one version: the states in between were never committed. A rolled-back
   transaction leaves no history.
-- **Two methods** (ADR 0033 step 7 benchmarks them and picks the default):
+- **Two methods**; `versions` is the default a language uses when its syntax names none (ADR 0033 step 7 measured
+  both):
   - **`versions`:** two tables beside it, `smalt_since_<table>` (when each current row's version started) and
     `smalt_versions_<table>` (the earlier versions, with the commits they were valid between). Reading any past state
     costs about the same.
