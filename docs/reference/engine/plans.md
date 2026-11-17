@@ -389,6 +389,24 @@ be typed `list<…>` (an error when the plan is compiled otherwise); NULL lists 
 `cast_text` of a list or struct gives its JSON text: `[1,2]`, `{"name":"a","score":2.5}`, dates and times as their text,
 `bool` as `true` / `false`, integers beyond 2^53 with every digit.
 
+**Maps** ([ADR 0038](../../adr/0038-map-type.md)) have their own operations too. A map argument must be typed
+`map<text, …>`; NULL maps give NULL, and keys are text (another key is an error, `SMALT_MISMATCH`). A map keeps its
+entries in key order, so results come back in that order.
+
+| Function | Arguments | Meaning |
+|---|---|---|
+| `map_of` | keys and values in pairs: `k1, v1, k2, v2, …` | A map of the pairs; a repeated key keeps its last value |
+| `map_from_entries` | 1: a list of key and value structs | A map of the entries (NULL entries skipped; a repeated key keeps its last value) |
+| `map_get` | 2: a map, key | The key's value, or NULL when the map hasn't the key |
+| `map_contains_key` | 2: a map, key | Whether the map has the key: `bool` |
+| `map_len` | 1 | The number of entries |
+| `map_keys`, `map_values` | 1 | The keys (`list<text>`) or the values, in key order |
+| `map_entries` | 1 | The entries as `list<struct<key text, value V>>`, in key order (ADR 0020's form of a map) |
+| `map_merge` | 2: maps | The entries of both; where both have a key, the second map's value (Cypher's `SET n += map`) |
+| `map_remove` | 2: a map, a list of keys | The map without those keys |
+
+`cast_text` of a map gives a JSON object: `{"a":1,"b":"x"}`.
+
 **Aggregate and window functions** are named the same way (`sum`, `rank`, …) in `AggCall` and `WindowCall`. `implode` gives a group's values as a list, in the group's order, NULLs included.
 
 ## Builders
