@@ -24,7 +24,8 @@ export { affinityOfStorage, planTypeOfStorage as staticTypeOfStorage } from '../
 
 const I64_MIN = -(2n ** 63n);
 const I64_MAX = 2n ** 63n - 1n;
-const textDecoder = new TextDecoder();
+// ignoreBOM: a leading U+FEFF is part of the text, as in SQLite (a default TextDecoder drops it).
+const textDecoder = new TextDecoder('utf-8', { ignoreBOM: true });
 const textEncoder = new TextEncoder();
 
 /**

@@ -76,7 +76,8 @@ const FMTINFO: Record<string, Info> = {
 };
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
+// ignoreBOM: a leading U+FEFF is part of the text, as in SQLite (a default TextDecoder drops it).
+const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
 
 /** UTF-8 encode into a byte string. */
 function bytes(s: string): string {

@@ -40,7 +40,8 @@ const META_COL = 0xffff;
 const HEADER_RG = 0xffffffff;
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
+// ignoreBOM: a leading U+FEFF is part of the text, as in SQLite (a default TextDecoder drops it).
+const textDecoder = new TextDecoder('utf-8', { ignoreBOM: true });
 
 /** A decoded column chunk. */
 export interface Chunk {
