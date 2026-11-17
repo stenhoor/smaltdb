@@ -95,7 +95,7 @@ function describeExternal(x: { name: string; sql: string; columns: readonly { na
     name: x.name,
     schema: 'main',
     columns: x.columns.map((c) => {
-      const d = c.type ? { type: c.type, storageType: (c.type.startsWith('list<') ? 'LIST' : c.type.startsWith('struct<') ? 'STRUCT' : c.type.toUpperCase()) as StorageType } : declaredType(c.declType);
+      const d = c.type ? { type: c.type, storageType: (c.type.startsWith('list<') ? 'LIST' : c.type.startsWith('struct<') ? 'STRUCT' : c.type.startsWith('map<') ? 'MAP' : c.type.toUpperCase()) as StorageType } : declaredType(c.declType);
       return { name: c.name, type: d.type, storageType: d.storageType, declaredType: c.declType, collation: 'binary', notNull: false, rowid: false, hasDefault: false };
     }),
     keys: [],

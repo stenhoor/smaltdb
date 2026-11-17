@@ -232,7 +232,7 @@ Original plan:
 
 - Current format: **4.0**, unreleased (smaltdb 0.8.3 wrote format 3). Format 4 stores definitions instead of SQL text
   (ADR 0015 step 7) and, before 0.9.0, gains ADR 0018's types: NaN's own key tag and zone maps that order it, then
-  the `BOOLEAN` storage type, the date and time storage types (ADR 0019), and `LIST` and `STRUCT` (ADR 0020), and the
+  the `BOOLEAN` storage type, the date and time storage types (ADR 0019), and `LIST` and `STRUCT` (ADR 0020), `MAP` (ADR 0038), and the
   header's required-feature bits, commit id and commit time (ADR 0033 step 0). Format 1 used 11-byte numeric key components (ADR 0006); format 2 used 7-byte fixed leaf
   cell headers and no free blocks (ADR 0007); format 3 stored SQL text in the catalog.
 

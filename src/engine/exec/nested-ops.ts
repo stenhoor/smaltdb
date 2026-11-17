@@ -551,11 +551,16 @@ function jsonOf(t: string, v: SqlValue): string {
   return JSON.stringify(Array.from(v as Uint8Array, (b) => b.toString(16).padStart(2, '0')).join(''));
 }
 
-/** The JSON text of a list or struct value: `[1,2]`, `{"x":1,"y":"a"}`; integers beyond 2^53 exact, blobs as hex. */
+/** The JSON text of a list, struct or map value: `[1,2]`, `{"x":1,"y":"a"}`; integers beyond 2^53 exact, blobs as hex. */
 export function nestedJson(t: NestedTypeName, bytes: Uint8Array): string {
   const n = parseNested(t);
   if (!n) return JSON.stringify(Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join(''));
   const vals = decodeKey(bytes);
   if (n.kind === 'list') return `[${vals.map((v) => jsonOf(n.of, v)).join(',')}]`;
+  if (n.kind === 'map') {
+    const parts: string[] = [];
+    for (let i = 0; i + 1 < vals.length; i += 2) parts.push(`${JSON.stringify(vals[i])}:${jsonOf(n.of, vals[i + 1]!)}`);
+    return `{${parts.join(',')}}`;
+  }
   return `{${n.fields.map((f, i) => `${JSON.stringify(f.name)}:${jsonOf(f.type, vals[i] ?? null)}`).join(',')}}`;
 }

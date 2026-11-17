@@ -1119,7 +1119,7 @@ export class Database implements FunctionContext {
       this.catalogEntries.set(r.name.toLowerCase(), { type: r.type as CatalogEntry['type'], name: r.name, rowid: r.rowid });
       if (r.type === 'external') {
         const x = def(r.name.toLowerCase(), 'external');
-        this.externals.set(r.name.toLowerCase(), { name: r.name, columns: x.columns.map((c) => ({ name: c.name, declType: c.declaredType, ...(c.type ? { type: c.type } : {}) })), options: { ...x.options }, sql: r.sql!, ...(x.language !== undefined ? { language: x.language } : {}), ...(isDescribed(x) ? { described: true } : {}) });
+        this.externals.set(r.name.toLowerCase(), { name: r.name, columns: x.columns.map((c) => ({ name: c.name, declType: c.declaredType, ...(c.type && isFormatType(c.type) ? { type: c.type } : {}) })), options: { ...x.options }, sql: r.sql!, ...(x.language !== undefined ? { language: x.language } : {}), ...(isDescribed(x) ? { described: true } : {}) });
         continue;
       }
       if (r.type === 'view') {
@@ -5410,6 +5410,7 @@ function fitsStorage(v: SqlValue, t: string): boolean {
     case 'BLOB':
     case 'LIST':
     case 'STRUCT':
+    case 'MAP':
       return v instanceof Uint8Array;
     default:
       return true;

@@ -623,10 +623,11 @@ class Validator {
         str(d.name, 'name');
         str(d.declaredType, 'declaredType', false);
         if (!STORAGE_TYPES.has(d.type as string)) this.fail(`unknown storage type ${JSON.stringify(d.type)} (one of ${[...STORAGE_TYPES].join(', ')})`, 'type');
-        // A LIST or STRUCT column's declared type is its full type (ADR 0020): list<int>, struct<a int, b text>.
-        if (d.type === 'LIST' || d.type === 'STRUCT') {
+        // A LIST, STRUCT or MAP column's declared type is its full type (ADR 0020, ADR 0038): list<int>, map<text, any>.
+        if (d.type === 'LIST' || d.type === 'STRUCT' || d.type === 'MAP') {
           const n = typeof d.declaredType === 'string' ? parseNested(d.declaredType) : null;
-          if (!n || n.kind !== (d.type === 'LIST' ? 'list' : 'struct')) this.fail(`a ${d.type} column's declared type is a ${d.type === 'LIST' ? 'list<…>' : 'struct<…>'} type, not ${JSON.stringify(d.declaredType)}`, 'declaredType');
+          const kind = d.type === 'LIST' ? 'list' : d.type === 'STRUCT' ? 'struct' : 'map';
+          if (!n || n.kind !== kind) this.fail(`a ${d.type} column's declared type is a ${kind}<…> type, not ${JSON.stringify(d.declaredType)}`, 'declaredType');
         }
         bool(d.notNull, 'notNull');
         conflict(d.notNullConflict, 'notNullConflict');
@@ -1002,7 +1003,7 @@ class Validator {
 
 // ------------------------------------------------------------------ schema operations
 
-const STORAGE_TYPES = new Set(['INTEGER', 'BOOLEAN', 'DATE', 'TIME', 'DATETIME', 'DURATION', 'LIST', 'STRUCT', 'REAL', 'TEXT', 'BLOB', 'ANY', 'NUMERIC']);
+const STORAGE_TYPES = new Set(['INTEGER', 'BOOLEAN', 'DATE', 'TIME', 'DATETIME', 'DURATION', 'LIST', 'STRUCT', 'MAP', 'REAL', 'TEXT', 'BLOB', 'ANY', 'NUMERIC']);
 const FK_ACTIONS = new Set(['SET NULL', 'SET DEFAULT', 'CASCADE', 'RESTRICT', 'NO ACTION']);
 const DROP_OBJECTS = new Set(['table', 'index', 'view', 'materialized view', 'trigger', 'external table', 'connection']);
 const SCHEMA_OPS = new Set(['createTable', 'createIndex', 'createView', 'createConnection', 'createExternalTable', 'drop', 'alterTable']);

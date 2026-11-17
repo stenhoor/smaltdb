@@ -27,6 +27,7 @@ Three rules run through the format:
 | `duration` | spans of time: µs, ISO 8601 text such as `P1DT2H` in results |
 | `list<T>` | lists of `T` values, nested to any depth (`list<list<int>>`): blobs while a plan runs, JS arrays in results ([ADR 0020](../../adr/0020-lists-and-structs.md)) |
 | `struct<name T, …>` | named fields in order (`struct<x real, y real>`): blobs while a plan runs, JS objects in results |
+| `map<text, T>` | text keys to `T` values (`map<text, any>`): blobs of the entries sorted by key, so equal maps are equal values; JS objects in results ([ADR 0038](../../adr/0038-map-type.md)) |
 | `real` | 64-bit floating point |
 | `num` | `int` or `real`, not known until run time |
 | `text` | strings |
@@ -69,7 +70,7 @@ changes a view's interface accepts.
 | `date` | `datetime` (`cast_datetime`), `text`, `any` (as text) | |
 | `datetime` | `text`, `any` (as text) | `date`, `time` |
 | `time`, `duration` | `text`, `any` (as text) | |
-| `list<T>`, `struct<…>` | `text`, `any` (JSON text); a list or struct whose elements or fields (the same names, in order) are kept as they are | |
+| `list<T>`, `struct<…>`, `map<text, T>` | `text`, `any` (JSON text); a list, struct or map of the same kind whose elements, fields (the same names, in order) or values are kept as they are | |
 | `any` | | `num`, `text`, `blob` |
 
 A temporal value, a list or a struct becomes `any` as its text: kept as it is, it would read as the integer or blob
@@ -163,7 +164,8 @@ column typed `date` holds days (an `Int32Array`, say), one typed `datetime`, `ti
 hold JavaScript `Date`s (in a `date` column its UTC day, as a `date` reads back as a `Date` at UTC midnight; elsewhere ms
 as µs, a `datetime`) or the text results give, which parses (or is an error). A column typed
 `list<…>` or `struct<…>` holds JS arrays, and objects by field name (or arrays by position) for a struct, their elements as
-the element types take them, or the bytes a list or struct is. The engine reads the values where they are. In JSON a typed array is `{"$typed": "f64", "data":
+the element types take them, or the bytes a list or struct is. A column typed `map<text, …>` holds plain objects or JS
+`Map`s with text keys. The engine reads the values where they are. In JSON a typed array is `{"$typed": "f64", "data":
 […]}`; through the client it crosses to the worker as binary data beside the plan's JSON (see [running
 plans](./running#through-the-client)).
 
