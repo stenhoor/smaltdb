@@ -101,8 +101,9 @@ from columns, not added to the engine.
 - **The engine keeps the invariants** (decision 12): node ids from the graph's sequence, the label index, per-label
   copies and history, on writes from any language.
 - **Several labels:** smaltdb's indexes produce exactly one key per row (`indexKey`, `exec/write.ts:153-175`), so the
-  label index is an internal table `(label, node_id)` with a B+tree, written with the node. A label set to keep its own
-  copy gets a row in its table too, kept in step on every write.
+  label index is a table of `(node, label)` rows with a unique B+tree index on `(label, node)`, kept with the node. As
+  built (step 3), it is an ordinary table of the graph, `<graph>_labels`, that every language can read; the engine checks
+  its writes. A label set to keep its own copy gets a row in its table too, kept in step on every write.
 - **Edge tables:** `start` and `end` node ids, declared columns, the catch-all, and B+tree indexes on `(start, end)` and
   `(end, start)`. A node that lives in one table can be a foreign key target (`ON DELETE CASCADE` gives `DETACH
   DELETE`).

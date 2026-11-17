@@ -3070,7 +3070,7 @@ export class Database implements FunctionContext {
 
   /** The property graph whose node or edge table `table` (lower case, main) is, or undefined. */
   private graphUsing(table: string): string | undefined {
-    for (const g of this.graphs.values()) if ([...g.graph.nodes, ...g.graph.edges].some((x) => x.table.toLowerCase() === table)) return g.graph.name;
+    for (const g of this.graphs.values()) if ([...g.graph.nodes, ...g.graph.edges, ...(g.graph.labels ? [g.graph.labels] : [])].some((x) => x.table.toLowerCase() === table)) return g.graph.name;
     return undefined;
   }
 
@@ -3080,6 +3080,8 @@ export class Database implements FunctionContext {
     for (const g of this.graphs.values()) {
       for (const n of g.graph.nodes) if (n.table.toLowerCase() === table) [n.id, n.props].forEach((c) => c && out.add(c.toLowerCase()));
       for (const e of g.graph.edges) if (e.table.toLowerCase() === table) [e.start, e.end, e.props].forEach((c) => c && out.add(c.toLowerCase()));
+      const l = g.graph.labels;
+      if (l && l.table.toLowerCase() === table) [l.node, l.label].forEach((c) => out.add(c.toLowerCase()));
     }
     return out;
   }
@@ -3108,10 +3110,10 @@ export class Database implements FunctionContext {
       if (user && user.toLowerCase() !== self) fail(`table ${name} is already used by property graph ${user}`);
       return t;
     };
-    const column = (t: ReturnType<typeof tableOf>, name: string, role: string, want: 'INTEGER' | 'MAP') => {
+    const column = (t: ReturnType<typeof tableOf>, name: string, role: string, want: 'INTEGER' | 'MAP' | 'TEXT') => {
       const c = t.columns.find((x) => x.name.toLowerCase() === name.toLowerCase());
       if (!c) return fail(`table ${t.name} has no column ${name}`);
-      if (c.storageType !== want) fail(`the ${role} column ${t.name}.${c.name} is ${c.storageType}, not ${want === 'MAP' ? 'a MAP (map<text, …>)' : 'INTEGER'}`);
+      if (c.storageType !== want) fail(`the ${role} column ${t.name}.${c.name} is ${c.storageType}, not ${want === 'MAP' ? 'a MAP (map<text, …>)' : want}`);
       return c;
     };
     for (const n of g.nodes) {
@@ -3130,10 +3132,18 @@ export class Database implements FunctionContext {
       column(t, e.end, 'end', 'INTEGER');
       if (e.props !== undefined) column(t, e.props, 'props', 'MAP');
     }
+    const l = g.labels;
+    if (l) {
+      unique('table', l.table);
+      const t = tableOf(l.table);
+      column(t, l.node, 'node', 'INTEGER');
+      column(t, l.label, 'label', 'TEXT');
+    }
     return {
       name: g.name,
       nodes: g.nodes.map((n) => ({ label: n.label, table: n.table, id: n.id, ...(n.props !== undefined ? { props: n.props } : {}) })),
       edges: g.edges.map((e) => ({ type: e.type, table: e.table, start: e.start, end: e.end, ...(e.props !== undefined ? { props: e.props } : {}) })),
+      ...(l ? { labels: { table: l.table, node: l.node, label: l.label } } : {}),
     };
   }
 
@@ -3171,6 +3181,7 @@ export class Database implements FunctionContext {
     if (!entry) throw new SmaltError('SMALT_ERROR', `no such property graph: ${stmt.name}`);
     const g = entry.graph;
     const a = stmt.action;
+    if (a.kind === 'addLabelIndex') return this.addLabelIndex(g, a.table, stmt.ifNotExists === true);
     const isLabel = a.kind === 'addLabel';
     const name = isLabel ? a.label : a.type;
     const have = isLabel ? g.nodes.some((n) => n.label.toLowerCase() === name.toLowerCase()) : g.edges.some((e) => e.type.toLowerCase() === name.toLowerCase());
@@ -3198,15 +3209,42 @@ export class Database implements FunctionContext {
       }
       next = this.checkGraph(next, g.name.toLowerCase());
     }
-    // The graph's record, replaced. Its source text no longer says what it is: it is described from now on.
+    this.replaceGraph(next);
+    return none;
+  }
+
+  /**
+   * A graph's label index (ADR 0033, decision 5), `<graph>_labels` unless named: `node INTEGER NOT NULL` and
+   * `label TEXT NOT NULL`, a unique index on (label, node) that finds a label's nodes, and an index on node that finds a
+   * node's labels. An existing table with those columns is adopted.
+   */
+  private addLabelIndex(g: PropertyGraphDef, table: string | undefined, ifNotExists: boolean): RunResult {
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    if (g.labels) {
+      if (ifNotExists) return none;
+      throw new SmaltError('SMALT_ERROR', `property graph ${g.name} already has a label index (${g.labels.table})`);
+    }
+    const tableName = table ?? `${g.name}_labels`;
+    if (!this.catalog.table(tableName, 'main')) {
+      const col = (name: string, type: 'INTEGER' | 'TEXT') => ({ name, declaredType: type, type, notNull: true, collation: 'binary' as const });
+      const key = (column: number) => ({ column, desc: false, collation: 'binary' as const });
+      this.createTable({ op: 'createTable', table: { name: tableName, columns: [col('node', 'INTEGER'), col('label', 'TEXT')], keys: [], checks: [], foreignKeys: [], storage: 'row' }, temp: false, ifNotExists: false });
+      this.createIndex({ op: 'createIndex', index: { name: `${tableName}_label`, table: tableName, columns: [key(1), key(0)], unique: true }, ifNotExists: false });
+      this.createIndex({ op: 'createIndex', index: { name: `${tableName}_node`, table: tableName, columns: [key(0)], unique: false }, ifNotExists: false });
+    }
+    this.replaceGraph(this.checkGraph({ ...g, labels: { table: this.catalog.table(tableName, 'main')!.name, node: 'node', label: 'label' } }, g.name.toLowerCase()));
+    return none;
+  }
+
+  /** A graph's record, replaced (alterPropertyGraph). Its source text no longer says what it is: it is described from now on. */
+  private replaceGraph(next: PropertyGraphDef): void {
     const stored: StoredDef = { kind: 'graph', graph: next, described: true };
     const sql = describeDefinition(stored);
     this.dirtySchema = true;
-    this.removeCatalogRow(g.name, graphKey(g.name));
-    this.addCatalogRow('graph', g.name, g.name, 0, sql, graphKey(g.name), stored);
-    this.graphs.set(g.name.toLowerCase(), { graph: next, sql, described: true });
+    this.removeCatalogRow(next.name, graphKey(next.name));
+    this.addCatalogRow('graph', next.name, next.name, 0, sql, graphKey(next.name), stored);
+    this.graphs.set(next.name.toLowerCase(), { graph: next, sql, described: true });
     this.schemaChanged();
-    return none;
   }
 
   private dropPropertyGraph(stmt: Extract<SchemaOp, { op: 'drop' }>): RunResult {

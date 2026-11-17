@@ -138,6 +138,12 @@ export interface PropertyGraphDef {
   readonly name: string;
   readonly nodes: readonly { readonly label: string; readonly table: string; readonly id: string; readonly props?: string }[];
   readonly edges: readonly { readonly type: string; readonly table: string; readonly start: string; readonly end: string; readonly props?: string }[];
+  /**
+   * The label index (ADR 0033, decision 5): the labels a node has besides its table's, one row per node and label. A
+   * node's table gives its first label; an entry here adds another of the graph's labels. The engine keeps it: entries
+   * name nodes of the graph and labels it has, and go when their node is deleted.
+   */
+  readonly labels?: { readonly table: string; readonly node: string; readonly label: string };
 }
 
 /**
@@ -190,7 +196,11 @@ export type SchemaOp =
   | {
       readonly op: 'alterPropertyGraph';
       readonly name: string;
-      readonly action: { readonly kind: 'addLabel'; readonly label: string; readonly table?: string } | { readonly kind: 'addType'; readonly type: string; readonly table?: string };
+      readonly action:
+        | { readonly kind: 'addLabel'; readonly label: string; readonly table?: string }
+        | { readonly kind: 'addType'; readonly type: string; readonly table?: string }
+        /** The graph's label index (`labels`), created as `<graph>_labels` unless `table` names one. */
+        | { readonly kind: 'addLabelIndex'; readonly table?: string };
       readonly ifNotExists?: boolean;
     }
   | { readonly op: 'createConnection'; readonly name: string; readonly ifNotExists: boolean; readonly options: Readonly<Record<string, SqlValue>>; readonly source?: Source }
