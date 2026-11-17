@@ -102,6 +102,7 @@ Each operation's output columns, in order:
 | `pivot` | `input`, `keys`, `on`, `collation`, `values`, `aggs`, `ordered?` | its keys, then one column per value and aggregate call (value by value) |
 | `unpivot` | `input`, `keep` (columns kept), `columns` (columns that become rows), `names` (one per column), `type` (of the values) | the kept columns, then each row's column name (`text`), then its value |
 | `explode` | `input`, `column` (a list column), `type` (its `list<T>` type), `position?`, `emptyAsNull?`, `keepNulls?`, `also?` (more list columns, `{ column, type }`, zipped by position) | the input's columns, `column` and each `also` column holding their elements (`T`), then its position (`int`) with `position`. Lists zipped in a row must be as long as each other (NULL only as long as NULL), else `SMALT_RANGE` |
+| `paths` | `input`, `start` (the column with each path's first node), `edges` (`{ table, db?, start, end }`: tables and their endpoint columns), `direction` (`out` / `in` / `both`), `minHops?` (1), `maxHops?`, `mode?` (`walk`), `selector?` (`all`) | the input's columns, then the path's last node (`int`), its length in hops (`int`) and the path (`list<struct<edge int, rowid int, from int, to int>>`). See [paths](#paths) |
 | `distinct` | `input`, `collations` (one per column), `ordered?` (`'first'`), `on?`, `keep?` (`'first'` / `'last'`) | its input's |
 | `join` | `kind`, `inputs` (left, right), `on?`, `ordered?` (`true`), `asof?` (kind `asof`) | the left input's, then the right's (`semi` / `anti`: the left's only) |
 | `aggregate` | `input`, `keys`, `aggs`, `carry`, `ordered?` (`'first'`) | its keys, then one per aggregate call, then the carried columns |
@@ -192,6 +193,35 @@ values give rows too.
 row gives one row per element, in input order and then the list's, with the element in place of the list. As Polars'
 `explode`: an empty list gives no row (one row whose element is NULL with `emptyAsNull`), and a NULL list one row whose
 element is NULL (none with `keepNulls: false`). With `position`, a last column holds each element's position, from 0.
+
+<a id="paths"></a>**Paths.** A `paths` operation finds paths through a graph ([ADR 0033](../../adr/0033-property-graphs-and-history.md),
+G5): for each input row, the paths from the node in its `start` column along the relationships of `edges` (any of
+them, in `direction`), with `minHops` to `maxHops` relationships. Each path is one row: the input row, the path's last
+node, its hops and the path itself, one struct per hop: `edge` (its table's position in `edges`), `rowid` (the
+relationship's), and the nodes it went `from` and `to`. A NULL start has no paths; with `minHops: 0`, each start has
+its empty path. Rows keep the input's order, and each input row's paths come shortest first.
+
+- **`mode`**: what a path may repeat. `walk` anything; `trail` no relationship; `acyclic` no node; `simple` no node,
+  except that the last may be the first (a cycle), which ends the path.
+- **`selector`**: which of an input row's paths to each last node it keeps. `all`; `any` (one); `anyShortest` (one of
+  the shortest); `allShortest`; `{ shortest: k }` (the `k` shortest, ties broken arbitrarily).
+- **An end:** a `walk` can go round a cycle forever, so it needs `maxHops`, unless its selector is `any` or
+  `anyShortest`; the other modes always end.
+- **Cost:** `any` and `anyShortest` walks keep one path per node (a keyed `iterate`): with no `maxHops` they cost about
+  as much as reaching every node once. They find a shortest path between two different nodes in any mode, because
+  such a path repeats nothing: use `walk` for them. Other combinations enumerate paths, which can grow exponentially
+  with `maxHops` on a dense graph; `trail`, `acyclic` and `simple` stop when a path can't grow.
+- **Indexes:** each step looks up the relationships from a path's last node, so give each edge table an index on its
+  `start` column (`out`), its `end` column (`in`), or both.
+
+The engine rewrites it into an `iterate` (`EXPLAIN` shows that plan).
+
+```ts
+import { plan } from 'smaltdb/engine';
+
+// The shortest ways from node 1 to every node it reaches along `knows`.
+const p = plan.paths(plan.values([[plan.lit(1)]]), 0, [{ table: 'knows', start: 0, end: 1 }], { selector: 'anyShortest' });
+```
 
 **Sort keys** (`SortKey`) are `{ expr, desc, nullsFirst, collation }`.
 
@@ -418,7 +448,7 @@ NULLs first). They check nothing: the engine validates every plan it is given, b
 |---|---|
 | Expressions | `col(input, index, type, collation?, depth?)`, `lit(value, type?)`, `value(v)`, `param(index, type?)`, `call(fn, args, type, collation?)`, `cast(fn, arg, to)`, `and(...)`, `or(...)`, `not(x)`, `isNull(x)`, `isNotNull(x)`, `typed(logic, 'bool' | 'int')`, `caseWhen(whens, type, otherwise?)`, `scalar(plan, type, collation?)`, `exists(plan)`, `inPlan(probe, plan, collation?)`, `listMap(list, body)`, `listFilter(list, predicate)`, `listAgg(list, aggs, body)`, `element(type, depth?)`, `elementPosition(depth?)`, `aggResult(index, type, depth?)` |
 | Sort keys, aggregates | `asc(expr, options?)`, `desc(expr, options?)`, `agg(fn, args, type, options?)` |
-| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `asofJoin(left, right, leftKey, rightKey, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `sample(input, { count } or { fraction }, options?)`, `pivot(input, keys, on, values, aggs, options?)`, `unpivot(input, keep, columns, names, type?)`, `explode(input, column, type, { position?, emptyAsNull?, keepNulls?, also? })`, `setop(kind, left, right, width)` |
+| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `asofJoin(left, right, leftKey, rightKey, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `sample(input, { count } or { fraction }, options?)`, `pivot(input, keys, on, values, aggs, options?)`, `unpivot(input, keep, columns, names, type?)`, `explode(input, column, type, { position?, emptyAsNull?, keepNulls?, also? })`, `paths(input, start, edges, { direction?, minHops?, maxHops?, mode?, selector? })`, `setop(kind, left, right, width)` |
 | Windows | `window(input, calls, options?)` (`partition`, `collations`, `order`, `frame`; the frame defaults to the partition's rows up to the current row and its peers), `windowCall(fn, args, type, options?)`, `frame(unit, start, end, exclude?)` with `unboundedPreceding`, `preceding(n)`, `currentRow`, `following(n)`, `unboundedFollowing` |
 | Sources and recursion | `source(kind, name, args, types, options?)`, `iterate(id, name, init, steps, options?)`, `working(id, types)` |
 | Writes | `append(table, input, columns, options?)`, `update(table, input, rowid, sets, options?)`, `remove(table, input, rowid, options?)` |

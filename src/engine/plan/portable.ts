@@ -7,7 +7,8 @@
  */
 export * from './build.js';
 export { PLAN_FORMAT_VERSION, type PlanType, type CollationName, type Field, type Schema } from './types.js';
-export type { PlanOp, SortKey, AggCall, WindowFrame, WindowCall, JoinKind, ConflictAction, ValueColumn, ColumnArray, ColumnValue } from './ops.js';
+export type { PlanOp, SortKey, AggCall, WindowFrame, WindowCall, JoinKind, ConflictAction, ValueColumn, ColumnArray, ColumnValue, PathEdges } from './ops.js';
+export { PATH_TYPE } from './ops.js';
 export type { PlanExpr, PlanOrigin, NestedPlan, ColExpr, LitExpr, ParamExpr, CallExpr, CastExpr, LogicExpr, NotExpr, IsNullExpr, CaseExpr, SubqueryExpr, InSubqueryExpr, EachExpr, EachAggCall, ElementExpr, EachAggExpr } from './expr.js';
 export type { BoundStatement, BoundQuery, BoundWrite, BoundTransaction, BoundColumn } from './bound.js';
 export type {

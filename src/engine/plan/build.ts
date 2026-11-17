@@ -9,7 +9,7 @@
 import type { SqlValue } from '../values.js';
 import { call, col, type EachAggCall, lit, param, type PlanExpr, typeOf } from './expr.js';
 import { parseNested } from '../../shared/nested-types.js';
-import type { AggCall, ConflictAction, JoinKind, PlanOp, SortKey, ValueColumn, WindowCall, WindowFrame } from './ops.js';
+import type { AggCall, ConflictAction, JoinKind, PathEdges, PlanOp, SortKey, ValueColumn, WindowCall, WindowFrame } from './ops.js';
 import type { CollationName, PlanType } from './types.js';
 
 type Op<K extends PlanOp['op']> = Extract<PlanOp, { op: K }>;
@@ -176,6 +176,23 @@ export const explode = (
   ...(options.position ? { position: true } : {}),
   ...(options.emptyAsNull ? { emptyAsNull: true } : {}),
   ...(options.keepNulls === false ? { keepNulls: false } : {}),
+});
+/** Paths through a graph from the node in column `start` of each input row (ADR 0033, G5; see the `paths` operation). */
+export const paths = (
+  input: PlanOp,
+  start: number,
+  edges: readonly PathEdges[],
+  options: { direction?: 'out' | 'in' | 'both'; minHops?: number; maxHops?: number; mode?: 'walk' | 'trail' | 'acyclic' | 'simple'; selector?: 'all' | 'any' | 'anyShortest' | 'allShortest' | { shortest: number } } = {},
+): Op<'paths'> => ({
+  op: 'paths',
+  input,
+  start,
+  edges,
+  direction: options.direction ?? 'out',
+  ...(options.minHops !== undefined ? { minHops: options.minHops } : {}),
+  ...(options.maxHops !== undefined ? { maxHops: options.maxHops } : {}),
+  ...(options.mode !== undefined ? { mode: options.mode } : {}),
+  ...(options.selector !== undefined ? { selector: options.selector } : {}),
 });
 export const unpivot = (input: PlanOp, keep: readonly number[], columns: readonly number[], names: readonly string[], type: PlanType = 'any'): Op<'unpivot'> => ({ op: 'unpivot', input, keep, columns, names, type });
 /** Distinct rows of an input with `width` columns. */

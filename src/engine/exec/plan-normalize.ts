@@ -9,7 +9,7 @@
  * SQL's plans have this layering already and are not normalized.
  */
 import { eachParts, lit, mapEach, type PlanExpr, typeOf } from '../plan/expr.js';
-import type { AggCall, PlanOp, SortKey, WindowCall } from '../plan/ops.js';
+import { type AggCall, PATH_TYPE, type PlanOp, type SortKey, type WindowCall } from '../plan/ops.js';
 import { SmaltError } from '../errors.js';
 import { planWidth } from './planner.js';
 import { parseNested } from '../../shared/nested-types.js';
@@ -75,6 +75,9 @@ function rewriteAll(x: unknown): unknown {
     case 'explode':
       // Its rewrite is an ordered join: rewritten in turn.
       return rewriteAll(explodeRows(op));
+    case 'paths':
+      // Its rewrite is an iterate joined back to the input in order: rewritten in turn.
+      return rewriteAll(pathRows(op));
     // Operations with no rewrite of their own (their inputs were rewritten above).
     case 'scan':
     case 'source':
@@ -312,6 +315,126 @@ function explodeRows(op: Op<'explode'>): PlanOp {
   });
   if (op.position) exprs.push({ k: 'col', input: 0, index: w + 1, depth: 0, type: 'int', collation: 'binary' });
   return { op: 'project', input: joined, exprs, ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+}
+
+/**
+ * Paths through a graph (ADR 0033, G5) as an `iterate` over the input rows, numbered. Its rows are `[n, start, end,
+ * hops, path]` and, as the mode needs them, the nodes visited (acyclic, simple), the relationships walked (trail) and
+ * a key bucket; it starts with each row's zero-hop path, and each step follows one edge table in one direction from
+ * a path's last node, extending the path. `maxHops` is the iterate's `maxDepth`.
+ *
+ * `any` and `anyShortest` walks are a keyed iterate (G2): one path per input row, last node and bucket, the first
+ * found, which is a shortest because the queue is in order of hops. The bucket is `min(hops, minHops)`, so a node
+ * reached in fewer hops than `minHops` doesn't hide a path long enough. Everything else enumerates paths, then keeps
+ * the selected ones per input row and last node, ranked by hops. The paths are joined back to their input rows,
+ * keeping the input's order.
+ */
+function pathRows(op: Op<'paths'>): PlanOp {
+  const w = planWidth(op.input);
+  const minHops = op.minHops ?? 1;
+  const mode = op.mode ?? 'walk';
+  const selector = op.selector ?? 'all';
+  const keyed = mode === 'walk' && (selector === 'any' || selector === 'anyShortest');
+  const PATH = PATH_TYPE as PlanType;
+  const INTS = 'list<int>' as PlanType;
+  const int = (value: number): PlanExpr => ({ k: 'lit', value, type: 'int' });
+  const fn = (name: string, args: PlanExpr[], type: PlanType): PlanExpr => ({ k: 'call', fn: name, args, type });
+  const at = (input: 0 | 1, index: number, type: PlanType): PlanExpr => ({ k: 'col', input, index, depth: 0, type, collation: 'binary' });
+  // The iterate's columns.
+  const [N, S, E, H, P] = [0, 1, 2, 3, 4];
+  const types: PlanType[] = ['int', 'int', 'int', 'int', PATH];
+  const NODES = mode === 'acyclic' || mode === 'simple' ? types.push(INTS) - 1 : -1;
+  const IDS = mode === 'trail' ? types.push(INTS) - 1 : -1;
+  const BUCKET = keyed ? types.push('int') - 1 : -1;
+  const width = types.length;
+  const bucket = (hops: PlanExpr): PlanExpr => ({ k: 'case', whens: [{ when: cmp('cmp_ge', hops, int(minHops)), then: int(minHops) }], else: hops, type: 'int' });
+
+  const numberedInput = numbered(op.input);
+  const startCol = at(0, op.start, 'int');
+  const init: PlanOp = {
+    op: 'project',
+    input: { op: 'filter', input: numberedInput, pred: { k: 'isNull', arg: startCol, not: true } },
+    exprs: types.map((_, i): PlanExpr => {
+      if (i === N) return at(0, w, 'int');
+      if (i === S || i === E) return startCol;
+      if (i === H) return int(0);
+      if (i === P) return fn('list_of', [], PATH);
+      if (i === NODES) return fn('list_of', [startCol], INTS);
+      if (i === IDS) return fn('list_of', [], INTS);
+      return bucket(int(0));
+    }),
+  };
+
+  const id = rewriteIterates++;
+  const working: PlanOp = { op: 'working', id, types };
+  const steps: PlanOp[] = [];
+  op.edges.forEach((e, i) => {
+    const ways: [number, number][] = op.direction === 'out' ? [[e.start, e.end]] : op.direction === 'in' ? [[e.end, e.start]] : [[e.start, e.end], [e.end, e.start]];
+    for (const [from, to] of ways) {
+      // The working row, then the relationship's from, to and rowid.
+      const edge: PlanOp = { op: 'scan', table: e.table, ...(e.db ? { db: e.db } : {}), columns: [from, to, -1] };
+      const joined: PlanOp = { op: 'join', kind: 'inner', inputs: [working, edge], on: cmp('cmp_eq', at(1, 0, 'int'), at(0, E, 'int')) };
+      const [F, T, R] = [width, width + 1, width + 2];
+      const next = at(0, T, 'int');
+      const conds: PlanExpr[] = [];
+      if (NODES >= 0) {
+        const fresh: PlanExpr = { k: 'not', arg: fn('list_contains', [at(0, NODES, INTS), next], 'int') };
+        if (mode === 'acyclic') conds.push(fresh);
+        else {
+          // simple: no node twice, except a last one that closes the path; a closed path goes no further.
+          conds.push({ k: 'or', args: [fresh, cmp('cmp_eq', next, at(0, S, 'int'))] });
+          conds.push({ k: 'not', arg: { k: 'and', args: [cmp('cmp_gt', at(0, H, 'int'), int(0)), cmp('cmp_eq', at(0, E, 'int'), at(0, S, 'int'))] } });
+        }
+      }
+      // A relationship's identity: its rowid, and its table's position when there are several.
+      const relId = op.edges.length === 1 ? at(0, R, 'int') : fn('add', [fn('mul', [at(0, R, 'int'), int(op.edges.length)], 'int'), int(i)], 'int');
+      if (IDS >= 0) conds.push({ k: 'not', arg: fn('list_contains', [at(0, IDS, INTS), relId], 'int') });
+      const hop = fn('add', [at(0, H, 'int'), int(1)], 'int');
+      const step = fn('list_of', [fn('struct_of', [int(i), at(0, R, 'int'), at(0, F, 'int'), next], 'any')], PATH);
+      const exprs = types.map((_, c): PlanExpr => {
+        if (c === E) return next;
+        if (c === H) return hop;
+        if (c === P) return fn('list_concat', [at(0, P, PATH), step], PATH);
+        if (c === NODES) return fn('list_concat', [at(0, NODES, INTS), fn('list_of', [next], INTS)], INTS);
+        if (c === IDS) return fn('list_concat', [at(0, IDS, INTS), fn('list_of', [relId], INTS)], INTS);
+        if (c === BUCKET) return bucket(hop);
+        return at(0, c, types[c]!);
+      });
+      const filtered: PlanOp = conds.length === 0 ? joined : { op: 'filter', input: joined, pred: conds.length === 1 ? conds[0]! : { k: 'and', args: conds } };
+      steps.push({ op: 'project', input: filtered, exprs });
+    }
+  });
+  const walked: PlanOp = {
+    op: 'iterate',
+    id,
+    name: 'paths',
+    init,
+    steps,
+    distinct: keyed,
+    collations: types.map(() => 'binary'),
+    ...(keyed ? { key: [N, E, BUCKET] } : {}),
+    ...(op.maxHops !== undefined ? { maxDepth: op.maxHops } : {}),
+  };
+  let found: PlanOp = minHops > 0 ? { op: 'filter', input: walked, pred: cmp('cmp_ge', at(0, H, 'int'), int(minHops)) } : walked;
+  if (!keyed && selector !== 'all') {
+    // Rank each input row's paths to each last node by hops, and keep the selected ranks.
+    const rank: WindowCall = { fn: selector === 'allShortest' ? 'rank' : 'row_number', args: [], star: false, collation: 'binary', type: 'int' };
+    const ranked: PlanOp = {
+      op: 'window',
+      input: found,
+      partition: [N, E].map((c) => ({ expr: at(0, c, 'int'), collation: 'binary' as const })),
+      order: [{ expr: at(0, H, 'int'), desc: false, nullsFirst: false, collation: 'binary' }],
+      frame: WHOLE,
+      calls: [rank],
+    };
+    const k = typeof selector === 'object' ? selector.shortest : 1;
+    found = { op: 'project', input: { op: 'filter', input: ranked, pred: cmp('cmp_le', at(0, width, 'int'), int(k)) }, exprs: types.map((t, c) => at(0, c, t)) };
+  }
+  // Shortest first within each input row, then back to the input rows, in their order.
+  const sorted: PlanOp = { op: 'sort', input: found, keys: [N, H].map((c) => ({ expr: at(0, c, 'int'), desc: false, nullsFirst: false, collation: 'binary' as const })) };
+  const joined: PlanOp = { op: 'join', kind: 'inner', inputs: [numberedInput, sorted], on: cmp('cmp_eq', at(0, w, 'int'), at(1, N, 'int')), ordered: true };
+  const out = w + 1;
+  return { op: 'project', input: joined, exprs: [...range(0, w), at(0, out + E, 'int'), at(0, out + H, 'int'), at(0, out + P, PATH)], ...(op.origin !== undefined ? { origin: op.origin } : {}) };
 }
 
 /**
@@ -633,6 +756,7 @@ function from(op: PlanOp): PlanOp {
     case 'pivot':
     case 'unpivot':
     case 'explode':
+    case 'paths':
     case 'append':
     case 'update':
     case 'delete':

@@ -4,7 +4,7 @@
  * statement given without column descriptions still says what each column holds.
  */
 import { typeOf } from './expr.js';
-import type { PlanOp } from './ops.js';
+import { PATH_TYPE, type PlanOp } from './ops.js';
 import type { PlanType } from './types.js';
 import { parseNested } from '../../shared/nested-types.js';
 
@@ -54,6 +54,8 @@ export function outputTypes(op: PlanOp, tableTypes: TableTypes): PlanType[] {
       }
       return op.position ? [...t, 'int'] : t;
     }
+    case 'paths':
+      return [...outputTypes(op.input, tableTypes), 'int', 'int', PATH_TYPE as PlanType];
     case 'unpivot': {
       const t = outputTypes(op.input, tableTypes);
       return [...op.keep.map((i) => t[i]), 'text', op.type];
