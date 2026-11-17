@@ -303,7 +303,8 @@ export function coerceForColumn(v: SqlValue, col: ColumnSchema, table: string, i
       break;
     case 'LIST':
     case 'STRUCT':
-      // A list or struct (ADR 0020): its bytes, or a JS array or object (a parameter) encoded by the declared type.
+    case 'MAP':
+      // A list, struct or map (ADR 0020, ADR 0038): its bytes, or a JS array or object (a parameter) encoded by the declared type.
       if (v instanceof Uint8Array) return v;
       if (typeof v === 'object') {
         try {

@@ -1,7 +1,8 @@
 # ADR 0038: A map type
 
 - **Status:** accepted in principle (owner, 2026-11-17: "a general map type" for every language, with text keys).
-  Sections 1–5 are the proposed design, settled in the pull requests of the steps that build it.
+  Sections 1–5 are the proposed design, settled in the pull requests of the steps that build it. Step 1 is done
+  (the type, the encoding, `MAP` storage, results and values in).
 - **Date:** 2026-11-17
 - **Amends:** [ADR 0020](0020-lists-and-structs.md), decision 5, which chose `list<struct<key K, value V>>` instead of a
   map type. Maps stored that way stay valid.

@@ -227,6 +227,7 @@ export function planTypeOfStorage(t: StorageType, declared?: string): PlanType {
   switch (t) {
     case 'LIST':
     case 'STRUCT':
+    case 'MAP':
       return declared !== undefined && isNestedType(declared) ? declared : 'blob';
     case 'INTEGER':
       return 'int';

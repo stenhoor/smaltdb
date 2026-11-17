@@ -20,10 +20,11 @@ const valueFor: Record<StorageType, fc.Arbitrary<SqlValue>> = {
   BLOB: fc.uint8Array({ maxLength: 40 }),
   LIST: fc.uint8Array({ maxLength: 40 }),
   STRUCT: fc.uint8Array({ maxLength: 40 }),
+  MAP: fc.uint8Array({ maxLength: 40 }),
   ANY: fc.oneof(fc.integer(), fc.double({ noNaN: true }).filter((d) => !Number.isInteger(d)), fc.string(), fc.uint8Array({ maxLength: 10 }), fc.bigInt(I64).map(norm)),
   NUMERIC: fc.oneof(fc.integer(), fc.double({ noNaN: true }).filter((d) => !Number.isInteger(d))),
 };
-const typeArb = fc.constantFrom<StorageType>('INTEGER', 'BOOLEAN', 'DATE', 'TIME', 'DATETIME', 'DURATION', 'LIST', 'STRUCT', 'REAL', 'TEXT', 'BLOB', 'ANY', 'NUMERIC');
+const typeArb = fc.constantFrom<StorageType>('INTEGER', 'BOOLEAN', 'DATE', 'TIME', 'DATETIME', 'DURATION', 'LIST', 'STRUCT', 'MAP', 'REAL', 'TEXT', 'BLOB', 'ANY', 'NUMERIC');
 
 describe('record format', () => {
   it('round-trips random rows', () => {

@@ -62,13 +62,13 @@ export function conversion(from: PlanType, to: PlanType): Conversion | undefined
   return TABLE[from]?.[to];
 }
 
-/** A list or struct as another: kept as it is when every element or field is, losslessly or not. */
+/** A list, struct or map as another: kept as it is when every element or field is, losslessly or not. */
 function nestedConversion(from: string, to: string): Conversion | undefined {
   const a = parseNested(from);
   const b = parseNested(to);
   if (!a || !b || a.kind !== b.kind) return undefined;
   const pairs: [string, string][] = [];
-  if (a.kind === 'list' && b.kind === 'list') pairs.push([a.of, b.of]);
+  if ((a.kind === 'list' && b.kind === 'list') || (a.kind === 'map' && b.kind === 'map')) pairs.push([a.of, b.of]);
   else if (a.kind === 'struct' && b.kind === 'struct') {
     if (a.fields.length !== b.fields.length) return undefined;
     for (let i = 0; i < a.fields.length; i++) {

@@ -18,7 +18,10 @@ import { type TemporalType, isTemporal } from '../../shared/temporal.js';
 import { type NestedTypeName, encodeNested, isNestedType } from '../../shared/nested.js';
 
 /** A type a format may give a column (FormatColumn.type): a date and time type, or a list or struct type. */
-export const isFormatType = (t: unknown): t is TemporalType | NestedTypeName => typeof t === 'string' && (isTemporal(t) || isNestedType(t));
+/** The list and struct types a format can give a column (plugin API v1, `FormatColumn.type`): maps are not among them. */
+type FormatNestedType = Exclude<NestedTypeName, `map<${string}>`>;
+
+export const isFormatType = (t: unknown): t is TemporalType | FormatNestedType => typeof t === 'string' && (isTemporal(t) || (isNestedType(t) && !t.startsWith('map<')));
 
 /** A named endpoint (`CREATE CONNECTION`). */
 export interface ConnectionInfo {
@@ -31,7 +34,7 @@ export interface ExternalColumn {
   name: string;
   declType: string;
   /** A date and time or list and struct type the format gave the column (FormatColumn.type). */
-  type?: TemporalType | NestedTypeName;
+  type?: TemporalType | FormatNestedType;
 }
 
 /** What to fetch and how to read it: an external table, or one call of a table function such as `read_csv`. */

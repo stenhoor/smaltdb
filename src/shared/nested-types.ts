@@ -1,18 +1,22 @@
 /**
- * List and struct types (ADR 0020), as text: `list<T>` and `struct<name T, …>`, nested to any depth, where `T` is any
- * plan type. Parsing only: the values are in `nested.ts`. No dependencies, so the plan format (`smaltdb/plan`) can use it.
+ * List, struct and map types (ADR 0020, ADR 0038), as text: `list<T>`, `struct<name T, …>` and `map<text, T>`, nested to
+ * any depth, where `T` is any plan type. A map's keys are text. Parsing only: the values are in `nested.ts`. No dependencies, so the plan format (`smaltdb/plan`) can use it.
  */
 
 /** A list or struct type, as text. */
-export type NestedTypeName = `list<${string}>` | `struct<${string}>`;
+export type NestedTypeName = `list<${string}>` | `struct<${string}>` | `map<${string}>`;
 
 /** A list or struct type, parsed. */
-export type NestedType = { readonly kind: 'list'; readonly of: string } | { readonly kind: 'struct'; readonly fields: readonly { readonly name: string; readonly type: string }[] };
+export type NestedType =
+  | { readonly kind: 'list'; readonly of: string }
+  | { readonly kind: 'struct'; readonly fields: readonly { readonly name: string; readonly type: string }[] }
+  /** A map from text keys to values of type `of` (ADR 0038). */
+  | { readonly kind: 'map'; readonly of: string };
 
 const BASE_TYPES = new Set(['int', 'bool', 'real', 'num', 'text', 'blob', 'null', 'any', 'date', 'datetime', 'time', 'duration']);
 
 /** Whether `t` is written as a list or struct type (`isNestedType` also checks it). */
-export const isNested = (t: string): t is NestedTypeName => t.startsWith('list<') || t.startsWith('struct<');
+export const isNested = (t: string): t is NestedTypeName => t.startsWith('list<') || t.startsWith('struct<') || t.startsWith('map<');
 
 const PARSED = new Map<string, NestedType | null>();
 
@@ -45,6 +49,10 @@ export function parseNested(t: string): NestedType | null {
   if (t.startsWith('list<') && t.endsWith('>')) {
     const of = t.slice(5, -1).trim();
     if (isPlanTypeName(of)) r = { kind: 'list', of };
+  } else if (t.startsWith('map<') && t.endsWith('>')) {
+    // Keys are text (ADR 0038).
+    const parts = splitTop(t.slice(4, -1));
+    if (parts && parts.length === 2 && parts[0] === 'text' && isPlanTypeName(parts[1]!)) r = { kind: 'map', of: parts[1]! };
   } else if (t.startsWith('struct<') && t.endsWith('>')) {
     const parts = splitTop(t.slice(7, -1));
     if (parts && parts.length > 0 && parts.every((p) => p !== '')) {
@@ -62,10 +70,10 @@ export function parseNested(t: string): NestedType | null {
   return r;
 }
 
-/** Whether `t` is a plan type: a simple one, or a well-formed list or struct type. */
+/** Whether `t` is a plan type: a simple one, or a well-formed list, struct or map type. */
 export function isPlanTypeName(t: string): boolean {
   return BASE_TYPES.has(t) || (isNested(t) && parseNested(t) !== null);
 }
 
-/** Whether `t` is a well-formed list or struct type. */
+/** Whether `t` is a well-formed list, struct or map type. */
 export const isNestedType = (t: string): t is NestedTypeName => isNested(t) && parseNested(t) !== null;
