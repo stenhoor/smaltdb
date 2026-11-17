@@ -172,6 +172,7 @@ table:
 | `checks` | CHECK constraints, `CheckDef[]` |
 | `foreignKeys` | `ForeignKeyDef[]` |
 | `storage` | `row` or `columnar` |
+| `history` | Optional, `versions`: the table keeps its past versions, read with `asOf` on a scan. See [history](#history) |
 | `exprLanguage` | Optional, for a table [defined without source text](#definitions-without-source-text): the language its expression texts are written in |
 
 | `ColumnDef` | |
@@ -192,6 +193,26 @@ Expressions in definitions (`ExprDef`: `{ text, expr? }`) are plan expressions w
 index expression reads the table's row: column `i` is `col(0, i, …)`, the rowid `col(0, n, …)` where `n` is the number
 of columns. `expr` may be absent when it could not be bound when the definition was made (a DEFAULT naming a function
 that does not exist yet): the table's language binds it from `text` where it is first used.
+
+<a id="history"></a>
+### History
+
+A table created with `history: 'versions'` keeps its past versions ([ADR 0033](../../adr/0033-property-graphs-and-history.md),
+step 6), and a plan reads it as it was after any commit, or at any time, with `asOf` on a `scan`
+([plans](./plans)). It is set when the table is created, for row tables in `main`.
+
+- **Versions are commits:** a version is valid from the commit that wrote it until the one that changed or deleted it.
+  Changes within one transaction make one version: the states in between were never committed. A rolled-back
+  transaction leaves no history.
+- **Where it lives:** two tables beside it, written in the same transaction as each change: `smalt_since_<table>`
+  (when each current row's version started) and `smalt_versions_<table>` (the earlier versions, with the commits
+  they were valid between). Only the engine writes them, and they are dropped with the table.
+- **Times:** every commit that writes such a table is recorded in `smalt_commits` with its time, so `asOf` a time reads
+  the last commit at or before it.
+- **Cost:** the table and its current reads don't change. An insert writes one small row more; an update or a delete
+  writes the old version and one small row. Tables without history pay nothing.
+- **Not yet:** `ALTER TABLE` on such a table is refused; history is kept until a forget command (coming) drops it.
+- **The file:** once a table keeps history, an engine that doesn't keep it refuses the file.
 
 ## Indexes
 

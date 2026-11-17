@@ -107,6 +107,8 @@ export interface TableSchema {
   recordDefaults: SqlValue[];
   /** System tables cannot be modified by user DML. */
   system?: boolean;
+  /** It keeps its past versions (TableDef.history): in `smalt_versions_<name>`, with `smalt_since_<name>`. */
+  history?: 'versions';
   /** The language of its source `sql` (absent: SQL). */
   language?: string;
   /** Defined without source text (ADR 0016 section 6): its catalog text describes the definition. */
@@ -443,6 +445,7 @@ export function tableSchemaFromDef(
     indexes: [],
     checks: [...def.checks],
     ...(def.exprLanguage !== undefined ? { exprLanguage: def.exprLanguage } : {}),
+    ...(def.history !== undefined ? { history: def.history } : {}),
     foreignKeys: def.foreignKeys.map((f) => ({ ...f, columns: [...f.columns], refColumns: f.refColumns ? [...f.refColumns] : undefined })),
     sql,
     layout: new RecordLayout(columns.map((c) => c.type)),

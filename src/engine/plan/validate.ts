@@ -28,6 +28,8 @@ import type { PlanOp } from './ops.js';
 export interface ValidateCatalog {
   /** A table's column count (rowid not included), or undefined. */
   tableColumns(name: string, db?: 'main' | 'temp'): number | undefined;
+  /** How a table keeps history (`asOf` needs it), or undefined. */
+  tableHistory?(name: string, db?: 'main' | 'temp'): string | undefined;
   /**
    * A source's column count (a table-valued function or a virtual table): `'data'` when its columns come from the data
    * it reads (external tables and functions), undefined when the catalog doesn't know the source (the planner reports
@@ -251,6 +253,14 @@ class Validator {
         const n = this.tableWidth(o.table, o.db);
         const cols = columnsOf(o.columns, n, o.table, 'columns');
         if (o.indexedBy !== undefined && o.indexedBy !== null && typeof o.indexedBy !== 'string') this.fail('expected an index name', 'indexedBy');
+        if (o.asOf !== undefined)
+          this.under('asOf', undefined, () => {
+            const a = o.asOf as Record<string, unknown>;
+            if (!a || typeof a !== 'object' || ('commit' in a) === ('time' in a)) this.fail('expected { commit } or { time }');
+            ex(('commit' in a ? a.commit : a.time) as PlanExpr, reading(), 'commit' in a ? 'commit' : 'time');
+            if (o.db === 'temp') this.fail('TEMP tables keep no history');
+            if (this.catalog.tableHistory && !this.catalog.tableHistory(o.table as string, o.db as 'main' | undefined)) this.fail(`table ${String(o.table)} keeps no history`);
+          });
         return cols.length;
       }
       case 'source': {
@@ -740,6 +750,7 @@ class Validator {
           checks(t.checks, width, 'checks');
           foreignKeys(t.foreignKeys, width, 'foreignKeys');
           if (t.storage !== 'row' && t.storage !== 'columnar') this.fail(`unknown storage ${JSON.stringify(t.storage)}`, 'storage');
+          if (t.history !== undefined && t.history !== 'versions') this.fail(`unknown history ${JSON.stringify(t.history)} (versions)`, 'history');
         });
         if (o.rows !== undefined)
           this.under('rows', undefined, () => {

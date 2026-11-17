@@ -124,7 +124,19 @@ export type PlanOp = OpMeaning & (
    * Rows of a table: `columns` lists table column indexes, -1 for the rowid. `db` names the schema when the query
    * did or the table is TEMP; `indexedBy` is SQL's INDEXED BY name, or null for NOT INDEXED.
    */
-  | { readonly op: 'scan'; readonly table: string; readonly db?: 'main' | 'temp'; readonly columns: readonly number[]; readonly indexedBy?: string | null }
+  | {
+      readonly op: 'scan';
+      readonly table: string;
+      readonly db?: 'main' | 'temp';
+      readonly columns: readonly number[];
+      readonly indexedBy?: string | null;
+      /**
+       * Read the table as it was after a commit (ADR 0033, decision 14): `{ commit }` a commit id, or `{ time }` a time
+       * in milliseconds since 1970, which reads it as of the last commit at or before then. The table must keep
+       * history (`TableDef.history`). An expression over no columns.
+       */
+      readonly asOf?: { readonly commit: PlanExpr } | { readonly time: PlanExpr };
+    }
   /**
    * Rows that are not a table's: a table-valued function (`pragma_table_info(t)`), a virtual table
    * (`information_schema.*`, the TEMP catalog) or an external table. A function's arguments may read the columns of

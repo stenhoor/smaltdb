@@ -4,6 +4,7 @@ import { BTree } from '../storage/btree.js';
 import { KeyEncoder, ROWID_KEY_SIZE, readIndexRowid, readRowidKey, writeRowidKey } from '../storage/key-codec.js';
 import { RecordEncoder, RecordReader } from '../storage/record.js';
 import type { Pager } from '../storage/pager.js';
+import type { HistoryHooks } from './history.js';
 import { type SqlValue, normalizeInt } from '../values.js';
 
 export type ConflictMode = 'ABORT' | 'FAIL' | 'IGNORE' | 'REPLACE' | 'ROLLBACK';
@@ -317,7 +318,11 @@ export class TableWriter {
       if (k) this.indexTrees[i].put(k, EMPTY);
     }
     this.noteRowid(rowid);
+    this.history?.inserted(row, rowid);
   }
+
+  /** A history table's hooks (exec/history.ts): every insert, update and delete through this writer is reported. */
+  history?: HistoryHooks;
 
   /**
    * Replace row `oldRowid` (currently `old`, conflicts already resolved) with `next`. Index entries
@@ -325,8 +330,16 @@ export class TableWriter {
    */
   updateRow(old: readonly SqlValue[], oldRowid: number | bigint, next: SqlValue[], newRowid: number | bigint): void {
     if (oldRowid !== newRowid) {
-      this.deleteRow(oldRowid, old, true);
-      this.writeRow(next, newRowid);
+      // One change for history, not a delete and an insert.
+      const h = this.history;
+      this.history = undefined;
+      try {
+        this.deleteRow(oldRowid, old, true);
+        this.writeRow(next, newRowid);
+      } finally {
+        this.history = h;
+      }
+      h?.updated(old, oldRowid, next, newRowid);
       return;
     }
     const t = this.table;
@@ -363,6 +376,7 @@ export class TableWriter {
     }
     this.tree.put(this.key(newRowid), this.enc.encode(next));
     if (alias >= 0) next[alias] = saved;
+    this.history?.updated(old, oldRowid, next, newRowid);
   }
 
   /** Foreign-key hooks around a deletion (not called for the delete half of an UPDATE). */
@@ -384,6 +398,7 @@ export class TableWriter {
       if (k) this.indexTrees[i].delete(k);
     }
     this.tree.delete(this.key(rowid));
+    this.history?.deleted(row, rowid);
     if (!silent) this.onDelete?.(row, replace);
     return true;
   }

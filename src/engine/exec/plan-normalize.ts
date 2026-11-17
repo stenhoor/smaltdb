@@ -17,9 +17,25 @@ import type { PlanType } from '../plan/types.js';
 
 type Op<K extends PlanOp['op']> = Extract<PlanOp, { op: K }>;
 
-/** `op` as a query block the planner reads. */
-export function normalizePlan(op: PlanOp): PlanOp {
-  return block(rewrite(op));
+/** A table's column types (`db` main or temp), or undefined when there is no such table. */
+export type TableTypes = (table: string, db?: 'main' | 'temp') => readonly PlanType[] | undefined;
+
+/** The catalog's column types, while a plan is normalized: rewrites that read tables (`asOf`) type their columns. */
+let tableTypes: TableTypes | undefined;
+
+function withTypes<T>(types: TableTypes | undefined, f: () => T): T {
+  const prev = tableTypes;
+  tableTypes = types;
+  try {
+    return f();
+  } finally {
+    tableTypes = prev;
+  }
+}
+
+/** `op` as a query block the planner reads. `types` gives tables' column types (needed for `asOf` scans). */
+export function normalizePlan(op: PlanOp, types?: TableTypes): PlanOp {
+  return withTypes(types, () => block(rewrite(op)));
 }
 
 /**
@@ -78,8 +94,10 @@ function rewriteAll(x: unknown): unknown {
     case 'paths':
       // Its rewrite is an iterate joined back to the input in order: rewritten in turn.
       return rewriteAll(pathRows(op));
-    // Operations with no rewrite of their own (their inputs were rewritten above).
     case 'scan':
+      // A scan as of a commit reads the table's history (ADR 0033 step 6).
+      return op.asOf ? rewriteAll(asOfRows(op)) : op;
+    // Operations with no rewrite of their own (their inputs were rewritten above).
     case 'source':
     case 'iterate':
     case 'working':
@@ -315,6 +333,51 @@ function explodeRows(op: Op<'explode'>): PlanOp {
   });
   if (op.position) exprs.push({ k: 'col', input: 0, index: w + 1, depth: 0, type: 'int', collation: 'binary' });
   return { op: 'project', input: joined, exprs, ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+}
+
+/**
+ * A history table as it was after commit C (ADR 0033 step 6; exec/history.ts): its current rows whose current version
+ * started at or before C (`smalt_since_<t>`), and the closed versions valid at C (`smalt_versions_<t>`: from ≤ C < to).
+ * A time is the last commit at or before it (`smalt_commits`), 0 before the first.
+ */
+function asOfRows(op: Op<'scan'>): PlanOp {
+  const a = op.asOf!;
+  const types = tableTypes?.(op.table, op.db) ?? [];
+  const typeOf = (c: number): PlanType => (c < 0 ? 'int' : (types[c] ?? 'any'));
+  const at = (input: 0 | 1, index: number, type: PlanType): PlanExpr => ({ k: 'col', input, index, depth: 0, type, collation: 'binary' });
+  let commit: PlanExpr;
+  if ('commit' in a) commit = a.commit;
+  else {
+    const last: PlanOp = {
+      op: 'aggregate',
+      input: { op: 'filter', input: { op: 'scan', table: 'smalt_commits', columns: [0, 1] }, pred: cmp('cmp_le', at(0, 1, 'int'), a.time) },
+      keys: [],
+      aggs: [{ fn: 'max', args: [at(0, 0, 'int')], star: false, distinct: false, collation: 'binary', type: 'int' }],
+      carry: [],
+    };
+    commit = { k: 'call', fn: 'ifnull', args: [{ k: 'subquery', mode: 'scalar', plan: last, type: 'int', collation: 'binary' }, { k: 'lit', value: 0, type: 'int' }], type: 'int' };
+  }
+  const w = op.columns.length;
+  const out = (from: number) => op.columns.map((c, i) => at(0, from + i, typeOf(c)));
+  // Current rows, with the commit their version started at.
+  const table: PlanOp = { op: 'scan', table: op.table, ...(op.db ? { db: op.db } : {}), columns: [...op.columns, -1] };
+  const since: PlanOp = { op: 'scan', table: `smalt_since_${op.table}`, columns: [0, -1] };
+  const current: PlanOp = {
+    op: 'project',
+    input: { op: 'join', kind: 'inner', inputs: [table, since], on: { k: 'and', args: [cmp('cmp_eq', at(1, 1, 'int'), at(0, w, 'int')), cmp('cmp_le', at(1, 0, 'int'), commit)] } },
+    exprs: out(0),
+  };
+  // Closed versions valid then: [$rowid, $from, $to, …columns].
+  const versions: PlanOp = {
+    op: 'project',
+    input: {
+      op: 'filter',
+      input: { op: 'scan', table: `smalt_versions_${op.table}`, columns: [...op.columns.map((c) => (c < 0 ? 0 : c + 3)), 1, 2] },
+      pred: { k: 'and', args: [cmp('cmp_le', at(0, w, 'int'), commit), cmp('cmp_gt', at(0, w + 1, 'int'), commit)] },
+    },
+    exprs: out(0),
+  };
+  return { op: 'setop', kind: 'unionAll', inputs: [current, versions], collations: op.columns.map(() => 'binary'), ...(op.origin !== undefined ? { origin: op.origin } : {}) };
 }
 
 /**
@@ -570,9 +633,11 @@ function correlated(e: PlanExpr, depth: number): PlanExpr {
 }
 
 /** A write's plan with its input normalized (an `append`'s rows; `update` and `delete` read their targets as given). */
-export function normalizeWrite(plan: PlanOp): PlanOp {
-  const op = rewrite(plan);
-  return op.op === 'append' && op.input ? { ...op, input: block(op.input) } : op;
+export function normalizeWrite(plan: PlanOp, types?: TableTypes): PlanOp {
+  return withTypes(types, () => {
+    const op = rewrite(plan);
+    return op.op === 'append' && op.input ? { ...op, input: block(op.input) } : op;
+  });
 }
 
 /** LIMIT? ORDER BY? then a compound, VALUES, or DISTINCT? over a projected core. */

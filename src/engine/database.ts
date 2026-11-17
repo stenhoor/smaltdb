@@ -17,11 +17,11 @@ import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js'
 import type { ConflictAction, PlanOp } from './plan/ops.js';
 import { type EncodedPlan, canonicalJSON, decodeData, decodePlan, encodeData, encodePlan, planFromJSON, planToJSON } from './plan/codec.js';
 import { type PlanStatementInput, paramCount, toBoundStatement, toPlanStatement } from './plan/statement.js';
-import { normalizePlan, normalizeWrite } from './exec/plan-normalize.js';
+import { type TableTypes, normalizePlan, normalizeWrite } from './exec/plan-normalize.js';
 import { type ValidateCatalog, validatePlan, validateSchemaOp } from './plan/validate.js';
 import { type PlanExpr, forEachCol, typeOf } from './plan/expr.js';
 import type { CollationName } from './plan/types.js';
-import { type Compiled, type Fn } from './exec/expr.js';
+import { type Compiled, type Fn, collationName } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
 import { type ExternalScan, type PhysicalEnv, Planner, type QueryPlan, Registers, type ResultColumnInfo } from './exec/planner.js';
@@ -30,7 +30,7 @@ import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from '.
 import { type PlanMorsels, planMorsels } from './exec/plan-morsel.js';
 import type { BoundQuery, BoundStatement, BoundTransaction, BoundWrite } from './plan/bound.js';
 import type { AlterAction, ColumnDef as ColumnDefinition, ExprDef, PropertyGraphDef, SchemaOp, Source, SourceEditor, TableDef } from './plan/schema.js';
-import { FEATURE_PROPERTY_GRAPHS } from './storage/format.js';
+import { FEATURE_HISTORY, FEATURE_PROPERTY_GRAPHS } from './storage/format.js';
 import { SYSTEM_TABLES, type StoredDef, type StoredText, type SystemTableName, decodeDef, describeDefinition, encodeDef, isDescribed, isSystemTable, systemTableText } from './catalog/stored.js';
 import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
@@ -65,6 +65,7 @@ import { type CatalogSnapshot, informationSchema } from './catalog/information-s
 import { type LanguageStatement, type SmaltLanguage, languagePart, registeredLanguage } from './plan/language.js';
 import { ForeignKeys } from './exec/fk.js';
 import { GraphRules } from './exec/graph-rules.js';
+import { VERSION_COLUMNS, historyHooks, sinceTableName, versionsTableName } from './exec/history.js';
 import { PluginRegistry, type SmaltPlugin } from './plugin.js';
 import { Collation, type SqlValue } from './values.js';
 import type { Vfs, VfsFile } from './vfs/types.js';
@@ -623,7 +624,7 @@ export class Database implements FunctionContext {
    */
   preparePlan(stmt: PlanStatementInput): PlanStatement {
     this.checkOpen();
-    const bound = normalizeBound(toBoundStatement(stmt, (plan) => this.receivedPlan(plan), (plan) => outputTypes(plan, (t, db) => this.getTable(t, db)?.columns.map((c) => planTypeOfStorage(c.type, c.declaredType)))));
+    const bound = normalizeBound(toBoundStatement(stmt, (plan) => this.receivedPlan(plan), (plan) => outputTypes(plan, this.tableTypes)), this.tableTypes);
     if (bound.kind === 'schema') validateSchemaOp(bound.op, this.validateCatalog);
     return new PlanStatement(this, bound, paramCount(bound));
   }
@@ -898,6 +899,13 @@ export class Database implements FunctionContext {
       if (this.fk.involved(table)) this.fk.beforeDelete(table, row);
       if (this.graphRules.involved(table)) this.graphRules.beforeDelete(table, row);
     };
+    if (table.history) {
+      const since = this.tables.get(sinceTableName(table.name).toLowerCase());
+      const versions = this.tables.get(versionsTableName(table.name).toLowerCase());
+      if (!since || !versions) throw new SmaltError('SMALT_CORRUPT', `table ${table.name} keeps history, but its history tables are missing`);
+      const writer = (t: TableSchema) => new TableWriter(t, this.pager, (root) => this.tree(root));
+      w.history = historyHooks(writer(since), writer(versions), () => this.pager.nextCommit().id, () => (this.historyTouched = true));
+    }
     w.onDelete = (row) => {
       if (this.fk.involved(table)) this.fk.afterDelete(table, row);
     };
@@ -941,7 +949,7 @@ export class Database implements FunctionContext {
     let c = this.internalPrograms.get(plan);
     if (!c || c.version !== this.schemaVersion) {
       const write = plan.op === 'append' || plan.op === 'update' || plan.op === 'delete';
-      const bound = normalizeBound(toBoundStatement(write ? { kind: 'write', plan } : plan, (x) => this.receivedPlan(x)));
+      const bound = normalizeBound(toBoundStatement(write ? { kind: 'write', plan } : plan, (x) => this.receivedPlan(x)), this.tableTypes);
       c = { version: this.schemaVersion, prog: this.compileBound(bound, paramCount(bound), '') };
       this.internalPrograms.set(plan, c);
     }
@@ -1391,11 +1399,15 @@ export class Database implements FunctionContext {
     // joins, …), as plan statements do (smaltdb ADR 0022). Plans without them are left exactly as given.
     if (!needsRewrite(r.plan)) return r;
     const write = r.plan.op === 'append' || r.plan.op === 'update' || r.plan.op === 'delete';
-    return { ...r, plan: write ? normalizeWrite(r.plan) : normalizePlan(r.plan) };
+    return { ...r, plan: write ? normalizeWrite(r.plan, this.tableTypes) : normalizePlan(r.plan, this.tableTypes) };
   }
+
+  /** A table's column types as plans read them (rewrites that read the catalog: `asOf`). */
+  private readonly tableTypes: TableTypes = (t, db) => this.getTable(t, db)?.columns.map((c) => (c.rowidAlias ? 'int' : planTypeOfStorage(c.type, c.declaredType)));
 
   private readonly validateCatalog: ValidateCatalog = {
     tableColumns: (name, db) => this.getTable(name, db)?.columns.length ?? this.viewWidth(name, db),
+    tableHistory: (name, db) => this.getTable(name, db)?.history,
     sourceColumns: (kind, name, schema) => {
       if (kind === 'external' || (kind === 'function' && this.external.plugins.isExternalFunction(name))) return 'data';
       return this.virtualTable(kind === 'virtual' ? schema : undefined, name)?.columns.length;
@@ -1473,7 +1485,7 @@ export class Database implements FunctionContext {
       const fn = want !== undefined && now !== undefined && now !== want ? conversion(now, want)?.fn : undefined;
       return fn ? { k: 'call', fn, args: [{ ...col, type: now! }], type: want! } : col;
     });
-    return normalizePlan({ op: 'project', input: query, exprs, ...(scan.origin !== undefined ? { origin: scan.origin } : {}) });
+    return normalizePlan({ op: 'project', input: query, exprs, ...(scan.origin !== undefined ? { origin: scan.origin } : {}) }, this.tableTypes);
   }
 
   /** The logical catalog languages bind against (plan/bind-context.ts): the planner's tables, views and sources. */
@@ -1878,17 +1890,23 @@ export class Database implements FunctionContext {
    */
   private recordCommit(): void {
     const info = this.commitInfo;
+    const history = this.historyTouched;
     this.commitInfo = null;
-    if (!info || !this.pager.inTransaction) return;
+    this.historyTouched = false;
+    if ((!info && !history) || !this.pager.inTransaction) return;
     if (!this.tables.has('smalt_commits')) this.createTable(systemTableOp('smalt_commits'), true);
     const t = this.tables.get('smalt_commits')!;
     const { id, time } = this.pager.nextCommit();
-    new TableWriter(t, this.pager, (root) => this.tree(root)).writeRow([id, time, info.author ?? null, info.message ?? null], id);
+    new TableWriter(t, this.pager, (root) => this.tree(root)).writeRow([id, time, info?.author ?? null, info?.message ?? null], id);
   }
+
+  /** The open transaction wrote a history table: its commit is recorded, so a time maps to it (`asOf`). */
+  private historyTouched = false;
 
   private rollbackTransaction(): void {
     this.lastTransactionEnd = 'rollback';
     this.commitInfo = null;
+    this.historyTouched = false;
     this.interfaceCheckDue = false;
     this.fk.deferred = 0;
     this.sqlSavepoints.length = 0;
@@ -1964,7 +1982,10 @@ export class Database implements FunctionContext {
       // failure part-way through B+tree maintenance (an interrupt, an I/O error) can leave pins.
       pager.releaseAllPins();
       if (journal) pager.rollbackStatement();
-      if (this.autocommit) pager.rollback();
+      if (this.autocommit) {
+        pager.rollback();
+        this.historyTouched = false;
+      }
       if (this.memDirty) {
         this.restoreMem(memBefore);
         this.memDirty = false;
@@ -1976,7 +1997,10 @@ export class Database implements FunctionContext {
       throw e;
     }
     if (journal) pager.commitStatement();
-    if (this.autocommit) pager.commit();
+    if (this.autocommit) {
+      this.recordCommit();
+      pager.commit();
+    }
     return result;
   }
 
@@ -3486,6 +3510,9 @@ export class Database implements FunctionContext {
     const schema = stmt.schema?.toLowerCase();
     if (schema !== undefined && schema !== 'main' && schema !== 'temp') throw new SmaltError('SMALT_ERROR', `unknown database ${stmt.schema}`);
     if (stmt.temp && schema === 'main') throw new SmaltError('SMALT_ERROR', 'temporary table name must be unqualified');
+    if (stmt.table.history !== undefined && (stmt.temp || schema === 'temp' || columnar)) {
+      throw new SmaltError('SMALT_UNSUPPORTED', `table ${stmt.table.name}: history is kept for row tables in main, not ${columnar ? 'columnar' : 'TEMP'} tables`);
+    }
     if (stmt.temp || schema === 'temp') {
       if (columnar) throw new SmaltError('SMALT_UNSUPPORTED', 'TEMP tables cannot be columnar');
       return this.createTempTable(stmt);
@@ -3510,7 +3537,8 @@ export class Database implements FunctionContext {
     for (const fk of table.foreignKeys) {
       if (this.tables.get(fk.table.toLowerCase())?.columnar) throw new SmaltError('SMALT_UNSUPPORTED', `foreign keys cannot reference columnar table ${fk.table}`);
     }
-    this.addCatalogRow('table', table.name, table.name, root, sql, undefined, internal ? undefined : stored);
+    // The engine's own tables are defined in code; the ones it makes per table (history) store their definitions.
+    this.addCatalogRow('table', table.name, table.name, root, sql, undefined, internal && isSystemTable(table.name) ? undefined : stored);
     implicitIndexes.forEach((spec, i) => {
       const name = autoIndexName(table.name, i + 1);
       const iroot = BTree.create(this.pager);
@@ -3520,8 +3548,35 @@ export class Database implements FunctionContext {
       this.addCatalogRow('index', name, table.name, iroot, null);
     });
     this.tables.set(table.name.toLowerCase(), table);
+    if (table.history) this.createHistoryTables(table);
     this.schemaChanged();
     return none;
+  }
+
+  /**
+   * A history table's companions (exec/history.ts): `smalt_since_<t>` (each current row's start commit) and
+   * `smalt_versions_<t>` (closed versions: rowid, from, to, then the table's columns, indexed on to), and
+   * `smalt_commits`, where every commit that writes history records its time. The file then needs an engine that keeps
+   * history.
+   */
+  private createHistoryTables(table: TableSchema): void {
+    const def = (name: string, columns: ColumnDefinition[]): Extract<SchemaOp, { op: 'createTable' }> => ({
+      op: 'createTable',
+      table: { name, columns, keys: [], checks: [], foreignKeys: [], storage: 'row' },
+      temp: false,
+      ifNotExists: false,
+    });
+    const int = (name: string): ColumnDefinition => ({ name, declaredType: 'INTEGER', type: 'INTEGER', notNull: false, collation: 'binary' });
+    for (const c of table.columns) {
+      if ((VERSION_COLUMNS as readonly string[]).includes(c.name.toLowerCase())) throw new SmaltError('SMALT_ERROR', `table ${table.name} keeps history: its column ${c.name} has a name history uses`);
+    }
+    const own: ColumnDefinition[] = table.columns.map((c) => ({ name: c.name, declaredType: c.declaredType, type: c.type, notNull: false, collation: collationName(c.collation) }));
+    this.createTable(def(sinceTableName(table.name), [int('from')]), true);
+    const versions = versionsTableName(table.name);
+    this.createTable(def(versions, [...VERSION_COLUMNS.map(int), ...own]), true);
+    this.createIndex({ op: 'createIndex', index: { name: `${versions}_to`, table: versions, columns: [{ column: 2, desc: false, collation: 'binary' }], unique: false }, ifNotExists: false }, true);
+    if (!this.tables.has('smalt_commits')) this.createTable(systemTableOp('smalt_commits'), true);
+    this.pager.requireFeatures(FEATURE_HISTORY);
   }
 
   /**
@@ -3593,7 +3648,7 @@ export class Database implements FunctionContext {
     return table;
   }
 
-  private createIndex(op: Extract<SchemaOp, { op: 'createIndex' }>): RunResult {
+  private createIndex(op: Extract<SchemaOp, { op: 'createIndex' }>, internal = false): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const stmt = op.index;
     const stored: StoredDef = { kind: 'index', index: stmt, ...sourceFields(op.source) };
@@ -3603,7 +3658,7 @@ export class Database implements FunctionContext {
     if (table.temp) {
       if (this.indexes.has(stmt.name.toLowerCase())) throw new SmaltError('SMALT_ERROR', `index ${stmt.name} already exists`);
     } else {
-      this.checkNewName(stmt.name, 'index');
+      if (!internal) this.checkNewName(stmt.name, 'index');
       // One namespace with TEMP indexes too (DROP INDEX resolves names through it).
       if (this.indexes.has(stmt.name.toLowerCase())) throw new SmaltError('SMALT_ERROR', `index ${stmt.name} already exists`);
     }
@@ -3883,6 +3938,21 @@ export class Database implements FunctionContext {
       this.removeCatalogRow(table.name);
       if (this.tables.get(lower) === table) this.tables.delete(lower);
       else this.shadowedMain.delete(lower); // a TEMP table of the same name stays
+      // Its history goes with it.
+      if (table.history) {
+        for (const name of [sinceTableName(table.name), versionsTableName(table.name)]) {
+          const h = this.tables.get(name.toLowerCase());
+          if (!h) continue;
+          for (const idx of h.indexes) {
+            this.freshTree(idx.rootPage).destroy();
+            this.removeCatalogRow(idx.name);
+            this.indexes.delete(idx.name.toLowerCase());
+          }
+          this.freshTree(h.rootPage).destroy();
+          this.removeCatalogRow(h.name);
+          this.tables.delete(name.toLowerCase());
+        }
+      }
       this.schemaChanged();
       return none;
     }
@@ -3940,6 +4010,8 @@ export class Database implements FunctionContext {
     // TEMP tables have no stored definitions (main.t reaches a shadowed main table).
     if (table.temp) throw new SmaltError('SMALT_UNSUPPORTED', `ALTER TABLE is not supported for TEMP table ${table.name}`);
     if (table.matview) throw new SmaltError('SMALT_ERROR', `materialized view ${table.name} may not be altered`);
+    // Its versions have its columns: changing them isn't supported yet (ADR 0033 step 6).
+    if (table.history) throw new SmaltError('SMALT_UNSUPPORTED', `table ${table.name} keeps history: ALTER TABLE isn't supported for it yet`);
     // A graph names its tables and their id, endpoint and props columns: those can't be renamed or dropped under it.
     const graphUser = this.graphUsing(table.name.toLowerCase());
     if (graphUser) {
@@ -4427,7 +4499,7 @@ export class Database implements FunctionContext {
   private targetTable(name: string, schema?: string): TableSchema {
     if (schema && !['main', 'temp'].includes(schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${schema}`);
     const lower = name.toLowerCase();
-    if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat' || lower === 'smalt_matview' || lower === 'smalt_columnar' || lower === 'smalt_extcache' || lower === 'smalt_commits') throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
+    if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat' || lower === 'smalt_matview' || lower === 'smalt_columnar' || lower === 'smalt_extcache' || lower === 'smalt_commits' || lower.startsWith('smalt_since_') || lower.startsWith('smalt_versions_')) throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
     const t = this.getTable(lower, schema);
     if (!t) {
       if (this.views.has(lower)) throw new SmaltError('SMALT_ERROR', `cannot modify ${name} because it is a view`);
@@ -4871,7 +4943,7 @@ export class Database implements FunctionContext {
     const truncate = !op.returning && wholeTable(op.input);
     const ncols = table.columns.length;
     const exec = (r: SqlValue[], out?: SqlValue[][]): RunResult => {
-      if (truncate && !this.fk.involved(table) && !this.graphRules.involved(table)) {
+      if (truncate && !this.fk.involved(table) && !this.graphRules.involved(table) && !table.history) {
         this.touchTable(table);
         const n = table.columnar ? this.rewriteColumnar(table, false) : new TableWriter(table, this.pager, (root) => this.tree(root)).truncate();
         this.lastChanges = n;
@@ -5907,14 +5979,14 @@ function remapIndexDef(name: string, m: (i: number) => number, defs: Map<string,
 }
 
 /** A plan statement's plans in the layering the physical planner reads (exec/plan-normalize.ts). */
-function normalizeBound(b: BoundStatement): BoundStatement {
+function normalizeBound(b: BoundStatement, types?: TableTypes): BoundStatement {
   switch (b.kind) {
     case 'query':
-      return { ...b, plan: normalizePlan(b.plan) };
+      return { ...b, plan: normalizePlan(b.plan, types) };
     case 'explain':
-      return { ...b, query: { ...b.query, plan: normalizePlan(b.query.plan) } };
+      return { ...b, query: { ...b.query, plan: normalizePlan(b.query.plan, types) } };
     case 'write':
-      return { ...b, plan: normalizeWrite(b.plan) };
+      return { ...b, plan: normalizeWrite(b.plan, types) };
     default:
       return b;
   }
@@ -5936,7 +6008,7 @@ function refreshIfChanged(st: PreparedStatement): string | null {
  * holds. Keyed by every operation, so a new one fails to compile until it is listed (ADR 0033 step 0).
  */
 const REWRITES: { readonly [K in PlanOp['op']]: boolean | ((o: Record<string, unknown>) => boolean) } = {
-  scan: false,
+  scan: (o) => o.asOf !== undefined,
   source: false,
   iterate: false,
   working: false,
