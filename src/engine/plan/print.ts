@@ -109,5 +109,10 @@ export function printPlan(op: PlanOp, depth = 0): string {
       const order = op.order.length ? ` order [${op.order.map((k) => `${printExpr(k.expr)}${k.desc ? ' desc' : ''}`).join(', ')}]` : '';
       return `${pad}window [${calls}]${part}${order} ${op.frame.unit} ${op.frame.start.kind}..${op.frame.end.kind}\n${sub(op.input)}`;
     }
+    default: {
+      // Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
+      const unhandled: never = op;
+      throw new Error(`printPlan: unknown operation ${(unhandled as { op: string }).op}`);
+    }
   }
 }

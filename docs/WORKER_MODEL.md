@@ -49,7 +49,7 @@ and they need only the baseline. Faster paths for newer browsers plug in behind 
 
 | Mode | Requirements | Behaviour |
 |---|---|---|
-| **Basic** (always available) | none | One engine worker. Statements are scheduled cooperatively: long reads are split into slices of N batches, so short queries interleave. MVCC snapshots keep reads consistent while writes proceed. |
+| **Basic** (always available) | none | One engine worker. Statements are scheduled cooperatively: long reads are split into slices of N batches, so short queries interleave. A statement's reads see one committed state: sessions run one at a time, and reader workers read snapshots of the latest commit (no MVCC). |
 | **Parallel** | `crossOriginIsolated === true` | The engine worker coordinates a pool of reader workers sized to `navigator.hardwareConcurrency - 1`. The buffer pool, WAL index, and catalog snapshot live in `SharedArrayBuffer`s. Page reads that miss the cache are proxied to the I/O owner through `Atomics.wait`/`notify`. Morsel-driven intra-query and inter-query parallelism. |
 
 ## 4. Transactions and isolation

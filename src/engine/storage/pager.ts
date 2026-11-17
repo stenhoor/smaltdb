@@ -10,6 +10,10 @@ import {
   DH_CATALOG_ROOT,
   DH_DEFINITION_ROOT,
   DH_CHANGE_COUNTER,
+  DH_COMMIT_ID,
+  DH_COMMIT_TIME,
+  DH_REQUIRED_FEATURES,
+  KNOWN_FEATURES,
   DH_FORMAT_MAJOR,
   DH_FORMAT_MINOR,
   DH_FREELIST_COUNT,
@@ -404,6 +408,28 @@ export class Pager {
     return this.hv.getUint32(DH_CHANGE_COUNTER, true);
   }
 
+  /** The latest commit's id (0 before the first commit). Unlike the change counter it doesn't wrap. */
+  get commitId(): number {
+    return readU64(this.hv, DH_COMMIT_ID);
+  }
+
+  /** The latest commit's time, in milliseconds since the Unix epoch (0 before the first commit). */
+  get commitTime(): number {
+    return readU64(this.hv, DH_COMMIT_TIME);
+  }
+
+  /** The feature bits this file requires (format.ts `DH_REQUIRED_FEATURES`). */
+  get requiredFeatures(): number {
+    return this.hv.getUint32(DH_REQUIRED_FEATURES, true);
+  }
+
+  /** Every commit: count it, give it the next id, and stamp its time (never earlier than the commit before). */
+  private stampCommit(): void {
+    this.hv.setUint32(DH_CHANGE_COUNTER, (this.changeCounter + 1) >>> 0, true);
+    writeU64(this.hv, DH_COMMIT_ID, this.commitId + 1);
+    writeU64(this.hv, DH_COMMIT_TIME, Math.max(Date.now(), this.commitTime));
+  }
+
   /** True when there are uncommitted changes. */
   get inTransaction(): boolean {
     if (this.headerDirty) return true;
@@ -757,7 +783,7 @@ export class Pager {
       for (const f of this.dirtyList) f.dirty = false;
       this.dirtyList.length = 0;
     this.dirtyCount = 0;
-      this.hv.setUint32(DH_CHANGE_COUNTER, (this.changeCounter + 1) >>> 0, true);
+      this.stampCommit();
       this.committedHeader.set(this.header);
       this.headerDirty = false;
       this.txn = this.newLevel();
@@ -806,7 +832,7 @@ export class Pager {
     }
     dirty.length = 0;
     this.dirtyCount = 0;
-    this.hv.setUint32(DH_CHANGE_COUNTER, (this.changeCounter + 1) >>> 0, true);
+    this.stampCommit();
     this.writePage(this.header, 0);
     this.committedHeader.set(this.header);
     this.headerDirty = false;
@@ -823,7 +849,7 @@ export class Pager {
       this.sealPage(f.bytes);
       pages.push({ pgno: f.pgno, bytes: f.bytes });
     }
-    this.hv.setUint32(DH_CHANGE_COUNTER, (this.changeCounter + 1) >>> 0, true);
+    this.stampCommit();
     this.sealPage(this.header);
     pages.push({ pgno: 0, bytes: this.header });
     wal.commit(pages, this.pageCount, this.syncOnCommit);
@@ -1043,5 +1069,19 @@ function parseHeader(probe: Uint8Array): { pageSize: number; reserved: number } 
   validatePageSize(pageSize);
   const reserved = pv.getUint8(DH_RESERVED_BYTES);
   if (reserved < 4) throw new CorruptionError(`invalid reserved byte count ${reserved}`);
+  const unknown = pv.getUint32(DH_REQUIRED_FEATURES, true) & ~KNOWN_FEATURES;
+  if (unknown !== 0) {
+    throw new SmaltError('SMALT_FORMAT', `the database needs features this engine doesn't support (feature bits 0x${(unknown >>> 0).toString(16)}): open it with a newer smaltdb`);
+  }
   return { pageSize, reserved };
+}
+
+/** A u64 header field as a number (exact to 2^53). */
+function readU64(v: DataView, off: number): number {
+  return v.getUint32(off + 4, true) * 0x1_0000_0000 + v.getUint32(off, true);
+}
+
+function writeU64(v: DataView, off: number, n: number): void {
+  v.setUint32(off, n >>> 0, true);
+  v.setUint32(off + 4, Math.floor(n / 0x1_0000_0000), true);
 }

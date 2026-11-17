@@ -68,7 +68,8 @@ See [WORKER_MODEL.md](WORKER_MODEL.md) for details.
 - Each database has **one engine worker** that owns the OPFS file handles. OPFS sync handles are exclusive per file by default.
 - Tabs and windows on the same origin find the owner through the Web Locks API (leader election), then talk to it over `MessagePort`s.
 - Concurrency **inside** the engine (proposed):
-  - Single writer and multiple readers under MVCC snapshot isolation, using the WAL.
+  - Single writer and multiple readers, each reader on a snapshot of the latest commit taken from the WAL (there is no
+    MVCC: no row versions, and sessions run one at a time; ADR 0009, ADR 0021).
   - Optional **reader worker pool** for parallel query execution: on Chromium readers open the files with shared
     OPFS handles (ADR 0009); elsewhere they read them through the owner, with a shared block cache, which needs
     `SharedArrayBuffer` and therefore cross-origin isolation (ADR 0021).

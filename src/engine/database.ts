@@ -1668,6 +1668,11 @@ export class Database implements FunctionContext {
         return run(() => this.drop(op));
       case 'alterTable':
         return run(() => this.alterTable(op));
+      default: {
+        // Every schema operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
+        const unhandled: never = op;
+        throw new SmaltError('SMALT_INTERNAL', `unknown schema operation ${(unhandled as { op: string }).op}`);
+      }
     }
   }
 
@@ -5616,27 +5621,41 @@ function refreshIfChanged(st: PreparedStatement): string | null {
   return b?.kind === 'maintenance' && b.action === 'refresh' && b.ifChanged ? b.view : null;
 }
 
+/**
+ * Which operations normalizePlan rewrites into others: always (true), never (false), or when a test of the operation
+ * holds. Keyed by every operation, so a new one fails to compile until it is listed (ADR 0033 step 0).
+ */
+const REWRITES: { readonly [K in PlanOp['op']]: boolean | ((o: Record<string, unknown>) => boolean) } = {
+  scan: false,
+  source: false,
+  iterate: false,
+  working: false,
+  values: false,
+  project: false,
+  filter: false,
+  sort: false,
+  limit: (o) => !!o.fromEnd,
+  distinct: (o) => o.on !== undefined || o.keep !== undefined,
+  aggregate: false,
+  window: false,
+  setop: false,
+  join: (o) => o.kind === 'asof',
+  sample: true,
+  pivot: true,
+  unpivot: true,
+  explode: true,
+  append: false,
+  update: false,
+  delete: false,
+};
+
 /** Whether `v` (a plan, or any part of one) holds an operation that normalizePlan rewrites into others. */
 function needsRewrite(v: unknown): boolean {
   if (v === null || typeof v !== 'object') return false;
   if (Array.isArray(v)) return v.some(needsRewrite);
   const o = v as Record<string, unknown>;
-  switch (o.op) {
-    case 'sample':
-    case 'pivot':
-    case 'unpivot':
-    case 'explode':
-      return true;
-    case 'join':
-      if (o.kind === 'asof') return true;
-      break;
-    case 'distinct':
-      if (o.on !== undefined || o.keep !== undefined) return true;
-      break;
-    case 'limit':
-      if (o.fromEnd) return true;
-      break;
-  }
+  const rule = typeof o.op === 'string' && Object.hasOwn(REWRITES, o.op) ? REWRITES[o.op as PlanOp['op']] : false;
+  if (rule === true || (typeof rule === 'function' && rule(o))) return true;
   for (const k in o) if (needsRewrite(o[k])) return true;
   return false;
 }
