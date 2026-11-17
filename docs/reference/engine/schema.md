@@ -19,7 +19,7 @@ it when ALTER TABLE changes the definition. Views need one; every other operatio
 | `createConnection` | `name`, `ifNotExists`, `options`, `source?` |
 | `createExternalTable` | `name`, `ifNotExists`, `columns` (empty: read from the source), `options`, `source?` |
 | `createPropertyGraph` | `graph` (a `PropertyGraphDef`: see [property graphs](#property-graphs)), `ifNotExists`, `source?` |
-| `alterPropertyGraph` | `name`, `action` (`{ kind: 'addLabel', label, table? }` or `{ kind: 'addType', type, table? }`: see [adding labels and types](#adding-labels-and-types)), `ifNotExists?` |
+| `alterPropertyGraph` | `name`, `action` (`{ kind: 'addLabel', label, table? }`, `{ kind: 'addType', type, table? }` or `{ kind: 'addLabelIndex', table? }`: see [adding labels and types](#adding-labels-and-types) and [nodes with several labels](#nodes-with-several-labels)), `ifNotExists?` |
 | `drop` | `objectType` (`table`, `index`, `view`, `materialized view`, `trigger`, `external table`, `connection`, `property graph`), `name`, `schema?`, `ifExists`, `cascade?` |
 | `alterTable` | `table`, `schema?`, `action` (`renameTable`, `renameColumn`, `addColumn`, `dropColumn`), `source?`, `cascade?` |
 
@@ -77,6 +77,8 @@ const op: plan.SchemaOp = { op: 'createPropertyGraph', graph, ifNotExists: false
   type `map<text, …>` ([ADR 0038](../../adr/0038-map-type.md)) for properties that have no column of their own.
 - **Relationships:** one table per type, with `INTEGER` `start` and `end` columns holding node ids, and optionally
   `props`.
+- **The label index** (optional, `labels: { table, node, label }`): a node's other labels, one row each, with an
+  `INTEGER` node column and a `TEXT` label column. See [nodes with several labels](#nodes-with-several-labels).
 - **Checks:** labels, types and tables are each listed once; a table belongs to one graph. Tables must be row tables in
   `main`, not views, materialized views, external or columnar tables.
 - **Names:** graphs have their own names, apart from tables'.
@@ -121,7 +123,29 @@ A language adds a label or relationship type the first time it writes one (ADR 0
 - The graph's record is replaced in the same transaction, and is then shown as its definition (JSON): its original
   source text no longer describes it.
 
-The label index for nodes with several labels, and per-label copies, come in the next steps of ADR 0033.
+### Nodes with several labels
+
+A node's table gives its first label. The graph's label index gives it more (ADR 0033, decision 5): a table of
+`(node, label)` rows, one for each other label. Add it with `alterPropertyGraph` and `{ kind: 'addLabelIndex' }`, or
+name an existing table as `labels` when creating the graph:
+
+- **The table:** `<graph>_labels` unless `table` names another, with `node INTEGER NOT NULL` and `label TEXT NOT NULL`,
+  a unique index on `(label, node)` (`<table>_label`) that finds a label's nodes, and an index on `node`
+  (`<table>_node`) that finds a node's labels. An existing table with those columns is adopted.
+- **A label's nodes** are the rows of its table and the index's entries for it, for example in SQL
+  `SELECT id FROM admin UNION SELECT node FROM g_labels WHERE label = 'Admin'`.
+
+The engine keeps the index on every write, from any language:
+
+- **An entry names a node of the graph** and one of the graph's labels, spelled exactly as the graph spells it (labels
+  are case-sensitive), other than the label of the node's own table (`SMALT_CONSTRAINT_FOREIGNKEY`). A node has each
+  label once (`SMALT_CONSTRAINT_UNIQUE`).
+- **Entries belong to their node:** deleting the node deletes them, and changing its id changes theirs. `INSERT OR
+  REPLACE` of a node deletes it first, so its entries go too.
+- **A label in the index needs a place in the graph:** add it with `addLabel` first (its table holds the nodes whose
+  first label it is).
+
+Per-label copies, where a label keeps its own copy of the node's row, come in the next step of ADR 0033.
 
 ## Tables
 

@@ -800,6 +800,12 @@ class Validator {
           };
           part('nodes', ['label', 'table', 'id']);
           part('edges', ['type', 'table', 'start', 'end']);
+          if (g.labels !== undefined)
+            this.under('labels', undefined, () => {
+              const x = g.labels as Record<string, unknown>;
+              if (!x || typeof x !== 'object') this.fail('expected an object');
+              for (const n of ['table', 'node', 'label']) str(x[n], n);
+            });
         });
         return;
       }
@@ -811,7 +817,7 @@ class Validator {
           if (!a || typeof a !== 'object') this.fail('expected an action');
           if (a.kind === 'addLabel') str(a.label, 'label');
           else if (a.kind === 'addType') str(a.type, 'type');
-          else this.fail(`unknown action ${JSON.stringify(a.kind)}`, 'kind');
+          else if (a.kind !== 'addLabelIndex') this.fail(`unknown action ${JSON.stringify(a.kind)}`, 'kind');
           if (a.table !== undefined) str(a.table, 'table');
         });
         return;
