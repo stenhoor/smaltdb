@@ -154,6 +154,11 @@ export interface PropertyGraphDef {
    * name nodes of the graph and labels it has, and go when their node is deleted.
    */
   readonly labels?: { readonly table: string; readonly node: string; readonly label: string };
+  /**
+   * The graph keeps history (ADR 0033, decision 8): every table it names keeps history this way (`TableDef.history`),
+   * and the tables it makes on first use are created with it.
+   */
+  readonly history?: 'versions' | 'log';
 }
 
 /**

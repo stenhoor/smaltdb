@@ -218,7 +218,14 @@ step 6), and a plan reads it as it was after any commit, or at any time, with `a
 - **Cost:** the table and its current reads don't change. With `versions`, an insert writes one small row more, and an
   update or a delete the old version and one small row; with `log`, each change writes one log row. Tables without
   history pay nothing.
-- **Not yet:** `ALTER TABLE` on such a table is refused; history is kept until a forget command (coming) drops it.
+- **Forgetting** (ADR 0033, decision 16): history is kept until `{ kind: 'maintenance', action: 'forget', before }`
+  drops what no read as of `before` or later needs (`before` is `{ commit }`, or `{ time }`: the last commit at or before
+  it), for one `table` or every table that keeps history. Reading as of an earlier commit is then an error
+  (`SMALT_RANGE`: history before that commit was forgotten). The horizon only moves forward, survives reopening and is
+  part of the transaction.
+- **Graphs:** a property graph with `history` keeps it for all its tables: each must keep history that way, and the
+  tables it makes on first use (and its label index) are created with it.
+- **Not yet:** `ALTER TABLE` on such a table is refused.
 - **The file:** once a table keeps history, an engine that doesn't keep it refuses the file.
 
 ## Indexes

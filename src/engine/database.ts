@@ -1221,6 +1221,7 @@ export class Database implements FunctionContext {
     }
     this.loadMatviews(rows.filter((r) => r.type === 'matview'), (key) => def(key, 'matview'));
     this.loadColumnar(columnarTables);
+    this.loadHorizons();
     for (const r of rows) {
       if (r.type !== 'index' || r.sql === null) continue;
       const table = this.tables.get(r.tbl_name.toLowerCase());
@@ -1412,6 +1413,108 @@ export class Database implements FunctionContext {
   /** A table's column types as plans read them (rewrites that read the catalog: `asOf`). */
   private readonly tableTypes: TableTypes = (t, db) => this.getTable(t, db)?.columns.map((c) => (c.rowidAlias ? 'int' : planTypeOfStorage(c.type, c.declaredType)));
   private readonly normalizeCatalog: NormalizeCatalog = { types: this.tableTypes, history: (t, db) => this.getTable(t, db)?.history };
+
+  /** FunctionContext: a history table's horizon now (`history_horizon`). */
+  historyHorizon(table: string): number {
+    return this.horizons.get(table.toLowerCase()) ?? 0;
+  }
+
+  /** History tables' horizons (smalt_history; ADR 0033, decision 16): reading before them is an error. */
+  private horizons = new Map<string, number>();
+
+  private loadHorizons(): void {
+    this.horizons = new Map();
+    const t = this.tables.get('smalt_history');
+    if (!t) return;
+    const reader = new RecordReader(t.layout, t.recordDefaults);
+    const c = this.tree(t.rootPage).cursor();
+    for (let ok = c.first(); ok; ok = c.next()) {
+      c.loadValue();
+      reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+      this.horizons.set(String(reader.column(0)).toLowerCase(), Number(reader.column(1)));
+    }
+    c.close();
+  }
+
+  /**
+   * Forget history (ADR 0033, decision 16): drop what no read as of `before` or later needs (versions that ended by
+   * then; log entries of commits up to it), and record the horizon, below which `asOf` is an error.
+   */
+  private forgetHistory(stmt: Extract<BoundStatement, { action: 'forget' }>, at: SqlValue): RunResult {
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    if (at === null) return none;
+    if (typeof at !== 'number' && typeof at !== 'bigint') throw new SmaltError('SMALT_MISMATCH', 'forget: expected a commit id or a time, a number');
+    let before = Number(at);
+    if ('time' in stmt.before) {
+      const commits = this.tables.get('smalt_commits');
+      let last = 0;
+      if (commits) {
+        const reader = new RecordReader(commits.layout, commits.recordDefaults);
+        const c = this.tree(commits.rootPage).cursor();
+        for (let ok = c.first(); ok; ok = c.next()) {
+          c.loadValue();
+          reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+          if (Number(reader.column(1)) <= before) last = Math.max(last, Number(reader.column(0)));
+        }
+        c.close();
+      }
+      before = last;
+    }
+    let targets = [...this.tables.values()].filter((t) => t.history);
+    if (stmt.table !== undefined) {
+      const t = this.getTable(stmt.table, 'main');
+      if (!t) throw new SmaltError('SMALT_ERROR', `no such table: ${stmt.table}`);
+      if (!t.history) throw new SmaltError('SMALT_ERROR', `table ${t.name} keeps no history`);
+      targets = [t];
+    }
+    if (targets.length === 0 || before <= 0) return none;
+    if (!this.tables.has('smalt_history')) this.createTable(systemTableOp('smalt_history'), true);
+    const hist = this.tables.get('smalt_history')!;
+    const histWriter = new TableWriter(hist, this.pager, (root) => this.tree(root));
+    let dropped = 0;
+    for (const t of targets) {
+      // Versions that ended by then ($to, column 2), or log entries of commits up to it ($commit, column 0).
+      const [name, column] = t.history === 'log' ? [logTableName(t.name), 0] : [versionsTableName(t.name), 2];
+      const h = this.tables.get(name.toLowerCase());
+      if (!h) continue;
+      const reader = new RecordReader(h.layout, h.recordDefaults);
+      const gone: (number | bigint)[] = [];
+      const c = this.tree(h.rootPage).cursor();
+      for (let ok = c.first(); ok; ok = c.next()) {
+        c.loadValue();
+        reader.reset(c.valueBytes, c.valueOffset, c.valueLength);
+        if (Number(reader.column(column)) <= before) {
+          c.loadKey();
+          gone.push(readRowidKey(c.keyBytes, c.keyOffset));
+        }
+      }
+      c.close();
+      const w = new TableWriter(h, this.pager, (root) => this.tree(root));
+      for (const id of gone) w.deleteRow(id);
+      dropped += gone.length;
+      // The horizon only moves forward.
+      const key = t.name.toLowerCase();
+      const next = Math.max(this.horizons.get(key) ?? 0, before);
+      const r = new RecordReader(hist.layout, hist.recordDefaults);
+      const hc = this.tree(hist.rootPage).cursor();
+      let existing: number | bigint | null = null;
+      for (let ok = hc.first(); ok; ok = hc.next()) {
+        hc.loadValue();
+        r.reset(hc.valueBytes, hc.valueOffset, hc.valueLength);
+        if (String(r.column(0)).toLowerCase() === key) {
+          hc.loadKey();
+          existing = readRowidKey(hc.keyBytes, hc.keyOffset);
+        }
+      }
+      hc.close();
+      histWriter.writeRow([t.name, next], existing ?? histWriter.newRowid());
+      this.horizons.set(key, next);
+    }
+    // Plans read the horizon when they are made: make them again.
+    this.dirtySchema = true;
+    this.schemaChanged();
+    return { changes: dropped, lastInsertRowid: this.lastRowid };
+  }
 
   private readonly validateCatalog: ValidateCatalog = {
     tableColumns: (name, db) => this.getTable(name, db)?.columns.length ?? this.viewWidth(name, db),
@@ -1696,6 +1799,13 @@ export class Database implements FunctionContext {
             return done({ exec: () => this.analyze(bound.target, bound.schema), readonly: false, columns: [], columnTypes: [] });
           case 'refresh':
             return done({ exec: () => this.refreshMatview(bound), readonly: false, columns: [], columnTypes: [] });
+          case 'forget': {
+            const b = bound.before as Record<string, unknown> | undefined;
+            if (!b || typeof b !== 'object' || ('commit' in b) === ('time' in b)) throw new SmaltError('SMALT_PLAN', 'forget: expected before: { commit } or { time }');
+            if (bound.table !== undefined && typeof bound.table !== 'string') throw new SmaltError('SMALT_PLAN', 'forget: expected a table name');
+            const at = planner.compileAt([('commit' in bound.before ? bound.before.commit : bound.before.time)], () => -1)[0];
+            return done({ exec: (regs) => this.forgetHistory(bound, at.fn(regs)), readonly: false, columns: [], columnTypes: [] });
+          }
           default:
             throw new SmaltError('SMALT_UNSUPPORTED', 'vacuum statements are not supported yet');
         }
@@ -3191,6 +3301,9 @@ export class Database implements FunctionContext {
     const tableOf = (name: string) => {
       const t = this.catalog.table(name, 'main');
       if (!t) return fail(`no such table: ${name}`);
+      // A graph that keeps history keeps it for all its tables, the same way.
+      const kept = this.tables.get(name.toLowerCase())?.history;
+      if (g.history !== undefined && kept !== g.history) fail(`table ${name} ${kept ? `keeps ${kept} history` : 'keeps no history'}: the graph's tables keep ${g.history} history (set when a table is created)`);
       if (t.kind !== 'table') fail(`${name} is not a table (a ${t.kind === 'materializedView' ? 'materialized view' : t.kind === 'external' ? 'external table' : 'system table'})`);
       if (t.storage !== 'row') fail(`table ${name} is columnar: a graph's tables are row tables`);
       const user = this.graphUsing(name.toLowerCase());
@@ -3231,6 +3344,7 @@ export class Database implements FunctionContext {
       nodes: g.nodes.map((n) => ({ label: n.label, table: n.table, id: n.id, ...(n.props !== undefined ? { props: n.props } : {}), ...(n.copy ? { copy: true } : {}) })),
       edges: g.edges.map((e) => ({ type: e.type, table: e.table, start: e.start, end: e.end, ...(e.props !== undefined ? { props: e.props } : {}) })),
       ...(l ? { labels: { table: l.table, node: l.node, label: l.label } } : {}),
+      ...(g.history !== undefined ? { history: g.history } : {}),
     };
   }
 
@@ -3287,8 +3401,8 @@ export class Database implements FunctionContext {
       const col = (n: string, type: 'INTEGER' | 'MAP', declaredType = type === 'MAP' ? 'map<text, any>' : 'INTEGER') => ({ name: n, declaredType, type, notNull: false, collation: 'binary' as const });
       const key = (column: number) => ({ column, desc: false, collation: 'binary' as const });
       const table: TableDef = isLabel
-        ? { name: tableName, columns: [col('id', 'INTEGER'), col('props', 'MAP')], keys: [{ kind: 'primaryKey', columns: [key(0)], ofColumn: 0 }], checks: [], foreignKeys: [], storage: 'row' }
-        : { name: tableName, columns: [col('start', 'INTEGER'), col('end', 'INTEGER'), col('props', 'MAP')], keys: [], checks: [], foreignKeys: [], storage: 'row' };
+        ? { name: tableName, columns: [col('id', 'INTEGER'), col('props', 'MAP')], keys: [{ kind: 'primaryKey', columns: [key(0)], ofColumn: 0 }], checks: [], foreignKeys: [], storage: 'row', ...(g.history ? { history: g.history } : {}) }
+        : { name: tableName, columns: [col('start', 'INTEGER'), col('end', 'INTEGER'), col('props', 'MAP')], keys: [], checks: [], foreignKeys: [], storage: 'row', ...(g.history ? { history: g.history } : {}) };
       next = isLabel ? { ...g, nodes: [...g.nodes, { label: name, table: tableName, id: 'id', props: 'props', ...(a.copy ? { copy: true } : {}) }] } : { ...g, edges: [...g.edges, { type: name, table: tableName, start: 'start', end: 'end', props: 'props' }] };
       this.createTable({ op: 'createTable', table, temp: false, ifNotExists: false });
       if (!isLabel) {
@@ -3315,7 +3429,7 @@ export class Database implements FunctionContext {
     if (!this.catalog.table(tableName, 'main')) {
       const col = (name: string, type: 'INTEGER' | 'TEXT') => ({ name, declaredType: type, type, notNull: true, collation: 'binary' as const });
       const key = (column: number) => ({ column, desc: false, collation: 'binary' as const });
-      this.createTable({ op: 'createTable', table: { name: tableName, columns: [col('node', 'INTEGER'), col('label', 'TEXT')], keys: [], checks: [], foreignKeys: [], storage: 'row' }, temp: false, ifNotExists: false });
+      this.createTable({ op: 'createTable', table: { name: tableName, columns: [col('node', 'INTEGER'), col('label', 'TEXT')], keys: [], checks: [], foreignKeys: [], storage: 'row', ...(g.history ? { history: g.history } : {}) }, temp: false, ifNotExists: false });
       this.createIndex({ op: 'createIndex', index: { name: `${tableName}_label`, table: tableName, columns: [key(1), key(0)], unique: true }, ifNotExists: false });
       this.createIndex({ op: 'createIndex', index: { name: `${tableName}_node`, table: tableName, columns: [key(0)], unique: false }, ifNotExists: false });
     }
@@ -4516,7 +4630,7 @@ export class Database implements FunctionContext {
   private targetTable(name: string, schema?: string): TableSchema {
     if (schema && !['main', 'temp'].includes(schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${schema}`);
     const lower = name.toLowerCase();
-    if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat' || lower === 'smalt_matview' || lower === 'smalt_columnar' || lower === 'smalt_extcache' || lower === 'smalt_commits' || lower.startsWith('smalt_since_') || lower.startsWith('smalt_versions_') || lower.startsWith('smalt_log_')) throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
+    if (CATALOG_NAMES.has(lower) || lower === 'smalt_stat' || lower === 'smalt_matview' || lower === 'smalt_columnar' || lower === 'smalt_extcache' || lower === 'smalt_commits' || lower === 'smalt_history' || lower.startsWith('smalt_since_') || lower.startsWith('smalt_versions_') || lower.startsWith('smalt_log_')) throw new SmaltError('SMALT_ERROR', `table ${name} may not be modified`);
     const t = this.getTable(lower, schema);
     if (!t) {
       if (this.views.has(lower)) throw new SmaltError('SMALT_ERROR', `cannot modify ${name} because it is a view`);

@@ -204,6 +204,8 @@ export const SYSTEM_TABLES = {
   smalt_extcache: systemTableDef('smalt_extcache', [['name', 'TEXT'], ['sources', 'TEXT']]),
   /** Commits that carried an author or message (ADR 0033, decision 17): rowid and `id` are the commit id. */
   smalt_commits: systemTableDef('smalt_commits', [['id', 'INTEGER'], ['time', 'INTEGER'], ['author', 'TEXT'], ['message', 'TEXT']]),
+  /** Each history table's horizon (ADR 0033, decision 16): history before this commit was forgotten. */
+  smalt_history: systemTableDef('smalt_history', [['name', 'TEXT'], ['horizon', 'INTEGER']]),
 } as const;
 
 export type SystemTableName = keyof typeof SYSTEM_TABLES;

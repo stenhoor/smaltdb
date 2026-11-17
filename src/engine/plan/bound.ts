@@ -57,6 +57,12 @@ export type BoundStatement =
   | { readonly kind: 'setting'; readonly name: string; readonly schema?: string; readonly value?: PlanExpr }
   | { readonly kind: 'maintenance'; readonly action: 'analyze'; readonly target?: string; readonly schema?: string }
   | { readonly kind: 'maintenance'; readonly action: 'vacuum' }
+  /**
+   * Forget history (ADR 0033, decision 16): drop the versions of `table` (or of every table that keeps history) that no
+   * read as of `before` or later needs: `{ commit }` a commit id, or `{ time }` the last commit at or before it. Reading
+   * as of an earlier commit is then an error (`SMALT_RANGE`). Expressions over constants and parameters.
+   */
+  | { readonly kind: 'maintenance'; readonly action: 'forget'; readonly before: { readonly commit: PlanExpr } | { readonly time: PlanExpr }; readonly table?: string }
   | {
       readonly kind: 'maintenance';
       readonly action: 'refresh';
