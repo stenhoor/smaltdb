@@ -136,7 +136,11 @@ export type DropObject = 'table' | 'index' | 'view' | 'materialized view' | 'tri
  */
 export interface PropertyGraphDef {
   readonly name: string;
-  readonly nodes: readonly { readonly label: string; readonly table: string; readonly id: string; readonly props?: string }[];
+  /**
+   * `copy` (ADR 0033, decision 18): the label keeps its own copy of the row of each node that has it through the label
+   * index, kept by the engine.
+   */
+  readonly nodes: readonly { readonly label: string; readonly table: string; readonly id: string; readonly props?: string; readonly copy?: boolean }[];
   readonly edges: readonly { readonly type: string; readonly table: string; readonly start: string; readonly end: string; readonly props?: string }[];
   /**
    * The label index (ADR 0033, decision 5): the labels a node has besides its table's, one row per node and label. A
@@ -197,7 +201,7 @@ export type SchemaOp =
       readonly op: 'alterPropertyGraph';
       readonly name: string;
       readonly action:
-        | { readonly kind: 'addLabel'; readonly label: string; readonly table?: string }
+        | { readonly kind: 'addLabel'; readonly label: string; readonly table?: string; readonly copy?: boolean }
         | { readonly kind: 'addType'; readonly type: string; readonly table?: string }
         /** The graph's label index (`labels`), created as `<graph>_labels` unless `table` names one. */
         | { readonly kind: 'addLabelIndex'; readonly table?: string };

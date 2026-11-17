@@ -796,6 +796,7 @@ class Validator {
                 if (!x || typeof x !== 'object') this.fail('expected an object');
                 for (const n of names) str(x[n], n);
                 if (x.props !== undefined) str(x.props, 'props');
+                if (x.copy !== undefined) bool(x.copy, 'copy');
               });
           };
           part('nodes', ['label', 'table', 'id']);
@@ -819,6 +820,7 @@ class Validator {
           else if (a.kind === 'addType') str(a.type, 'type');
           else if (a.kind !== 'addLabelIndex') this.fail(`unknown action ${JSON.stringify(a.kind)}`, 'kind');
           if (a.table !== undefined) str(a.table, 'table');
+          if (a.kind === 'addLabel' && a.copy !== undefined) bool(a.copy, 'copy');
         });
         return;
       }
