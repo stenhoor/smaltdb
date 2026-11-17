@@ -187,6 +187,8 @@ interface Source {
   cols: SourceColumn[];
   rowidReg: number;
   sub?: QueryPlan;
+  /** A recursive step's working rows (the previous step's): estimated at WORKING_ROWS, not SUBQUERY_ROWS. */
+  working?: boolean;
   /** Table-valued function whose arguments read earlier sources of the same FROM (re-run per row). */
   lateral?: boolean;
   /** `INDEXED BY name` (string) / `NOT INDEXED` (null). */
@@ -359,6 +361,13 @@ const COST = {
 
 /** Default rows for derived tables (unknown cardinality). */
 const SUBQUERY_ROWS = 1000;
+/**
+ * Rows a recursive step reads from its working table per iteration. The step runs once per working row, as SQLite's
+ * does, so the step's other tables are the inner side (ADR 0033 G1): costed at SUBQUERY_ROWS, the step scanned a large
+ * table on the outside and probed the working rows, once per working row (49 s against 139 ms for reachability over
+ * 100,000 edges, docs/research/graph-on-plans.md section 4).
+ */
+const WORKING_ROWS = 1;
 
 export class Planner {
   constructor(
@@ -1449,7 +1458,7 @@ export class Planner {
   private addPlannedSource(sub: QueryPlan, joinType: JoinType, scope: Scope, name: string, working: boolean): void {
     if (sub.correlated && !working) scope.correlated = true;
     const cols: SourceColumn[] = sub.columns.map((c, i) => ({ name: c.name, reg: sub.outRegs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '', index: i }));
-    scope.sources.push({ name, cols, rowidReg: -1, sub, joinType, position: scope.sources.length });
+    scope.sources.push({ name, cols, rowidReg: -1, sub, joinType, position: scope.sources.length, ...(working ? { working: true } : {}) });
   }
 
   private sourceRegs(src: Source): number[] {
@@ -1591,7 +1600,8 @@ export class Planner {
   private accessOptions(src: Source, p: number, candidates: ConjunctInfo[], scope: Scope, ctx: FunctionContext): AccessOption[] {
     if (src.sub) {
       const sub = src.sub;
-      return [{ label: 'subquery', cost: SUBQUERY_ROWS * COST.scanRow, rows: SUBQUERY_ROWS, dependsOnOuter: sub.correlated, build: () => ({ leaf: sub.root, dependsOnOuter: sub.correlated }) }];
+      const rows = this.tableRows(src);
+      return [{ label: 'subquery', cost: rows * COST.scanRow, rows, dependsOnOuter: sub.correlated, build: () => ({ leaf: sub.root, dependsOnOuter: sub.correlated }) }];
     }
     const N = this.tableRows(src);
     const table = src.table!;
@@ -1815,7 +1825,7 @@ export class Planner {
 
   /** Estimated rows of a source (ANALYZE stats, else B+tree shape). */
   private tableRows(src: Source): number {
-    if (src.sub) return SUBQUERY_ROWS;
+    if (src.sub) return src.working ? WORKING_ROWS : SUBQUERY_ROWS;
     if (src.estRows === undefined) {
       const t = src.table!;
       const live = this.env.liveRows ? this.env.liveRows(t) : src.access!.tree.estimateCount();

@@ -101,5 +101,5 @@ columns: sum(i) int
         Project
           SingleRow
         Project
-          Filter [est 330]
+          Filter [est 1]
             WorkingScan: SCAN n (recursive step)
