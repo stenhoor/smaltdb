@@ -130,6 +130,27 @@ Both need a **durable 64-bit commit id** and a **commit time**. smaltdb has neit
 History applies to local row tables. Columnar tables, materialized views and external tables are out of scope for the
 first version (section 5.2).
 
+**As built (step 6), in parts:**
+
+1. **Commit metadata** (done): `begin` and `commit` take an optional `author` and `message`. A commit that changes
+   something and carries either records them, with its id and time, in the system table `smalt_commits` (rowid = commit
+   id), in the same transaction. The pager fixes a transaction's commit id and time the first time it is asked
+   (`nextCommit`), so what is recorded is what the header gets. A commit without them writes nothing extra.
+2. **History tables, method (a)** (next): `history: 'versions'` on a table, set when it is created. A system table per
+   table holds closed versions (the row, its rowid, `valid_from`, `valid_to`), and a small one holds each current row's
+   `valid_from`, so the table itself and its reads don't change. Inserts write one small row more; updates and deletes
+   write a version and change the small row. Every commit that writes such a table records itself in `smalt_commits`,
+   so a time maps to a commit. `asOf` on a `scan` (a commit id or a time) is rewritten into the current rows that
+   existed then and the versions valid then.
+3. **Method (b), the commit log**: `history: 'log'`. Each insert, update and delete appends the operation, the rowid,
+   the commit and the row before it. A past state is the current rows untouched since, and for the others the row
+   before their first change after it (none if that change was the insert): no replay, one pass over the log since.
+   The same log serves `track_changes`.
+4. **Forgetting, graphs and limits**: an explicit command drops versions older than a commit and records the limit,
+   below which `asOf` is an error. A property graph can turn history on for all its tables. Changing a history table's
+   columns is refused at first.
+5. **Step 7** benchmarks both and picks the default.
+
 ## 4. Cypher on smaltdb
 
 smaltcy's parser stays. Its binder is rewritten to produce smaltdb plans against a property graph, keeping Cypher's

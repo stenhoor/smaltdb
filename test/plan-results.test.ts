@@ -131,4 +131,11 @@ describe('through the client', () => {
     });
     expect(inTx).toBe(102);
   });
+
+  it("db.transaction's author and message are recorded with its commit (ADR 0033, decision 17)", async () => {
+    const db = await openDb();
+    await db.transaction(async (tx) => void (await tx.queryPlan(insert(50))), { author: 'ada', message: 'add 50' });
+    const r = await db.query('SELECT author, message FROM smalt_commits', [], { rowMode: 'array' });
+    expect([...r]).toEqual([['ada', 'add 50']]);
+  });
 });

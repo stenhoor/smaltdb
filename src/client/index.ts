@@ -691,14 +691,15 @@ export class Database implements Queryable {
    * Run `fn` in a transaction: COMMIT on success, ROLLBACK if it throws. Every other call on this
    * Database and its prepared statements waits until the transaction finishes: run statements through
    * `tx`. If `fn` ends the transaction itself, a COMMIT stands (the promise resolves) and a ROLLBACK
-   * rejects the promise with SMALT_ERROR.
+   * rejects the promise with SMALT_ERROR. `author` and `message` describe the commit: they are recorded with its id and
+   * time in `smalt_commits` (ADR 0033, decision 17).
    */
-  transaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T> {
+  transaction<T>(fn: (tx: Transaction) => Promise<T>, options: { author?: string; message?: string } = {}): Promise<T> {
     return this.withLock(async () => {
       let done!: () => void;
       this.txRunning = new Promise<void>((r) => (done = r));
       try {
-        return await this.runTransaction(fn);
+        return await this.runTransaction(fn, options);
       } finally {
         this.txRunning = null;
         done();
@@ -706,9 +707,10 @@ export class Database implements Queryable {
     });
   }
 
-  private async runTransaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T> {
+  private async runTransaction<T>(fn: (tx: Transaction) => Promise<T>, options: { author?: string; message?: string }): Promise<T> {
     // A plan statement, not SQL text: transactions work with no language registered (ADR 0017).
-    await this.rawQueryPlan({ kind: 'transaction', action: 'begin', mode: 'deferred' }, undefined, {});
+    const about = { ...(options.author !== undefined ? { author: options.author } : {}), ...(options.message !== undefined ? { message: options.message } : {}) };
+    await this.rawQueryPlan({ kind: 'transaction', action: 'begin', mode: 'deferred', ...about }, undefined, {});
     let active = true;
     const ended = (): SmaltdbError => new SmaltdbError('SMALT_MISUSE', 'the transaction has ended: use tx only while the transaction callback runs');
     const tx: Transaction = {

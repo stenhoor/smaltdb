@@ -13,7 +13,7 @@ A `PlanStatementInput` is one of:
 | `{ kind: 'query', plan, columns? }` | A query and its result columns |
 | `{ kind: 'write', plan, returning?, source? }` | An `append`, `update` or `delete` plan; `returning` names and types its RETURNING values (without it, they are named `column1`, … and typed from the plan) |
 | `{ kind: 'explain', mode: 'plan' \| 'analyze', query }` | The query's physical plan, or the plan with run-time counts |
-| `{ kind: 'transaction', … }` | `begin` (with `mode` `deferred`, `immediate` or `exclusive`), `commit`, `rollback` (to an optional `savepoint`), `savepoint`, `release` |
+| `{ kind: 'transaction', … }` | `begin` (with `mode` `deferred`, `immediate` or `exclusive`), `commit`, `rollback` (to an optional `savepoint`), `savepoint`, `release`. `begin` and `commit` take an optional `author` and `message` (text; `commit`'s win): a commit that changes something records them with its id and time in `smalt_commits` (`id`, `time` in milliseconds since 1970, `author`, `message`), which only the engine writes. The client's `db.transaction(fn, { author, message })` sends them |
 | `{ kind: 'setting', name, value? }` | Read a setting, or set it (`value` an expression over constants and parameters), as SQL's PRAGMA |
 | `{ kind: 'maintenance', action, … }` | `analyze` (optional `target`), `vacuum`, or `refresh` a materialized view |
 | `{ kind: 'schema', op }` | A [schema operation](./schema) |
