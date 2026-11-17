@@ -126,7 +126,19 @@ export interface Source {
 }
 
 /** What DROP removes. */
-export type DropObject = 'table' | 'index' | 'view' | 'materialized view' | 'trigger' | 'external table' | 'connection';
+export type DropObject = 'table' | 'index' | 'view' | 'materialized view' | 'trigger' | 'external table' | 'connection' | 'property graph';
+
+/**
+ * A property graph (ADR 0033, G4): a catalog record naming the tables its nodes and relationships are stored in. Each
+ * label has a node table, keyed by an integer node id unique across the graph's node tables; each relationship type
+ * has an edge table whose `start` and `end` columns hold node ids. `props`: a `map<text, …>` column holding the
+ * properties that have no column of their own (ADR 0038). Every language sees the same tables.
+ */
+export interface PropertyGraphDef {
+  readonly name: string;
+  readonly nodes: readonly { readonly label: string; readonly table: string; readonly id: string; readonly props?: string }[];
+  readonly edges: readonly { readonly type: string; readonly table: string; readonly start: string; readonly end: string; readonly props?: string }[];
+}
 
 /**
  * A schema operation (ADR 0015 section 5): what a language's DDL becomes. Views and materialized views are kept as their
@@ -168,6 +180,8 @@ export type SchemaOp =
       readonly withData?: boolean;
       readonly source: Source;
     }
+  /** A property graph over existing tables (ADR 0033, G4). */
+  | { readonly op: 'createPropertyGraph'; readonly graph: PropertyGraphDef; readonly ifNotExists: boolean; readonly source?: Source }
   | { readonly op: 'createConnection'; readonly name: string; readonly ifNotExists: boolean; readonly options: Readonly<Record<string, SqlValue>>; readonly source?: Source }
   | {
       readonly op: 'createExternalTable';

@@ -780,6 +780,29 @@ class Validator {
         optSource(o.source);
         return;
       }
+      case 'createPropertyGraph': {
+        // The shape only: the engine checks the tables and columns against its catalog when it creates the graph.
+        bool(o.ifNotExists, 'ifNotExists');
+        optSource(o.source);
+        this.under('graph', undefined, () => {
+          const g = o.graph as Record<string, unknown>;
+          if (!g || typeof g !== 'object') this.fail('expected a property graph');
+          str(g.name, 'name');
+          const part = (key: 'nodes' | 'edges', names: readonly string[]) => {
+            const l = this.list(g[key], key);
+            for (let i = 0; i < l.length; i++)
+              this.under(key, i, () => {
+                const x = l[i] as Record<string, unknown>;
+                if (!x || typeof x !== 'object') this.fail('expected an object');
+                for (const n of names) str(x[n], n);
+                if (x.props !== undefined) str(x.props, 'props');
+              });
+          };
+          part('nodes', ['label', 'table', 'id']);
+          part('edges', ['type', 'table', 'start', 'end']);
+        });
+        return;
+      }
       case 'drop': {
         if (!DROP_OBJECTS.has(o.objectType as string)) this.fail(`unknown object type ${JSON.stringify(o.objectType)}`, 'objectType');
         str(o.name, 'name');
@@ -1005,8 +1028,8 @@ class Validator {
 
 const STORAGE_TYPES = new Set(['INTEGER', 'BOOLEAN', 'DATE', 'TIME', 'DATETIME', 'DURATION', 'LIST', 'STRUCT', 'MAP', 'REAL', 'TEXT', 'BLOB', 'ANY', 'NUMERIC']);
 const FK_ACTIONS = new Set(['SET NULL', 'SET DEFAULT', 'CASCADE', 'RESTRICT', 'NO ACTION']);
-const DROP_OBJECTS = new Set(['table', 'index', 'view', 'materialized view', 'trigger', 'external table', 'connection']);
-const SCHEMA_OPS = new Set(['createTable', 'createIndex', 'createView', 'createConnection', 'createExternalTable', 'drop', 'alterTable']);
+const DROP_OBJECTS = new Set(['table', 'index', 'view', 'materialized view', 'trigger', 'external table', 'connection', 'property graph']);
+const SCHEMA_OPS = new Set(['createTable', 'createIndex', 'createView', 'createConnection', 'createExternalTable', 'createPropertyGraph', 'drop', 'alterTable']);
 
 /**
  * Throws SMALT_PLAN when `op` is not a valid schema operation (ADR 0016 section 9): the fields each operation needs,

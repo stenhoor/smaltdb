@@ -18,7 +18,8 @@ it when ALTER TABLE changes the definition. Views need one; every other operatio
 | `createView` | `name`, `schema?`, `temp`, `ifNotExists`, `columns?` (result column names), `materialized`, `options?` and `withData?` (materialized views), `source` |
 | `createConnection` | `name`, `ifNotExists`, `options`, `source?` |
 | `createExternalTable` | `name`, `ifNotExists`, `columns` (empty: read from the source), `options`, `source?` |
-| `drop` | `objectType` (`table`, `index`, `view`, `materialized view`, `trigger`, `external table`, `connection`), `name`, `schema?`, `ifExists`, `cascade?` |
+| `createPropertyGraph` | `graph` (a `PropertyGraphDef`: see [property graphs](#property-graphs)), `ifNotExists`, `source?` |
+| `drop` | `objectType` (`table`, `index`, `view`, `materialized view`, `trigger`, `external table`, `connection`, `property graph`), `name`, `schema?`, `ifExists`, `cascade?` |
 | `alterTable` | `table`, `schema?`, `action` (`renameTable`, `renameColumn`, `addColumn`, `dropColumn`), `source?`, `cascade?` |
 
 A view is kept as its language's source, not as a plan: it is bound by its language where it is read (see
@@ -54,6 +55,37 @@ a refresh converts and keeps their columns as a view's read does, so their store
 view over external data that isn't loaded can't be bound when the check runs, and is not checked then. A view whose
 language isn't registered in the database is not checked there (it can't be read there either), and views made before interfaces
 reflect what they read, as before.
+
+## Property graphs
+
+A property graph ([ADR 0033](../../adr/0033-property-graphs-and-history.md)) is a catalog record over ordinary tables,
+which every language can read and write as tables:
+
+```ts
+import type { plan } from 'smaltdb/engine';
+
+const graph: plan.PropertyGraphDef = {
+  name: 'social',
+  nodes: [{ label: 'Person', table: 'person', id: 'id', props: 'props' }],
+  edges: [{ type: 'KNOWS', table: 'knows', start: 'a', end: 'b' }],
+};
+const op: plan.SchemaOp = { op: 'createPropertyGraph', graph, ifNotExists: false };
+```
+
+- **Nodes:** one table per label, with an `INTEGER` id column and, optionally, a `props` column of type
+  `map<text, …>` ([ADR 0038](../../adr/0038-map-type.md)) for properties that have no column of their own.
+- **Relationships:** one table per type, with `INTEGER` `start` and `end` columns holding node ids, and optionally
+  `props`.
+- **Checks:** labels, types and tables are each listed once; a table belongs to one graph. Tables must be row tables in
+  `main`, not views, materialized views, external or columnar tables.
+- **Names:** graphs have their own names, apart from tables'.
+- **Protection:** while a graph exists, its tables can't be dropped or renamed, and the columns it names can't be
+  dropped or renamed. Its other columns change as usual.
+- **The file:** the first graph marks the database as needing property graphs, so an engine that doesn't know them
+  refuses to open it ([storage format](../../STORAGE_FORMAT.md)). Dropping the graph keeps its tables.
+
+The [catalog](./catalog) lists graphs with `graphs()` and `graph(name)`. Creating a label's table when it is first
+written, node ids, the label index and keeping them right on writes come in the next steps of ADR 0033.
 
 ## Tables
 

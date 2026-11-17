@@ -8,7 +8,7 @@
  */
 import type { SqlValue } from '../values.js';
 import type { BoundExpr, ExprMeaning } from './expr.js';
-import type { CheckDef, DefaultDef, ForeignKeyDef, Source, StorageType } from './schema.js';
+import type { CheckDef, DefaultDef, ForeignKeyDef, PropertyGraphDef, Source, StorageType } from './schema.js';
 import type { CollationName, PlanType } from './types.js';
 import { isNestedType } from '../../shared/nested-types.js';
 
@@ -86,6 +86,12 @@ export interface CatalogConnection {
   readonly source?: Source;
 }
 
+/** A property graph (`createPropertyGraph`): its node and edge tables, as created. */
+export interface CatalogGraph extends PropertyGraphDef {
+  /** Its definition, in the language it was written in; absent for one defined without source text. */
+  readonly source?: Source;
+}
+
 /** A view: its language and source text, bound where it is read. */
 export interface CatalogView {
   readonly name: string;
@@ -151,6 +157,7 @@ export interface CatalogData {
   readonly tables: readonly CatalogTable[];
   readonly views: readonly CatalogView[];
   readonly connections: readonly CatalogConnection[];
+  readonly graphs: readonly CatalogGraph[];
   readonly functions: readonly CatalogFunction[];
   readonly settings: CatalogSettings;
 }
@@ -166,6 +173,9 @@ export interface Catalog {
   /** Connections, and one by name. */
   connections(): CatalogConnection[];
   connection(name: string): CatalogConnection | undefined;
+  /** Property graphs (ADR 0033), and one by name. */
+  graphs(): CatalogGraph[];
+  graph(name: string): CatalogGraph | undefined;
   functions(): CatalogFunction[];
   /**
    * A function by name (a former `sql.*` name finds its operation). A name can have one function of each kind (`min`
