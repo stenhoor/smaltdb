@@ -17,6 +17,7 @@ import { STAT_AGGREGATES } from './stat-aggregates.js';
 import { dateFn, datetimeFn, juliandayFn, strftimeFn, timeFn, timediffFn, unixepochFn } from './datetime.js';
 import { TEMPORAL_FUNCTIONS } from './temporal-ops.js';
 import { IMPLODE, NESTED_FUNCTIONS } from './nested-ops.js';
+import { encodeKey } from '../storage/key-codec.js';
 import { MATH_FUNCTIONS, ROUNDING, logScalar, mathScalar, roundingScalar } from './math.js';
 
 /**
@@ -106,6 +107,29 @@ export interface AggregateFunction {
 const isRealType = (t: StaticType | undefined): boolean => t === 'real';
 
 // ------------------------------------------------------------------ helpers
+
+/**
+ * A test of two values, NULL when either is: as text (numbers as SQLite writes them), or byte by byte when either is a
+ * blob, as `instr` compares them. Text compares code points, so it is case-sensitive and ignores collations.
+ */
+function textTest(onText: (a: string, b: string) => boolean, onBytes: (a: Uint8Array, b: Uint8Array) => boolean) {
+  return ([x, y]: SqlValue[], args: CompiledArg[]): SqlValue => {
+    if (x === null || y === null) return null;
+    const xr = isRealType(args[0].type);
+    const yr = isRealType(args[1].type);
+    if (x instanceof Uint8Array || y instanceof Uint8Array) return onBytes(toBlob(x, xr)!, toBlob(y, yr)!) ? 1 : 0;
+    return onText(toText(x, xr)!, toText(y, yr)!) ? 1 : 0;
+  };
+}
+
+/** Where bytes `b` first occur in `a`, or -1. */
+function blobIndex(a: Uint8Array, b: Uint8Array): number {
+  outer: for (let i = 0; i + b.length <= a.length; i++) {
+    for (let j = 0; j < b.length; j++) if (a[i + j] !== b[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
 
 function simple(
   min: number,
@@ -581,6 +605,20 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
   ['mod_floor', simple(2, 2, twoNumberType, ([x, y], args) => modFloor(x, y, args))],
   ['lower_unicode', simple(1, 1, 'text', ([x], args) => (x === null ? null : toText(x, isRealType(args[0].type))!.toLowerCase()))],
   ['upper_unicode', simple(1, 1, 'text', ([x], args) => (x === null ? null : toText(x, isRealType(args[0].type))!.toUpperCase()))],
+  // Text tests and splitting that SQL and Cypher both use (ADR 0033 step 5).
+  ['starts_with', simple(2, 2, 'bool', textTest((a, b) => a.startsWith(b), (a, b) => b.length <= a.length && b.every((x, i) => a[i] === x)))],
+  ['ends_with', simple(2, 2, 'bool', textTest((a, b) => a.endsWith(b), (a, b) => b.length <= a.length && b.every((x, i) => a[a.length - b.length + i] === x)))],
+  ['contains', simple(2, 2, 'bool', textTest((a, b) => a.includes(b), (a, b) => blobIndex(a, b) >= 0))],
+  [
+    'split',
+    simple(2, 2, 'list<text>' as StaticType, ([x, y], args) => {
+      if (x === null || y === null) return null;
+      const s = toText(x, isRealType(args[0].type))!;
+      const sep = toText(y, isRealType(args[1].type))!;
+      // An empty separator splits into characters (code points), as Cypher's split and DuckDB's string_split do.
+      return encodeKey(sep === '' ? Array.from(s) : s.split(sep));
+    }),
+  ],
   ...TEMPORAL_FUNCTIONS,
   ...NESTED_FUNCTIONS,
   ['regex_match', simple(2, 3, 'bool', (v) => (v[0] === null || v[1] === null ? null : regex(v[1], v[2], false).test(toText(v[0])!) ? 1 : 0))],

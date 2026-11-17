@@ -93,7 +93,7 @@ Each operation's output columns, in order:
 |---|---|---|
 | `scan` | `table`, `columns` (table column indexes, -1 the rowid), `db?` (`main` / `temp`), `indexedBy?` | the listed columns. `table` may name a view: its query, bound by its language when the plan is compiled ([views](./languages#views)) |
 | `values` | `rows` (expressions over no columns), `types`, `columns?` (the values as data: see below) | one column per value |
-| `source` | `kind` (`function` / `virtual` / `external`), `name`, `schema?`, `args`, `named?`, `types` | the source's columns (a table function, `information_schema.*`, an external table) |
+| `source` | `kind` (`function` / `virtual` / `external`), `name`, `schema?`, `args`, `named?`, `types` | the source's columns (a table function, `information_schema.*`, an external table). The engine's own table functions are `list_elements` (what `explode` uses) and `range(start, stop [, step])`: the integers from `start` to `stop`, both included, `step` apart (default 1, negative to count down), in one column `value`; made as they are read, so a long range costs no memory. A NULL argument gives no rows; a step of 0 is an error (`SMALT_RANGE`) |
 | `filter` | `input`, `pred` | its input's |
 | `project` | `input`, `exprs` | one column per expression |
 | `sort` | `input`, `keys` | its input's |
@@ -331,6 +331,8 @@ picks the one it means. smaltdf, for example, divides with `div_float` where SQL
 | `regex_match` | 2 or 3 | Whether `text` matches `pattern`: 1, 0 or NULL |
 | `regex_find` | 2 or 3 | The first match of `pattern` in `text`, or NULL |
 | `regex_replace`, `regex_replace_all` | 3 or 4 | `text` with the first match, or every match, of `pattern` replaced by `replacement` (`$1`, `$&`) |
+| `starts_with`, `ends_with`, `contains` | 2 | Whether the first value starts with, ends with or contains the second (`bool`), comparing code points: case-sensitive, whatever the collation. Numbers are compared as their text; a blob on either side compares bytes. NULL gives NULL |
+| `split` | 2 | `text` cut at each `separator` (`list<text>`), keeping empty pieces; an empty separator gives the characters (code points). NULL gives NULL |
 
 Patterns are JavaScript regular expressions in Unicode mode; the optional last argument gives flags among `i`, `m` and
 `s`. `length` counts code points. These operations are not inlined by code generation yet, nor are the checked and
