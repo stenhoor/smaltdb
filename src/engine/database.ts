@@ -3141,7 +3141,7 @@ export class Database implements FunctionContext {
     }
     return {
       name: g.name,
-      nodes: g.nodes.map((n) => ({ label: n.label, table: n.table, id: n.id, ...(n.props !== undefined ? { props: n.props } : {}) })),
+      nodes: g.nodes.map((n) => ({ label: n.label, table: n.table, id: n.id, ...(n.props !== undefined ? { props: n.props } : {}), ...(n.copy ? { copy: true } : {}) })),
       edges: g.edges.map((e) => ({ type: e.type, table: e.table, start: e.start, end: e.end, ...(e.props !== undefined ? { props: e.props } : {}) })),
       ...(l ? { labels: { table: l.table, node: l.node, label: l.label } } : {}),
     };
@@ -3194,7 +3194,7 @@ export class Database implements FunctionContext {
     let next: PropertyGraphDef;
     if (existing) {
       // Adopt it: the columns are the conventional ones, checked as any graph's are.
-      next = isLabel ? { ...g, nodes: [...g.nodes, { label: name, table: existing.name, id: 'id', ...(existing.columns.some((c) => c.name.toLowerCase() === 'props') ? { props: 'props' } : {}) }] } : { ...g, edges: [...g.edges, { type: name, table: existing.name, start: 'start', end: 'end', ...(existing.columns.some((c) => c.name.toLowerCase() === 'props') ? { props: 'props' } : {}) }] };
+      next = isLabel ? { ...g, nodes: [...g.nodes, { label: name, table: existing.name, id: 'id', ...(existing.columns.some((c) => c.name.toLowerCase() === 'props') ? { props: 'props' } : {}), ...(a.copy ? { copy: true } : {}) }] } : { ...g, edges: [...g.edges, { type: name, table: existing.name, start: 'start', end: 'end', ...(existing.columns.some((c) => c.name.toLowerCase() === 'props') ? { props: 'props' } : {}) }] };
       next = this.checkGraph(next, g.name.toLowerCase());
     } else {
       const col = (n: string, type: 'INTEGER' | 'MAP', declaredType = type === 'MAP' ? 'map<text, any>' : 'INTEGER') => ({ name: n, declaredType, type, notNull: false, collation: 'binary' as const });
@@ -3202,7 +3202,7 @@ export class Database implements FunctionContext {
       const table: TableDef = isLabel
         ? { name: tableName, columns: [col('id', 'INTEGER'), col('props', 'MAP')], keys: [{ kind: 'primaryKey', columns: [key(0)], ofColumn: 0 }], checks: [], foreignKeys: [], storage: 'row' }
         : { name: tableName, columns: [col('start', 'INTEGER'), col('end', 'INTEGER'), col('props', 'MAP')], keys: [], checks: [], foreignKeys: [], storage: 'row' };
-      next = isLabel ? { ...g, nodes: [...g.nodes, { label: name, table: tableName, id: 'id', props: 'props' }] } : { ...g, edges: [...g.edges, { type: name, table: tableName, start: 'start', end: 'end', props: 'props' }] };
+      next = isLabel ? { ...g, nodes: [...g.nodes, { label: name, table: tableName, id: 'id', props: 'props', ...(a.copy ? { copy: true } : {}) }] } : { ...g, edges: [...g.edges, { type: name, table: tableName, start: 'start', end: 'end', props: 'props' }] };
       this.createTable({ op: 'createTable', table, temp: false, ifNotExists: false });
       if (!isLabel) {
         for (const [i, c] of ['start', 'end'].entries()) this.createIndex({ op: 'createIndex', index: { name: `${tableName}_${c}`, table: tableName, columns: [key(i)], unique: false }, ifNotExists: false });

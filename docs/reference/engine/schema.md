@@ -77,6 +77,8 @@ const op: plan.SchemaOp = { op: 'createPropertyGraph', graph, ifNotExists: false
   type `map<text, …>` ([ADR 0038](../../adr/0038-map-type.md)) for properties that have no column of their own.
 - **Relationships:** one table per type, with `INTEGER` `start` and `end` columns holding node ids, and optionally
   `props`.
+- **Copies** (optional, `copy: true` on a node table): the label keeps its own row for each node that has it through
+  the label index. See [per-label copies](#per-label-copies).
 - **The label index** (optional, `labels: { table, node, label }`): a node's other labels, one row each, with an
   `INTEGER` node column and a `TEXT` label column. See [nodes with several labels](#nodes-with-several-labels).
 - **Checks:** labels, types and tables are each listed once; a table belongs to one graph. Tables must be row tables in
@@ -145,7 +147,20 @@ The engine keeps the index on every write, from any language:
 - **A label in the index needs a place in the graph:** add it with `addLabel` first (its table holds the nodes whose
   first label it is).
 
-Per-label copies, where a label keeps its own copy of the node's row, come in the next step of ADR 0033.
+### Per-label copies
+
+A label marked `copy` (in the graph's `nodes`, or `addLabel` with `copy: true`) keeps its own row for each node that
+has it through the label index (ADR 0033, decision 18), so the label's table lists all its nodes and a query reads one
+table:
+
+- **What the copy holds:** the node's id, and the columns the label's table shares with the node's table, by name. Its
+  other columns get their defaults.
+- **The engine keeps it:** it writes the copy when the entry is added, updates it when the node changes, moves it when
+  the node's id or the entry changes, and deletes it with the entry or the node.
+- **Only the engine writes copies:** changing or deleting one directly is refused (`SMALT_CONSTRAINT_FOREIGNKEY`);
+  change the node, or delete its entry. A copy's id stays the node's: no other node can take it.
+- **The label's own nodes** (rows whose first label it is) are ordinary rows of its table.
+- **Cost:** each write to a node of a graph with copy labels looks up the node's labels, and writes each copy too.
 
 ## Tables
 
