@@ -95,11 +95,11 @@ export interface TableDef {
   readonly foreignKeys: readonly ForeignKeyDef[];
   readonly storage: 'row' | 'columnar';
   /**
-   * Keep the table's past versions (ADR 0033, decision 8; set when it is created): `versions` keeps each row's earlier
-   * versions with the commits they were valid between, so plans can read the table as of a commit or a time (`asOf`
-   * on a scan). Row tables in main only.
+   * Keep the table's past versions (ADR 0033, decision 8; set when it is created), so plans can read it as of a commit
+   * or a time (`asOf` on a scan). Two methods (step 7 picks the default): `versions` keeps each row's earlier versions
+   * with the commits they were valid between; `log` appends each change, with the row before it. Row tables in main.
    */
-  readonly history?: 'versions';
+  readonly history?: 'versions' | 'log';
   /**
    * For a table defined without source text: the registered language its expression texts (CHECKs, defaults, and its
    * indexes' expressions) are written in. A column rename edits them with that language's `sourceEditor`

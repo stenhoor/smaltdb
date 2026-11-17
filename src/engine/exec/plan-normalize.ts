@@ -20,21 +20,27 @@ type Op<K extends PlanOp['op']> = Extract<PlanOp, { op: K }>;
 /** A table's column types (`db` main or temp), or undefined when there is no such table. */
 export type TableTypes = (table: string, db?: 'main' | 'temp') => readonly PlanType[] | undefined;
 
-/** The catalog's column types, while a plan is normalized: rewrites that read tables (`asOf`) type their columns. */
-let tableTypes: TableTypes | undefined;
+/** What rewrites that read tables (`asOf`) need of the catalog: column types, and how a table keeps history. */
+export interface NormalizeCatalog {
+  readonly types: TableTypes;
+  readonly history: (table: string, db?: 'main' | 'temp') => 'versions' | 'log' | undefined;
+}
 
-function withTypes<T>(types: TableTypes | undefined, f: () => T): T {
-  const prev = tableTypes;
-  tableTypes = types;
+/** The catalog, while a plan is normalized. */
+let catalog: NormalizeCatalog | undefined;
+
+function withTypes<T>(c: NormalizeCatalog | undefined, f: () => T): T {
+  const prev = catalog;
+  catalog = c;
   try {
     return f();
   } finally {
-    tableTypes = prev;
+    catalog = prev;
   }
 }
 
 /** `op` as a query block the planner reads. `types` gives tables' column types (needed for `asOf` scans). */
-export function normalizePlan(op: PlanOp, types?: TableTypes): PlanOp {
+export function normalizePlan(op: PlanOp, types?: NormalizeCatalog): PlanOp {
   return withTypes(types, () => block(rewrite(op)));
 }
 
@@ -342,7 +348,7 @@ function explodeRows(op: Op<'explode'>): PlanOp {
  */
 function asOfRows(op: Op<'scan'>): PlanOp {
   const a = op.asOf!;
-  const types = tableTypes?.(op.table, op.db) ?? [];
+  const types = catalog?.types(op.table, op.db) ?? [];
   const typeOf = (c: number): PlanType => (c < 0 ? 'int' : (types[c] ?? 'any'));
   const at = (input: 0 | 1, index: number, type: PlanType): PlanExpr => ({ k: 'col', input, index, depth: 0, type, collation: 'binary' });
   let commit: PlanExpr;
@@ -359,6 +365,7 @@ function asOfRows(op: Op<'scan'>): PlanOp {
   }
   const w = op.columns.length;
   const out = (from: number) => op.columns.map((c, i) => at(0, from + i, typeOf(c)));
+  if (catalog?.history(op.table, op.db) === 'log') return logAsOf(op, commit, out, at);
   // Current rows, with the commit their version started at.
   const table: PlanOp = { op: 'scan', table: op.table, ...(op.db ? { db: op.db } : {}), columns: [...op.columns, -1] };
   const since: PlanOp = { op: 'scan', table: `smalt_since_${op.table}`, columns: [0, -1] };
@@ -378,6 +385,45 @@ function asOfRows(op: Op<'scan'>): PlanOp {
     exprs: out(0),
   };
   return { op: 'setop', kind: 'unionAll', inputs: [current, versions], collations: op.columns.map(() => 'binary'), ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+}
+
+/**
+ * A table that keeps a log (method (b), exec/history.ts) as it was after commit C, without replay: its current rows with
+ * no change after C, and for each row changed after C the row before its first change after C, unless that change was
+ * its insert. The log is `[$commit, $op, $rowid, …columns]`, its rowid the change's sequence.
+ */
+function logAsOf(op: Op<'scan'>, commit: PlanExpr, out: (from: number) => PlanExpr[], at: (input: 0 | 1, index: number, type: PlanType) => PlanExpr): PlanOp {
+  const w = op.columns.length;
+  const log = `smalt_log_${op.table}`;
+  const int = (value: number): PlanExpr => ({ k: 'lit', value, type: 'int' });
+  // Rows unchanged since C.
+  const table: PlanOp = { op: 'scan', table: op.table, ...(op.db ? { db: op.db } : {}), columns: [...op.columns, -1] };
+  const changes: PlanOp = { op: 'scan', table: log, columns: [0, 2] };
+  const unchanged: PlanOp = {
+    op: 'project',
+    input: { op: 'join', kind: 'anti', inputs: [table, changes], on: { k: 'and', args: [cmp('cmp_eq', at(1, 1, 'int'), at(0, w, 'int')), cmp('cmp_gt', at(1, 0, 'int'), commit)] } },
+    exprs: out(0),
+  };
+  // Each changed row's first change since C: [rowid, sequence].
+  const first: PlanOp = {
+    op: 'aggregate',
+    input: { op: 'filter', input: { op: 'scan', table: log, columns: [0, 2, -1] }, pred: cmp('cmp_gt', at(0, 0, 'int'), commit) },
+    keys: [{ expr: at(0, 1, 'int'), collation: 'binary' }],
+    aggs: [{ fn: 'min', args: [at(0, 2, 'int')], star: false, distinct: false, collation: 'binary', type: 'int' }],
+    carry: [],
+  };
+  // The row before it: [rowid, sequence] then [sequence, op, …columns].
+  const entry: PlanOp = { op: 'scan', table: log, columns: [-1, 1, ...op.columns.map((c) => (c < 0 ? 2 : c + 3))] };
+  const before: PlanOp = {
+    op: 'project',
+    input: {
+      op: 'filter',
+      input: { op: 'join', kind: 'inner', inputs: [first, entry], on: cmp('cmp_eq', at(1, 0, 'int'), at(0, 1, 'int')) },
+      pred: cmp('cmp_ne', at(0, 3, 'int'), int(0)),
+    },
+    exprs: out(4),
+  };
+  return { op: 'setop', kind: 'unionAll', inputs: [unchanged, before], collations: op.columns.map(() => 'binary'), ...(op.origin !== undefined ? { origin: op.origin } : {}) };
 }
 
 /**
@@ -633,7 +679,7 @@ function correlated(e: PlanExpr, depth: number): PlanExpr {
 }
 
 /** A write's plan with its input normalized (an `append`'s rows; `update` and `delete` read their targets as given). */
-export function normalizeWrite(plan: PlanOp, types?: TableTypes): PlanOp {
+export function normalizeWrite(plan: PlanOp, types?: NormalizeCatalog): PlanOp {
   return withTypes(types, () => {
     const op = rewrite(plan);
     return op.op === 'append' && op.input ? { ...op, input: block(op.input) } : op;
