@@ -1,7 +1,8 @@
 # ADR 0020: Lists and structs
 
 - **Status:** accepted with the owner's decisions of 2026-11-07 (at the end: each as recommended); implemented, steps
-  1–6: smaltdb #161, #163, #165, #166, smaltdb-parquet #8, smaltql #25, smaltdf #22
+  1–6: smaltdb #161, #163, #165, #166, smaltdb-parquet #8, smaltql #25, smaltdf #22. Decision 5 (maps) is amended by
+  [ADR 0038](0038-map-type.md) (2026-11-17): a `map<text, V>` type; lists of key/value structs stay valid
 - **Date:** 2026-11-07
 - **Builds on:** [ADR 0016](0016-plan-api-for-every-language.md) section 3 (types), item 4 and section 4 (`explode`);
   [ADR 0018](0018-bool-and-nan.md) and [ADR 0019](0019-dates-and-times.md) (the pattern: a static type over values the

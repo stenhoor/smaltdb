@@ -1,7 +1,7 @@
 # ADR 0033: Property graphs and version history in smaltdb
 
-- **Status:** proposed (2026-11-14). The owner's decisions from the interview are below; the impact review (section 5)
-  is for the owner's review before anything is built.
+- **Status:** accepted (2026-11-17), with the owner's decisions from two interviews (2026-11-14 and 2026-11-17) below.
+  Section 5's impact review stands; work starts with step 0.
 - **Date:** 2026-11-14
 - **Research:** [Graphs on the plan API](../research/graph-on-plans.md) (G1–G6, measurements and sizes) and
   [Pluggable storage engines](../research/pluggable-engines.md)
@@ -9,7 +9,8 @@
   [ADR 0020](0020-lists-and-structs.md) (lists, structs, and maps as `list<struct<key, value>>`),
   [ADR 0009](0009-concurrency.md) and [ADR 0021](0021-parallel-readers-everywhere.md) (concurrency),
   [ADR 0028](0028-pluggable-storage-engines.md) (deferred: graph needs plan work, not a new storage engine)
-- **Affects:** smaltcy ([its ADR 0001](https://github.com/stenhoor/smaltcy/blob/main/docs/adr/0001-smaltcy.md) and
+- **Amended by:** [ADR 0038](0038-map-type.md) (the catch-all column is a `map<text, any>`)
+- **Affects:** smaltkit (the renderer, timeline and GraphJSON move there), smaltcy ([its ADR 0001](https://github.com/stenhoor/smaltcy/blob/main/docs/adr/0001-smaltcy.md) and
   [ADR 0002](https://github.com/stenhoor/smaltcy/blob/main/docs/adr/0002-graph-history.md)), smaltql, smaltdf, smaltts
 
 ## Context
@@ -44,13 +45,29 @@ serve as history.
 | 9 | Timing | Catalog and file-format changes land **before smaltdb's 1.0 format freeze** |
 | 10 | Review | The plan is reviewed for performance, compatibility and breaking changes before it is built (section 5) |
 
-### One change from the interview, proposed here
+### The owner's decisions (2026-11-17)
 
-The interview said the catch-all column would need a new map type. smaltdb already decided against one: ADR 0020
-(accepted, owner's decisions of 2026-11-07, item 5) stores a map as `list<struct<key K, value V>>`. This ADR follows
-it. The catch-all column is `list<struct<key text, value any>>`, with entries sorted by key on write so that equal maps
-have equal bytes. That needs **no new value type, no new record tag and no file-format change**, and existing files and
-tools read it. The owner should confirm this.
+| # | Question | Decision |
+|---|---|---|
+| 11 | A label or relationship type with no table yet | **Created on first use** by the engine, with the node id (or endpoints) and the catch-all column. Columns can be declared later; values move from the catch-all into them |
+| 12 | Who keeps a graph's invariants (node ids unique across the graph, the label index, per-label copies, history) | **The engine,** on every write to a graph's tables, whichever language makes it. A write to a table outside a graph costs nothing extra (a per-table flag) |
+| 13 | Where Cypher's meaning and smaltdb's differ (section 5.4) | **Cypher's meaning.** smaltcy's compiler keeps it: checking division, guarded comparisons, Cypher's null and type order, and the function mappings |
+| 14 | Who reads the past | **Every language:** history is an `asOf` in plans, which smaltcy (`AT VERSION`, `AT TIME`) and smaltql both use, on any table that opted in |
+| 15 | The catch-all column | **A new, general map type,** `map<text, any>`, for every language: [ADR 0038](0038-map-type.md), which amends ADR 0020 |
+| 16 | Retention | **Keep everything by default;** an explicit command drops versions older than a point (smaltcy's `forget(v)`, ADR 0002 there) |
+| 17 | Version numbers | **The database's commit ids** (gaps allowed when other tables change). Author and message are optional on any transaction, in every language |
+| 18 | Per-label copies | **Kept;** the engine updates and deletes them with the node (they can't be foreign-key targets) |
+| 19 | Timing | **Next** on the roadmap, before M8.5 and M8.4, since it changes the file format |
+| 20 | Who does what | This work's smaltdb steps (0–7) are done in smaltdb; smaltcy's compiler and switch (steps 8–9) in smaltcy |
+| 21 | What stays in smaltcy | **The Cypher parser and compiler only.** The GPU renderer, the timeline widget and GraphJSON import and export move to smaltkit |
+| 22 | This ADR's number | 0033 stays |
+
+### The catch-all column
+
+The first interview asked for a new map type; this ADR first proposed following ADR 0020 instead (a map as
+`list<struct<key, value>>`). The owner chose a general map type (decision 15). [ADR 0038](0038-map-type.md) follows ADR
+0020's own pattern: a static type over encoded bytes with a `MAP` storage type in format 4, which is unreleased. So it
+needs no new run-time value kind and no new record tag.
 
 ## 1. The plan: additive operations
 
@@ -65,6 +82,8 @@ build today keep their meaning.
 | G4 | Schema operations `createPropertyGraph` and `dropPropertyGraph`, and a catalog record | plan schema ops, catalog |
 | G5 | A `paths` operation: start set, edge table and endpoint columns, direction, hop range, path mode (walk, trail, acyclic, simple), selector (any, any shortest, all shortest, shortest k); the path as `list<struct>`. Lowered to G2's `iterate` at first | plan, normalizer |
 | G3 | `loop`, a set-at-a-time fixpoint, for graph algorithms (PageRank, components) | later, when wanted |
+| H1 | `asOf` on a scan (a commit id or a time): reads a history-enabled table as it was (decision 14) | plan, planner |
+| M | The `map<text, V>` type and its operations ([ADR 0038](0038-map-type.md)) | types, functions |
 
 Functions Cypher needs that SQL users would use too (`split`, `range` as a table function, `starts_with`, `ends_with`,
 `contains`) are added to the engine. Cypher-only ones (`labels`, `type`, `startNode` …) are built by smaltcy's compiler
@@ -75,8 +94,12 @@ from columns, not added to the engine.
 - **A property graph** is a catalog record that names its node tables (one per label), edge tables (one per type), each
   table's key and endpoint columns, and the label index. Languages bind against it, as views are bound (ADR 0016). SQL
   sees the same tables.
-- **Node tables:** declared columns, a `props list<struct<key text, value any>>` catch-all, and an integer node id.
-  Node ids are unique across a graph's tables, so a relationship's endpoint names one node whatever its label.
+- **Node tables:** declared columns, a `props map<text, any>` catch-all ([ADR 0038](0038-map-type.md)), and an integer
+  node id. Node ids are unique across a graph's tables, so a relationship's endpoint names one node whatever its label.
+- **Tables made on first use** (decision 11): a label or type that has no table gets one, with the id (or endpoints) and
+  the catch-all, inside the writing transaction, and is added to the graph's record.
+- **The engine keeps the invariants** (decision 12): node ids from the graph's sequence, the label index, per-label
+  copies and history, on writes from any language.
 - **Several labels:** smaltdb's indexes produce exactly one key per row (`indexKey`, `exec/write.ts:153-175`), so the
   label index is an internal table `(label, node_id)` with a B+tree, written with the node. A label set to keep its own
   copy gets a row in its table too, kept in step on every write.
@@ -96,6 +119,10 @@ Opt-in per table or graph, set when it is created. Two methods are built behind 
 | Writes | About 2× on updates and deletes, none extra on inserts | One extra append per change |
 | Relation to planned work | Like SQL:2011 system-versioned tables | The same idea as the roadmap's `track_changes` ("Sync groundwork"): **design them as one** |
 
+- **Reading the past:** an `asOf` (commit id or time) in plans, for every language (decision 14).
+- **Retention:** everything is kept until an explicit command drops versions older than a point (decision 16).
+- **Versions are commit ids** for the whole database; each commit can carry an author and a message (decision 17).
+
 Both need a **durable 64-bit commit id** and a **commit time**. smaltdb has neither: the header's change counter is
 32-bit and wraps (`storage/pager.ts:760`), and the 64-bit checkpoint LSN slot is unused (`storage/format.ts:54`).
 History applies to local row tables. Columnar tables, materialized views and external tables are out of scope for the
@@ -103,7 +130,8 @@ first version (section 5.2).
 
 ## 4. Cypher on smaltdb
 
-smaltcy's parser stays. Its binder is rewritten to produce smaltdb plans against a property graph:
+smaltcy's parser stays. Its binder is rewritten to produce smaltdb plans against a property graph, keeping Cypher's
+meaning where it differs from smaltdb's (decision 13):
 - patterns become joins on the endpoint indexes, variable-length and shortest paths become `paths`;
 - relationship uniqueness within a `MATCH` becomes filters, or a visited set in `paths`;
 - `MERGE`, `SET n = map`, `SET n += map`, `REMOVE` and `DETACH DELETE` become writes on the graph's tables;
@@ -179,8 +207,9 @@ engines.
 ### 5.4 Breaking changes for smaltcy's users
 
 Moving smaltcy onto smaltdb changes behaviour. These are breaking, so the switch is a **new major version of
-smaltcy**, with its own migration notes, and each item is either kept by the compiler or documented in its
-"Where it differs" page.
+smaltcy**, with its own migration notes. The owner decided Cypher's meaning is kept (decision 13): where the Plan
+column offers "or document", the compiler keeps Cypher's behaviour. Only what can't be kept (the API, exports, error
+codes, ids) is documented in its "Where it differs" page.
 
 | Area | smaltcy today | On smaltdb | Plan |
 |---|---|---|---|
@@ -196,8 +225,9 @@ smaltcy**, with its own migration notes, and each item is either kept by the com
 | `ORDER BY` | Nulls last; Cypher's type order | Nulls first by default, another type order | Compiler sets `nullsFirst` per key; mixed-type order documented |
 | Lists with `null` | `[1, null] = [1, null]` is `null` | Byte equality: true *(inferred)* | Document |
 | Functions | — | `substring` 1-based; `log` is log10; `trim` spaces only; `sum` of nothing `NULL`; `stDev` of one value `NULL`; `collect` keeps nulls; `toInteger('12abc')` is 12; `=~` finds rather than matches | The compiler maps each to Cypher's meaning (`ln`, `+1`, `total`, `list_drop_nulls`, anchored patterns …) |
-| History | `AT VERSION`, `AT TIME`, `version()`, `commits()`, `commit()`, `history()`, `Graph.at/diff`, author and message per commit, the timeline | Section 3 | Kept, on whichever method is chosen; commit numbering and authors must carry over |
-| Files | `GraphJSON` export and import | Same, through the compiler | Kept: the way to move a graph from the old engine to the new |
+| History | `AT VERSION`, `AT TIME`, `version()`, `commits()`, `commit()`, `history()`, `Graph.at/diff`, author and message per commit, the timeline | Section 3 | Kept, on whichever method is chosen. Versions become the database's commit ids, with gaps (decision 17); the timeline moves to smaltkit |
+| Files | `GraphJSON` export and import | Moves to smaltkit (decision 21) | Kept: the way to move a graph from the old engine to the new |
+| Drawing | The WebGPU renderer | Moves to smaltkit (decision 21) | smaltcy's users import it from smaltkit |
 
 ## 6. Steps
 
@@ -206,26 +236,24 @@ smaltcy**, with its own migration notes, and each item is either kept by the com
 | 0 | smaltdb | Format safety: refuse files that need unknown features; reserve a durable 64-bit commit id and commit time in the header; exhaustiveness checks on op switches; fix `plan/public.ts` | — |
 | 1 | smaltdb | G1, narrow; differential and sqllogictest runs adjusted for order | — |
 | 2 | smaltdb | G2: `key`, `maxDepth`, a heap that lowers keys | 1 |
-| 3 | smaltdb | G4: the property graph record and schema ops; node and edge table conventions; the label index table; per-label copies | 0 |
+| 2a | smaltdb | The map type ([ADR 0038](0038-map-type.md)) | 0 |
+| 3 | smaltdb | G4: the property graph record and schema ops; node and edge table conventions; tables made on first use; the label index table; per-label copies; the engine's invariants on writes from any language | 0, 2a |
 | 4 | smaltdb | G5: `paths`, lowered to `iterate`; path modes and selectors | 2, 3 |
 | 5 | smaltdb | Engine functions SQL can use too: `split`, `range`, `starts_with`, `ends_with`, `contains` | — |
-| 6 | smaltdb | History: the opt-in switch, both methods, retention; designed with `track_changes` | 0 |
+| 6 | smaltdb | History: the opt-in switch, both methods, `asOf` in plans, commit author and message, the explicit cleanup; designed with `track_changes` | 0 |
+| 6a | smaltql | SQL reads the past (`FOR SYSTEM_TIME AS OF`, or the syntax its ADR picks) | 6 |
 | 7 | smaltdb | Benchmarks of section 5.1; history's default chosen and recorded here | 6 |
 | 8 | smaltcy | The compiler to smaltdb plans, beside its own engine; both run the Cypher suites and are compared | 3, 4, 5 |
-| 9 | smaltcy | Switch to smaltdb: a new major version, migration notes, its own engine removed | 7, 8 |
+| 9 | smaltcy | Switch to smaltdb: a new major version, migration notes, its own engine removed | 7, 8, 10 |
+| 10 | smaltkit, smaltcy | The renderer, timeline widget and GraphJSON import and export move to smaltkit | — |
 | — | smaltdb | G3 `loop`, when graph algorithms are wanted | 2 |
 
 Steps 0 to 7 land before the 1.0 format freeze (decision 9).
 
-## Open questions for the owner
+## Questions answered (2026-11-17)
 
-1. **The catch-all column** as `list<struct<key text, value any>>`, following ADR 0020, instead of a new map type.
-2. **Cypher semantics or smaltdb's** where they differ (section 5.4): the compiler can keep Cypher's meaning, at some
-   cost per comparison, or smaltcy can document the differences. A rule for which to choose.
-3. **History retention:** keep everything, or a limit (versions, age or size) with a `VACUUM`-style cleanup.
-4. **A label with its own copy:** its rows can't be foreign key targets, so `DETACH DELETE` maintains them itself.
-   Acceptable?
-5. **This ADR's number.** ADR numbers are shared across the smalt repositories; 0033 was the next free one found.
+The five open questions of 2026-11-14 are decisions 15 (the catch-all column), 13 (Cypher's meaning), 16 (retention),
+18 (per-label copies) and 22 (the number) above.
 
 ## Consequences
 
