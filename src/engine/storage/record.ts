@@ -34,7 +34,8 @@ const HI_SAFE_MIN = -2097152; // hi words whose int64 value is within ±2^53
 const HI_SAFE_MAX = 2097151;
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
+// ignoreBOM: a leading U+FEFF is part of the text, as in SQLite (a default TextDecoder drops it).
+const textDecoder = new TextDecoder('utf-8', { ignoreBOM: true });
 
 function isFixed(t: StorageType): boolean {
   return isInt64Storage(t) || t === 'REAL';

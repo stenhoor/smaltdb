@@ -106,7 +106,7 @@ Each operation's output columns, in order:
 | `aggregate` | `input`, `keys`, `aggs`, `carry`, `ordered?` (`'first'`) | its keys, then one per aggregate call, then the carried columns |
 | `window` | `input`, `partition`, `order`, `frame`, `calls` | its input's, then one per window call |
 | `setop` | `kind` (`union` / `unionAll` / `intersect` / `except`), `inputs`, `collations` | the first input's |
-| `iterate` | `id`, `name`, `init`, `steps`, `distinct`, `collations`, `order?`, `limit?`, `offset?` | `init`'s: its rows, then each step's until a step gives none (a recursive query) |
+| `iterate` | `id`, `name`, `init`, `steps`, `distinct`, `collations`, `order?`, `limit?`, `offset?`, `key?`, `maxDepth?` | `init`'s: its rows, then each step's until a step gives none (a recursive query). `key` (with `distinct`) keeps one row per value of those columns: the first, or with `order` the lowest, so shortest paths by hops or by cost keep one row per node. `maxDepth` runs the steps only for rows fewer than that many steps from `init` |
 | `working` | `id`, `types` | inside an `iterate` with the same `id`: the previous step's rows |
 | `append` | `table`, `db`, `input` (null: one row of defaults), `columns`, `upserts`, `onConflict?`, `returning?` | the RETURNING rows |
 | `update` | `table`, `db`, `input`, `rowid`, `sets`, `from`, `onConflict?`, `returning?` | the RETURNING rows |

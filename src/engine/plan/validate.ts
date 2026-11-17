@@ -296,6 +296,18 @@ class Validator {
         if (o.order) sortKeys(o.order, reading(w), 'order');
         optEx(o.limit, reading(), 'limit');
         optEx(o.offset, reading(), 'offset');
+        if (o.key !== undefined) {
+          const key = this.list(o.key, 'key');
+          if (key.length === 0) this.fail('expected at least one key column', 'key');
+          const seen = new Set<unknown>();
+          key.forEach((k, i) => {
+            if (!Number.isInteger(k) || (k as number) < 0 || (k as number) >= w) this.fail(`expected a column index below ${w}`, 'key', i);
+            if (seen.has(k)) this.fail(`column ${String(k)} is listed twice`, 'key', i);
+            seen.add(k);
+          });
+          if (o.distinct !== true) this.fail('a key needs distinct: rows are kept once per key', 'key');
+        }
+        if (o.maxDepth !== undefined && (!Number.isInteger(o.maxDepth) || o.maxDepth < 0)) this.fail('expected a non-negative integer', 'maxDepth');
         return w;
       }
       case 'working': {

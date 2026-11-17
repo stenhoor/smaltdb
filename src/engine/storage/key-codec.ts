@@ -58,7 +58,8 @@ const TINY_BIAS = 1100;
 export const KEY_AFTER_NULL: Uint8Array = Uint8Array.of(TAG_NULL + 1);
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
+// ignoreBOM: a leading U+FEFF is part of the text, as in SQLite (a default TextDecoder drops it).
+const textDecoder = new TextDecoder('utf-8', { ignoreBOM: true });
 const BIG_2_53 = 2n ** 53n;
 const TWO_32 = 4294967296;
 
