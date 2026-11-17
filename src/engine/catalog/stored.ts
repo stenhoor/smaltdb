@@ -13,7 +13,7 @@
 import { SmaltError } from '../errors.js';
 import { decodeDataJSON, encodeDataJSON, valueFromJSON } from '../plan/codec.js';
 import type { PlanExpr } from '../plan/expr.js';
-import type { DefaultDef, ExprDef, IndexDef, StorageType, TableDef } from '../plan/schema.js';
+import type { DefaultDef, ExprDef, IndexDef, PropertyGraphDef, StorageType, TableDef } from '../plan/schema.js';
 import type { ViewInterfaceColumn } from '../plan/catalog.js';
 import type { SqlValue } from '../values.js';
 import type { TemporalType } from '../../shared/temporal.js';
@@ -38,6 +38,8 @@ export type StoredDef =
   /** A materialized view; the table its rows are stored in is in `smalt_matview` (its layout). */
   | { readonly kind: 'matview'; readonly language: string; readonly columns?: readonly string[]; readonly options: Readonly<Record<string, SqlValue>>; readonly interface?: readonly ViewInterfaceColumn[] }
   | { readonly kind: 'connection'; readonly options: Readonly<Record<string, SqlValue>>; readonly language?: string; readonly described?: true }
+  /** A property graph (ADR 0033, G4): plain data, no expressions. */
+  | { readonly kind: 'graph'; readonly graph: PropertyGraphDef; readonly language?: string; readonly described?: true }
   | { readonly kind: 'external'; readonly columns: readonly { readonly name: string; readonly declaredType: string; readonly type?: TemporalType | NestedTypeName }[]; readonly options: Readonly<Record<string, SqlValue>>; readonly language?: string; readonly described?: true };
 
 /** Whether `def` was defined without source text: its catalog text is {@link describeDefinition}'s. */

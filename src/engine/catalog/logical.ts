@@ -7,10 +7,10 @@ import { CollSrc, boundMetadata, compilePlanExpr } from '../exec/expr.js';
 import { type CompiledArg, type FunctionContext, aggregateFunctions, scalarFunctions } from '../exec/functions.js';
 import { SQL_FUNCTIONS } from '../exec/sql-functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../exec/window.js';
-import type { Catalog, CatalogConnection, CatalogData, CatalogFunction, CatalogKey, CatalogSettings, CatalogTable, CatalogView, FunctionCatalog, ViewInterfaceColumn } from '../plan/catalog.js';
+import type { Catalog, CatalogConnection, CatalogData, CatalogGraph, CatalogFunction, CatalogKey, CatalogSettings, CatalogTable, CatalogView, FunctionCatalog, ViewInterfaceColumn } from '../plan/catalog.js';
 import type { TemporalType } from '../../shared/temporal.js';
 import type { NestedTypeName } from '../../shared/nested-types.js';
-import type { StorageType } from '../plan/schema.js';
+import type { PropertyGraphDef, StorageType } from '../plan/schema.js';
 import { declaredType, planTypeOfStorage } from '../plan/catalog.js';
 import { type BoundExpr, eachParts, mapEach, typeOf } from '../plan/expr.js';
 import type { Source, TableDef } from '../plan/schema.js';
@@ -24,6 +24,8 @@ export interface CatalogHost {
   tables(): readonly TableSchema[];
   externals(): readonly { name: string; sql: string; columns: readonly { name: string; declType: string }[]; options: Readonly<Record<string, SqlValue>>; language?: string; described?: boolean }[];
   connections(): readonly { name: string; sql: string; options: Readonly<Record<string, SqlValue>>; language?: string; described?: boolean }[];
+  /** Property graphs (ADR 0033): their definitions and catalog text. */
+  graphs(): readonly { graph: PropertyGraphDef; sql: string; language?: string; described?: boolean }[];
   views(): readonly { name: string; source: Source; columns?: readonly string[]; interface?: readonly ViewInterfaceColumn[]; pending?: boolean; temp: boolean }[];
   settings(): CatalogSettings;
   /** Changes whenever the schema does: descriptions are kept until then. */
@@ -339,6 +341,7 @@ export function logicalCatalog(host: CatalogHost): Catalog {
   let tables: CatalogTable[] = [];
   let views: CatalogView[] = [];
   let connections: CatalogConnection[] = [];
+  let graphs: CatalogGraph[] = [];
   const fresh = (): void => {
     const v = host.schemaVersion();
     if (v === version) return;
@@ -347,6 +350,7 @@ export function logicalCatalog(host: CatalogHost): Catalog {
     // TEMP first: the one a name finds when it shadows a main table.
     tables = [...described.filter((t) => t.schema === 'temp'), ...described.filter((t) => t.schema === 'main'), ...host.externals().map(describeExternal)];
     connections = host.connections().map(describeConnection);
+    graphs = host.graphs().map((g) => ({ ...structuredClone(g.graph), ...(g.described ? {} : { source: { language: g.language ?? 'sql', text: g.sql } }) }));
     views = host.views().map((x) => ({ name: x.name, schema: x.temp ? 'temp' : 'main', language: x.source.language, text: x.source.text, ...(x.columns ? { columns: [...x.columns] } : {}), ...(x.interface ? { interface: x.interface.map((c) => ({ ...c })) } : x.pending ? {} : { reflects: true as const }) }));
   };
   const find = <T extends { name: string; schema: 'main' | 'temp' }>(xs: readonly T[], name: string, schema?: 'main' | 'temp'): T | undefined => {
@@ -360,10 +364,12 @@ export function logicalCatalog(host: CatalogHost): Catalog {
     view: (name, schema) => (fresh(), find(views, name, schema)),
     connections: () => (fresh(), [...connections]),
     connection: (name) => (fresh(), connections.find((c) => c.name.toLowerCase() === name.toLowerCase())),
+    graphs: () => (fresh(), [...graphs]),
+    graph: (name) => (fresh(), graphs.find((g) => g.name.toLowerCase() === name.toLowerCase())),
     functions: engineFunctions.functions,
     function: engineFunctions.function,
     settings: () => host.settings(),
-    snapshot: (): CatalogData => (fresh(), { tables: [...tables], views: [...views], connections: [...connections], functions: engineFunctions.functions(), settings: host.settings() }),
+    snapshot: (): CatalogData => (fresh(), { tables: [...tables], views: [...views], connections: [...connections], graphs: [...graphs], functions: engineFunctions.functions(), settings: host.settings() }),
     resultType: engineFunctions.resultType,
     typeOf: (expr) => {
       if (!compilable(expr)) return typeOf(expr);

@@ -79,8 +79,8 @@ describe('commit id and commit time', () => {
 });
 
 describe('required features', () => {
-  it('no feature bits are known yet, and new files require none', () => {
-    expect(KNOWN_FEATURES).toBe(0);
+  it('new files require no features (property graphs, the first known bit, are required only once one exists)', () => {
+    expect(KNOWN_FEATURES).toBe(0x1);
     const { pager } = openMemoryPager({ pageSize: 1024 });
     expect(pager.requiredFeatures).toBe(0);
   });

@@ -29,7 +29,8 @@ import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type PlanMorsels, planMorsels } from './exec/plan-morsel.js';
 import type { BoundQuery, BoundStatement, BoundTransaction, BoundWrite } from './plan/bound.js';
-import type { AlterAction, ColumnDef as ColumnDefinition, ExprDef, SchemaOp, Source, SourceEditor, TableDef } from './plan/schema.js';
+import type { AlterAction, ColumnDef as ColumnDefinition, ExprDef, PropertyGraphDef, SchemaOp, Source, SourceEditor, TableDef } from './plan/schema.js';
+import { FEATURE_PROPERTY_GRAPHS } from './storage/format.js';
 import { SYSTEM_TABLES, type StoredDef, type StoredText, type SystemTableName, decodeDef, describeDefinition, encodeDef, isDescribed, isSystemTable, systemTableText } from './catalog/stored.js';
 import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
@@ -183,10 +184,12 @@ interface ExternalCacheEntry {
 
 /** Catalog key of a connection (connections have their own namespace). */
 const connectionKey = (name: string): string => `\u0000connection:${name.toLowerCase()}`;
+/** Property graphs have their own names, apart from tables' (ADR 0033): their catalog key. */
+const graphKey = (name: string): string => `\u0000graph:${name.toLowerCase()}`;
 
 
 interface CatalogEntry {
-  type: 'table' | 'index' | 'view' | 'matview' | 'external' | 'connection';
+  type: 'table' | 'index' | 'view' | 'matview' | 'external' | 'connection' | 'graph';
   name: string;
   rowid: number | bigint;
 }
@@ -243,6 +246,8 @@ export class Database implements FunctionContext {
   /** M8: connections and external tables (lower-cased names). */
   /** Connections, with their catalog text, its language (absent: SQL), and whether they were defined without source text. */
   private readonly connections = new Map<string, ConnectionInfo & { sql: string; language?: string; described?: boolean }>();
+  /** Property graphs by lower-case name (ADR 0033, G4). */
+  private readonly graphs = new Map<string, { graph: PropertyGraphDef; sql: string; language?: string; described?: boolean }>();
   private readonly externals = new Map<string, ExternalTableDef>();
   /** M8: registered files, credential providers and the data loaded for running statements. */
   /** External data (M8): registered files and credentials, loaded sources, and plugin formats (ADR 0012). */
@@ -1079,6 +1084,7 @@ export class Database implements FunctionContext {
       tables: () => [...this.tables.values(), ...this.shadowedMain.values()].filter((t) => !t.system && !/^(smalt|sqlite)_/i.test(t.name)),
       externals: () => [...this.externals.values()],
       connections: () => [...this.connections.values()],
+      graphs: () => [...this.graphs.values()],
       views: () => [...[...this.tempViews.values()].map((v) => ({ ...v, temp: true })), ...[...this.views.values()].map((v) => ({ ...v, temp: false }))],
       settings: () => ({ foreignKeys: this.fk.enabled, workMem: this.spill.workMem, matviewRewrite: this.matviewRewriteOn, parallelAggregates: this.parallelAggregates }),
       schemaVersion: () => this.schemaVersion,
@@ -1093,6 +1099,7 @@ export class Database implements FunctionContext {
     this.indexes.clear();
     this.views.clear();
     this.connections.clear();
+    this.graphs.clear();
     this.externals.clear();
     this.catalogEntries.clear();
     this.catalogTable = { ...tableSchemaFromDef(SYSTEM_TABLES.smalt_schema, systemTableText('smalt_schema'), this.pager.catalogRoot).table, system: true };
@@ -1114,6 +1121,12 @@ export class Database implements FunctionContext {
         const c = def(connectionKey(r.name), 'connection');
         this.catalogEntries.set(connectionKey(r.name), { type: 'connection', name: r.name, rowid: r.rowid });
         this.connections.set(r.name.toLowerCase(), { name: r.name, options: { ...c.options }, sql: r.sql!, ...(c.language !== undefined ? { language: c.language } : {}), ...(isDescribed(c) ? { described: true } : {}) });
+        continue;
+      }
+      if (r.type === 'graph') {
+        const g = def(graphKey(r.name), 'graph');
+        this.catalogEntries.set(graphKey(r.name), { type: 'graph', name: r.name, rowid: r.rowid });
+        this.graphs.set(r.name.toLowerCase(), { graph: g.graph, sql: r.sql!, ...(g.language !== undefined ? { language: g.language } : {}), ...(isDescribed(g) ? { described: true } : {}) });
         continue;
       }
       this.catalogEntries.set(r.name.toLowerCase(), { type: r.type as CatalogEntry['type'], name: r.name, rowid: r.rowid });
@@ -1658,6 +1671,8 @@ export class Database implements FunctionContext {
         return run(() => this.createIndex(op));
       case 'createConnection':
         return run(() => this.createConnection(op));
+      case 'createPropertyGraph':
+        return run(() => this.createPropertyGraph(op));
       case 'createExternalTable':
         return run(() => this.createExternalTable(op));
       case 'createView':
@@ -3037,6 +3052,101 @@ export class Database implements FunctionContext {
     return none;
   }
 
+  // ---------------------------------------------------------------- property graphs (ADR 0033, G4)
+
+  /** The property graph whose node or edge table `table` (lower case, main) is, or undefined. */
+  private graphUsing(table: string): string | undefined {
+    for (const g of this.graphs.values()) if ([...g.graph.nodes, ...g.graph.edges].some((x) => x.table.toLowerCase() === table)) return g.graph.name;
+    return undefined;
+  }
+
+  /** The columns of `table` (lower case) that graphs name: ids, endpoints and props. */
+  private graphColumns(table: string): Set<string> {
+    const out = new Set<string>();
+    for (const g of this.graphs.values()) {
+      for (const n of g.graph.nodes) if (n.table.toLowerCase() === table) [n.id, n.props].forEach((c) => c && out.add(c.toLowerCase()));
+      for (const e of g.graph.edges) if (e.table.toLowerCase() === table) [e.start, e.end, e.props].forEach((c) => c && out.add(c.toLowerCase()));
+    }
+    return out;
+  }
+
+  private createPropertyGraph(stmt: Extract<SchemaOp, { op: 'createPropertyGraph' }>): RunResult {
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    const g = stmt.graph;
+    const fail = (message: string): never => {
+      throw new SmaltError('SMALT_ERROR', `property graph ${g.name}: ${message}`);
+    };
+    if (this.graphs.has(g.name.toLowerCase())) {
+      if (stmt.ifNotExists) return none;
+      throw new SmaltError('SMALT_ERROR', `property graph ${g.name} already exists`);
+    }
+    if (g.nodes.length === 0) fail('a graph needs at least one node table');
+    const seen = new Map<string, string>();
+    const unique = (what: string, name: string) => {
+      const k = `${what}:${name.toLowerCase()}`;
+      if (seen.has(k)) fail(`${what} ${name} is listed twice`);
+      seen.set(k, name);
+    };
+    const tableOf = (name: string) => {
+      const t = this.catalog.table(name, 'main');
+      if (!t) return fail(`no such table: ${name}`);
+      if (t.kind !== 'table') fail(`${name} is not a table (a ${t.kind === 'materializedView' ? 'materialized view' : t.kind === 'external' ? 'external table' : 'system table'})`);
+      if (t.storage !== 'row') fail(`table ${name} is columnar: a graph's tables are row tables`);
+      if (this.graphUsing(name.toLowerCase())) fail(`table ${name} is already used by property graph ${this.graphUsing(name.toLowerCase())}`);
+      return t;
+    };
+    const column = (t: ReturnType<typeof tableOf>, name: string, role: string, want: 'INTEGER' | 'MAP') => {
+      const c = t.columns.find((x) => x.name.toLowerCase() === name.toLowerCase());
+      if (!c) return fail(`table ${t.name} has no column ${name}`);
+      if (c.storageType !== want) fail(`the ${role} column ${t.name}.${c.name} is ${c.storageType}, not ${want === 'MAP' ? 'a MAP (map<text, …>)' : 'INTEGER'}`);
+      return c;
+    };
+    for (const n of g.nodes) {
+      unique('label', n.label);
+      unique('table', n.table);
+      const t = tableOf(n.table);
+      column(t, n.id, 'id', 'INTEGER');
+      if (n.props !== undefined) column(t, n.props, 'props', 'MAP');
+    }
+    for (const e of g.edges) {
+      unique('relationship type', e.type);
+      unique('table', e.table);
+      const t = tableOf(e.table);
+      column(t, e.start, 'start', 'INTEGER');
+      column(t, e.end, 'end', 'INTEGER');
+      if (e.props !== undefined) column(t, e.props, 'props', 'MAP');
+    }
+    const def: PropertyGraphDef = {
+      name: g.name,
+      nodes: g.nodes.map((n) => ({ label: n.label, table: n.table, id: n.id, ...(n.props !== undefined ? { props: n.props } : {}) })),
+      edges: g.edges.map((e) => ({ type: e.type, table: e.table, start: e.start, end: e.end, ...(e.props !== undefined ? { props: e.props } : {}) })),
+    };
+    const stored: StoredDef = { kind: 'graph', graph: def, ...(stmt.source ? (stmt.source.language !== 'sql' ? { language: stmt.source.language } : {}) : { described: true as const }) };
+    const sql = stmt.source?.text ?? describeDefinition(stored);
+    this.dirtySchema = true;
+    // An engine that doesn't know property graphs must not read or write this file (ADR 0033 step 0).
+    this.pager.requireFeatures(FEATURE_PROPERTY_GRAPHS);
+    this.addCatalogRow('graph', g.name, g.name, 0, sql, graphKey(g.name), stored);
+    this.graphs.set(g.name.toLowerCase(), { graph: def, sql, ...(stmt.source && stmt.source.language !== 'sql' ? { language: stmt.source.language } : {}), ...(stmt.source ? {} : { described: true }) });
+    this.schemaChanged();
+    return none;
+  }
+
+  private dropPropertyGraph(stmt: Extract<SchemaOp, { op: 'drop' }>): RunResult {
+    const none = { changes: 0, lastInsertRowid: this.lastRowid };
+    const g = this.graphs.get(stmt.name.toLowerCase());
+    if (!g) {
+      if (stmt.ifExists) return none;
+      throw new SmaltError('SMALT_ERROR', `no such property graph: ${stmt.name}`);
+    }
+    // Its tables stay: they are ordinary tables. The file keeps its feature bit (format.ts: bits are never cleared).
+    this.dirtySchema = true;
+    this.removeCatalogRow(g.graph.name, graphKey(g.graph.name));
+    this.graphs.delete(stmt.name.toLowerCase());
+    this.schemaChanged();
+    return none;
+  }
+
   private dropConnection(stmt: Extract<SchemaOp, { op: 'drop' }>): RunResult {
     const none = { changes: 0, lastInsertRowid: this.lastRowid };
     const c = this.connections.get(stmt.name.toLowerCase());
@@ -3499,6 +3609,7 @@ export class Database implements FunctionContext {
     const existing = this.catalogEntries.get(lower);
     const kindOf = (t: CatalogEntry['type']): string => (t === 'matview' ? 'materialized view' : t === 'external' ? 'external table' : t);
     if (stmt.objectType === 'connection') return this.dropConnection(stmt);
+    if (stmt.objectType === 'property graph') return this.dropPropertyGraph(stmt);
     // The schema table and the engine's own objects (smalt_*, sqlite_*: names reserved at creation) are never dropped,
     // IF EXISTS or not: dropping one corrupts the database. As ALTER TABLE, and SQLite ('table sqlite_master may not be
     // dropped'). Here in the engine, so plans and every language are covered.
@@ -3507,6 +3618,10 @@ export class Database implements FunctionContext {
     }
     if (existing && stmt.objectType !== 'index' && existing.type !== 'index' && kindOf(existing.type) !== stmt.objectType) {
       throw new SmaltError('SMALT_ERROR', `use DROP ${kindOf(existing.type).toUpperCase()} to delete ${kindOf(existing.type)} ${existing.name}`);
+    }
+    if (stmt.objectType === 'table' && (stmt.schema === undefined || stmt.schema.toLowerCase() === 'main')) {
+      const user = this.graphUsing(lower);
+      if (user) throw new SmaltError('SMALT_ERROR', `table ${stmt.name} is used by property graph ${user}: drop the graph first`);
     }
     if (stmt.objectType === 'external table') {
       const x = this.externals.get(lower);
@@ -3655,6 +3770,15 @@ export class Database implements FunctionContext {
     // TEMP tables have no stored definitions (main.t reaches a shadowed main table).
     if (table.temp) throw new SmaltError('SMALT_UNSUPPORTED', `ALTER TABLE is not supported for TEMP table ${table.name}`);
     if (table.matview) throw new SmaltError('SMALT_ERROR', `materialized view ${table.name} may not be altered`);
+    // A graph names its tables and their id, endpoint and props columns: those can't be renamed or dropped under it.
+    const graphUser = this.graphUsing(table.name.toLowerCase());
+    if (graphUser) {
+      const used = this.graphColumns(table.name.toLowerCase());
+      if (a.kind === 'renameTable') throw new SmaltError('SMALT_ERROR', `table ${table.name} is used by property graph ${graphUser} and can't be renamed`);
+      if ((a.kind === 'renameColumn' || a.kind === 'dropColumn') && used.has(a.column.toLowerCase())) {
+        throw new SmaltError('SMALT_ERROR', `column ${a.column} of table ${table.name} is used by property graph ${graphUser}`);
+      }
+    }
     // A columnar table can be renamed (its segments move to the new name); its columns can't change yet.
     if (table.columnar && a.kind !== 'renameTable') throw new SmaltError('SMALT_UNSUPPORTED', `ALTER TABLE is not supported for columnar table ${table.name} yet, except RENAME TO`);
     const defs = this.storedDefinitions();
@@ -3763,6 +3887,8 @@ export class Database implements FunctionContext {
           return def.index.table.toLowerCase() === t;
         case 'connection':
         case 'external':
+        // A graph's tables and columns can't be renamed while it exists (alterTable refuses), so its text can't mention them.
+        case 'graph':
           return false;
         case 'view':
         case 'matview': {
@@ -3788,7 +3914,7 @@ export class Database implements FunctionContext {
 
   /** The catalog key of a catalog row. */
   private static rowKey(row: { type: string; name: string }): string {
-    return row.type === 'connection' ? connectionKey(row.name) : row.name.toLowerCase();
+    return row.type === 'connection' ? connectionKey(row.name) : row.type === 'graph' ? graphKey(row.name) : row.name.toLowerCase();
   }
 
   private renameTableDefs(table: TableSchema, newName: string, defs: Map<string, StoredDef>, change: AlterChange): void {

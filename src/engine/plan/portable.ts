@@ -28,6 +28,7 @@ export type {
   StorageType,
   Source,
   DropObject,
+  PropertyGraphDef,
 } from './schema.js';
 export type { PlanColumn, PlanQuery, PlanWrite, PlanStatementInput } from './statement.js';
 export { MAX_PARAMS } from './statement.js';
@@ -36,6 +37,7 @@ export {
   type Catalog,
   type CatalogColumn,
   type CatalogConnection,
+  type CatalogGraph,
   type CatalogData,
   type CatalogFunction,
   type CatalogIndex,

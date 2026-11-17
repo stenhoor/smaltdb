@@ -64,5 +64,7 @@ export const DH_COMMIT_ID = 64; // u64
 export const DH_COMMIT_TIME = 72; // u64
 // 80..127 reserved (future: encryption salt/KDF params, application id, ...)
 
-/** The required-feature bits this engine knows. None are defined yet: ADR 0033's graphs and history add the first. */
-export const KNOWN_FEATURES = 0;
+/** Required feature: the file has property graphs (ADR 0033, G4), whose tables' invariants an engine must keep. */
+export const FEATURE_PROPERTY_GRAPHS = 0x1;
+/** The required-feature bits this engine knows. */
+export const KNOWN_FEATURES = FEATURE_PROPERTY_GRAPHS;

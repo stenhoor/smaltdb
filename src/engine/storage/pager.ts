@@ -423,6 +423,15 @@ export class Pager {
     return this.hv.getUint32(DH_REQUIRED_FEATURES, true);
   }
 
+  /**
+   * Mark the file as needing `bits` (format.ts `FEATURE_*`), in the current transaction: an engine that doesn't know
+   * them refuses the file. Bits are never cleared, so an engine that knows them always reads the file.
+   */
+  requireFeatures(bits: number): void {
+    const cur = this.requiredFeatures;
+    if ((cur | bits) !== cur) this.setHeaderU32(DH_REQUIRED_FEATURES, (cur | bits) >>> 0);
+  }
+
   /** Every commit: count it, give it the next id, and stamp its time (never earlier than the commit before). */
   private stampCommit(): void {
     this.hv.setUint32(DH_CHANGE_COUNTER, (this.changeCounter + 1) >>> 0, true);

@@ -38,6 +38,9 @@ first, when it shadows a main one; `schema` picks `main` or `temp`). Each `Catal
 (`type`, `url`, `credentials` and the type's own), and its definition's source, absent for one defined without
 source text. `snapshot()` lists them as `connections`.
 
+`graphs()` and `graph(name)` give each property graph's definition (`{ name, nodes, edges, source? }`, see
+[property graphs](./schema#property-graphs)); `snapshot()` lists them as `graphs`.
+
 `views()` and `view(name, schema?)` give `{ name, schema, language, text, columns?, interface?, reflects? }`: a view is
 source text in its language, bound where it is read.
 
