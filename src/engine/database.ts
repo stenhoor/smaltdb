@@ -64,6 +64,7 @@ import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec
 import { type CatalogSnapshot, informationSchema } from './catalog/information-schema.js';
 import { type LanguageStatement, type SmaltLanguage, languagePart, registeredLanguage } from './plan/language.js';
 import { ForeignKeys } from './exec/fk.js';
+import { GraphRules } from './exec/graph-rules.js';
 import { PluginRegistry, type SmaltPlugin } from './plugin.js';
 import { Collation, type SqlValue } from './values.js';
 import type { Vfs, VfsFile } from './vfs/types.js';
@@ -865,6 +866,7 @@ export class Database implements FunctionContext {
       : new TableWriter(table, this.pager, (root) => this.tree(root));
     w.beforeDelete = (row) => {
       if (this.fk.involved(table)) this.fk.beforeDelete(table, row);
+      if (this.graphRules.involved(table)) this.graphRules.beforeDelete(table, row);
     };
     w.onDelete = (row) => {
       if (this.fk.involved(table)) this.fk.afterDelete(table, row);
@@ -887,6 +889,16 @@ export class Database implements FunctionContext {
     allTables: () => [...this.tables.values()].filter((t) => !t.system),
     run: (plan, params) => this.internalPlan(plan, params) ?? [],
     defaultValue: (t, c) => this.tableExprs(t).defaults[c] ?? null,
+  });
+
+  /** Property graphs' rules on writes to their tables (ADR 0033, G4; exec/graph-rules.ts). */
+  private readonly graphRules = new GraphRules({
+    graphs: () => [...this.graphs.values()].map((g) => g.graph),
+    getTable: (n) => this.tables.get(n.toLowerCase()),
+    schemaVersion: () => this.schemaVersion,
+    rowExists: (t, rowid) => this.writerFor(t).rowExists(rowid),
+    nextRowid: (t) => this.writerFor(t).newRowid(),
+    run: (plan, params) => this.internalPlan(plan, params) ?? [],
   });
 
   private internalPrograms = new WeakMap<PlanOp, { version: number; prog: Program }>();
@@ -3105,7 +3117,8 @@ export class Database implements FunctionContext {
       unique('label', n.label);
       unique('table', n.table);
       const t = tableOf(n.table);
-      column(t, n.id, 'id', 'INTEGER');
+      // The id is the rowid: unique in its table, and found by a B+tree seek when the graph checks it.
+      if (!column(t, n.id, 'id', 'INTEGER').rowid) fail(`the id column ${t.name}.${n.id} must be the table's INTEGER PRIMARY KEY`);
       if (n.props !== undefined) column(t, n.props, 'props', 'MAP');
     }
     for (const e of g.edges) {
@@ -4491,7 +4504,8 @@ export class Database implements FunctionContext {
         let rowid: number | bigint;
         if (table.rowidAlias >= 0 && row[table.rowidAlias] !== null) rowid = this.toRowid(row[table.rowidAlias], table);
         else if (explicitRowid !== null) rowid = this.toRowid(explicitRowid, table);
-        else rowid = w.newRowid();
+        // A graph's node without an id gets the next one across the graph's node tables.
+        else rowid = (this.graphRules.involved(table) ? this.graphRules.nextNodeId(table) : null) ?? w.newRowid();
         if (table.rowidAlias >= 0) row[table.rowidAlias] = rowid;
         r[rowidReg] = rowid;
         if (!this.validateRow(table, row, real, checks, r, base, mode, defaults)) return;
@@ -4508,6 +4522,7 @@ export class Database implements FunctionContext {
         if (!w.resolveConflicts(row, rowid, null, mode)) return;
         w.writeRow(row, rowid);
         if (this.fk.involved(table)) this.fk.afterInsert(table, row);
+        if (this.graphRules.involved(table)) this.graphRules.afterWrite(table, row);
         changes++;
         last = rowid;
         emitReturning(r, out, row, rowid);
@@ -4616,6 +4631,7 @@ export class Database implements FunctionContext {
       w.resolveConflicts(next, newRowid, other, 'ABORT');
       w.updateRow(old, other, next, newRowid);
       if (this.fk.involved(table)) this.fk.afterUpdate(table, old, next);
+      if (this.graphRules.involved(table)) this.graphRules.afterWrite(table, next, old);
       return { row: next, rowid: newRowid };
     }
     return undefined;
@@ -4677,6 +4693,7 @@ export class Database implements FunctionContext {
         if (!writer.resolveConflicts(next, newRowid, rowid, mode)) continue;
         writer.updateRow(old, rowid, next, newRowid);
         if (this.fk.involved(table)) this.fk.afterUpdate(table, old, next);
+        if (this.graphRules.involved(table)) this.graphRules.afterWrite(table, next, old);
         changes++;
         if (ret && out) {
           for (let i = 0; i < ncols; i++) r[base + i] = next[i];
@@ -4697,7 +4714,7 @@ export class Database implements FunctionContext {
     const truncate = !op.returning && wholeTable(op.input);
     const ncols = table.columns.length;
     const exec = (r: SqlValue[], out?: SqlValue[][]): RunResult => {
-      if (truncate && !this.fk.involved(table)) {
+      if (truncate && !this.fk.involved(table) && !this.graphRules.involved(table)) {
         this.touchTable(table);
         const n = table.columnar ? this.rewriteColumnar(table, false) : new TableWriter(table, this.pager, (root) => this.tree(root)).truncate();
         this.lastChanges = n;

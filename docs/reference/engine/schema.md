@@ -72,8 +72,8 @@ const graph: plan.PropertyGraphDef = {
 const op: plan.SchemaOp = { op: 'createPropertyGraph', graph, ifNotExists: false };
 ```
 
-- **Nodes:** one table per label, with an `INTEGER` id column and, optionally, a `props` column of type
-  `map<text, …>` ([ADR 0038](../../adr/0038-map-type.md)) for properties that have no column of their own.
+- **Nodes:** one table per label, whose id column is its `INTEGER PRIMARY KEY`, and optionally a `props` column of
+  type `map<text, …>` ([ADR 0038](../../adr/0038-map-type.md)) for properties that have no column of their own.
 - **Relationships:** one table per type, with `INTEGER` `start` and `end` columns holding node ids, and optionally
   `props`.
 - **Checks:** labels, types and tables are each listed once; a table belongs to one graph. Tables must be row tables in
@@ -84,8 +84,29 @@ const op: plan.SchemaOp = { op: 'createPropertyGraph', graph, ifNotExists: false
 - **The file:** the first graph marks the database as needing property graphs, so an engine that doesn't know them
   refuses to open it ([storage format](../../STORAGE_FORMAT.md)). Dropping the graph keeps its tables.
 
-The [catalog](./catalog) lists graphs with `graphs()` and `graph(name)`. Creating a label's table when it is first
-written, node ids, the label index and keeping them right on writes come in the next steps of ADR 0033.
+The [catalog](./catalog) lists graphs with `graphs()` and `graph(name)`.
+
+### The rules on a graph's tables
+
+The engine keeps these on every write to a graph's tables, from any language (SQL, plans, DataFrames). Tables outside
+a graph aren't affected.
+
+- **Node ids are unique across the graph.** A node written without an id gets the next one: one more than the largest
+  id in any of the graph's node tables. An id another node table of the graph has is refused, on insert and on update
+  (`SMALT_CONSTRAINT_PRIMARYKEY`).
+- **Relationships connect nodes of the graph.** An edge's `start` and `end` must be ids of nodes of the graph, of any
+  label; NULL is refused (`SMALT_CONSTRAINT_FOREIGNKEY`).
+- **A node with relationships can't be deleted**, nor its id changed, while a relationship refers to it, at either end
+  (`SMALT_CONSTRAINT_FOREIGNKEY`). Delete the relationships first, as Cypher's `DETACH DELETE` does. Each row is
+  checked when it's written, so a statement that deletes both must delete the relationships first. `INSERT OR REPLACE`
+  of a connected node is refused, as its delete would be.
+- **Lookups:** checking a node is a B+tree seek on each node table. Checking a node's relationships searches each edge
+  table's `start` and `end`, so give edge tables indexes on both.
+
+Errors from these rules keep the engine's wording in every language: they say which graph, table and node.
+
+Creating a label's table when it is first written, the label index for nodes with several labels, and per-label copies
+come in the next steps of ADR 0033.
 
 ## Tables
 

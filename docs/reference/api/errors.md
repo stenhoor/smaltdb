@@ -115,6 +115,8 @@ INSERT INTO users(email) VALUES ('a@example.com'), ('a@example.com');
 
 A row with the same primary key exists already. The message has the same form as for `UNIQUE`: `UNIQUE constraint failed: table.column`.
 
+A property graph's node id that another node table of the graph already has fails with this code too ([property graphs](../engine/schema#the-rules-on-a-graph-s-tables)).
+
 **Remedy:** as for `SMALT_CONSTRAINT_UNIQUE`.
 
 <!-- docs:error SMALT_CONSTRAINT_PRIMARYKEY -->
@@ -136,6 +138,8 @@ INSERT INTO users(email, age) VALUES ('d@example.com', -1);
 ## SMALT_CONSTRAINT_FOREIGNKEY
 
 A row refers to a parent row that does not exist, or a parent row that is still referenced would be deleted or changed. Message: `FOREIGN KEY constraint failed`. For deferred foreign keys, the error comes from `COMMIT`, and the transaction stays open so you can fix the data.
+
+A property graph's rules fail with this code too: a relationship whose start or end isn't a node of the graph, and deleting (or changing the id of) a node that relationships refer to ([property graphs](../engine/schema#the-rules-on-a-graph-s-tables)).
 
 **Remedy:** insert the parent first, delete children first, or use an `ON DELETE` action. See [tables and schema](https://stenhoor.github.io/smaltql/guide/schema).
 
