@@ -803,6 +803,19 @@ class Validator {
         });
         return;
       }
+      case 'alterPropertyGraph': {
+        str(o.name, 'name');
+        optBool(o.ifNotExists, 'ifNotExists');
+        this.under('action', undefined, () => {
+          const a = o.action as Record<string, unknown>;
+          if (!a || typeof a !== 'object') this.fail('expected an action');
+          if (a.kind === 'addLabel') str(a.label, 'label');
+          else if (a.kind === 'addType') str(a.type, 'type');
+          else this.fail(`unknown action ${JSON.stringify(a.kind)}`, 'kind');
+          if (a.table !== undefined) str(a.table, 'table');
+        });
+        return;
+      }
       case 'drop': {
         if (!DROP_OBJECTS.has(o.objectType as string)) this.fail(`unknown object type ${JSON.stringify(o.objectType)}`, 'objectType');
         str(o.name, 'name');
@@ -1029,7 +1042,7 @@ class Validator {
 const STORAGE_TYPES = new Set(['INTEGER', 'BOOLEAN', 'DATE', 'TIME', 'DATETIME', 'DURATION', 'LIST', 'STRUCT', 'MAP', 'REAL', 'TEXT', 'BLOB', 'ANY', 'NUMERIC']);
 const FK_ACTIONS = new Set(['SET NULL', 'SET DEFAULT', 'CASCADE', 'RESTRICT', 'NO ACTION']);
 const DROP_OBJECTS = new Set(['table', 'index', 'view', 'materialized view', 'trigger', 'external table', 'connection', 'property graph']);
-const SCHEMA_OPS = new Set(['createTable', 'createIndex', 'createView', 'createConnection', 'createExternalTable', 'createPropertyGraph', 'drop', 'alterTable']);
+const SCHEMA_OPS = new Set(['createTable', 'createIndex', 'createView', 'createConnection', 'createExternalTable', 'createPropertyGraph', 'alterPropertyGraph', 'drop', 'alterTable']);
 
 /**
  * Throws SMALT_PLAN when `op` is not a valid schema operation (ADR 0016 section 9): the fields each operation needs,

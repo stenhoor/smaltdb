@@ -19,6 +19,7 @@ it when ALTER TABLE changes the definition. Views need one; every other operatio
 | `createConnection` | `name`, `ifNotExists`, `options`, `source?` |
 | `createExternalTable` | `name`, `ifNotExists`, `columns` (empty: read from the source), `options`, `source?` |
 | `createPropertyGraph` | `graph` (a `PropertyGraphDef`: see [property graphs](#property-graphs)), `ifNotExists`, `source?` |
+| `alterPropertyGraph` | `name`, `action` (`{ kind: 'addLabel', label, table? }` or `{ kind: 'addType', type, table? }`: see [adding labels and types](#adding-labels-and-types)), `ifNotExists?` |
 | `drop` | `objectType` (`table`, `index`, `view`, `materialized view`, `trigger`, `external table`, `connection`, `property graph`), `name`, `schema?`, `ifExists`, `cascade?` |
 | `alterTable` | `table`, `schema?`, `action` (`renameTable`, `renameColumn`, `addColumn`, `dropColumn`), `source?`, `cascade?` |
 
@@ -105,8 +106,22 @@ a graph aren't affected.
 
 Errors from these rules keep the engine's wording in every language: they say which graph, table and node.
 
-Creating a label's table when it is first written, the label index for nodes with several labels, and per-label copies
-come in the next steps of ADR 0033.
+### Adding labels and types
+
+A language adds a label or relationship type the first time it writes one (ADR 0033, decision 11: Cypher's
+`CREATE (:Gadget {…})` with no `Gadget` table yet) with `alterPropertyGraph`, in the same transaction as the write:
+
+- **`addLabel`:** the label's table, named `table` or after the label, gets `id INTEGER PRIMARY KEY` and
+  `props map<text, any>`.
+- **`addType`:** the type's table gets `start INTEGER`, `end INTEGER` and `props map<text, any>`, and indexes on `start`
+  and on `end` (`<table>_start`, `<table>_end`), which the rules' lookups use.
+- **An existing table** of that name is adopted instead, if it has the conventional columns (`id`, or `start` and
+  `end`, and optionally `props`) and passes the checks a new graph's tables pass.
+- **A label or type the graph has** is an error, or a no-op with `ifNotExists`.
+- The graph's record is replaced in the same transaction, and is then shown as its definition (JSON): its original
+  source text no longer describes it.
+
+The label index for nodes with several labels, and per-label copies, come in the next steps of ADR 0033.
 
 ## Tables
 
