@@ -134,8 +134,9 @@ export default defineConfig({
           { text: '0021 Parallel readers everywhere', link: '/adr/0021-parallel-readers-everywhere' },
           { text: '0022 SQL for the new engine features', link: '/adr/0022-sql-for-the-new-engine-features' },
           { text: '0028 Pluggable storage engines (deferred)', link: '/adr/0028-pluggable-storage-engines' },
-          { text: '0033 Property graphs and history (proposed)', link: '/adr/0033-property-graphs-and-history' },
+          { text: '0033 Property graphs and history', link: '/adr/0033-property-graphs-and-history' },
           { text: '0036 User-defined functions', link: '/adr/0036-user-defined-functions' },
+          { text: '0038 A map type', link: '/adr/0038-map-type' },
         ],
       },
       {
