@@ -5890,6 +5890,7 @@ const REWRITES: { readonly [K in PlanOp['op']]: boolean | ((o: Record<string, un
   pivot: true,
   unpivot: true,
   explode: true,
+  paths: true,
   append: false,
   update: false,
   delete: false,

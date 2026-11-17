@@ -446,6 +446,35 @@ class Validator {
         }
         return w + (o.position ? 1 : 0);
       }
+      case 'paths': {
+        const w = sub(o.input, 'input');
+        if (!Number.isInteger(o.start) || o.start < 0 || o.start >= w) this.fail(`no column ${String(o.start)}`, 'start');
+        const edges = this.list(o.edges, 'edges');
+        if (edges.length === 0) this.fail('expected at least one edge table', 'edges');
+        for (let i = 0; i < edges.length; i++)
+          this.under('edges', i, () => {
+            const e = edges[i] as Record<string, unknown>;
+            this.object(e);
+            if (typeof e.table !== 'string') this.fail('expected a table name', 'table');
+            if (e.db !== undefined && e.db !== 'main' && e.db !== 'temp') this.fail(`unknown schema ${JSON.stringify(e.db)}`, 'db');
+            const n = this.tableWidth(e.table as string, e.db as 'main' | 'temp' | undefined);
+            columnsOf([e.start], n, e.table as string, 'start');
+            columnsOf([e.end], n, e.table as string, 'end');
+          });
+        if (o.direction !== 'out' && o.direction !== 'in' && o.direction !== 'both') this.fail(`unknown direction ${JSON.stringify(o.direction)}`, 'direction');
+        const min = o.minHops ?? 1;
+        if (!Number.isInteger(min) || min < 0) this.fail('expected a whole number of hops, 0 or more', 'minHops');
+        if (o.maxHops !== undefined && (!Number.isInteger(o.maxHops) || o.maxHops < min)) this.fail(`expected a whole number of hops, at least minHops (${min})`, 'maxHops');
+        const mode = o.mode ?? 'walk';
+        if (!['walk', 'trail', 'acyclic', 'simple'].includes(mode)) this.fail(`unknown mode ${JSON.stringify(mode)}`, 'mode');
+        const sel = o.selector ?? 'all';
+        if (typeof sel === 'object' && sel !== null) {
+          if (!Number.isInteger(sel.shortest) || sel.shortest < 1) this.fail('expected { shortest: k } with k 1 or more', 'selector');
+        } else if (!['all', 'any', 'anyShortest', 'allShortest'].includes(sel)) this.fail(`unknown selector ${JSON.stringify(sel)}`, 'selector');
+        // A walk may repeat a cycle forever: it needs a limit, or a selector that keeps one path per node.
+        if (mode === 'walk' && o.maxHops === undefined && sel !== 'any' && sel !== 'anyShortest') this.fail('a walk with no maxHops has no end: give maxHops, another mode, or the selector any or anyShortest', 'maxHops');
+        return w + 3;
+      }
       case 'unpivot': {
         const w = sub(o.input, 'input');
         const index = (l: readonly unknown[], field: string): void => {

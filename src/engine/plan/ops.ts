@@ -108,6 +108,17 @@ export interface OpMeaning {
   readonly origin?: PlanOrigin;
 }
 
+/** A relationship table a `paths` operation follows: `start` and `end` are its endpoint columns (column indexes). */
+export interface PathEdges {
+  readonly table: string;
+  readonly db?: 'main' | 'temp';
+  readonly start: number;
+  readonly end: number;
+}
+
+/** The type of a `paths` operation's path column: per hop, its table's position in `edges`, its rowid, and the nodes it went from and to. */
+export const PATH_TYPE = 'list<struct<edge int, rowid int, from int, to int>>';
+
 export type PlanOp = OpMeaning & (
   /**
    * Rows of a table: `columns` lists table column indexes, -1 for the rowid. `db` names the schema when the query
@@ -232,6 +243,30 @@ export type PlanOp = OpMeaning & (
       readonly position?: boolean;
       readonly emptyAsNull?: boolean;
       readonly keepNulls?: boolean;
+    }
+  /**
+   * Paths through a graph (ADR 0033, G5): for each input row, the paths that start at the node in column `start` and
+   * follow `edges` (each a table and its two endpoint columns, as table column indexes) in `direction`, with
+   * `minHops` (default 1) to `maxHops` (default no limit) relationships. Each row is the input row followed by the
+   * path's last node (`int`), its length in hops (`int`) and the path ({@link PATH_TYPE}: per hop, the position of its
+   * table in `edges`, the relationship's rowid, and the nodes it went from and to). Rows keep the input's order; an
+   * input row's paths come shortest first.
+   *
+   * `mode` limits what a path may repeat: `walk` anything, `trail` no relationship, `acyclic` no node, `simple` no node
+   * except that the last may be the first. `selector` picks among each input row's paths to each last node: `all`,
+   * `any` (one), `anyShortest` (one of the shortest), `allShortest`, or `{ shortest: k }` (the k shortest). A walk
+   * with no `maxHops` needs `any` or `anyShortest`, which keep one path per node; everything else has an end.
+   */
+  | {
+      readonly op: 'paths';
+      readonly input: PlanOp;
+      readonly start: number;
+      readonly edges: readonly PathEdges[];
+      readonly direction: 'out' | 'in' | 'both';
+      readonly minHops?: number;
+      readonly maxHops?: number;
+      readonly mode?: 'walk' | 'trail' | 'acyclic' | 'simple';
+      readonly selector?: 'all' | 'any' | 'anyShortest' | 'allShortest' | { readonly shortest: number };
     }
   | {
       readonly op: 'unpivot';

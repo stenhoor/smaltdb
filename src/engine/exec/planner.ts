@@ -2642,6 +2642,8 @@ export function planWidth(op: PlanOp): number {
       return op.keep.length + 2;
     case 'explode':
       return planWidth(op.input) + (op.position ? 1 : 0);
+    case 'paths':
+      return planWidth(op.input) + 3;
     case 'pivot':
       return op.keys.length + op.values.length * op.aggs.length;
     case 'aggregate':
@@ -2814,6 +2816,7 @@ function supportedLeaf(op: PlanOp, level: number): boolean {
     case 'pivot':
     case 'unpivot':
     case 'explode':
+    case 'paths':
     case 'append':
     case 'update':
     case 'delete':
