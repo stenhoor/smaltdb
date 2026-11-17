@@ -841,6 +841,7 @@ class Validator {
           };
           part('nodes', ['label', 'table', 'id']);
           part('edges', ['type', 'table', 'start', 'end']);
+          if (g.history !== undefined && g.history !== 'versions' && g.history !== 'log') this.fail(`unknown history ${JSON.stringify(g.history)} (versions or log)`, 'history');
           if (g.labels !== undefined)
             this.under('labels', undefined, () => {
               const x = g.labels as Record<string, unknown>;

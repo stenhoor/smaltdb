@@ -46,6 +46,8 @@ export interface FunctionContext {
   now(): number;
   /** Set while evaluating an index expression or CHECK constraint (see DateTimeContext.pureContext). */
   pureContext?: string;
+  /** The commit before which a table's history was forgotten, now (0: none; ADR 0033, decision 16). */
+  historyHorizon?(table: string): number;
 }
 
 /** `base` for evaluating an index expression or CHECK constraint (`where`: 'an index', 'a CHECK constraint'). */
@@ -618,6 +620,22 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
       // An empty separator splits into characters (code points), as Cypher's split and DuckDB's string_split do.
       return encodeKey(sep === '' ? Array.from(s) : s.split(sep));
     }),
+  ],
+  // `asOf` past a forgotten history (ADR 0033, decision 16): the commit, or an error when it is before the table's
+  // horizon as it is when the statement runs (a plan made before a forget still checks).
+  [
+    'history_horizon',
+    simple(
+      2,
+      2,
+      'int',
+      ([c, t], _args, ctx) => {
+        const h = c === null ? 0 : (ctx.historyHorizon?.(String(t)) ?? 0);
+        if (c !== null && Number(c) < h) throw new SmaltError('SMALT_RANGE', `table ${String(t)}: history before commit ${h} was forgotten`);
+        return c;
+      },
+      false,
+    ),
   ],
   ...TEMPORAL_FUNCTIONS,
   ...NESTED_FUNCTIONS,

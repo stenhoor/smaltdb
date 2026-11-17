@@ -363,9 +363,19 @@ function asOfRows(op: Op<'scan'>): PlanOp {
     };
     commit = { k: 'call', fn: 'ifnull', args: [{ k: 'subquery', mode: 'scalar', plan: last, type: 'int', collation: 'binary' }, { k: 'lit', value: 0, type: 'int' }], type: 'int' };
   }
+  // History before the table's horizon was forgotten: reading it is an error, not a wrong answer. Checked once each
+  // time the statement runs (a forget may come after the plan is made), whatever rows the table and its history hold:
+  // a first part with no rows whose one filter evaluation is the check.
+  const check: PlanExpr = { k: 'call', fn: 'history_horizon', args: [commit, { k: 'lit', value: op.table, type: 'text' }], type: 'int' };
+  const guard: PlanOp = {
+    op: 'project',
+    input: { op: 'filter', input: { op: 'values', rows: [[]], types: [] }, pred: cmp('cmp_lt', check, { k: 'lit', value: 0, type: 'int' }) },
+    exprs: op.columns.map((c) => ({ k: 'lit', value: null, type: typeOf(c) })),
+  };
+  const guarded = (rows: PlanOp): PlanOp => ({ op: 'setop', kind: 'unionAll', inputs: [guard, rows], collations: op.columns.map(() => 'binary'), ...(op.origin !== undefined ? { origin: op.origin } : {}) });
   const w = op.columns.length;
   const out = (from: number) => op.columns.map((c, i) => at(0, from + i, typeOf(c)));
-  if (catalog?.history(op.table, op.db) === 'log') return logAsOf(op, commit, out, at);
+  if (catalog?.history(op.table, op.db) === 'log') return guarded(logAsOf(op, commit, out, at));
   // Current rows, with the commit their version started at.
   const table: PlanOp = { op: 'scan', table: op.table, ...(op.db ? { db: op.db } : {}), columns: [...op.columns, -1] };
   const since: PlanOp = { op: 'scan', table: `smalt_since_${op.table}`, columns: [0, -1] };
@@ -384,7 +394,7 @@ function asOfRows(op: Op<'scan'>): PlanOp {
     },
     exprs: out(0),
   };
-  return { op: 'setop', kind: 'unionAll', inputs: [current, versions], collations: op.columns.map(() => 'binary'), ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+  return guarded({ op: 'setop', kind: 'unionAll', inputs: [current, versions], collations: op.columns.map(() => 'binary') });
 }
 
 /**

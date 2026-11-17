@@ -146,9 +146,11 @@ first version (section 5.2).
    the commit and the row before it. A past state is the current rows untouched since, and for the others the row
    before their first change after it (none if that change was the insert): no replay, one pass over the log since.
    The same log serves `track_changes`.
-4. **Forgetting, graphs and limits**: an explicit command drops versions older than a commit and records the limit,
-   below which `asOf` is an error. A property graph can turn history on for all its tables. Changing a history table's
-   columns is refused at first.
+4. **Forgetting and graphs** (done): an explicit command (`forget`) drops versions older than a commit and records
+   the limit (`smalt_history`), below which `asOf` is an error, checked when the statement runs. A property graph can
+   turn history on for all its tables.
+4a. **ALTER TABLE on history tables** (next): their history tables follow added, renamed and dropped columns; refused
+   until then.
 5. **Step 7** benchmarks both and picks the default.
 
 ## 4. Cypher on smaltdb
