@@ -22,7 +22,7 @@
  *     ANY    per value: u8 tag (0 null, 1 f64, 2 i64, 3 text, 4 blob) | payload (f64, i64, u32 len + bytes)
  */
 import { CorruptionError } from '../errors.js';
-import { type SqlValue, compareNumeric } from '../values.js';
+import { type SqlValue, TypedValue, compareNumeric } from '../values.js';
 import type { BTree } from './btree.js';
 import { decodeUtf8 } from './record.js';
 
@@ -335,7 +335,7 @@ function encodeChunk(vals: SqlValue[], w: ByteWriter, ce: ChunkEncoder): { bytes
       }
     } else {
       allNum = allInt32 = allStr = false;
-      if (!(v instanceof Uint8Array)) allBlob = false;
+      if (!(v instanceof Uint8Array) || v instanceof TypedValue) allBlob = false;
     }
   }
   const zone: Zone = { nulls };
@@ -456,6 +456,14 @@ function encodeChunk(vals: SqlValue[], w: ByteWriter, ce: ChunkEncoder): { bytes
           w.u8(3);
           w.u32(b.length);
           w.bytes(b);
+        } else if (v instanceof TypedValue) {
+          // A typed value (ADR 0039): its type's text, then its bytes.
+          const t = textEncoder.encode(v.type);
+          w.u8(5);
+          w.u32(t.length);
+          w.bytes(t);
+          w.u32(v.length);
+          w.bytes(v);
         } else {
           w.u8(4);
           w.u32(v.length);
@@ -598,6 +606,13 @@ function decodeChunk(b: Uint8Array): Chunk {
           const x = v.getBigInt64(p, true);
           vals[i] = x >= -(2n ** 53n) && x <= 2n ** 53n ? Number(x) : x;
           p += 8;
+        } else if (tag === 5) {
+          const tl = v.getUint32(p, true);
+          const type = textDecoder.decode(b.subarray(p + 4, p + 4 + tl));
+          p += 4 + tl;
+          const len = v.getUint32(p, true);
+          vals[i] = new TypedValue(type, b.subarray(p + 4, p + 4 + len));
+          p += 4 + len;
         } else {
           const len = v.getUint32(p, true);
           const s = b.subarray(p + 4, p + 4 + len);

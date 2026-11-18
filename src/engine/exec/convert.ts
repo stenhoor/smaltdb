@@ -1,6 +1,6 @@
 import { formatReal, textToNumber } from '../catalog/schema.js';
 import type { StorageType } from '../storage/record.js';
-import { type SqlValue, normalizeInt } from '../values.js';
+import { type SqlValue, TypedValue, normalizeInt } from '../values.js';
 
 /**
  * Static expression types inferred at compile time. 'num' = INTEGER or REAL, 'any' = unknown.
@@ -157,6 +157,8 @@ export function truthy(v: SqlValue): boolean | null {
   if (v === null) return null;
   if (typeof v === 'number') return v !== 0;
   if (typeof v === 'bigint') return v !== 0n;
+  // A typed bool (ADR 0039) is its value; another typed value has no truth value, as a blob of it would be false.
+  if (v instanceof TypedValue) return v.type === 'bool' ? v[0] !== 0 : false;
   const n = toNumeric(v);
   return n !== 0 && n !== 0n;
 }
@@ -173,7 +175,8 @@ export function hashKey(v: SqlValue, collation = 0): unknown {
     else if (collation === 2) s = s.replace(/ +$/, '');
     return s.length > 0 && s.charCodeAt(0) === 0 ? '\u0000S' + s : s;
   }
-  let s = '\u0000B';
+  // A typed value (ADR 0039) hashes apart from a blob of the same bytes, as it compares apart from one.
+  let s = v instanceof TypedValue ? `\u0000T${v.type}\u0000` : '\u0000B';
   for (let i = 0; i < v.length; i++) s += String.fromCharCode(v[i]);
   return s;
 }

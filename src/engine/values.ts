@@ -13,6 +13,30 @@
  */
 export type SqlValue = null | number | bigint | string | Uint8Array;
 
+/**
+ * A value that keeps its type where the static type is `any` (ADR 0039): a `bool` (one byte, 0 or 1), or a list,
+ * struct or map (its bytes). It is a blob to code that doesn't look for it, so it travels through every operator,
+ * record and key unchanged; the key codec, records, comparisons, hashing and results keep its type.
+ */
+export class TypedValue extends Uint8Array {
+  // Methods that make a new array (slice, subarray, map …) make plain blobs: they have no type to give it.
+  static get [Symbol.species](): Uint8ArrayConstructor {
+    return Uint8Array;
+  }
+  constructor(
+    readonly type: string,
+    bytes: ArrayLike<number>,
+  ) {
+    super(bytes.length);
+    this.set(bytes);
+  }
+}
+
+const TRUE_BYTES = Uint8Array.of(1);
+const FALSE_BYTES = Uint8Array.of(0);
+/** A `bool` as a typed value. */
+export const typedBool = (b: boolean): TypedValue => new TypedValue('bool', b ? TRUE_BYTES : FALSE_BYTES);
+
 const BIG_MIN_SAFE = BigInt(Number.MIN_SAFE_INTEGER);
 const BIG_MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -21,7 +45,7 @@ export function normalizeInt(v: bigint): number | bigint {
   return v >= BIG_MIN_SAFE && v <= BIG_MAX_SAFE ? Number(v) : v;
 }
 
-/** SQLite's ordering rank: NULL < numeric < TEXT < BLOB. */
+/** SQLite's ordering rank: NULL < numeric < TEXT < BLOB, then typed values (ADR 0039). */
 export function typeRank(v: SqlValue): number {
   if (v === null) return 0;
   switch (typeof v) {
@@ -31,8 +55,13 @@ export function typeRank(v: SqlValue): number {
     case 'string':
       return 2;
     default:
-      return 3;
+      return v instanceof TypedValue ? 4 : 3;
   }
+}
+
+/** Typed values in order: by type name, then by bytes (the order of their key encoding). */
+export function compareTyped(a: TypedValue, b: TypedValue): number {
+  return a.type === b.type ? compareBlobs(a, b) : compareText(a.type, b.type);
 }
 
 /**
@@ -141,7 +170,9 @@ export function compareValues(a: SqlValue, b: SqlValue, collation: Collation = C
       return compareNumeric(a as number | bigint, b as number | bigint);
     case 2:
       return compareText(a as string, b as string, collation);
-    default:
+    case 3:
       return compareBlobs(a as Uint8Array, b as Uint8Array);
+    default:
+      return compareTyped(a as TypedValue, b as TypedValue);
   }
 }

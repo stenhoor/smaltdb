@@ -18,7 +18,9 @@ export type { AlterAction, CheckDef, ColumnDef, DefaultDef, DeferredError, ExprD
 export type { CollationName } from './plan/types.js';
 
 export { type ErrorDetails, type ErrorToWord, SmaltError, withDetails } from './errors.js';
-export { Collation, type SqlValue, collationByName, normalizeInt } from './values.js';
+export { Collation, type SqlValue, TypedValue, collationByName, normalizeInt, typedBool } from './values.js';
+// Values under `any` that keep their type (ADR 0039): a language's parameters and results.
+export { anyResult, encodeNested, typedResult } from '../shared/nested.js';
 
 export { storageTypeFor } from './plan/catalog.js';
 export { type Affinity, type StaticType, affinityOfStorage, staticTypeOfStorage } from './exec/convert.js';

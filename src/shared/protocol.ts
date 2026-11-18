@@ -5,7 +5,8 @@
  */
 import type { ErrorDetails } from '../engine/errors.js';
 import type { PlanType } from '../engine/plan/types.js';
-import type { SqlValue } from '../engine/values.js';
+import { type SqlValue, TypedValue } from '../engine/values.js';
+import { typedResult } from './nested.js';
 
 /**
  * Statement parameters: an array for `?` / `?NNN` slots or an object for named ones. Besides SQL
@@ -163,7 +164,10 @@ export function encodeColumns(cols: SqlValue[][], length: number): { cols: WireC
     } else if (text) {
       out.push({ t: 'str', data: col.slice(0, length) as (string | null)[] });
     } else {
-      out.push({ t: 'any', data: col.slice(0, length) });
+      // A typed value (ADR 0039) would cross as a plain blob: it crosses as its JavaScript value.
+      const data = col.slice(0, length);
+      for (let i = 0; i < length; i++) if (data[i] instanceof TypedValue) data[i] = typedResult(data[i] as TypedValue) as SqlValue;
+      out.push({ t: 'any', data });
     }
   }
   return { cols: out, transfer };

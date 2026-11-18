@@ -5,7 +5,7 @@
  */
 import { SmaltError } from '../errors.js';
 import { decodeKey, encodeKey } from '../storage/key-codec.js';
-import { Collation, type SqlValue, compareValues, normalizeInt } from '../values.js';
+import { Collation, type SqlValue, TypedValue, compareValues, normalizeInt, typedBool } from '../values.js';
 import { type NestedTypeName, isNested, parseNested } from '../../shared/nested-types.js';
 import { compareCodePoints } from '../../shared/nested.js';
 import { isTemporal, temporalText } from '../../shared/temporal.js';
@@ -82,6 +82,26 @@ function common(ts: readonly StaticType[]): string {
   if (known.length === 0) return 'null';
   return known.every((t) => t === known[0]) ? known[0]! : 'any';
 }
+
+/**
+ * What a value of static type `t` becomes in an `any` place (ADR 0039): a `bool` or a list, struct or map keeps its
+ * type as a typed value; other values need nothing (null).
+ */
+export function toAny(t: string): ((v: SqlValue) => SqlValue) | null {
+  if (t === 'bool') return (v) => (v === null || v instanceof TypedValue ? v : typedBool(v !== 0 && v !== 0n));
+  if (isNested(t)) return (v) => (v instanceof Uint8Array && !(v instanceof TypedValue) ? new TypedValue(t, v) : v);
+  return null;
+}
+
+/** For each argument, what it becomes as an element of type `el`: typed when `el` is `any` (ADR 0039). */
+function asElements(args: readonly Pick<CompiledArg, 'type'>[], el: string): (((v: SqlValue) => SqlValue) | null)[] | null {
+  if (el !== 'any') return null;
+  const w = args.map((a) => toAny(a.type));
+  return w.some((f) => f !== null) ? w : null;
+}
+
+/** `vals` with each wrapped as `w` says (a fresh array). */
+const wrapAll = (vals: readonly SqlValue[], w: readonly (((v: SqlValue) => SqlValue) | null)[]): SqlValue[] => vals.map((v, i) => (w[i] ? w[i]!(v) : v));
 
 const sameAsFirst = (args: readonly Pick<CompiledArg, 'type'>[]): StaticType => args[0]!.type;
 const elementOf = (fn: string) => (args: readonly Pick<CompiledArg, 'type'>[]): StaticType => listOf(fn, args[0]!.type) as StaticType;
@@ -393,7 +413,10 @@ const LIST_SAMPLE: [string, ScalarFunction] = [
 const sumType = (el: string): StaticType => (el === 'int' || el === 'bool' ? 'int' : el === 'real' ? 'real' : 'num');
 
 const LIST_OPS: [string, ScalarFunction][] = [
-  op('list_of', 0, -1, (a) => `list<${common(a.map((x) => x.type)) === 'null' ? 'any' : common(a.map((x) => x.type))}>` as StaticType, () => (v) => encodeKey(v)),
+  op('list_of', 0, -1, (a) => `list<${common(a.map((x) => x.type)) === 'null' ? 'any' : common(a.map((x) => x.type))}>` as StaticType, (args) => {
+    const w = asElements(args, common(args.map((x) => x.type)));
+    return w ? (v) => encodeKey(wrapAll(v, w)) : (v) => encodeKey(v);
+  }),
   op('struct_of', 1, -1, (a) => `struct<${a.map((x, i) => `f${i} ${x.type === 'null' ? 'any' : x.type}`).join(', ')}>` as StaticType, () => (v) => encodeKey(v)),
   op('list_len', 1, 1, () => 'int', ([a]) => {
     listOf('list_len', a!.type);
@@ -576,9 +599,10 @@ const MAP_OPS: [string, ScalarFunction][] = [
   // map_of(k1, v1, k2, v2, …): a repeated key keeps its last value.
   op('map_of', 0, -1, (a) => mapType(common(a.filter((_, i) => i % 2 === 1).map((x) => x.type))), (args) => {
     if (args.length % 2 !== 0) throw mismatch('map_of takes keys and values in pairs');
+    const w = asElements(args, common(args.filter((_, i) => i % 2 === 1).map((x) => x.type))) ?? args.map(() => null);
     return (v) => {
       const entries: [string, SqlValue][] = [];
-      for (let i = 0; i < v.length; i += 2) entries.push([keyArg(v[i]!, 'map_of'), v[i + 1]!]);
+      for (let i = 0; i < v.length; i += 2) entries.push([keyArg(v[i]!, 'map_of'), w[i + 1] ? w[i + 1]!(v[i + 1]!) : v[i + 1]!]);
       return encodeEntries(entries);
     };
   }),
@@ -650,14 +674,18 @@ const MAP_OPS: [string, ScalarFunction][] = [
     const y = mapOf('map_merge', a[1]!.type);
     return mapType(x === 'null' ? y : y === 'null' ? x : x === y ? x : 'any');
   }, ([a, b]) => {
-    mapOf('map_merge', a!.type);
-    mapOf('map_merge', b!.type);
+    const tx = mapOf('map_merge', a!.type);
+    const ty = mapOf('map_merge', b!.type);
+    // Values of maps of different types merge into a map of `any`, where they keep their types (ADR 0039).
+    const differ = tx !== 'null' && ty !== 'null' && tx !== ty;
+    const wx = differ ? toAny(tx) : null;
+    const wy = differ ? toAny(ty) : null;
     return ([x, y]) => {
       if (x === null || y === null) return null;
       const ex = entriesOf(x, 'map_merge');
       const ey = entriesOf(y, 'map_merge');
-      const entries: [string, SqlValue][] = ex.keys.map((k, i) => [k, ex.vals[i]!]);
-      ey.keys.forEach((k, i) => entries.push([k, ey.vals[i]!]));
+      const entries: [string, SqlValue][] = ex.keys.map((k, i) => [k, wx ? wx(ex.vals[i]!) : ex.vals[i]!]);
+      ey.keys.forEach((k, i) => entries.push([k, wy ? wy(ey.vals[i]!) : ey.vals[i]!]));
       return encodeEntries(entries);
     };
   }),
@@ -678,7 +706,56 @@ const MAP_OPS: [string, ScalarFunction][] = [
 ];
 
 /** The list, struct and map operations, for the scalar function registry. */
-export const NESTED_FUNCTIONS: readonly [string, ScalarFunction][] = [...LIST_OPS, ...MORE_LIST_OPS, LIST_SAMPLE, ...MAP_OPS];
+// ------------------------------------------------------------------ values under `any` (ADR 0039)
+
+/** The type of a value as text: what a typed value keeps, else its kind. */
+function anyType(v: SqlValue): string {
+  if (v === null) return 'null';
+  if (v instanceof TypedValue) return v.type;
+  if (typeof v === 'bigint') return 'int';
+  if (typeof v === 'number') return Number.isInteger(v) ? 'int' : 'real';
+  return typeof v === 'string' ? 'text' : 'blob';
+}
+
+/** A typed list, struct or map's elements, each as an `any` element (typed where its type says). */
+function anyElements(v: TypedValue, n: NonNullable<ReturnType<typeof parseNested>>): SqlValue[] {
+  const vals = decodeKey(v);
+  if (n.kind === 'list') {
+    const w = toAny(n.of);
+    return w ? vals.map(w) : vals;
+  }
+  if (n.kind === 'map') {
+    const w = toAny(n.of);
+    return w ? vals.map((x, i) => (i % 2 === 1 ? w(x) : x)) : vals;
+  }
+  // A struct: its fields by name, sorted as a map's keys are.
+  const entries: [string, SqlValue][] = n.fields.map((f, i) => {
+    const w = toAny(f.type);
+    const x = vals[i] ?? null;
+    return [f.name, w ? w(x) : x];
+  });
+  return entries.sort((a, b) => compareCodePoints(a[0], b[0])).flat();
+}
+
+const ANY_OPS: [string, ScalarFunction][] = [
+  op('any_type', 1, 1, () => 'text', () => ([v]) => anyType(v!)),
+  // The value as a bool when it is one, else NULL.
+  op('any_bool', 1, 1, () => 'bool', () => ([v]) => (v instanceof TypedValue && v.type === 'bool' ? v[0]! : null)),
+  // A list as a list<any> (its elements keep their types), else NULL.
+  op('any_list', 1, 1, () => 'list<any>' as StaticType, () => ([v]) => {
+    if (!(v instanceof TypedValue)) return null;
+    const n = isNested(v.type) ? parseNested(v.type) : null;
+    return n && n.kind === 'list' ? encodeKey(anyElements(v, n)) : null;
+  }),
+  // A map, or a struct by field name, as a map<text, any>, else NULL.
+  op('any_map', 1, 1, () => 'map<text, any>' as StaticType, () => ([v]) => {
+    if (!(v instanceof TypedValue)) return null;
+    const n = isNested(v.type) ? parseNested(v.type) : null;
+    return n && n.kind !== 'list' ? encodeKey(anyElements(v, n)) : null;
+  }),
+];
+
+export const NESTED_FUNCTIONS: readonly [string, ScalarFunction][] = [...LIST_OPS, ...MORE_LIST_OPS, LIST_SAMPLE, ...MAP_OPS, ...ANY_OPS];
 
 // ------------------------------------------------------------------ implode
 
@@ -707,6 +784,8 @@ export const IMPLODE: AggregateFunction = {
 
 function jsonOf(t: string, v: SqlValue): string {
   if (v === null) return 'null';
+  // A typed value (ADR 0039) prints as its type does.
+  if (v instanceof TypedValue && t === 'any') return v.type === 'bool' ? (v[0] ? 'true' : 'false') : jsonOf(v.type, v);
   if (t === 'bool') return v !== 0 && v !== 0n ? 'true' : 'false';
   if (isTemporal(t)) return JSON.stringify(temporalText(t, v));
   if (isNested(t) && v instanceof Uint8Array) return nestedJson(t, v);
@@ -716,6 +795,9 @@ function jsonOf(t: string, v: SqlValue): string {
   if (typeof v === 'string') return JSON.stringify(v);
   return JSON.stringify(Array.from(v as Uint8Array, (b) => b.toString(16).padStart(2, '0')).join(''));
 }
+
+/** The JSON text of a typed value (ADR 0039): `true`, `[1,2]`, `{"a":1}`. */
+export const typedJson = (v: TypedValue): string => jsonOf('any', v);
 
 /** The JSON text of a list, struct or map value: `[1,2]`, `{"x":1,"y":"a"}`; integers beyond 2^53 exact, blobs as hex. */
 export function nestedJson(t: NestedTypeName, bytes: Uint8Array): string {

@@ -33,7 +33,7 @@ Three rules run through the format:
 | `text` | strings |
 | `blob` | `Uint8Array` |
 | `null` | only NULL |
-| `any` | not known until run time |
+| `any` | not known until run time; a `bool`, list, struct or map there keeps its type ([ADR 0039](../../adr/0039-typed-values-under-any.md)) |
 
 A type is what the engine knows of a value ahead of time, used to pick specialized code: a value may always be NULL.
 
@@ -438,6 +438,20 @@ entries in key order, so results come back in that order.
 | `map_remove` | 2: a map, a list of keys | The map without those keys |
 
 `cast_text` of a map gives a JSON object: `{"a":1,"b":"x"}`.
+
+**Values under `any`** ([ADR 0039](../../adr/0039-typed-values-under-any.md)) keep their type: a `bool`, list, struct or
+map that becomes an element of a `list<any>` or a value of a `map<text, any>` (`list_of` and `map_of` of mixed types,
+`map_merge` of maps of different types, JavaScript `true`, arrays and objects given for them) is a typed value. It is
+stored, sorted (after blobs, by type, then by value), grouped and indexed as itself, never equal to `1` or to a blob,
+and results give it as JavaScript (`true`, an array, an object); `cast_text` gives its JSON text. A typed `bool` is true
+or false where a condition is tested.
+
+| Function | Arguments | Meaning |
+|---|---|---|
+| `any_type` | 1 | The value's type as text: `null`, `int`, `real`, `text`, `blob`, `bool`, or its list, struct or map type |
+| `any_bool` | 1 | The value as a `bool` when it is one, else NULL |
+| `any_list` | 1 | A list as a `list<any>` (its elements keep their types), else NULL |
+| `any_map` | 1 | A map, or a struct by field name, as a `map<text, any>`, else NULL |
 
 **Aggregate and window functions** are named the same way (`sum`, `rank`, …) in `AggCall` and `WindowCall`. `implode` gives a group's values as a list, in the group's order, NULLs included.
 

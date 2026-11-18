@@ -31,7 +31,8 @@ value.
 
 - **Equality and order come free.** Equal maps have equal bytes, so grouping, `DISTINCT`, joins, hashing and index keys
   work unchanged. Maps order entry by entry, by key then value.
-- **Values** are any engine value, NULL included, and nested lists, structs and maps.
+- **Values** are any engine value, NULL included, and nested lists, structs and maps. (Under `map<text, any>`, a
+  `bool` or a nested value keeps its type only as ADR 0039's typed value; before it, it was 0/1 or bare bytes.)
 - **No new run-time value kind and no new record tag.** Records, columnar chunks, the protocol and code generation see
   a blob, as they do for lists and structs.
 

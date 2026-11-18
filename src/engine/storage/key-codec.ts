@@ -32,7 +32,7 @@ import { CorruptionError } from '../errors.js';
  * ({@link rowidSuffixStart}).
  */
 
-import { Collation, type SqlValue } from '../values.js';
+import { Collation, type SqlValue, TypedValue } from '../values.js';
 
 export { Collation, type SqlValue };
 
@@ -52,6 +52,8 @@ const TAG_POS_HUGE = 0x86;
 const TAG_NAN = 0x87;
 const TAG_TEXT = 0x90;
 const TAG_BLOB = 0xa0;
+/** A typed value (ADR 0039): its type's text, then its bytes, each escaped as a blob's are. Sorts after blobs. */
+const TAG_TYPED = 0xb0;
 const TINY_BIAS = 1100;
 
 /** One byte past every NULL component: a lower bound that skips NULLs of an ascending column. */
@@ -99,7 +101,11 @@ export class KeyEncoder {
     else if (typeof value === 'number') this.addNumber(value);
     else if (typeof value === 'bigint') this.addBigInt(value);
     else if (typeof value === 'string') this.addTextRaw(value, col?.collation ?? Collation.Binary);
-    else this.addEscaped(TAG_BLOB, value, value.length);
+    else if (value instanceof TypedValue) {
+      const t = textEncoder.encode(value.type);
+      this.addEscaped(TAG_TYPED, t, t.length);
+      this.addEscaped(-1, value, value.length);
+    } else this.addEscaped(TAG_BLOB, value, value.length);
     if (col?.desc) this.invert(start);
     return this;
   }
@@ -262,7 +268,7 @@ export class KeyEncoder {
     this.ensure(2 * n + 3);
     const b = this.buf;
     let o = this.len;
-    b[o++] = tag;
+    if (tag >= 0) b[o++] = tag;
     for (let i = 0; i < n; i++) {
       const c = src[i];
       b[o++] = c;
@@ -437,28 +443,38 @@ export function decodeKey(key: Uint8Array, cols?: readonly KeyColumn[]): SqlValu
       out.push(u >= 0 ? u : decodeNumber(key, pos, flip, tag));
       pos = decPos;
     } else if (tag === TAG_TEXT || tag === TAG_BLOB) {
-      const bytes: number[] = [];
-      pos++;
-      for (;;) {
-        if (pos >= key.length) throw new CorruptionError('unterminated key component');
-        const c = key[pos++] ^ flip;
-        if (c === 0) {
-          const nx = key[pos++] ^ flip;
-          if (nx === 0) break;
-          if (nx !== 0xff) throw new CorruptionError('invalid escape in key');
-          bytes.push(0);
-        } else {
-          bytes.push(c);
-        }
-      }
-      const u8 = Uint8Array.from(bytes);
+      const u8 = unescape(key, pos + 1, flip);
+      pos = decPos;
       out.push(tag === TAG_TEXT ? textDecoder.decode(u8) : u8);
+    } else if (tag === TAG_TYPED) {
+      const type = textDecoder.decode(unescape(key, pos + 1, flip));
+      out.push(new TypedValue(type, unescape(key, decPos, flip)));
+      pos = decPos;
     } else {
       throw new CorruptionError(`invalid key tag 0x${tag.toString(16)}`);
     }
     col++;
   }
   return out;
+}
+
+/** The escaped bytes at `pos` up to their 00 00 terminator; `decPos` is set past it. */
+function unescape(key: Uint8Array, pos: number, flip: number): Uint8Array {
+  const bytes: number[] = [];
+  for (;;) {
+    if (pos >= key.length) throw new CorruptionError('unterminated key component');
+    const c = key[pos++] ^ flip;
+    if (c === 0) {
+      const nx = key[pos++] ^ flip;
+      if (nx === 0) break;
+      if (nx !== 0xff) throw new CorruptionError('invalid escape in key');
+      bytes.push(0);
+    } else {
+      bytes.push(c);
+    }
+  }
+  decPos = pos;
+  return Uint8Array.from(bytes);
 }
 
 /** Offset where the rowid suffix of an index entry `key[...end]` starts (= end of the column part). */
