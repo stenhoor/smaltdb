@@ -225,3 +225,69 @@ describe('labels and types are case-sensitive', () => {
     ).toThrow(/label Y is listed twice/);
   });
 });
+
+describe('a graph whose labels ignore case (caseSensitive: false)', () => {
+  const graphOf = (caseSensitive: boolean) =>
+    op({
+      op: 'createPropertyGraph',
+      ifNotExists: false,
+      graph: { name: 'g', caseSensitive, nodes: [{ label: 'Person', table: 'person', id: 'id' }], edges: [{ type: 'KNOWS', table: 'knows', start: 'start', end: 'end' }] },
+    });
+  const add = (kind: 'addLabel' | 'addType', name: string, ifNotExists = false) =>
+    op({ op: 'alterPropertyGraph', name: 'g', ifNotExists, action: kind === 'addLabel' ? { kind, label: name } : { kind, type: name } });
+  const insensitive = (vfs?: MemoryVfs) => {
+    const db = vfs ? Database.openFile(vfs.openSync('a.db'), {}, vfs.openSync('a.db-wal')) : Database.openMemory();
+    db.exec('CREATE TABLE person(id INTEGER PRIMARY KEY); CREATE TABLE knows(start INTEGER, end INTEGER)');
+    db.queryPlan(graphOf(false));
+    db.queryPlan(addLabelIndex());
+    db.queryPlan(add('addLabel', 'Admin'));
+    db.exec('INSERT INTO person VALUES (1), (2)');
+    return db;
+  };
+
+  it('a label or type in another case is the same one', () => {
+    const db = insensitive();
+    expect(() => db.queryPlan(add('addLabel', 'person'))).toThrow(/already has label person/);
+    expect(() => db.queryPlan(add('addType', 'knows'))).toThrow(/already has relationship type knows/);
+    db.queryPlan(add('addLabel', 'ADMIN', true));
+    expect(db.catalog.graph('g')!.nodes.map((n) => n.label)).toEqual(['Person', 'Admin']);
+    expect(db.catalog.graph('g')!.caseSensitive).toBe(false);
+  });
+
+  it("a label index entry in another case is stored as the graph spells the label, and is one entry", () => {
+    const db = insensitive();
+    db.exec("INSERT INTO g_labels(node, label) VALUES (1, 'admin')");
+    db.exec("INSERT INTO g_labels(node, label) VALUES (2, 'ADMIN')");
+    db.exec("UPDATE g_labels SET label = 'aDmIn' WHERE node = 2");
+    expect(db.query('SELECT node, label FROM g_labels ORDER BY node').rows).toEqual([
+      [1, 'Admin'],
+      [2, 'Admin'],
+    ]);
+    expect(code(() => db.exec("INSERT INTO g_labels(node, label) VALUES (1, 'Admin')"))).toBe('SMALT_CONSTRAINT_UNIQUE');
+    expect(code(() => db.exec("INSERT INTO g_labels(node, label) VALUES (1, 'Nobody')"))).toBe('SMALT_CONSTRAINT_FOREIGNKEY');
+  });
+
+  it('a graph listing labels that differ only in case is refused', () => {
+    const db = Database.openMemory();
+    db.exec('CREATE TABLE a(id INTEGER PRIMARY KEY); CREATE TABLE b(id INTEGER PRIMARY KEY)');
+    expect(() =>
+      db.queryPlan(op({ op: 'createPropertyGraph', ifNotExists: false, graph: { name: 'h', caseSensitive: false, nodes: [{ label: 'X', table: 'a', id: 'id' }, { label: 'x', table: 'b', id: 'id' }], edges: [] } })),
+    ).toThrow(/label x is listed twice/);
+  });
+
+  it('keeps the setting when the database is reopened; a graph without it is case-sensitive', () => {
+    const vfs = new MemoryVfs();
+    insensitive(vfs).close();
+    const db = Database.openFile(vfs.openSync('a.db'), {}, vfs.openSync('a.db-wal'));
+    expect(db.catalog.graph('g')!.caseSensitive).toBe(false);
+    db.exec("INSERT INTO g_labels(node, label) VALUES (1, 'admin')");
+    expect(db.query('SELECT label FROM g_labels').rows).toEqual([['Admin']]);
+    expect(fresh().catalog.graph('g')!.caseSensitive).toBeUndefined();
+  });
+
+  it('caseSensitive is true or false', () => {
+    const db = Database.openMemory();
+    db.exec('CREATE TABLE a(id INTEGER PRIMARY KEY)');
+    expect(() => db.queryPlan(op({ op: 'createPropertyGraph', ifNotExists: false, graph: { name: 'h', caseSensitive: 'no', nodes: [{ label: 'X', table: 'a', id: 'id' }], edges: [] } }))).toThrow(/expected true or false/);
+  });
+});

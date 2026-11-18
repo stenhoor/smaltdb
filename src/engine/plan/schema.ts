@@ -159,6 +159,13 @@ export interface PropertyGraphDef {
    * and the tables it makes on first use are created with it.
    */
   readonly history?: 'versions' | 'log';
+  /**
+   * Whether labels and relationship types are case-sensitive (default true, as Cypher's are): `Person` and `person`
+   * are two labels. With false they are one: a graph can't have both, adding one finds the other, and a label index
+   * entry spelled in another case is stored as the graph spells the label. Set when the graph is created; table names
+   * ignore case either way.
+   */
+  readonly caseSensitive?: boolean;
 }
 
 /**
