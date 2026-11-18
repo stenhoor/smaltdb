@@ -3293,8 +3293,10 @@ export class Database implements FunctionContext {
     };
     if (g.nodes.length === 0) fail('a graph needs at least one node table');
     const seen = new Map<string, string>();
+    // Labels and relationship types are case-sensitive unless the graph says not (`caseSensitive: false`); table names
+    // never are.
     const unique = (what: string, name: string) => {
-      const k = `${what}:${name.toLowerCase()}`;
+      const k = `${what}:${what === 'table' || g.caseSensitive === false ? name.toLowerCase() : name}`;
       if (seen.has(k)) fail(`${what} ${name} is listed twice`);
       seen.set(k, name);
     };
@@ -3345,6 +3347,7 @@ export class Database implements FunctionContext {
       edges: g.edges.map((e) => ({ type: e.type, table: e.table, start: e.start, end: e.end, ...(e.props !== undefined ? { props: e.props } : {}) })),
       ...(l ? { labels: { table: l.table, node: l.node, label: l.label } } : {}),
       ...(g.history !== undefined ? { history: g.history } : {}),
+      ...(g.caseSensitive === false ? { caseSensitive: false } : {}),
     };
   }
 
@@ -3385,12 +3388,21 @@ export class Database implements FunctionContext {
     if (a.kind === 'addLabelIndex') return this.addLabelIndex(g, a.table, stmt.ifNotExists === true);
     const isLabel = a.kind === 'addLabel';
     const name = isLabel ? a.label : a.type;
-    const have = isLabel ? g.nodes.some((n) => n.label.toLowerCase() === name.toLowerCase()) : g.edges.some((e) => e.type.toLowerCase() === name.toLowerCase());
+    // Labels and types are case-sensitive (`Person` and `person` are two labels) unless the graph says not.
+    const same = g.caseSensitive === false ? (x: string) => x.toLowerCase() === name.toLowerCase() : (x: string) => x === name;
+    const have = isLabel ? g.nodes.some((n) => same(n.label)) : g.edges.some((e) => same(e.type));
     if (have) {
       if (stmt.ifNotExists) return none;
       throw new SmaltError('SMALT_ERROR', `property graph ${g.name} already has ${isLabel ? 'label' : 'relationship type'} ${name}`);
     }
-    const tableName = a.table ?? name;
+    // Named after the label or type unless given; when that name is a table of this graph already (a label differing
+    // only in case: table names ignore case), the first free `<name>_<n>`.
+    let tableName = a.table ?? name;
+    if (a.table === undefined && this.graphUsing(tableName.toLowerCase())?.toLowerCase() === g.name.toLowerCase()) {
+      let n = 2;
+      while (this.catalog.table(`${name}_${n}`, 'main')) n++;
+      tableName = `${name}_${n}`;
+    }
     const existing = this.catalog.table(tableName, 'main');
     let next: PropertyGraphDef;
     if (existing) {
@@ -4920,6 +4932,7 @@ export class Database implements FunctionContext {
         else rowid = (this.graphRules.involved(table) ? this.graphRules.nextNodeId(table) : null) ?? w.newRowid();
         if (table.rowidAlias >= 0) row[table.rowidAlias] = rowid;
         r[rowidReg] = rowid;
+        if (this.graphRules.involved(table)) this.graphRules.prepare(table, row);
         if (!this.validateRow(table, row, real, checks, r, base, mode, defaults)) return;
         if (upserts.length) {
           const done = this.applyUpsert(upserts, w, table, row, rowid, r, base, rowidReg, checks, defaults);
@@ -5039,6 +5052,7 @@ export class Database implements FunctionContext {
         next[table.rowidAlias] = newRowid;
       }
       r[rowidReg] = newRowid;
+      if (this.graphRules.involved(table)) this.graphRules.prepare(table, next);
       this.validateRow(table, next, real, checks, r, base, 'ABORT', defaults);
       w.resolveConflicts(next, newRowid, other, 'ABORT');
       w.updateRow(old, other, next, newRowid);
@@ -5101,6 +5115,7 @@ export class Database implements FunctionContext {
         const newRowid = this.toRowid(newRowidV, table);
         if (table.rowidAlias >= 0) next[table.rowidAlias] = newRowid;
         r[checkRowid] = newRowid;
+        if (this.graphRules.involved(table)) this.graphRules.prepare(table, next);
         if (!this.validateRow(table, next, real, checks, r, base, mode, defaults)) continue;
         if (!writer.resolveConflicts(next, newRowid, rowid, mode)) continue;
         writer.updateRow(old, rowid, next, newRowid);

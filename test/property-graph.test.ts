@@ -90,7 +90,7 @@ describe('creating a property graph', () => {
     [{ ...GRAPH, nodes: [{ label: 'Person', table: 'person', id: 'name' }] }, /id column person\.name is TEXT, not INTEGER/],
     [{ ...GRAPH, nodes: [{ label: 'Works', table: 'works_at', id: 'since' }] }, /id column works_at\.since must be the table's INTEGER PRIMARY KEY/],
     [{ ...GRAPH, nodes: [{ label: 'Person', table: 'person', id: 'id', props: 'name' }] }, /props column person\.name is TEXT, not a MAP/],
-    [{ ...GRAPH, nodes: [GRAPH.nodes[0]!, { label: 'person', table: 'company', id: 'id' }] }, /label person is listed twice/],
+    [{ ...GRAPH, nodes: [GRAPH.nodes[0]!, { label: GRAPH.nodes[0]!.label, table: 'company', id: 'id' }] }, new RegExp(`label ${GRAPH.nodes[0]!.label} is listed twice`)],
     [{ ...GRAPH, nodes: [GRAPH.nodes[0]!, { label: 'Other', table: 'person', id: 'id' }] }, /table person is listed twice/],
     [{ ...GRAPH, edges: [{ type: 'KNOWS', table: 'knows', start: 'a', end: 'nope' }] }, /table knows has no column nope/],
   ])('refuses a graph whose tables or columns are wrong (%#)', (graph, message) => {

@@ -84,6 +84,8 @@ interface Graph {
   /** Each node table's label, as the graph spells it. */
   labelOf: Map<TableSchema, string>;
   labelNames: Set<string>;
+  /** In a graph whose labels ignore case (`caseSensitive: false`): each label's spelling, by its lower case. */
+  spelling?: Map<string, string>;
   tableOf: Map<string, TableSchema>;
   /** The labels that keep copies. */
   copies: Set<string>;
@@ -116,6 +118,7 @@ export class GraphRules {
     this.dropPlans = new Map();
     for (const def of this.host.graphs()) {
       const graph: Graph = { name: def.name, nodes: [], labelOf: new Map(), labelNames: new Set(def.nodes.map((n) => n.label)), tableOf: new Map(), copies: new Set(), edges: [] };
+      if (def.caseSensitive === false) graph.spelling = new Map(def.nodes.map((n) => [n.label.toLowerCase(), n.label]));
       for (const n of def.nodes) {
         const t = this.host.getTable(n.table);
         if (!t) continue;
@@ -173,6 +176,19 @@ export class GraphRules {
       if (n > next) next = n;
     }
     return next;
+  }
+
+  /**
+   * Before a row is written to `table`: in a graph whose labels ignore case, a label index entry takes the graph's
+   * spelling of its label, so `person` is stored as `Person`.
+   */
+  prepare(table: TableSchema, row: SqlValue[]): void {
+    this.refresh();
+    const role = this.roles.get(table);
+    if (role?.kind !== 'labels' || !role.graph.spelling) return;
+    const at = role.labels.label;
+    const v = row[at];
+    if (typeof v === 'string') row[at] = role.graph.spelling.get(v.toLowerCase()) ?? v;
   }
 
   /** After a row is written to `table` (a new row, or a changed one: `old` is the row before). */
