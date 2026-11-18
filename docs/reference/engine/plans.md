@@ -333,6 +333,7 @@ picks the one it means. smaltdf, for example, divides with `div_float` where SQL
 | `regex_replace`, `regex_replace_all` | 3 or 4 | `text` with the first match, or every match, of `pattern` replaced by `replacement` (`$1`, `$&`) |
 | `starts_with`, `ends_with`, `contains` | 2 | Whether the first value starts with, ends with or contains the second (`bool`), comparing code points: case-sensitive, whatever the collation. Numbers are compared as their text; a blob on either side compares bytes. NULL gives NULL |
 | `split` | 2 | `text` cut at each `separator` (`list<text>`), keeping empty pieces; an empty separator gives the characters (code points). NULL gives NULL |
+| `raise_error` | 1 or 2: message, code | Fails the statement with `message`, as a language's own error (a type error, a failed check), with the code given (upper-case letters, digits and `_`) or `SMALT_ERROR`. It raises only when a row reaches it: in a `case` branch not taken, it doesn't. Its type is `any`; declare the type the expression needs |
 
 Patterns are JavaScript regular expressions in Unicode mode; the optional last argument gives flags among `i`, `m` and
 `s`. `length` counts code points. These operations are not inlined by code generation yet, nor are the checked and

@@ -621,6 +621,23 @@ export const scalarFunctions = new Map<string, ScalarFunction>([
       return encodeKey(sep === '' ? Array.from(s) : s.split(sep));
     }),
   ],
+  // raise_error(message[, code]): fails the statement with the message, as a language's own error (a Cypher type
+  // error, a failed check). Its code is SMALT_ERROR unless given (upper-case letters, digits and _). Never evaluated
+  // ahead of time: it raises only where a row reaches it, so a CASE branch not taken doesn't raise.
+  [
+    'raise_error',
+    simple(
+      1,
+      2,
+      'any',
+      ([m, c]) => {
+        const code = c === undefined || c === null ? 'SMALT_ERROR' : String(c);
+        if (!/^[A-Z][A-Z0-9_]*$/.test(code)) throw new SmaltError('SMALT_MISUSE', `raise_error: ${JSON.stringify(code)} is not an error code (upper-case letters, digits and _)`);
+        throw new SmaltError(code, m === null ? 'error' : String(m));
+      },
+      false,
+    ),
+  ],
   // `asOf` past a forgotten history (ADR 0033, decision 16): the commit, or an error when it is before the table's
   // horizon as it is when the statement runs (a plan made before a forget still checks).
   [
