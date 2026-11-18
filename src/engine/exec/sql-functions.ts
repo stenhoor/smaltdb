@@ -10,7 +10,7 @@
  */
 import type { FnTraits } from './traits.js';
 import { SmaltError } from '../errors.js';
-import { Collation, type SqlValue, compareValues, normalizeInt } from '../values.js';
+import { Collation, type SqlValue, TypedValue, compareValues, normalizeInt } from '../values.js';
 import {
   type StaticType,
   applyNumericAffinity,
@@ -30,7 +30,7 @@ import type { Fn } from './functions.js';
 import { arithOperandType, daysAsUs, isDateDifference, temporalArithType } from './temporal-ops.js';
 import { isTemporal, temporalText } from '../../shared/temporal.js';
 import { isNestedType } from '../../shared/nested-types.js';
-import { nestedJson } from './nested-ops.js';
+import { nestedJson, typedJson } from './nested-ops.js';
 
 /** One compiled argument. */
 export interface SqlArg {
@@ -737,6 +737,8 @@ const OPERATIONS: ReadonlyMap<string, SqlFunction> = new Map<string, SqlFunction
     // A list or struct as its JSON text (ADR 0020).
     if (isNestedType(xt)) return { fn: (r) => { const v = f(r); return v instanceof Uint8Array ? nestedJson(xt, v) : toText(v, false); }, type: 'text' };
     const xr = xt === 'real';
+    // A typed value under `any` (ADR 0039) as its JSON text, as its type would print.
+    if (xt === 'any') return { fn: (r) => { const v = f(r); return v instanceof TypedValue ? typedJson(v) : toText(v, xr); }, type: 'text' };
     return { fn: (r) => toText(f(r), xr), type: 'text' };
   }),
   fixed('cast_blob', 1, ([x]) => {

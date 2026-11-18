@@ -1,5 +1,5 @@
 import { CorruptionError } from '../errors.js';
-import { type SqlValue, normalizeInt } from '../values.js';
+import { type SqlValue, TypedValue, normalizeInt } from '../values.js';
 
 /**
  * Row record format (table B+tree values). See docs/STORAGE_FORMAT.md §3.
@@ -28,6 +28,8 @@ const TAG_INT = 1;
 const TAG_REAL = 2;
 const TAG_TEXT = 3;
 const TAG_BLOB = 4;
+/** A typed value (ADR 0039): its type's UTF-8, a 0 byte, then its bytes. */
+const TAG_TYPED = 5;
 
 const TWO_32 = 4294967296;
 const HI_SAFE_MIN = -2097152; // hi words whose int64 value is within ±2^53
@@ -116,6 +118,7 @@ export class RecordEncoder {
       const v = values[i];
       if (v === null) continue;
       if (typeof v === 'string') varBound += v.length * 3 + 1;
+      else if (v instanceof TypedValue) varBound += v.length + v.type.length * 3 + 2;
       else if (v instanceof Uint8Array) varBound += v.length + 1;
       else varBound += 9;
     }
@@ -210,6 +213,13 @@ function writeTagged(b: Uint8Array, dv: DataView, pos: number, v: SqlValue): num
       return pos + 1 + textEncoder.encodeInto(v, b.subarray(pos + 1)).written;
     default: {
       const blob = v as Uint8Array;
+      if (blob instanceof TypedValue) {
+        b[pos] = TAG_TYPED;
+        pos = pos + 1 + textEncoder.encodeInto(blob.type, b.subarray(pos + 1)).written;
+        b[pos] = 0;
+        b.set(blob, pos + 1);
+        return pos + 1 + blob.length;
+      }
       b[pos] = TAG_BLOB;
       b.set(blob, pos + 1);
       return pos + 1 + blob.length;
@@ -228,9 +238,18 @@ export function decodeTagged(b: Uint8Array, dv: DataView, start: number, end: nu
       return decodeUtf8(b, start + 1, end);
     case TAG_BLOB:
       return b.slice(start + 1, end);
+    case TAG_TYPED:
+      return decodeTyped(b, start, end);
     default:
       throw new CorruptionError(`invalid value tag ${b[start]}`);
   }
+}
+
+/** A typed value stored at [start, end), its tag at `start`. */
+function decodeTyped(b: Uint8Array, start: number, end: number): TypedValue {
+  const z = b.indexOf(0, start + 1);
+  if (z < 0 || z >= end) throw new CorruptionError('invalid typed value');
+  return new TypedValue(decodeUtf8(b, start + 1, z), b.subarray(z + 1, end));
 }
 
 /** Fast UTF-8 decode: short ASCII strings avoid TextDecoder call overhead. */
@@ -340,6 +359,8 @@ export class RecordReader {
         return decodeUtf8(b, start + 1, end);
       case TAG_BLOB:
         return b.slice(start + 1, end);
+      case TAG_TYPED:
+        return decodeTyped(b, start, end);
       default:
         throw new CorruptionError(`invalid value tag ${b[start]}`);
     }

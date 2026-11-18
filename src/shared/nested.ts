@@ -10,7 +10,7 @@
  * maps have equal bytes (ADR 0038).
  */
 import { decodeKey, encodeKey } from '../engine/storage/key-codec.js';
-import type { SqlValue } from '../engine/values.js';
+import { type SqlValue, TypedValue, typedBool } from '../engine/values.js';
 import { type NestedTypeName, isNested, parseNested } from './nested-types.js';
 import { isTemporal, parseDate, parseDatetime, parseTime, temporalText } from './temporal.js';
 
@@ -27,6 +27,12 @@ function elementValue(t: string, v: unknown, where: string): SqlValue {
   if (isNested(t)) {
     if (v instanceof Uint8Array) return v;
     return encodeNested(t, v, where);
+  }
+  // Under `any`, a boolean, an array or an object keeps its kind as a typed value (ADR 0039).
+  if (t === 'any') {
+    if (typeof v === 'boolean') return typedBool(v);
+    if (Array.isArray(v)) return new TypedValue('list<any>', encodeNested('list<any>', v, where));
+    if (isPlainObject(v) || v instanceof Map) return new TypedValue('map<text, any>', encodeNested('map<text, any>', v, where));
   }
   if (typeof v === 'boolean') return v ? 1 : 0;
   if (isTemporal(t)) {
@@ -106,6 +112,7 @@ export function compareCodePoints(a: string, b: string): number {
 /** A result value of an element of type `t`: bool as a boolean, dates and times as text, lists and structs as JS. */
 function resultElement(t: string, v: SqlValue): unknown {
   if (v === null) return null;
+  if (v instanceof TypedValue) return typedResult(v);
   if (t === 'bool') return v !== 0 && v !== 0n;
   if (isTemporal(t)) return temporalText(t, v);
   if (isNested(t) && v instanceof Uint8Array) return decodeNested(t, v);
@@ -128,6 +135,15 @@ export function decodeNested(t: NestedTypeName, bytes: Uint8Array): unknown {
   n.fields.forEach((f, i) => (out[f.name] = resultElement(f.type, vals[i] ?? null)));
   return out;
 }
+
+/** The JavaScript value of a typed value (ADR 0039): a boolean, or an array or object as its type decodes. */
+export function typedResult(v: TypedValue): unknown {
+  if (v.type === 'bool') return v[0] !== 0;
+  return isNested(v.type) ? decodeNested(v.type, v) : v;
+}
+
+/** `v` as a result where its static type is `any`: a typed value as JavaScript, anything else as it is. */
+export const anyResult = (v: SqlValue): unknown => (v instanceof TypedValue ? typedResult(v) : v);
 
 /** A result value of type `t`: decoded when `t` is a list or struct type and `v` its bytes. */
 export const nestedResult = (t: string, v: SqlValue): unknown => (v instanceof Uint8Array && isNested(t) ? decodeNested(t, v) : v);

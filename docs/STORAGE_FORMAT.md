@@ -82,7 +82,9 @@
     INTEGER, BOOLEAN (0 and 1, ADR 0018), DATE, DATETIME, TIME, DURATION (days and µs, ADR 0019) and REAL columns are
     fixed-width (8 bytes); the BOOLEAN and temporal columns are stored as an INTEGER is. LIST and STRUCT columns
     (ADR 0020) are variable-width and stored as an ANY column holding a BLOB is (tag byte and bytes): their value is a
-    sequence of key components (section 4) with no terminator.
+    sequence of key components (section 4) with no terminator. An ANY column's typed value (ADR 0039) is tag `5`, its
+    type's UTF-8, a `00` byte, then its bytes; a columnar chunk's tagged encoding gives it tag `5`, the type's length
+    and UTF-8, then the bytes' length and bytes.
   - Records carry the schema version so `ALTER TABLE ADD COLUMN` can be lazy.
 - Interior pages store **suffix-truncated** separator keys: the shortest prefix that separates two leaves.
 - **Leaf sibling pointers** support fast range scans in both directions.
@@ -145,7 +147,8 @@ interior cell:  u32 child | u16 keyLen | key
   (order-preserving byte strings), so a key comparison is a single `Uint8Array` compare loop.
 - Format 2 key encoding (`src/engine/storage/key-codec.ts`, ADR 0006):
   - NULL `0x01`; NaN `0x87`, after every number (Infinity included) and equal to itself (format 4, ADR 0018); TEXT
-    `0x90` + escaped collated UTF-8 + `00 00`; BLOB `0xA0` + escaped bytes + `00 00`.
+    `0x90` + escaped collated UTF-8 + `00 00`; BLOB `0xA0` + escaped bytes + `00 00`; a typed value under `any`
+    (format 4, ADR 0039) `0xB0` + its type's escaped UTF-8 + `00 00` + its escaped bytes + `00 00`, after every blob.
   - Numbers: a tag for sign and binary exponent (`0x46 + E` for positive E in 0..63, mirrored
     below `0x44` = zero for negatives; values below 1 or at least 2^64 add a 2-byte exponent),
     then the mantissa in 7-bit groups with a continuation bit (negative payloads inverted).

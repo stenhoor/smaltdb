@@ -36,7 +36,7 @@ import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import { type TemporalForm, type TemporalType, datetimeFromDate, isTemporal, rowsInForm, temporalText } from '../shared/temporal.js';
-import { type NestedTypeName, isNestedType, nestedResult } from '../shared/nested.js';
+import { type NestedTypeName, anyResult, isNestedType, nestedResult } from '../shared/nested.js';
 import type { ReaderSettings } from '../shared/protocol.js';
 import { describeTable, logicalCatalog } from './catalog/logical.js';
 import { outputTypes } from './plan/output.js';
@@ -5792,6 +5792,8 @@ export class RowCursor {
   private readonly temporals: readonly [number, TemporalType][];
   /** The list and struct columns (ADR 0020): given as JS arrays and objects. */
   private readonly nested: readonly [number, NestedTypeName][];
+  /** The columns typed `any`: a typed value in one (ADR 0039) is given as its JavaScript value. */
+  private readonly anys: readonly number[];
 
   constructor(
     readonly db: Database,
@@ -5807,6 +5809,7 @@ export class RowCursor {
     this.bools = boolColumns(columnTypes);
     this.temporals = temporalColumns(columnTypes);
     this.nested = columnTypes.flatMap((t, i): [number, NestedTypeName][] => (isNestedType(t) ? [[i, t]] : []));
+    this.anys = columnTypes.flatMap((t, i) => (t === 'any' ? [i] : []));
     if (plan) {
       try {
         plan.root.open(regs);
@@ -5826,7 +5829,7 @@ export class RowCursor {
     if (this.fixedRows) {
       if (this.i < this.fixedRows.length) {
         const row = this.fixedRows[this.i++];
-        return this.bools.length === 0 && this.temporals.length === 0 && this.nested.length === 0 ? row : this.converted(row.slice());
+        return this.bools.length === 0 && this.temporals.length === 0 && this.nested.length === 0 && this.anys.length === 0 ? row : this.converted(row.slice());
       }
       this.done = true;
       return null;
@@ -5850,7 +5853,7 @@ export class RowCursor {
     const r = this.regs;
     const row = new Array(out.length);
     for (let j = 0; j < out.length; j++) row[j] = r[out[j]];
-    return this.bools.length === 0 && this.temporals.length === 0 && this.nested.length === 0 ? row : this.converted(row);
+    return this.bools.length === 0 && this.temporals.length === 0 && this.nested.length === 0 && this.anys.length === 0 ? row : this.converted(row);
   }
 
   /** `row` with its bool and temporal columns as results give them. */
@@ -5858,6 +5861,7 @@ export class RowCursor {
     if (this.bools.length) asBooleans(row, this.bools);
     for (const [c, t] of this.temporals) row[c] = temporalText(t, row[c]);
     for (const [c, t] of this.nested) row[c] = nestedResult(t, row[c]) as SqlValue;
+    for (const c of this.anys) row[c] = anyResult(row[c]) as SqlValue;
     return row;
   }
 
