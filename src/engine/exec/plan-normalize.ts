@@ -14,6 +14,7 @@ import { SmaltError } from '../errors.js';
 import { planWidth } from './planner.js';
 import { parseNested } from '../../shared/nested-types.js';
 import type { PlanType } from '../plan/types.js';
+import { outputTypes } from '../plan/output.js';
 
 type Op<K extends PlanOp['op']> = Extract<PlanOp, { op: K }>;
 
@@ -103,6 +104,9 @@ function rewriteAll(x: unknown): unknown {
     case 'scan':
       // A scan as of a commit reads the table's history (ADR 0033 step 6).
       return op.asOf ? rewriteAll(asOfRows(op)) : op;
+    case 'sort':
+      // A sort of VALUES or a compound by expressions sorts by columns made for them.
+      return keyedSort(op);
     // Operations with no rewrite of their own (their inputs were rewritten above).
     case 'source':
     case 'iterate':
@@ -110,7 +114,6 @@ function rewriteAll(x: unknown): unknown {
     case 'values':
     case 'project':
     case 'filter':
-    case 'sort':
     case 'window':
     case 'setop':
     case 'append':
@@ -123,6 +126,25 @@ function rewriteAll(x: unknown): unknown {
       return unhandled;
     }
   }
+}
+
+/**
+ * A sort of VALUES or a compound by keys other than its columns. The planner sorts those by result position, as SQL's
+ * ORDER BY of a compound does, so the keys become columns: `project(sort(project(input, [cols, keys]), [positions]),
+ * [cols])`. Other sorts come back as they were.
+ */
+function keyedSort(op: Extract<PlanOp, { op: 'sort' }>): PlanOp {
+  const input = op.input;
+  if ((input.op !== 'values' && input.op !== 'setop') || op.keys.every((k) => k.expr.k === 'col' && k.expr.depth === 0)) return op;
+  const types = outputTypes(input, catalog?.types ?? (() => undefined));
+  const cols = types.map((type, index): PlanExpr => ({ k: 'col', input: 0, index, depth: 0, type, collation: 'binary' }));
+  const extra: PlanExpr[] = [];
+  const keys = op.keys.map((k) => {
+    if (k.expr.k === 'col' && k.expr.depth === 0) return k;
+    extra.push(k.expr);
+    return { ...k, expr: { k: 'col', input: 0, index: types.length + extra.length - 1, depth: 0, type: typeOf(k.expr), collation: 'binary' } as PlanExpr };
+  });
+  return { op: 'project', input: { op: 'sort', input: { op: 'project', input, exprs: [...cols, ...extra] }, keys }, exprs: cols };
 }
 
 /**
