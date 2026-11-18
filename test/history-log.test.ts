@@ -98,6 +98,17 @@ describe('both methods against a model', () => {
   }
 });
 
+describe('asOf a commit given as a subquery', () => {
+  it.each(['versions', 'log'])('%s: the commit may be any expression, a subquery too', (method) => {
+    const db = Database.openMemory();
+    db.queryPlan(create('t', method));
+    db.exec("INSERT INTO t VALUES (1, 'a'); UPDATE t SET v = 'b'");
+    const first = { k: 'subquery', mode: 'scalar', type: 'int', collation: 'binary', plan: { op: 'aggregate', input: { op: 'scan', table: 'smalt_commits', columns: [0] }, keys: [], aggs: [{ fn: 'min', args: [{ k: 'col', input: 0, index: 0, depth: 0, type: 'int', collation: 'binary' }], star: false, distinct: false, collation: 'binary', type: 'int' }], carry: [] } };
+    const r = db.queryPlan({ kind: 'query', plan: { op: 'scan', table: 't', columns: [0, 1], asOf: { commit: first } } } as unknown as PlanStatementInput).rows;
+    expect(r).toEqual([[1, 'a']]);
+  });
+});
+
 describe('the log', () => {
   it('appends each change with the row before it, and a rowid change as a delete and an insert', () => {
     const db = Database.openMemory();

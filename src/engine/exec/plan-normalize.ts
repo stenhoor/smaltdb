@@ -408,10 +408,11 @@ function logAsOf(op: Op<'scan'>, commit: PlanExpr, out: (from: number) => PlanEx
   const int = (value: number): PlanExpr => ({ k: 'lit', value, type: 'int' });
   // Rows unchanged since C.
   const table: PlanOp = { op: 'scan', table: op.table, ...(op.db ? { db: op.db } : {}), columns: [...op.columns, -1] };
-  const changes: PlanOp = { op: 'scan', table: log, columns: [0, 2] };
+  // The changes since C are filtered first: an anti join's condition can't hold the commit when it is a subquery.
+  const changes: PlanOp = { op: 'filter', input: { op: 'scan', table: log, columns: [0, 2] }, pred: cmp('cmp_gt', at(0, 0, 'int'), commit) };
   const unchanged: PlanOp = {
     op: 'project',
-    input: { op: 'join', kind: 'anti', inputs: [table, changes], on: { k: 'and', args: [cmp('cmp_eq', at(1, 1, 'int'), at(0, w, 'int')), cmp('cmp_gt', at(1, 0, 'int'), commit)] } },
+    input: { op: 'join', kind: 'anti', inputs: [table, changes], on: cmp('cmp_eq', at(1, 1, 'int'), at(0, w, 'int')) },
     exprs: out(0),
   };
   // Each changed row's first change since C: [rowid, sequence].
