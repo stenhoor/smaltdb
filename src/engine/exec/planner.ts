@@ -812,8 +812,9 @@ export class Planner {
       root = new ColumnValues(op.columns.map((c, i) => columnReader(c, op.types[i]!)), columnLength(op.columns[0]), regs);
     } else {
       const compiled = op.rows.map((r) => r.map((e) => compileBoundExpr(rebind(e, f, (m, g) => this.subqueryExpr(m, g)), this.env.funcCtx)));
-      regs = outRegs ?? compiled[0].map(() => this.regs.alloc());
-      columns = given ?? compiled[0].map((c, i) => ({ name: `column${i + 1}`, type: c.type, collation: Collation.Binary, affinity: 'NONE' as Affinity }));
+      // VALUES with no rows has its width and types from `types` alone.
+      regs = outRegs ?? op.types.map(() => this.regs.alloc());
+      columns = given ?? op.types.map((type, i) => ({ name: `column${i + 1}`, type: compiled[0]?.[i]?.type ?? type, collation: Collation.Binary, affinity: 'NONE' as Affinity }));
       root = new Values(compiled.map((r) => r.map((c) => c.fn)), regs);
     }
     if (sort) root = new Sort(root, sort.map((k) => ({ ...this.resultKey(k, regs, columns), collation: Collation.Binary })), regs, undefined, this.env.spill ?? null);

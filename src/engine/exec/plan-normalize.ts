@@ -105,7 +105,7 @@ function rewriteAll(x: unknown): unknown {
       // A scan as of a commit reads the table's history (ADR 0033 step 6).
       return op.asOf ? rewriteAll(asOfRows(op)) : op;
     case 'sort':
-      // A sort of VALUES or a compound by expressions sorts by columns made for them.
+      // A sort by expressions sorts by columns made for them.
       return keyedSort(op);
     // Operations with no rewrite of their own (their inputs were rewritten above).
     case 'source':
@@ -129,13 +129,13 @@ function rewriteAll(x: unknown): unknown {
 }
 
 /**
- * A sort of VALUES or a compound by keys other than its columns. The planner sorts those by result position, as SQL's
- * ORDER BY of a compound does, so the keys become columns: `project(sort(project(input, [cols, keys]), [positions]),
- * [cols])`. Other sorts come back as they were.
+ * A sort by keys other than its input's columns. The planner sorts by columns: a SELECT core's ORDER BY by its result
+ * columns and the extra ones made for its keys, VALUES and compounds by result position. So the keys become columns:
+ * `project(sort(project(input, [cols, keys]), [positions]), [cols])`. Sorts by columns come back as they were.
  */
 function keyedSort(op: Extract<PlanOp, { op: 'sort' }>): PlanOp {
   const input = op.input;
-  if ((input.op !== 'values' && input.op !== 'setop') || op.keys.every((k) => k.expr.k === 'col' && k.expr.depth === 0)) return op;
+  if (op.keys.every((k) => k.expr.k === 'col' && k.expr.depth === 0)) return op;
   const types = outputTypes(input, catalog?.types ?? (() => undefined));
   const cols = types.map((type, index): PlanExpr => ({ k: 'col', input: 0, index, depth: 0, type, collation: 'binary' }));
   const extra: PlanExpr[] = [];
