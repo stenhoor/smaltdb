@@ -81,7 +81,7 @@ const op: plan.SchemaOp = { op: 'createPropertyGraph', graph, ifNotExists: false
   the label index. See [per-label copies](#per-label-copies).
 - **The label index** (optional, `labels: { table, node, label }`): a node's other labels, one row each, with an
   `INTEGER` node column and a `TEXT` label column. See [nodes with several labels](#nodes-with-several-labels).
-- **Checks:** labels, types and tables are each listed once; a table belongs to one graph. Tables must be row tables in
+- **Checks:** labels, types (case-sensitive) and tables are each listed once; a table belongs to one graph. Tables must be row tables in
   `main`, not views, materialized views, external or columnar tables.
 - **Names:** graphs have their own names, apart from tables'.
 - **Protection:** while a graph exists, its tables can't be dropped or renamed, and the columns it names can't be
@@ -117,11 +117,13 @@ A language adds a label or relationship type the first time it writes one (ADR 0
 
 - **`addLabel`:** the label's table, named `table` or after the label, gets `id INTEGER PRIMARY KEY` and
   `props map<text, any>`.
+- **Names are case-sensitive:** `Person` and `person` are two labels (or types), as in Cypher. Table names are not, so
+  a label or type named like a table of the graph already gets the first free `<name>_<n>` (`person_2`).
 - **`addType`:** the type's table gets `start INTEGER`, `end INTEGER` and `props map<text, any>`, and indexes on `start`
   and on `end` (`<table>_start`, `<table>_end`), which the rules' lookups use.
 - **An existing table** of that name is adopted instead, if it has the conventional columns (`id`, or `start` and
   `end`, and optionally `props`) and passes the checks a new graph's tables pass.
-- **A label or type the graph has** is an error, or a no-op with `ifNotExists`.
+- **A label or type the graph has**, spelled the same, is an error, or a no-op with `ifNotExists`.
 - The graph's record is replaced in the same transaction, and is then shown as its definition (JSON): its original
   source text no longer describes it.
 

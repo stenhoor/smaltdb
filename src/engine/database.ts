@@ -3293,8 +3293,9 @@ export class Database implements FunctionContext {
     };
     if (g.nodes.length === 0) fail('a graph needs at least one node table');
     const seen = new Map<string, string>();
+    // Labels and relationship types are case-sensitive, as Cypher's are; table names are not.
     const unique = (what: string, name: string) => {
-      const k = `${what}:${name.toLowerCase()}`;
+      const k = `${what}:${what === 'table' ? name.toLowerCase() : name}`;
       if (seen.has(k)) fail(`${what} ${name} is listed twice`);
       seen.set(k, name);
     };
@@ -3385,12 +3386,20 @@ export class Database implements FunctionContext {
     if (a.kind === 'addLabelIndex') return this.addLabelIndex(g, a.table, stmt.ifNotExists === true);
     const isLabel = a.kind === 'addLabel';
     const name = isLabel ? a.label : a.type;
-    const have = isLabel ? g.nodes.some((n) => n.label.toLowerCase() === name.toLowerCase()) : g.edges.some((e) => e.type.toLowerCase() === name.toLowerCase());
+    // Labels and types are case-sensitive: `Person` and `person` are two labels.
+    const have = isLabel ? g.nodes.some((n) => n.label === name) : g.edges.some((e) => e.type === name);
     if (have) {
       if (stmt.ifNotExists) return none;
       throw new SmaltError('SMALT_ERROR', `property graph ${g.name} already has ${isLabel ? 'label' : 'relationship type'} ${name}`);
     }
-    const tableName = a.table ?? name;
+    // Named after the label or type unless given; when that name is a table of this graph already (a label differing
+    // only in case: table names ignore case), the first free `<name>_<n>`.
+    let tableName = a.table ?? name;
+    if (a.table === undefined && this.graphUsing(tableName.toLowerCase())?.toLowerCase() === g.name.toLowerCase()) {
+      let n = 2;
+      while (this.catalog.table(`${name}_${n}`, 'main')) n++;
+      tableName = `${name}_${n}`;
+    }
     const existing = this.catalog.table(tableName, 'main');
     let next: PropertyGraphDef;
     if (existing) {

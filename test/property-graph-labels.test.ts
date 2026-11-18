@@ -186,3 +186,42 @@ describe('the record', () => {
     db.close();
   });
 });
+
+describe('labels and types are case-sensitive', () => {
+  const add = (kind: 'addLabel' | 'addType', name: string, ifNotExists = false) =>
+    op({ op: 'alterPropertyGraph', name: 'g', ifNotExists, action: kind === 'addLabel' ? { kind, label: name } : { kind, type: name } });
+
+  it('a label or type that differs only in case is another one, with a table of its own', () => {
+    const db = fresh();
+    db.queryPlan(add('addLabel', 'person'));
+    db.queryPlan(add('addType', 'knows'));
+    const g = db.catalog.graph('g')!;
+    const tableOf = (label: string) => g.nodes.find((n) => n.label === label)?.table;
+    expect(tableOf('Person')).toBe('person');
+    // `person` is a table already (Person's): table names ignore case, so the new label's table is the first free one.
+    expect(tableOf('person')).toBe('person_2');
+    expect(g.edges.find((e) => e.type === 'knows')?.table).toBe('knows_2');
+    // Their entries in the label index are apart: a node has both labels.
+    db.exec("INSERT INTO g_labels(node, label) VALUES (1, 'person')");
+    expect(db.query("SELECT label FROM g_labels WHERE node = 1 ORDER BY label").rows).toEqual([['person']]);
+    expect(code(() => db.exec("INSERT INTO g_labels(node, label) VALUES (1, 'PERSON')"))).toBe('SMALT_CONSTRAINT_FOREIGNKEY');
+  });
+
+  it('adding a label or type with the same spelling is an error, or nothing with ifNotExists', () => {
+    const db = fresh();
+    expect(() => db.queryPlan(add('addLabel', 'Person'))).toThrow(/already has label Person/);
+    expect(() => db.queryPlan(add('addType', 'KNOWS'))).toThrow(/already has relationship type KNOWS/);
+    db.queryPlan(add('addLabel', 'Person', true));
+    expect(db.catalog.graph('g')!.nodes.filter((n) => n.label === 'Person').length).toBe(1);
+  });
+
+  it('a graph may list labels that differ only in case', () => {
+    const db = Database.openMemory();
+    db.exec('CREATE TABLE a(id INTEGER PRIMARY KEY); CREATE TABLE b(id INTEGER PRIMARY KEY); CREATE TABLE c(id INTEGER PRIMARY KEY); CREATE TABLE d(id INTEGER PRIMARY KEY)');
+    db.queryPlan(op({ op: 'createPropertyGraph', ifNotExists: false, graph: { name: 'h', nodes: [{ label: 'X', table: 'a', id: 'id' }, { label: 'x', table: 'b', id: 'id' }], edges: [] } }));
+    expect(db.catalog.graph('h')!.nodes.map((n) => n.label)).toEqual(['X', 'x']);
+    expect(() =>
+      db.queryPlan(op({ op: 'createPropertyGraph', ifNotExists: false, graph: { name: 'k', nodes: [{ label: 'Y', table: 'c', id: 'id' }, { label: 'Y', table: 'd', id: 'id' }], edges: [] } })),
+    ).toThrow(/label Y is listed twice/);
+  });
+});

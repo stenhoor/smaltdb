@@ -57,11 +57,14 @@ describe('adding a label', () => {
     expect(db.catalog.graph('g')!.nodes).toHaveLength(1);
   });
 
-  it('a label the graph has is an error, or a no-op with ifNotExists (case-insensitive)', () => {
+  it('a label the graph has, spelled the same, is an error, or a no-op with ifNotExists (labels are case-sensitive)', () => {
     const db = fresh();
-    expect(() => db.queryPlan(addLabel('person'))).toThrow(/already has label person/);
-    db.queryPlan(addLabel('PERSON', { ifNotExists: true }));
+    expect(() => db.queryPlan(addLabel('Person'))).toThrow(/already has label Person/);
+    db.queryPlan(addLabel('Person', { ifNotExists: true }));
     expect(db.catalog.graph('g')!.nodes).toHaveLength(1);
+    // Another case is another label (test/property-graph-labels.test.ts).
+    db.queryPlan(addLabel('PERSON', { ifNotExists: true }));
+    expect(db.catalog.graph('g')!.nodes.map((n) => n.label)).toEqual(['Person', 'PERSON']);
   });
 });
 
