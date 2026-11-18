@@ -714,9 +714,22 @@ function correlated(e: PlanExpr, depth: number): PlanExpr {
 /** A write's plan with its input normalized (an `append`'s rows; `update` and `delete` read their targets as given). */
 export function normalizeWrite(plan: PlanOp, types?: NormalizeCatalog): PlanOp {
   return withTypes(types, () => {
-    const op = rewrite(plan);
+    // An update's target rows: the order they are visited in changes nothing the update gives, and the planner takes
+    // their join region as joins, so an `ordered` join there is planned as a join.
+    const target = plan.op === 'update' ? { ...plan, input: unorderedJoins(plan.input) } : plan;
+    const op = rewrite(target);
     return op.op === 'append' && op.input ? { ...op, input: block(op.input) } : op;
   });
+}
+
+/** `op` with `ordered` dropped from the joins of its join region (its inputs, not the plans in its expressions). */
+function unorderedJoins(op: PlanOp): PlanOp {
+  if (op.op === 'join') {
+    const { ordered: _ordered, ...rest } = op;
+    return { ...rest, inputs: [unorderedJoins(op.inputs[0]), unorderedJoins(op.inputs[1])] };
+  }
+  if (op.op === 'filter' || op.op === 'project') return { ...op, input: unorderedJoins(op.input) };
+  return op;
 }
 
 /** LIMIT? ORDER BY? then a compound, VALUES, or DISTINCT? over a projected core. */
