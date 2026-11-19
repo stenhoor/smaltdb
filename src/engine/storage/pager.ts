@@ -266,6 +266,10 @@ export class Pager {
 
   /** Read-only snapshot reader (parallel reader workers): never writes. */
   private readOnly = false;
+  /** A read-only snapshot reader: it alone sees other connections' commits (refreshSnapshot). */
+  get snapshotReader(): boolean {
+    return this.readOnly;
+  }
 
   /**
    * Open a read-only reader of a database that another handle writes (in WAL mode). Its view is

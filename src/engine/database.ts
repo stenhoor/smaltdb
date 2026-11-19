@@ -1937,8 +1937,9 @@ export class Database implements FunctionContext {
    */
   private indexCache(t: TableSchema, idx: IndexSchema): IndexCache | undefined {
     if (INDEX_CACHE_OFF) return undefined;
-    // Checked on every seek: three numbers compared, the copy rebuilt only when one moved.
-    const commit = this.pager.commitId;
+    // Checked on every seek: three numbers compared, the copy rebuilt only when one moved. Commits matter only to a
+    // snapshot reader (another connection's): this connection's own writes are counted per table.
+    const commit = this.pager.snapshotReader ? this.pager.commitId : 0;
     const writes = writesOf(t);
     const rollbacks = this.pager.rollbacks;
     const had = this.indexCaches.get(idx.rootPage);
