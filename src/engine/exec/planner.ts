@@ -1,5 +1,5 @@
 import type { TableStats } from './stats.js';
-import { type FrameSpec, WINDOW_ARITY, Window, type WindowCallKind, type WindowDef } from './window.js';
+import { type FrameSpec, RowNumbers, streamsRowNumbers, WINDOW_ARITY, Window, type WindowCallKind, type WindowDef } from './window.js';
 
 let decorrelateOff: boolean | undefined;
 /** SMALT_NO_DECORRELATE=1 disables subquery decorrelation (tests compare both paths). */
@@ -1004,7 +1004,8 @@ export class Planner {
     }
 
     if (!agg) root = this.tryFuseScanFilter(root, scope);
-    if (windowDefs.length) {
+    if (windowDefs.length && streamsRowNumbers(windowDefs)) root = new RowNumbers(root, windowDefs);
+    else if (windowDefs.length) {
       // Registers the projection reads from each input row (restored by the Window operator).
       const snap = agg
         ? [...agg.groupRegs, ...agg.aggs.map((x) => x.outReg), ...agg.bare]

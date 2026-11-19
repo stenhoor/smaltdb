@@ -102,6 +102,54 @@ function offsetValue(fn: Fn | undefined, r: SqlValue[], which: 'starting' | 'end
   return v;
 }
 
+/**
+ * Windows whose calls are all `row_number()` over the whole input in input order (no PARTITION BY, no ORDER BY, no
+ * FILTER, no frame offset to check), as plans number their rows (an ordered join, aggregate or distinct): each row is
+ * numbered as it passes, without buffering the input. The same rows, in the same order, with the same numbers as
+ * {@link Window} gives them.
+ */
+export function streamsRowNumbers(defs: readonly WindowDef[]): boolean {
+  return defs.every((d) => d.partition.length === 0 && d.order.length === 0 && !d.frame.start.offset && !d.frame.end.offset && d.calls.every((c) => c.kind === 'row_number' && c.filter === undefined));
+}
+
+/** {@link Window} for windows {@link streamsRowNumbers} accepts. */
+export class RowNumbers implements Operator {
+  readonly kind = 'WINDOW';
+  readonly children: Operator[];
+  private r!: SqlValue[];
+  private n = 0;
+  private readonly outRegs: number[];
+
+  constructor(
+    readonly child: Operator,
+    defs: readonly WindowDef[],
+  ) {
+    this.children = [child];
+    this.outRegs = defs.flatMap((d) => d.calls.map((c) => c.outReg));
+  }
+
+  get detail(): string {
+    return '';
+  }
+
+  open(r: SqlValue[]): void {
+    this.r = r;
+    this.n = 0;
+    this.child.open(r);
+  }
+
+  next(): boolean {
+    if (!this.child.next()) return false;
+    const n = ++this.n;
+    for (let j = 0; j < this.outRegs.length; j++) this.r[this.outRegs[j]] = n;
+    return true;
+  }
+
+  close(): void {
+    this.child.close();
+  }
+}
+
 export class Window implements Operator {
   readonly kind = 'WINDOW';
   readonly children: Operator[];

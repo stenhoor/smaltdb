@@ -75,6 +75,10 @@ describe('window functions', () => {
       'SELECT id, total(y) OVER w2 FROM t WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER BY id ROWS 1 PRECEDING)',
       'SELECT * FROM (SELECT id, g, row_number() OVER (PARTITION BY g ORDER BY y DESC) AS r FROM t) WHERE r <= 2',
       'SELECT id, row_number() OVER () FROM t WHERE x > 5',
+      // row_number() over the whole input, numbered as rows pass: with a LIMIT, twice, over groups, in a correlated subquery.
+      'SELECT id, row_number() OVER (), row_number() OVER (ROWS UNBOUNDED PRECEDING) FROM t LIMIT 6',
+      'SELECT g, c, row_number() OVER () FROM (SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g)',
+      'SELECT id, (SELECT max(n) FROM (SELECT row_number() OVER () AS n FROM t AS u WHERE u.x = t.x)) FROM t',
       'SELECT x, count(*) OVER (PARTITION BY x) FROM t WHERE 0',
       'SELECT id, sum(x) OVER (ORDER BY id ROWS -1 PRECEDING) FROM t',
       'SELECT id, ntile(0) OVER () FROM t',
