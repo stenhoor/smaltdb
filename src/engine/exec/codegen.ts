@@ -532,6 +532,17 @@ export interface LoaderSpec {
   decode: readonly number[];
   /** Register(s) receiving the rowid, if any. */
   rowidRegs: readonly number[];
+  /** Values of map columns read by key (`map_get(col, key)`), decoded without the map: see TableAccess.useKey. */
+  keys?: readonly MapKeyRead[];
+}
+
+/** A map column's value at one key, decoded into a register. */
+export interface MapKeyRead {
+  readonly col: number;
+  readonly key: string;
+  /** The key's encoding (as a map's keys are stored). */
+  readonly enc: Uint8Array;
+  readonly reg: number;
 }
 
 export interface LoaderHelpers {
@@ -539,6 +550,11 @@ export interface LoaderHelpers {
   utf8: (b: Uint8Array, start: number, end: number) => string;
   tagged: (b: Uint8Array, dv: DataView, start: number, end: number) => SqlValue;
   rowid: (b: Uint8Array, off: number) => number | bigint;
+  /** The value at a key of the map stored at [start, end) (nested-ops.ts `mapValueAt`). */
+  mapKey: (b: Uint8Array, dv: DataView, start: number, end: number, enc: Uint8Array, key: string) => SqlValue;
+  /** The table access's map keys read (`LoaderSpec.keys`, in order): their encodings and names. */
+  keyEnc: readonly Uint8Array[];
+  keyName: readonly string[];
 }
 
 /** Cursor surface used by generated decoders. */
@@ -579,9 +595,10 @@ function emitDecode(spec: LoaderSpec, L: string[], assign: Assign = toRegister, 
   const bitmap = (n + 7) >>> 3;
   // Leaf cell header (see btree.ts): 1-byte key length (rowid keys are 8), 1- or 2-byte value field.
   L.push('const ko = off + (b[off + 1] < 128 ? 2 : 3); const vo = ko + b[off];');
-  if (spec.decode.length > 0) {
+  const keys = spec.keys ?? [];
+  if (spec.decode.length > 0 || keys.length > 0) {
     L.push(`const bm = vo + 3; const fx = bm + ${bitmap}; const vt = fx + ${spec.fixedSize};`);
-    const needsVar = spec.decode.some((_, i) => i % 2 === 0 && !(isInt64Storage(spec.types[spec.decode[i]]) || spec.types[spec.decode[i]] === 'REAL'));
+    const needsVar = keys.length > 0 || spec.decode.some((_, i) => i % 2 === 0 && !(isInt64Storage(spec.types[spec.decode[i]]) || spec.types[spec.decode[i]] === 'REAL'));
     if (needsVar) L.push(`const wide = (b[vo] & 1) === 1; const vd = vt + ${spec.varCount} * (wide ? 4 : 2);`);
     const endOf = (j: number): string => `(wide ? dv.getUint32(vt + ${4 * j}, true) : (b[vt + ${2 * j}] | (b[vt + ${2 * j + 1}] << 8)))`;
     const bounds = (col: number): ColBounds => {
@@ -611,6 +628,10 @@ function emitDecode(spec: LoaderSpec, L: string[], assign: Assign = toRegister, 
       }
       L.push(`if (${isNull}) { ${assign(reg, 'null')} } else { ${value} }`);
     }
+    keys.forEach((k, j) => {
+      const { isNull, st, fin } = bounds(k.col);
+      L.push(`if (${isNull}) { ${assign(k.reg, 'null')} } else { ${assign(k.reg, `H.mapKey(b, dv, ${st}, ${fin}, H.keyEnc[${j}], H.keyName[${j}])`)} }`);
+    });
   }
   if (spec.rowidRegs.length > 0) {
     L.push('{ const id = H.rowid(b, ko);');
@@ -623,7 +644,7 @@ function emitDecode(spec: LoaderSpec, L: string[], assign: Assign = toRegister, 
 function cellIsFast(spec: LoaderSpec): string {
   // Key length < 128, value field of at most 2 bytes without the overflow bit.
   const hdr = '(b[off] < 128 && (b[off + 1] & 1) === 0 && (b[off + 1] < 128 || b[off + 2] < 128))';
-  if (spec.decode.length === 0) return hdr;
+  if (spec.decode.length === 0 && !spec.keys?.length) return hdr;
   const vo = '(off + (b[off + 1] < 128 ? 2 : 3) + b[off])';
   return `${hdr} && (b[${vo} + 1] | (b[${vo} + 2] << 8)) === ${spec.types.length}`;
 }
@@ -642,7 +663,7 @@ const loaderBySpec = new WeakMap<Int32Array, Map<string, (H: LoaderHelpers) => L
 export function generateLoader(spec: LoaderSpec, helpers: LoaderHelpers): Loader {
   let byLayout = loaderBySpec.get(spec.slots);
   if (byLayout === undefined) loaderBySpec.set(spec.slots, (byLayout = new Map()));
-  const key = `${spec.decode.join(',')}|${spec.rowidRegs.join(',')}`;
+  const key = `${spec.decode.join(',')}|${spec.rowidRegs.join(',')}|${(spec.keys ?? []).map((k) => `${k.col}:${k.reg}:${k.key}`).join(',')}`;
   const known = traced ? undefined : byLayout.get(key);
   if (known !== undefined) return known(helpers);
   const L: string[] = [];
@@ -875,6 +896,7 @@ class Pipeline {
     const localRegs = this.localRegs;
     const decodedRegs = new Set<number>([...spec.rowidRegs]);
     for (let i = 1; i < spec.decode.length; i += 2) decodedRegs.add(spec.decode[i]);
+    for (const k of spec.keys ?? []) decodedRegs.add(k.reg);
     const mapCol = new Map<number, number>(); // reg -> MAP column decoded into it
     for (let i = 0; i < spec.decode.length; i += 2) if (spec.types[spec.decode[i]] === 'MAP') mapCol.set(spec.decode[i + 1], spec.decode[i]);
     const slowOnly = this.exactLines((c) => mapCol.has(c.reg));

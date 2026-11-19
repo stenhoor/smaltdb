@@ -175,6 +175,10 @@ export interface QueryPlan {
   correlated: boolean;
   /** Per result: marks it read where it is a column read lazily (`physical`'s aliased results). */
   uses?: ((() => void) | undefined)[];
+  /** Per result: the column it is (a register no operator of this plan saves and restores), for `keyReads`. */
+  origins?: (FromCell | undefined)[];
+  /** Registers of map keys read from the plan's tables for the enclosing query (`keyReads`): its rows carry them. */
+  keyRegs?: number[];
 }
 
 interface SourceColumn {
@@ -463,6 +467,8 @@ export class Planner {
       },
       release: (page) => pager.release(page as Frame),
       slow: (page, off, r) => access.loadCell(page, off, r),
+      keyEnc: access.keyEnc,
+      keyName: access.keyName,
     };
   }
 
@@ -482,6 +488,7 @@ export class Planner {
         const t = table.columns[spec.decode[i]].type;
         outs.push({ reg: spec.decode[i + 1], type: t === 'INTEGER' ? 'int' : t === 'REAL' ? 'real' : isInt64Storage(t) ? planTypeOfStorage(t) : 'any' });
       }
+      for (const k of spec.keys ?? []) outs.push({ reg: k.reg, type: 'any' });
       for (const reg of spec.rowidRegs) outs.push({ reg, type: 'int' });
       const fill = generateScanFilter(preds, outs, cap, () => access.loaderSpec(), helpers, pipelineCompiler(ctx));
       return { fill, regs: outs.map((o) => o.reg) };
@@ -570,6 +577,8 @@ export class Planner {
       },
       release: (page) => pager.release(page as Frame),
       slow: (page, off, r) => access.loadCell(page, off, r),
+      keyEnc: access.keyEnc,
+      keyName: access.keyName,
     };
     const run = generateFusedAggregate(preds, specs, { rows: () => access.loaderSpec() }, helpers, pipelineCompiler(ctx));
     return new FusedScanAggregate(access, aggs, run as (r: SqlValue[], states: AggregateState[]) => void);
@@ -723,11 +732,11 @@ export class Planner {
       return () => this.dryCompile || src.external?.projection?.add(src.cols[col].name.toLowerCase());
     };
     return {
-      bind: (e, m) => rebind(e, up(m), sub),
+      bind: (e, m) => this.keyReads(rebind(e, up(m), sub), scope),
       analysis: (e, m) => rebind(e, up(m)),
       fromRow,
       useOf,
-      fromSlot: (c) => slotFor(c, fromRow[c.index].reg, useOf(fromRow[c.index])),
+      fromSlot: (c) => cellSlot(slotFor(c, fromRow[c.index].reg, useOf(fromRow[c.index])), fromRow[c.index]),
     };
   }
 
@@ -752,7 +761,7 @@ export class Planner {
       (p: number): ColMap =>
       (c) => {
         const f = fromRow[c.input === 1 ? offsets[p] + c.index : c.index];
-        return slotFor(c, f.reg, useOf(f));
+        return cellSlot(slotFor(c, f.reg, useOf(f)), f);
       };
     return this.planFrom(scope, {
       items: leaves.map((l, p) => ({ item: planLeaf(l.op, p), joinType: JOIN_TYPES[l.join ?? 'inner'] })),
@@ -1073,8 +1082,10 @@ export class Planner {
     // Such a result's column is marked read only when the enclosing query reads it (`uses`), so a column no one reads
     // is not decoded. Not under DISTINCT, which reads every result.
     const uses: ((() => void) | undefined)[] = [];
+    const origins: (FromCell | undefined)[] = [];
     const compiled = s.project.slice(0, n).map((e, i) => {
       const b = bind(e, readSlot);
+      if (aliased && b.k === 'slot') origins[i] = cellOf.get(b);
       if (aliased && !s.distinct && b.k === 'slot' && b.use) {
         uses[i] = b.use;
         (b as { use?: () => void }).use = undefined;
@@ -1153,7 +1164,10 @@ export class Planner {
       const hint = s.limit ? topN(...limitFns()) : undefined;
       root = new Sort(root, sortKeys, [...regs, ...extraRegs], hint, this.env.spill ?? null);
     }
-    return { root: limit(root), outRegs: regs, columns, correlated: scope.correlated, ...(uses.length ? { uses } : {}) };
+    // Its results are their columns' registers where no operator here saves and restores rows (a sort, a window over
+    // rows, DISTINCT): then a map key read from one is read where its table's rows are loaded.
+    const restores = sortNeeded || !!s.distinct || (windowDefs.length > 0 && !streamsRowNumbers(windowDefs));
+    return { root: limit(root), outRegs: regs, columns, correlated: scope.correlated, ...(uses.length ? { uses } : {}), ...(origins.length && !restores ? { origins, keyRegs: [] } : {}) };
   }
 
   /**
@@ -1620,9 +1634,83 @@ export class Planner {
     scope.sources.push({ name, cols, rowidReg: -1, sub, joinType, position: scope.sources.length, ...(working ? { working: true } : {}) });
   }
 
+  /**
+   * `map_get(col, 'key')` on a map column of a row table, in `e`, read from the stored row into a register of its own
+   * (TableAccess.useKey), so the map isn't decoded (prototype). The column may come through FROM plans whose results are
+   * its register (`QueryPlan.origins`); their rows then carry the key's register (`keyRegs`).
+   */
+  private keyReads(e: BoundExpr, scope: Scope): BoundExpr {
+    if (KEYS_OFF || isOpaque(e)) return e;
+    if (e.k === 'call' && e.fn === 'map_get' && e.args.length === 2) {
+      const [m, k] = e.args;
+      if (m.k === 'slot' && k.k === 'lit' && typeof k.value === 'string') {
+        let cell = cellOf.get(m);
+        if (cell && scope.sources.includes(cell.src)) {
+          const via: QueryPlan[] = [];
+          while (cell && !cell.src.access && cell.src.sub?.origins) {
+            via.push(cell.src.sub);
+            cell = cell.src.sub.origins[cell.col];
+          }
+          const access = cell?.src.access;
+          const table = cell?.src.table;
+          // Only through FROM plans: a block's own map conditions keep the generated scans' map probes (codegen.ts).
+          if (via.length > 0 && cell && access && table && !isColumnar(table) && cell.col >= 0 && table.columns[cell.col]?.type === 'MAP') {
+            const key = k.value;
+            const col = cell.col;
+            let byKey = this.keyRegsOf.get(access);
+            if (byKey === undefined) this.keyRegsOf.set(access, (byKey = new Map()));
+            let reg = byKey.get(`${col}:${key}`);
+            if (reg === undefined) byKey.set(`${col}:${key}`, (reg = this.regs.alloc()));
+            const r = reg;
+            const use = (): void => {
+              if (this.dryCompile) return;
+              access.useKey(col, key, r);
+              for (const q of via) if (!q.keyRegs!.includes(r)) q.keyRegs!.push(r);
+            };
+            const slot: BoundExpr = { k: 'slot', reg: r, type: e.type, use };
+            const meta = getMeta(e);
+            if (meta) setMeta(slot, meta);
+            return slot;
+          }
+        }
+      }
+    }
+    let changed = false;
+    const sub = (x: BoundExpr): BoundExpr => {
+      const y = this.keyReads(x, scope);
+      if (y !== x) changed = true;
+      return y;
+    };
+    let out: BoundExpr;
+    switch (e.k) {
+      case 'call':
+      case 'and':
+      case 'or':
+        out = { ...e, args: e.args.map(sub) } as BoundExpr;
+        break;
+      case 'cast':
+      case 'not':
+      case 'isNull':
+        out = { ...e, arg: sub(e.arg) } as BoundExpr;
+        break;
+      case 'case':
+        out = { ...e, whens: e.whens.map((w) => ({ when: sub(w.when), then: sub(w.then) })), else: sub(e.else) } as BoundExpr;
+        break;
+      default:
+        return e;
+    }
+    if (!changed) return e;
+    const meta = getMeta(e);
+    if (meta) setMeta(out, meta);
+    return out;
+  }
+
+  private readonly keyRegsOf = new WeakMap<TableAccess, Map<string, number>>();
+
   private sourceRegs(src: Source): number[] {
     if (src.access) return src.access.registers();
-    return src.cols.map((c) => c.reg);
+    const regs = src.cols.map((c) => c.reg);
+    return src.sub?.keyRegs?.length ? [...regs, ...src.sub.keyRegs] : regs;
   }
 
   /** The source and column a bound slot reads, among `scope`'s sources. */
@@ -3317,6 +3405,13 @@ function rebind(e: BoundExpr, f: (c: ColRef) => BoundExpr, sub?: (n: BoundExpr, 
 }
 
 /** The register slot for column `c`, with its SQL metadata; `use` marks the column as read when compiled. */
+/** The column a slot reads (set where FROM columns are bound), for `keyReads`. */
+const cellOf = new WeakMap<BoundExpr, FromCell>();
+function cellSlot(slot: BoundExpr, cell: FromCell): BoundExpr {
+  cellOf.set(slot, cell);
+  return slot;
+}
+const KEYS_OFF = typeof process !== 'undefined' && !!process.env?.SMALT_NO_KEYS;
 const ALIAS_OFF = typeof process !== 'undefined' && !!process.env?.SMALT_NO_ALIAS;
 
 function slotFor(c: ColRef, reg: number, use?: () => void): BoundExpr {

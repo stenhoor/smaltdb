@@ -1,13 +1,14 @@
+import { mapGetValue, mapValueAt } from './nested-ops.js';
 import { type IndexCache, type IndexGroup, entriesWith } from './index-cache.js';
 import { SmaltError } from '../errors.js';
 import { type BTree, type BTreeCursor, leafCell } from '../storage/btree.js';
 import { compareKeyAt } from '../util/bytes.js';
 import { type Chunk, type ColumnStore, ROW_GROUP_ROWS, chunkValue, zoneMayMatch } from '../storage/columnar.js';
-import { KeyEncoder, type KeyColumn, KEY_AFTER_NULL, ROWID_KEY_SIZE, decodeKey, readIndexRowid, readRowidKey, rowidSuffixStart, writeRowidKey } from '../storage/key-codec.js';
+import { encodeKey, KeyEncoder, type KeyColumn, KEY_AFTER_NULL, ROWID_KEY_SIZE, decodeKey, readIndexRowid, readRowidKey, rowidSuffixStart, writeRowidKey } from '../storage/key-codec.js';
 import { type RecordReader, decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
-import { type LoaderHelpers, type LoaderSpec, type ScanState, codegenEnabled, generateLoader } from './codegen.js';
+import { type LoaderSpec, type MapKeyRead, type ScanState, codegenEnabled, generateLoader } from './codegen.js';
 
-const LOADER_HELPERS: LoaderHelpers = { readInt64, utf8: decodeUtf8, tagged: decodeTagged, rowid: readRowidKey };
+const LOADER_HELPERS = { readInt64, utf8: decodeUtf8, tagged: decodeTagged, rowid: readRowidKey, mapKey: mapValueAt };
 import { Collation, type SqlValue, compareValues } from '../values.js';
 import { applyNumericAffinity, hashKey, hashKeyMulti, toNumeric, truthy } from './convert.js';
 import { type Fn, isTrue } from './expr.js';
@@ -70,6 +71,20 @@ export class TableAccess {
     this.decode.push(col, reg);
   }
 
+  /** Map keys read without their map (`map_get(col, key)` into `reg`), and their encodings and names in that order. */
+  readonly keys: MapKeyRead[] = [];
+  readonly keyEnc: Uint8Array[] = [];
+  readonly keyName: string[] = [];
+
+  /** Ensure the value at `key` of map column `col` is decoded into `reg` (not the map). */
+  useKey(col: number, key: string, reg: number): void {
+    if (this.keys.some((k) => k.reg === reg)) return;
+    const enc = encodeKey([key]);
+    this.keys.push({ col, key, enc, reg });
+    this.keyEnc.push(enc);
+    this.keyName.push(key);
+  }
+
   useRowid(reg: number): void {
     if (this.rowidReg === -1) this.rowidReg = reg;
     else if (this.rowidReg !== reg) this.extraRowidRegs.push(reg);
@@ -98,12 +113,13 @@ export class TableAccess {
       varCount: layout.full.varCount,
       decode: this.decode,
       rowidRegs: this.rowidReg >= 0 ? [this.rowidReg, ...this.extraRowidRegs] : [],
+      ...(this.keys.length ? { keys: this.keys } : {}),
     };
   }
 
   private buildLoader(): ((c: BTreeCursor, r: SqlValue[]) => boolean) | null {
     if (!codegenEnabled()) return null;
-    return generateLoader(this.loaderSpec(), LOADER_HELPERS) as unknown as (c: BTreeCursor, r: SqlValue[]) => boolean;
+    return generateLoader(this.loaderSpec(), { ...LOADER_HELPERS, keyEnc: this.keyEnc, keyName: this.keyName }) as unknown as (c: BTreeCursor, r: SqlValue[]) => boolean;
   }
 
   /** Generic decode of the cell at `off` in leaf `page` (for generated scans' slow path). */
@@ -111,7 +127,7 @@ export class TableAccess {
     const d = this.decode;
     const cell = leafCell(page.bytes, off);
     const ko = cell.keyOffset;
-    if (d.length > 0) {
+    if (d.length > 0 || this.keys.length > 0) {
       let bytes = page.bytes;
       let start = ko + cell.keyLength;
       let len = cell.valueLength;
@@ -123,6 +139,7 @@ export class TableAccess {
       const rd = this.reader;
       rd.reset(bytes, start, len);
       for (let i = 0; i < d.length; i += 2) r[d[i + 1]] = rd.column(d[i]);
+      for (const k of this.keys) r[k.reg] = mapGetValue(rd.column(k.col), k.key);
     }
     if (this.rowidReg >= 0) {
       const id = readRowidKey(page.bytes, ko);
@@ -134,11 +151,12 @@ export class TableAccess {
   /** Generic decoder (always correct; used for overflow values, short records, and without codegen). */
   loadGeneric(c: BTreeCursor, r: SqlValue[]): void {
     const d = this.decode;
-    if (d.length > 0) {
+    if (d.length > 0 || this.keys.length > 0) {
       c.loadValue();
       const rd = this.reader;
       rd.reset(c.valueBytes, c.valueOffset, c.valueLength);
       for (let i = 0; i < d.length; i += 2) r[d[i + 1]] = rd.column(d[i]);
+      for (const k of this.keys) r[k.reg] = mapGetValue(rd.column(k.col), k.key);
     }
     if (this.rowidReg >= 0) {
       c.loadKey();
@@ -152,6 +170,7 @@ export class TableAccess {
   registers(): number[] {
     const regs: number[] = [];
     for (let i = 1; i < this.decode.length; i += 2) regs.push(this.decode[i]);
+    for (const k of this.keys) regs.push(k.reg);
     if (this.rowidReg >= 0) regs.push(this.rowidReg, ...this.extraRowidRegs);
     return regs;
   }
@@ -423,7 +442,8 @@ export class IndexScan implements Operator {
     if (this.cover === undefined) {
       const kc = this.spec.keyColumns;
       const d = this.access.decode;
-      let plan: { keyPos: number[]; regs: number[]; keyCols: KeyColumn[] } | null = kc ? { keyPos: [], regs: [], keyCols: this.spec.columns } : null;
+      // A map key read needs the row (the map isn't in an index key).
+      let plan: { keyPos: number[]; regs: number[]; keyCols: KeyColumn[] } | null = kc && this.access.keys.length === 0 ? { keyPos: [], regs: [], keyCols: this.spec.columns } : null;
       for (let i = 0; plan && i < d.length; i += 2) {
         const pos = kc!.indexOf(d[i]);
         if (pos < 0) plan = null;

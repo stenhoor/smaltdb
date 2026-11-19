@@ -295,3 +295,66 @@ describe('WHERE on a map key in a generated scan', () => {
     }
   });
 });
+
+/**
+ * `map_get(col, 'key')` read through FROM plans (planner.ts `keyReads`, prototype): the key's value is read from the
+ * stored row into a register of its own, without the map, and rows that pass through joins carry it. Against what
+ * decoding the whole map gives, on every key of every row (overflowing rows included).
+ */
+describe('map keys read through FROM plans', () => {
+  const db = stored();
+  const props = p.col(0, 1, M);
+  /** t's rows through a FROM plan of their own (a LIMIT keeps it one). */
+  const inner = (): PlanOp => p.limit(p.project(p.scan('t', [0, 1]), [p.col(0, 0, 'int'), props]), 1000);
+  const traced = <T>(f: () => T): { out: T; code: string } => {
+    traceGeneratedCode(true);
+    try {
+      const out = f();
+      return { out, code: traceGeneratedCode(false).join('\n') };
+    } finally {
+      traceGeneratedCode(false);
+    }
+  };
+
+  it('gives each key of each map, and reads it from the row', () => {
+    const { out: rows, code } = traced(() => db.queryPlan(p.project(inner(), [p.col(0, 0, 'int'), ...KEYS.map((k) => p.call('map_get', [props, p.lit(k)], 'any'))])).rows);
+    expect(code).toContain('H.mapKey(');
+    ROWS.forEach((row, i) => KEYS.forEach((k, j) => expect(rows[i]![1 + j], `${i} ${JSON.stringify(k)}`).toEqual(expected(row, k))));
+  });
+
+  it('on either side of a join, a LEFT join that finds nothing included', () => {
+    const ID = [0, 3, 5, 7, 9, 11, 42];
+    const ids = p.fromColumns([ID] as never, ['int']);
+    const K = ['name', 'age', 'tags', 'missing'];
+    const vals = (i: number | null) => K.map((k) => (i === null ? null : expected(ROWS[i]!, k)));
+    for (const kind of ['inner', 'left'] as const) {
+      // t's rows as the join's right side (a hash join builds them), and as its left.
+      for (const tLeft of [false, true]) {
+        const on = p.call('cmp_eq', [p.col(0, 0, 'int'), p.col(1, 0, 'int')], 'bool');
+        const join = tLeft ? p.join(kind, inner(), ids, on) : p.join(kind, ids, inner(), on);
+        const [tId, idsId, m] = tLeft ? [p.col(0, 0, 'int'), p.col(0, 2, 'int'), p.col(0, 1, M)] : [p.col(0, 1, 'int'), p.col(0, 0, 'int'), p.col(0, 2, M)];
+        const { out: rows, code } = traced(() => db.queryPlan(p.project(join, [tId, idsId, ...K.map((k) => p.call('map_get', [m, p.lit(k)], 'any'))])).rows);
+        expect(code, `${kind} ${tLeft}: the keys are read from the row`).toContain('H.mapKey(');
+        const inT = (i: number) => i < ROWS.length;
+        const want =
+          kind === 'inner'
+            ? ID.filter(inT).map((i) => [i, i, ...vals(i)])
+            : tLeft
+              ? ROWS.map((_, i) => [i, ID.includes(i) ? i : null, ...vals(i)])
+              : ID.map((j) => [inT(j) ? j : null, j, ...vals(inT(j) ? j : null)]);
+        const order = (r: unknown[][]) => [...r].sort((a, b) => ((a[0] ?? a[1]) as number) - ((b[0] ?? b[1]) as number));
+        expect(order(rows), `${kind} ${tLeft ? 't left' : 't right'}`).toEqual(order(want));
+      }
+    }
+  });
+
+  it('through a FROM plan that sorts its rows (read with the map), and in a GROUP BY', () => {
+    const sorted = p.sort(p.project(p.scan('t', [0, 1]), [p.col(0, 0, 'int'), props]), [{ ...p.asc(p.col(0, 0, 'int')), desc: true }]);
+    const rows = db.queryPlan(p.project(sorted, [p.col(0, 0, 'int'), p.call('map_get', [props, p.lit('name')], 'any')])).rows;
+    expect(rows).toEqual(ROWS.map((r, i) => [i, expected(r, 'name')]).reverse());
+    const grouped = db.queryPlan(p.aggregate(inner(), [p.call('map_get', [props, p.lit('name')], 'any')], [p.agg('count', [], 'int', { star: true })])).rows;
+    const counts = new Map<unknown, number>();
+    for (const r of ROWS) counts.set(expected(r, 'name'), (counts.get(expected(r, 'name')) ?? 0) + 1);
+    expect(new Map(grouped.map((r) => [r[0], r[1]]))).toEqual(counts);
+  });
+});

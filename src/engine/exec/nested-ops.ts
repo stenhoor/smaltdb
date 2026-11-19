@@ -5,6 +5,7 @@
  */
 import { SmaltError } from '../errors.js';
 import { compareSameKind, decodeComponent, decodeKey, encodeKey, skipComponent } from '../storage/key-codec.js';
+import { decodeTagged, isTaggedBlob } from '../storage/record.js';
 import { Collation, type SqlValue, TypedValue, compareValues, normalizeInt, typedBool } from '../values.js';
 import { type NestedTypeName, isNested, parseNested } from '../../shared/nested-types.js';
 import { compareCodePoints } from '../../shared/nested.js';
@@ -979,4 +980,21 @@ export function nestedJson(t: NestedTypeName, bytes: Uint8Array): string {
     return `{${parts.join(',')}}`;
   }
   return `{${n.fields.map((f, i) => `${JSON.stringify(f.name)}:${jsonOf(f.type, vals[i] ?? null)}`).join(',')}}`;
+}
+
+const mapGetFinder = new KeyFinder('map_get');
+
+/** `map_get(v, key)` on a map value. */
+export function mapGetValue(v: SqlValue, key: string): SqlValue {
+  return v === null ? null : (mapGetFinder.get(v, key) ?? null);
+}
+
+/**
+ * `map_get(m, key)` on the map column stored at [start, end) of a record (its tag first), without copying the map out
+ * of the page: the key found in place (`enc`: its encoding) and only its value decoded. The value is a copy.
+ */
+export function mapValueAt(b: Uint8Array, dv: DataView, start: number, end: number, enc: Uint8Array, key: string): SqlValue {
+  if (!isTaggedBlob(b, start)) return mapGetValue(decodeTagged(b, dv, start, end), key);
+  const at = findMapKey(b, start + 1, end, enc);
+  return at < 0 ? null : decodeComponent(b, at);
 }
