@@ -163,7 +163,8 @@ export type PlanOp = OpMeaning & (
       /**
        * Deduplicate on these output columns instead of the whole row (needs `distinct`): the first row seen for a key
        * wins or, with `order`, the lowest; a key taken from the queue is final (ADR 0033 G2). Shortest paths by hops
-       * (no `order`) or by a cost column (`order` on it) keep one row per node.
+       * (no `order`) or by a cost column (`order` on it) keep one row per node. Without `order`, a step's row whose key
+       * was seen may be dropped before its other columns are computed: an error one of them would raise is not.
        */
       readonly key?: readonly number[];
       /** Run the steps only for rows fewer than this many steps from `init`, whose rows are at depth 0. */

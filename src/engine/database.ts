@@ -15,7 +15,7 @@ import {
 import { MisuseError, SmaltError, constraintMessage, withDetails, wordError } from './errors.js';
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
 import type { ConflictAction, PlanOp } from './plan/ops.js';
-import { type EncodedPlan, canonicalJSON, decodeData, decodePlan, encodeData, encodePlan, planFromJSON, planToJSON } from './plan/codec.js';
+import { type EncodedPlan, canonicalJSON, decodeData, decodePlan, encodeData, encodePlan, plainJSON, planFromJSON, planToJSON } from './plan/codec.js';
 import { type PlanStatementInput, paramCount, toBoundStatement, toPlanStatement } from './plan/statement.js';
 import { type NormalizeCatalog, type TableTypes, normalizePlan, normalizeWrite } from './exec/plan-normalize.js';
 import { type ValidateCatalog, validatePlan, validateSchemaOp } from './plan/validate.js';
@@ -649,7 +649,16 @@ export class Database implements FunctionContext {
   /** @internal A compiled plan statement from the cache (or compiled and cached). */
   cachedPlan(stmt: PlanStatementInput): PlanStatement {
     this.checkOpen();
-    const key = canonicalJSON(stmt);
+    // The canonical text, found by the plain JSON text when it has one (the same statement run again, most often).
+    const plain = plainJSON(stmt);
+    let key = plain === null ? undefined : this.planKeys.get(plain);
+    if (key === undefined) {
+      key = canonicalJSON(stmt);
+      if (plain !== null) {
+        this.planKeys.set(plain, key);
+        if (this.planKeys.size > this.cacheSize) this.planKeys.delete(this.planKeys.keys().next().value!);
+      }
+    }
     let st = this.planCache.get(key);
     if (st) {
       this.planCache.delete(key);
@@ -663,6 +672,8 @@ export class Database implements FunctionContext {
   }
 
   private readonly planCache = new Map<string, PlanStatement>();
+  /** The canonical text of plan statements, by their plain JSON text ({@link plainJSON}). */
+  private readonly planKeys = new Map<string, string>();
 
   /** @internal Whether a plan statement reads memory-resident objects (as {@link usesMemoryObjects} for SQL). */
   planUsesMemoryObjects(bound: BoundStatement): boolean {

@@ -172,6 +172,40 @@ export function canonicalJSON(x: unknown): string {
   return JSON.stringify(sort(encode(x, true)));
 }
 
+/**
+ * `x`'s JSON text when it holds only JSON's own data (plain objects and arrays, strings, finite numbers, booleans,
+ * null), else null: {@link canonicalJSON}'s text but for the order of its objects' fields, and several times faster to
+ * make. Statement caches look up the canonical text by it.
+ */
+export function plainJSON(x: unknown): string | null {
+  return isPlainJSON(x) ? JSON.stringify(x) : null;
+}
+
+/** Whether `JSON.stringify` writes `x` as {@link encodeDataJSON} would, but for the order of its objects' fields. */
+function isPlainJSON(x: unknown): boolean {
+  switch (typeof x) {
+    case 'string':
+    case 'boolean':
+    case 'undefined':
+      return true;
+    case 'number':
+      return Number.isFinite(x);
+    case 'object':
+      break;
+    default:
+      return false;
+  }
+  if (x === null) return true;
+  if (Array.isArray(x)) {
+    for (let i = 0; i < x.length; i++) if (!isPlainJSON(x[i])) return false;
+    return true;
+  }
+  const proto = Object.getPrototypeOf(x);
+  if (proto !== Object.prototype && proto !== null) return false;
+  for (const k in x) if (!isPlainJSON((x as Record<string, unknown>)[k])) return false;
+  return true;
+}
+
 /** `plan` as JSON text. */
 export function planToJSON(plan: PlanOp): string {
   return JSON.stringify({ version: PLAN_FORMAT_VERSION, plan: encode(plan, true) });

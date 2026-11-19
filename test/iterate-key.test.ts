@@ -67,6 +67,24 @@ describe('iterate with key (ADR 0033 G2)', () => {
     expect(asMap(rows)).toEqual(bfs());
   });
 
+  it('without order, gives rows in the order a first-in, first-out search queues them, as it finds them', () => {
+    // The search in plain JS: each node's edges in rowid order (the order of edge_src's entries for one src).
+    const want: [number, number][] = [[1, 0]];
+    const seen = new Set([1]);
+    for (let i = 0; i < want.length; i++) {
+      for (const [s, d] of edges) if (s === want[i][0] && !seen.has(d)) (seen.add(d), want.push([d, want[i][1] + 1]));
+    }
+    expect(db.queryPlan(paths(10, false, { distinct: true, key: [0] })).rows).toEqual(want);
+    // A reader that stops at the first row it looks for stops the search there: the node found by the first row's
+    // steps is given before the other rows' steps run.
+    const found = want.find(([, hops]) => hops === 1)!;
+    const first = p.limit(p.filter(paths(11, false, { distinct: true, key: [0] }), p.call('cmp_eq', [col(0), int(found[0])], 'int')), 1);
+    expect(db.queryPlan(first).rows).toEqual([found]);
+    const analyzed = db.queryPlan({ kind: 'explain', mode: 'analyze', query: { kind: 'query', plan: first } } as never);
+    const loops = analyzed.rows.filter((r) => String(r[2]).startsWith('SEARCH edge') || String(r[2]).startsWith('SCAN edge')).map((r) => r[4]);
+    expect(loops).toEqual([1]);
+  });
+
   it('with order, the lowest row per key wins: shortest paths by weight (Dijkstra)', () => {
     const rows = db.queryPlan(paths(2, true, { distinct: true, key: [0], order: [p.asc(col(1))] })).rows;
     expect(rows.length).toBe(new Set(rows.map((r) => r[0])).size);
