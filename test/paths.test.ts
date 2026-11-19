@@ -198,3 +198,66 @@ describe('paths', () => {
     expect(printPlan(p.paths(p.values([[p.lit(1)]]), 0, edges, { mode: 'trail', maxHops: 3, selector: { shortest: 2 } })).split('\n')[0]).toBe('paths from 0 out over [e(0 -> 1)] hops 1..3 trail shortest 2');
   });
 });
+
+/**
+ * `paths` over a property graph's edge tables runs natively (exec/paths-op.ts) on in-memory copies of their `(start,
+ * end)` and `(end, start)` indexes: the same random graphs as above, checked against the enumeration and, row for row
+ * and in order, against `paths` over plain tables (lowered to `iterate`).
+ */
+describe('paths over a graph, run natively', () => {
+  const modes: Mode[] = ['walk', 'trail', 'acyclic', 'simple'];
+  const selectors: Selector[] = ['all', 'any', 'anyShortest', 'allShortest', { shortest: 2 }];
+  const dirs: Dir[] = ['out', 'in', 'both'];
+  const schema = (o: Record<string, unknown>) => ({ kind: 'schema', op: o }) as unknown as PlanStatementInput;
+  for (let seed = 1; seed <= 4; seed++) {
+    it(`random graph ${seed}: every mode, selector and direction, as the plain tables give them`, () => {
+      const e1 = randomGraph(seed, 5, 7);
+      const e2 = randomGraph(seed + 100, 5, 3);
+      const plain = Database.openMemory();
+      plain.exec('CREATE TABLE r1(a INTEGER, b INTEGER); CREATE TABLE r2(a INTEGER, b INTEGER)');
+      plain.exec(`INSERT INTO r1 VALUES ${e1.map(([a, b]) => `(${a}, ${b})`).join(', ')}`);
+      plain.exec(`INSERT INTO r2 VALUES ${e2.map(([a, b]) => `(${a}, ${b})`).join(', ')}`);
+      const graph = Database.openMemory();
+      graph.exec('CREATE TABLE n(id INTEGER PRIMARY KEY); INSERT INTO n VALUES (1), (2), (3), (4), (5)');
+      graph.queryPlan(schema({ op: 'createPropertyGraph', ifNotExists: false, graph: { name: 'g', nodes: [{ label: 'N', table: 'n', id: 'id' }], edges: [] } }));
+      graph.queryPlan(schema({ op: 'alterPropertyGraph', name: 'g', action: { kind: 'addType', type: 'R1', table: 'g1' } }));
+      graph.queryPlan(schema({ op: 'alterPropertyGraph', name: 'g', action: { kind: 'addType', type: 'R2', table: 'g2' } }));
+      graph.exec(`INSERT INTO g1(start, "end") VALUES ${e1.map(([a, b]) => `(${a}, ${b})`).join(', ')}`);
+      graph.exec(`INSERT INTO g2(start, "end") VALUES ${e2.map(([a, b]) => `(${a}, ${b})`).join(', ')}`);
+      const plainEdges = [
+        { table: 'r1', start: 0, end: 1 },
+        { table: 'r2', start: 0, end: 1 },
+      ];
+      const graphEdges = [
+        { table: 'g1', start: 0, end: 1 },
+        { table: 'g2', start: 0, end: 1 },
+      ];
+      const starts = [1, 3, null, 1];
+      const plan = (edges: typeof plainEdges, o: Options) => p.paths(p.values(starts.map((s) => [p.lit(s)])), 0, edges, o as never);
+      expect(printPlan(plan(graphEdges, {}) as never)).toContain('paths');
+      for (const mode of modes)
+        for (const selector of selectors)
+          for (const direction of dirs)
+            for (const [minHops, maxHops] of [
+              [1, 3],
+              [0, 2],
+              [2, undefined],
+            ] as const) {
+              const o: Options = { mode, selector, direction, minHops, ...(maxHops !== undefined ? { maxHops } : {}) };
+              if (mode === 'walk' && maxHops === undefined && selector !== 'any' && selector !== 'anyShortest') continue;
+              const got = pathsOf(graph, starts, graphEdges, o);
+              expect(summary(got, o), JSON.stringify(o)).toEqual(summary(reference([e1, e2], starts, o), o));
+              // The order `paths` promises: the input's, then shortest first; equally long paths in any order.
+              const promised = (rows: typeof got) => {
+                const keyed = rows.map((r, i) => ({ r, i }));
+                const runs: string[] = [];
+                for (const { r } of keyed) runs.push(`${r[0]}|${r[2]}`);
+                const sorted = [...rows].map((r) => JSON.stringify(r));
+                return { runs: runs.filter((x, i) => i === 0 || x !== runs[i - 1]), rows: sorted.sort() };
+              };
+              // Which of several paths `any`, `anyShortest` and `shortest k` keep is free (checked above by `summary`).
+              if (selector === 'all' || selector === 'allShortest') expect(promised(got), `${JSON.stringify(o)}: as over plain tables`).toEqual(promised(pathsOf(plain, starts, plainEdges, o)));
+            }
+    });
+  }
+});

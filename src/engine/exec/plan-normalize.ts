@@ -99,8 +99,8 @@ function rewriteAll(x: unknown): unknown {
       // Its rewrite is an ordered join: rewritten in turn.
       return rewriteAll(explodeRows(op));
     case 'paths':
-      // Its rewrite is an iterate joined back to the input in order: rewritten in turn.
-      return rewriteAll(pathRows(op));
+      // Planned as it is: natively where the edge tables' indexes have in-memory copies, else as `pathsAsIterate`.
+      return op;
     case 'scan':
       // A scan as of a commit reads the table's history (ADR 0033 step 6).
       return op.asOf ? rewriteAll(asOfRows(op)) : op;
@@ -472,6 +472,11 @@ function logAsOf(op: Op<'scan'>, commit: PlanExpr, out: (from: number) => PlanEx
  * the selected ones per input row and last node, ranked by hops. The paths are joined back to their input rows,
  * keeping the input's order.
  */
+/** `paths` as the recursive CTE `pathRows` makes it, normalized: where the planner can't run it natively. */
+export function pathsAsIterate(op: Op<'paths'>): PlanOp {
+  return block(rewriteAll(pathRows(op)) as PlanOp);
+}
+
 function pathRows(op: Op<'paths'>): PlanOp {
   const w = planWidth(op.input);
   const minHops = op.minHops ?? 1;
@@ -1006,6 +1011,9 @@ function from(op: PlanOp): PlanOp {
       return { ...op, args: op.args.map(expr), ...(op.named ? { named: Object.fromEntries(Object.entries(op.named).map(([k, v]) => [k, expr(v)])) } : {}) };
     case 'iterate':
       return { ...op, init: block(op.init), steps: op.steps.map(block), ...(op.limit ? { limit: expr(op.limit) } : {}), ...(op.offset ? { offset: expr(op.offset) } : {}) };
+    case 'paths':
+      // A FROM leaf: its input a block of its own.
+      return { ...op, input: block(op.input) };
     case 'values':
       // A single empty row is SQL's FROM-less SELECT; other VALUES are blocks of their own.
       return op.rows.length === 1 && op.rows[0].length === 0 ? op : block(op);
@@ -1022,7 +1030,6 @@ function from(op: PlanOp): PlanOp {
     case 'pivot':
     case 'unpivot':
     case 'explode':
-    case 'paths':
     case 'append':
     case 'update':
     case 'delete':

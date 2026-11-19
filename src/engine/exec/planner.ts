@@ -1,5 +1,8 @@
 import type { TableStats } from './stats.js';
 import type { IndexCache } from './index-cache.js';
+import { PathsScan, type PathStep } from './paths-op.js';
+import { pathsAsIterate } from './plan-normalize.js';
+import { PATH_TYPE } from '../plan/ops.js';
 import { type FrameSpec, RowNumbers, streamsRowNumbers, WINDOW_ARITY, Window, type WindowCallKind, type WindowDef } from './window.js';
 
 let decorrelateOff: boolean | undefined;
@@ -784,8 +787,9 @@ export class Planner {
    * steps of a recursive CTE share them).
    */
   private physicalAny(op: PlanOp, given: ResultColumnInfo[] | null, outer: ColMap | null, outRegs?: number[]): QueryPlan {
+    if (op.op === 'paths') return this.physicalPaths(op, given, outer, outRegs);
     if (flatShape(op)) return this.physical(op, given, outer, outRegs);
-    let n = op;
+    let n: PlanOp = op;
     const lim = n.op === 'limit' ? n : null;
     if (lim) n = lim.input;
     const sort = n.op === 'sort' ? n.keys : null;
@@ -820,6 +824,46 @@ export class Planner {
       plan.root = new Limit(plan.root, bind(lim.count), lim.offset ? bind(lim.offset) : undefined);
     }
     return plan;
+  }
+
+  /**
+   * `paths`: natively (exec/paths-op.ts) when each edge table has in-memory copies of its `(start, end)` and
+   * `(end, start)` indexes, else as the recursive CTE the normalizer makes of it.
+   */
+  private physicalPaths(op: Extract<PlanOp, { op: 'paths' }>, given: ResultColumnInfo[] | null, outer: ColMap | null, outRegs?: number[]): QueryPlan {
+    const steps: PathStep[] = [];
+    const env = this.env;
+    let native = !!env.indexCache;
+    for (let i = 0; native && i < op.edges.length; i++) {
+      const e = op.edges[i];
+      const t = env.getTable(e.table, e.db);
+      const idx = (a: number, b: number) => t?.indexes.find((x) => x.columns.length === 2 && x.columns[0].column === a && x.columns[1].column === b);
+      const out = idx(e.start, e.end);
+      const inn = idx(e.end, e.start);
+      if (!t || !out || !inn || !env.indexCache!(t, out) || !env.indexCache!(t, inn)) {
+        native = false;
+        break;
+      }
+      const ways = op.direction === 'out' ? [out] : op.direction === 'in' ? [inn] : [out, inn];
+      for (const x of ways) steps.push({ edge: i, cache: () => env.indexCache!(t, x) });
+    }
+    if (!native) return this.physicalAny(pathsAsIterate(op), given, outer, outRegs);
+    const input = this.physicalAny(op.input, null, outer);
+    const w = input.outRegs.length;
+    const regs = outRegs ?? Array.from({ length: w + 3 }, () => this.regs.alloc());
+    const col = (type: StaticType): ResultColumnInfo => ({ name: '', type, collation: Collation.Binary, affinity: 'NONE' });
+    const columns = given ?? [...input.columns, col('int'), col('int'), col(PATH_TYPE as StaticType)];
+    const root = new PathsScan(input.root, input.outRegs, input.outRegs[op.start], regs, {
+      steps,
+      edgeCount: op.edges.length,
+      minHops: op.minHops ?? 1,
+      maxHops: op.maxHops,
+      mode: op.mode ?? 'walk',
+      selector: op.selector ?? 'all',
+      loopsOnce: op.direction === 'both' && op.loopsOnce === true,
+      path: op.path !== false,
+    });
+    return { root, outRegs: regs, columns, correlated: input.correlated };
   }
 
   /** A compound's (or VALUES') ORDER BY key: a result position, with the result column's collation. */
@@ -3078,8 +3122,10 @@ function supportedLeaf(op: PlanOp, level: number): boolean {
     case 'sample':
     case 'pivot':
     case 'unpivot':
-    case 'explode':
+      return supportedPlan(op, level);
     case 'paths':
+      return supportedPlan(op.input, level);
+    case 'explode':
     case 'append':
     case 'update':
     case 'delete':

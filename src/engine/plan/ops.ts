@@ -280,6 +280,10 @@ export type PlanOp = OpMeaning & (
       readonly maxHops?: number;
       readonly mode?: 'walk' | 'trail' | 'acyclic' | 'simple';
       readonly selector?: 'all' | 'any' | 'anyShortest' | 'allShortest' | { readonly shortest: number };
+      /** With `both`: read a self-loop once (from its start), not once from each end. */
+      readonly loopsOnce?: boolean;
+      /** false: the path column is NULL (nothing reads it), sparing its making. */
+      readonly path?: boolean;
     }
   | {
       readonly op: 'unpivot';
