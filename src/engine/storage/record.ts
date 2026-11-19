@@ -245,6 +245,11 @@ export function decodeTagged(b: Uint8Array, dv: DataView, start: number, end: nu
   }
 }
 
+/** The ANY/NUMERIC (tagged) value stored at `start` is a blob (a list, struct or map's bytes follow the tag). */
+export function isTaggedBlob(b: Uint8Array, start: number): boolean {
+  return b[start] === TAG_BLOB;
+}
+
 /** A typed value stored at [start, end), its tag at `start`. */
 function decodeTyped(b: Uint8Array, start: number, end: number): TypedValue {
   const z = b.indexOf(0, start + 1);

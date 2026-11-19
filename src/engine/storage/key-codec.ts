@@ -442,12 +442,14 @@ export function decodeKey(key: Uint8Array, cols?: readonly KeyColumn[]): SqlValu
       const u = flip === 0 ? decodeSmallPos(key, pos) : -1;
       out.push(u >= 0 ? u : decodeNumber(key, pos, flip, tag));
       pos = decPos;
-    } else if (tag === TAG_TEXT || tag === TAG_BLOB) {
-      const u8 = unescape(key, pos + 1, flip);
+    } else if (tag === TAG_TEXT) {
+      out.push(flip === 0 ? decodeText(key, pos + 1) : textDecoder.decode(unescape(key, pos + 1, flip)));
       pos = decPos;
-      out.push(tag === TAG_TEXT ? textDecoder.decode(u8) : u8);
+    } else if (tag === TAG_BLOB) {
+      out.push(unescape(key, pos + 1, flip));
+      pos = decPos;
     } else if (tag === TAG_TYPED) {
-      const type = textDecoder.decode(unescape(key, pos + 1, flip));
+      const type = flip === 0 ? decodeText(key, pos + 1) : textDecoder.decode(unescape(key, pos + 1, flip));
       out.push(new TypedValue(type, unescape(key, decPos, flip)));
       pos = decPos;
     } else {
@@ -460,6 +462,14 @@ export function decodeKey(key: Uint8Array, cols?: readonly KeyColumn[]): SqlValu
 
 /** The escaped bytes at `pos` up to their 00 00 terminator; `decPos` is set past it. */
 function unescape(key: Uint8Array, pos: number, flip: number): Uint8Array {
+  if (flip === 0) {
+    // Most components hold no 0x00 byte, so no escape: one copy of the run.
+    const end = escapedEnd(key, pos);
+    if (escapes === 0) {
+      decPos = end + 2;
+      return key.slice(pos, end);
+    }
+  }
   const bytes: number[] = [];
   for (;;) {
     if (pos >= key.length) throw new CorruptionError('unterminated key component');
@@ -475,6 +485,109 @@ function unescape(key: Uint8Array, pos: number, flip: number): Uint8Array {
   }
   decPos = pos;
   return Uint8Array.from(bytes);
+}
+
+/** The number of escapes (00 FF) {@link escapedEnd} last passed. */
+let escapes = 0;
+
+/**
+ * Where the escaped run of an ascending component at `pos` ends: the offset of its 00 00 terminator. Sets `escapes`.
+ */
+function escapedEnd(key: Uint8Array, pos: number): number {
+  let n = 0;
+  const len = key.length;
+  for (;;) {
+    let at = pos;
+    while (at < len && key[at] !== 0) at++;
+    if (at + 1 >= len) throw new CorruptionError('unterminated key component');
+    const nx = key[at + 1];
+    if (nx === 0) {
+      escapes = n;
+      return at;
+    }
+    if (nx !== 0xff) throw new CorruptionError('invalid escape in key');
+    n++;
+    pos = at + 2;
+  }
+}
+
+/** Short ASCII text decodes faster by hand than through a TextDecoder call. */
+const SHORT_TEXT = 24;
+
+/** The text of an ascending text component whose bytes start at `pos`; `decPos` is set past it. */
+function decodeText(key: Uint8Array, pos: number): string {
+  const end = escapedEnd(key, pos);
+  if (escapes !== 0) return textDecoder.decode(unescape(key, pos, 0));
+  decPos = end + 2;
+  if (end - pos <= SHORT_TEXT) {
+    let s = '';
+    let i = pos;
+    for (; i < end; i++) {
+      const c = key[i];
+      if (c >= 0x80) break;
+      s += String.fromCharCode(c);
+    }
+    if (i === end) return s;
+  }
+  return textDecoder.decode(key.subarray(pos, end));
+}
+
+/**
+ * Where the ascending (not DESC) component that starts at `pos` ends, without decoding it. Lists, structs and maps
+ * are such components one after another (src/shared/nested.ts), so this walks them.
+ */
+export function skipComponent(key: Uint8Array, pos: number): number {
+  const tag = key[pos];
+  if (tag === TAG_NULL || tag === TAG_NAN || tag === TAG_ZERO) return pos + 1;
+  if (tag >= TAG_NEG_HUGE && tag <= TAG_POS_HUGE) {
+    let p = pos + 1;
+    if (tag === TAG_NEG_HUGE || tag === TAG_NEG_TINY || tag === TAG_POS_TINY || tag === TAG_POS_HUGE) p += 2;
+    // A negative number's mantissa bytes are inverted: its last byte has the low bit set.
+    const last = tag < TAG_ZERO ? 1 : 0;
+    for (;;) {
+      if (p >= key.length) throw new CorruptionError('truncated numeric key');
+      if ((key[p++] & 1) === last) return p;
+    }
+  }
+  if (tag === TAG_TEXT || tag === TAG_BLOB) return escapedEnd(key, pos + 1) + 2;
+  if (tag === TAG_TYPED) return escapedEnd(key, escapedEnd(key, pos + 1) + 2) + 2;
+  throw new CorruptionError(`invalid key tag 0x${tag === undefined ? 'end' : tag.toString(16)}`);
+}
+
+/** The value of the ascending component that starts at `pos`, as {@link decodeKey} gives it. */
+export function decodeComponent(key: Uint8Array, pos: number): SqlValue {
+  const tag = key[pos];
+  if (tag === TAG_TEXT) return decodeText(key, pos + 1);
+  if (tag === TAG_NULL) return null;
+  if (tag === TAG_NAN) return NaN;
+  if (tag >= TAG_NEG_HUGE && tag <= TAG_POS_HUGE) {
+    const u = decodeSmallPos(key, pos);
+    return u >= 0 ? u : decodeNumber(key, pos, 0, tag);
+  }
+  if (tag === TAG_BLOB) return unescape(key, pos + 1, 0);
+  if (tag === TAG_TYPED) {
+    const type = decodeText(key, pos + 1);
+    return new TypedValue(type, unescape(key, decPos, 0));
+  }
+  throw new CorruptionError(`invalid key tag 0x${tag === undefined ? 'end' : tag.toString(16)}`);
+}
+
+/**
+ * The order of the ascending component at `a[at]` against `b`, an encoded component (`b[0]` its tag), when both are
+ * numbers (NaN not included) or both text: negative, 0 or positive, as their bytes order, which is the numbers' order
+ * and the text's under BINARY. NaN when they are not of one of those kinds.
+ */
+export function compareSameKind(a: Uint8Array, at: number, b: Uint8Array): number {
+  const t = a[at];
+  const u = b[0];
+  const numbers = t >= TAG_NEG_HUGE && t <= TAG_POS_HUGE && u >= TAG_NEG_HUGE && u <= TAG_POS_HUGE;
+  if (!numbers && !(t === TAG_TEXT && u === TAG_TEXT)) return NaN;
+  // Components are prefix-free: two differ within the shorter, and equal bytes up to `b`'s end are `b`.
+  for (let j = 0; j < b.length; j++) {
+    const x = a[at + j];
+    if (x !== b[j]) return x === undefined ? -1 : x - b[j];
+  }
+  return 0;
 }
 
 /** Offset where the rowid suffix of an index entry `key[...end]` starts (= end of the column part). */
