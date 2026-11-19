@@ -34,7 +34,8 @@ import { FEATURE_HISTORY, FEATURE_PROPERTY_GRAPHS } from './storage/format.js';
 import { SYSTEM_TABLES, type StoredDef, type StoredText, type SystemTableName, decodeDef, describeDefinition, encodeDef, isDescribed, isSystemTable, systemTableText } from './catalog/stored.js';
 import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
-import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
+import { type ConflictMode, TableWriter, constraintError, writesOf } from './exec/write.js';
+import { IndexCache } from './exec/index-cache.js';
 import { type TemporalForm, type TemporalType, datetimeFromDate, isTemporal, rowsInForm, temporalText } from '../shared/temporal.js';
 import { type NestedTypeName, anyResult, isNestedType, nestedResult } from '../shared/nested.js';
 import type { ReaderSettings } from '../shared/protocol.js';
@@ -268,6 +269,9 @@ function roundTripOn(): boolean {
  */
 /** Root page numbers at or above this live in the memory store (see Database.mem). */
 const MEM_BASE = 2 ** 30;
+
+/** SMALT_NO_INDEX_CACHE: graph indexes are read from their B-trees only (to compare). */
+const INDEX_CACHE_OFF = !!(globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.SMALT_NO_INDEX_CACHE;
 
 export class Database implements FunctionContext {
   readonly pager: Pager;
@@ -1916,10 +1920,40 @@ export class Database implements FunctionContext {
       columnStore: (t) => this.storeOf(t, true),
       liveRows: (t) => this.liveRows(t),
       deletedRows: (t) => this.deletedRowsOf(t),
+      indexCache: (t, idx) => this.indexCache(t, idx),
       funcCtx: this,
       state: this.state,
       spill: this.spill,
     };
+  }
+
+  /** In-memory copies of graph tables' two-column indexes (exec/index-cache.ts), by index root page. */
+  private readonly indexCaches = new Map<number, { commit: number; writes: number; rollbacks: number; cache: IndexCache | undefined }>();
+
+  /**
+   * The in-memory copy of an index (exec/index-cache.ts), built or rebuilt when its table may have changed since: for
+   * the two-column indexes of a property graph's edge tables and label index. Undefined for other indexes, or with
+   * SMALT_NO_INDEX_CACHE set.
+   */
+  private indexCache(t: TableSchema, idx: IndexSchema): IndexCache | undefined {
+    if (INDEX_CACHE_OFF) return undefined;
+    // Checked on every seek: three numbers compared, the copy rebuilt only when one moved.
+    const commit = this.pager.commitId;
+    const writes = writesOf(t);
+    const rollbacks = this.pager.rollbacks;
+    const had = this.indexCaches.get(idx.rootPage);
+    if (had && had.commit === commit && had.writes === writes && had.rollbacks === rollbacks) return had.cache;
+    let cache: IndexCache | undefined;
+    if (idx.columns.length === 2 && !idx.where && idx.columns.every((c) => c.column >= 0 && !c.desc && c.collation === Collation.Binary)) {
+      const name = t.name.toLowerCase();
+      let graphTable = false;
+      for (const { graph } of this.graphs.values()) {
+        if (graph.edges.some((e) => e.table.toLowerCase() === name) || graph.labels?.table.toLowerCase() === name) graphTable = true;
+      }
+      if (graphTable) cache = IndexCache.build(this.tree(idx.rootPage), idx.columns.map((c) => ({ desc: c.desc, collation: c.collation })));
+    }
+    this.indexCaches.set(idx.rootPage, { commit, writes, rollbacks, cache });
+    return cache;
   }
 
 

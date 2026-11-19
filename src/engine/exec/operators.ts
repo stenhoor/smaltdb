@@ -1,3 +1,4 @@
+import { type IndexCache, type IndexGroup, entriesWith } from './index-cache.js';
 import { SmaltError } from '../errors.js';
 import { type BTree, type BTreeCursor, leafCell } from '../storage/btree.js';
 import { compareKeyAt } from '../util/bytes.js';
@@ -365,6 +366,11 @@ export interface IndexScanSpec {
    * (an expression, or text stored in a non-BINARY collated form). Enables index-only scans.
    */
   keyColumns?: number[];
+  /**
+   * An in-memory copy of a two-column index (exec/index-cache.ts), for a seek of equalities only: when it gives one and
+   * the seek reads the index alone, its entries come from the copy, in the index's order.
+   */
+  cache?: () => IndexCache | undefined;
 }
 
 /** Index range/equality scan followed by a table lookup per entry. */
@@ -493,8 +499,75 @@ export class IndexScan implements Operator {
     return true;
   }
 
+  /** A seek answered from the in-memory index (`spec.cache`): the group, the entries' positions in it, the next. */
+  private cached: { g: IndexGroup; at: number[] | null; i: number; end: number } | null = null;
+
+  /** Starts a seek from the in-memory index, when there is one for it: false to read the B-tree. */
+  private fromCache(): boolean {
+    this.cached = null;
+    const s = this.spec;
+    if (!s.cache || s.eq.length === 0 || s.eq.length > 2 || !this.covering()) return false;
+    const vals: SqlValue[] = [];
+    for (let i = 0; i < s.eq.length; i++) {
+      const v = s.convert[i](s.eq[i](this.r));
+      // Numbers (not bigints) and text are the keys the copy holds as the index compares them; others read the B-tree.
+      if (v !== null && typeof v !== 'number' && typeof v !== 'string') return false;
+      if (typeof v === 'number' && Number.isNaN(v)) return false;
+      vals.push(v);
+    }
+    const cache = s.cache();
+    if (!cache) return false;
+    if (vals[0] === null || (vals.length === 2 && vals[1] === null)) {
+      this.done = true;
+      return true;
+    }
+    const g = cache.group(vals[0]!);
+    if (!g) {
+      this.done = true;
+      return true;
+    }
+    if (vals.length === 2) {
+      const at = entriesWith(g, vals[1]!);
+      if (!at) {
+        this.done = true;
+        return true;
+      }
+      this.cached = { g, at, i: 0, end: at.length };
+    } else this.cached = { g, at: null, i: 0, end: g.rowids.length };
+    return true;
+  }
+
+  private nextCached(): boolean {
+    const k = this.cached!;
+    if (k.i >= k.end) return (this.done = true), false;
+    const j = k.at ? k.at[k.i++]! : k.i++;
+    const rowid = k.g.rowids[j]!;
+    const cover = this.cover!;
+    const r = this.r;
+    for (let i = 0; i < cover.regs.length; i++) {
+      const pos = cover.keyPos[i];
+      r[cover.regs[i]] = pos === 0 ? this.firstValue() : k.g.second[j]!;
+    }
+    const a = this.access;
+    if (a.rowidReg >= 0) {
+      r[a.rowidReg] = rowid;
+      for (const x of a.extraRowidRegs) r[x] = rowid;
+    }
+    return true;
+  }
+
+  /** The seek's value of the index's first column (every entry of the group has it). */
+  private firstValue(): SqlValue {
+    return this.spec.convert[0](this.spec.eq[0](this.r));
+  }
+
   next(): boolean {
     if (this.done) return false;
+    if (this.started && this.cached) return this.nextCached();
+    if (!this.started && this.fromCache()) {
+      this.started = true;
+      return this.done ? false : this.nextCached();
+    }
     if (this.unordered && !this.covering()) return this.nextSorted();
     const c = this.idx!;
     let ok: boolean;

@@ -1,4 +1,5 @@
 import type { TableStats } from './stats.js';
+import type { IndexCache } from './index-cache.js';
 import { type FrameSpec, RowNumbers, streamsRowNumbers, WINDOW_ARITY, Window, type WindowCallKind, type WindowDef } from './window.js';
 
 let decorrelateOff: boolean | undefined;
@@ -115,6 +116,8 @@ export interface PhysicalEnv {
   liveRows?(table: TableSchema): number;
   /** Columnar table: rowids hidden in its segments (read per scan), null when none. */
   deletedRows?(table: TableSchema): Set<number | bigint> | null;
+  /** An in-memory copy of an index (exec/index-cache.ts), for equality seeks; undefined where there is none. */
+  indexCache?(table: TableSchema, idx: IndexSchema): IndexCache | undefined;
   funcCtx: FunctionContext;
   state: ExecState;
   /** Scratch file for sorts and hash aggregates that outgrow work_mem (M7.2). */
@@ -1959,6 +1962,8 @@ export class Planner {
           lo: lo ? { fn: compileBoundExpr(lo.other, ctx).fn, inclusive: lo.op === '>=' } : undefined,
           hi: hi ? { fn: compileBoundExpr(hi.other, ctx).fn, inclusive: hi.op === '<=' } : undefined,
           convert: [...converters, ...(rangeConv ? [rangeConv] : [])],
+          // Equalities only: the seek may read an in-memory copy of the index, where the database keeps one.
+          ...(!lo && !hi && this.env.indexCache ? { cache: () => this.env.indexCache!(table, idx) } : {}),
           // Key columns usable for index-only scans: plain columns whose key form is the value itself.
           keyColumns: idx.columns.map((c) => {
             if (c.column < 0) return -1;

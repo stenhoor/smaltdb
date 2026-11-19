@@ -128,6 +128,8 @@ export class Pager {
    * reuses it only while this is unchanged (`BTreeCursor.seekNear`).
    */
   writes = 0;
+  /** Counts rollbacks (of a statement, a savepoint or a transaction): pages may then hold what they held before. */
+  rollbacks = 0;
   readonly pageSize: number;
   /** Bytes per page available to page formats (page size minus reserved trailer). */
   readonly usableSize: number;
@@ -649,6 +651,7 @@ export class Pager {
    */
   rollbackToSavepoint(depth: number, keep: boolean): void {
     this.writes++;
+    this.rollbacks++;
     this.checkDepth(depth);
     for (const f of this.frames) if (f.pins > 0) throw new MisuseError(`savepoint rollback with pinned page ${f.pgno}`);
     while (this.savepoints.length >= depth) {
@@ -702,6 +705,7 @@ export class Pager {
   /** Undo every change made since beginStatement. */
   rollbackStatement(): void {
     this.writes++;
+    this.rollbacks++;
     if (this.savepoints.length === 0) throw new MisuseError('no active statement');
     this.rollbackToSavepoint(this.savepoints.length, false);
   }
@@ -923,6 +927,7 @@ export class Pager {
   /** Discard all uncommitted changes. No page may be pinned. */
   rollback(): void {
     this.writes++;
+    this.rollbacks++;
     this.checkOpen();
     this.savepoints.length = 0;
     this.pending = null;

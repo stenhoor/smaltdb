@@ -42,6 +42,16 @@ function uniqueCheckOrder(indexes: readonly IndexSchema[]): number[] {
  * Row-level writes for one table: record encoding, rowid assignment, unique-constraint checks,
  * and secondary index maintenance. Callers coerce values and check NOT NULL / CHECK first.
  */
+/** Rows written to each table by this process's writers (`noteWrite`): a cache of a table's index checks it. */
+const tableWrites = new WeakMap<TableSchema, number>();
+function noteWrite(t: TableSchema): void {
+  tableWrites.set(t, (tableWrites.get(t) ?? 0) + 1);
+}
+/** How many rows this process has written to a table (by any writer of it). */
+export function writesOf(t: TableSchema): number {
+  return tableWrites.get(t) ?? 0;
+}
+
 export class TableWriter {
   readonly tree: BTree;
   private readonly indexTrees: BTree[];
@@ -296,6 +306,7 @@ export class TableWriter {
   /** Write a row whose conflicts were already resolved. */
   writeRow(row: SqlValue[], rowid: number | bigint): void {
     const t = this.table;
+    noteWrite(t);
     // Index keys first: evaluating an index expression or an oversized key fails before anything
     // is written, so a single-row INSERT needs no statement journal (Database.compile).
     const keys = this.newKeys;
@@ -329,6 +340,7 @@ export class TableWriter {
    * whose key is unchanged are left alone and a same-size record is overwritten in place.
    */
   updateRow(old: readonly SqlValue[], oldRowid: number | bigint, next: SqlValue[], newRowid: number | bigint): void {
+    noteWrite(this.table);
     if (oldRowid !== newRowid) {
       // One change for history, not a delete and an insert.
       const h = this.history;
@@ -391,6 +403,7 @@ export class TableWriter {
   deleteRow(rowid: number | bigint, knownRow?: readonly SqlValue[], silent = false, replace = false): boolean {
     const row = knownRow ?? this.readRow(rowid);
     if (row === null) return false;
+    noteWrite(this.table);
     if (!silent) this.beforeDelete?.(row);
     const t = this.table;
     for (let i = 0; i < t.indexes.length; i++) {
