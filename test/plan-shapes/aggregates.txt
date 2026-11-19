@@ -31,7 +31,7 @@ columns: region text
 columns: status text, day int
   Distinct: USE TEMP B-TREE FOR DISTINCT
     Project
-      IndexScan: SEARCH orders USING COVERING INDEX orders_day_status (range) [est 6600]
+      IndexScan: SEARCH orders USING COVERING INDEX orders_day_status (range) [est 219]
 
 > SELECT sum(amount) FROM orders WHERE day < 30
 columns: sum(amount) real

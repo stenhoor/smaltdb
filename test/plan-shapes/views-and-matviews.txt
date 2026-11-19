@@ -14,7 +14,7 @@ columns: amount real, name text
 > SELECT * FROM customer_totals WHERE customer_id = 9
 columns: customer_id int, n int, total real
   Project
-    Filter [est 330]
+    Filter [est 10]
       Project
         FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
 

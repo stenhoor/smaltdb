@@ -26,7 +26,7 @@ columns: id int
 > SELECT id FROM customers WHERE lower(name) = 'name14'
 columns: id int
   Project
-    IndexScan: SEARCH customers USING COVERING INDEX customers_lower_name (=?) [est 660]
+    IndexScan: SEARCH customers USING COVERING INDEX customers_lower_name (=?) [est 1]
 
 > SELECT id FROM orders WHERE day = 10
 columns: id int
@@ -41,7 +41,7 @@ columns: id int
 > SELECT id FROM orders WHERE day BETWEEN 10 AND 12
 columns: id int
   Project
-    IndexScan: SEARCH orders USING COVERING INDEX orders_day_status (range) [est 2180]
+    IndexScan: SEARCH orders USING COVERING INDEX orders_day_status (range) [est 164]
 
 > SELECT id FROM orders WHERE status = 'paid'
 columns: id int

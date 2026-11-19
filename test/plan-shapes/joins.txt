@@ -110,3 +110,17 @@ columns: id int
           Materialize: MATERIALIZE
             FusedScanFilter: SCAN tiers (fused scan + filter) [est 1]
       FusedScanFilter: SCAN orders (fused scan + filter) [est 20000]
+
+> SELECT o.id FROM customers c JOIN orders o ON o.customer_id = c.id WHERE upper(c.name) = 'NAME14'
+columns: id int
+  Project
+    NestedLoopJoin [est 97.7]
+      FusedScanFilter: SCAN customers (fused scan + filter) [est 10]
+      IndexScan: SEARCH orders USING COVERING INDEX orders_customer (=?) [est 9.77]
+
+> SELECT o.id FROM customers c JOIN orders o ON o.customer_id = c.id WHERE lower(c.name) = 'name14'
+columns: id int
+  Project
+    NestedLoopJoin [est 9.77]
+      IndexScan: SEARCH customers USING COVERING INDEX customers_lower_name (=?) [est 1]
+      IndexScan: SEARCH orders USING COVERING INDEX orders_customer (=?) [est 9.77]

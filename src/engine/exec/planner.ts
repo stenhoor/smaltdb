@@ -452,7 +452,10 @@ export class Planner {
       const fill = generateScanFilter(preds, outs, cap, () => access.loaderSpec(), helpers, pipelineCompiler(ctx));
       return { fill, regs: outs.map((o) => o.reg) };
     };
-    return new FusedScanFilter(access, build, helpers.first, helpers.release);
+    const fused = new FusedScanFilter(access, build, helpers.first, helpers.release);
+    const est = this.estimates.get(src);
+    if (est !== undefined) this.fusedRows.set(fused, est);
+    return fused;
   }
 
   /** Scan + filter + GROUP BY + aggregates in one generated loop. */
@@ -1581,12 +1584,21 @@ export class Planner {
           const r = this.colRefOf(e.args[1], scope);
           if (l && r && l.src !== r.src) return 1 / Math.max(this.ndv(l.src, l.col), this.ndv(r.src, r.col));
           const c = l ?? r;
-          return c ? 1 / this.ndv(c.src, c.col) : 0.33;
+          if (c) return 1 / this.ndv(c.src, c.col);
+          // Neither side a table column: an expression over one source, or a derived table's column.
+          const a = this.sideNdv(e.args[0], scope);
+          const b = this.sideNdv(e.args[1], scope);
+          if (a && b) return a.src !== b.src ? 1 / Math.max(a.ndv, b.ndv) : 0.33;
+          const one = a ?? b;
+          // Against a value that reads no source of this scope (a constant, a parameter, an enclosing row).
+          return one && this.depsOf(e.args[one === a ? 1 : 0], scope).size === 0 ? 1 / one.ndv : 0.33;
         }
         if (t.compare === '!=' || t.compare === 'IS NOT') return 0.9;
         if (t.inList) {
           const c = this.colRefOf(e.args[0], scope);
-          return c ? Math.min(1, (e.args.length - 1) / this.ndv(c.src, c.col)) : 0.33;
+          if (c) return Math.min(1, (e.args.length - 1) / this.ndv(c.src, c.col));
+          const x = this.sideNdv(e.args[0], scope);
+          return x && e.args.slice(1).every((v) => this.depsOf(v, scope).size === 0) ? Math.min(1, (e.args.length - 1) / x.ndv) : 0.33;
         }
         if (t.pattern) return 0.25;
         return 0.33;
@@ -1594,6 +1606,44 @@ export class Planner {
       default:
         return 0.33;
     }
+  }
+
+  /**
+   * Distinct values of a comparison operand that is not a table column: a derived table's column (its rows / 10), or a
+   * expression over one table source's columns. An expression index on it gives the number (its
+   * statistics, else ~10 rows per value, as index costing assumes); otherwise no more than its columns have, and no more
+   * than one per ~10 rows (SQLite's assumption for an index without statistics). Undefined for anything else.
+   */
+  private sideNdv(e: BoundExpr, scope: Scope): { src: Source; ndv: number } | undefined {
+    const x = unconvertedOperand(e);
+    if (x.k === 'slot') {
+      const s = this.slotSource(x.reg, scope);
+      if (!s) return undefined;
+      if (!s.src.table) return { src: s.src, ndv: this.ndv(s.src, 0) };
+    }
+    if (planHasSubquery(x)) return undefined;
+    const deps = this.depsOf(x, scope);
+    if (deps.size !== 1) return undefined;
+    const src = scope.sources[[...deps][0]];
+    const t = src.table;
+    if (!t) return undefined;
+    // Only this source's columns (no enclosing row).
+    let outer = false;
+    let colNdv = 0;
+    forEachSlot(x, (reg) => {
+      const s = this.slotSource(reg, scope);
+      if (!s || s.src !== src) outer = true;
+      else if (s.col !== null) colNdv = Math.max(colNdv, this.ndv(src, s.col));
+    });
+    if (outer) return undefined;
+    const n = this.tableRows(src);
+    const key = this.shapeKey(x, src, scope);
+    for (const idx of t.indexes) {
+      if (idx.where || idx.columns[0].column >= 0) continue;
+      if (this.shapeKey(this.indexBound(src, this.indexPlan(idx).cols[0]!), src, scope) !== key) continue;
+      return { src, ndv: idx.stats ? Math.max(1, n / Math.max(1, idx.stats.avg[0])) : Math.max(1, n / 10) };
+    }
+    return { src, ndv: Math.max(1, Math.min(colNdv || 1, n / 10)) };
   }
 
   // ---------------------------------------------------------------- access paths
@@ -1827,7 +1877,11 @@ export class Planner {
 
   /** Estimated rows of a source (ANALYZE stats, else B+tree shape). */
   private tableRows(src: Source): number {
-    if (src.sub) return src.working ? WORKING_ROWS : SUBQUERY_ROWS;
+    if (src.sub) {
+      if (src.working) return WORKING_ROWS;
+      // A derived table planned here: its plan's own estimate (a UNION ALL sums its inputs'), else SUBQUERY_ROWS.
+      return (src.estRows ??= Math.max(1, this.planRows(src.sub.root) ?? SUBQUERY_ROWS));
+    }
     if (src.estRows === undefined) {
       const t = src.table!;
       const live = this.env.liveRows ? this.env.liveRows(t) : src.access!.tree.estimateCount();
@@ -1891,6 +1945,28 @@ export class Planner {
     // Decoding typed column chunks is cheaper per row than record decoding.
     return [{ label: 'columnar scan', cost: N * COST.scanRow * 0.5, rows: N, dependsOnOuter: false, build: () => ({ leaf: new ColumnScan(access, store, zones), dependsOnOuter: false }) }];
   }
+
+  /**
+   * Estimated rows of an operator tree this planner built (a derived table's plan), from the estimates its join
+   * planning recorded: a compound adds (UNION, UNION ALL) or bounds (INTERSECT, EXCEPT) its inputs', operators that
+   * keep their input's rows pass it through. Undefined when nothing in it was estimated (a recursive CTE, a table
+   * function, external data, a grouping).
+   */
+  private planRows(op: Operator): number | undefined {
+    const est = this.estimates.get(op) ?? this.fusedRows.get(op);
+    if (est !== undefined) return est;
+    if (op instanceof Compound) {
+      const l = this.planRows(op.left);
+      const r = this.planRows(op.right);
+      if (l === undefined || r === undefined) return undefined;
+      return op.op === 'INTERSECT' ? Math.min(l, r) : op.op === 'EXCEPT' ? l : l + r;
+    }
+    if (op instanceof Project || op instanceof Sort || op instanceof Materialize || op instanceof Distinct || op instanceof Limit || op instanceof Filter) return this.planRows(op.children[0]);
+    return undefined;
+  }
+
+  /** Estimates of single-source scans fused after their estimate was recorded (planning only; EXPLAIN shows none). */
+  private readonly fusedRows = new WeakMap<Operator, number>();
 
   /** >0 while compiling expressions only to inspect them (column use is not recorded). */
   private dryCompile = 0;
@@ -2186,6 +2262,8 @@ export class Planner {
     for (const c of joins) joinSel *= this.selectivityOf(c.bound, scope);
     const opts = this.accessOptions(t, p, candidates, scope, ctx);
     const standalone = this.bestStandalone(opts);
+    // An access path that applies some of the conditions (an index seek) yields no more rows than its estimate.
+    filtered = Math.min(filtered, standalone.rows);
     if (placed.size === 0) {
       return { cost: standalone.cost, rows: Math.max(1, filtered), filtered: Math.max(1, filtered), method: 'first', option: standalone, candidates };
     }

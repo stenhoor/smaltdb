@@ -115,6 +115,10 @@ const CORPUS: Record<string, string[]> = {
     'SELECT o.id FROM orders o JOIN customers c USING (id) WHERE c.tier = 1',
     'SELECT a.id, b.id FROM orders a JOIN orders b ON b.customer_id = a.customer_id WHERE a.id = 100',
     'SELECT o.id FROM orders o JOIN customers c ON c.id = o.customer_id JOIN tiers t ON t.tier = c.tier WHERE t.label = ?',
+    // An equality on an expression: one per ~10 rows without an index (not a third of the table), the index's estimate
+    // with one; either way the join seeks orders by customer.
+    "SELECT o.id FROM customers c JOIN orders o ON o.customer_id = c.id WHERE upper(c.name) = 'NAME14'",
+    "SELECT o.id FROM customers c JOIN orders o ON o.customer_id = c.id WHERE lower(c.name) = 'name14'",
   ],
   aggregates: [
     'SELECT status, count(*), sum(amount), avg(amount) FROM orders GROUP BY status',
@@ -181,6 +185,9 @@ const CORPUS: Record<string, string[]> = {
     'SELECT id FROM customers UNION ALL SELECT id FROM orders ORDER BY 1 LIMIT 3',
     'SELECT customer_id FROM orders WHERE day = 1 INTERSECT SELECT id FROM customers WHERE tier = 1',
     'SELECT id FROM customers EXCEPT SELECT customer_id FROM orders',
+    // A UNION ALL in a join: its inputs' estimates added up (not a fixed 1000 rows).
+    'SELECT c.name FROM customers c JOIN (SELECT customer_id AS k FROM orders WHERE day = 1 UNION ALL SELECT customer_id FROM orders WHERE day = 2) u ON u.k = c.id',
+    'SELECT c.name FROM (SELECT customer_id AS k FROM orders UNION ALL SELECT order_id FROM items) u JOIN customers c ON c.id = u.k WHERE c.tier = 1',
     'VALUES (1, 2), (3, 4)',
     'SELECT 1 + 2, ? AS p',
   ],
