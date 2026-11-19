@@ -32,6 +32,28 @@ columns: id int
     Project
       FusedScanFilter: SCAN orders (fused scan + filter)
 
+> SELECT c.name FROM customers c JOIN (SELECT customer_id AS k FROM orders WHERE day = 1 UNION ALL SELECT customer_id FROM orders WHERE day = 2) u ON u.k = c.id
+columns: name text
+  Project
+    NestedLoopJoin [est 109]
+      Compound: COMPOUND QUERY (UNION ALL) [est 109]
+        Project
+          IndexScan: SEARCH orders USING INDEX orders_day_status (=?) [est 54.5]
+        Project
+          IndexScan: SEARCH orders USING INDEX orders_day_status (=?) [est 54.5]
+      RowidLookup: SEARCH customers USING INTEGER PRIMARY KEY (rowid=?) [est 1]
+
+> SELECT c.name FROM (SELECT customer_id AS k FROM orders UNION ALL SELECT order_id FROM items) u JOIN customers c ON c.id = u.k WHERE c.tier = 1
+columns: name text
+  Project
+    HashJoin: HASH JOIN [est 17500]
+      Compound: COMPOUND QUERY (UNION ALL) [est 70000]
+        Project
+          FusedScanFilter: SCAN orders (fused scan + filter)
+        Project
+          FusedScanFilter: SCAN items (fused scan + filter)
+      FusedScanFilter: SCAN customers (fused scan + filter) [est 500]
+
 > VALUES (1, 2), (3, 4)
 columns: column1 int, column2 int
   Values: SCAN CONSTANT ROW

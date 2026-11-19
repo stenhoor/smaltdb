@@ -71,17 +71,17 @@ columns: customer_id int, total real
 > SELECT * FROM (SELECT id, amount * 2 AS a2 FROM orders WHERE day = 1) WHERE a2 > 10
 columns: id int, a2 real
   Project
-    Filter [est 330]
+    Filter [est 18]
       Project
         IndexScan: SEARCH orders USING INDEX orders_day_status (=?) [est 54.5]
 
 > WITH big AS (SELECT * FROM orders WHERE amount > 200) SELECT c.name, big.amount FROM big JOIN customers c ON c.id = big.customer_id
 columns: name text, amount real
   Project
-    HashJoin: HASH JOIN [est 1000]
-      FusedScanFilter: SCAN customers (fused scan + filter) [est 2000]
-      Project [est 1000]
+    HashJoin: HASH JOIN [est 6600]
+      Project [est 6600]
         FusedScanFilter: SCAN orders (fused scan + filter)
+      FusedScanFilter: SCAN customers (fused scan + filter) [est 2000]
 
 > WITH s AS (SELECT day, sum(amount) AS t FROM orders GROUP BY day) SELECT a.day FROM s a JOIN s b ON b.day = a.day + 1 WHERE b.t > a.t
 columns: day int

@@ -8,19 +8,19 @@ columns: id int, row_number() OVER (ORDER BY id) int
 columns: id int, rank() OVER (PARTITION BY status ORDER BY amount DESC) int
   Project
     Window
-      IndexScan: SEARCH orders USING INDEX orders_day_status (range) [est 6600]
+      IndexScan: SEARCH orders USING INDEX orders_day_status (range) [est 219]
 
 > SELECT id, sum(amount) OVER (PARTITION BY customer_id ORDER BY day ROWS 2 PRECEDING) FROM orders WHERE customer_id < 5
 columns: id int, sum(amount) OVER (PARTITION BY customer_id ORDER BY day ROWS 2 PRECEDING) real
   Project
     Window
-      IndexScan: SEARCH orders USING INDEX orders_customer (range) [est 6600]
+      IndexScan: SEARCH orders USING INDEX orders_customer (range) [est 50]
 
 > SELECT day, sum(amount) OVER w, avg(amount) OVER w FROM orders WHERE day < 5 WINDOW w AS (ORDER BY day RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)
 columns: day int, sum(amount) OVER w real, avg(amount) OVER w real
   Project
     Window
-      IndexScan: SEARCH orders USING INDEX orders_day_status (range) [est 6600]
+      IndexScan: SEARCH orders USING INDEX orders_day_status (range) [est 329]
 
 > SELECT * FROM (SELECT id, lag(amount) OVER (ORDER BY id) AS prev FROM orders) WHERE prev > 200
 columns: id int, prev real
