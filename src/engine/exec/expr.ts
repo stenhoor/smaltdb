@@ -16,12 +16,13 @@ import { ARITHMETIC_FUNCTIONS, BITWISE_FUNCTIONS, COMPARISON_FUNCTIONS, arithImp
 import { type AggregateState, type CompiledArg, type Fn, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
 import { type CodegenHelpers, type FallbackNode, codegenEnabled, generate, generatedType, isCodegenRoot } from './codegen.js';
 import { daysAsUs } from './temporal-ops.js';
+import { type MapCompare, mapProbe } from './nested-ops.js';
 import { WINDOW_ARITY } from './window.js';
 import { type SqlMeta, getMeta, setMeta } from './sql-meta.js';
 import { type BoundExpr, type ExprMeaning, call, eachParts, lit, param, typeOf } from '../plan/expr.js';
 import type { CollationName } from '../plan/types.js';
 import type { PlanOp } from '../plan/ops.js';
-import { decodeTagged, decodeUtf8, readInt64 } from '../storage/record.js';
+import { decodeTagged, decodeUtf8, isTaggedBlob, readInt64 } from '../storage/record.js';
 import { decodeKey, encodeKey, readRowidKey } from '../storage/key-codec.js';
 
 export type { Fn };
@@ -667,4 +668,6 @@ export const CODEGEN_HELPERS_FOR_FUSION = {
   utf8: decodeUtf8,
   tagged: decodeTagged,
   rowid: readRowidKey,
+  /** A map column's prefilter (codegen.ts): false when the row's map stored at [start, end) rules the conjunct out. */
+  mapProbe: (b: Uint8Array, start: number, end: number, key: Uint8Array, op: MapCompare, lit: Uint8Array | null): boolean => !isTaggedBlob(b, start) || mapProbe(b, start + 1, end, key, op, lit),
 };

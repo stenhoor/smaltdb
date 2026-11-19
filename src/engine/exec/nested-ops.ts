@@ -4,7 +4,7 @@
  * `src/shared/nested.ts`); an operation decodes what it needs and encodes what it gives.
  */
 import { SmaltError } from '../errors.js';
-import { decodeKey, encodeKey } from '../storage/key-codec.js';
+import { compareSameKind, decodeComponent, decodeKey, encodeKey, skipComponent } from '../storage/key-codec.js';
 import { Collation, type SqlValue, TypedValue, compareValues, normalizeInt, typedBool } from '../values.js';
 import { type NestedTypeName, isNested, parseNested } from '../../shared/nested-types.js';
 import { compareCodePoints } from '../../shared/nested.js';
@@ -37,12 +37,19 @@ const cachedBytes: (Uint8Array | null)[] = new Array(CACHED).fill(null);
 const cachedValues: (readonly SqlValue[])[] = new Array(CACHED).fill([]);
 let nextSlot = 0;
 function elements(bytes: Uint8Array): readonly SqlValue[] {
-  for (let i = 0; i < CACHED; i++) if (cachedBytes[i] === bytes) return cachedValues[i]!;
+  const hit = cached(bytes);
+  if (hit) return hit;
   const values = decodeKey(bytes);
   cachedBytes[nextSlot] = bytes;
   cachedValues[nextSlot] = values;
   nextSlot = (nextSlot + 1) % CACHED;
   return values;
+}
+
+/** The elements of `bytes` if they are among the lists last decoded, else null (nothing is decoded). */
+function cached(bytes: Uint8Array): readonly SqlValue[] | null {
+  for (let i = 0; i < CACHED; i++) if (cachedBytes[i] === bytes) return cachedValues[i]!;
+  return null;
 }
 
 function op(
@@ -529,7 +536,11 @@ const LIST_OPS: [string, ScalarFunction][] = [
         if (v === null || i === null) return null;
         const k = intArg(i, 'struct_field', 'the field index');
         if (k < 0 || k >= width) throw new SmaltError('SMALT_RANGE', `struct_field: ${t} has no field ${k}`);
-        return decodeKey(bytesOf(v, 'struct_field'))[k] ?? null;
+        // Skip the fields before it and decode only this one.
+        const b = bytesOf(v, 'struct_field');
+        let pos = 0;
+        for (let j = 0; j < k && pos < b.length; j++) pos = skipComponent(b, pos);
+        return pos < b.length ? decodeComponent(b, pos) : null;
       };
     },
   ),
@@ -576,14 +587,111 @@ function encodeEntries(entries: [string, SqlValue][]): Uint8Array {
   return encodeKey(flat);
 }
 
-/** The index of `key` in sorted `keys`, or -1. */
-function findKey(keys: readonly string[], key: string): number {
+/**
+ * The offset of the value of the key whose component is `key` (a text component, encoded) in the map whose bytes are
+ * `m[start, end)`, or -1 when it has none. A map is its entries' components, key then value, sorted by key (ADR 0038),
+ * and a key is a text component, whose bytes order as the keys do: so each key's bytes are compared with `key`, the
+ * value of a smaller key is skipped without decoding it, and the walk stops at the first greater key. Without offsets
+ * in the bytes there is no binary search.
+ */
+export function findMapKey(m: Uint8Array, start: number, end: number, key: Uint8Array): number {
+  const kl = key.length;
+  let pos = start;
+  while (pos < end) {
+    let i = 0;
+    while (i < kl && m[pos + i] === key[i]) i++;
+    // Components are prefix-free: all of `key` matching is this whole key.
+    if (i === kl) return pos + kl;
+    if (pos + i < end && m[pos + i]! > key[i]!) return -1;
+    pos = skipComponent(m, skipComponent(m, pos));
+  }
+  return -1;
+}
+
+/** The tag of a NULL component. */
+const NULL_TAG = encodeKey([null])[0]!;
+
+/** How {@link mapProbe} compares a map's value with a literal. */
+export const MapCompare = { None: 0, Eq: 1, Ne: 2, Lt: 3, Le: 4, Gt: 5, Ge: 6, NotNull: 7 } as const;
+export type MapCompare = (typeof MapCompare)[keyof typeof MapCompare];
+
+/**
+ * For generated scans (codegen.ts): false when a conjunct that needs the map stored at `m[start, end)` to have `key`
+ * (encoded) cannot be true of the row, so the row is skipped without decoding the map. With `lit` (an encoded number
+ * or text literal), also false when the key's value is of the literal's kind and `value op lit` does not hold (see
+ * `compareSameKind`); with `NotNull`, false when the value is NULL. True otherwise: the conjunct itself decides.
+ */
+export function mapProbe(m: Uint8Array, start: number, end: number, key: Uint8Array, op: MapCompare, lit: Uint8Array | null): boolean {
+  const at = findMapKey(m, start, end, key);
+  if (at < 0) return false;
+  if (op === MapCompare.NotNull) return m[at] !== NULL_TAG;
+  if (lit === null) return true;
+  const c = compareSameKind(m, at, lit);
+  if (c !== c) return true;
+  switch (op) {
+    case MapCompare.Eq:
+      return c === 0;
+    case MapCompare.Ne:
+      return c !== 0;
+    case MapCompare.Lt:
+      return c < 0;
+    case MapCompare.Le:
+      return c <= 0;
+    case MapCompare.Gt:
+      return c > 0;
+    case MapCompare.Ge:
+      return c >= 0;
+    default:
+      return true;
+  }
+}
+
+/**
+ * Reads one key of maps without decoding the rest (ADR 0038): {@link findMapKey}, then only the value found is
+ * decoded. A map whose elements are in `elements`' cache is binary searched there instead.
+ */
+class KeyFinder {
+  private key: string | null = null;
+  private enc: Uint8Array = new Uint8Array(0);
+
+  constructor(private readonly fn: string) {}
+
+  /** The offset of `k`'s value in map `m`'s bytes, or -1 when the map has no such key. */
+  private find(m: Uint8Array, k: string): number {
+    if (k !== this.key) {
+      this.enc = encodeKey([k]);
+      this.key = k;
+    }
+    return findMapKey(m, 0, m.length, this.enc);
+  }
+
+  /** `k`'s value in map `v`, or undefined when it has none. */
+  get(v: SqlValue, k: string): SqlValue | undefined {
+    const m = bytesOf(v, this.fn);
+    const flat = cached(m);
+    if (flat) {
+      const i = findFlatKey(flat, k);
+      return i < 0 ? undefined : flat[i + 1]!;
+    }
+    const at = this.find(m, k);
+    return at < 0 ? undefined : decodeComponent(m, at);
+  }
+
+  has(v: SqlValue, k: string): boolean {
+    const m = bytesOf(v, this.fn);
+    const flat = cached(m);
+    return flat ? findFlatKey(flat, k) >= 0 : this.find(m, k) >= 0;
+  }
+}
+
+/** The index of `key` among the keys of flat entries (key, value, key, value, …), sorted by key, or -1. */
+function findFlatKey(flat: readonly SqlValue[], key: string): number {
   let lo = 0;
-  let hi = keys.length - 1;
+  let hi = (flat.length >> 1) - 1;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
-    const c = compareCodePoints(keys[mid]!, key);
-    if (c === 0) return mid;
+    const c = compareCodePoints(flat[mid * 2] as string, key);
+    if (c === 0) return mid * 2;
     if (c < 0) lo = mid + 1;
     else hi = mid - 1;
   }
@@ -636,16 +744,13 @@ const MAP_OPS: [string, ScalarFunction][] = [
   // map_get(m, key): the key's value, NULL when it is missing.
   op('map_get', 2, 2, valueOfMap('map_get'), ([a]) => {
     mapOf('map_get', a!.type);
-    return ([m, k]) => {
-      if (m === null || k === null) return null;
-      const { keys, vals } = entriesOf(m, 'map_get');
-      const i = findKey(keys, keyArg(k, 'map_get'));
-      return i < 0 ? null : vals[i]!;
-    };
+    const finder = new KeyFinder('map_get');
+    return ([m, k]) => (m === null || k === null ? null : (finder.get(m, keyArg(k, 'map_get')) ?? null));
   }),
   op('map_contains_key', 2, 2, () => 'bool', ([a]) => {
     mapOf('map_contains_key', a!.type);
-    return ([m, k]) => (m === null || k === null ? null : findKey(entriesOf(m, 'map_contains_key').keys, keyArg(k, 'map_contains_key')) >= 0 ? 1 : 0);
+    const finder = new KeyFinder('map_contains_key');
+    return ([m, k]) => (m === null || k === null ? null : finder.has(m, keyArg(k, 'map_contains_key')) ? 1 : 0);
   }),
   op('map_len', 1, 1, () => 'int', ([a]) => {
     mapOf('map_len', a!.type);

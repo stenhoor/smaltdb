@@ -8,6 +8,16 @@ import { arithOperandType, isDateDifference, temporalArithType } from './tempora
 import { type StaticType, truthy } from './convert.js';
 import { type InlineMath, type MathFunction, inlineMath, roundingType } from './math.js';
 import { isInt64Storage } from '../storage/record.js';
+import { encodeKey } from '../storage/key-codec.js';
+import { MapCompare } from './nested-ops.js';
+
+/** A condition on one key of a map column (see `Pipeline.mapKeys`). */
+interface MapCondition {
+  reg: number;
+  key: Uint8Array;
+  op: MapCompare;
+  lit: Uint8Array | null;
+}
 
 /**
  * Expression code generation (ADR 0001 decision 5). Arithmetic, numeric comparisons, boolean
@@ -672,6 +682,8 @@ export interface FusedHelpers extends LoaderHelpers, CodegenHelpers {
   release(page: { bytes: Uint8Array; view: DataView }): void;
   /** Generic decode of one cell (overflow values, short records). */
   slow(page: { bytes: Uint8Array; view: DataView }, off: number, r: SqlValue[]): void;
+  /** False when the map stored at [start, end) of a leaf rules out a conjunct that needs its key (see `Pipeline`). */
+  mapProbe(b: Uint8Array, start: number, end: number, key: Uint8Array, op: MapCompare, lit: Uint8Array | null): boolean;
 }
 
 /**
@@ -704,14 +716,137 @@ class Pipeline {
   /** `column = 'text literal'` conjuncts (BINARY): checked on the raw UTF-8 bytes before decoding. */
   private readonly textEq: { reg: number; bytes: Uint8Array }[] = [];
 
+  /**
+   * Conditions on one key of a map column that a WHERE conjunct needs to be true, checked on the map's stored bytes
+   * before the row is decoded (`H.mapProbe`), so the rows they rule out are never decoded: the key is there
+   * (`map_get(m, 'k')` compared with anything, or IS NOT NULL; `map_contains_key(m, 'k')`), and when its value is
+   * compared with a literal of its own kind (a number, or text under BINARY), the comparison holds. They are found
+   * in the conjunct, its ANDs and a CASE of one WHEN and no ELSE. The conjunct itself still decides each row kept.
+   */
+  private readonly mapKeys: MapCondition[] = [];
+
+  /**
+   * Conjuncts that are exactly their map condition (`map_contains_key(m, 'k')`, `map_get(m, 'k') IS NOT NULL`): where
+   * the probe checks them, the closure compiler's conjunct runs only for rows the probe did not see (`sw`, cells
+   * decoded by `H.slow`), so the map is not decoded for it. `line`: its place in `rowLines`, filled in by `finish`.
+   */
+  private readonly exact: { cond: MapCondition; fn: string; line: number }[] = [];
+
   /** WHERE: every conjunct must be true (NULL counts as false). */
   addPredicates(preds: BoundExpr[]): void {
     for (const p of preds) {
+      const ex = this.exactMapConjunct(p);
+      if (ex) {
+        this.mapKeys.push(ex);
+        this.exact.push({ cond: ex, fn: this.em.constant(this.em.fallbackOf(p).fn), line: this.rowLines.push('') - 1 });
+        continue;
+      }
       const eq = this.textEqualityConjunct(p);
       if (eq) this.textEq.push(eq);
+      this.mapConditions(p);
       const g = this.em.gen(p);
       this.rowLines.push(...this.take(), `if (!${this.em.isTrue(g)}) continue;`);
     }
+  }
+
+  /**
+   * Fills in the lines of the `exact` conjuncts: run for rows the probe did not see where `probed` says it checks
+   * them, else for every row (reading the register file). True when the probe checks any.
+   */
+  private exactLines(probed: (c: MapCondition) => boolean): boolean {
+    let any = false;
+    for (const x of this.exact) {
+      const yes = probed(x.cond);
+      if (!yes) this.em.usesRegisterFile = true;
+      any ||= yes;
+      this.rowLines[x.line] = `${yes ? 'if (sw) ' : ''}{ const v = ${x.fn}(r); if (v === null || v == 0) continue; }`;
+    }
+    return any;
+  }
+
+  /** The map condition that is all of conjunct `p`, if it is one (see `exact`). */
+  private exactMapConjunct(p: BoundExpr): MapCondition | null {
+    if (isOpaque(p)) return null;
+    const x = p.k === 'not' && p.arg.k === 'isNull' && !p.arg.not && !isOpaque(p.arg) ? p.arg.arg : p.k === 'isNull' && p.not ? p.arg : p;
+    const fn = x === p ? 'map_contains_key' : 'map_get';
+    const r = this.mapRead(x, fn);
+    return r ? { reg: r.reg, key: encodeKey([r.key]), op: fn === 'map_get' ? MapCompare.NotNull : MapCompare.None, lit: null } : null;
+  }
+
+  /** `fn(m, 'k')` of a column m: its register and the key. */
+  private mapRead(x: BoundExpr, fn: string): { reg: number; key: string } | null {
+    if (x.k !== 'call' || x.fn !== fn || isOpaque(x) || x.args.length !== 2) return null;
+    const [m, k] = x.args;
+    if (m!.k !== 'slot' || k!.k !== 'lit' || typeof k!.value !== 'string') return null;
+    const c = this.em.fallbackOf(m!);
+    return c.reg === undefined ? null : { reg: c.reg, key: k!.value };
+  }
+
+  /** Adds to `mapKeys` the conditions on map keys that `p` needs to be true. */
+  private mapConditions(p: BoundExpr): void {
+    if (isOpaque(p)) return;
+    const read = (x: BoundExpr, fn: string) => this.mapRead(x, fn);
+    const add = (r: { reg: number; key: string } | null, op: MapCompare = MapCompare.None, lit: Uint8Array | null = null): void => {
+      if (r) this.mapKeys.push({ reg: r.reg, key: encodeKey([r.key]), op, lit });
+    };
+    switch (p.k) {
+      case 'and':
+        for (const x of p.args) this.mapConditions(x);
+        return;
+      case 'case': {
+        const els = p.else;
+        if (p.whens.length === 1 && els.k === 'lit' && (els.value === null || els.value === 0)) {
+          this.mapConditions(p.whens[0]!.when);
+          this.mapConditions(p.whens[0]!.then);
+        }
+        return;
+      }
+      case 'isNull':
+        if (p.not) add(read(p.arg, 'map_get'), MapCompare.NotNull);
+        return;
+      case 'not':
+        if (p.arg.k === 'isNull' && !p.arg.not && !isOpaque(p.arg)) add(read(p.arg.arg, 'map_get'), MapCompare.NotNull);
+        return;
+      case 'call':
+        break;
+      default:
+        return;
+    }
+    if (p.fn === 'map_contains_key') return add(read(p, 'map_contains_key'));
+    // A comparison is NULL, so not true, when an operand is: a missing key's NULL included.
+    const op = traitsOf(p.fn).compare;
+    if (op === undefined || op === 'IS' || op === 'IS NOT' || p.args.length !== 2) return;
+    for (const [i, j] of [
+      [0, 1],
+      [1, 0],
+    ] as const) {
+      const r = read(unconverted(p.args[i]!), 'map_get');
+      if (!r) continue;
+      add(r, ...this.literalComparison(op, p.args[i]!, p.args[j]!, p.collation, i === 1));
+      return;
+    }
+  }
+
+  /**
+   * `x op y` of a map's value `x` and a literal `y` as a comparison of their encoded bytes, which order as numbers do
+   * and as text does under BINARY: for a literal number or text, with no conversion of either operand and no affinity
+   * that could change a number to text. `flip`: the map's value is the right operand.
+   */
+  private literalComparison(op: string, x: BoundExpr, y: BoundExpr, collation: CollationName | undefined, flip: boolean): [MapCompare, Uint8Array | null] {
+    if (unconverted(x) !== x || unconverted(y) !== y || y.k !== 'lit') return [MapCompare.None, null];
+    const v = y.value;
+    if (typeof v === 'string') {
+      if (!this.em.binaryTextOperands(x, y, collation)) return [MapCompare.None, null];
+    } else if (typeof v === 'number' || typeof v === 'bigint') {
+      if (v !== v || (y.type !== 'int' && y.type !== 'real' && y.type !== 'num')) return [MapCompare.None, null];
+      const textual = (c: FallbackNode): boolean => c.affinity === 'TEXT' || (c.collation ?? 0) !== 0;
+      if (textual(this.em.fallbackOf(x)) || textual(this.em.fallbackOf(y))) return [MapCompare.None, null];
+    } else return [MapCompare.None, null];
+    const ops: Record<string, MapCompare> = flip
+      ? { '=': MapCompare.Eq, '!=': MapCompare.Ne, '<': MapCompare.Gt, '<=': MapCompare.Ge, '>': MapCompare.Lt, '>=': MapCompare.Le }
+      : { '=': MapCompare.Eq, '!=': MapCompare.Ne, '<': MapCompare.Lt, '<=': MapCompare.Le, '>': MapCompare.Gt, '>=': MapCompare.Ge };
+    const c = ops[op];
+    return c === undefined ? [MapCompare.None, null] : [c, encodeKey([v])];
   }
 
   private textEqualityConjunct(p: BoundExpr): { reg: number; bytes: Uint8Array } | null {
@@ -740,6 +875,9 @@ class Pipeline {
     const localRegs = this.localRegs;
     const decodedRegs = new Set<number>([...spec.rowidRegs]);
     for (let i = 1; i < spec.decode.length; i += 2) decodedRegs.add(spec.decode[i]);
+    const mapCol = new Map<number, number>(); // reg -> MAP column decoded into it
+    for (let i = 0; i < spec.decode.length; i += 2) if (spec.types[spec.decode[i]] === 'MAP') mapCol.set(spec.decode[i + 1], spec.decode[i]);
+    const slowOnly = this.exactLines((c) => mapCol.has(c.reg));
     // Closure-compiled nodes read the register file, so then mirror decoded values into it.
     const mirror = this.em.usesRegisterFile;
     const assign: Assign = (reg, expr) => {
@@ -752,9 +890,14 @@ class Pipeline {
     const textCol = new Map<number, number>(); // reg -> TEXT column decoded into it
     for (let i = 0; i < spec.decode.length; i += 2) if (spec.types[spec.decode[i]] === 'TEXT') textCol.set(spec.decode[i + 1], spec.decode[i]);
     const prefilters = this.textEq.filter((t) => textCol.has(t.reg));
-    const pre: PreDecode | undefined = prefilters.length
-      ? (bounds) =>
-          prefilters.map((t) => {
+    const mapProbes = this.mapKeys.filter((t) => mapCol.has(t.reg));
+    const pre: PreDecode | undefined = prefilters.length || mapProbes.length
+      ? (bounds) => [
+          ...mapProbes.map((t) => {
+            const bd = bounds(mapCol.get(t.reg)!);
+            return `if (${bd.isNull}) continue; if (!H.mapProbe(b, ${bd.st}, ${bd.fin}, ${this.em.constant(t.key)}, ${t.op}, ${t.lit ? this.em.constant(t.lit) : 'null'})) continue;`;
+          }),
+          ...prefilters.map((t) => {
             const bd = bounds(textCol.get(t.reg)!);
             const k = this.em.constant(t.bytes);
             const L = t.bytes.length;
@@ -763,7 +906,8 @@ class Pipeline {
             const head = `if (${bd.isNull}) continue; { const s = ${bd.st}; if (${bd.fin} - s !== ${L}) continue; const q = ${k};`;
             if (L <= 16) return `${head}${L ? ` if (!(${Array.from(t.bytes, (_, j) => `b[s + ${j}] === q[${j}]`).join(' && ')})) continue;` : ''} }`;
             return `${head} let j = 0; while (j < ${L} && b[s + j] === q[j]) j++; if (j !== ${L}) continue; }`;
-          })
+          }),
+        ]
       : undefined;
     emitDecode(spec, dec, assign, pre);
     // Registers referenced but not decoded here (e.g. outer-query columns) come from the register file.
@@ -777,7 +921,8 @@ class Pipeline {
       rowStart: [
         'const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);',
         locals.length ? `let ${declLocals};` : '',
-        `if (${cellIsFast(spec)}) { ${dec.join(' ')} } else { H.slow(f, off, r); ${locals.map(load).join(' ')} }`,
+        ...(slowOnly ? ['let sw = false;'] : []),
+        `if (${cellIsFast(spec)}) { ${dec.join(' ')} } else { ${slowOnly ? 'sw = true; ' : ''}H.slow(f, off, r); ${locals.map(load).join(' ')} }`,
       ],
     };
   }
@@ -790,6 +935,7 @@ class Pipeline {
     const localRegs = this.localRegs;
     const decodedRegs = new Set<number>([...src.rowidRegs]);
     for (let i = 1; i < src.decode.length; i += 2) decodedRegs.add(src.decode[i]);
+    this.exactLines(() => false);
     const mirror = this.em.usesRegisterFile;
     const assign: Assign = (reg, expr) => {
       const m = mirror ? (expr === 'null' ? ` r[${reg}] = null;` : ` r[${reg}] = c${reg};`) : '';
