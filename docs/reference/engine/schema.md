@@ -123,8 +123,9 @@ A language adds a label or relationship type the first time it writes one (ADR 0
 - **Names are case-sensitive** by default: `Person` and `person` are two labels (or types), as in Cypher. Table names
   are not, so a label or type named like a table of the graph already gets the first free `<name>_<n>` (`person_2`).
   A graph created with `caseSensitive: false` ignores case instead: see below.
-- **`addType`:** the type's table gets `start INTEGER`, `end INTEGER` and `props map<text, any>`, and indexes on `start`
-  and on `end` (`<table>_start`, `<table>_end`), which the rules' lookups use.
+- **`addType`:** the type's table gets `start INTEGER`, `end INTEGER` and `props map<text, any>`, and indexes on
+  `(start, end)` and on `(end, start)` (`<table>_start`, `<table>_end`), which the rules' lookups use. A hop from a
+  node to the other end reads the index alone, not the table.
 - **An existing table** of that name is adopted instead, if it has the conventional columns (`id`, or `start` and
   `end`, and optionally `props`) and passes the checks a new graph's tables pass.
 - **A label or type the graph has**, spelled the same, is an error, or a no-op with `ifNotExists`.

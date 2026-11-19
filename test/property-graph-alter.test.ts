@@ -77,6 +77,25 @@ describe('adding a relationship type', () => {
     expect(db.catalog.graph('g')!.edges).toEqual([{ type: 'KNOWS', table: 'KNOWS', start: 'start', end: 'end', props: 'props' }]);
   });
 
+  it('indexes (start, end) and (end, start): a hop from a node to the other end reads the index alone', () => {
+    const db = fresh();
+    db.queryPlan(addType('KNOWS', 'knows'));
+    const cols = (name: string) => db.catalog.table('knows')!.indexes.find((i) => i.name === name)!.columns.map((c) => c.column);
+    expect([cols('knows_start'), cols('knows_end')]).toEqual([
+      [0, 1],
+      [1, 0],
+    ]);
+    db.exec("INSERT INTO person VALUES (1, 'Ada'), (2, 'Charles'), (3, 'Grace'); INSERT INTO knows(start, end) VALUES (1, 2), (3, 2), (2, 1)");
+    expect(db.query('SELECT start, rowid FROM knows WHERE "end" = 2 ORDER BY start').rows).toEqual([
+      [1, 1],
+      [3, 2],
+    ]);
+    const plan = (sql: string) => db.query(`EXPLAIN QUERY PLAN ${sql}`).rows.flat().join(' ');
+    // Named, as a compiler seeking for each row names it: on three rows the planner would scan.
+    expect(plan('SELECT start, rowid FROM knows INDEXED BY knows_end WHERE "end" = 2')).toContain('COVERING INDEX knows_end');
+    expect(plan('SELECT "end" FROM knows INDEXED BY knows_start WHERE start = 1')).toContain('COVERING INDEX knows_start');
+  });
+
   it('the new table follows the graph rules: endpoints must be nodes, and a connected node stays', () => {
     const db = fresh();
     db.queryPlan(addType('KNOWS', 'knows'));
