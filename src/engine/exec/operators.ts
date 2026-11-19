@@ -379,6 +379,8 @@ export class IndexScan implements Operator {
   private lower: Uint8Array | null = null;
   private readonly enc = new KeyEncoder();
   private readonly keyBuf = new Uint8Array(ROWID_KEY_SIZE);
+  /** The bounds of an equality probe (`bounds`). */
+  private boundBuf = new Uint8Array(32);
 
   /**
    * Set by the planner when the consumer cannot observe row order (an order-insensitive aggregate,
@@ -449,6 +451,17 @@ export class IndexScan implements Operator {
       const v = s.convert[i](s.eq[i](this.r));
       if (v === null) return false;
       e.add(v, s.columns[i]);
+    }
+    if (!s.lo && !s.hi) {
+      // Equalities only (an index nested loop's probe, run per outer row): the bounds in one buffer, kept between
+      // opens, with no copy of the key: [prefix] and [prefix, 0xff].
+      const n = e.length;
+      if (this.boundBuf.length < n + 1) this.boundBuf = new Uint8Array(Math.max(2 * this.boundBuf.length, n + 1));
+      this.boundBuf.set(e.view());
+      this.boundBuf[n] = 0xff;
+      this.lower = this.boundBuf.subarray(0, n);
+      this.upper = this.boundBuf.subarray(0, n + 1);
+      return true;
     }
     const prefix = e.finish();
     const ff = (b: Uint8Array): Uint8Array => {
@@ -1073,6 +1086,11 @@ export class Project implements Operator {
   readonly children: Operator[];
   readonly detail = '';
   private r!: SqlValue[];
+  /**
+   * Set by a keyed {@link RecursiveCte} on its steps: the outputs `first` are computed, then `keep` drops the row (its
+   * key was seen) before the others (`rest`) are computed.
+   */
+  gate: { readonly first: readonly number[]; readonly rest: readonly number[]; readonly keep: (r: SqlValue[]) => boolean } | null = null;
   constructor(
     readonly child: Operator,
     readonly fns: Fn[],
@@ -1085,10 +1103,20 @@ export class Project implements Operator {
     this.child.open(r);
   }
   next(): boolean {
-    if (!this.child.next()) return false;
     const r = this.r;
     const fns = this.fns;
     const out = this.outRegs;
+    const g = this.gate;
+    if (g !== null) {
+      for (;;) {
+        if (!this.child.next()) return false;
+        for (const i of g.first) r[out[i]] = fns[i](r);
+        if (!g.keep(r)) continue;
+        for (const i of g.rest) r[out[i]] = fns[i](r);
+        return true;
+      }
+    }
+    if (!this.child.next()) return false;
     for (let i = 0; i < fns.length; i++) r[out[i]] = fns[i](r);
     return true;
   }
@@ -2042,7 +2070,7 @@ export class RecursiveCte implements Operator {
   private queue: CteItem[] = [];
   private head = 0;
   private seq = 0;
-  private seen = new Set<string>();
+  private seen = new Set<unknown>();
   /** Keyed with an order (ADR 0033 G2): the queued row of each key, which a lower row replaces. */
   private best = new Map<string, CteItem>();
   private produced = 0;
@@ -2070,6 +2098,42 @@ export class RecursiveCte implements Operator {
     this.children = [initial, ...recursive];
     this.keyCollations = key ? key.map((i) => collations[i]) : null;
     this.keyBuf = new Array(key?.length ?? 0).fill(null);
+    // Keyed without an order, the first row of a key wins: a step that computes the row's columns (a Project into
+    // the CTE's registers) computes the key first and drops a row whose key was seen before computing the others
+    // (a path, say), which only rows that are kept need.
+    this.gated = recursive.map((op) => {
+      if (!key || order || !(op instanceof Project) || op.gate !== null || op.outRegs.length !== outRegs.length || op.outRegs.some((g, i) => g !== outRegs[i])) return false;
+      const keyRegs = key.map((i) => outRegs[i]);
+      const buf = this.keyBuf;
+      op.gate = {
+        first: [...new Set(key)],
+        rest: outRegs.map((_, i) => i).filter((i) => !key.includes(i)),
+        keep: (r) => {
+          for (let i = 0; i < buf.length; i++) buf[i] = r[keyRegs[i]];
+          const k = this.keyOf(buf);
+          if (this.seen.has(k)) return false;
+          this.seen.add(k);
+          return true;
+        },
+      };
+      return true;
+    });
+  }
+
+  /** Steps whose rows were deduplicated on the key as they were computed (their Project's `gate`). */
+  private readonly gated: boolean[];
+
+  /**
+   * The key's identity in `seen`: as `hashKeyMulti` tells keys apart, a single number (or an integer it equals) as
+   * itself, without making a string of it.
+   */
+  private keyOf(buf: SqlValue[]): unknown {
+    if (buf.length === 1) {
+      const v = buf[0];
+      if (typeof v === 'number' && !(Number.isInteger(v) && !Number.isSafeInteger(v))) return v;
+      if (typeof v === 'bigint' && v >= -9007199254740991n && v <= 9007199254740991n) return Number(v);
+    }
+    return hashKeyMulti(buf, this.keyCollations!);
   }
 
   get detail(): string {
@@ -2096,8 +2160,71 @@ export class RecursiveCte implements Operator {
       const v = this.offsetFn(r);
       this.skip = typeof v === 'number' || typeof v === 'bigint' ? Math.max(0, Number(v)) : 0;
     }
+    this.closeStep();
+    this.expanding = null;
+    this.out = 0;
     if (this.limit === 0) return;
     this.runInto(this.initial, 0);
+  }
+
+  /**
+   * Keyed without an order, the queue is first in, first out and a row is final when it is queued: rows are given in
+   * the order they are queued, so each is given as soon as a step queues it (a search stops where its reader does,
+   * with LIMIT 1 at the row it looks for), and a row's steps run once the rows before it are given.
+   */
+  private get lazy(): boolean {
+    return this.key !== null && this.order === null;
+  }
+
+  /** Lazily: the row whose steps run, the step open (`this.recursive[step]`) or -1, the next row to give. */
+  private expanding: CteItem | null = null;
+  private step = -1;
+  private out = 0;
+
+  private closeStep(): void {
+    if (this.step < 0) return;
+    const op = this.recursive[this.step];
+    this.step = -1;
+    op.close();
+  }
+
+  /** Lazily: runs the steps until one queues a row (true), or every row's have run (false). */
+  private more(): boolean {
+    const r = this.r;
+    for (;;) {
+      if (this.step >= 0) {
+        const op = this.recursive[this.step];
+        const n = this.queue.length;
+        if (op.next()) {
+          const row = this.outRegs.map((g) => r[g]);
+          if (this.gated[this.step]) this.queue.push({ row, seq: this.seq++, depth: this.expanding!.depth + 1, pos: -1, key: '' });
+          else this.add(row, this.expanding!.depth + 1);
+          if (this.queue.length > n) return true;
+          continue;
+        }
+        const next = this.step + 1;
+        this.closeStep();
+        if (next < this.recursive.length) this.openStep(next);
+        continue;
+      }
+      // The next queued row's steps (rows from `head` on are given; those before it have run their steps).
+      if (this.head >= this.queue.length) return false;
+      const item = this.queue[this.head++];
+      if (this.head > 1024 && this.head * 2 > this.queue.length) {
+        this.queue = this.queue.slice(this.head);
+        this.out -= this.head;
+        this.head = 0;
+      }
+      if (this.maxDepth >= 0 && item.depth >= this.maxDepth) continue;
+      this.expanding = item;
+      if (this.recursive.length) this.openStep(0);
+    }
+  }
+
+  private openStep(i: number): void {
+    this.working.row = this.expanding!.row;
+    this.step = i;
+    this.recursive[i].open(this.r);
   }
 
   private runInto(op: Operator, depth: number): void {
@@ -2115,6 +2242,13 @@ export class RecursiveCte implements Operator {
     if (this.key) {
       const buf = this.keyBuf;
       for (let i = 0; i < buf.length; i++) buf[i] = row[this.key[i]];
+      if (!this.order) {
+        const id = this.keyOf(buf);
+        if (this.seen.has(id)) return;
+        this.seen.add(id);
+        this.queue.push({ row, seq: this.seq++, depth, pos: -1, key: '' });
+        return;
+      }
       k = hashKeyMulti(buf, this.keyCollations!);
       if (this.order) {
         // The lowest row per key: a key already taken from the queue is final; a queued one is replaced by a lower row.
@@ -2221,6 +2355,21 @@ export class RecursiveCte implements Operator {
   }
 
   next(): boolean {
+    if (this.lazy) {
+      for (;;) {
+        if (this.limit >= 0 && this.produced >= this.limit) return false;
+        if (this.out >= this.queue.length && !this.more()) return false;
+        const row = this.queue[this.out++].row;
+        if (this.skip > 0) {
+          this.skip--;
+          continue;
+        }
+        const r = this.r;
+        for (let j = 0; j < this.outRegs.length; j++) r[this.outRegs[j]] = row[j];
+        this.produced++;
+        return true;
+      }
+    }
     for (;;) {
       if (this.limit >= 0 && this.produced >= this.limit) return false;
       const item = this.pop();
@@ -2243,6 +2392,8 @@ export class RecursiveCte implements Operator {
 
   close(): void {
     // Children consumed in open() are closed here too, so an error part-way releases their pages.
+    this.step = -1;
+    this.expanding = null;
     this.initial.close();
     for (const op of this.recursive) op.close();
     this.queue = [];
