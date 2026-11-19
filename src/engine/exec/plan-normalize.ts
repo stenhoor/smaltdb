@@ -169,6 +169,7 @@ function numbered(input: PlanOp): PlanOp {
 }
 
 const column = (index: number, type: 'int' | 'text' | 'any' = 'any'): PlanExpr => ({ k: 'col', input: 0, index, depth: 0, type, collation: 'binary' });
+const typedColumn = (index: number, type: PlanType): PlanExpr => ({ k: 'col', input: 0, index, depth: 0, type, collation: 'binary' });
 const range = (from: number, to: number): PlanExpr[] => Array.from({ length: to - from }, (_, i) => column(from + i));
 /** `op` without its `ordered` flag. */
 function unordered<T extends { ordered?: unknown }>(op: T): T {
@@ -666,7 +667,15 @@ function orderedGroups(op: Op<'aggregate'>): PlanOp {
   const first = column(w, 'int');
   let grouped: PlanOp;
   let at: number;
-  if (op.carry.length === 0) {
+  let orderType: PlanType = 'int';
+  const sorted = op.carry.length === 0 && op.aggs.every((c) => ORDER_FREE_AGGS.has(c.fn)) ? sortKeyColumn(op.input) : null;
+  if (sorted) {
+    // Each group's first row is the one whose sort keys are least: no sort of the rows, no numbers.
+    const min: AggCall = { fn: 'min', args: [typedColumn(sorted.at, sorted.type)], star: false, distinct: false, collation: 'binary', type: sorted.type };
+    grouped = { ...plain, input: sorted.input, aggs: [...op.aggs, min] };
+    at = k + a;
+    orderType = sorted.type;
+  } else if (op.carry.length === 0) {
     const min: AggCall = { fn: 'min', args: [first], star: false, distinct: false, collation: 'binary', type: 'int' };
     grouped = { ...plain, input: numbered(op.input), aggs: [...op.aggs, min] };
     at = k + a;
@@ -677,8 +686,48 @@ function orderedGroups(op: Op<'aggregate'>): PlanOp {
     at = k;
   }
   const width = k + a + op.carry.length + 1;
-  const keys: SortKey[] = [{ expr: column(at, 'int'), desc: false, nullsFirst: false, collation: 'binary' }];
+  const keys: SortKey[] = [{ expr: typedColumn(at, orderType), desc: false, nullsFirst: false, collation: 'binary' }];
   return { op: 'project', input: { op: 'sort', input: grouped, keys }, exprs: [...range(0, at), ...range(at + 1, width)] };
+}
+
+/** Aggregates whose value doesn't depend on the order of their rows (sum and avg up to rounding, as the planner's). */
+const ORDER_FREE_AGGS = new Set(['count', 'sum', 'total', 'avg', 'min', 'max']);
+
+/**
+ * An input that is a sort under projections, as an ordered aggregate's often is: the input without the sort, with its
+ * sort keys as one more column (`at`) carried through the projections, a list that orders as the sort does: each key
+ * preceded by whether it is NULL (or isn't, for NULLS FIRST), then the row's position in the sort's input (numbered as
+ * the rows pass, no sort), and lists compare element by element. So a group's least list is its first row in the sort's
+ * order. Null when a key is descending, has a collation or a subquery.
+ */
+function sortKeyColumn(input: PlanOp): { input: PlanOp; at: number; type: PlanType } | null {
+  const chain: Op<'project'>[] = [];
+  let n = input;
+  while (n.op === 'project') {
+    chain.push(n);
+    n = n.input;
+  }
+  if (n.op !== 'sort' || n.keys.some((key) => key.desc || key.collation !== 'binary' || hasSubquery(key.expr))) return null;
+  const types = n.keys.map((key) => typeOf(key.expr));
+  const elem: PlanType = types.every((t) => t === 'int') ? 'int' : 'any';
+  const type = `list<${elem}>` as PlanType;
+  const flag = (key: SortKey): PlanExpr => ({
+    k: 'case',
+    whens: [{ when: { k: 'isNull', arg: key.expr, not: false }, then: lit(key.nullsFirst ? 0 : 1, 'int') }],
+    else: lit(key.nullsFirst ? 1 : 0, 'int'),
+    type: 'int',
+  } as PlanExpr);
+  const below = n.input;
+  const w = planWidth(below);
+  // Last, the row's position in the sort's input: rows whose keys tie keep that order, as the sort (stable) keeps it.
+  const tuple: PlanExpr = { k: 'call', fn: 'list_of', args: [...n.keys.flatMap((key) => [flag(key), key.expr]), typedColumn(w, 'int')], type };
+  let cur: PlanOp = { op: 'project', input: numbered(below), exprs: [...identity(below), tuple] };
+  let at = w;
+  for (const pj of chain.reverse()) {
+    cur = { ...pj, input: cur, exprs: [...pj.exprs, typedColumn(at, type)] };
+    at = pj.exprs.length;
+  }
+  return { input: cur, at, type };
 }
 
 /**

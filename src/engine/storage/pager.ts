@@ -123,6 +123,11 @@ interface Savepoint {
 const INTERRUPT_EVERY = 256;
 
 export class Pager {
+  /**
+   * Counts every change to a page's contents (marking it dirty, freeing it, rolling back): a cursor that kept a leaf
+   * reuses it only while this is unchanged (`BTreeCursor.seekNear`).
+   */
+  writes = 0;
   readonly pageSize: number;
   /** Bytes per page available to page formats (page size minus reserved trailer). */
   readonly usableSize: number;
@@ -572,6 +577,7 @@ export class Pager {
    */
   markDirty(f: Frame): void {
     if (this.readOnly) throw new SmaltError('SMALT_READONLY', 'attempt to write a read-only snapshot');
+    this.writes++;
     if (this.txn !== null && !f.dirty) this.captureTxn(f);
     const sp = this.top;
     if (sp !== undefined && f.pgno < sp.pageCount && !sp.images?.has(f.pgno) && !sp.fresh?.has(f.pgno)) {
@@ -586,6 +592,7 @@ export class Pager {
   }
 
   private markDirtyNoCapture(f: Frame): void {
+    this.writes++;
     f.unverified = false;
     if (!f.dirty) {
       f.dirty = true;
@@ -641,6 +648,7 @@ export class Pager {
    * (SQL `ROLLBACK TO`); otherwise it is closed too. No page may be pinned.
    */
   rollbackToSavepoint(depth: number, keep: boolean): void {
+    this.writes++;
     this.checkDepth(depth);
     for (const f of this.frames) if (f.pins > 0) throw new MisuseError(`savepoint rollback with pinned page ${f.pgno}`);
     while (this.savepoints.length >= depth) {
@@ -693,6 +701,7 @@ export class Pager {
 
   /** Undo every change made since beginStatement. */
   rollbackStatement(): void {
+    this.writes++;
     if (this.savepoints.length === 0) throw new MisuseError('no active statement');
     this.rollbackToSavepoint(this.savepoints.length, false);
   }
@@ -742,6 +751,7 @@ export class Pager {
 
   /** Return a page to the freelist. The page must not be pinned. */
   free(pgno: number): void {
+    this.writes++;
     if (pgno <= 0 || pgno >= this.pageCount) throw new MisuseError(`free of invalid page ${pgno}`);
     const cached = this.map.get(pgno);
     if (cached !== undefined && cached.pins > 0) throw new MisuseError(`free of pinned page ${pgno}`);
@@ -912,6 +922,7 @@ export class Pager {
 
   /** Discard all uncommitted changes. No page may be pinned. */
   rollback(): void {
+    this.writes++;
     this.checkOpen();
     this.savepoints.length = 0;
     this.pending = null;

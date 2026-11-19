@@ -1290,6 +1290,8 @@ function lastKeyAtLeast(p: PageBuf, n: number, key: Uint8Array): boolean {
 export class BTreeCursor {
   private frame: Frame | null = null;
   private idx = 0;
+  /** The pager's `writes` when the cursor last sought: its leaf is reused by `seekNear` only while nothing changed. */
+  private seenWrites = -1;
 
   constructor(private readonly tree: BTree) {}
 
@@ -1302,6 +1304,7 @@ export class BTreeCursor {
     this.close();
     const f = this.tree.descendForCursor(key ?? null, false);
     this.frame = f;
+    this.seenWrites = this.tree.pager.writes;
     this.idx = key === undefined ? 0 : this.tree.leafLowerBound(f, key);
     return this.settleForward();
   }
@@ -1328,6 +1331,37 @@ export class BTreeCursor {
       const g = tree.pager.get(nx);
       n = nCells(g);
       if (n > 0 && lastKeyAtLeast(g, n, key)) {
+        tree.pager.release(f);
+        this.frame = g;
+        this.idx = tree.leafLowerBound(g, key);
+        return this.settleForward();
+      }
+      tree.pager.release(g);
+    }
+    return this.seek(key);
+  }
+
+  /**
+   * {@link seek} for probes that are often near the previous one (a nested loop's lookups, in the order the outer rows
+   * come): when nothing was written since this cursor last sought, and `key` lies within the keys of its leaf (or of
+   * the next leaf, past them), the leaf is searched without a descent from the root. A B+tree leaf holds every key
+   * between its first and last, so the result is {@link seek}'s.
+   */
+  seekNear(key: Uint8Array): boolean {
+    const f = this.frame;
+    const tree = this.tree;
+    if (f === null || this.seenWrites !== tree.pager.writes) return this.seek(key);
+    const n = nCells(f);
+    if (n === 0 || cmpLeafKey(key, f, slot(f, 0)) < 0) return this.seek(key);
+    if (lastKeyAtLeast(f, n, key)) {
+      this.idx = tree.leafLowerBound(f, key);
+      return this.settleForward();
+    }
+    const nx = rightPtr(f);
+    if (nx !== 0) {
+      const g = tree.pager.get(nx);
+      const m = nCells(g);
+      if (m > 0 && lastKeyAtLeast(g, m, key)) {
         tree.pager.release(f);
         this.frame = g;
         this.idx = tree.leafLowerBound(g, key);
