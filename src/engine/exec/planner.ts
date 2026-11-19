@@ -346,6 +346,9 @@ interface AccessOption {
  * Cost model constants, in approximate nanoseconds on the reference container (calibrated against
  * bench/micro/joins.ts). Only their ratios matter.
  */
+/** The most index entries the planner counts for an equality on constants (`countEntries`). */
+const COUNT_CAP = 1024;
+
 const COST = {
   /** Sequential scan, per row (fused decode + filter). */
   scanRow: 30,
@@ -1655,6 +1658,33 @@ export class Planner {
   // ---------------------------------------------------------------- access paths
 
   /** Enumerate ways to read `src` using the given candidate conjuncts, with estimated costs. */
+  /**
+   * How many entries an index holds whose leading columns equal the values given (constants): counted when there are
+   * fewer than `cap`, else null (the statistics' estimate stands). Read at planning time, so a plan cached for these
+   * values keeps the count it was planned with.
+   */
+  private countEntries(table: TableSchema, idx: IndexSchema, eq: Fn[], convert: ((v: SqlValue) => SqlValue)[], cap: number): number | null {
+    const access = new TableAccess(this.env.openTree(table.rootPage), new RecordReader(table.layout, table.recordDefaults), table.name, table.rowidAlias);
+    access.table = table;
+    const scan = new IndexScan(access, {
+      indexName: idx.name,
+      tree: this.env.openTree(idx.rootPage),
+      columns: idx.columns.map((c) => ({ desc: c.desc, collation: c.collation })),
+      eq,
+      convert,
+      // Nothing is decoded: every entry is counted from the index alone.
+      keyColumns: idx.columns.map((c) => c.column),
+    });
+    scan.open([]);
+    let n = 0;
+    try {
+      while (scan.next()) if (++n >= cap) return null;
+    } finally {
+      scan.close();
+    }
+    return n;
+  }
+
   private accessOptions(src: Source, p: number, candidates: ConjunctInfo[], scope: Scope, ctx: FunctionContext): AccessOption[] {
     if (src.sub) {
       const sub = src.sub;
@@ -1831,6 +1861,13 @@ export class Planner {
         matches = N;
         // Expression columns have no statistics: assume ~10 rows per value, like SQLite without ANALYZE.
         for (let j = 0; j < k; j++) matches /= idx.columns[j].column < 0 ? Math.max(1, N / 10) : this.ndv(src, idx.columns[j].column);
+      }
+      // Equalities on literals: the entries the index holds for them, counted up to a cap, when fewer than the
+      // estimate. A column with few values often has very different counts per value (a label index: most nodes
+      // are one label, and a new label has none), where the average overestimates the rare ones.
+      if (!unique && k > 0 && !lo && !hi && !idx.where && matches > 1 && eqs.every((x) => x.other.k === 'lit')) {
+        const counted = this.countEntries(table, idx, eqs.map((x) => compileBoundExpr(x.other, ctx).fn), converters, Math.min(COUNT_CAP, Math.ceil(matches)));
+        if (counted !== null) matches = counted;
       }
       if (lo || hi) matches *= (k === 0 ? this.rangeFraction(idx, lo, hi) : undefined) ?? (lo && hi ? 0.25 : 0.33);
       // A partial index only holds rows matching its WHERE.

@@ -1,8 +1,14 @@
 /**
- * The planner's cost of a covering index: a plan's scan names the columns it reads, and when the index's key holds
+ * How the planner costs an index.
+ *
+ * A covering index: a plan's scan names the columns it reads, and when the index's key holds
  * them all, each entry costs an index step, not a table fetch. An equality on a column with few distinct values
  * (an edge table's `end`, where most edges end at a few nodes) then seeks the index instead of scanning the table: a
  * value that isn't there costs one descent, not a scan.
+ *
+ * An equality on literals: the planner counts the index's entries for them (up to a cap) when that is fewer than the
+ * statistics' average, so a rare value of a column with few values (a label nearly no node has) isn't costed as a
+ * common one.
  */
 import { describe, expect, it } from 'vitest';
 import { Database } from '../src/engine/database.js';
@@ -36,6 +42,29 @@ describe('a covering index', () => {
 
   it('is not costed as covering when the scan reads a column outside it: the table is scanned', () => {
     const db = edges();
-    expect(explain(db, query([-1, 0, 1, 2], eq(2, 99)))).toContain('SCAN e');
+    expect(explain(db, query([-1, 0, 1, 2], eq(2, 1)))).toContain('SCAN e');
+  });
+});
+
+describe('an equality on a literal', () => {
+  function labels(): Database {
+    const db = Database.openMemory();
+    db.exec('CREATE TABLE node(id INTEGER PRIMARY KEY, props TEXT); CREATE TABLE lab(id INTEGER, label TEXT); CREATE INDEX lab_label ON lab(label, id)');
+    // 3,000 nodes labelled A, 3,000 labelled B, 5 labelled C.
+    db.exec("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 6005) INSERT INTO node SELECT i, 'x' FROM n");
+    db.exec("INSERT INTO lab SELECT id, CASE WHEN id <= 3000 THEN 'A' WHEN id <= 6000 THEN 'B' ELSE 'C' END FROM node");
+    db.exec('ANALYZE');
+    return db;
+  }
+  const plan = (db: Database, sql: string) => db.query(`EXPLAIN QUERY PLAN ${sql}`).rows.map((r) => r[3]).join(' | ');
+
+  it('is estimated from the entries the index holds for it, when fewer than the average', () => {
+    const db = labels();
+    const join = (label: string) => `SELECT node.id FROM node JOIN lab ON lab.id = node.id WHERE lab.label = '${label}'`;
+    // The average (about 2,000 per label) would hash-join both tables; C's 5 entries are sought, then 5 nodes.
+    expect(plan(db, join('C'))).toBe('SEARCH lab USING COVERING INDEX lab_label (=?) | SEARCH node USING INTEGER PRIMARY KEY (rowid=?)');
+    expect(plan(db, join('none'))).toBe('SEARCH lab USING COVERING INDEX lab_label (=?) | SEARCH node USING INTEGER PRIMARY KEY (rowid=?)');
+    expect(db.query(join('C')).rows.length).toBe(5);
+    expect(db.query(join('none')).rows).toEqual([]);
   });
 });
