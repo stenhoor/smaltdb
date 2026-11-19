@@ -194,6 +194,8 @@ interface Source {
   lateral?: boolean;
   /** `INDEXED BY name` (string) / `NOT INDEXED` (null). */
   indexedBy?: string | null;
+  /** The table's columns a plan's scan reads (-1: the rowid); all of them when not given. */
+  reads?: readonly number[];
   joinType: JoinType;
   /** The join condition's conjuncts, bound from the plan. */
   onBound?: BoundConjunct[];
@@ -351,6 +353,8 @@ const COST = {
   probe: 1500,
   /** Per index entry: advance plus table row fetch by rowid. */
   fetch: 1200,
+  /** Per index entry of a covering index (every column read is in its key): advance and decode, no fetch. */
+  indexEntry: 40,
   /** Hash join: per build row, per probe row. */
   hashBuild: 80,
   hashProbe: 60,
@@ -1450,6 +1454,7 @@ export class Planner {
       joinType,
       position,
       indexedBy: item.indexedBy,
+      ...(item.kind === 'table' && item.columns ? { reads: item.columns } : {}),
     };
     if (typeof item.indexedBy === 'string' && !table.indexes.some((i) => sameName(i.name, item.indexedBy!))) {
       throw new SmaltError('SMALT_ERROR', `no such index: ${item.indexedBy}`);
@@ -1832,7 +1837,13 @@ export class Planner {
       if (idx.where) for (const w of andParts(this.indexPlan(idx).where!)) matches *= this.selectivityOf(this.indexBound(src, w), scope);
       matches = Math.max(1, matches);
       const deps = outerDep([...eqs, ...(lo ? [lo] : []), ...(hi ? [hi] : [])]);
-      consider(`index ${idx.name}`, COST.probe + matches * COST.fetch, matches, deps, () => {
+      // Covering when every column the source reads (its scan's columns; the rowid is in every entry) is a plain key
+      // column whose key form is its value (as `keyColumns` below): the rows come from the index alone, as IndexScan
+      // decides once it knows what it decodes. A scan's columns are all it may read, so this never calls an index
+      // covering that isn't.
+      const keyCols = idx.columns.filter((c) => c.column >= 0 && !(c.collation !== Collation.Binary && ['TEXT', 'ANY', 'NUMERIC'].includes(table.columns[c.column].type))).map((c) => c.column);
+      const covering = (src.reads ?? src.cols.map((c) => c.index)).every((c) => c === -1 || keyCols.includes(c));
+      consider(`index ${idx.name}`, COST.probe + matches * (covering ? COST.indexEntry : COST.fetch), matches, deps, () => {
         const spec = {
           indexName: idx.name,
           tree: this.env.openTree(idx.rootPage),
@@ -2758,13 +2769,13 @@ const JOIN_TYPES: Readonly<Record<JoinKind, JoinType>> = { inner: 'INNER', cross
  * plan (planned separately: see BoundFrom.source). `alias` is the leaf's position (`#p`).
  */
 type PlanLeaf =
-  | { readonly kind: 'table'; readonly name: string; readonly schema?: string; readonly alias: string; readonly indexedBy?: string | null }
+  | { readonly kind: 'table'; readonly name: string; readonly schema?: string; readonly alias: string; readonly indexedBy?: string | null; readonly columns?: readonly number[] }
   | { readonly kind: 'function'; readonly name: string; readonly alias: string }
   | { readonly kind: 'nested'; readonly alias: string };
 
 function planLeaf(op: PlanOp, p: number): PlanLeaf {
   const alias = `#${p}`;
-  if (op.op === 'scan') return { kind: 'table', schema: op.db, name: op.table, alias, indexedBy: op.indexedBy };
+  if (op.op === 'scan') return { kind: 'table', schema: op.db, name: op.table, alias, indexedBy: op.indexedBy, columns: op.columns };
   if (op.op !== 'source') return { kind: 'nested', alias };
   if (op.kind === 'function') return { kind: 'function', name: op.name, alias };
   return { kind: 'table', schema: op.schema, name: op.name, alias };
