@@ -84,6 +84,20 @@ describe('changing maps', () => {
     });
   });
 
+  it('map_merge of two maps of one type merges their bytes: the same as merging their entries, for any keys', () => {
+    // Keys that are prefixes of each other, empty, beyond ASCII and beyond the BMP; values of every kind.
+    const keys = ['', 'a', 'ab', 'abc', 'b', 'B', 'é', 'z', '日本', '😀', 'a\u0000'];
+    const values = [null, 0, -1, 2.5, 'x', '', true, [1, 'a'], 1e300];
+    let seed = 7;
+    const rand = (n: number) => ((seed = (seed * 1103515245 + 12345) % 2147483648), seed % n);
+    const map = () => Object.fromEntries(Array.from({ length: rand(6) }, () => [keys[rand(keys.length)]!, values[rand(values.length)]!]));
+    const rows = Array.from({ length: 200 }, () => [map(), map()]);
+    const frame = p.fromColumns([rows.map((r) => r[0]), rows.map((r) => r[1])] as never, [M, M]);
+    const out = db.queryPlan(p.project(frame, [call('map_merge', [p.col(0, 0, M), p.col(0, 1, M)], M)])).rows;
+    const sorted = (m: object) => Object.fromEntries(Object.entries(m).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+    rows.forEach(([x, y], i) => expect(out[i]![0], JSON.stringify([x, y])).toEqual(sorted({ ...x, ...y })));
+  });
+
   it('map_remove drops the keys listed, and gives the map unchanged for a NULL list', () => {
     expect(one((props) => call('map_remove', [props, call('list_of', [p.lit('title'), p.lit('nope')], 'list<text>' as PlanType)], M), M)).toEqual({ born: 1815, name: 'Ada' });
     expect(one((props) => call('map_remove', [props, p.lit(null)], M), M)).toEqual({ born: 1815, name: 'Ada', title: null });
