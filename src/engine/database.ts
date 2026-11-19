@@ -952,10 +952,23 @@ export class Database implements FunctionContext {
     graphs: () => [...this.graphs.values()].map((g) => g.graph),
     getTable: (n) => this.tables.get(n.toLowerCase()),
     schemaVersion: () => this.schemaVersion,
-    rowExists: (t, rowid) => this.writerFor(t).rowExists(rowid),
+    rowExists: (t, rowid) => this.rowExists(t, rowid),
     nextRowid: (t) => this.writerFor(t).newRowid(),
     run: (plan, params) => this.internalPlan(plan, params) ?? [],
   });
+
+  private readonly rowKey = new Uint8Array(ROWID_KEY_SIZE);
+
+  /**
+   * Whether a table has a row, for the graph rules' checks on every row written: a row table's B-tree is asked
+   * directly (a writer, made when the table's own is busy writing, would cost more than the check). A columnar table
+   * asks its writer, which also looks in its segments.
+   */
+  private rowExists(t: TableSchema, rowid: number | bigint): boolean {
+    if (t.columnar) return this.writerFor(t).rowExists(rowid);
+    writeRowidKey(this.rowKey, 0, rowid);
+    return this.tree(t.rootPage).has(this.rowKey);
+  }
 
   private internalPrograms = new WeakMap<PlanOp, { version: number; prog: Program }>();
 
