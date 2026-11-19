@@ -15,15 +15,13 @@ columns: amount real, name text
 columns: customer_id int, n int, total real
   Project
     Filter [est 10]
-      Project
-        FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
+      FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
 
 > SELECT c.name, t.total FROM customers c JOIN customer_totals t ON t.customer_id = c.id WHERE c.region = ?
 columns: name text, total real
   Project
     HashJoin: HASH JOIN [est 200]
-      Project [est 1000]
-        FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
+      FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY) [est 1000]
       FusedScanFilter: SCAN customers (fused scan + filter) [est 400]
 
 > SELECT region, sum(total) FROM region_day GROUP BY region

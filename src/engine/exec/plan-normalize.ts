@@ -676,7 +676,11 @@ function orderedGroups(op: Op<'aggregate'>): PlanOp {
   const sorted = op.carry.length === 0 && op.aggs.every((c) => ORDER_FREE_AGGS.has(c.fn)) ? sortKeyColumn(op.input) : null;
   if (sorted) {
     // Each group's first row is the one whose sort keys are least: no sort of the rows, no numbers.
-    const min: AggCall = { fn: 'min', args: [typedColumn(sorted.at, sorted.type)], star: false, distinct: false, collation: 'binary', type: sorted.type };
+    const parts = sorted.at.map((c, i) => typedColumn(c, sorted.types[i]!));
+    // Whole numbers compare without a list per row (functions.ts `smalt_min_int_list`); others as lists.
+    const min: AggCall = sorted.type === 'list<int>'
+      ? { fn: 'smalt_min_int_list', args: parts, star: false, distinct: false, collation: 'binary', type: sorted.type }
+      : { fn: 'min', args: [{ k: 'call', fn: 'list_of', args: parts, type: sorted.type } as PlanExpr], star: false, distinct: false, collation: 'binary', type: sorted.type };
     grouped = { ...plain, input: sorted.input, aggs: [...op.aggs, min] };
     at = k + a;
     orderType = sorted.type;
@@ -705,7 +709,7 @@ const ORDER_FREE_AGGS = new Set(['count', 'sum', 'total', 'avg', 'min', 'max']);
  * the rows pass, no sort), and lists compare element by element. So a group's least list is its first row in the sort's
  * order. Null when a key is descending, has a collation or a subquery.
  */
-function sortKeyColumn(input: PlanOp): { input: PlanOp; at: number; type: PlanType } | null {
+function sortKeyColumn(input: PlanOp): { input: PlanOp; at: number[]; types: PlanType[]; type: PlanType } | null {
   const chain: Op<'project'>[] = [];
   let n = input;
   while (n.op === 'project') {
@@ -725,14 +729,15 @@ function sortKeyColumn(input: PlanOp): { input: PlanOp; at: number; type: PlanTy
   const below = n.input;
   const w = planWidth(below);
   // Last, the row's position in the sort's input: rows whose keys tie keep that order, as the sort (stable) keeps it.
-  const tuple: PlanExpr = { k: 'call', fn: 'list_of', args: [...n.keys.flatMap((key) => [flag(key), key.expr]), typedColumn(w, 'int')], type };
-  let cur: PlanOp = { op: 'project', input: numbered(below), exprs: [...identity(below), tuple] };
-  let at = w;
+  const parts: PlanExpr[] = [...n.keys.flatMap((key) => [flag(key), key.expr]), typedColumn(w, 'int')];
+  const partTypes: PlanType[] = parts.map((p) => typeOf(p));
+  let cur: PlanOp = { op: 'project', input: numbered(below), exprs: [...identity(below), ...parts] };
+  let at = parts.map((_p, i) => w + i);
   for (const pj of chain.reverse()) {
-    cur = { ...pj, input: cur, exprs: [...pj.exprs, typedColumn(at, type)] };
-    at = pj.exprs.length;
+    cur = { ...pj, input: cur, exprs: [...pj.exprs, ...at.map((c, i) => typedColumn(c, partTypes[i]!))] };
+    at = at.map((_c, i) => pj.exprs.length + i);
   }
-  return { input: cur, at, type };
+  return { input: cur, at, types: partTypes, type };
 }
 
 /**

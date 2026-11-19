@@ -26,6 +26,5 @@ columns: day int, sum(amount) OVER w real, avg(amount) OVER w real
 columns: id int, prev real
   Project
     Filter [est 330]
-      Project
-        Window
-          FusedScanFilter: SCAN orders (fused scan + filter)
+      Window
+        FusedScanFilter: SCAN orders (fused scan + filter)

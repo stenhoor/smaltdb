@@ -65,8 +65,7 @@ columns: id int, customer_id int, day int, status text, amount real
 columns: customer_id int, total real
   Project
     Filter [est 330]
-      Project
-        FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
+      FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
 
 > SELECT * FROM (SELECT id, amount * 2 AS a2 FROM orders WHERE day = 1) WHERE a2 > 10
 columns: id int, a2 real
@@ -79,8 +78,7 @@ columns: id int, a2 real
 columns: name text, amount real
   Project
     HashJoin: HASH JOIN [est 6600]
-      Project [est 6600]
-        FusedScanFilter: SCAN orders (fused scan + filter)
+      FusedScanFilter: SCAN orders (fused scan + filter) [est 6600]
       FusedScanFilter: SCAN customers (fused scan + filter) [est 2000]
 
 > WITH s AS (SELECT day, sum(amount) AS t FROM orders GROUP BY day) SELECT a.day FROM s a JOIN s b ON b.day = a.day + 1 WHERE b.t > a.t
@@ -88,10 +86,8 @@ columns: day int
   Project
     Filter
       HashJoin: HASH JOIN [est 109000]
-        Project [est 1000]
-          FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
-        Project [est 1000]
-          FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY)
+        FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY) [est 1000]
+        FusedGroupAggregate: SCAN orders (fused scan + filter + GROUP BY) [est 1000]
 
 > WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10) SELECT sum(i) FROM n
 columns: sum(i) int

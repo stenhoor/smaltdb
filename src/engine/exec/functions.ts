@@ -1052,5 +1052,33 @@ for (const [name, agg] of STAT_AGGREGATES) aggregateFunctions.set(name, agg);
 // A group's values as a list (ADR 0020).
 aggregateFunctions.set('implode', IMPLODE);
 
+/**
+ * `min(list_of(args...))` for whole-number arguments, without making a list per row: the least arguments compared
+ * element by element, made into the list once (prototype; plan-normalize.ts `sortKeyColumn` uses it).
+ */
+class MinListState implements AggregateState {
+  private best: SqlValue[] | null = null;
+  step(args: SqlValue[]): void {
+    const b = this.best;
+    if (b !== null) {
+      let i = 0;
+      for (; i < args.length; i++) {
+        const x = args[i] as number | bigint;
+        const y = b[i] as number | bigint;
+        if (x !== y) {
+          if (x > y) return;
+          break;
+        }
+      }
+      if (i === args.length) return;
+    }
+    this.best = args.slice();
+  }
+  final(): SqlValue {
+    return this.best === null ? null : encodeKey(this.best);
+  }
+}
+aggregateFunctions.set('smalt_min_int_list', { minArgs: 1, maxArgs: 255, resultType: () => 'list<int>' as never, create: () => new MinListState() });
+
 /** Format helper re-exported for EXPLAIN and tests. */
 export { formatReal };

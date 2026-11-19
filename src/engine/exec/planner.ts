@@ -760,7 +760,10 @@ export class Planner {
           const w = this.workings.get(l.id)!;
           return { plan: { root: w.scan, outRegs: w.regs, columns: w.columns, correlated: true }, working: true };
         }
-        return { plan: l.op === 'iterate' ? this.physicalIterate(l, outer) : this.physicalAny(l, null, outer) };
+        if (l.op === 'iterate') return { plan: this.physicalIterate(l, outer) };
+        // A FROM plan's results are read where they are: a result that is a register is not copied.
+        this.aliasResults = flatShape(l) !== null;
+        return { plan: this.physicalAny(l, null, outer) };
       },
       args: (p) => {
         const l = leaves[p].op;
@@ -960,6 +963,8 @@ export class Planner {
    */
   private physical(op: PlanOp, given: ResultColumnInfo[] | null, outer: ColMap | null, outRegs?: number[]): QueryPlan {
     const s = flatShape(op)!;
+    const alias = this.aliasResults;
+    this.aliasResults = false;
     const ctx = this.env.funcCtx;
     const compile = (e: BoundExpr): Compiled => compileBoundExpr(e, ctx);
     const scope = new Scope(null);
@@ -1060,7 +1065,9 @@ export class Planner {
     // Result expressions, then ORDER BY expressions that are not results, then HAVING (planCore's order).
     const n = s.width;
     const compiled = s.project.slice(0, n).map((e) => compile(bind(e, readSlot)));
-    const regs = outRegs ?? compiled.map(() => this.regs.alloc());
+    // A result that only reads a register is that register (no copy per row), unless the caller gives the registers.
+    const aliased = !outRegs && !ALIAS_OFF && alias;
+    const regs = outRegs ?? compiled.map((c) => (aliased && c.reg !== undefined ? c.reg : this.regs.alloc()));
     const columns: ResultColumnInfo[] =
       given ?? compiled.map((c) => ({ name: '', type: c.type, collation: c.collSrc !== CollSrc.None ? c.collation : Collation.Binary, affinity: c.affinity }));
     const sortKeys: SortKey[] = [];
@@ -1117,7 +1124,12 @@ export class Planner {
         : scope.sources.flatMap((src) => [...src.cols.map((c) => c.reg), ...(src.rowidReg >= 0 ? [src.rowidReg] : [])]);
       root = new Window(root, [...new Set(snap)], windowDefs);
     }
-    root = new Project(root, [...compiled.map((c) => c.fn), ...extraFns], [...regs, ...extraRegs]);
+    const pfns: Fn[] = [];
+    const pregs: number[] = [];
+    compiled.forEach((c, i) => {
+      if (!(aliased && c.reg !== undefined && regs[i] === c.reg)) (pfns.push(c.fn), pregs.push(regs[i]));
+    });
+    if (pfns.length || extraFns.length) root = new Project(root, [...pfns, ...extraFns], [...pregs, ...extraRegs]);
     if (s.distinct) root = new Distinct(root, regs, s.distinct.map(collationId));
     if (sortNeeded) {
       const hint = s.limit ? topN(...limitFns()) : undefined;
@@ -1309,6 +1321,8 @@ export class Planner {
   private orderWanted: OrderWanted | null = null;
   /** Set by `planFrom`: whether its rows come in `orderWanted`'s order (so no sort is needed). */
   private orderDelivered = false;
+  /** Set for a FROM plan, read once by `physical`: its results that are registers are not copied (prototype). */
+  private aliasResults = false;
 
   /**
    * Plan FROM + WHERE into an operator tree; registers sources in `scope`. `bound` (the physical planner) gives the
@@ -3285,6 +3299,8 @@ function rebind(e: BoundExpr, f: (c: ColRef) => BoundExpr, sub?: (n: BoundExpr, 
 }
 
 /** The register slot for column `c`, with its SQL metadata; `use` marks the column as read when compiled. */
+const ALIAS_OFF = typeof process !== 'undefined' && !!process.env?.SMALT_NO_ALIAS;
+
 function slotFor(c: ColRef, reg: number, use?: () => void): BoundExpr {
   const slot: BoundExpr = use ? { k: 'slot', reg, type: c.type, use } : { k: 'slot', reg, type: c.type };
   const m = getMeta(c);
