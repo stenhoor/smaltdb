@@ -3376,7 +3376,8 @@ export class Database implements FunctionContext {
   /**
    * A label or relationship type added to a graph (ADR 0033, decision 11: made on first use). Its table, by default
    * named after it, is created when there is none: `id INTEGER PRIMARY KEY` and `props map<text, any>` for a label;
-   * `start`, `end` and `props`, with indexes on `start` and on `end`, for a type. An existing table is checked as
+   * `start`, `end` and `props`, with indexes on `(start, end)` and on `(end, start)` for a type (ADR 0033: a hop from
+   * a node to its other end reads the index alone, not the table). An existing table is checked as
    * createPropertyGraph checks one. One transaction: the table, its indexes and the graph's new record.
    */
   private alterPropertyGraph(stmt: Extract<SchemaOp, { op: 'alterPropertyGraph' }>): RunResult {
@@ -3418,7 +3419,7 @@ export class Database implements FunctionContext {
       next = isLabel ? { ...g, nodes: [...g.nodes, { label: name, table: tableName, id: 'id', props: 'props', ...(a.copy ? { copy: true } : {}) }] } : { ...g, edges: [...g.edges, { type: name, table: tableName, start: 'start', end: 'end', props: 'props' }] };
       this.createTable({ op: 'createTable', table, temp: false, ifNotExists: false });
       if (!isLabel) {
-        for (const [i, c] of ['start', 'end'].entries()) this.createIndex({ op: 'createIndex', index: { name: `${tableName}_${c}`, table: tableName, columns: [key(i)], unique: false }, ifNotExists: false });
+        for (const [i, c] of ['start', 'end'].entries()) this.createIndex({ op: 'createIndex', index: { name: `${tableName}_${c}`, table: tableName, columns: [key(i), key(1 - i)], unique: false }, ifNotExists: false });
       }
       next = this.checkGraph(next, g.name.toLowerCase());
     }
