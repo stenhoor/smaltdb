@@ -334,7 +334,7 @@ export class RowidLookup implements Operator {
     while (this.i < this.keys.length) {
       const k = this.keys[this.i++];
       writeRowidKey(this.keyBuf, 0, k);
-      if (c.seek(this.keyBuf) && c.compareKey(this.keyBuf) === 0) {
+      if (c.seekNear(this.keyBuf) && c.compareKey(this.keyBuf) === 0) {
         this.access.load(c, this.r);
         return true;
       }
@@ -501,7 +501,7 @@ export class IndexScan implements Operator {
     if (!this.started) {
       this.started = true;
       if (!this.bounds()) return (this.done = true), false;
-      ok = c.seek(this.lower!);
+      ok = c.seekNear(this.lower!);
     } else ok = c.next();
     if (!ok) return (this.done = true), false;
     c.loadKey();

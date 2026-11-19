@@ -226,3 +226,62 @@ describe('BTree.bulkLoadKeys', () => {
     });
   }
 });
+
+describe('BTreeCursor.seekNear', () => {
+  it('finds what seek finds, for probes near and far, with writes between them', () => {
+    const { pager } = openMemoryPager({ pageSize: 512 });
+    const tree = new BTree(pager, BTree.create(pager));
+    const rand = rng(42);
+    const keys = new Set<number>();
+    for (let i = 0; i < 3000; i++) {
+      const k = Math.floor(rand() * 10000);
+      keys.add(k);
+      tree.put(encodeKey([k]), new Uint8Array([k & 0xff]));
+    }
+    const near = tree.cursor();
+    const plain = tree.cursor();
+    const at = (c: ReturnType<BTree['cursor']>, ok: boolean) => (ok ? hex(c.key()) : null);
+    let probe = 0;
+    for (let i = 0; i < 4000; i++) {
+      // Mostly ascending, with jumps back and far ahead.
+      const r = rand();
+      probe = r < 0.7 ? probe + Math.floor(rand() * 8) : r < 0.85 ? Math.floor(rand() * 10000) : Math.max(0, probe - Math.floor(rand() * 50));
+      const key = encodeKey([probe]);
+      expect(at(near, near.seekNear(key)), `probe ${probe}`).toBe(at(plain, plain.seek(key)));
+      // Writes between probes. Inserts split pages, the cursors' leaves among them, while the cursors hold them: a
+      // leaf still holds every key between its first and last. Deletes free pages, which a pinned leaf can't be (the
+      // engine's operators close their cursors before such writes): the cursors are closed for those, and seekNear
+      // then descends.
+      if (i % 97 === 0) {
+        near.close();
+        plain.close();
+        for (let k = Math.max(0, probe - 200); k < probe + 200; k++) if (keys.delete(k)) tree.delete(encodeKey([k]));
+        for (let j = 0; j < 150; j++) {
+          const k = 20000 + Math.floor(rand() * 10000);
+          tree.put(encodeKey([k]), new Uint8Array(40));
+          keys.add(k);
+        }
+        for (let j = 0; j < 40; j++) {
+          const k = Math.floor(rand() * 10000);
+          if (keys.has(k) && rand() < 0.6) {
+            tree.delete(encodeKey([k]));
+            keys.delete(k);
+          } else {
+            tree.put(encodeKey([k]), new Uint8Array(1 + Math.floor(rand() * 60)));
+            keys.add(k);
+          }
+        }
+        near.seek(key);
+        plain.seek(key);
+      } else if (i % 13 === 0) {
+        for (let j = 0; j < 30; j++) {
+          const k = probe + Math.floor(rand() * 40);
+          tree.put(encodeKey([k]), new Uint8Array(1 + Math.floor(rand() * 60)));
+          keys.add(k);
+        }
+      }
+    }
+    near.close();
+    plain.close();
+  });
+});
