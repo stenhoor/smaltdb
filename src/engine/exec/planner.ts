@@ -340,6 +340,23 @@ interface AccessOption {
   rows: number;
   dependsOnOuter: boolean;
   build: () => AccessChoice;
+  /**
+   * The table column its rows come in ascending order of (-1: the rowid), with that order's collation: a table scan
+   * reads by rowid; an index seek by the index column after its equalities (by rowid when they cover the index).
+   */
+  orderBy?: { column: number; collation: Collation };
+}
+
+/** An ORDER BY with a LIMIT that a join could give in order (`physical` to `planFrom`): which source and column. */
+interface OrderWanted {
+  readonly source: number;
+  /** The table column (-1: the rowid). */
+  readonly column: number;
+  readonly collation: Collation;
+  /** The rows the LIMIT (and OFFSET) read. */
+  readonly rows: number;
+  /** NULLS LAST: an index gives NULLs first, so only a column without NULLs (the rowid, NOT NULL) is in order. */
+  readonly nullsLast: boolean;
 }
 
 /**
@@ -365,6 +382,8 @@ const COST = {
   nlRow: 20,
   /** Per output row of a join. */
   outRow: 10,
+  /** A sort, per row and per comparison (rows × log2 rows). */
+  sortRow: 15,
 };
 
 /** Default rows for derived tables (unknown cardinality). */
@@ -860,6 +879,34 @@ export class Planner {
   }
 
   /**
+   * An ORDER BY of one column of a FROM table, ascending, with a literal LIMIT, in a plan without grouping, DISTINCT or
+   * windows: what `planFrom` may give in order (`orderedJoin`). Null otherwise.
+   */
+  private orderWantedOf(s: FlatShape): OrderWanted | null {
+    if (!s.sort || s.sort.length !== 1 || !s.limit || !s.from || s.aggregate || s.distinct || s.windows.length || s.having) return null;
+    const literal = (e: PlanExpr | undefined): number | null => (e === undefined ? 0 : e.k === 'lit' && typeof e.value === 'number' && e.value >= 0 ? e.value : null);
+    const count = literal(s.limit.count);
+    const offset = literal(s.limit.offset);
+    if (count === null || offset === null) return null;
+    const k = s.sort[0];
+    if (k.desc) return null;
+    const e = s.project[(k.expr as ColRef).index];
+    if (e.k !== 'col' || e.depth !== 0 || isOpaque(e)) return null;
+    let at = e.index;
+    for (let p = 0; p < s.from.length; p++) {
+      const l = s.from[p];
+      const w = planWidth(l.op);
+      if (at < w) {
+        const join = l.join ?? 'inner';
+        if (l.op.op !== 'scan' || (join !== 'inner' && join !== 'cross')) return null;
+        return { source: p, column: l.op.columns[at], collation: collationId(k.collation), rows: count + offset, nullsLast: !k.nullsFirst };
+      }
+      at -= w;
+    }
+    return null;
+  }
+
+  /**
    * Operators for a plan `supportedPlan` accepts. `outer` maps the columns of the enclosing operation's row for a
    * subquery's plan (its columns with depth > 0), null at the top; `given` are the result columns (computed when
    * null).
@@ -876,7 +923,11 @@ export class Planner {
 
     const fast = this.countRowsOf(s, given, outRegs);
     if (fast) return { ...fast, root: limit(fast.root) };
+    this.orderWanted = this.orderWantedOf(s);
     let root = this.planFromShape(s.from, s.where, scope, outer, b);
+    const ordered = this.orderDelivered;
+    this.orderWanted = null;
+    this.orderDelivered = false;
 
     // The aggregate's output row: keys, then aggregate calls (registers allocated where first read, as planCore
     // does while binding), then carried bare columns (the FROM row's registers).
@@ -995,7 +1046,7 @@ export class Planner {
     }
 
     // ORDER BY the rowid of a table scan: read the table in rowid order (backwards for DESC), as planCore.
-    let sortNeeded = sortKeys.length > 0;
+    let sortNeeded = sortKeys.length > 0 && !ordered;
     const single = s.from?.length === 1 && s.from[0].op.op === 'scan' ? s.from[0].op : null;
     if (sortNeeded && !agg && !s.distinct && single && sortKeys.length === 1) {
       const k = s.sort![0];
@@ -1207,6 +1258,10 @@ export class Planner {
 
   /** The full scan chosen for the first source (for ORDER BY elimination); reset per FROM. */
   private lastScan: TableScan | null = null;
+  /** Set by `physical` for `planFrom`: an ORDER BY with a LIMIT that the join could give in order. */
+  private orderWanted: OrderWanted | null = null;
+  /** Set by `planFrom`: whether its rows come in `orderWanted`'s order (so no sort is needed). */
+  private orderDelivered = false;
 
   /**
    * Plan FROM + WHERE into an operator tree; registers sources in `scope`. `bound` (the physical planner) gives the
@@ -1252,7 +1307,17 @@ export class Planner {
     if (!hasOuter) this.prunePartitions(scope, pool);
 
     const ctx = this.env.funcCtx;
-    const order = hasOuter ? scope.sources.map((_, i) => i) : this.joinOrder(scope, pool, ctx);
+    const wanted = this.orderWanted;
+    this.orderWanted = null;
+    this.orderDelivered = false;
+    let order = hasOuter ? scope.sources.map((_, i) => i) : this.joinOrder(scope, pool, ctx);
+    // ORDER BY … LIMIT: the plan that reads the ordering source first, in order, and every other source by an index
+    // lookup per row (which keeps the order), when stopping at the LIMIT costs less than the join and a sort.
+    const forced = wanted && !hasOuter ? this.orderedJoin(scope, pool, ctx, order, wanted) : null;
+    if (forced) {
+      order = forced.order;
+      this.orderDelivered = true;
+    }
     const multi = scope.sources.length > 1;
     const placed = new Set<number>();
     let outerRows = 1;
@@ -1292,6 +1357,7 @@ export class Planner {
       const allowed = hasOuter ? pool.filter((c) => (c.minStep ?? -1) <= p) : pool;
       const step = this.joinStep(src, placed, outerRows, isLeft ? onInfos : allowed, scope, ctx);
       const candidates = step.candidates;
+      if (forced) step.option = this.accessOptions(src, p, candidates, scope, ctx).find((o) => o.label === forced.labels.get(p))!;
       const access = step.option.build();
       if (!multi && access.scan) this.lastScan = access.scan;
 
@@ -1751,6 +1817,7 @@ export class Planner {
           const scan = new TableScan(access);
           return { leaf: scan, dependsOnOuter: false, scan };
         },
+        orderBy: { column: -1, collation: Collation.Binary },
       },
     ];
     const consider = (label: string, cost: number, rows: number, dependsOnOuter: boolean, build: () => AccessChoice): void => {
@@ -1880,6 +1947,9 @@ export class Planner {
       // covering that isn't.
       const keyCols = idx.columns.filter((c) => c.column >= 0 && !(c.collation !== Collation.Binary && ['TEXT', 'ANY', 'NUMERIC'].includes(table.columns[c.column].type))).map((c) => c.column);
       const covering = (src.reads ?? src.cols.map((c) => c.index)).every((c) => c === -1 || keyCols.includes(c));
+      // The order its entries come in: by the column after the equalities, or by rowid when they cover the index.
+      const next = idx.columns[k];
+      const orderBy = !next ? { column: -1, collation: Collation.Binary } : next.column >= 0 && !next.desc ? { column: next.column, collation: next.collation } : undefined;
       consider(`index ${idx.name}`, COST.probe + matches * (covering ? COST.indexEntry : COST.fetch), matches, deps, () => {
         const spec = {
           indexName: idx.name,
@@ -1899,6 +1969,7 @@ export class Planner {
         };
         return { leaf: new IndexScan(access, spec), dependsOnOuter: deps, consumed: [...eqs, ...(lo ? [lo] : []), ...(hi ? [hi] : [])].map((x) => x.conj) };
       });
+      if (orderBy) options[options.length - 1].orderBy = orderBy;
     }
     // INDEXED BY / NOT INDEXED, as in SQLite.
     if (src.indexedBy === null) return options.filter((o) => !o.label.startsWith('index '));
@@ -2279,6 +2350,64 @@ export class Planner {
     const sampled = this.statsOf(src);
     if (sampled) return Math.max(1, Math.min(n, sampled.ndv[col] || 1));
     return Math.max(1, n / 10);
+  }
+
+  /**
+   * The join for an ORDER BY with a LIMIT, read in order: the ordering source first, through an access path whose rows
+   * come in the order wanted, then every other source by its cheapest index lookup per row (a nested loop keeps the
+   * outer order). Its cost is scaled by the share of its rows the LIMIT reads. Null when a source has no index lookup,
+   * no access path gives the order, or the usual join (`order`) and a sort cost less. The access paths are named by
+   * label, for `planFrom` to build.
+   */
+  private orderedJoin(scope: Scope, pool: ConjunctInfo[], ctx: FunctionContext, order: number[], wanted: OrderWanted): { order: number[]; labels: Map<number, string> } | null {
+    const n = scope.sources.length;
+    if (scope.sources.some((s) => s.joinType !== 'INNER' && s.joinType !== 'CROSS') || scope.sources.some((s) => s.lateral || s.sub)) return null;
+    const first = scope.sources[wanted.source];
+    if (!first.table || isColumnar(first.table)) return null;
+    const column = wanted.column === first.table.rowidAlias ? -1 : wanted.column;
+    if (wanted.nullsLast && column !== -1 && !first.table.columns[column].notNull) return null;
+    const sameOrder = (o: AccessOption): boolean =>
+      !o.dependsOnOuter && o.orderBy !== undefined && o.orderBy.column === column && (column === -1 || o.orderBy.collation === wanted.collation);
+    const cands = pool.filter((c) => c.deps !== null && c.deps.size === 1 && c.deps.has(wanted.source));
+    const opts = this.accessOptions(first, wanted.source, cands, scope, ctx).filter(sameOrder);
+    if (!opts.length) return null;
+    const start = opts.reduce((a, b) => (b.cost < a.cost ? b : a));
+    const labels = new Map<number, string>([[wanted.source, start.label]]);
+    const placed = new Set([wanted.source]);
+    const out = [wanted.source];
+    let rows = Math.max(1, start.rows);
+    let cost = start.cost;
+    // Greedily, the source with the cheapest index lookup from those placed.
+    while (out.length < n) {
+      let pick: { p: number; option: AccessOption; rows: number } | null = null;
+      for (let p = 0; p < n; p++) {
+        if (placed.has(p)) continue;
+        const step = this.joinStep(scope.sources[p], placed, rows, pool, scope, ctx);
+        const inl = this.accessOptions(scope.sources[p], p, step.candidates, scope, ctx).filter((o) => o.dependsOnOuter);
+        if (!inl.length) continue;
+        const o = inl.reduce((a, b) => (b.cost < a.cost ? b : a));
+        if (!pick || o.cost < pick.option.cost) pick = { p, option: o, rows: step.rows };
+      }
+      if (!pick) return null;
+      cost += rows * pick.option.cost;
+      rows = Math.max(1, pick.rows);
+      labels.set(pick.p, pick.option.label);
+      placed.add(pick.p);
+      out.push(pick.p);
+    }
+    const share = Math.min(1, wanted.rows / rows);
+    // The usual join, and a sort of all its rows.
+    let usual = 0;
+    let usualRows = 1;
+    const done = new Set<number>();
+    for (const p of order) {
+      const step = this.joinStep(scope.sources[p], done, usualRows, pool, scope, ctx);
+      usual += step.cost;
+      usualRows = step.rows;
+      done.add(p);
+    }
+    usual += usualRows * Math.log2(Math.max(2, usualRows)) * COST.sortRow;
+    return cost * share < usual ? { order: out, labels } : null;
   }
 
   /** Pick the cheapest standalone (not outer-dependent) access option. */

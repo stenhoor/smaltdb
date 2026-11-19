@@ -776,7 +776,67 @@ function projectedSort(op: Op<'project'>, s: Op<'sort'>): PlanOp {
   const all: PlanExpr[] = [...op.exprs, ...identity(s.input)];
   const keys = s.keys.map((k) => ({ ...k, expr: expr(shift(k.expr, m)) }));
   const results = op.exprs.map((e, i): PlanExpr => ({ k: 'col', input: 0, index: i, depth: 0, type: typeOf(e), collation: 'binary' }));
-  return { op: 'project', exprs: results, input: { ...s, keys, input: distinctProjected({ op: 'project', exprs: all, input: s.input }) } };
+  const under = composed(all, s.input) ?? { op: 'project', exprs: all, input: s.input };
+  return { op: 'project', exprs: results, input: { ...s, keys, input: distinctProjected(under) } };
+}
+
+/**
+ * `exprs` over a projection, as one projection over the projection's input: its columns replaced by the expressions
+ * that make them. Then the block's FROM is the projection's input (a join region the planner orders, and can read in
+ * the ORDER BY's order) rather than a nested plan. Only where that changes nothing: no subqueries (whose columns of the
+ * enclosing row would move), a projection straight over a core (not over a sort, LIMIT, DISTINCT or compound, whose
+ * order and rows it keeps), and no expression of it but a column or a literal computed more than once. Null otherwise.
+ */
+function composed(exprs: readonly PlanExpr[], inner: PlanOp): Op<'project'> | null {
+  if (inner.op !== 'project' || exprs.some(hasSubquery) || inner.exprs.some(hasSubquery)) return null;
+  const below = inner.input.op;
+  if (below === 'sort' || below === 'limit' || below === 'distinct' || below === 'setop' || below === 'values') return null;
+  const uses = new Array<number>(inner.exprs.length).fill(0);
+  const count = (e: PlanExpr): void => {
+    switch (e.k) {
+      case 'col':
+        if (e.depth === 0 && e.input === 0) uses[e.index]++;
+        return;
+      case 'call':
+      case 'and':
+      case 'or':
+        return e.args.forEach(count);
+      case 'cast':
+      case 'not':
+      case 'isNull':
+        return count(e.arg);
+      case 'case':
+        e.whens.forEach((w) => (count(w.when), count(w.then)));
+        return count(e.else);
+      case 'each':
+        return eachParts(e).forEach(count);
+      default:
+        return;
+    }
+  };
+  exprs.forEach(count);
+  if (inner.exprs.some((x, i) => uses[i] > 1 && x.k !== 'col' && x.k !== 'lit')) return null;
+  const sub = (e: PlanExpr): PlanExpr => {
+    switch (e.k) {
+      case 'col':
+        return e.depth === 0 && e.input === 0 ? inner.exprs[e.index] : e;
+      case 'call':
+      case 'and':
+      case 'or':
+        return { ...e, args: e.args.map(sub) };
+      case 'cast':
+      case 'not':
+      case 'isNull':
+        return { ...e, arg: sub(e.arg) };
+      case 'case':
+        return { ...e, whens: e.whens.map((w) => ({ when: sub(w.when), then: sub(w.then) })), else: sub(e.else) };
+      case 'each':
+        return mapEach(e, sub);
+      default:
+        return e;
+    }
+  };
+  return { op: 'project', exprs: exprs.map(sub), input: inner.input };
 }
 
 /** `e` reading column `i + by` where it read column `i` of its own input. */
