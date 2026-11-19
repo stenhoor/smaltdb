@@ -36,7 +36,7 @@ columns: id int
 > SELECT id FROM orders WHERE day = 10 AND status = 'paid'
 columns: id int
   Project
-    IndexScan: SEARCH orders USING COVERING INDEX orders_day_status (=?,=?) [est 13.6]
+    IndexScan: SEARCH orders USING COVERING INDEX orders_day_status (=?,=?) [est 13]
 
 > SELECT id FROM orders WHERE day BETWEEN 10 AND 12
 columns: id int

@@ -194,6 +194,8 @@ interface Source {
   lateral?: boolean;
   /** `INDEXED BY name` (string) / `NOT INDEXED` (null). */
   indexedBy?: string | null;
+  /** The table's columns a plan's scan reads (-1: the rowid); all of them when not given. */
+  reads?: readonly number[];
   joinType: JoinType;
   /** The join condition's conjuncts, bound from the plan. */
   onBound?: BoundConjunct[];
@@ -344,6 +346,9 @@ interface AccessOption {
  * Cost model constants, in approximate nanoseconds on the reference container (calibrated against
  * bench/micro/joins.ts). Only their ratios matter.
  */
+/** The most index entries the planner counts for an equality on constants (`countEntries`). */
+const COUNT_CAP = 1024;
+
 const COST = {
   /** Sequential scan, per row (fused decode + filter). */
   scanRow: 30,
@@ -351,6 +356,8 @@ const COST = {
   probe: 1500,
   /** Per index entry: advance plus table row fetch by rowid. */
   fetch: 1200,
+  /** Per index entry of a covering index (every column read is in its key): advance and decode, no fetch. */
+  indexEntry: 40,
   /** Hash join: per build row, per probe row. */
   hashBuild: 80,
   hashProbe: 60,
@@ -1450,6 +1457,7 @@ export class Planner {
       joinType,
       position,
       indexedBy: item.indexedBy,
+      ...(item.kind === 'table' && item.columns ? { reads: item.columns } : {}),
     };
     if (typeof item.indexedBy === 'string' && !table.indexes.some((i) => sameName(i.name, item.indexedBy!))) {
       throw new SmaltError('SMALT_ERROR', `no such index: ${item.indexedBy}`);
@@ -1650,6 +1658,33 @@ export class Planner {
   // ---------------------------------------------------------------- access paths
 
   /** Enumerate ways to read `src` using the given candidate conjuncts, with estimated costs. */
+  /**
+   * How many entries an index holds whose leading columns equal the values given (constants): counted when there are
+   * fewer than `cap`, else null (the statistics' estimate stands). Read at planning time, so a plan cached for these
+   * values keeps the count it was planned with.
+   */
+  private countEntries(table: TableSchema, idx: IndexSchema, eq: Fn[], convert: ((v: SqlValue) => SqlValue)[], cap: number): number | null {
+    const access = new TableAccess(this.env.openTree(table.rootPage), new RecordReader(table.layout, table.recordDefaults), table.name, table.rowidAlias);
+    access.table = table;
+    const scan = new IndexScan(access, {
+      indexName: idx.name,
+      tree: this.env.openTree(idx.rootPage),
+      columns: idx.columns.map((c) => ({ desc: c.desc, collation: c.collation })),
+      eq,
+      convert,
+      // Nothing is decoded: every entry is counted from the index alone.
+      keyColumns: idx.columns.map((c) => c.column),
+    });
+    scan.open([]);
+    let n = 0;
+    try {
+      while (scan.next()) if (++n >= cap) return null;
+    } finally {
+      scan.close();
+    }
+    return n;
+  }
+
   private accessOptions(src: Source, p: number, candidates: ConjunctInfo[], scope: Scope, ctx: FunctionContext): AccessOption[] {
     if (src.sub) {
       const sub = src.sub;
@@ -1827,12 +1862,25 @@ export class Planner {
         // Expression columns have no statistics: assume ~10 rows per value, like SQLite without ANALYZE.
         for (let j = 0; j < k; j++) matches /= idx.columns[j].column < 0 ? Math.max(1, N / 10) : this.ndv(src, idx.columns[j].column);
       }
+      // Equalities on literals: the entries the index holds for them, counted up to a cap, when fewer than the
+      // estimate. A column with few values often has very different counts per value (a label index: most nodes
+      // are one label, and a new label has none), where the average overestimates the rare ones.
+      if (!unique && k > 0 && !lo && !hi && !idx.where && matches > 1 && eqs.every((x) => x.other.k === 'lit')) {
+        const counted = this.countEntries(table, idx, eqs.map((x) => compileBoundExpr(x.other, ctx).fn), converters, Math.min(COUNT_CAP, Math.ceil(matches)));
+        if (counted !== null) matches = counted;
+      }
       if (lo || hi) matches *= (k === 0 ? this.rangeFraction(idx, lo, hi) : undefined) ?? (lo && hi ? 0.25 : 0.33);
       // A partial index only holds rows matching its WHERE.
       if (idx.where) for (const w of andParts(this.indexPlan(idx).where!)) matches *= this.selectivityOf(this.indexBound(src, w), scope);
       matches = Math.max(1, matches);
       const deps = outerDep([...eqs, ...(lo ? [lo] : []), ...(hi ? [hi] : [])]);
-      consider(`index ${idx.name}`, COST.probe + matches * COST.fetch, matches, deps, () => {
+      // Covering when every column the source reads (its scan's columns; the rowid is in every entry) is a plain key
+      // column whose key form is its value (as `keyColumns` below): the rows come from the index alone, as IndexScan
+      // decides once it knows what it decodes. A scan's columns are all it may read, so this never calls an index
+      // covering that isn't.
+      const keyCols = idx.columns.filter((c) => c.column >= 0 && !(c.collation !== Collation.Binary && ['TEXT', 'ANY', 'NUMERIC'].includes(table.columns[c.column].type))).map((c) => c.column);
+      const covering = (src.reads ?? src.cols.map((c) => c.index)).every((c) => c === -1 || keyCols.includes(c));
+      consider(`index ${idx.name}`, COST.probe + matches * (covering ? COST.indexEntry : COST.fetch), matches, deps, () => {
         const spec = {
           indexName: idx.name,
           tree: this.env.openTree(idx.rootPage),
@@ -2758,13 +2806,13 @@ const JOIN_TYPES: Readonly<Record<JoinKind, JoinType>> = { inner: 'INNER', cross
  * plan (planned separately: see BoundFrom.source). `alias` is the leaf's position (`#p`).
  */
 type PlanLeaf =
-  | { readonly kind: 'table'; readonly name: string; readonly schema?: string; readonly alias: string; readonly indexedBy?: string | null }
+  | { readonly kind: 'table'; readonly name: string; readonly schema?: string; readonly alias: string; readonly indexedBy?: string | null; readonly columns?: readonly number[] }
   | { readonly kind: 'function'; readonly name: string; readonly alias: string }
   | { readonly kind: 'nested'; readonly alias: string };
 
 function planLeaf(op: PlanOp, p: number): PlanLeaf {
   const alias = `#${p}`;
-  if (op.op === 'scan') return { kind: 'table', schema: op.db, name: op.table, alias, indexedBy: op.indexedBy };
+  if (op.op === 'scan') return { kind: 'table', schema: op.db, name: op.table, alias, indexedBy: op.indexedBy, columns: op.columns };
   if (op.op !== 'source') return { kind: 'nested', alias };
   if (op.kind === 'function') return { kind: 'function', name: op.name, alias };
   return { kind: 'table', schema: op.schema, name: op.name, alias };
