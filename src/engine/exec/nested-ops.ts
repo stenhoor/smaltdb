@@ -578,6 +578,45 @@ function entriesOf(v: SqlValue, fn: string): { keys: string[]; vals: SqlValue[] 
 }
 
 /** A map's bytes from entries in any order: sorted by key, the last of a repeated key kept. */
+/**
+ * Two maps' bytes merged, `y`'s entry winning where both have a key, without decoding a value. A map is its entries'
+ * components, key then value, sorted by key (ADR 0038), and a key's bytes order as the keys do (and are prefix-free):
+ * so the two are walked together by key bytes, as sorted lists merge, and each entry is copied as it is.
+ */
+export function mergeMapBytes(x: Uint8Array, y: Uint8Array): Uint8Array {
+  if (x.length === 0) return y;
+  if (y.length === 0) return x;
+  const out = new Uint8Array(x.length + y.length);
+  let o = 0;
+  let i = 0;
+  let j = 0;
+  const copy = (m: Uint8Array, from: number, to: number): void => {
+    out.set(m.subarray(from, to), o);
+    o += to - from;
+  };
+  while (i < x.length && j < y.length) {
+    const ki = skipComponent(x, i);
+    const kj = skipComponent(y, j);
+    let c = 0;
+    const n = Math.min(ki - i, kj - j);
+    for (let d = 0; d < n && c === 0; d++) c = x[i + d]! - y[j + d]!;
+    if (c === 0) c = ki - i - (kj - j);
+    if (c < 0) {
+      const e = skipComponent(x, ki);
+      copy(x, i, e);
+      i = e;
+    } else {
+      const e = skipComponent(y, kj);
+      copy(y, j, e);
+      j = e;
+      if (c === 0) i = skipComponent(x, ki);
+    }
+  }
+  copy(x, i, x.length);
+  copy(y, j, y.length);
+  return out.slice(0, o);
+}
+
 function encodeEntries(entries: [string, SqlValue][]): Uint8Array {
   const byKey = new Map<string, SqlValue>();
   for (const [k, v] of entries) byKey.set(k, v);
@@ -787,6 +826,8 @@ const MAP_OPS: [string, ScalarFunction][] = [
     const wy = differ ? toAny(ty) : null;
     return ([x, y]) => {
       if (x === null || y === null) return null;
+      // Of one type, the maps' bytes merge as they are (`mergeMapBytes`): no value is decoded.
+      if (!differ) return mergeMapBytes(bytesOf(x, 'map_merge'), bytesOf(y, 'map_merge'));
       const ex = entriesOf(x, 'map_merge');
       const ey = entriesOf(y, 'map_merge');
       const entries: [string, SqlValue][] = ex.keys.map((k, i) => [k, wx ? wx(ex.vals[i]!) : ex.vals[i]!]);
