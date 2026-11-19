@@ -689,6 +689,9 @@ export function mapProbe(m: Uint8Array, start: number, end: number, key: Uint8Ar
  * Reads one key of maps without decoding the rest (ADR 0038): {@link findMapKey}, then only the value found is
  * decoded. A map whose elements are in `elements`' cache is binary searched there instead.
  */
+/** How many maps a `KeyFinder` remembers. */
+const SEEN = 16;
+
 class KeyFinder {
   private key: string | null = null;
   private enc: Uint8Array = new Uint8Array(0);
@@ -704,16 +707,35 @@ class KeyFinder {
     return findMapKey(m, 0, m.length, this.enc);
   }
 
+  /**
+   * The last maps read and their values, by identity: a join gives each row of its smaller side's maps to many rows (a
+   * city's map to each of its people), so the same map's key is read again and again.
+   */
+  private readonly seenMaps: (Uint8Array | null)[] = new Array(SEEN).fill(null);
+  private readonly seenKeys: (string | null)[] = new Array(SEEN).fill(null);
+  private readonly seenVals: (SqlValue | undefined)[] = new Array(SEEN).fill(undefined);
+  private seenAt = 0;
+
   /** `k`'s value in map `v`, or undefined when it has none. */
   get(v: SqlValue, k: string): SqlValue | undefined {
     const m = bytesOf(v, this.fn);
+    const maps = this.seenMaps;
+    for (let i = 0; i < SEEN; i++) if (maps[i] === m && this.seenKeys[i] === k) return this.seenVals[i];
+    let out: SqlValue | undefined;
     const flat = cached(m);
     if (flat) {
       const i = findFlatKey(flat, k);
-      return i < 0 ? undefined : flat[i + 1]!;
+      out = i < 0 ? undefined : flat[i + 1]!;
+    } else {
+      const at = this.find(m, k);
+      out = at < 0 ? undefined : decodeComponent(m, at);
     }
-    const at = this.find(m, k);
-    return at < 0 ? undefined : decodeComponent(m, at);
+    const j = this.seenAt;
+    this.seenAt = (j + 1) % SEEN;
+    maps[j] = m;
+    this.seenKeys[j] = k;
+    this.seenVals[j] = out;
+    return out;
   }
 
   has(v: SqlValue, k: string): boolean {

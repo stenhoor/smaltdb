@@ -173,6 +173,8 @@ export interface QueryPlan {
   columns: ResultColumnInfo[];
   /** References columns of an enclosing query (must be re-run per outer row). */
   correlated: boolean;
+  /** Per result: marks it read where it is a column read lazily (`physical`'s aliased results). */
+  uses?: ((() => void) | undefined)[];
 }
 
 interface SourceColumn {
@@ -716,6 +718,8 @@ export class Planner {
     const useOf = (f: FromCell): (() => void) => {
       const { reg, src, col } = f;
       if (src.access) return col < 0 ? () => this.dryCompile || src.access!.useRowid(reg) : () => this.dryCompile || src.access!.use(col, reg);
+      const lazy = src.sub?.uses?.[col];
+      if (lazy) return () => this.dryCompile || lazy();
       return () => this.dryCompile || src.external?.projection?.add(src.cols[col].name.toLowerCase());
     };
     return {
@@ -1064,9 +1068,19 @@ export class Planner {
 
     // Result expressions, then ORDER BY expressions that are not results, then HAVING (planCore's order).
     const n = s.width;
-    const compiled = s.project.slice(0, n).map((e) => compile(bind(e, readSlot)));
     // A result that only reads a register is that register (no copy per row), unless the caller gives the registers.
     const aliased = !outRegs && !ALIAS_OFF && alias;
+    // Such a result's column is marked read only when the enclosing query reads it (`uses`), so a column no one reads
+    // is not decoded. Not under DISTINCT, which reads every result.
+    const uses: ((() => void) | undefined)[] = [];
+    const compiled = s.project.slice(0, n).map((e, i) => {
+      const b = bind(e, readSlot);
+      if (aliased && !s.distinct && b.k === 'slot' && b.use) {
+        uses[i] = b.use;
+        (b as { use?: () => void }).use = undefined;
+      }
+      return compile(b);
+    });
     const regs = outRegs ?? compiled.map((c) => (aliased && c.reg !== undefined ? c.reg : this.regs.alloc()));
     const columns: ResultColumnInfo[] =
       given ?? compiled.map((c) => ({ name: '', type: c.type, collation: c.collSrc !== CollSrc.None ? c.collation : Collation.Binary, affinity: c.affinity }));
@@ -1076,8 +1090,12 @@ export class Planner {
     for (const k of s.sort ?? []) {
       const at = (k.expr as ColRef).index;
       let reg: number;
-      if (at < n) reg = regs[at];
-      else {
+      if (at < n) {
+        reg = regs[at];
+        // The sort reads the result's register itself.
+        uses[at]?.();
+        uses[at] = undefined;
+      } else {
         extraFns.push(compile(bind(s.project[at], readSlot)).fn);
         extraRegs.push((reg = this.regs.alloc()));
       }
@@ -1135,7 +1153,7 @@ export class Planner {
       const hint = s.limit ? topN(...limitFns()) : undefined;
       root = new Sort(root, sortKeys, [...regs, ...extraRegs], hint, this.env.spill ?? null);
     }
-    return { root: limit(root), outRegs: regs, columns, correlated: scope.correlated };
+    return { root: limit(root), outRegs: regs, columns, correlated: scope.correlated, ...(uses.length ? { uses } : {}) };
   }
 
   /**
