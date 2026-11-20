@@ -590,6 +590,22 @@ export function compareSameKind(a: Uint8Array, at: number, b: Uint8Array): numbe
   return 0;
 }
 
+/**
+ * The first `out.length` components of the key at `pos`, when each is an ascending non-negative number below 2^53 (an
+ * index entry over integer columns, with its rowid: a graph's endpoint index). False when one isn't (NULL, text, a
+ * negative or huge number, a descending column), and `out` is then undefined.
+ */
+export function decodeSmallRun(key: Uint8Array, pos: number, out: Float64Array): boolean {
+  let p = pos;
+  for (let i = 0; i < out.length; i++) {
+    const v = decodeSmallPos(key, p);
+    if (v < 0) return false;
+    out[i] = v;
+    p = decPos;
+  }
+  return true;
+}
+
 /** Offset where the rowid suffix of an index entry `key[...end]` starts (= end of the column part). */
 export function rowidSuffixStart(key: Uint8Array, end: number): number {
   const n = key[end - 1];

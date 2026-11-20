@@ -23,6 +23,9 @@ export function notNullColumns(op: PlanOp, table: NotNullColumns): boolean[] {
       const cols = table(op.table, op.db);
       return op.columns.map((c) => c === -1 || cols?.[c] === true);
     }
+    case 'relationships':
+      // Every column but `props`.
+      return [true, true, true, true, true, false];
     case 'values': {
       if (op.columns) return op.columns.map((col) => Array.from(col as ArrayLike<unknown>).every((v) => v !== null && v !== undefined));
       return op.types.map((_, i) => op.rows.length > 0 && op.rows.every((r) => litNotNull(r[i])));
@@ -87,6 +90,8 @@ function widthOf(op: PlanOp): number | undefined {
   switch (op.op) {
     case 'scan':
       return op.columns.length;
+    case 'relationships':
+      return 6;
     case 'values':
     case 'source':
     case 'working':

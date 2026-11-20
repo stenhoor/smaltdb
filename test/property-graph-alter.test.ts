@@ -4,7 +4,7 @@
  * adopting an existing one, in one transaction with the graph's new record.
  */
 import { describe, expect, it } from 'vitest';
-import { Database } from '../src/engine/database.js';
+import { Database, type DatabaseOptions } from '../src/engine/database.js';
 import type { PlanStatementInput } from '../src/engine/plan/statement.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
 
@@ -12,8 +12,8 @@ const op = (o: Record<string, unknown>) => ({ kind: 'schema', op: o }) as unknow
 const addLabel = (label: string, extra: Record<string, unknown> = {}) => op({ op: 'alterPropertyGraph', name: 'g', action: { kind: 'addLabel', label, ...extra }, ...('ifNotExists' in extra ? { ifNotExists: extra.ifNotExists } : {}) });
 const addType = (type: string, table?: string) => op({ op: 'alterPropertyGraph', name: 'g', action: { kind: 'addType', type, ...(table ? { table } : {}) } });
 
-function fresh(): Database {
-  const db = Database.openMemory();
+function fresh(options: DatabaseOptions = {}): Database {
+  const db = Database.openMemory(options);
   db.exec('CREATE TABLE person(id INTEGER PRIMARY KEY, name TEXT)');
   db.queryPlan(op({ op: 'createPropertyGraph', ifNotExists: false, graph: { name: 'g', nodes: [{ label: 'Person', table: 'person', id: 'id' }], edges: [] } }));
   return db;
@@ -78,7 +78,8 @@ describe('adding a relationship type', () => {
   });
 
   it('indexes (start, end) and (end, start): a hop from a node to the other end reads the index alone', () => {
-    const db = fresh();
+    // Without the graph's index in memory (ADR 0040), which answers these hops before the B+tree is asked.
+    const db = fresh({ graphIndexMem: 0 });
     db.queryPlan(addType('KNOWS', 'knows'));
     const cols = (name: string) => db.catalog.table('knows')!.indexes.find((i) => i.name === name)!.columns.map((c) => c.column);
     expect([cols('knows_start'), cols('knows_end')]).toEqual([
@@ -94,6 +95,19 @@ describe('adding a relationship type', () => {
     // Named, as a compiler seeking for each row names it: on three rows the planner would scan.
     expect(plan('SELECT start, rowid FROM knows INDEXED BY knows_end WHERE "end" = 2')).toContain('COVERING INDEX knows_end');
     expect(plan('SELECT "end" FROM knows INDEXED BY knows_start WHERE start = 1')).toContain('COVERING INDEX knows_start');
+  });
+
+  it('and with the graph\'s index in memory, the hop reads that', () => {
+    const db = fresh();
+    db.queryPlan(addType('KNOWS', 'knows'));
+    db.exec("INSERT INTO person VALUES (1, 'Ada'), (2, 'Charles'), (3, 'Grace'); INSERT INTO knows(start, end) VALUES (1, 2), (3, 2), (2, 1)");
+    const plan = (sql: string) => db.query(`EXPLAIN QUERY PLAN ${sql}`).rows.flat().join(' ');
+    expect(plan('SELECT start, rowid FROM knows INDEXED BY knows_end WHERE "end" = 2')).toContain('SEARCH knows USING GRAPH INDEX (end=?)');
+    expect(plan('SELECT "end" FROM knows INDEXED BY knows_start WHERE start = 1')).toContain('SEARCH knows USING GRAPH INDEX (start=?)');
+    expect(db.query('SELECT start, rowid FROM knows INDEXED BY knows_end WHERE "end" = 2').rows).toEqual([
+      [1, 1],
+      [3, 2],
+    ]);
   });
 
   it('the new table follows the graph rules: endpoints must be nodes, and a connected node stays', () => {

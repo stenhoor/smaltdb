@@ -14,17 +14,19 @@ import {
 } from './catalog/schema.js';
 import { MisuseError, SmaltError, constraintMessage, withDetails, wordError } from './errors.js';
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
-import type { ConflictAction, PlanOp } from './plan/ops.js';
+import { type ConflictAction, PATH_TYPE, type PlanOp } from './plan/ops.js';
 import { type EncodedPlan, canonicalJSON, decodeData, decodePlan, encodeData, encodePlan, plainJSON, planFromJSON, planToJSON } from './plan/codec.js';
 import { type PlanStatementInput, paramCount, toBoundStatement, toPlanStatement } from './plan/statement.js';
-import { type NormalizeCatalog, type TableTypes, normalizePlan, normalizeWrite } from './exec/plan-normalize.js';
+import { type NormalizeCatalog, PATHS_FUNCTION, type TableTypes, normalizePlan, normalizeWrite } from './exec/plan-normalize.js';
 import { type ValidateCatalog, validatePlan, validateSchemaOp } from './plan/validate.js';
 import { type PlanExpr, forEachCol, typeOf } from './plan/expr.js';
 import type { CollationName } from './plan/types.js';
 import { type Compiled, type Fn, collationName } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFunctions } from './exec/functions.js';
-import { type ExecState, type Operator, explainAnalyze, explainRows } from './exec/operators.js';
-import { type ExternalScan, type PhysicalEnv, Planner, type QueryPlan, Registers, type ResultColumnInfo } from './exec/planner.js';
+import { type ExecState, type Operator, TableAccess, explainAnalyze, explainRows } from './exec/operators.js';
+import { GraphIndexes, endpointIndex } from './exec/graph-index.js';
+import { searchPaths } from './exec/graph-paths.js';
+import { type ExternalScan, type PhysicalEnv, type PlannedGraph, Planner, type QueryPlan, Registers, type ResultColumnInfo } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type PlanMorsels, planMorsels } from './exec/plan-morsel.js';
@@ -114,7 +116,14 @@ export interface DatabaseOptions extends PagerOptions {
    * a path. In-memory databases never spill.
    */
   spillPath?: string | false;
+  /**
+   * Bytes a property graph's index may take in memory (ADR 0040; default 256 MiB). A graph that needs more is not
+   * indexed, and its plans read the B+trees; 0 turns graph indexes off. Readers hold none.
+   */
+  graphIndexMem?: number;
 }
+
+const DEFAULT_GRAPH_INDEX_MEM = 256 * 1024 * 1024;
 
 const CATALOG_NAMES = new Set(['smalt_schema', 'sqlite_schema', 'sqlite_master']);
 
@@ -238,6 +247,8 @@ interface Program {
   singleRowWrite?: boolean;
   /** Table sizes the cost-based plan assumed (root page -> estimated rows). */
   rowAssumptions?: Map<number, number>;
+  /** It reads a property graph's index in memory (ADR 0040), which only this engine holds. */
+  graphIndex?: boolean;
   /** External sources the statement reads (M8): loaded by the async API before it runs. */
   externals?: ExternalSource[];
   /** Result rows for utility statements (PRAGMA, EXPLAIN) computed at run time. */
@@ -250,6 +261,30 @@ interface Program {
   memory?: boolean;
   /** The language of the statement's source: it words the statement's errors (ADR 0016 section 10). */
   language?: SmaltLanguage;
+}
+
+let graphCheck: boolean | undefined;
+/**
+ * SMALT_GRAPH_INDEX_CHECK=1 (tests; ADR 0040, section 3): every graph index is compared with its tables after each
+ * statement that writes, and a query that read one is run again without it and must give the same rows in order.
+ */
+function graphCheckOn(): boolean {
+  if (graphCheck === undefined) {
+    const g = globalThis as { process?: { env?: Record<string, string | undefined> } };
+    graphCheck = !!g.process?.env?.SMALT_GRAPH_INDEX_CHECK;
+  }
+  return graphCheck;
+}
+
+/** The same value: NaN equal to itself, blobs by their bytes, and lists, structs and maps (as results carry them) by their parts. */
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a === b || (a !== a && b !== b)) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (a instanceof Uint8Array || b instanceof Uint8Array) return a instanceof Uint8Array && b instanceof Uint8Array && a.length === b.length && a.every((byte, i) => byte === b[i]);
+  if (Array.isArray(a) || Array.isArray(b)) return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => sameValue(x, b[i]));
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  return ka.length === kb.length && ka.every((k, i) => k === kb[i] && sameValue((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
 }
 
 let roundTrip: boolean | undefined;
@@ -352,6 +387,18 @@ export class Database implements FunctionContext {
     this.spill = new SpillArea(spillFile?.file ?? null, options.workMem ?? DEFAULT_WORK_MEM, spillFile?.release ?? null);
     this.mem = file === null ? null : Pager.openMemory({ pageSize: this.pager.pageSize });
     this.cacheSize = options.statementCacheSize ?? 64;
+    this.graphIndexes = new GraphIndexes(
+      {
+        schemaVersion: () => this.schemaVersion,
+        graphs: () => [...this.graphs.values()].map((g) => g.graph),
+        getTable: (n) => this.tables.get(n.toLowerCase()),
+        openTree: (root) => this.tree(root),
+        changeCounter: () => this.pager.changeCounter,
+        uncommitted: () => this.pager.inTransaction,
+        rows: (t, a, b) => this.endpointRows(t, a, b),
+      },
+      reader ? 0 : (options.graphIndexMem ?? DEFAULT_GRAPH_INDEX_MEM),
+    );
     if (this.pager.catalogRoot === 0) {
       if (reader) throw new SmaltError('SMALT_CANTOPEN', 'reader: the database has no catalog yet');
       this.pager.catalogRoot = BTree.create(this.pager);
@@ -502,15 +549,18 @@ export class Database implements FunctionContext {
       this.pager.rollbackStatement();
       this.mem?.rollbackStatement();
       this.dropColumnarCaches();
+      this.graphIndexes.rolledBack();
     },
     commit: (): void => {
       this.pager.commit();
       this.mem?.commit();
+      this.graphIndexes.committed();
     },
     rollback: (): void => {
       this.pager.rollback();
       this.mem?.rollback();
       this.dropColumnarCaches();
+      this.graphIndexes.rolledBack();
     },
     releaseAllPins: (): void => {
       this.pager.releaseAllPins();
@@ -529,6 +579,7 @@ export class Database implements FunctionContext {
       this.pager.rollbackToSavepoint(d, keep);
       this.mem?.rollbackToSavepoint(d, keep);
       this.dropColumnarCaches();
+      this.graphIndexes.rolledBack();
     },
   };
 
@@ -910,6 +961,17 @@ export class Database implements FunctionContext {
       if (this.fk.involved(table)) this.fk.beforeDelete(table, row);
       if (this.graphRules.involved(table)) this.graphRules.beforeDelete(table, row);
     };
+    // An edge table of an indexed property graph: its rows are also in the graph's index (ADR 0040).
+    const roles = c ? undefined : this.graphIndexes.rolesOf(table);
+    if (roles) {
+      const ix = this.graphIndexes;
+      w.graph = {
+        inserted: (row, rowid) => ix.inserted(roles, row, rowid),
+        updated: (old, next, rowid) => ix.updated(roles, old, next, rowid),
+        deleted: (row, rowid) => ix.deleted(roles, row, rowid),
+        truncated: () => ix.truncated(roles),
+      };
+    }
     if (table.history) {
       const get = (name: string): TableSchema => {
         const t = this.tables.get(name.toLowerCase());
@@ -956,6 +1018,74 @@ export class Database implements FunctionContext {
     nextRowid: (t) => this.writerFor(t).newRowid(),
     run: (plan, params) => this.internalPlan(plan, params) ?? [],
   });
+
+  /** Property graphs' indexes in memory (ADR 0040; exec/graph-index.ts). */
+  private readonly graphIndexes: GraphIndexes;
+
+  /** @internal The graph indexes, for tests and benchmarks. */
+  get graphIndexState(): GraphIndexes {
+    return this.graphIndexes;
+  }
+
+  /** A property graph as the planner reads it for `relationships` (PhysicalEnv.graph). */
+  private plannedGraph(name: string): PlannedGraph | undefined {
+    const g = this.graphs.get(name.toLowerCase())?.graph;
+    if (!g) return undefined;
+    const edges = g.edges.map((e) => {
+      const table = this.tables.get(e.table.toLowerCase());
+      if (!table) throw new SmaltError('SMALT_ERROR', `property graph ${g.name}: no such table: ${e.table}`);
+      return { type: e.type, table, start: findColumn(table, e.start), end: findColumn(table, e.end), props: e.props !== undefined ? findColumn(table, e.props) : -1 };
+    });
+    const ix = this.graphIndexes;
+    // The graph's index is every edge table's: the first one's role names it.
+    const role = edges.length > 0 ? ix.rolesOf(edges[0]!.table)?.find((r) => r.graph.name.toLowerCase() === g.name.toLowerCase()) : undefined;
+    return {
+      name: g.name,
+      caseSensitive: g.caseSensitive !== false,
+      edges,
+      indexed: role !== undefined,
+      lists: () => {
+        const open = role ? ix.open(role.graph) : null;
+        return open === null ? null : { out: open.out!, in: open.in! };
+      },
+    };
+  }
+
+  /** What the planner needs to read an edge table through its graph's index (PhysicalEnv.graphEdge). */
+  private graphEdge(t: TableSchema): ReturnType<NonNullable<PhysicalEnv['graphEdge']>> {
+    const role = this.graphIndexes.rolesOf(t)?.[0];
+    if (!role) return undefined;
+    const ix = this.graphIndexes;
+    return {
+      type: role.type,
+      start: role.start,
+      end: role.end,
+      lists: (byStart) => {
+        const g = ix.open(role.graph);
+        return g === null ? null : byStart ? g.out : g.in;
+      },
+    };
+  }
+
+  /** Every row of a table as [column a, column b, rowid]: a graph index of an edge table without an endpoint index. */
+  private endpointRows(t: TableSchema, a: number, b: number): SqlValue[][] {
+    const access = new TableAccess(this.tree(t.rootPage), new RecordReader(t.layout, t.recordDefaults), t.name, t.rowidAlias);
+    access.use(a, 0);
+    access.use(b, 1);
+    access.useRowid(2);
+    const regs: SqlValue[] = [null, null, null];
+    const out: SqlValue[][] = [];
+    const c = this.tree(t.rootPage).cursor();
+    try {
+      for (let ok = c.first(); ok; ok = c.next()) {
+        access.loadGeneric(c, regs);
+        out.push([regs[0]!, regs[1]!, regs[2]!]);
+      }
+    } finally {
+      c.close();
+    }
+    return out;
+  }
 
   private readonly rowKey = new Uint8Array(ROWID_KEY_SIZE);
 
@@ -1029,6 +1159,7 @@ export class Database implements FunctionContext {
     }
     // As in SQLite, a schema qualifier on a pragma function (main.pragma_table_info) changes nothing.
     const lower = name.toLowerCase().replace(/^(main|temp)\./, '');
+    if (schema === undefined && lower === PATHS_FUNCTION) return this.pathsFunction;
     if (schema === undefined && lower === 'list_elements') return LIST_ELEMENTS;
     if (schema === undefined && lower === 'range') return RANGE;
     if (!lower.startsWith('pragma_')) return undefined;
@@ -1436,7 +1567,76 @@ export class Database implements FunctionContext {
 
   /** A table's column types as plans read them (rewrites that read the catalog: `asOf`). */
   private readonly tableTypes: TableTypes = (t, db) => this.getTable(t, db)?.columns.map((c) => (c.rowidAlias ? 'int' : planTypeOfStorage(c.type, c.declaredType)));
-  private readonly normalizeCatalog: NormalizeCatalog = { types: this.tableTypes, history: (t, db) => this.getTable(t, db)?.history };
+  private readonly normalizeCatalog: NormalizeCatalog = {
+    types: this.tableTypes,
+    history: (t, db) => this.getTable(t, db)?.history,
+    searchable: (name, db, a, b) => {
+      const t = db === 'temp' ? undefined : this.tables.get(name.toLowerCase());
+      if (!t || t.temp || t.columnar || !endpointIndex(t, a, b) || !endpointIndex(t, b, a)) return false;
+      // An edge table of a property graph, by its two endpoints: the graph's rules keep them node ids.
+      for (const g of this.graphs.values()) {
+        for (const e of g.graph.edges) {
+          if (e.table.toLowerCase() !== name.toLowerCase()) continue;
+          const ends = [findColumn(t, e.start), findColumn(t, e.end)];
+          if (ends.includes(a) && ends.includes(b) && a !== b) return true;
+        }
+      }
+      return false;
+    },
+    graph: (name) => {
+      const g = this.graphs.get(name.toLowerCase())?.graph;
+      if (!g) return undefined;
+      const edges = g.edges.map((e) => {
+        const t = this.tables.get(e.table.toLowerCase());
+        if (!t) throw new SmaltError('SMALT_ERROR', `property graph ${g.name}: no such table: ${e.table}`);
+        return { type: e.type, table: t.name, start: findColumn(t, e.start), end: findColumn(t, e.end), props: e.props !== undefined ? findColumn(t, e.props) : -1 };
+      });
+      return { caseSensitive: g.caseSensitive !== false, edges };
+    },
+  };
+
+  /** The searches `smalt_paths` has run, by what they walk (its third argument), for the current schema. */
+  private pathSearches = new Map<string, { version: number; ways: { edge: number; table: TableSchema; from: number; tree: BTree }[]; minHops: number; maxHops: number | undefined; target: boolean }>();
+
+  /**
+   * `smalt_paths(start, target, what)`: the rows of a path search (exec/graph-paths.ts), which the rewrite of a `paths`
+   * operation calls for each of its input rows (exec/plan-normalize.ts). `what` is the rewrite's own description of the
+   * edge tables and bounds; the function is not for plans to call.
+   */
+  private readonly pathsFunction = {
+    columns: [
+      { name: 'end', type: 'int' as StaticType },
+      { name: 'hops', type: 'int' as StaticType },
+      { name: 'path', type: PATH_TYPE as StaticType },
+    ],
+    rows: (args: SqlValue[]): Iterable<SqlValue[]> => {
+      const what = String(args[2]);
+      let s = this.pathSearches.get(what);
+      if (!s || s.version !== this.schemaVersion) {
+        const w = JSON.parse(what) as { edges: { table: string; start: number; end: number }[]; direction: 'out' | 'in' | 'both'; minHops: number; maxHops?: number; target: boolean };
+        const ways: { edge: number; table: TableSchema; from: number; tree: BTree }[] = [];
+        w.edges.forEach((e, edge) => {
+          const table = this.tables.get(e.table.toLowerCase());
+          const pairs: [number, number][] = w.direction === 'out' ? [[e.start, e.end]] : w.direction === 'in' ? [[e.end, e.start]] : [[e.start, e.end], [e.end, e.start]];
+          for (const [from, to] of pairs) {
+            const idx = table && endpointIndex(table, from, to);
+            if (!table || !idx) throw new SmaltError('SMALT_ERROR', `${PATHS_FUNCTION}: ${e.table} has no index on its endpoints`);
+            ways.push({ edge, table, from, tree: this.tree(idx.rootPage) });
+          }
+        });
+        if (this.pathSearches.size >= 256) this.pathSearches.clear();
+        this.pathSearches.set(what, (s = { version: this.schemaVersion, ways, minHops: w.minHops, maxHops: w.maxHops, target: w.target }));
+      }
+      // The graph's index, where it has one now; a table outside it is read from its endpoint index.
+      const ix = this.graphIndexes;
+      const ways = s.ways.map((way) => {
+        const role = ix.rolesOf(way.table)?.[0];
+        const g = role ? ix.open(role.graph) : null;
+        return { edge: way.edge, tree: way.tree, lists: g === null || !role ? null : way.from === role.start ? g.out : g.in, type: role?.type ?? 0 };
+      });
+      return searchPaths({ ways, minHops: s.minHops, maxHops: s.maxHops, target: s.target }, args[0] ?? null, args[1] ?? null);
+    },
+  };
 
   /** FunctionContext: a history table's horizon now (`history_horizon`). */
   historyHorizon(table: string): number {
@@ -1546,6 +1746,10 @@ export class Database implements FunctionContext {
     sourceColumns: (kind, name, schema) => {
       if (kind === 'external' || (kind === 'function' && this.external.plugins.isExternalFunction(name))) return 'data';
       return this.virtualTable(kind === 'virtual' ? schema : undefined, name)?.columns.length;
+    },
+    graph: (name) => {
+      const g = this.graphs.get(name.toLowerCase())?.graph;
+      return g ? { types: g.edges.map((e) => e.type), caseSensitive: g.caseSensitive !== false, history: g.history !== undefined } : undefined;
     },
   };
 
@@ -1787,7 +1991,14 @@ export class Database implements FunctionContext {
     const planner = new Planner(this.plannerDeps(this.rewritePolicy(bound)), regs);
     planner.sqlText = text;
     // Every program records what it compiles: statements given as plans and as a language's text alike.
-    const done = (p: Omit<Program, 'regCount'>): Program => ({ ...p, bound: given, regCount: regs.count, rowAssumptions: planner.rowAssumptions, externals: planner.finishExternals() });
+    const done = (p: Omit<Program, 'regCount'>): Program => ({
+      ...p,
+      bound: given,
+      regCount: regs.count,
+      rowAssumptions: planner.rowAssumptions,
+      externals: planner.finishExternals(),
+      ...(planner.readsGraphIndex ? { graphIndex: true } : {}),
+    });
     switch (bound.kind) {
       case 'query': {
         const plan = this.planQuery(bound, planner);
@@ -1915,6 +2126,8 @@ export class Database implements FunctionContext {
       sampledStats: (t) => this.sampledStats(t),
       columnStore: (t) => this.storeOf(t, true),
       liveRows: (t) => this.liveRows(t),
+      graphEdge: (t) => this.graphEdge(t),
+      graph: (name) => this.plannedGraph(name),
       deletedRows: (t) => this.deletedRowsOf(t),
       funcCtx: this,
       state: this.state,
@@ -2112,6 +2325,7 @@ export class Database implements FunctionContext {
     this.columnarTouched.clear();
     try {
       result = body();
+      if (graphCheckOn()) this.graphIndexes.check();
       // Columnar tables written by this statement: move full row groups out of the delta store.
       // Needs a way to undo a failure part-way: a statement journal or the autocommit transaction.
       if (this.columnarTouched.size > 0 && (journal || this.autocommit)) this.compactTouched();
@@ -5628,6 +5842,31 @@ export abstract class PreparedStatement {
     return this.prog().bound?.kind;
   }
 
+  /** Reads a property graph's index in memory (ADR 0040): parallel readers hold none, so it runs on this engine. */
+  get usesGraphIndex(): boolean {
+    return this.prog().graphIndex === true;
+  }
+
+  /** SMALT_GRAPH_INDEX_CHECK (tests): a query that read a graph index gives the same rows, in order, without it. */
+  private checkGraphIndex(rows: SqlValue[][], params: BindParams | undefined): void {
+    const p = this.prog();
+    const ix = this.db.graphIndexState;
+    if (!p.readonly || p.graphIndex !== true || !graphCheckOn() || ix.suspended) return;
+    ix.suspended = true;
+    const without: SqlValue[][] = [];
+    try {
+      const c = this.cursor(params);
+      try {
+        for (let row = c.next(); row !== null; row = c.next()) without.push(row);
+      } finally {
+        c.close();
+      }
+    } finally {
+      ix.suspended = false;
+    }
+    if (!sameValue(rows, without)) throw new SmaltError('SMALT_CORRUPT', `a query gave ${rows.length} rows with a graph index and ${without.length} without it, or rows that differ`);
+  }
+
   /** Reads TEMP tables or memory-resident views (parallel readers cannot see them). */
   get usesMemoryObjects(): boolean {
     // Memory objects come and go with DDL, which bumps the schema version.
@@ -5668,6 +5907,7 @@ export abstract class PreparedStatement {
     try {
       const out: SqlValue[][] = [];
       for (let row = c.next(); row !== null; row = c.next()) out.push(row);
+      this.checkGraphIndex(out, params);
       return out;
     } finally {
       c.close();
@@ -5683,6 +5923,7 @@ export abstract class PreparedStatement {
     try {
       const rows: SqlValue[][] = [];
       for (let row = c.next(); row !== null; row = c.next()) rows.push(row);
+      this.checkGraphIndex(rows, params);
       return { columns: c.columns, columnTypes: c.columnTypes, rows, ...(c.run ?? {}) };
     } finally {
       c.close();
@@ -6236,6 +6477,7 @@ function refreshIfChanged(st: PreparedStatement): string | null {
  */
 const REWRITES: { readonly [K in PlanOp['op']]: boolean | ((o: Record<string, unknown>) => boolean) } = {
   scan: (o) => o.asOf !== undefined,
+  relationships: (o) => o.asOf !== undefined,
   source: false,
   iterate: false,
   working: false,
