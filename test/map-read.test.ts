@@ -282,6 +282,56 @@ describe('WHERE on a map key in a generated scan', () => {
     expect(src.indexOf('H.mapProbe(')).toBeLessThan(src.indexOf('H.tagged('));
   });
 
+  it('checks the stored bytes against a parameter as against a literal: the rows the conjunct keeps, for a value of every kind', () => {
+    // A parameter of every type a plan gives one, bound to values of its kind and of every other: the probe compares
+    // with a value only where the comparison was checked for its kind, so no row the conjunct keeps is skipped.
+    const TYPES: PlanType[] = ['any', 'int', 'real', 'num', 'text', 'bool'];
+    const VALUES: SqlValue[] = [...LITS, null, NaN, Infinity, -0, 2 ** 60, 2n ** 60n, 1e300, 1, ''];
+    const count = (pred: PlanExpr): PlanOp => p.aggregate(p.filter(p.scan('t', [0, 1]), pred), [], [p.agg('count', [], 'int', { star: true })]);
+    traceGeneratedCode(true);
+    let checked = 0;
+    try {
+      for (const k of ['name', 'age', 'born', 'nope', 'title', 'nan', 'big', 'flag'])
+        for (const fn of OPS)
+          for (const type of TYPES)
+            for (const pred of [cmp(fn, get(k), p.param(0, type)), cmp(fn, p.param(0, type), get(k)), cmp(fn, get(k), p.param(0, type), 'nocase')]) {
+              // The same conjunct evaluated row by row in a projection, which no generated scan reads ahead of.
+              const each = db.preparePlan(p.project(p.scan('t', [0, 1]), [p.col(0, 0, 'int'), pred]));
+              const kept = db.preparePlan(p.project(p.filter(p.scan('t', [0, 1]), pred), [p.col(0, 0, 'int')]));
+              const counted = db.preparePlan(count(pred));
+              for (const v of VALUES) {
+                const want = each.result([v]).rows.filter((r) => r[1] === 1 || (r[1] as unknown) === true).map((r) => r[0]);
+                expect(kept.result([v]).rows.map((r) => r[0]), `${k} ${fn} ${type} ${String(v)}`).toEqual(want);
+                expect(counted.result([v]).rows[0]![0]).toBe(want.length);
+                checked++;
+              }
+            }
+    } finally {
+      const src = traceGeneratedCode(false);
+      expect(src.some((x) => x.includes('H.probeValue(r[0], true, true)'))).toBe(true);
+      expect(src.some((x) => x.includes('H.probeValue(r[0], true, false)'))).toBe(true);
+      expect(src.some((x) => x.includes('H.probeValue(r[0], false, true)'))).toBe(true);
+    }
+    expect(checked).toBe(8 * 6 * 6 * 3 * VALUES.length);
+  });
+
+  it("makes a parameter's bytes once a run, and probes with them before decoding the row", () => {
+    traceGeneratedCode(true);
+    const pred = cmp('cmp_gt', get('age'), p.param(0, 'int'));
+    const st = db.preparePlan(p.aggregate(p.filter(p.scan('t', [0, 1]), pred), [], [p.agg('count', [], 'int', { star: true })]));
+    const each = db.preparePlan(p.project(p.scan('t', [0, 1]), [pred]));
+    // One statement, a value each run: the bytes are the run's.
+    for (const v of [30, 29, 31.5, 100, '30', null]) {
+      expect(st.result([v]).rows[0]![0], String(v)).toBe(each.result([v]).rows.filter((r) => r[0] === 1 || (r[0] as unknown) === true).length);
+    }
+    expect(st.result([29]).rows[0]![0]).toBeGreaterThan(st.result([100]).rows[0]![0] as number);
+    const src = traceGeneratedCode(false).join('\n');
+    expect(src).toMatch(/const mp0 = H\.probeValue\(r\[0\], true, false\);/);
+    expect(src).toMatch(/H\.mapProbe\(b, .*, K\[\d+\], 5, mp0\)\) continue;/);
+    expect(src.indexOf('H.probeValue(')).toBeLessThan(src.indexOf('H.mapProbe('));
+    expect(src.indexOf('H.mapProbe(')).toBeLessThan(src.indexOf('H.tagged('));
+  });
+
   it('leaves a conjunct the probe decides to the rows it did not see, and then does not decode the map', () => {
     const db = stored();
     for (const pred of [p.call('map_contains_key', [props, p.lit('age')], 'bool'), p.not(p.isNull(get('title'))), { k: 'isNull', arg: get('age'), not: true } as PlanExpr]) {

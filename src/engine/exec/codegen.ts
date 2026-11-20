@@ -17,6 +17,11 @@ interface MapCondition {
   key: Uint8Array;
   op: MapCompare;
   lit: Uint8Array | null;
+  /**
+   * In place of `lit`, the parameter the key's value is compared with: its bytes are made when the statement runs
+   * (`H.probeValue`), for a value of a kind the comparison was checked for (`numbers`, `text`).
+   */
+  param?: { index: number; numbers: boolean; text: boolean };
 }
 
 /**
@@ -684,6 +689,8 @@ export interface FusedHelpers extends LoaderHelpers, CodegenHelpers {
   slow(page: { bytes: Uint8Array; view: DataView }, off: number, r: SqlValue[]): void;
   /** False when the map stored at [start, end) of a leaf rules out a conjunct that needs its key (see `Pipeline`). */
   mapProbe(b: Uint8Array, start: number, end: number, key: Uint8Array, op: MapCompare, lit: Uint8Array | null): boolean;
+  /** A parameter's value as `mapProbe`'s literal: its encoded bytes, or null where the probe may not compare with it. */
+  probeValue(v: SqlValue, numbers: boolean, text: boolean): Uint8Array | null;
 }
 
 /**
@@ -720,8 +727,9 @@ class Pipeline {
    * Conditions on one key of a map column that a WHERE conjunct needs to be true, checked on the map's stored bytes
    * before the row is decoded (`H.mapProbe`), so the rows they rule out are never decoded: the key is there
    * (`map_get(m, 'k')` compared with anything, or IS NOT NULL; `map_contains_key(m, 'k')`), and when its value is
-   * compared with a literal of its own kind (a number, or text under BINARY), the comparison holds. They are found
-   * in the conjunct, its ANDs and a CASE of one WHEN and no ELSE. The conjunct itself still decides each row kept.
+   * compared with a literal or a parameter of its own kind (a number, or text under BINARY), the comparison holds.
+   * They are found in the conjunct, its ANDs and a CASE of one WHEN and no ELSE. The conjunct itself still decides
+   * each row kept.
    */
   private readonly mapKeys: MapCondition[] = [];
 
@@ -786,8 +794,8 @@ class Pipeline {
   private mapConditions(p: BoundExpr): void {
     if (isOpaque(p)) return;
     const read = (x: BoundExpr, fn: string) => this.mapRead(x, fn);
-    const add = (r: { reg: number; key: string } | null, op: MapCompare = MapCompare.None, lit: Uint8Array | null = null): void => {
-      if (r) this.mapKeys.push({ reg: r.reg, key: encodeKey([r.key]), op, lit });
+    const add = (r: { reg: number; key: string } | null, op: MapCompare = MapCompare.None, lit: Uint8Array | null = null, param?: MapCondition['param']): void => {
+      if (r) this.mapKeys.push({ reg: r.reg, key: encodeKey([r.key]), op, lit, ...(param ? { param } : {}) });
     };
     switch (p.k) {
       case 'and':
@@ -828,25 +836,36 @@ class Pipeline {
   }
 
   /**
-   * `x op y` of a map's value `x` and a literal `y` as a comparison of their encoded bytes, which order as numbers do
-   * and as text does under BINARY: for a literal number or text, with no conversion of either operand and no affinity
-   * that could change a number to text. `flip`: the map's value is the right operand.
+   * `x op y` of a map's value `x` and a literal or a parameter `y` as a comparison of their encoded bytes, which order
+   * as numbers do and as text does under BINARY: for a number or text, with no conversion of either operand and no
+   * affinity that could change a number to text. A parameter's bytes are made when the statement runs, for a value of
+   * a kind checked here: a number where the parameter's type is a number's or `any`, text where it is `text` or `any`
+   * (a truth value or a date is neither, whatever holds it). `flip`: the map's value is the right operand.
    */
-  private literalComparison(op: string, x: BoundExpr, y: BoundExpr, collation: CollationName | undefined, flip: boolean): [MapCompare, Uint8Array | null] {
-    if (unconverted(x) !== x || unconverted(y) !== y || y.k !== 'lit') return [MapCompare.None, null];
-    const v = y.value;
-    if (typeof v === 'string') {
-      if (!this.em.binaryTextOperands(x, y, collation)) return [MapCompare.None, null];
-    } else if (typeof v === 'number' || typeof v === 'bigint') {
-      if (v !== v || (y.type !== 'int' && y.type !== 'real' && y.type !== 'num')) return [MapCompare.None, null];
-      const textual = (c: FallbackNode): boolean => c.affinity === 'TEXT' || (c.collation ?? 0) !== 0;
-      if (textual(this.em.fallbackOf(x)) || textual(this.em.fallbackOf(y))) return [MapCompare.None, null];
-    } else return [MapCompare.None, null];
+  private literalComparison(op: string, x: BoundExpr, y: BoundExpr, collation: CollationName | undefined, flip: boolean): [MapCompare, Uint8Array | null, MapCondition['param']?] {
+    const none: [MapCompare, null] = [MapCompare.None, null];
+    if (unconverted(x) !== x || unconverted(y) !== y || (y.k !== 'lit' && y.k !== 'param')) return none;
     const ops: Record<string, MapCompare> = flip
       ? { '=': MapCompare.Eq, '!=': MapCompare.Ne, '<': MapCompare.Gt, '<=': MapCompare.Ge, '>': MapCompare.Lt, '>=': MapCompare.Le }
       : { '=': MapCompare.Eq, '!=': MapCompare.Ne, '<': MapCompare.Lt, '<=': MapCompare.Le, '>': MapCompare.Gt, '>=': MapCompare.Ge };
     const c = ops[op];
-    return c === undefined ? [MapCompare.None, null] : [c, encodeKey([v])];
+    if (c === undefined) return none;
+    const textual = (n: FallbackNode): boolean => n.affinity === 'TEXT' || (n.collation ?? 0) !== 0;
+    const asNumbers = (): boolean => !textual(this.em.fallbackOf(x)) && !textual(this.em.fallbackOf(y));
+    const asText = (): boolean => this.em.binaryTextOperands(x, y, collation);
+    if (y.k === 'param') {
+      const any = y.type === 'any';
+      const numbers = (any || y.type === 'int' || y.type === 'real' || y.type === 'num') && asNumbers();
+      const text = (any || y.type === 'text') && asText();
+      return numbers || text ? [c, null, { index: y.index, numbers, text }] : none;
+    }
+    const v = y.value;
+    if (typeof v === 'string') {
+      if (!asText()) return none;
+    } else if (typeof v === 'number' || typeof v === 'bigint') {
+      if (v !== v || (y.type !== 'int' && y.type !== 'real' && y.type !== 'num') || !asNumbers()) return none;
+    } else return none;
+    return [c, encodeKey([v])];
   }
 
   private textEqualityConjunct(p: BoundExpr): { reg: number; bytes: Uint8Array } | null {
@@ -891,11 +910,14 @@ class Pipeline {
     for (let i = 0; i < spec.decode.length; i += 2) if (spec.types[spec.decode[i]] === 'TEXT') textCol.set(spec.decode[i + 1], spec.decode[i]);
     const prefilters = this.textEq.filter((t) => textCol.has(t.reg));
     const mapProbes = this.mapKeys.filter((t) => mapCol.has(t.reg));
+    // A parameter's bytes for a probe, made once a run (parameters are the first registers).
+    const probeValues = mapProbes.flatMap((t, n) => (t.param ? [`const mp${n} = H.probeValue(r[${t.param.index}], ${t.param.numbers}, ${t.param.text});`] : []));
     const pre: PreDecode | undefined = prefilters.length || mapProbes.length
       ? (bounds) => [
-          ...mapProbes.map((t) => {
+          ...mapProbes.map((t, n) => {
             const bd = bounds(mapCol.get(t.reg)!);
-            return `if (${bd.isNull}) continue; if (!H.mapProbe(b, ${bd.st}, ${bd.fin}, ${this.em.constant(t.key)}, ${t.op}, ${t.lit ? this.em.constant(t.lit) : 'null'})) continue;`;
+            const value = t.param ? `mp${n}` : t.lit ? this.em.constant(t.lit) : 'null';
+            return `if (${bd.isNull}) continue; if (!H.mapProbe(b, ${bd.st}, ${bd.fin}, ${this.em.constant(t.key)}, ${t.op}, ${value})) continue;`;
           }),
           ...prefilters.map((t) => {
             const bd = bounds(textCol.get(t.reg)!);
@@ -917,7 +939,7 @@ class Pipeline {
       localRegs.get(reg) ? `{ const t = r[${reg}]; c${reg}n = t === null; c${reg} = c${reg}n ? 0 : t; }` : `c${reg} = r[${reg}];`;
     const declLocals = locals.map((reg) => (localRegs.get(reg) ? `c${reg} = 0, c${reg}n = true` : `c${reg} = null`)).join(', ');
     return {
-      prologue: outer.map((reg) => (localRegs.get(reg) ? `const c${reg}n = r[${reg}] === null; const c${reg} = c${reg}n ? 0 : r[${reg}];` : `const c${reg} = r[${reg}];`)),
+      prologue: [...outer.map((reg) => (localRegs.get(reg) ? `const c${reg}n = r[${reg}] === null; const c${reg} = c${reg}n ? 0 : r[${reg}];` : `const c${reg} = r[${reg}];`)), ...probeValues],
       rowStart: [
         'const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);',
         locals.length ? `let ${declLocals};` : '',
