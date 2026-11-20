@@ -156,6 +156,13 @@ Source: `src/engine/exec/` — `planner.ts`, `operators.ts`, `expr.ts`, `functio
   compiled, and looked at when the projection first opens). Only an output that cannot fail is left out: a column, a
   constant, a parameter, or logic and CASE over those. A function call, a conversion or a subquery is computed whether
   or not it is read, so no error is hidden.
+- **A projection over a projection is one projection** in a plan statement (`composed` in `exec/plan-normalize.ts`):
+  the outer one's columns are replaced by the inner one's expressions, so one operator copies the row where two did,
+  and the planner sees the inner one's input (a join region) rather than a nested plan. Only where that changes
+  nothing: no inner expression that could fail is left out, none but a column or a constant is computed twice, there
+  is no subquery, the inner one is not over a sort, a limit or a DISTINCT, and a column keeps the type its reader
+  declares. Measured on smaltcy's benchmark statements, prepared, against the engine without it: group by city 36.9
+  to 32.2 ms, a variable-length pattern 7.16 to 6.16 ms, hops 0.89x to 0.99x of their time, nothing slower.
 - **Predicate placement:** every conjunct is evaluated at the earliest join level where its tables are available. Filters
   on the inner side of a LEFT JOIN stay in the join condition.
 - **Aggregation:** hash aggregation; GROUP BY expressions, aggregate calls, and bare columns are mapped to registers.

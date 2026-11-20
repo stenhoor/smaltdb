@@ -892,7 +892,13 @@ function distinctProjected(op: PlanOp): PlanOp {
 }
 
 function projected(op: PlanOp): PlanOp {
-  if (op.op === 'project') return { ...op, exprs: op.exprs.map(expr), input: core(op.input) };
+  if (op.op === 'project') {
+    // A projection over a projection is one projection where composing them changes nothing: one operator copies
+    // the row where two did, and the block reads the inner one's input (a join region) rather than a nested plan.
+    const one = composed(op.exprs, op.input, true);
+    if (one) return projected(op.origin !== undefined ? { ...one, origin: op.origin } : one);
+    return { ...op, exprs: op.exprs.map(expr), input: core(op.input) };
+  }
   return { op: 'project', exprs: identity(op), input: core(op) };
 }
 
@@ -917,8 +923,13 @@ function projectedSort(op: Op<'project'>, s: Op<'sort'>): PlanOp {
  * the ORDER BY's order) rather than a nested plan. Only where that changes nothing: no subqueries (whose columns of the
  * enclosing row would move), a projection straight over a core (not over a sort, LIMIT, DISTINCT or compound, whose
  * order and rows it keeps), and no expression of it but a column or a literal computed more than once. Null otherwise.
+ *
+ * `whole`: the projection being composed is all that reads the inner one (a projection straight over a projection),
+ * so two more things must hold. None of the inner one's expressions that could fail is left out: it is computed for
+ * every row today, read or not. And a column read through the inner one keeps the type its reader declares (the
+ * rewrites here pass columns through as `any`): where the two declare different types or collations, no composing.
  */
-function composed(exprs: readonly PlanExpr[], inner: PlanOp): Op<'project'> | null {
+function composed(exprs: readonly PlanExpr[], inner: PlanOp, whole = false): Op<'project'> | null {
   if (inner.op !== 'project' || exprs.some(hasSubquery) || inner.exprs.some(hasSubquery)) return null;
   const below = inner.input.op;
   if (below === 'sort' || below === 'limit' || below === 'distinct' || below === 'setop' || below === 'values') return null;
@@ -946,11 +957,19 @@ function composed(exprs: readonly PlanExpr[], inner: PlanOp): Op<'project'> | nu
     }
   };
   exprs.forEach(count);
-  if (inner.exprs.some((x, i) => uses[i] > 1 && x.k !== 'col' && x.k !== 'lit')) return null;
+  if (inner.exprs.some((x, i) => (uses[i] > 1 && x.k !== 'col' && x.k !== 'lit') || (whole && uses[i] === 0 && !cannotFail(x)))) return null;
+  let clash = false;
+  /** The inner expression a column of the projection reads, as that column declares it. */
+  const through = (e: Extract<PlanExpr, { k: 'col' }>): PlanExpr => {
+    const x = inner.exprs[e.index]!;
+    if (!whole || x.k !== 'col') return x;
+    if (x.collation !== e.collation || (x.type !== e.type && x.type !== 'any' && e.type !== 'any')) clash = true;
+    return e.type === 'any' || e.type === x.type ? x : { ...x, type: e.type };
+  };
   const sub = (e: PlanExpr): PlanExpr => {
     switch (e.k) {
       case 'col':
-        return e.depth === 0 && e.input === 0 ? inner.exprs[e.index] : e;
+        return e.depth === 0 && e.input === 0 ? through(e) : e;
       case 'call':
       case 'and':
       case 'or':
@@ -967,7 +986,28 @@ function composed(exprs: readonly PlanExpr[], inner: PlanOp): Op<'project'> | nu
         return e;
     }
   };
-  return { op: 'project', exprs: exprs.map(sub), input: inner.input };
+  const out = exprs.map(sub);
+  return clash ? null : { op: 'project', exprs: out, input: inner.input };
+}
+
+/** Whether computing `e` can't raise an error: a column, a constant, a parameter, or logic and CASE over those. */
+function cannotFail(e: PlanExpr): boolean {
+  switch (e.k) {
+    case 'col':
+    case 'lit':
+    case 'param':
+      return true;
+    case 'and':
+    case 'or':
+      return e.args.every(cannotFail);
+    case 'not':
+    case 'isNull':
+      return cannotFail(e.arg);
+    case 'case':
+      return e.whens.every((w) => cannotFail(w.when) && cannotFail(w.then)) && cannotFail(e.else);
+    default:
+      return false;
+  }
 }
 
 /** `e` reading column `i + by` where it read column `i` of its own input. */
