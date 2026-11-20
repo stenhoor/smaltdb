@@ -226,3 +226,23 @@ Decisions and their rationale: [ADR 0005](adr/0005-cost-based-optimizer.md).
 - **EXPLAIN** shows `SCAN t (columnar[, fused scan + filter + …][, zone maps: col op ? …])`.
 
 See [ADR 0008](adr/0008-materialized-views-and-columnar-segments.md).
+
+## 9. Graph indexes
+
+- **Access path.** An edge table of a property graph, read by one endpoint (`start = x` or `end = x`), has one more
+  access path beside its endpoint index: `GraphIndexScan` (`exec/graph-scan.ts`) reads the node's relationships from
+  the graph's index in memory (`exec/graph-index.ts`, `exec/graph-lists.ts`), in the endpoint index's order, with no
+  B+tree descent. The other endpoint and the rowid come from the index; other columns are fetched by rowid. It costs
+  less than the endpoint index (`COST.graphOpen`, `COST.graphEntry`), and stands for it where a plan names the index.
+- **Chosen when the scan opens.** The scan asks for the graph's index once per execution, which builds it if it isn't
+  built. When the graph isn't indexed (a reader, ids or a size the index can't hold), the scan runs the endpoint
+  index's scan it carries, so a prepared statement stays valid as the index comes and goes.
+- **Kept by writers.** An edge table's `TableWriter` reports every row written, changed and deleted to the index
+  (`GraphHooks`, `exec/write.ts`). A rollback drops an index that may hold what it undid; a commit confirms it at the
+  pager's new change counter.
+- **Tests.** With `SMALT_GRAPH_INDEX_CHECK=1` (set for every test, `test/setup-sql.ts`) the engine compares each index
+  with its tables after every statement that writes, and runs every query that read one again without it: the rows
+  must be the same, in order.
+- **EXPLAIN** shows `SEARCH t USING GRAPH INDEX (start=?)`.
+
+See [ADR 0040](adr/0040-graph-index-and-relationships.md).

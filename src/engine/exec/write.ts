@@ -347,10 +347,14 @@ export class TableWriter {
     }
     this.noteRowid(rowid);
     this.history?.inserted(row, rowid);
+    this.graph?.inserted(row, rowid);
   }
 
   /** A history table's hooks (exec/history.ts): every insert, update and delete through this writer is reported. */
   history?: HistoryHooks;
+
+  /** An edge table's graph indexes (exec/graph-index.ts, ADR 0040): every row written or removed is reported. */
+  graph?: GraphHooks;
 
   /**
    * Replace row `oldRowid` (currently `old`, conflicts already resolved) with `next`. Index entries
@@ -405,6 +409,7 @@ export class TableWriter {
     this.tree.put(this.key(newRowid), this.enc.encode(next));
     if (alias >= 0) next[alias] = saved;
     this.history?.updated(old, oldRowid, next, newRowid);
+    this.graph?.updated(old, next, newRowid);
   }
 
   /** Foreign-key hooks around a deletion (not called for the delete half of an UPDATE). */
@@ -427,6 +432,7 @@ export class TableWriter {
     }
     this.tree.delete(this.key(rowid));
     this.history?.deleted(row, rowid);
+    this.graph?.deleted(row, rowid);
     if (!silent) this.onDelete?.(row, replace);
     return true;
   }
@@ -437,8 +443,17 @@ export class TableWriter {
     this.tree.clear();
     for (const t of this.indexTrees) t.clear();
     this.maxRowid = 0;
+    this.graph?.truncated();
     return n;
   }
+}
+
+/** What an edge table's writer tells its graph indexes. An update that changes the rowid is a delete and an insert. */
+export interface GraphHooks {
+  inserted(row: readonly SqlValue[], rowid: number | bigint): void;
+  updated(old: readonly SqlValue[], next: readonly SqlValue[], rowid: number | bigint): void;
+  deleted(row: readonly SqlValue[], rowid: number | bigint): void;
+  truncated(): void;
 }
 
 /** The rowid a row will have (its INTEGER PRIMARY KEY), for evaluating index expressions; 0 otherwise. */

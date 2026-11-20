@@ -113,6 +113,26 @@ a graph aren't affected.
 
 Errors from these rules keep the engine's wording in every language: they say which graph, table and node.
 
+### The graph index
+
+The engine keeps each property graph's relationships in memory, by node: a graph index
+([ADR 0040](../../adr/0040-graph-index-and-relationships.md)). Where a plan reads an edge table by its start or its end
+(`start = x`), the planner can answer from it instead of descending the endpoint index, and gives the same rows in the
+same order. `EXPLAIN` shows it as `SEARCH <table> USING GRAPH INDEX (start=?)`. Nothing in a plan names it: joins,
+[`paths`](./plans#paths) and the rules above use it where they would use the endpoint index.
+
+- **What it needs:** an edge table with indexes on `(start, end)` and `(end, start)`, as the tables `addType` makes
+  have. A table without them is read by a scan, or by whatever index it has.
+- **Built on first use** from the endpoint indexes, and kept as rows are written, by any language. It is never written
+  to the file, so opening a database costs nothing, and the first statement that reads a graph builds its index.
+- **Dropped and built again** when a rollback undid a change to it (of a statement, a savepoint or a transaction), or
+  when the graph's edge tables change.
+- **Not held** for a graph with a node id or a relationship rowid outside 0 to 2^31 - 1, or that needs more memory
+  than `graphIndexMem` ([options](../api/engine), 256 MiB by default; `0` turns graph indexes off). Its plans read the
+  B+trees, with the same results.
+- **Readers hold none:** a [parallel reader](../../ARCHITECTURE.md) reads the B+trees, and a statement that reads a
+  graph index runs on the engine that writes.
+
 ### Adding labels and types
 
 A language adds a label or relationship type the first time it writes one (ADR 0033, decision 11: Cypher's
@@ -125,7 +145,8 @@ A language adds a label or relationship type the first time it writes one (ADR 0
   A graph created with `caseSensitive: false` ignores case instead: see below.
 - **`addType`:** the type's table gets `start INTEGER`, `end INTEGER` and `props map<text, any>`, and indexes on
   `(start, end)` and on `(end, start)` (`<table>_start`, `<table>_end`), which the rules' lookups use. A hop from a
-  node to the other end reads the index alone, not the table.
+  node to the other end reads the index alone, not the table; with [the graph index](#the-graph-index), it reads
+  neither.
 - **An existing table** of that name is adopted instead, if it has the conventional columns (`id`, or `start` and
   `end`, and optionally `props`) and passes the checks a new graph's tables pass.
 - **A label or type the graph has**, spelled the same, is an error, or a no-op with `ifNotExists`.

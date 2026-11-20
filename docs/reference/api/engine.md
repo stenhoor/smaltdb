@@ -63,6 +63,7 @@ console.log(again.query('SELECT a FROM t').rows); // [['kept']]
 | `journalMode` | `'wal'` \| `'off'` | `'wal'` | `'off'` writes pages in place: commits are then not atomic if the process stops halfway. |
 | `workMem` | `number` | 256 MiB | Bytes a sort or hash aggregate may use before it spills to the scratch file; `0` never spills. `PRAGMA work_mem` changes it at run time. |
 | `spillPath` | `string` \| `false` | `<path>-spill` | The scratch file, or `false` for none (operators then stay in memory). In-memory databases never spill. |
+| `graphIndexMem` | `number` | 256 MiB | Bytes a property graph's [index in memory](../engine/schema#the-graph-index) may take. A graph that needs more is read from its B+trees; `0` turns graph indexes off. |
 | `statementCacheSize` | `number` | `64` | Compiled statements kept by `run` and `query`, by SQL text. |
 | `verifyChecksums` | `boolean` | `true` | Check page checksums on every read from storage. |
 | `walAutoCheckpointBytes` | `number` | 4 MiB | Copy the write-ahead log into the database file once it reaches this size. |

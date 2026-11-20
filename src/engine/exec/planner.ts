@@ -15,6 +15,9 @@ import { type IndexEval, type IndexSchema, type TableSchema, isColumnar, storage
 import { type BTree, BTreeCursor } from '../storage/btree.js';
 import { KEY_AFTER_NULL, decodeKey, rowidSuffixStart } from '../storage/key-codec.js';
 import { RecordReader, isInt64Storage } from '../storage/record.js';
+import { endpointIndex } from './graph-index.js';
+import type { GraphLists } from './graph-lists.js';
+import { GraphIndexScan } from './graph-scan.js';
 import { Collation, type SqlValue, normalizeInt } from '../values.js';
 import { type Affinity, type StaticType, affinityOfStorage, hashKey, hashKeyMulti, staticTypeOfStorage, truthy } from './convert.js';
 import {
@@ -124,6 +127,12 @@ export interface PhysicalEnv {
    * to the plans it builds itself (a decorrelated subquery's inner side).
    */
   rewritePlan?(plan: PlanOp): PlanOp;
+  /**
+   * An edge table of a property graph that has an index in memory (ADR 0040): its position among the graph's edge
+   * tables, its endpoint columns, and the graph's lists by start or by end node, asked when a scan opens (null when the
+   * graph isn't indexed then).
+   */
+  graphEdge?(table: TableSchema): { type: number; start: number; end: number; lists(byStart: boolean): GraphLists | null } | undefined;
   /** M8: an external table by name (its columns from the catalog; its rows once loaded). */
   externalTable?(name: string): ExternalScan | undefined;
   /** M8: a table function over external data (`read_csv`, `read_json`) called with constant arguments; undefined for other functions. */
@@ -375,6 +384,9 @@ const COST = {
   fetch: 1200,
   /** Per index entry of a covering index (every column read is in its key): advance and decode, no fetch. */
   indexEntry: 40,
+  /** A graph index's list of a node (ADR 0040): finding it, and per entry. */
+  graphOpen: 60,
+  graphEntry: 15,
   /** Hash join: per build row, per probe row. */
   hashBuild: 80,
   hashProbe: 60,
@@ -1950,8 +1962,8 @@ export class Planner {
       // The order its entries come in: by the column after the equalities, or by rowid when they cover the index.
       const next = idx.columns[k];
       const orderBy = !next ? { column: -1, collation: Collation.Binary } : next.column >= 0 && !next.desc ? { column: next.column, collation: next.collation } : undefined;
-      consider(`index ${idx.name}`, COST.probe + matches * (covering ? COST.indexEntry : COST.fetch), matches, deps, () => {
-        const spec = {
+      const indexScan = (): IndexScan =>
+        new IndexScan(access, {
           indexName: idx.name,
           tree: this.env.openTree(idx.rootPage),
           columns: idx.columns.map((c) => ({ desc: c.desc, collation: c.collation })),
@@ -1966,15 +1978,39 @@ export class Planner {
             const textual = t === 'TEXT' || t === 'ANY' || t === 'NUMERIC';
             return textual && c.collation !== Collation.Binary ? -1 : c.column;
           }),
-        };
-        return { leaf: new IndexScan(access, spec), dependsOnOuter: deps, consumed: [...eqs, ...(lo ? [lo] : []), ...(hi ? [hi] : [])].map((x) => x.conj) };
-      });
+        });
+      const consumed = [...eqs, ...(lo ? [lo] : []), ...(hi ? [hi] : [])].map((x) => x.conj);
+      consider(`index ${idx.name}`, COST.probe + matches * (covering ? COST.indexEntry : COST.fetch), matches, deps, () => ({ leaf: indexScan(), dependsOnOuter: deps, consumed }));
       if (orderBy) options[options.length - 1].orderBy = orderBy;
+      // An edge table of an indexed property graph, by one endpoint: the same rows in the same order from the graph's
+      // index in memory, with no descent (ADR 0040, 2.1). Its scan is this index's when the graph isn't indexed.
+      const edge = k === 1 && !lo && !hi ? this.env.graphEdge?.(table) : undefined;
+      if (edge && idx === endpointIndex(table, idx.columns[0].column, idx.columns[1]?.column ?? -1) && [edge.start, edge.end].includes(idx.columns[0].column) && [edge.start, edge.end].includes(idx.columns[1].column)) {
+        const byStart = idx.columns[0].column === edge.start;
+        consider(`index ${idx.name} graph`, COST.graphOpen + matches * (covering ? COST.graphEntry : COST.fetch), matches, deps, () => ({
+          leaf: this.graphScan([
+            access,
+            indexScan(),
+            () => edge.lists(byStart),
+            this.env.state,
+            edge.type,
+            compileBoundExpr(eqs[0].other, ctx).fn,
+            converters[0],
+            idx.columns[0].column,
+            idx.columns[1].column,
+            table.columns[idx.columns[0].column].name,
+          ]),
+          dependsOnOuter: deps,
+          consumed,
+        }));
+        if (orderBy) options[options.length - 1].orderBy = orderBy;
+      }
     }
     // INDEXED BY / NOT INDEXED, as in SQLite.
     if (src.indexedBy === null) return options.filter((o) => !o.label.startsWith('index '));
     if (typeof src.indexedBy === 'string') {
-      const forced = options.filter((o) => o.label.toLowerCase() === `index ${src.indexedBy!.toLowerCase()}`);
+      // A graph's index stands for the endpoint index it reads like.
+      const forced = options.filter((o) => [`index ${src.indexedBy!.toLowerCase()}`, `index ${src.indexedBy!.toLowerCase()} graph`].includes(o.label.toLowerCase()));
       // Where the index is unusable on its own (e.g. this table placed first in a join), offer an
       // infinitely expensive option: join ordering avoids it, and only a plan that needs it fails.
       if (!forced.some((o) => !o.dependsOnOuter)) {
@@ -2100,12 +2136,19 @@ export class Planner {
    */
   readonly subplans: { label: string; root: Operator }[] = [];
 
+  private graphScan(args: ConstructorParameters<typeof GraphIndexScan>): GraphIndexScan {
+    if (!this.dryCompile) this.readsGraphIndex = true;
+    return new GraphIndexScan(...args);
+  }
+
   private recordSubplan(label: string, root: Operator): void {
     if (!this.dryCompile) this.subplans.push({ label, root });
   }
 
   /** Root page -> row estimate (from the tree shape) each costed table had when this plan was made. */
   readonly rowAssumptions = new Map<number, number>();
+  /** The plan reads a property graph's index in memory (ADR 0040): it runs where the index is. */
+  readsGraphIndex = false;
   /** External sources the statement reads (M8): loaded before it runs. */
   readonly externals: ExternalSource[] = [];
 
