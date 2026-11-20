@@ -10,7 +10,7 @@
  */
 import type { FnTraits } from './traits.js';
 import { SmaltError } from '../errors.js';
-import { Collation, type SqlValue, TypedValue, compareValues, normalizeInt } from '../values.js';
+import { Collation, type SqlValue, TypedValue, compareNumeric, compareText, compareValues, normalizeInt } from '../values.js';
 import {
   type StaticType,
   applyNumericAffinity,
@@ -186,6 +186,48 @@ function comparisonFn(op: string, a: SqlArg, b: SqlArg, coll: Collation): Fn {
     if (ca) x = ca(x);
     if (cb) y = cb(y);
     return test(compareValues(x, y, coll)) ? 1 : 0;
+  };
+}
+
+/** Comparisons within one kind, by operator (see {@link kindComparisonFn}). */
+export const KIND_COMPARISON_FUNCTIONS: Readonly<Record<'<' | '<=' | '>' | '>=', string>> = { '<': 'cmp_lt_kind', '<=': 'cmp_le_kind', '>': 'cmp_gt_kind', '>=': 'cmp_ge_kind' };
+
+/** A number that orders among numbers: NaN is left out (in the engine's order it sorts after them all, ADR 0018). */
+const ordersAsNumber = (v: SqlValue): v is number | bigint => typeof v === 'bigint' || (typeof v === 'number' && v === v);
+
+/**
+ * `cmp_lt_kind` and the others: `x op y` where both are numbers, neither NaN, or both are text, by its UTF-8 bytes.
+ * NULL where either is NULL, and for operands of any other kinds (a number and text, a NaN, a blob, a typed value),
+ * which `cmp_lt` and the others rank by storage class. It applies no affinity and takes no collation but BINARY: for
+ * a language whose comparisons order only values of one kind, as Cypher's do. What it gives is what the stored bytes
+ * of two such values give (`compareSameKind` in storage/key-codec.ts), so a generated scan decides it on a map's
+ * bytes without decoding the value (exec/codegen.ts).
+ */
+function kindComparisonFn(name: string, op: string, a: SqlArg, b: SqlArg, coll: Collation | undefined): Fn {
+  if (coll !== undefined && coll !== Collation.Binary) throw new SmaltError('SMALT_MISMATCH', `${name} compares text by its bytes: it takes no collation`);
+  const fa = a.fn;
+  const fb = b.fn;
+  const ca = a.convert ?? null;
+  const cb = b.convert ?? null;
+  const test = cmpTest(op);
+  return (r) => {
+    let x = fa(r);
+    if (x === null) return null;
+    let y = fb(r);
+    if (y === null) return null;
+    if (ca) x = ca(x);
+    if (cb) y = cb(y);
+    let c: number;
+    if (typeof x === 'number' && typeof y === 'number') {
+      // With a NaN no branch holds, and the comparison is NULL.
+      if (x < y) c = -1;
+      else if (x > y) c = 1;
+      else if (x === y) c = 0;
+      else return null;
+    } else if (typeof x === 'string' && typeof y === 'string') c = compareText(x, y);
+    else if (ordersAsNumber(x) && ordersAsNumber(y)) c = compareNumeric(x, y);
+    else return null;
+    return test(c) ? 1 : 0;
   };
 }
 
@@ -658,6 +700,9 @@ const OPERATIONS: ReadonlyMap<string, SqlFunction> = new Map<string, SqlFunction
   ...Object.entries(COMPARISON_FUNCTIONS).map(([op, alias]) => [op, alias] as const).map(([op, name]) =>
     // A comparison gives bool (ADR 0018): 0 / 1 at run time; a language that wants an INTEGER declares int.
     fixed(name, 2, (args, o) => ({ fn: comparisonFn(op, args[0], args[1], o.collation ?? Collation.Binary), type: 'bool' }), COMPARISON_TRAITS[op]),
+  ),
+  ...(Object.entries(KIND_COMPARISON_FUNCTIONS) as ['<' | '<=' | '>' | '>=', string][]).map(([op, name]) =>
+    fixed(name, 2, (args, o) => ({ fn: kindComparisonFn(name, op, args[0], args[1], o.collation), type: 'bool' }), { kindCompare: op }),
   ),
   ...Object.entries(ARITHMETIC_FUNCTIONS).map(([op, alias]) => [op, alias] as const).map(([op, name]) => fixed(name, 2, (args) => arithmeticFn(op, args[0], args[1]), ARITHMETIC_TRAITS[op])),
   ...Object.entries(BITWISE_FUNCTIONS).map(([op, alias]) => [op, alias] as const).map(([op, name]) => fixed(name, 2, (args) => ({ fn: bitwiseFn(op, args[0], args[1]), type: 'int' }))),

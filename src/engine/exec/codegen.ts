@@ -734,9 +734,10 @@ class Pipeline {
   private readonly mapKeys: MapCondition[] = [];
 
   /**
-   * Conjuncts that are exactly their map condition (`map_contains_key(m, 'k')`, `map_get(m, 'k') IS NOT NULL`): where
-   * the probe checks them, the closure compiler's conjunct runs only for rows the probe did not see (`sw`, cells
-   * decoded by `H.slow`), so the map is not decoded for it. `line`: its place in `rowLines`, filled in by `finish`.
+   * Conjuncts that are exactly their map condition (`map_contains_key(m, 'k')`, `map_get(m, 'k') IS NOT NULL`, and a
+   * comparison within one kind of `map_get(m, 'k')` with a number or text, `kindCondition`): where the probe checks
+   * them, the closure compiler's conjunct runs only for rows the probe did not see (`sw`, cells decoded by `H.slow`),
+   * so the map is not decoded for it. `line`: its place in `rowLines`, filled in by `finish`.
    */
   private readonly exact: { cond: MapCondition; fn: string; line: number }[] = [];
 
@@ -775,10 +776,38 @@ class Pipeline {
   /** The map condition that is all of conjunct `p`, if it is one (see `exact`). */
   private exactMapConjunct(p: BoundExpr): MapCondition | null {
     if (isOpaque(p)) return null;
+    const kind = this.kindCondition(p);
+    if (kind) return kind;
     const x = p.k === 'not' && p.arg.k === 'isNull' && !p.arg.not && !isOpaque(p.arg) ? p.arg.arg : p.k === 'isNull' && p.not ? p.arg : p;
     const fn = x === p ? 'map_contains_key' : 'map_get';
     const r = this.mapRead(x, fn);
     return r ? { reg: r.reg, key: encodeKey([r.key]), op: fn === 'map_get' ? MapCompare.NotNull : MapCompare.None, lit: null } : null;
+  }
+
+  /**
+   * `p` as a comparison within one kind (`cmp_lt_kind` and the others) of `map_get(m, 'k')` with a number or text, a
+   * literal or a parameter, written either way round. The stored bytes of the two decide it, whatever the value's
+   * kind (`mapProbe` in nested-ops.ts): the operation applies no affinity and no collation, so nothing about the
+   * operands' types changes what it gives. A parameter's bytes are made when the statement runs, for a number that
+   * isn't NaN or text; for any other value the comparison is NULL for every row, and the probe passes none.
+   */
+  private kindCondition(p: BoundExpr): MapCondition | null {
+    if (p.k !== 'call' || isOpaque(p) || p.args.length !== 2 || p.collation !== undefined) return null;
+    const op = traitsOf(p.fn).kindCompare;
+    if (op === undefined) return null;
+    for (const flip of [false, true]) {
+      const r = this.mapRead(p.args[flip ? 1 : 0]!, 'map_get');
+      if (!r) continue;
+      const y = p.args[flip ? 0 : 1]!;
+      const c = flip
+        ? { '<': MapCompare.KindGt, '<=': MapCompare.KindGe, '>': MapCompare.KindLt, '>=': MapCompare.KindLe }[op]
+        : { '<': MapCompare.KindLt, '<=': MapCompare.KindLe, '>': MapCompare.KindGt, '>=': MapCompare.KindGe }[op];
+      const cond = { reg: r.reg, key: encodeKey([r.key]), op: c };
+      if (y.k === 'param') return { ...cond, lit: null, param: { index: y.index, numbers: true, text: true } };
+      const v = y.k === 'lit' ? y.value : undefined;
+      return typeof v === 'string' || typeof v === 'bigint' || (typeof v === 'number' && v === v) ? { ...cond, lit: encodeKey([v]) } : null;
+    }
+    return null;
   }
 
   /** `fn(m, 'k')` of a column m: its register and the key. */
@@ -821,6 +850,9 @@ class Pipeline {
         return;
     }
     if (p.fn === 'map_contains_key') return add(read(p, 'map_contains_key'));
+    // A comparison within one kind that is part of a conjunct: the conjunct needs it to hold.
+    const kind = this.kindCondition(p);
+    if (kind) return void this.mapKeys.push(kind);
     // A comparison is NULL, so not true, when an operand is: a missing key's NULL included.
     const op = traitsOf(p.fn).compare;
     if (op === undefined || op === 'IS' || op === 'IS NOT' || p.args.length !== 2) return;

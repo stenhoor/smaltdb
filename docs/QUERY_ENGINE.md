@@ -206,6 +206,12 @@ Decisions and their rationale: [ADR 0005](adr/0005-cost-based-optimizer.md).
   its value is compared with a number or with text under BINARY, a literal or a parameter, the comparison must hold
   for a value of that kind. A parameter's bytes are made once a run, so a statement kept and run with another value
   filters as fast as one written with the value in it.
+- **A comparison within one kind is decided on those bytes.** `cmp_lt_kind` and the three like it are NULL unless
+  both operands are numbers or both are text, which is what the stored bytes of the two give. So where a conjunct
+  is `cmp_gt_kind(map_get(m, 'k'), x)`, written either way round with `x` a literal or a parameter, the check on the
+  bytes is the conjunct: it is not run for the rows the check saw, and the map is not decoded for it. Measured on
+  20,000 rows of which 19 in 20 pass, counted: 6.85 ms as a CASE that tests the value's kind and then compares it
+  (the conjunct reads the key three times for each row that passes the check), 0.64 ms as the one operation.
 - **Literals in generated code.** Per-row expression functions read text and numeric literals from their
   constants (`K`), so statements that differ only in their literals share one compiled function: a new point query
   or projection costs no `new Function`. Integer divisors of `/` and `%` stay in the source, where V8 turns the

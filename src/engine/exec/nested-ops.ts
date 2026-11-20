@@ -650,8 +650,11 @@ export function findMapKey(m: Uint8Array, start: number, end: number, key: Uint8
 /** The tag of a NULL component. */
 const NULL_TAG = encodeKey([null])[0]!;
 
-/** How {@link mapProbe} compares a map's value with a literal. */
-export const MapCompare = { None: 0, Eq: 1, Ne: 2, Lt: 3, Le: 4, Gt: 5, Ge: 6, NotNull: 7 } as const;
+/**
+ * How {@link mapProbe} compares a map's value with a literal. `KindLt` and the three after it are the comparisons
+ * within one kind (`cmp_lt_kind` and the others).
+ */
+export const MapCompare = { None: 0, Eq: 1, Ne: 2, Lt: 3, Le: 4, Gt: 5, Ge: 6, NotNull: 7, KindLt: 8, KindLe: 9, KindGt: 10, KindGe: 11 } as const;
 export type MapCompare = (typeof MapCompare)[keyof typeof MapCompare];
 
 /**
@@ -659,11 +662,20 @@ export type MapCompare = (typeof MapCompare)[keyof typeof MapCompare];
  * (encoded) cannot be true of the row, so the row is skipped without decoding the map. With `lit` (an encoded number
  * or text literal), also false when the key's value is of the literal's kind and `value op lit` does not hold (see
  * `compareSameKind`); with `NotNull`, false when the value is NULL. True otherwise: the conjunct itself decides.
+ *
+ * A comparison within one kind is decided here, true or not: it holds only for a value of the literal's kind that
+ * compares so with it, which is what `compareSameKind` gives (NaN, which passes no test, for two other kinds). With
+ * no literal (a parameter that is NULL, a NaN or neither a number nor text) it holds for no row.
  */
 export function mapProbe(m: Uint8Array, start: number, end: number, key: Uint8Array, op: MapCompare, lit: Uint8Array | null): boolean {
   const at = findMapKey(m, start, end, key);
   if (at < 0) return false;
   if (op === MapCompare.NotNull) return m[at] !== NULL_TAG;
+  if (op >= MapCompare.KindLt) {
+    if (lit === null) return false;
+    const c = compareSameKind(m, at, lit);
+    return op === MapCompare.KindLt ? c < 0 : op === MapCompare.KindLe ? c <= 0 : op === MapCompare.KindGt ? c > 0 : c >= 0;
+  }
   if (lit === null) return true;
   const c = compareSameKind(m, at, lit);
   if (c !== c) return true;

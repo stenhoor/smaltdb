@@ -346,6 +346,7 @@ traits they declare (a comparison, a constant offset, an inline form), not by th
 | Operation | Arguments | Meaning |
 |---|---|---|
 | `cmp_eq`, `cmp_ne`, `cmp_lt`, `cmp_le`, `cmp_gt`, `cmp_ge` | 2 | Comparison in SQLite's storage-class order (NULL < numbers < text < blobs); NULL if either side is NULL. Text compares by the call's `collation`. |
+| `cmp_lt_kind`, `cmp_le_kind`, `cmp_gt_kind`, `cmp_ge_kind` | 2 | Comparison within one kind: of two numbers, or of two texts by their UTF-8 bytes. NULL if either side is NULL, a NaN, or anything else (a number against text, a blob, a truth value, a list or a map under `any`). No affinity, and no `collation` but `binary`. For a language whose `<` orders only values of one kind. |
 | `cmp_is`, `cmp_is_not` | 2 | Comparison where NULL equals NULL; never NULL |
 | `add`, `sub`, `mul` | 2 | Arithmetic; integer overflow becomes REAL, text converts by its numeric prefix |
 | `div_trunc` | 2 | Division: two integers divide truncating toward zero, a REAL operand gives REAL division; division by zero is NULL |

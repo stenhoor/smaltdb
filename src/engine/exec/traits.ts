@@ -19,6 +19,13 @@ export interface FnTraits {
    * collation), so index and rowid probes, zone maps and join methods may use it. `=` comparisons are equi-joins.
    */
   readonly compare?: CompareOp;
+  /**
+   * A comparison within one kind (`cmp_lt_kind` and the others): of two numbers, neither NaN, or of two texts by
+   * their bytes, and NULL for anything else. It is not a `compare`: an index, a zone map and a join order values of
+   * every kind, and this is NULL where they would rank a number against text. A generated scan decides it on a map's
+   * stored bytes (exec/codegen.ts, `Pipeline.exact`).
+   */
+  readonly kindCompare?: '<' | '<=' | '>' | '>=';
   /** The form code generation emits inline over numbers (and, for comparisons, text under BINARY). */
   readonly inline?: InlineForm;
   /** A constant offset of its first argument by its second (`x + k`: 1, `x - k`: -1), for range estimates. */
