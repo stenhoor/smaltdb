@@ -177,6 +177,22 @@ export const explode = (
   ...(options.emptyAsNull ? { emptyAsNull: true } : {}),
   ...(options.keepNulls === false ? { keepNulls: false } : {}),
 });
+/**
+ * A property graph's relationships as a relation (ADR 0040; see the `relationships` operation): columns `node`,
+ * `other`, `type`, `id`, `outgoing`, `props`. Join it on `node` for the relationships at a node.
+ */
+export const relationships = (
+  graph: string,
+  direction: 'out' | 'in' | 'both' = 'out',
+  options: { types?: readonly string[]; asOf?: { readonly commit: PlanExpr } | { readonly time: PlanExpr } } = {},
+): Op<'relationships'> => ({
+  op: 'relationships',
+  graph,
+  direction,
+  ...(options.types ? { types: options.types } : {}),
+  ...(options.asOf ? { asOf: options.asOf } : {}),
+});
+
 /** Paths through a graph from the node in column `start` of each input row (ADR 0033, G5; see the `paths` operation). */
 export const paths = (
   input: PlanOp,

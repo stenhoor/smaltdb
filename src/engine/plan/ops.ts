@@ -119,6 +119,13 @@ export interface PathEdges {
 /** The type of a `paths` operation's path column: per hop, its table's position in `edges`, its rowid, and the nodes it went from and to. */
 export const PATH_TYPE = 'list<struct<edge int, rowid int, from int, to int>>';
 
+/**
+ * The columns of a `relationships` operation, in order: the node the relationship is at (`node`), the node at its other
+ * end (`other`), its type's name (`type`), its rowid in its type's table (`id`), whether `node` is its start
+ * (`outgoing`), and its catch-all properties (`props`: NULL for a type whose table has none).
+ */
+export const RELATIONSHIP_TYPES = ['int', 'int', 'text', 'int', 'bool', 'map<text, any>'] as const;
+
 export type PlanOp = OpMeaning & (
   /**
    * Rows of a table: `columns` lists table column indexes, -1 for the rowid. `db` names the schema when the query
@@ -135,6 +142,23 @@ export type PlanOp = OpMeaning & (
        * in milliseconds since 1970, which reads it as of the last commit at or before then. The table must keep
        * history (`TableDef.history`). An expression over no columns.
        */
+      readonly asOf?: { readonly commit: PlanExpr } | { readonly time: PlanExpr };
+    }
+  /**
+   * The relationships of a property graph, as a relation (ADR 0040, section 2.2). Its columns are
+   * {@link RELATIONSHIP_TYPES}: `node`, `other`, `type`, `id`, `outgoing`, `props`. `direction` says at which end a
+   * relationship is given: `out`, once, at its start; `in`, once, at its end; `both`, at each end (a relationship from
+   * a node to itself once, as outgoing). `types` keeps only these relationship types (all of the graph's when left
+   * out; none gives no rows). `asOf` reads the graph as it was, as a scan's does: the graph must keep history.
+   *
+   * A join on `node` (and on `other`) reads only the relationships at that node: a hop of a pattern is one join. Rows
+   * come in no promised order.
+   */
+  | {
+      readonly op: 'relationships';
+      readonly graph: string;
+      readonly direction: 'out' | 'in' | 'both';
+      readonly types?: readonly string[];
       readonly asOf?: { readonly commit: PlanExpr } | { readonly time: PlanExpr };
     }
   /**

@@ -26,7 +26,7 @@ import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFu
 import { type ExecState, type Operator, TableAccess, explainAnalyze, explainRows } from './exec/operators.js';
 import { GraphIndexes, endpointIndex } from './exec/graph-index.js';
 import { searchPaths } from './exec/graph-paths.js';
-import { type ExternalScan, type PhysicalEnv, Planner, type QueryPlan, Registers, type ResultColumnInfo } from './exec/planner.js';
+import { type ExternalScan, type PhysicalEnv, type PlannedGraph, Planner, type QueryPlan, Registers, type ResultColumnInfo } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
 import { type PlanMorsels, planMorsels } from './exec/plan-morsel.js';
@@ -1027,6 +1027,30 @@ export class Database implements FunctionContext {
     return this.graphIndexes;
   }
 
+  /** A property graph as the planner reads it for `relationships` (PhysicalEnv.graph). */
+  private plannedGraph(name: string): PlannedGraph | undefined {
+    const g = this.graphs.get(name.toLowerCase())?.graph;
+    if (!g) return undefined;
+    const edges = g.edges.map((e) => {
+      const table = this.tables.get(e.table.toLowerCase());
+      if (!table) throw new SmaltError('SMALT_ERROR', `property graph ${g.name}: no such table: ${e.table}`);
+      return { type: e.type, table, start: findColumn(table, e.start), end: findColumn(table, e.end), props: e.props !== undefined ? findColumn(table, e.props) : -1 };
+    });
+    const ix = this.graphIndexes;
+    // The graph's index is every edge table's: the first one's role names it.
+    const role = edges.length > 0 ? ix.rolesOf(edges[0]!.table)?.find((r) => r.graph.name.toLowerCase() === g.name.toLowerCase()) : undefined;
+    return {
+      name: g.name,
+      caseSensitive: g.caseSensitive !== false,
+      edges,
+      indexed: role !== undefined,
+      lists: () => {
+        const open = role ? ix.open(role.graph) : null;
+        return open === null ? null : { out: open.out!, in: open.in! };
+      },
+    };
+  }
+
   /** What the planner needs to read an edge table through its graph's index (PhysicalEnv.graphEdge). */
   private graphEdge(t: TableSchema): ReturnType<NonNullable<PhysicalEnv['graphEdge']>> {
     const role = this.graphIndexes.rolesOf(t)?.[0];
@@ -1559,6 +1583,16 @@ export class Database implements FunctionContext {
       }
       return false;
     },
+    graph: (name) => {
+      const g = this.graphs.get(name.toLowerCase())?.graph;
+      if (!g) return undefined;
+      const edges = g.edges.map((e) => {
+        const t = this.tables.get(e.table.toLowerCase());
+        if (!t) throw new SmaltError('SMALT_ERROR', `property graph ${g.name}: no such table: ${e.table}`);
+        return { type: e.type, table: t.name, start: findColumn(t, e.start), end: findColumn(t, e.end), props: e.props !== undefined ? findColumn(t, e.props) : -1 };
+      });
+      return { caseSensitive: g.caseSensitive !== false, edges };
+    },
   };
 
   /** The searches `smalt_paths` has run, by what they walk (its third argument), for the current schema. */
@@ -1712,6 +1746,10 @@ export class Database implements FunctionContext {
     sourceColumns: (kind, name, schema) => {
       if (kind === 'external' || (kind === 'function' && this.external.plugins.isExternalFunction(name))) return 'data';
       return this.virtualTable(kind === 'virtual' ? schema : undefined, name)?.columns.length;
+    },
+    graph: (name) => {
+      const g = this.graphs.get(name.toLowerCase())?.graph;
+      return g ? { types: g.edges.map((e) => e.type), caseSensitive: g.caseSensitive !== false, history: g.history !== undefined } : undefined;
     },
   };
 
@@ -2089,6 +2127,7 @@ export class Database implements FunctionContext {
       columnStore: (t) => this.storeOf(t, true),
       liveRows: (t) => this.liveRows(t),
       graphEdge: (t) => this.graphEdge(t),
+      graph: (name) => this.plannedGraph(name),
       deletedRows: (t) => this.deletedRowsOf(t),
       funcCtx: this,
       state: this.state,
@@ -6438,6 +6477,7 @@ function refreshIfChanged(st: PreparedStatement): string | null {
  */
 const REWRITES: { readonly [K in PlanOp['op']]: boolean | ((o: Record<string, unknown>) => boolean) } = {
   scan: (o) => o.asOf !== undefined,
+  relationships: (o) => o.asOf !== undefined,
   source: false,
   iterate: false,
   working: false,

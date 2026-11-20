@@ -62,6 +62,8 @@ export function printPlan(op: PlanOp, depth = 0): string {
   switch (op.op) {
     case 'scan':
       return `${pad}scan ${op.db ? `${op.db}.` : ''}${op.table} [${op.columns.join(', ')}]${op.asOf ? ` as of ${'commit' in op.asOf ? `commit ${printExpr(op.asOf.commit)}` : `time ${printExpr(op.asOf.time)}`}` : ''}`;
+    case 'relationships':
+      return `${pad}relationships ${op.graph} ${op.direction}${op.types ? ` [${op.types.join(', ')}]` : ''}${op.asOf ? ` as of ${'commit' in op.asOf ? `commit ${printExpr(op.asOf.commit)}` : `time ${printExpr(op.asOf.time)}`}` : ''}`;
     case 'source':
       return `${pad}${op.kind} ${op.schema ? `${op.schema}.` : ''}${op.name}(${[list(op.args), ...Object.entries(op.named ?? {}).map(([k, e]) => `${k} => ${printExpr(e)}`)].filter((x) => x).join(', ')})`;
     case 'iterate':

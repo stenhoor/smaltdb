@@ -19,6 +19,8 @@ import { endpointIndex } from './graph-index.js';
 import { PATHS_FUNCTION } from './plan-normalize.js';
 import type { GraphLists } from './graph-lists.js';
 import { GraphIndexScan } from './graph-scan.js';
+import { type RelationshipKey, type RelationshipLists, type RelationshipType, RelationshipsScan } from './graph-relationships.js';
+import { relationshipEdges } from './plan-normalize.js';
 import { Collation, type SqlValue, normalizeInt } from '../values.js';
 import { type Affinity, type StaticType, affinityOfStorage, hashKey, hashKeyMulti, staticTypeOfStorage, truthy } from './convert.js';
 import {
@@ -90,6 +92,7 @@ import { type ColumnStore, ROW_GROUP_ROWS, type Zone, zoneMayMatch } from '../st
 import { SpillRestart, type SpillArea, rowBytes } from './spill.js';
 import { type BoundExpr, eachParts, lit, mapEach, type PlanExpr } from '../plan/expr.js';
 import type { AggCall, ColumnArray, JoinKind, PlanOp, SortKey as PlanSortKey, ValueColumn } from '../plan/ops.js';
+import { RELATIONSHIP_TYPES } from '../plan/ops.js';
 import type { CollationName } from '../plan/types.js';
 import { datetimeFromDate, isTemporal, parseDate, parseDatetime, parseDuration, parseTime } from '../../shared/temporal.js';
 import { encodeNested, isNested } from '../../shared/nested.js';
@@ -134,11 +137,29 @@ export interface PhysicalEnv {
    * graph isn't indexed then).
    */
   graphEdge?(table: TableSchema): { type: number; start: number; end: number; lists(byStart: boolean): GraphLists | null } | undefined;
+  /**
+   * A property graph, for `relationships` (ADR 0040, 2.2): its relationship types in order, each with its table and its
+   * endpoint and props columns (-1: no props), and the graph's lists in memory, asked when a scan opens (null when the
+   * graph isn't indexed then). `indexed`: the graph can have an index here, so a statement that reads it runs here.
+   */
+  graph?(name: string): PlannedGraph | undefined;
   /** M8: an external table by name (its columns from the catalog; its rows once loaded). */
   externalTable?(name: string): ExternalScan | undefined;
   /** M8: a table function over external data (`read_csv`, `read_json`) called with constant arguments; undefined for other functions. */
   externalFunction?(name: string, args: SqlValue[], named: Record<string, SqlValue>): ExternalScan | undefined;
 }
+
+/** A property graph as the planner reads it (`PhysicalEnv.graph`). */
+export interface PlannedGraph {
+  readonly name: string;
+  readonly caseSensitive: boolean;
+  readonly edges: readonly { readonly type: string; readonly table: TableSchema; readonly start: number; readonly end: number; readonly props: number }[];
+  readonly indexed: boolean;
+  lists(): RelationshipLists | null;
+}
+
+/** The names of a `relationships` operation's columns (`RELATIONSHIP_TYPES`). */
+const RELATIONSHIP_COLUMNS = ['node', 'other', 'type', 'id', 'outgoing', 'props'] as const;
 
 /** Table functions that read external data (their arguments must be constants). */
 
@@ -216,6 +237,22 @@ interface Source {
   external?: ExternalSource;
   /** An external table (not a table function): partition pruning applies. */
   externalTable?: boolean;
+  /** A property graph's relationships (a `relationships` operation): `cols` are its six columns. */
+  rel?: RelationshipSource;
+}
+
+/** What a `relationships` source reads, and what the plan reads of it. */
+interface RelationshipSource {
+  readonly graph: PlannedGraph;
+  readonly direction: 'out' | 'in' | 'both';
+  /** The types read, in the graph's order. */
+  readonly edges: PlannedGraph['edges'];
+  /** Columns the plan reads (as `RelationshipsScan.reads`): shared by every scan built for the source. */
+  readonly reads: boolean[];
+  /** Estimates: its rows, and the relationships with one node as their `node`, and as their `other`. */
+  readonly rows: number;
+  readonly perNode: number;
+  readonly perOther: number;
 }
 
 const TEMP_CATALOG = new Set(['sqlite_temp_schema', 'sqlite_temp_master']);
@@ -723,6 +760,7 @@ export class Planner {
     const useOf = (f: FromCell): (() => void) => {
       const { reg, src, col } = f;
       if (src.access) return col < 0 ? () => this.dryCompile || src.access!.useRowid(reg) : () => this.dryCompile || src.access!.use(col, reg);
+      if (src.rel) return () => this.dryCompile || (src.rel!.reads[col] = true);
       return () => this.dryCompile || src.external?.projection?.add(src.cols[col].name.toLowerCase());
     };
     return {
@@ -762,7 +800,7 @@ export class Planner {
       // Nested plans read the rows of the operation this one is evaluated in, as derived tables do.
       source: (p) => {
         const l = leaves[p].op;
-        if (l.op === 'scan' || l.op === 'source') return undefined;
+        if (l.op === 'scan' || l.op === 'source' || l.op === 'relationships') return undefined;
         if (l.op === 'working') {
           const w = this.workings.get(l.id)!;
           return { plan: { root: w.scan, outRegs: w.regs, columns: w.columns, correlated: true }, working: true };
@@ -1513,6 +1551,10 @@ export class Planner {
       scope.sources.push({ name: alias, cols, rowidReg: -1, sub, lateral, joinType, position });
       return;
     }
+    if (item.kind === 'relationships') {
+      scope.sources.push(this.relationshipSource(item.op, item.alias, joinType, position));
+      return;
+    }
     if (item.kind === 'nested') throw new SmaltError('SMALT_INTERNAL', 'nested plans are planned as sources');
     if (item.schema && !['main', 'temp'].includes(item.schema.toLowerCase())) throw new SmaltError('SMALT_ERROR', `unknown database ${item.schema}`);
     const table = this.env.getTable(item.name, item.schema);
@@ -1709,6 +1751,12 @@ export class Planner {
     if (x.k === 'slot') {
       const s = this.slotSource(x.reg, scope);
       if (!s) return undefined;
+      // A relationship's node or other end: as many values as nodes have relationships; its id: one per row.
+      if (s.src.rel) {
+        const rel = s.src.rel;
+        const at = s.src.cols.findIndex((c) => c.reg === x.reg);
+        return { src: s.src, ndv: at === 3 ? Math.max(1, rel.rows) : at <= 1 ? Math.max(1, rel.rows / Math.max(1, rel.perNode)) : this.ndv(s.src, 0) };
+      }
       if (!s.src.table) return { src: s.src, ndv: this.ndv(s.src, 0) };
     }
     if (planHasSubquery(x)) return undefined;
@@ -1767,6 +1815,7 @@ export class Planner {
   }
 
   private accessOptions(src: Source, p: number, candidates: ConjunctInfo[], scope: Scope, ctx: FunctionContext): AccessOption[] {
+    if (src.rel) return this.relationshipOptions(src, p, candidates, scope, ctx);
     if (src.sub) {
       const sub = src.sub;
       const rows = this.tableRows(src);
@@ -2036,6 +2085,7 @@ export class Planner {
 
   /** Estimated rows of a source (ANALYZE stats, else B+tree shape). */
   private tableRows(src: Source): number {
+    if (src.rel) return (src.estRows ??= Math.max(1, src.rel.rows));
     if (src.sub) {
       if (src.working) return WORKING_ROWS;
       // A derived table planned here: its plan's own estimate (a UNION ALL sums its inputs'), else SUBQUERY_ROWS.
@@ -2138,6 +2188,183 @@ export class Planner {
    * For tests that compare plan shapes (test/plan-shapes.test.ts); trial compiles don't record.
    */
   readonly subplans: { label: string; root: Operator }[] = [];
+
+  // ---------------------------------------------------------------- relationships
+
+  /** Estimated distinct values of a table's column, as `ndv` estimates a source's. */
+  private columnNdv(t: TableSchema, col: number, n: number): number {
+    if (col === t.rowidAlias) return n;
+    for (const ix of t.indexes) if (ix.unique && ix.columns.length === 1 && ix.columns[0].column === col) return n;
+    if (t.stats) return Math.max(1, t.stats.ndv[col] || 1);
+    for (const ix of t.indexes) if (ix.columns[0].column === col && ix.stats) return Math.max(1, n / ix.stats.avg[0]);
+    const sampled = this.env.sampledStats?.(t);
+    if (sampled) return Math.max(1, Math.min(n, sampled.ndv[col] || 1));
+    return Math.max(1, n / 10);
+  }
+
+  /**
+   * A `relationships` operation as a source of a join region (ADR 0040, 2.2): its six columns, the types it reads and
+   * its estimates, which come from the types' tables whether or not the graph is indexed.
+   */
+  private relationshipSource(op: Extract<PlanOp, { op: 'relationships' }>, alias: string, joinType: JoinType, position: number): Source {
+    const g = this.env.graph?.(op.graph);
+    if (!g) throw new SmaltError('SMALT_ERROR', `no such property graph: ${op.graph}`);
+    const edges = relationshipEdges(g, op.types);
+    const cols: SourceColumn[] = RELATIONSHIP_COLUMNS.map((name, i) => ({
+      name,
+      reg: this.regs.alloc(),
+      type: RELATIONSHIP_TYPES[i] as StaticType,
+      collation: Collation.Binary,
+      affinity: i === 2 ? 'TEXT' : i === 5 ? 'BLOB' : 'INTEGER',
+      declType: '',
+      index: i,
+    }));
+    let rows = 0;
+    let perNode = 0;
+    let perOther = 0;
+    for (const out of op.direction === 'both' ? [true, false] : [op.direction === 'out']) {
+      for (const e of edges) {
+        const live = this.env.liveRows ? this.env.liveRows(e.table) : this.env.openTree(e.table.rootPage).estimateCount();
+        // Remember what the plan assumed, as for a table it scans (`tableRows`).
+        this.rowAssumptions.set(e.table.rootPage, live);
+        const n = Math.max(1, e.table.stats?.rows ?? live);
+        rows += n;
+        perNode += n / this.columnNdv(e.table, out ? e.start : e.end, n);
+        perOther += n / this.columnNdv(e.table, out ? e.end : e.start, n);
+      }
+    }
+    return { name: alias, cols, rowidReg: -1, joinType, position, rel: { graph: g, direction: op.direction, edges, reads: [false, false, false, false, false, false], rows, perNode, perOther } };
+  }
+
+  /**
+   * The ways to read a `relationships` source: every relationship; those at a node, when a condition gives `node` or
+   * gives `other`; those between two nodes, when conditions give both. The conditions are enforced exactly, as an
+   * index's are.
+   */
+  private relationshipOptions(src: Source, p: number, candidates: ConjunctInfo[], scope: Scope, ctx: FunctionContext): AccessOption[] {
+    const rel = src.rel!;
+    type Probe = { value: BoundExpr; deps: Set<number>; conj: ConjunctInfo; convert: (v: SqlValue) => SqlValue };
+    const probes: (Probe | undefined)[] = [undefined, undefined];
+    for (const c of candidates) {
+      if (!c.compilable) continue;
+      const e = c.bound;
+      if (e.k !== 'call' || isOpaque(e) || probeOp(e.fn) !== '=') continue;
+      for (const flip of [false, true]) {
+        const colSide = unconvertedOperand(e.args[flip ? 1 : 0]);
+        const value = unconvertedOperand(e.args[flip ? 0 : 1]);
+        if (colSide.k !== 'slot' || isOpaque(colSide)) continue;
+        const which = colSide.reg === src.cols[0].reg ? 0 : colSide.reg === src.cols[1].reg ? 1 : -1;
+        if (which < 0 || probes[which]) continue;
+        const deps = this.depsOf(value, scope);
+        if (deps.has(p)) continue;
+        // The value as an index on an INTEGER column would take it (`usable` in `accessOptions`). Costing only:
+        // compiling the operands must not mark a column as read.
+        let convert: ((v: SqlValue) => SqlValue) | null = null;
+        this.dryCompile++;
+        try {
+          const colC = boundMetadata(colSide, ctx);
+          const valueC = boundMetadata(value, ctx);
+          if (comparisonCollation(colC, valueC) === Collation.Binary) {
+            const [convCol, convValue] = comparisonConverters(colC, valueC);
+            if (!convCol) convert = convValue ?? ((v) => v);
+          }
+        } finally {
+          this.dryCompile--;
+        }
+        if (!convert) continue;
+        probes[which] = { value, deps, conj: c, convert };
+        break;
+      }
+    }
+    const [node, other] = probes;
+    const rows = this.tableRows(src);
+    const options: AccessOption[] = [{ label: 'relationships', cost: rows * COST.scanRow, rows, dependsOnOuter: false, build: () => ({ leaf: this.relationshipsScan(src, ctx), dependsOnOuter: false }) }];
+    // With the graph's index a node's list is found once; without it each type's endpoint index is descended.
+    const readings = (rel.direction === 'both' ? 2 : 1) * rel.edges.length;
+    const open = rel.graph.indexed ? COST.graphOpen : Math.max(1, readings) * COST.probe;
+    const entry = rel.graph.indexed ? COST.graphEntry : COST.indexEntry;
+    const at = (label: string, matches: number, given: Probe[], scan: () => RelationshipsScan): void => {
+      const outer = given.some((x) => x.deps.size > 0);
+      options.push({ label, cost: open + matches * entry, rows: matches, dependsOnOuter: outer, build: () => ({ leaf: scan(), dependsOnOuter: outer, consumed: given.map((x) => x.conj) }) });
+    };
+    // The relation reads from either end: at the node a condition gives for `node`, for `other`, or between the two.
+    if (node) at('relationships node', Math.max(1, rel.perNode), [node], () => this.relationshipsScan(src, ctx, node));
+    if (other) at('relationships other', Math.max(1, rel.perOther), [other], () => this.relationshipsScan(src, ctx, undefined, other));
+    if (node && other) at('relationships node other', 1, [node, other], () => this.relationshipsScan(src, ctx, node, other));
+    return options;
+  }
+
+  /**
+   * The scan of a `relationships` source: every relationship, or those at the node given for `node` or for `other`, or
+   * those between the two.
+   */
+  private relationshipsScan(
+    src: Source,
+    ctx: FunctionContext,
+    node?: { value: BoundExpr; convert: (v: SqlValue) => SqlValue },
+    other?: { value: BoundExpr; convert: (v: SqlValue) => SqlValue },
+  ): RelationshipsScan {
+    const rel = src.rel!;
+    const regs = src.cols.map((c) => c.reg);
+    const key = (x: typeof node): RelationshipKey | undefined => (x ? { value: compileBoundExpr(x.value, ctx).fn, convert: x.convert } : undefined);
+    const nodeKey = key(node);
+    const otherKey = key(other);
+    // What the endpoint indexes are sought with: the node the scan is at, then the one at the far end, if given too.
+    const keys = [nodeKey, otherKey].filter((k): k is RelationshipKey => k !== undefined);
+    const types = rel.edges.map((e): RelationshipType => {
+      const table = e.table;
+      const accessOf = (): TableAccess => {
+        const a = new TableAccess(this.env.openTree(table.rootPage), new RecordReader(table.layout, table.recordDefaults), table.name, table.rowidAlias);
+        a.table = table;
+        return a;
+      };
+      // The table's rows as its own scans give them: start, end and rowid in registers of their own, props beside them.
+      const access = accessOf();
+      const start = this.regs.alloc();
+      const end = this.regs.alloc();
+      const rowid = this.regs.alloc();
+      const props = e.props >= 0 ? this.regs.alloc() : -1;
+      access.use(e.start, start);
+      access.use(e.end, end);
+      access.useRowid(rowid);
+      const byIndex = (a: number, b: number): Operator | null => {
+        const idx = keys.length > 0 ? endpointIndex(table, a, b) : undefined;
+        if (!idx) return null;
+        return new IndexScan(access, {
+          indexName: idx.name,
+          tree: this.env.openTree(idx.rootPage),
+          columns: idx.columns.map((c) => ({ desc: c.desc, collation: c.collation })),
+          eq: keys.map((k) => k.value),
+          convert: keys.map((k) => k.convert),
+          keyColumns: idx.columns.map((c) => c.column),
+        });
+      };
+      // By rowid, a relationship's props for the scan's own register (with the graph's index, which holds none).
+      let fetch: TableAccess | null = null;
+      if (e.props >= 0) {
+        fetch = accessOf();
+        fetch.use(e.props, regs[5]);
+      }
+      return {
+        name: e.type,
+        position: rel.graph.edges.indexOf(e),
+        whole: new TableScan(access),
+        byStart: byIndex(e.start, e.end),
+        byEnd: byIndex(e.end, e.start),
+        start,
+        end,
+        rowid,
+        props,
+        readProps: () => {
+          if (e.props >= 0) access.use(e.props, props);
+        },
+        fetch,
+      };
+    });
+    // A scan at a node reads the graph's index: the statement runs where the index is.
+    if (keys.length > 0 && rel.graph.indexed && !this.dryCompile) this.readsGraphIndex = true;
+    return new RelationshipsScan(rel.graph.name, rel.direction, types, rel.edges.length === rel.graph.edges.length, regs, rel.reads, () => rel.graph.lists(), this.env.state, nodeKey, otherKey);
+  }
 
   private graphScan(args: ConstructorParameters<typeof GraphIndexScan>): GraphIndexScan {
     if (!this.dryCompile) this.readsGraphIndex = true;
@@ -2930,6 +3157,8 @@ export function planWidth(op: PlanOp): number {
   switch (op.op) {
     case 'scan':
       return op.columns.length;
+    case 'relationships':
+      return RELATIONSHIP_TYPES.length;
     case 'source':
     case 'working':
     case 'values':
@@ -2983,11 +3212,13 @@ const JOIN_TYPES: Readonly<Record<JoinKind, JoinType>> = { inner: 'INNER', cross
 type PlanLeaf =
   | { readonly kind: 'table'; readonly name: string; readonly schema?: string; readonly alias: string; readonly indexedBy?: string | null; readonly columns?: readonly number[] }
   | { readonly kind: 'function'; readonly name: string; readonly alias: string }
+  | { readonly kind: 'relationships'; readonly op: Extract<PlanOp, { op: 'relationships' }>; readonly alias: string }
   | { readonly kind: 'nested'; readonly alias: string };
 
 function planLeaf(op: PlanOp, p: number): PlanLeaf {
   const alias = `#${p}`;
   if (op.op === 'scan') return { kind: 'table', schema: op.db, name: op.table, alias, indexedBy: op.indexedBy, columns: op.columns };
+  if (op.op === 'relationships') return { kind: 'relationships', op, alias };
   if (op.op !== 'source') return { kind: 'nested', alias };
   if (op.kind === 'function') return { kind: 'function', name: op.name, alias };
   return { kind: 'table', schema: op.schema, name: op.name, alias };
@@ -3100,6 +3331,7 @@ function supportedPlan(op: PlanOp, level: number): boolean {
 function supportedLeaf(op: PlanOp, level: number): boolean {
   switch (op.op) {
     case 'scan':
+    case 'relationships':
     case 'source':
     case 'working':
       return true;

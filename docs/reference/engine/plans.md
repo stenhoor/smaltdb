@@ -103,6 +103,7 @@ Each operation's output columns, in order:
 | `unpivot` | `input`, `keep` (columns kept), `columns` (columns that become rows), `names` (one per column), `type` (of the values) | the kept columns, then each row's column name (`text`), then its value |
 | `explode` | `input`, `column` (a list column), `type` (its `list<T>` type), `position?`, `emptyAsNull?`, `keepNulls?`, `also?` (more list columns, `{ column, type }`, zipped by position) | the input's columns, `column` and each `also` column holding their elements (`T`), then its position (`int`) with `position`. Lists zipped in a row must be as long as each other (NULL only as long as NULL), else `SMALT_RANGE` |
 | `paths` | `input`, `start` (the column with each path's first node), `edges` (`{ table, db?, start, end }`: tables and their endpoint columns), `direction` (`out` / `in` / `both`), `minHops?` (1), `maxHops?`, `mode?` (`walk`), `selector?` (`all`) | the input's columns, then the path's last node (`int`), its length in hops (`int`) and the path (`list<struct<edge int, rowid int, from int, to int>>`). See [paths](#paths) |
+| `relationships` | `graph` (a property graph), `direction` (`out` / `in` / `both`), `types?` (relationship type names), `asOf?` (as `scan`'s) | `node` (`int`), `other` (`int`), `type` (`text`), `id` (`int`), `outgoing` (`bool`), `props` (`map<text, any>`): a graph's relationships as a relation. See [relationships](#relationships) |
 | `distinct` | `input`, `collations` (one per column), `ordered?` (`'first'`), `on?`, `keep?` (`'first'` / `'last'`) | its input's |
 | `join` | `kind`, `inputs` (left, right), `on?`, `ordered?` (`true`), `asof?` (kind `asof`) | the left input's, then the right's (`semi` / `anti`: the left's only) |
 | `aggregate` | `input`, `keys`, `aggs`, `carry`, `ordered?` (`'first'`) | its keys, then one per aggregate call, then the carried columns |
@@ -229,6 +230,44 @@ import { plan } from 'smaltdb/engine';
 
 // The shortest ways from node 1 to every node it reaches along `knows`.
 const p = plan.paths(plan.values([[plan.lit(1)]]), 0, [{ table: 'knows', start: 0, end: 1 }], { selector: 'anyShortest' });
+```
+
+<a id="relationships"></a>**Relationships.** A `relationships` operation is the relationships of a
+[property graph](./schema#property-graphs) as a relation ([ADR 0040](../../adr/0040-graph-index-and-relationships.md),
+section 2.2), whatever tables its types are in. A row is a relationship at one of its ends:
+
+| Column | |
+|---|---|
+| `node` | The node the relationship is at |
+| `other` | The node at its other end |
+| `type` | Its type's name, as the graph spells it |
+| `id` | Its rowid in its type's table |
+| `outgoing` | Whether `node` is its start |
+| `props` | Its catch-all properties; NULL for a type whose table has no props column |
+
+- **`direction`**: at which end a relationship is given. `out`: once, at its start. `in`: once, at its end. `both`: at
+  each end, so twice; a relationship from a node to itself once, as outgoing.
+- **`types`**: only these relationship types (every type of the graph when left out; an empty list gives no rows). A
+  name the graph doesn't have is an error; a graph made with `caseSensitive: false` takes them in any case.
+- **A hop is a join.** A condition that gives `node`, or `other`, or both (`node = x`, in a join or a filter) reads only
+  the relationships at that node, or between the two: the relation reads from either end. A pattern of several hops
+  is a join of several `relationships`, which the planner orders by cost like any join; which relationships a pattern
+  may repeat is a condition the plan writes (`id` and `type` name a relationship).
+- **Where it reads.** At a node it reads [the graph's index](./schema#the-graph-index) in memory. Without one (a reader,
+  a graph the index can't hold) it reads each type's table through its indexes on `(start, end)` and `(end, start)`,
+  or the table itself where one is missing. The rows are the same either way.
+- **`props`** is read from the relationship's row, and only when the plan reads the column.
+- **`asOf`** reads the graph as it was after a commit, as a scan's does; the graph must keep history. A past version is
+  read from the tables' history, whole.
+- **Order:** none is promised. A plan that needs one sorts.
+
+```ts
+import { plan } from 'smaltdb/engine';
+
+// The people two KNOWS hops from person 1, either way: one join per hop.
+const first = plan.filter(plan.relationships('social', 'both', { types: ['KNOWS'] }), plan.call('cmp_eq', [plan.col(0, 0, 'int'), plan.lit(1)], 'bool'));
+const second = plan.join('inner', first, plan.relationships('social', 'both', { types: ['KNOWS'] }), plan.call('cmp_eq', [plan.col(1, 0, 'int'), plan.col(0, 1, 'int')], 'bool'));
+const friendsOfFriends = plan.project(second, [plan.col(0, 7, 'int')]);
 ```
 
 **Sort keys** (`SortKey`) are `{ expr, desc, nullsFirst, collation }`.
@@ -473,7 +512,7 @@ NULLs first). They check nothing: the engine validates every plan it is given, b
 |---|---|
 | Expressions | `col(input, index, type, collation?, depth?)`, `lit(value, type?)`, `value(v)`, `param(index, type?)`, `call(fn, args, type, collation?)`, `cast(fn, arg, to)`, `and(...)`, `or(...)`, `not(x)`, `isNull(x)`, `isNotNull(x)`, `typed(logic, 'bool' | 'int')`, `caseWhen(whens, type, otherwise?)`, `scalar(plan, type, collation?)`, `exists(plan)`, `inPlan(probe, plan, collation?)`, `listMap(list, body)`, `listFilter(list, predicate)`, `listAgg(list, aggs, body)`, `element(type, depth?)`, `elementPosition(depth?)`, `aggResult(index, type, depth?)` |
 | Sort keys, aggregates | `asc(expr, options?)`, `desc(expr, options?)`, `agg(fn, args, type, options?)` |
-| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `asofJoin(left, right, leftKey, rightKey, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `sample(input, { count } or { fraction }, options?)`, `pivot(input, keys, on, values, aggs, options?)`, `unpivot(input, keep, columns, names, type?)`, `explode(input, column, type, { position?, emptyAsNull?, keepNulls?, also? })`, `paths(input, start, edges, { direction?, minHops?, maxHops?, mode?, selector? })`, `setop(kind, left, right, width)` |
+| Queries | `scan(table, columns, options?)`, `values(rows, types?)`, `fromColumns(columns, types)`, `filter`, `project`, `sort`, `limit(input, count, offset?, options?)`, `join(kind, left, right, on?, options?)`, `asofJoin(left, right, leftKey, rightKey, options?)`, `aggregate(input, keys, aggs, options?)`, `distinct(input, width, collations?, options?)`, `sample(input, { count } or { fraction }, options?)`, `pivot(input, keys, on, values, aggs, options?)`, `unpivot(input, keep, columns, names, type?)`, `explode(input, column, type, { position?, emptyAsNull?, keepNulls?, also? })`, `paths(input, start, edges, { direction?, minHops?, maxHops?, mode?, selector?, target? })`, `relationships(graph, direction?, { types?, asOf? })`, `setop(kind, left, right, width)` |
 | Windows | `window(input, calls, options?)` (`partition`, `collations`, `order`, `frame`; the frame defaults to the partition's rows up to the current row and its peers), `windowCall(fn, args, type, options?)`, `frame(unit, start, end, exclude?)` with `unboundedPreceding`, `preceding(n)`, `currentRow`, `following(n)`, `unboundedFollowing` |
 | Sources and recursion | `source(kind, name, args, types, options?)`, `iterate(id, name, init, steps, options?)`, `working(id, types)` |
 | Writes | `append(table, input, columns, options?)`, `update(table, input, rowid, sets, options?)`, `remove(table, input, rowid, options?)` |

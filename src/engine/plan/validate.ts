@@ -22,7 +22,7 @@ import { aggregateFunctions, scalarFunctions } from '../exec/functions.js';
 import { SQL_FUNCTIONS, isEngineOperation } from '../exec/sql-functions.js';
 import { NAVIGATION, RANKING, WINDOW_ARITY } from '../exec/window.js';
 import { type ExprMeaning, type PlanExpr, typeOf } from './expr.js';
-import type { PlanOp } from './ops.js';
+import { type PlanOp, RELATIONSHIP_TYPES } from './ops.js';
 
 /** What the validator asks of the catalog. */
 export interface ValidateCatalog {
@@ -36,6 +36,11 @@ export interface ValidateCatalog {
    * it in its own words).
    */
   sourceColumns?(kind: 'function' | 'virtual' | 'external', name: string, schema: string | undefined): number | 'data' | undefined;
+  /**
+   * A property graph (`relationships` reads one): its relationship types, whether their names are case-sensitive, and
+   * whether the graph keeps history. Undefined: no such graph.
+   */
+  graph?(name: string): { readonly types: readonly string[]; readonly caseSensitive: boolean; readonly history: boolean } | undefined;
 }
 
 /** Deeper plans are refused (SQLite's expression depth limit is 1000). */
@@ -262,6 +267,33 @@ class Validator {
             if (this.catalog.tableHistory && !this.catalog.tableHistory(o.table as string, o.db as 'main' | undefined)) this.fail(`table ${String(o.table)} keeps no history`);
           });
         return cols.length;
+      }
+      case 'relationships': {
+        if (typeof o.graph !== 'string') this.fail('expected a property graph name', 'graph');
+        if (o.direction !== 'out' && o.direction !== 'in' && o.direction !== 'both') this.fail(`unknown direction ${JSON.stringify(o.direction)}`, 'direction');
+        // The catalog's answer, where it has one: a validator without graphs leaves them to the planner.
+        const g = this.catalog.graph?.(o.graph);
+        if (this.catalog.graph && !g) this.fail(`no such property graph: ${o.graph}`, 'graph');
+        if (o.types !== undefined) {
+          const names = this.list(o.types, 'types');
+          const fold = (s: string): string => (g && !g.caseSensitive ? s.toLowerCase() : s);
+          const seen = new Set<string>();
+          for (let i = 0; i < names.length; i++) {
+            const name = names[i];
+            if (typeof name !== 'string') this.fail('expected a relationship type name', 'types', i);
+            if (seen.has(fold(name as string))) this.fail(`${String(name)} is listed twice`, 'types', i);
+            seen.add(fold(name as string));
+            if (g && !g.types.some((t) => fold(t) === fold(name as string))) this.fail(`property graph ${o.graph} has no relationship type ${String(name)}`, 'types', i);
+          }
+        }
+        if (o.asOf !== undefined)
+          this.under('asOf', undefined, () => {
+            const a = o.asOf as Record<string, unknown>;
+            if (!a || typeof a !== 'object' || ('commit' in a) === ('time' in a)) this.fail('expected { commit } or { time }');
+            ex(('commit' in a ? a.commit : a.time) as PlanExpr, reading(), 'commit' in a ? 'commit' : 'time');
+            if (g && !g.history) this.fail(`property graph ${o.graph} keeps no history`);
+          });
+        return RELATIONSHIP_TYPES.length;
       }
       case 'source': {
         if (o.kind !== 'function' && o.kind !== 'virtual' && o.kind !== 'external') this.fail(`unknown source kind ${JSON.stringify(o.kind)}`, 'kind');

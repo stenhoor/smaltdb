@@ -249,6 +249,16 @@ See [ADR 0008](adr/0008-materialized-views-and-columnar-segments.md).
   when the graph isn't indexed: the same relationships in the same order, so the same rows. With a `target` it stops
   when it reaches it. Other `paths` are rewritten to `iterate`, whose steps read edge tables through the access path
   above.
-- **EXPLAIN** shows `SEARCH t USING GRAPH INDEX (start=?)`, and `SCAN smalt_paths() VIRTUAL TABLE` for a path search.
+- **Relationships.** A `relationships` operation is a source of a join region, like a table (`Source.rel` in
+  `exec/planner.ts`), with four access paths (`relationshipOptions`): every relationship; those at the node a
+  condition gives for `node`, or for `other`; those between the two nodes when conditions give both. The conditions
+  are consumed, as an index's are. Its estimates come from the types' tables (their rows, and the distinct values of
+  their endpoints), so a plan is the same whether or not the graph is indexed. `RelationshipsScan`
+  (`exec/graph-relationships.ts`) reads a node's lists by start and by end from the graph's index; without it, each
+  type's endpoint index scan in turn, which gives the same order; read whole, each type's table. It writes only the
+  columns the plan reads, and fetches a relationship's row only for `props`. With `asOf` the operation is rewritten
+  to a union of the types' tables as of then (`relationshipsAsOf`, `exec/plan-normalize.ts`).
+- **EXPLAIN** shows `SEARCH t USING GRAPH INDEX (start=?)`, `SCAN smalt_paths() VIRTUAL TABLE` for a path search, and
+  `SEARCH RELATIONSHIPS OF g (node=?)`, `(other=?)`, `(node=? AND other=?)` or `SCAN RELATIONSHIPS OF g`.
 
 See [ADR 0040](adr/0040-graph-index-and-relationships.md).

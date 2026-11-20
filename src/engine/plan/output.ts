@@ -4,7 +4,7 @@
  * statement given without column descriptions still says what each column holds.
  */
 import { typeOf } from './expr.js';
-import { PATH_TYPE, type PlanOp } from './ops.js';
+import { PATH_TYPE, type PlanOp, RELATIONSHIP_TYPES } from './ops.js';
 import type { PlanType } from './types.js';
 import { parseNested } from '../../shared/nested-types.js';
 
@@ -18,6 +18,8 @@ export function outputTypes(op: PlanOp, tableTypes: TableTypes): PlanType[] {
       const t = tableTypes(op.table, op.db);
       return op.columns.map((i) => (i < 0 ? 'int' : (t?.[i] ?? 'any')));
     }
+    case 'relationships':
+      return [...RELATIONSHIP_TYPES];
     case 'source':
     case 'working':
     case 'values':
