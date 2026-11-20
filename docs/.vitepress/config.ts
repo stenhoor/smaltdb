@@ -138,6 +138,7 @@ export default defineConfig({
           { text: '0036 User-defined functions', link: '/adr/0036-user-defined-functions' },
           { text: '0038 A map type', link: '/adr/0038-map-type' },
           { text: '0039 Typed values under any', link: '/adr/0039-typed-values-under-any' },
+          { text: '0040 A graph index and relationships', link: '/adr/0040-graph-index-and-relationships' },
         ],
       },
       {
