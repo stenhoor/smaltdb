@@ -151,6 +151,11 @@ Source: `src/engine/exec/` — `planner.ts`, `operators.ts`, `expr.ts`, `functio
   - otherwise a nested loop, with uncorrelated derived tables materialized.
 
   LEFT JOIN is supported for all three.
+- **A nested plan's unread outputs:** where a FROM item is a plan with a projection at its top, the projection computes
+  only the outputs the plan around it reads (`Project.reads`, filled in as the expressions that read them are
+  compiled, and looked at when the projection first opens). Only an output that cannot fail is left out: a column, a
+  constant, a parameter, or logic and CASE over those. A function call, a conversion or a subquery is computed whether
+  or not it is read, so no error is hidden.
 - **Predicate placement:** every conjunct is evaluated at the earliest join level where its tables are available. Filters
   on the inner side of a LEFT JOIN stay in the join condition.
 - **Aggregation:** hash aggregation; GROUP BY expressions, aggregate calls, and bare columns are mapped to registers.

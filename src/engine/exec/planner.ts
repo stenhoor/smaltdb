@@ -243,6 +243,8 @@ interface Source {
   external?: ExternalSource;
   /** An external table (not a table function): partition pruning applies. */
   externalTable?: boolean;
+  /** A nested plan whose projection leaves out what isn't read: which of `cols` this plan reads. */
+  subReads?: boolean[];
   /** A property graph's relationships (a `relationships` operation): `cols` are its six columns. */
   rel?: RelationshipSource;
 }
@@ -293,6 +295,26 @@ const probeOp = (fn: string): CompareOp | undefined => {
   const op = traitsOf(fn).compare;
   return op !== undefined && PROBE_OPS.has(op) ? op : undefined;
 };
+
+/** Whether evaluating `e` can never raise an error: a column, a constant, a parameter, or logic and CASE over those. */
+function cannotFail(e: BoundExpr): boolean {
+  switch (e.k) {
+    case 'slot':
+    case 'lit':
+    case 'param':
+      return true;
+    case 'and':
+    case 'or':
+      return e.args.every(cannotFail);
+    case 'not':
+    case 'isNull':
+      return cannotFail(e.arg);
+    case 'case':
+      return e.whens.every((w) => cannotFail(w.when) && cannotFail(w.then)) && cannotFail(e.else);
+    default:
+      return false;
+  }
+}
 
 /** True for an equality comparison of two operands (an equi-join). */
 const isEquality = (e: BoundExpr): e is Extract<BoundExpr, { k: 'call' }> => e.k === 'call' && traitsOf(e.fn).compare === '=' && !isOpaque(e);
@@ -766,6 +788,7 @@ export class Planner {
     const useOf = (f: FromCell): (() => void) => {
       const { reg, src, col } = f;
       if (src.access) return col < 0 ? () => this.dryCompile || src.access!.useRowid(reg) : () => this.dryCompile || src.access!.use(col, reg);
+      if (src.subReads) return () => this.dryCompile || (src.subReads![col] = true);
       if (src.rel) return () => this.dryCompile || (src.rel!.reads[col] = true);
       return () => this.dryCompile || src.external?.projection?.add(src.cols[col].name.toLowerCase());
     };
@@ -1069,7 +1092,8 @@ export class Planner {
 
     // Result expressions, then ORDER BY expressions that are not results, then HAVING (planCore's order).
     const n = s.width;
-    const compiled = s.project.slice(0, n).map((e) => compile(bind(e, readSlot)));
+    const boundOut = s.project.slice(0, n).map((e) => bind(e, readSlot));
+    const compiled = boundOut.map(compile);
     const regs = outRegs ?? compiled.map(() => this.regs.alloc());
     const columns: ResultColumnInfo[] =
       given ?? compiled.map((c) => ({ name: '', type: c.type, collation: c.collSrc !== CollSrc.None ? c.collation : Collation.Binary, affinity: c.affinity }));
@@ -1127,7 +1151,10 @@ export class Planner {
         : scope.sources.flatMap((src) => [...src.cols.map((c) => c.reg), ...(src.rowidReg >= 0 ? [src.rowidReg] : [])]);
       root = new Window(root, [...new Set(snap)], windowDefs);
     }
-    root = new Project(root, [...compiled.map((c) => c.fn), ...extraFns], [...regs, ...extraRegs]);
+    const projection = new Project(root, [...compiled.map((c) => c.fn), ...extraFns], [...regs, ...extraRegs]);
+    // Which outputs need not be computed when nothing reads them (`addPlannedSource` says what is read).
+    projection.canSkip = [...boundOut.map(cannotFail), ...extraFns.map(() => false)];
+    root = projection;
     if (s.distinct) root = new Distinct(root, regs, s.distinct.map(collationId));
     if (sortNeeded) {
       const hint = s.limit ? topN(...limitFns()) : undefined;
@@ -1601,7 +1628,12 @@ export class Planner {
   private addPlannedSource(sub: QueryPlan, joinType: JoinType, scope: Scope, name: string, working: boolean): void {
     if (sub.correlated && !working) scope.correlated = true;
     const cols: SourceColumn[] = sub.columns.map((c, i) => ({ name: c.name, reg: sub.outRegs[i], type: c.type, collation: c.collation, affinity: c.affinity, declType: c.declType ?? '', index: i }));
-    scope.sources.push({ name, cols, rowidReg: -1, sub, joinType, position: scope.sources.length, ...(working ? { working: true } : {}) });
+    // A projection at the top of the nested plan computes only the columns this plan reads, where leaving one out
+    // can't hide an error (`Project.reads`): recorded as the expressions that read them are compiled.
+    const root = sub.root;
+    const reads = !working && root instanceof Project && root.canSkip !== null && sub.outRegs.every((r, i) => root.outRegs[i] === r) ? sub.outRegs.map(() => false) : undefined;
+    if (reads) (root as Project).reads = reads;
+    scope.sources.push({ name, cols, rowidReg: -1, sub, joinType, position: scope.sources.length, ...(working ? { working: true } : {}), ...(reads ? { subReads: reads } : {}) });
   }
 
   private sourceRegs(src: Source): number[] {
