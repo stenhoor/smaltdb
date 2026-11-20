@@ -1,7 +1,9 @@
 # ADR 0040: A graph index in memory, and relationships as a relation
 
-- **Status:** proposed, for the owner's review. Nothing here is built. The numbers come from a spike that was measured
-  and thrown away (2026-11-20).
+- **Status:** merged by the owner in [#276](https://github.com/stenhoor/smaltdb/pull/276) (2026-11-20), which this
+  record takes as its acceptance. The questions at the end got no separate answer, so each step follows the record's
+  own proposal and says so in its pull request. Step 2a is built (section 5). The numbers in the Context come from a
+  spike that was measured and thrown away (2026-11-20).
 - **Date:** 2026-11-20
 - **Builds on:** [ADR 0033](0033-property-graphs-and-history.md): its decision 7 ("An adjacency index only if benchmarks
   ask for one") and section 4 ("patterns become joins"), and G6 of the
@@ -199,7 +201,8 @@ it meets its gate.
 
 If 2b's hop to a labelled node is over the bar, the index also holds each node's labels, measured then.
 
-**Built since, on branches, not merged** (2026-11-20; the same benchmarks):
+**Built since** (2026-11-20; the same benchmarks; the commits named are the branches as they were measured, before
+they were rebased onto `main`):
 
 | | Before, then with 2a: `claude/graph-index` (`8904484`) | With 2c too: `claude/graph-paths` (`95189f6`), smaltcy `claude/shortest-path-target` (`e0dffcb`) |
 |---|---|---|
@@ -220,7 +223,7 @@ If 2b's hop to a labelled node is over the bar, the index also holds each node's
   fixed cost, not the search: of smaltdb's 32.0 µs for the directed search with no path, the prepared statement is
   9.4 µs, turning the Cypher into its plan is 13.2 µs (smaltcy's engine does that too), and finding the kept statement
   by its shape is the rest. The seek by name is the same case (1.04x). That cost is smaltcy's to cut, in its own step.
-- Their pull requests wait for this record.
+- Their pull requests come in the steps' order of building: 2a, then 2c on it, then 2b.
 
 Later, each only with its own measurement: the index shared with reader workers, an undo log for rollbacks, the index
 kept in pager pages so opening a large graph doesn't wait for a build, and whether a graph's edge tables still need
