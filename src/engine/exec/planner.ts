@@ -1306,7 +1306,7 @@ export class Planner {
       def,
       args: args.map((x) => x.fn),
       argTypes: args.map((x) => x.type),
-      distinct: a.distinct,
+      distinct: a.distinct && !def.ignoresDistinct,
       filter: filterExpr ? compileBoundExpr(filterExpr, this.env.funcCtx).fn : undefined,
       outReg: this.regs.alloc(),
       collation: args[0]?.collSrc ? args[0].collation : Collation.Binary,
