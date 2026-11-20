@@ -231,11 +231,18 @@ they were rebased onto `main`):
   0.64x. With [#278](https://github.com/stenhoor/smaltdb/pull/278) too (a nested plan's projection leaves out what
   nothing reads) the same text gives 1 hop 0.79x, 2 hops 0.35x, 3 hops 0.30x. Still over:
   - **2 hops to a label** (2.26x; 1.30x and 1.12x): each far node's label is a probe of the label index's B+tree,
-    about a microsecond for each of 1,505 nodes. The provision above applies: the index also holds each node's labels.
-    Not built yet.
+    about a microsecond for each of 1,505 nodes. The provision above applies: the index also holds each node's labels
+    (next bullet).
   - **2 hops filtered on a relationship's property** (2.86x; 1.38x and 1.36x): each relationship's row is fetched for
     one property. That is step 5's subject.
-- Their pull requests come in the steps' order of building: 2a (#279), then 2c on it (#280), then 2b (#281).
+- **The index holds labels too** (the provision above, built after 2b): a set of nodes per label, from the graph's
+  label index table, kept by that table's writer and dropped with the lists. A plan that asks whether one node has
+  one label is answered from it. With it, on 2b: 2 hops to a label 2.26x to 0.47x (0.369 ms against 0.740), with a
+  literal and a parameter 0.44x and 0.50x. The planner also now scans a label's nodes from the node table and checks
+  the label for each in memory, where it read the label's entries and fetched each node's row: label scan and filter
+  2.18x to 1.02x (4.48 to 2.11 ms), group by city 2.69x to 1.65x (53.7 to 37.4 ms). The other queries did not move.
+- Their pull requests come in the steps' order of building: 2a (#279), then 2c on it (#280), then 2b (#281), then
+  the labels.
 
 Later, each only with its own measurement: the index shared with reader workers, an undo log for rollbacks, the index
 kept in pager pages so opening a large graph doesn't wait for a build, and whether a graph's edge tables still need

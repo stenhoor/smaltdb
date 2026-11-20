@@ -15,10 +15,11 @@ import { type IndexEval, type IndexSchema, type TableSchema, isColumnar, storage
 import { type BTree, BTreeCursor } from '../storage/btree.js';
 import { KEY_AFTER_NULL, decodeKey, rowidSuffixStart } from '../storage/key-codec.js';
 import { RecordReader, isInt64Storage } from '../storage/record.js';
-import { endpointIndex } from './graph-index.js';
+import { endpointIndex, labelKeyIndex } from './graph-index.js';
+import type { GraphLabels } from './graph-labels.js';
 import { PATHS_FUNCTION } from './plan-normalize.js';
 import type { GraphLists } from './graph-lists.js';
-import { GraphIndexScan } from './graph-scan.js';
+import { GraphIndexScan, GraphLabelScan } from './graph-scan.js';
 import { type RelationshipKey, type RelationshipLists, type RelationshipType, RelationshipsScan } from './graph-relationships.js';
 import { relationshipEdges } from './plan-normalize.js';
 import { Collation, type SqlValue, normalizeInt } from '../values.js';
@@ -143,6 +144,11 @@ export interface PhysicalEnv {
    * graph isn't indexed then). `indexed`: the graph can have an index here, so a statement that reads it runs here.
    */
   graph?(name: string): PlannedGraph | undefined;
+  /**
+   * The label index table of a property graph that has an index in memory (ADR 0040): its node and label columns, and
+   * the graph's label sets, asked when a scan opens (null when the graph isn't indexed then).
+   */
+  graphLabels?(table: TableSchema): { node: number; label: number; labels(): GraphLabels | null } | undefined;
   /** M8: an external table by name (its columns from the catalog; its rows once loaded). */
   externalTable?(name: string): ExternalScan | undefined;
   /** M8: a table function over external data (`read_csv`, `read_json`) called with constant arguments; undefined for other functions. */
@@ -2057,6 +2063,27 @@ export class Planner {
         }));
         if (orderBy) options[options.length - 1].orderBy = orderBy;
       }
+      // A graph's label index, asked whether one node has one label, through its unique index on both: the answer is
+      // in the graph's index in memory (ADR 0040). Its scan is this index's when the graph isn't indexed.
+      const lab = k === 2 && unique && !lo && !hi ? this.env.graphLabels?.(table) : undefined;
+      if (lab && idx === labelKeyIndex(table, lab.node, lab.label)) {
+        const nodeAt = idx.columns[0].column === lab.node ? 0 : 1;
+        consider(`index ${idx.name} graph`, COST.graphOpen, 1, deps, () => ({
+          leaf: this.graphLabelScan([
+            access,
+            indexScan(),
+            () => lab.labels(),
+            this.env.state,
+            { value: compileBoundExpr(eqs[nodeAt].other, ctx).fn, convert: converters[nodeAt] },
+            { value: compileBoundExpr(eqs[1 - nodeAt].other, ctx).fn, convert: converters[1 - nodeAt] },
+            lab.node,
+            lab.label,
+            idx.columns.map((c) => table.columns[c.column].name),
+          ]),
+          dependsOnOuter: deps,
+          consumed,
+        }));
+      }
     }
     // INDEXED BY / NOT INDEXED, as in SQLite.
     if (src.indexedBy === null) return options.filter((o) => !o.label.startsWith('index '));
@@ -2364,6 +2391,11 @@ export class Planner {
     // A scan at a node reads the graph's index: the statement runs where the index is.
     if (keys.length > 0 && rel.graph.indexed && !this.dryCompile) this.readsGraphIndex = true;
     return new RelationshipsScan(rel.graph.name, rel.direction, types, rel.edges.length === rel.graph.edges.length, regs, rel.reads, () => rel.graph.lists(), this.env.state, nodeKey, otherKey);
+  }
+
+  private graphLabelScan(args: ConstructorParameters<typeof GraphLabelScan>): GraphLabelScan {
+    if (!this.dryCompile) this.readsGraphIndex = true;
+    return new GraphLabelScan(...args);
   }
 
   private graphScan(args: ConstructorParameters<typeof GraphIndexScan>): GraphIndexScan {

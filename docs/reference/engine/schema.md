@@ -125,6 +125,11 @@ relation, reads a node's relationships of every type from it (`SEARCH RELATIONSH
 
 - **What it needs:** an edge table with indexes on `(start, end)` and `(end, start)`, as the tables `addType` makes
   have. A table without them is read by a scan, or by whatever index it has.
+- **Labels too:** the index also holds the graph's [label index](#nodes-with-several-labels), which nodes have which labels,
+  where that table has a unique index on its node and label (the one `addLabelIndex` makes has). A plan that asks
+  whether one node has one label (`node = x AND label = 'L'`) is answered from it: `EXPLAIN` shows
+  `SEARCH <table> USING GRAPH INDEX (label=? AND node=?)`. A plan that reads the entry's rowid or another column reads
+  the table.
 - **Built on first use** from the endpoint indexes, and kept as rows are written, by any language. It is never written
   to the file, so opening a database costs nothing, and the first statement that reads a graph builds its index.
 - **Dropped and built again** when a rollback undid a change to it (of a statement, a savepoint or a transaction), or

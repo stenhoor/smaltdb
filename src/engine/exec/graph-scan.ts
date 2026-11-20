@@ -12,6 +12,7 @@ import type { BTreeCursor } from '../storage/btree.js';
 import { ROWID_KEY_SIZE, writeRowidKey } from '../storage/key-codec.js';
 import type { SqlValue } from '../values.js';
 import type { Fn } from './expr.js';
+import type { GraphLabels } from './graph-labels.js';
 import { type GraphLists, ListCursor } from './graph-lists.js';
 import type { ExecState, IndexScan, Operator, TableAccess } from './operators.js';
 
@@ -128,5 +129,90 @@ export class GraphIndexScan implements Operator {
     this.fallback.close();
     this.tab?.close();
     this.tab = null;
+  }
+}
+
+/**
+ * A graph's label index asked whether one node has one label (ADR 0040, section 5): the row its unique index on node
+ * and label gives, or none, from the graph's label sets in memory, without descending a B+tree.
+ *
+ * It answers from memory only when the plan reads nothing of the row but its node and label, which the conditions
+ * give: its rowid and any other column are in the table. Otherwise, and when the graph isn't indexed (asked once per
+ * execution), it is the unique index's own scan.
+ */
+export class GraphLabelScan implements Operator {
+  readonly children: Operator[] = [];
+  private r!: SqlValue[];
+  private labels: GraphLabels | null = null;
+  private epoch = -1;
+  /** Decided when the scan first opens (planning may add columns until then). */
+  private covered: boolean | undefined;
+  private nodeReg = -1;
+  private labelReg = -1;
+  private node = -1;
+  private label = '';
+  private found = false;
+
+  constructor(
+    readonly access: TableAccess,
+    /** The unique index's scan with the same probe: what runs when the sets can't answer. */
+    readonly fallback: IndexScan,
+    /** The graph's label sets, or null when it isn't indexed. Asked once per execution. */
+    readonly source: () => GraphLabels | null,
+    readonly state: ExecState,
+    readonly nodeKey: { readonly value: Fn; readonly convert: (v: SqlValue) => SqlValue },
+    readonly labelKey: { readonly value: Fn; readonly convert: (v: SqlValue) => SqlValue },
+    readonly nodeCol: number,
+    readonly labelCol: number,
+    /** The index's columns, in its order, for EXPLAIN. */
+    readonly names: readonly string[],
+  ) {}
+
+  get detail(): string {
+    return `SEARCH ${this.access.tableName} USING GRAPH INDEX (${this.names.map((n) => `${n}=?`).join(' AND ')})`;
+  }
+
+  open(r: SqlValue[]): void {
+    this.r = r;
+    if (this.covered === undefined) {
+      const a = this.access;
+      this.covered = a.rowidReg < 0;
+      for (let i = 0; i < a.decode.length; i += 2) {
+        if (a.decode[i] === this.nodeCol) this.nodeReg = a.decode[i + 1]!;
+        else if (a.decode[i] === this.labelCol) this.labelReg = a.decode[i + 1]!;
+        else this.covered = false;
+      }
+    }
+    if (this.covered && this.epoch !== this.state.epoch) {
+      this.epoch = this.state.epoch;
+      this.labels = this.source();
+    }
+    const labels = this.covered ? this.labels : null;
+    if (labels === null) {
+      this.fallback.open(r);
+      return;
+    }
+    let node = this.nodeKey.convert(this.nodeKey.value(r));
+    if (typeof node === 'bigint' && node >= 0n && node <= 2147483647n) node = Number(node);
+    const label = this.labelKey.convert(this.labelKey.value(r));
+    // A node that is no id the index holds, or a label that is not text, is in no entry.
+    this.found = typeof node === 'number' && node >= 0 && node <= 2147483647 && Number.isInteger(node) && typeof label === 'string' && labels.has(label, node);
+    if (this.found) {
+      this.node = node as number;
+      this.label = label as string;
+    }
+  }
+
+  next(): boolean {
+    if (!this.covered || this.labels === null) return this.fallback.next();
+    if (!this.found) return false;
+    this.found = false;
+    if (this.nodeReg >= 0) this.r[this.nodeReg] = this.node;
+    if (this.labelReg >= 0) this.r[this.labelReg] = this.label;
+    return true;
+  }
+
+  close(): void {
+    this.fallback.close();
   }
 }
