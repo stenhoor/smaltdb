@@ -243,6 +243,12 @@ See [ADR 0008](adr/0008-materialized-views-and-columnar-segments.md).
 - **Tests.** With `SMALT_GRAPH_INDEX_CHECK=1` (set for every test, `test/setup-sql.ts`) the engine compares each index
   with its tables after every statement that writes, and runs every query that read one again without it: the rows
   must be the same, in order.
-- **EXPLAIN** shows `SEARCH t USING GRAPH INDEX (start=?)`.
+- **Path searches.** A `paths` operation that keeps one path per node over a property graph's edge tables is rewritten
+  to a lateral call of the table function `smalt_paths` (`exec/plan-normalize.ts`), a breadth-first search
+  (`exec/graph-paths.ts`) that reads each node's relationships from the graph's index, or from the endpoint indexes
+  when the graph isn't indexed: the same relationships in the same order, so the same rows. With a `target` it stops
+  when it reaches it. Other `paths` are rewritten to `iterate`, whose steps read edge tables through the access path
+  above.
+- **EXPLAIN** shows `SEARCH t USING GRAPH INDEX (start=?)`, and `SCAN smalt_paths() VIRTUAL TABLE` for a path search.
 
 See [ADR 0040](adr/0040-graph-index-and-relationships.md).

@@ -459,6 +459,7 @@ class Validator {
       case 'paths': {
         const w = sub(o.input, 'input');
         if (!Number.isInteger(o.start) || o.start < 0 || o.start >= w) this.fail(`no column ${String(o.start)}`, 'start');
+        if (o.target !== undefined && (!Number.isInteger(o.target) || o.target < 0 || o.target >= w)) this.fail(`no column ${String(o.target)}`, 'target');
         const edges = this.list(o.edges, 'edges');
         if (edges.length === 0) this.fail('expected at least one edge table', 'edges');
         for (let i = 0; i < edges.length; i++)

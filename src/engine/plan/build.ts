@@ -182,7 +182,14 @@ export const paths = (
   input: PlanOp,
   start: number,
   edges: readonly PathEdges[],
-  options: { direction?: 'out' | 'in' | 'both'; minHops?: number; maxHops?: number; mode?: 'walk' | 'trail' | 'acyclic' | 'simple'; selector?: 'all' | 'any' | 'anyShortest' | 'allShortest' | { shortest: number } } = {},
+  options: {
+    direction?: 'out' | 'in' | 'both';
+    minHops?: number;
+    maxHops?: number;
+    mode?: 'walk' | 'trail' | 'acyclic' | 'simple';
+    selector?: 'all' | 'any' | 'anyShortest' | 'allShortest' | { shortest: number };
+    target?: number;
+  } = {},
 ): Op<'paths'> => ({
   op: 'paths',
   input,
@@ -193,6 +200,7 @@ export const paths = (
   ...(options.maxHops !== undefined ? { maxHops: options.maxHops } : {}),
   ...(options.mode !== undefined ? { mode: options.mode } : {}),
   ...(options.selector !== undefined ? { selector: options.selector } : {}),
+  ...(options.target !== undefined ? { target: options.target } : {}),
 });
 export const unpivot = (input: PlanOp, keep: readonly number[], columns: readonly number[], names: readonly string[], type: PlanType = 'any'): Op<'unpivot'> => ({ op: 'unpivot', input, keep, columns, names, type });
 /** Distinct rows of an input with `width` columns. */

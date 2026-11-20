@@ -14,17 +14,18 @@ import {
 } from './catalog/schema.js';
 import { MisuseError, SmaltError, constraintMessage, withDetails, wordError } from './errors.js';
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
-import type { ConflictAction, PlanOp } from './plan/ops.js';
+import { type ConflictAction, PATH_TYPE, type PlanOp } from './plan/ops.js';
 import { type EncodedPlan, canonicalJSON, decodeData, decodePlan, encodeData, encodePlan, plainJSON, planFromJSON, planToJSON } from './plan/codec.js';
 import { type PlanStatementInput, paramCount, toBoundStatement, toPlanStatement } from './plan/statement.js';
-import { type NormalizeCatalog, type TableTypes, normalizePlan, normalizeWrite } from './exec/plan-normalize.js';
+import { type NormalizeCatalog, PATHS_FUNCTION, type TableTypes, normalizePlan, normalizeWrite } from './exec/plan-normalize.js';
 import { type ValidateCatalog, validatePlan, validateSchemaOp } from './plan/validate.js';
 import { type PlanExpr, forEachCol, typeOf } from './plan/expr.js';
 import type { CollationName } from './plan/types.js';
 import { type Compiled, type Fn, collationName } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, TableAccess, explainAnalyze, explainRows } from './exec/operators.js';
-import { GraphIndexes } from './exec/graph-index.js';
+import { GraphIndexes, endpointIndex } from './exec/graph-index.js';
+import { searchPaths } from './exec/graph-paths.js';
 import { type ExternalScan, type PhysicalEnv, Planner, type QueryPlan, Registers, type ResultColumnInfo } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
 import { COMPACT_ROWS, ColumnarTableWriter, deletedBitmap, loadDeleted } from './exec/columnar-table.js';
@@ -1134,6 +1135,7 @@ export class Database implements FunctionContext {
     }
     // As in SQLite, a schema qualifier on a pragma function (main.pragma_table_info) changes nothing.
     const lower = name.toLowerCase().replace(/^(main|temp)\./, '');
+    if (schema === undefined && lower === PATHS_FUNCTION) return this.pathsFunction;
     if (schema === undefined && lower === 'list_elements') return LIST_ELEMENTS;
     if (schema === undefined && lower === 'range') return RANGE;
     if (!lower.startsWith('pragma_')) return undefined;
@@ -1541,7 +1543,66 @@ export class Database implements FunctionContext {
 
   /** A table's column types as plans read them (rewrites that read the catalog: `asOf`). */
   private readonly tableTypes: TableTypes = (t, db) => this.getTable(t, db)?.columns.map((c) => (c.rowidAlias ? 'int' : planTypeOfStorage(c.type, c.declaredType)));
-  private readonly normalizeCatalog: NormalizeCatalog = { types: this.tableTypes, history: (t, db) => this.getTable(t, db)?.history };
+  private readonly normalizeCatalog: NormalizeCatalog = {
+    types: this.tableTypes,
+    history: (t, db) => this.getTable(t, db)?.history,
+    searchable: (name, db, a, b) => {
+      const t = db === 'temp' ? undefined : this.tables.get(name.toLowerCase());
+      if (!t || t.temp || t.columnar || !endpointIndex(t, a, b) || !endpointIndex(t, b, a)) return false;
+      // An edge table of a property graph, by its two endpoints: the graph's rules keep them node ids.
+      for (const g of this.graphs.values()) {
+        for (const e of g.graph.edges) {
+          if (e.table.toLowerCase() !== name.toLowerCase()) continue;
+          const ends = [findColumn(t, e.start), findColumn(t, e.end)];
+          if (ends.includes(a) && ends.includes(b) && a !== b) return true;
+        }
+      }
+      return false;
+    },
+  };
+
+  /** The searches `smalt_paths` has run, by what they walk (its third argument), for the current schema. */
+  private pathSearches = new Map<string, { version: number; ways: { edge: number; table: TableSchema; from: number; tree: BTree }[]; minHops: number; maxHops: number | undefined; target: boolean }>();
+
+  /**
+   * `smalt_paths(start, target, what)`: the rows of a path search (exec/graph-paths.ts), which the rewrite of a `paths`
+   * operation calls for each of its input rows (exec/plan-normalize.ts). `what` is the rewrite's own description of the
+   * edge tables and bounds; the function is not for plans to call.
+   */
+  private readonly pathsFunction = {
+    columns: [
+      { name: 'end', type: 'int' as StaticType },
+      { name: 'hops', type: 'int' as StaticType },
+      { name: 'path', type: PATH_TYPE as StaticType },
+    ],
+    rows: (args: SqlValue[]): Iterable<SqlValue[]> => {
+      const what = String(args[2]);
+      let s = this.pathSearches.get(what);
+      if (!s || s.version !== this.schemaVersion) {
+        const w = JSON.parse(what) as { edges: { table: string; start: number; end: number }[]; direction: 'out' | 'in' | 'both'; minHops: number; maxHops?: number; target: boolean };
+        const ways: { edge: number; table: TableSchema; from: number; tree: BTree }[] = [];
+        w.edges.forEach((e, edge) => {
+          const table = this.tables.get(e.table.toLowerCase());
+          const pairs: [number, number][] = w.direction === 'out' ? [[e.start, e.end]] : w.direction === 'in' ? [[e.end, e.start]] : [[e.start, e.end], [e.end, e.start]];
+          for (const [from, to] of pairs) {
+            const idx = table && endpointIndex(table, from, to);
+            if (!table || !idx) throw new SmaltError('SMALT_ERROR', `${PATHS_FUNCTION}: ${e.table} has no index on its endpoints`);
+            ways.push({ edge, table, from, tree: this.tree(idx.rootPage) });
+          }
+        });
+        if (this.pathSearches.size >= 256) this.pathSearches.clear();
+        this.pathSearches.set(what, (s = { version: this.schemaVersion, ways, minHops: w.minHops, maxHops: w.maxHops, target: w.target }));
+      }
+      // The graph's index, where it has one now; a table outside it is read from its endpoint index.
+      const ix = this.graphIndexes;
+      const ways = s.ways.map((way) => {
+        const role = ix.rolesOf(way.table)?.[0];
+        const g = role ? ix.open(role.graph) : null;
+        return { edge: way.edge, tree: way.tree, lists: g === null || !role ? null : way.from === role.start ? g.out : g.in, type: role?.type ?? 0 };
+      });
+      return searchPaths({ ways, minHops: s.minHops, maxHops: s.maxHops, target: s.target }, args[0] ?? null, args[1] ?? null);
+    },
+  };
 
   /** FunctionContext: a history table's horizon now (`history_horizon`). */
   historyHorizon(table: string): number {

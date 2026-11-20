@@ -21,11 +21,19 @@ type Op<K extends PlanOp['op']> = Extract<PlanOp, { op: K }>;
 /** A table's column types (`db` main or temp), or undefined when there is no such table. */
 export type TableTypes = (table: string, db?: 'main' | 'temp') => readonly PlanType[] | undefined;
 
-/** What rewrites that read tables (`asOf`) need of the catalog: column types, and how a table keeps history. */
+/** What rewrites that read tables (`asOf`, `paths`) need of the catalog: column types, and how a table keeps history. */
 export interface NormalizeCatalog {
   readonly types: TableTypes;
   readonly history: (table: string, db?: 'main' | 'temp') => 'versions' | 'log' | undefined;
+  /**
+   * Whether a path search can walk the table itself (exec/graph-paths.ts): an edge table of a property graph whose
+   * endpoints are these two columns, with an index on each pair of them.
+   */
+  readonly searchable?: (table: string, db: 'main' | 'temp' | undefined, a: number, b: number) => boolean;
 }
+
+/** The table function a path search is (exec/graph-paths.ts): its arguments are the start, the target and what to walk. */
+export const PATHS_FUNCTION = 'smalt_paths';
 
 /** The catalog, while a plan is normalized. */
 let catalog: NormalizeCatalog | undefined;
@@ -479,6 +487,21 @@ function pathRows(op: Op<'paths'>): PlanOp {
   const selector = op.selector ?? 'all';
   const keyed = mode === 'walk' && (selector === 'any' || selector === 'anyShortest');
   const PATH = PATH_TYPE as PlanType;
+  // One path per node over a property graph's edge tables: a breadth-first search that reads the graph's index, or
+  // the endpoint indexes, itself (ADR 0040, 2.3), giving the rows this rewrite gives, in its order.
+  const search = catalog?.searchable;
+  if (keyed && minHops <= 1 && search && op.edges.every((e) => search(e.table, e.db, e.start, e.end))) {
+    const what = JSON.stringify({ edges: op.edges.map((e) => ({ table: e.table, start: e.start, end: e.end })), direction: op.direction, minHops, ...(op.maxHops !== undefined ? { maxHops: op.maxHops } : {}), target: op.target !== undefined });
+    const found: PlanOp = {
+      op: 'source',
+      kind: 'function',
+      name: PATHS_FUNCTION,
+      args: [typedColumn(op.start, 'int'), op.target !== undefined ? typedColumn(op.target, 'int') : { k: 'lit', value: null, type: 'int' }, { k: 'lit', value: what, type: 'text' }],
+      types: ['int', 'int', PATH],
+    };
+    const exprs = [...range(0, w), typedColumn(w, 'int'), typedColumn(w + 1, 'int'), typedColumn(w + 2, PATH)];
+    return { op: 'project', input: { op: 'join', kind: 'inner', inputs: [op.input, found], ordered: true }, exprs, ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+  }
   const INTS = 'list<int>' as PlanType;
   const int = (value: number): PlanExpr => ({ k: 'lit', value, type: 'int' });
   const fn = (name: string, args: PlanExpr[], type: PlanType): PlanExpr => ({ k: 'call', fn: name, args, type });
@@ -577,7 +600,9 @@ function pathRows(op: Op<'paths'>): PlanOp {
   const sorted: PlanOp = { op: 'sort', input: found, keys: [N, H].map((c) => ({ expr: at(0, c, 'int'), desc: false, nullsFirst: false, collation: 'binary' as const })) };
   const joined: PlanOp = { op: 'join', kind: 'inner', inputs: [numberedInput, sorted], on: cmp('cmp_eq', at(0, w, 'int'), at(1, N, 'int')), ordered: true };
   const out = w + 1;
-  return { op: 'project', input: joined, exprs: [...range(0, w), at(0, out + E, 'int'), at(0, out + H, 'int'), at(0, out + P, PATH)], ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+  const rows: PlanOp = { op: 'project', input: joined, exprs: [...range(0, w), at(0, out + E, 'int'), at(0, out + H, 'int'), at(0, out + P, PATH)], ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+  // Only the paths that end at the target.
+  return op.target === undefined ? rows : { op: 'filter', input: rows, pred: cmp('cmp_eq', at(0, w, 'int'), at(0, op.target, 'int')) };
 }
 
 /**

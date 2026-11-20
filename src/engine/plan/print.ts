@@ -96,7 +96,7 @@ export function printPlan(op: PlanOp, depth = 0): string {
     case 'paths': {
       const sel = op.selector ?? 'all';
       const hops = `${op.minHops ?? 1}..${op.maxHops ?? ''}`;
-      return `${pad}paths from ${op.start} ${op.direction} over [${op.edges.map((e) => `${e.table}(${e.start} -> ${e.end})`).join(', ')}] hops ${hops} ${op.mode ?? 'walk'} ${typeof sel === 'object' ? `shortest ${sel.shortest}` : sel}\n${sub(op.input)}`;
+      return `${pad}paths from ${op.start} ${op.direction} over [${op.edges.map((e) => `${e.table}(${e.start} -> ${e.end})`).join(', ')}] hops ${hops} ${op.mode ?? 'walk'} ${typeof sel === 'object' ? `shortest ${sel.shortest}` : sel}${op.target !== undefined ? ` to ${op.target}` : ''}\n${sub(op.input)}`;
     }
     case 'unpivot':
       return `${pad}unpivot keep [${op.keep.join(', ')}] columns [${op.columns.map((c, i) => `${c} as ${JSON.stringify(op.names[i])}`).join(', ')}]\n${sub(op.input)}`;

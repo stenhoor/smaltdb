@@ -119,7 +119,8 @@ The engine keeps each property graph's relationships in memory, by node: a graph
 ([ADR 0040](../../adr/0040-graph-index-and-relationships.md)). Where a plan reads an edge table by its start or its end
 (`start = x`), the planner can answer from it instead of descending the endpoint index, and gives the same rows in the
 same order. `EXPLAIN` shows it as `SEARCH <table> USING GRAPH INDEX (start=?)`. Nothing in a plan names it: joins,
-[`paths`](./plans#paths) and the rules above use it where they would use the endpoint index.
+[`paths`](./plans#paths) and the rules above use it where they would use the endpoint index, and a `paths` that keeps
+one path per node searches it directly.
 
 - **What it needs:** an edge table with indexes on `(start, end)` and `(end, start)`, as the tables `addType` makes
   have. A table without them is read by a scan, or by whatever index it has.

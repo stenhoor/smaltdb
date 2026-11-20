@@ -211,8 +211,16 @@ its empty path. Rows keep the input's order, and each input row's paths come sho
   as much as reaching every node once. They find a shortest path between two different nodes in any mode, because
   such a path repeats nothing: use `walk` for them. Other combinations enumerate paths, which can grow exponentially
   with `maxHops` on a dense graph; `trail`, `acyclic` and `simple` stop when a path can't grow.
+- **`target`** names an input column: only the paths that end at the node in it (none for a NULL). A search for one
+  path per node stops when it reaches that node.
 - **Indexes:** each step looks up the relationships from a path's last node, so give each edge table an index on its
   `start` column (`out`), its `end` column (`in`), or both.
+- **Over a property graph:** one path per node (`walk` with `any` or `anyShortest`, `minHops` 0 or 1) over
+  [edge tables of a property graph](./schema#the-graph-index) with indexes on both pairs of endpoints is a breadth-first
+  search the engine runs itself, over the graph's index in memory, or over the endpoint indexes when the graph isn't
+  indexed. It takes nodes in the order it found them and reads each one's relationships table by table, outgoing first,
+  by other node and rowid. Which of two paths as short it keeps is not part of `paths`' meaning, and can differ from
+  what the same operation gives over tables outside a graph.
 
 The engine rewrites it into an `iterate` (`EXPLAIN` shows that plan).
 

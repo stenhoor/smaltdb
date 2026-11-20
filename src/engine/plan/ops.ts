@@ -269,6 +269,9 @@ export type PlanOp = OpMeaning & (
    * except that the last may be the first. `selector` picks among each input row's paths to each last node: `all`,
    * `any` (one), `anyShortest` (one of the shortest), `allShortest`, or `{ shortest: k }` (the k shortest). A walk
    * with no `maxHops` needs `any` or `anyShortest`, which keep one path per node; everything else has an end.
+   *
+   * `target` (ADR 0040) names an input column: only paths that end at the node in it. A search for one path per node
+   * then stops when it reaches that node.
    */
   | {
       readonly op: 'paths';
@@ -280,6 +283,7 @@ export type PlanOp = OpMeaning & (
       readonly maxHops?: number;
       readonly mode?: 'walk' | 'trail' | 'acyclic' | 'simple';
       readonly selector?: 'all' | 'any' | 'anyShortest' | 'allShortest' | { readonly shortest: number };
+      readonly target?: number;
     }
   | {
       readonly op: 'unpivot';

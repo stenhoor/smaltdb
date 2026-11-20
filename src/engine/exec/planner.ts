@@ -16,6 +16,7 @@ import { type BTree, BTreeCursor } from '../storage/btree.js';
 import { KEY_AFTER_NULL, decodeKey, rowidSuffixStart } from '../storage/key-codec.js';
 import { RecordReader, isInt64Storage } from '../storage/record.js';
 import { endpointIndex } from './graph-index.js';
+import { PATHS_FUNCTION } from './plan-normalize.js';
 import type { GraphLists } from './graph-lists.js';
 import { GraphIndexScan } from './graph-scan.js';
 import { Collation, type SqlValue, normalizeInt } from '../values.js';
@@ -1491,6 +1492,8 @@ export class Planner {
         if (isInfoSchema) throw new SmaltError('SMALT_ERROR', `no such table: information_schema.${item.name}`);
         throw new SmaltError('SMALT_ERROR', `no such table-valued function: ${item.name}`);
       }
+      // A path search reads the graph's index (ADR 0040): the statement runs where the index is.
+      if (item.kind === 'function' && item.name.toLowerCase() === PATHS_FUNCTION && !this.dryCompile) this.readsGraphIndex = true;
       const argFns = planArgs.map((a) => compileBoundExpr(a, this.env.funcCtx).fn);
       // Arguments that read earlier sources of this FROM make the source lateral; a subquery or a column of an enclosing
       // query makes it correlated.
