@@ -315,7 +315,7 @@ function compileEach(e: Extract<BoundExpr, { k: 'each' }>, ctx: FunctionContext)
           args: args.map((x) => x.fn),
           argTypes: a.star ? [] : args.map((x) => x.type),
           filter: a.filter === undefined ? undefined : compileBoundExpr(a.filter, ctx).fn,
-          distinct: a.distinct,
+          distinct: a.distinct && !def.ignoresDistinct,
           collation: collationId(a.collation),
           buf: new Array<SqlValue>(a.args.length).fill(null),
         };

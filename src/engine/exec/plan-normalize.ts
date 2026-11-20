@@ -198,6 +198,16 @@ function numbered(input: PlanOp): PlanOp {
   return { op: 'window', input, partition: [], order: [], frame: WHOLE, calls: [ROW_NUMBER] };
 }
 
+/**
+ * `numbered(input)` where the input is a projection: the rows are numbered under it, and it passes the number on after
+ * its own columns. A projection keeps every row and the rows' order, so the numbers are the same; it is then straight
+ * under the projections that read it, and the planner makes them one.
+ */
+function numberedUnder(input: PlanOp): PlanOp {
+  if (input.op !== 'project') return numbered(input);
+  return { ...input, input: numberedUnder(input.input), exprs: [...input.exprs, typedColumn(planWidth(input.input), 'int')] };
+}
+
 const column = (index: number, type: 'int' | 'text' | 'any' = 'any'): PlanExpr => ({ k: 'col', input: 0, index, depth: 0, type, collation: 'binary' });
 const typedColumn = (index: number, type: PlanType): PlanExpr => ({ k: 'col', input: 0, index, depth: 0, type, collation: 'binary' });
 const range = (from: number, to: number): PlanExpr[] => Array.from({ length: to - from }, (_, i) => column(from + i));
@@ -750,11 +760,13 @@ function orderedGroups(op: Op<'aggregate'>): PlanOp {
   let grouped: PlanOp;
   let at: number;
   let orderType: PlanType = 'int';
-  const sorted = op.carry.length === 0 && op.aggs.every((c) => ORDER_FREE_AGGS.has(c.fn)) ? sortKeyColumn(op.input) : null;
+  const sorted = op.carry.length === 0 && op.aggs.every((c) => ORDER_FREE_AGGS.has(c.fn)) ? sortKeyColumns(op.input) : null;
   if (sorted) {
-    // Each group's first row is the one whose sort keys are least: no sort of the rows, no numbers.
-    const min: AggCall = { fn: 'min', args: [typedColumn(sorted.at, sorted.type)], star: false, distinct: false, collation: 'binary', type: sorted.type };
-    grouped = { ...plain, input: sorted.input, aggs: [...op.aggs, min] };
+    // Each group's first row is the one whose sort keys are least: no sort of the rows, and no list made for each
+    // (`min_list` keeps the least keys as they are, and makes the group's list of them).
+    const args = sorted.types.map((t, j) => typedColumn(sorted.at + j, t));
+    const least: AggCall = { fn: 'min_list', args, star: false, distinct: false, collation: 'binary', type: sorted.type };
+    grouped = { ...plain, input: sorted.input, aggs: [...op.aggs, least] };
     at = k + a;
     orderType = sorted.type;
   } else if (op.carry.length === 0) {
@@ -777,12 +789,12 @@ const ORDER_FREE_AGGS = new Set(['count', 'sum', 'total', 'avg', 'min', 'max']);
 
 /**
  * An input that is a sort under projections, as an ordered aggregate's often is: the input without the sort, with its
- * sort keys as one more column (`at`) carried through the projections, a list that orders as the sort does: each key
- * preceded by whether it is NULL (or isn't, for NULLS FIRST), then the row's position in the sort's input (numbered as
- * the rows pass, no sort), and lists compare element by element. So a group's least list is its first row in the sort's
- * order. Null when a key is descending, has a collation or a subquery.
+ * sort keys as more columns (from `at`, of `types`) carried through the projections. As a list they order as the sort
+ * does: each key preceded by whether it is NULL (or isn't, for NULLS FIRST), then the row's position in the sort's
+ * input (numbered as the rows pass, no sort), and lists compare element by element. So a group's least list (of type
+ * `type`) is its first row in the sort's order. Null when a key is descending, has a collation or a subquery.
  */
-function sortKeyColumn(input: PlanOp): { input: PlanOp; at: number; type: PlanType } | null {
+function sortKeyColumns(input: PlanOp): { input: PlanOp; at: number; types: PlanType[]; type: PlanType } | null {
   const chain: Op<'project'>[] = [];
   let n = input;
   while (n.op === 'project') {
@@ -802,14 +814,15 @@ function sortKeyColumn(input: PlanOp): { input: PlanOp; at: number; type: PlanTy
   const below = n.input;
   const w = planWidth(below);
   // Last, the row's position in the sort's input: rows whose keys tie keep that order, as the sort (stable) keeps it.
-  const tuple: PlanExpr = { k: 'call', fn: 'list_of', args: [...n.keys.flatMap((key) => [flag(key), key.expr]), typedColumn(w, 'int')], type };
-  let cur: PlanOp = { op: 'project', input: numbered(below), exprs: [...identity(below), tuple] };
+  const elements: PlanExpr[] = [...n.keys.flatMap((key) => [flag(key), key.expr]), typedColumn(w, 'int')];
+  const elementTypes: PlanType[] = [...types.flatMap((t): PlanType[] => ['int', t]), 'int'];
+  let cur: PlanOp = { op: 'project', input: numberedUnder(below), exprs: [...identity(below), ...elements] };
   let at = w;
   for (const pj of chain.reverse()) {
-    cur = { ...pj, input: cur, exprs: [...pj.exprs, typedColumn(at, type)] };
+    cur = { ...pj, input: cur, exprs: [...pj.exprs, ...elementTypes.map((t, j) => typedColumn(at + j, t))] };
     at = pj.exprs.length;
   }
-  return { input: cur, at, type };
+  return { input: cur, at, types: elementTypes, type };
 }
 
 /**

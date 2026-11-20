@@ -16,7 +16,7 @@ import { sqlPrintf, valueInt64 } from './printf.js';
 import { STAT_AGGREGATES } from './stat-aggregates.js';
 import { dateFn, datetimeFn, juliandayFn, strftimeFn, timeFn, timediffFn, unixepochFn } from './datetime.js';
 import { TEMPORAL_FUNCTIONS } from './temporal-ops.js';
-import { IMPLODE, NESTED_FUNCTIONS } from './nested-ops.js';
+import { IMPLODE, NESTED_FUNCTIONS, toAny } from './nested-ops.js';
 import { encodeKey } from '../storage/key-codec.js';
 import { MATH_FUNCTIONS, ROUNDING, logScalar, mathScalar, roundingScalar } from './math.js';
 
@@ -104,6 +104,11 @@ export interface AggregateFunction {
   maxArgs: number;
   resultType(argTypes: StaticType[]): StaticType;
   create(argTypes: StaticType[], collation: Collation): AggregateState;
+  /**
+   * Its value is the same with DISTINCT as without, so DISTINCT is not applied. An operator keeps a DISTINCT call's
+   * rows apart by their first argument, which for a call of several arguments would leave rows out.
+   */
+  ignoresDistinct?: true;
 }
 
 const isRealType = (t: StaticType | undefined): boolean => t === 'real';
@@ -1015,6 +1020,44 @@ class FirstLastState implements AggregateState {
   }
 }
 
+/** The type of the elements of a list made of values of types `ts`, as `list_of` types it: theirs when they agree, else `any`. */
+function elementType(ts: readonly StaticType[]): string {
+  const known = ts.filter((t) => t !== 'null');
+  return known.length > 0 && known.every((t) => t === known[0]) ? known[0]! : 'any';
+}
+
+/**
+ * `min_list(a, b, …)`: the least of the lists its arguments make, one for each row: what `min(list_of(a, b, …))`
+ * gives, without a list made for every row. Lists order element by element, in the engine's value order (the order
+ * of their encoding, ADR 0018), so the least is kept as its elements and compared so, and is made a list once, at
+ * the end. NULL over no rows, as `min` is. An element of a list of `any` keeps its type as a typed value, as
+ * `list_of` makes it (ADR 0039).
+ */
+class MinListState implements AggregateState {
+  private best: SqlValue[] | null = null;
+  constructor(private readonly asElement: readonly (((v: SqlValue) => SqlValue) | null)[] | null) {}
+  step(args: SqlValue[]): void {
+    const w = this.asElement;
+    const best = this.best;
+    if (best !== null) {
+      let c = 0;
+      for (let i = 0; i < args.length && c === 0; i++) {
+        const f = w === null ? null : w[i]!;
+        const x = f === null ? args[i]! : f(args[i]!);
+        const y = best[i]!;
+        // Two numbers that order (neither NaN) need no look at their kinds.
+        c = typeof x === 'number' && typeof y === 'number' && x === x && y === y ? (x < y ? -1 : x > y ? 1 : 0) : compareValues(x, y);
+      }
+      // A tie keeps the earlier row's: the same list either way.
+      if (c >= 0) return;
+    }
+    this.best = w === null ? args.slice() : args.map((v, i) => (w[i] ? w[i]!(v) : v));
+  }
+  final(): SqlValue {
+    return this.best === null ? null : encodeKey(this.best);
+  }
+}
+
 export const aggregateFunctions = new Map<string, AggregateFunction>([
   ['count', { minArgs: 0, maxArgs: 1, resultType: () => 'int', create: (t) => new CountState(t.length === 0) }],
   [
@@ -1051,6 +1094,17 @@ export const aggregateFunctions = new Map<string, AggregateFunction>([
 for (const [name, agg] of STAT_AGGREGATES) aggregateFunctions.set(name, agg);
 // A group's values as a list (ADR 0020).
 aggregateFunctions.set('implode', IMPLODE);
+// The least of the lists a group's rows make of its arguments.
+aggregateFunctions.set('min_list', {
+  minArgs: 1,
+  maxArgs: -1,
+  resultType: (t) => `list<${elementType(t)}>` as StaticType,
+  create: (t) => {
+    const w = elementType(t) === 'any' ? t.map((x) => toAny(x)) : null;
+    return new MinListState(w !== null && w.some((f) => f !== null) ? w : null);
+  },
+  ignoresDistinct: true,
+});
 
 /** Format helper re-exported for EXPLAIN and tests. */
 export { formatReal };

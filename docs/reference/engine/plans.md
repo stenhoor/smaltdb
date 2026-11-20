@@ -276,7 +276,9 @@ const friendsOfFriends = plan.project(second, [plan.col(0, 7, 'int')]);
 `{ fn, args, star, distinct, filter?, collation, type }`: `fn` names an aggregate function (`count`, `sum`, `avg`,
 `min`, `max`, `first`, `last`, `group_concat`, `total`, `sum_float`, `avg_float`, and the [others](https://stenhoor.github.io/smaltql/reference/functions/aggregate)); `star` is `count(*)`.
 `sum` and `avg` follow SQLite, where a NaN result (a NaN term, or `Infinity` and `-Infinity` together) is NULL; `sum_float` and
-`avg_float` are the same but keep it NaN ([ADR 0018](../../adr/0018-bool-and-nan.md)). `carry` passes
+`avg_float` are the same but keep it NaN ([ADR 0018](../../adr/0018-bool-and-nan.md)). `min_list(a, b, …)` is the
+least of the lists a group's rows make of its arguments: what `min(list_of(a, b, …))` gives, without a list made for
+every row. `carry` passes
 input columns through, taken from one row of each group (SQL's bare columns). With no keys, an aggregate gives one row,
 also over no input rows.
 

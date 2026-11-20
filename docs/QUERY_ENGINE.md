@@ -166,6 +166,12 @@ Source: `src/engine/exec/` — `planner.ts`, `operators.ts`, `expr.ts`, `functio
 - **Predicate placement:** every conjunct is evaluated at the earliest join level where its tables are available. Filters
   on the inner side of a LEFT JOIN stay in the join condition.
 - **Aggregation:** hash aggregation; GROUP BY expressions, aggregate calls, and bare columns are mapped to registers.
+- **Groups in the order of their first row** (an `aggregate` with `ordered: 'first'` over a sort): the rows are not
+  sorted. Each row carries its sort keys and its position as columns, the aggregate takes each group's least with
+  `min_list`, and the groups are sorted by it (`orderedGroups` in `exec/plan-normalize.ts`). `min_list` keeps the
+  least keys as they are and makes one list for each group, where the rewrite made a list for every row and took
+  `min` over them. Where the sort reads a projection, the rows are numbered under it, which leaves it straight
+  under the projections that read the sort: one projection where there were two.
 - **Sorting:** in-memory stable sort with a top-N cap when `LIMIT` is known. `ORDER BY rowid` on a single-table scan uses the
   table order, scanning in reverse for DESC.
 - **`count(*)` fast path:** summing leaf cell counts, as SQLite's `OP_Count` does.
