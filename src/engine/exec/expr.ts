@@ -670,4 +670,11 @@ export const CODEGEN_HELPERS_FOR_FUSION = {
   rowid: readRowidKey,
   /** A map column's prefilter (codegen.ts): false when the row's map stored at [start, end) rules the conjunct out. */
   mapProbe: (b: Uint8Array, start: number, end: number, key: Uint8Array, op: MapCompare, lit: Uint8Array | null): boolean => !isTaggedBlob(b, start) || mapProbe(b, start + 1, end, key, op, lit),
+  /**
+   * A parameter's value as `mapProbe`'s literal (codegen.ts): its encoded bytes when it is a number that isn't NaN and
+   * the comparison may be probed with numbers, or text and it may be probed with text; else null, and the probe checks
+   * the key alone.
+   */
+  probeValue: (v: SqlValue, numbers: boolean, text: boolean): Uint8Array | null =>
+    (numbers && ((typeof v === 'number' && v === v) || typeof v === 'bigint')) || (text && typeof v === 'string') ? encodeKey([v]) : null,
 };
