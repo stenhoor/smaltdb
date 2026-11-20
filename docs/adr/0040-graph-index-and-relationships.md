@@ -199,19 +199,19 @@ it meets its gate.
 
 If 2b's hop to a labelled node is over the bar, the index also holds each node's labels, measured then.
 
-**Built since, on branches, not merged** (2026-11-20; the same benchmarks; before, with 2a, with 2a and 2c):
+**Built since, on branches, not merged** (2026-11-20; the same benchmarks):
 
-| | 2a: `claude/graph-index` (`8904484`) | 2c: `claude/graph-paths` (`95189f6`), smaltcy `claude/shortest-path-target` (`e0dffcb`) |
+| | Before, then with 2a: `claude/graph-index` (`8904484`) | With 2c too: `claude/graph-paths` (`95189f6`), smaltcy `claude/shortest-path-target` (`e0dffcb`) |
 |---|---|---|
-| Variable length 1..3, the same text | 1.05x, 0.58x | 0.63x |
-| Shortest path | 0.95x, 0.89x | 0.88x |
-| Shortest path, 5 hops | 1.36x, 0.86x | 0.16x |
-| Shortest path, directed, no path | 1.91x, 1.55x | 1.20x (0.033 ms against 0.029) |
-| Shortest path, no path | 2.53x, 1.25x | 0.25x |
-| Shortest path, a literal, a parameter | 0.62x and 0.96x, 0.49x and 0.67x | 0.13x and 0.18x |
-| Shortest path, directed | 1.50x and 1.63x, 1.13x and 1.22x | 1.03x and 0.90x |
-| Shortest path, no path | 2.29x and 2.81x, 1.28x and 1.24x | 0.28x and 0.29x |
-| 1, 2 and 3 hops, the same text | 1.89x, 2.58x, 2.94x; 1.28x, 1.51x, 1.68x | 1.32x, 1.58x, 1.59x |
+| The same text: variable length 1..3 | 1.05x, 0.58x | 0.63x |
+| The same text: shortest path | 0.95x, 0.89x | 0.88x |
+| The same text: shortest path, 5 hops | 1.36x, 0.86x | 0.16x |
+| The same text: shortest path, directed, no path | 1.91x, 1.55x | 1.20x (0.033 ms against 0.029) |
+| The same text: shortest path, no path | 2.53x, 1.25x | 0.25x |
+| The same text: 1, 2 and 3 hops | 1.89x, 2.58x, 2.94x; 1.28x, 1.51x, 1.68x | 1.32x, 1.58x, 1.59x |
+| Statements that differ (a literal and a parameter): shortest path | 0.62x and 0.96x, 0.49x and 0.67x | 0.13x and 0.18x |
+| Statements that differ: shortest path, directed | 1.50x and 1.63x, 1.13x and 1.22x | 1.03x and 0.90x |
+| Statements that differ: shortest path, no path | 2.29x and 2.81x, 1.28x and 1.24x | 0.28x and 0.29x |
 
 - **2a meets its gate.** No write is slower with the index kept (in turns against a database with none: 0.98x to
   1.04x; deleting 1,000 nodes 0.84x). In the engine the index builds in 13.9 ms for the 60,025 relationships and 191.5
