@@ -1091,6 +1091,17 @@ export class Project implements Operator {
    * key was seen) before the others (`rest`) are computed.
    */
   gate: { readonly first: readonly number[]; readonly rest: readonly number[]; readonly keep: (r: SqlValue[]) => boolean } | null = null;
+  /** Set by the planner: the outputs whose expression can't fail (a column, a constant, logic and CASE over them). */
+  canSkip: readonly boolean[] | null = null;
+  /**
+   * Set by the planner on a nested plan's projection: which of its outputs the plan around it reads. An output nothing
+   * reads isn't computed, where `canSkip` allows. It fills in as the plan around it is compiled, so it is read when
+   * the projection first opens.
+   */
+  reads: readonly boolean[] | null = null;
+  /** The outputs computed: all of them, or those left once the unread are dropped. Settled at the first open. */
+  private liveFns: Fn[] | null = null;
+  private liveOut: number[] = [];
   constructor(
     readonly child: Operator,
     readonly fns: Fn[],
@@ -1100,14 +1111,33 @@ export class Project implements Operator {
   }
   open(r: SqlValue[]): void {
     this.r = r;
+    if (this.liveFns === null) this.settle();
     this.child.open(r);
+  }
+  private settle(): void {
+    const reads = this.reads;
+    const can = this.canSkip;
+    if (reads === null || can === null || this.gate !== null) {
+      this.liveFns = this.fns;
+      this.liveOut = this.outRegs;
+      return;
+    }
+    const fns: Fn[] = [];
+    const out: number[] = [];
+    for (let i = 0; i < this.fns.length; i++) {
+      if (can[i] === true && reads[i] === false) continue;
+      fns.push(this.fns[i]);
+      out.push(this.outRegs[i]);
+    }
+    this.liveFns = fns;
+    this.liveOut = out;
   }
   next(): boolean {
     const r = this.r;
-    const fns = this.fns;
-    const out = this.outRegs;
     const g = this.gate;
     if (g !== null) {
+      const fns = this.fns;
+      const out = this.outRegs;
       for (;;) {
         if (!this.child.next()) return false;
         for (const i of g.first) r[out[i]] = fns[i](r);
@@ -1117,6 +1147,8 @@ export class Project implements Operator {
       }
     }
     if (!this.child.next()) return false;
+    const fns = this.liveFns!;
+    const out = this.liveOut;
     for (let i = 0; i < fns.length; i++) r[out[i]] = fns[i](r);
     return true;
   }
