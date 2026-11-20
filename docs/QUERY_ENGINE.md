@@ -226,3 +226,39 @@ Decisions and their rationale: [ADR 0005](adr/0005-cost-based-optimizer.md).
 - **EXPLAIN** shows `SCAN t (columnar[, fused scan + filter + …][, zone maps: col op ? …])`.
 
 See [ADR 0008](adr/0008-materialized-views-and-columnar-segments.md).
+
+## 9. Graph indexes
+
+- **Access path.** An edge table of a property graph, read by one endpoint (`start = x` or `end = x`), has one more
+  access path beside its endpoint index: `GraphIndexScan` (`exec/graph-scan.ts`) reads the node's relationships from
+  the graph's index in memory (`exec/graph-index.ts`, `exec/graph-lists.ts`), in the endpoint index's order, with no
+  B+tree descent. The other endpoint and the rowid come from the index; other columns are fetched by rowid. It costs
+  less than the endpoint index (`COST.graphOpen`, `COST.graphEntry`), and stands for it where a plan names the index.
+- **Chosen when the scan opens.** The scan asks for the graph's index once per execution, which builds it if it isn't
+  built. When the graph isn't indexed (a reader, ids or a size the index can't hold), the scan runs the endpoint
+  index's scan it carries, so a prepared statement stays valid as the index comes and goes.
+- **Kept by writers.** An edge table's `TableWriter` reports every row written, changed and deleted to the index
+  (`GraphHooks`, `exec/write.ts`). A rollback drops an index that may hold what it undid; a commit confirms it at the
+  pager's new change counter.
+- **Tests.** With `SMALT_GRAPH_INDEX_CHECK=1` (set for every test, `test/setup-sql.ts`) the engine compares each index
+  with its tables after every statement that writes, and runs every query that read one again without it: the rows
+  must be the same, in order.
+- **Path searches.** A `paths` operation that keeps one path per node over a property graph's edge tables is rewritten
+  to a lateral call of the table function `smalt_paths` (`exec/plan-normalize.ts`), a breadth-first search
+  (`exec/graph-paths.ts`) that reads each node's relationships from the graph's index, or from the endpoint indexes
+  when the graph isn't indexed: the same relationships in the same order, so the same rows. With a `target` it stops
+  when it reaches it. Other `paths` are rewritten to `iterate`, whose steps read edge tables through the access path
+  above.
+- **Relationships.** A `relationships` operation is a source of a join region, like a table (`Source.rel` in
+  `exec/planner.ts`), with four access paths (`relationshipOptions`): every relationship; those at the node a
+  condition gives for `node`, or for `other`; those between the two nodes when conditions give both. The conditions
+  are consumed, as an index's are. Its estimates come from the types' tables (their rows, and the distinct values of
+  their endpoints), so a plan is the same whether or not the graph is indexed. `RelationshipsScan`
+  (`exec/graph-relationships.ts`) reads a node's lists by start and by end from the graph's index; without it, each
+  type's endpoint index scan in turn, which gives the same order; read whole, each type's table. It writes only the
+  columns the plan reads, and fetches a relationship's row only for `props`. With `asOf` the operation is rewritten
+  to a union of the types' tables as of then (`relationshipsAsOf`, `exec/plan-normalize.ts`).
+- **EXPLAIN** shows `SEARCH t USING GRAPH INDEX (start=?)`, `SCAN smalt_paths() VIRTUAL TABLE` for a path search, and
+  `SEARCH RELATIONSHIPS OF g (node=?)`, `(other=?)`, `(node=? AND other=?)` or `SCAN RELATIONSHIPS OF g`.
+
+See [ADR 0040](adr/0040-graph-index-and-relationships.md).

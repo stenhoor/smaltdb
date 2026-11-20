@@ -62,6 +62,8 @@ export function printPlan(op: PlanOp, depth = 0): string {
   switch (op.op) {
     case 'scan':
       return `${pad}scan ${op.db ? `${op.db}.` : ''}${op.table} [${op.columns.join(', ')}]${op.asOf ? ` as of ${'commit' in op.asOf ? `commit ${printExpr(op.asOf.commit)}` : `time ${printExpr(op.asOf.time)}`}` : ''}`;
+    case 'relationships':
+      return `${pad}relationships ${op.graph} ${op.direction}${op.types ? ` [${op.types.join(', ')}]` : ''}${op.asOf ? ` as of ${'commit' in op.asOf ? `commit ${printExpr(op.asOf.commit)}` : `time ${printExpr(op.asOf.time)}`}` : ''}`;
     case 'source':
       return `${pad}${op.kind} ${op.schema ? `${op.schema}.` : ''}${op.name}(${[list(op.args), ...Object.entries(op.named ?? {}).map(([k, e]) => `${k} => ${printExpr(e)}`)].filter((x) => x).join(', ')})`;
     case 'iterate':
@@ -96,7 +98,7 @@ export function printPlan(op: PlanOp, depth = 0): string {
     case 'paths': {
       const sel = op.selector ?? 'all';
       const hops = `${op.minHops ?? 1}..${op.maxHops ?? ''}`;
-      return `${pad}paths from ${op.start} ${op.direction} over [${op.edges.map((e) => `${e.table}(${e.start} -> ${e.end})`).join(', ')}] hops ${hops} ${op.mode ?? 'walk'} ${typeof sel === 'object' ? `shortest ${sel.shortest}` : sel}\n${sub(op.input)}`;
+      return `${pad}paths from ${op.start} ${op.direction} over [${op.edges.map((e) => `${e.table}(${e.start} -> ${e.end})`).join(', ')}] hops ${hops} ${op.mode ?? 'walk'} ${typeof sel === 'object' ? `shortest ${sel.shortest}` : sel}${op.target !== undefined ? ` to ${op.target}` : ''}\n${sub(op.input)}`;
     }
     case 'unpivot':
       return `${pad}unpivot keep [${op.keep.join(', ')}] columns [${op.columns.map((c, i) => `${c} as ${JSON.stringify(op.names[i])}`).join(', ')}]\n${sub(op.input)}`;

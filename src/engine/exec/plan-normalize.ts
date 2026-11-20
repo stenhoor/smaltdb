@@ -9,7 +9,7 @@
  * SQL's plans have this layering already and are not normalized.
  */
 import { eachParts, lit, mapEach, type PlanExpr, typeOf } from '../plan/expr.js';
-import { type AggCall, PATH_TYPE, type PlanOp, type SortKey, type WindowCall } from '../plan/ops.js';
+import { type AggCall, PATH_TYPE, type PlanOp, RELATIONSHIP_TYPES, type SortKey, type WindowCall } from '../plan/ops.js';
 import { SmaltError } from '../errors.js';
 import { planWidth } from './planner.js';
 import { parseNested } from '../../shared/nested-types.js';
@@ -21,11 +21,38 @@ type Op<K extends PlanOp['op']> = Extract<PlanOp, { op: K }>;
 /** A table's column types (`db` main or temp), or undefined when there is no such table. */
 export type TableTypes = (table: string, db?: 'main' | 'temp') => readonly PlanType[] | undefined;
 
-/** What rewrites that read tables (`asOf`) need of the catalog: column types, and how a table keeps history. */
+/** What rewrites that read tables (`asOf`, `paths`) need of the catalog: column types, and how a table keeps history. */
 export interface NormalizeCatalog {
   readonly types: TableTypes;
   readonly history: (table: string, db?: 'main' | 'temp') => 'versions' | 'log' | undefined;
+  /**
+   * Whether a path search can walk the table itself (exec/graph-paths.ts): an edge table of a property graph whose
+   * endpoints are these two columns, with an index on each pair of them.
+   */
+  readonly searchable?: (table: string, db: 'main' | 'temp' | undefined, a: number, b: number) => boolean;
+  /** A property graph's relationship types, in the graph's order: each one's table and its columns (`props`: -1 for none). */
+  readonly graph?: (name: string) => { readonly caseSensitive: boolean; readonly edges: readonly GraphEdgeColumns[] } | undefined;
 }
+
+/** A relationship type of a property graph: its table, and its endpoint and props columns (column indexes). */
+export interface GraphEdgeColumns {
+  readonly type: string;
+  readonly table: string;
+  readonly start: number;
+  readonly end: number;
+  readonly props: number;
+}
+
+/** The types of `graph` a `relationships` operation reads, in the graph's order. */
+export function relationshipEdges<E extends { readonly type: string }>(graph: { readonly caseSensitive: boolean; readonly edges: readonly E[] }, types: readonly string[] | undefined): E[] {
+  if (types === undefined) return [...graph.edges];
+  const fold = (s: string): string => (graph.caseSensitive ? s : s.toLowerCase());
+  const wanted = new Set(types.map(fold));
+  return graph.edges.filter((e) => wanted.has(fold(e.type)));
+}
+
+/** The table function a path search is (exec/graph-paths.ts): its arguments are the start, the target and what to walk. */
+export const PATHS_FUNCTION = 'smalt_paths';
 
 /** The catalog, while a plan is normalized. */
 let catalog: NormalizeCatalog | undefined;
@@ -104,6 +131,9 @@ function rewriteAll(x: unknown): unknown {
     case 'scan':
       // A scan as of a commit reads the table's history (ADR 0033 step 6).
       return op.asOf ? rewriteAll(asOfRows(op)) : op;
+    case 'relationships':
+      // As of a commit: each type's table as of then, which is rewritten in turn. In the present the planner reads it.
+      return op.asOf ? rewriteAll(relationshipsAsOf(op)) : op;
     case 'sort':
       // A sort by expressions sorts by columns made for them.
       return keyedSort(op);
@@ -421,6 +451,41 @@ function asOfRows(op: Op<'scan'>): PlanOp {
 }
 
 /**
+ * A graph's relationships as they were after a commit (ADR 0040, 2.2, with `asOf`): each type's table read as of then
+ * (`asOfRows`), at its start, at its end or at both, in one union. A past version has no index in memory, and its
+ * tables' rows come from their history, so it is read whole.
+ */
+function relationshipsAsOf(op: Op<'relationships'>): PlanOp {
+  const g = catalog?.graph?.(op.graph);
+  if (!g) throw new SmaltError('SMALT_ERROR', `no such property graph: ${op.graph}`);
+  const PROPS = RELATIONSHIP_TYPES[5] as PlanType;
+  const at = (index: number, type: PlanType): PlanExpr => ({ k: 'col', input: 0, index, depth: 0, type, collation: 'binary' });
+  const parts: PlanOp[] = [];
+  for (const out of op.direction === 'both' ? [true, false] : [op.direction === 'out']) {
+    for (const e of relationshipEdges(g, op.types)) {
+      // The table's start, end and rowid, then its props where it has them.
+      const scan: PlanOp = { op: 'scan', table: e.table, columns: [e.start, e.end, -1, ...(e.props >= 0 ? [e.props] : [])], asOf: op.asOf! };
+      // Read at both ends, a relationship from a node to itself is given once, as outgoing.
+      const rows: PlanOp = !out && op.direction === 'both' ? { op: 'filter', input: scan, pred: cmp('cmp_ne', at(0, 'int'), at(1, 'int')) } : scan;
+      parts.push({
+        op: 'project',
+        input: rows,
+        exprs: [at(out ? 0 : 1, 'int'), at(out ? 1 : 0, 'int'), lit(e.type, 'text'), at(2, 'int'), lit(out ? 1 : 0, 'bool'), e.props >= 0 ? at(3, PROPS) : lit(null, PROPS)],
+      });
+    }
+  }
+  const origin = op.origin !== undefined ? { origin: op.origin } : {};
+  if (parts.length === 0) {
+    // No type: no rows.
+    const none: PlanOp = { op: 'filter', input: { op: 'values', rows: [[]], types: [] }, pred: lit(0, 'bool') };
+    return { op: 'project', input: none, exprs: RELATIONSHIP_TYPES.map((t) => lit(null, t as PlanType)), ...origin };
+  }
+  const collations = RELATIONSHIP_TYPES.map(() => 'binary' as const);
+  const all = parts.reduce((a, b): PlanOp => ({ op: 'setop', kind: 'unionAll', inputs: [a, b], collations }));
+  return { ...all, ...origin };
+}
+
+/**
  * A table that keeps a log (method (b), exec/history.ts) as it was after commit C, without replay: its current rows with
  * no change after C, and for each row changed after C the row before its first change after C, unless that change was
  * its insert. The log is `[$commit, $op, $rowid, …columns]`, its rowid the change's sequence.
@@ -479,6 +544,21 @@ function pathRows(op: Op<'paths'>): PlanOp {
   const selector = op.selector ?? 'all';
   const keyed = mode === 'walk' && (selector === 'any' || selector === 'anyShortest');
   const PATH = PATH_TYPE as PlanType;
+  // One path per node over a property graph's edge tables: a breadth-first search that reads the graph's index, or
+  // the endpoint indexes, itself (ADR 0040, 2.3), giving the rows this rewrite gives, in its order.
+  const search = catalog?.searchable;
+  if (keyed && minHops <= 1 && search && op.edges.every((e) => search(e.table, e.db, e.start, e.end))) {
+    const what = JSON.stringify({ edges: op.edges.map((e) => ({ table: e.table, start: e.start, end: e.end })), direction: op.direction, minHops, ...(op.maxHops !== undefined ? { maxHops: op.maxHops } : {}), target: op.target !== undefined });
+    const found: PlanOp = {
+      op: 'source',
+      kind: 'function',
+      name: PATHS_FUNCTION,
+      args: [typedColumn(op.start, 'int'), op.target !== undefined ? typedColumn(op.target, 'int') : { k: 'lit', value: null, type: 'int' }, { k: 'lit', value: what, type: 'text' }],
+      types: ['int', 'int', PATH],
+    };
+    const exprs = [...range(0, w), typedColumn(w, 'int'), typedColumn(w + 1, 'int'), typedColumn(w + 2, PATH)];
+    return { op: 'project', input: { op: 'join', kind: 'inner', inputs: [op.input, found], ordered: true }, exprs, ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+  }
   const INTS = 'list<int>' as PlanType;
   const int = (value: number): PlanExpr => ({ k: 'lit', value, type: 'int' });
   const fn = (name: string, args: PlanExpr[], type: PlanType): PlanExpr => ({ k: 'call', fn: name, args, type });
@@ -577,7 +657,9 @@ function pathRows(op: Op<'paths'>): PlanOp {
   const sorted: PlanOp = { op: 'sort', input: found, keys: [N, H].map((c) => ({ expr: at(0, c, 'int'), desc: false, nullsFirst: false, collation: 'binary' as const })) };
   const joined: PlanOp = { op: 'join', kind: 'inner', inputs: [numberedInput, sorted], on: cmp('cmp_eq', at(0, w, 'int'), at(1, N, 'int')), ordered: true };
   const out = w + 1;
-  return { op: 'project', input: joined, exprs: [...range(0, w), at(0, out + E, 'int'), at(0, out + H, 'int'), at(0, out + P, PATH)], ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+  const rows: PlanOp = { op: 'project', input: joined, exprs: [...range(0, w), at(0, out + E, 'int'), at(0, out + H, 'int'), at(0, out + P, PATH)], ...(op.origin !== undefined ? { origin: op.origin } : {}) };
+  // Only the paths that end at the target.
+  return op.target === undefined ? rows : { op: 'filter', input: rows, pred: cmp('cmp_eq', at(0, w, 'int'), at(0, op.target, 'int')) };
 }
 
 /**
@@ -1000,6 +1082,7 @@ function from(op: PlanOp): PlanOp {
       return { ...op, inputs: [from(l), r.op === 'join' ? block(r) : from(r)], ...(op.on ? { on: expr(op.on) } : {}) };
     }
     case 'scan':
+    case 'relationships':
     case 'working':
       return op;
     case 'source':
