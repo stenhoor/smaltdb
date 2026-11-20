@@ -226,6 +226,11 @@ export class ColumnarTableWriter extends TableWriter {
     return super.rowExists(rowid) || this.segmentRow(rowid) !== null;
   }
 
+  /** Its rows are in segments too: none is known past the end from the delta tree alone. */
+  protected override pastEnd(): boolean {
+    return false;
+  }
+
   override readRow(rowid: Rowid): SqlValue[] | null {
     const row = super.readRow(rowid);
     if (row !== null) return row;
