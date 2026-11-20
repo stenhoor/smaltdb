@@ -972,6 +972,17 @@ export class Database implements FunctionContext {
         truncated: () => ix.truncated(roles),
       };
     }
+    // A graph's label index table: its entries are also in the graph's index.
+    const labelRoles = c ? undefined : this.graphIndexes.labelRolesOf(table);
+    if (labelRoles) {
+      const ix = this.graphIndexes;
+      w.graph = {
+        inserted: (row) => ix.labelInserted(labelRoles, row),
+        updated: (old, next) => ix.labelUpdated(labelRoles, old, next),
+        deleted: (row) => ix.labelDeleted(labelRoles, row),
+        truncated: () => ix.labelTruncated(labelRoles),
+      };
+    }
     if (table.history) {
       const get = (name: string): TableSchema => {
         const t = this.tables.get(name.toLowerCase());
@@ -1049,6 +1060,14 @@ export class Database implements FunctionContext {
         return open === null ? null : { out: open.out!, in: open.in! };
       },
     };
+  }
+
+  /** What the planner needs to answer a label index table from its graph's index (PhysicalEnv.graphLabels). */
+  private graphLabels(t: TableSchema): ReturnType<NonNullable<PhysicalEnv['graphLabels']>> {
+    const role = this.graphIndexes.labelRolesOf(t)?.[0];
+    if (!role) return undefined;
+    const ix = this.graphIndexes;
+    return { node: role.node, label: role.label, labels: () => ix.open(role.graph)?.labels ?? null };
   }
 
   /** What the planner needs to read an edge table through its graph's index (PhysicalEnv.graphEdge). */
@@ -2128,6 +2147,7 @@ export class Database implements FunctionContext {
       liveRows: (t) => this.liveRows(t),
       graphEdge: (t) => this.graphEdge(t),
       graph: (name) => this.plannedGraph(name),
+      graphLabels: (t) => this.graphLabels(t),
       deletedRows: (t) => this.deletedRowsOf(t),
       funcCtx: this,
       state: this.state,

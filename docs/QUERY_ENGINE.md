@@ -249,6 +249,12 @@ See [ADR 0008](adr/0008-materialized-views-and-columnar-segments.md).
   when the graph isn't indexed: the same relationships in the same order, so the same rows. With a `target` it stops
   when it reaches it. Other `paths` are rewritten to `iterate`, whose steps read edge tables through the access path
   above.
+- **Labels.** A graph's label index table, asked whether one node has one label through its unique index on both
+  columns, has one more access path too: `GraphLabelScan` (`exec/graph-scan.ts`) answers from the graph's label sets
+  in memory (`exec/graph-labels.ts`: a bitmap of node ids per label), which are built, kept and dropped with the
+  relationship lists. It gives the row's node and label; a plan that reads the rowid or another column, and a graph
+  that isn't indexed, run the unique index's scan it carries. Costed at `COST.graphOpen`, it also makes a scan of the
+  nodes with a label check for each cheaper than the label's entries with a row fetch for each.
 - **Relationships.** A `relationships` operation is a source of a join region, like a table (`Source.rel` in
   `exec/planner.ts`), with four access paths (`relationshipOptions`): every relationship; those at the node a
   condition gives for `node`, or for `other`; those between the two nodes when conditions give both. The conditions

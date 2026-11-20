@@ -9,6 +9,9 @@
  *   change to it, another connection's commit (the pager's change counter moved), a change to the graph's edge tables.
  * - **Not held** for a graph whose ids it can't (they are integers from 0 to 2^31 - 1), whose tables are columnar or
  *   TEMP, or that needs more memory than the limit. Its plans then run on the B+trees.
+ *
+ * It also holds the graph's label index, where that table has a unique index on its node and label: which nodes have
+ * which labels (exec/graph-labels.ts), built, kept and dropped with the relationships.
  */
 import { type IndexSchema, type TableSchema, findColumn } from '../catalog/schema.js';
 import { SmaltError } from '../errors.js';
@@ -16,6 +19,7 @@ import type { PropertyGraphDef } from '../plan/schema.js';
 import type { BTree } from '../storage/btree.js';
 import { decodeSmallRun } from '../storage/key-codec.js';
 import { Collation, type SqlValue } from '../values.js';
+import { GraphLabels } from './graph-labels.js';
 import { GraphLists } from './graph-lists.js';
 
 export interface GraphIndexHost {
@@ -42,6 +46,13 @@ interface EdgeTable {
   end: number;
 }
 
+/** A graph's label index table, with its node and label columns. */
+interface LabelTable {
+  table: TableSchema;
+  node: number;
+  label: number;
+}
+
 /** One graph's index. */
 export class GraphIndex {
   /** The graph's edge tables with their roots and endpoint columns: the index is of these. */
@@ -50,6 +61,9 @@ export class GraphIndex {
   /** By start node and by end node. Null until built. */
   out: GraphLists | null = null;
   in: GraphLists | null = null;
+  /** The graph's label index table, when it can be held, and its entries: built and dropped with the lists. */
+  labelTable: LabelTable | null = null;
+  labels: GraphLabels | null = null;
   /** Why the graph isn't indexed, until its edge tables change. */
   off: string | null = null;
   /** It may hold changes that aren't committed. */
@@ -63,11 +77,12 @@ export class GraphIndex {
 
   drop(): void {
     this.out = this.in = null;
+    this.labels = null;
     this.dirty = false;
   }
 
   bytes(): number {
-    return this.out === null ? 0 : this.out.bytes() + this.in!.bytes();
+    return this.out === null ? 0 : this.out.bytes() + this.in!.bytes() + (this.labels?.bytes() ?? 0);
   }
 }
 
@@ -79,6 +94,30 @@ export interface EdgeRole {
   readonly table: TableSchema;
   readonly start: number;
   readonly end: number;
+}
+
+/** A label index table's place in a graph's index. */
+export interface LabelRole {
+  readonly graph: GraphIndex;
+  readonly table: TableSchema;
+  readonly node: number;
+  readonly label: number;
+}
+
+/**
+ * The unique index a label index table has on its node and label, in either order: with it a node has a label at most
+ * once, which a set of nodes per label can hold.
+ */
+export function labelKeyIndex(table: TableSchema, node: number, label: number): IndexSchema | undefined {
+  return table.indexes.find(
+    (x) =>
+      x.unique &&
+      !x.where &&
+      !x.eval &&
+      x.columns.length === 2 &&
+      x.columns.every((c) => !c.desc && c.collation === Collation.Binary) &&
+      ((x.columns[0]!.column === node && x.columns[1]!.column === label) || (x.columns[0]!.column === label && x.columns[1]!.column === node)),
+  );
 }
 
 /** The index a table has on (a, b), ascending and whole: its entries are (a, b, rowid) in order. */
@@ -99,6 +138,7 @@ export class GraphIndexes {
   /** Tests: while set, no index is read (scans read the B+trees); the indexes are still kept. */
   suspended = false;
   private roles = new Map<TableSchema, EdgeRole[]>();
+  private labelRoles = new Map<TableSchema, LabelRole[]>();
   private readonly graphs = new Map<string, GraphIndex>();
 
   constructor(
@@ -112,6 +152,7 @@ export class GraphIndexes {
     if (v === this.version) return;
     this.version = v;
     this.roles = new Map();
+    this.labelRoles = new Map();
     const seen = new Set<string>();
     for (const def of this.host.graphs()) {
       const key = def.name.toLowerCase();
@@ -133,17 +174,30 @@ export class GraphIndexes {
         else if (table.temp) off = `${table.name} is a TEMP table`;
         edges.push({ table, start, end });
       }
-      const signature = off ?? edges.map((e) => `${e.table.name.toLowerCase()}:${e.table.rootPage}:${e.start}:${e.end}`).join('|');
+      // The label index, where it can be held: a row table with a unique index on its node and label.
+      let labelTable: LabelTable | null = null;
+      const l = def.labels && this.host.getTable(def.labels.table);
+      if (def.labels && l && !l.columnar && !l.temp) {
+        const node = findColumn(l, def.labels.node);
+        const label = findColumn(l, def.labels.label);
+        if (node >= 0 && label >= 0 && labelKeyIndex(l, node, label)) labelTable = { table: l, node, label };
+      }
+      const labelPart = labelTable ? `${labelTable.table.name.toLowerCase()}:${labelTable.table.rootPage}:${labelTable.node}:${labelTable.label}` : '';
+      const signature = off ?? `${labelPart}#${edges.map((e) => `${e.table.name.toLowerCase()}:${e.table.rootPage}:${e.start}:${e.end}`).join('|')}`;
       if (signature !== g.signature) {
         // A graph that only gained edge tables keeps its lists: the new types are read from their tables.
-        const kept = g.out !== null && off === null && g.off === null && g.signature !== '' && signature.startsWith(`${g.signature}|`) ? g.edges.length : -1;
+        const kept = g.out !== null && off === null && g.off === null && g.edges.length > 0 && signature.startsWith(`${g.signature}|`) ? g.edges.length : -1;
         g.signature = signature;
         g.off = off;
         g.edges = edges;
+        g.labelTable = labelTable;
         if (kept < 0) g.drop();
         else if (!this.fill(g, kept)) g.drop();
         else if (this.host.uncommitted()) g.dirty = true;
-      } else g.edges = edges;
+      } else {
+        g.edges = edges;
+        g.labelTable = labelTable;
+      }
       if (g.off === null) {
         edges.forEach((e, type) => {
           const role: EdgeRole = { graph: g, type, table: e.table, start: e.start, end: e.end };
@@ -151,6 +205,12 @@ export class GraphIndexes {
           if (list) list.push(role);
           else this.roles.set(e.table, [role]);
         });
+        if (labelTable) {
+          const role: LabelRole = { graph: g, ...labelTable };
+          const list = this.labelRoles.get(labelTable.table);
+          if (list) list.push(role);
+          else this.labelRoles.set(labelTable.table, [role]);
+        }
       }
     }
     for (const k of [...this.graphs.keys()]) if (!seen.has(k)) this.graphs.delete(k);
@@ -161,6 +221,13 @@ export class GraphIndexes {
     if (this.limit <= 0) return undefined;
     this.refresh();
     return this.roles.size === 0 ? undefined : this.roles.get(table);
+  }
+
+  /** The table's roles as the label index of indexed graphs. Undefined for any other table, and with the indexes off. */
+  labelRolesOf(table: TableSchema): readonly LabelRole[] | undefined {
+    if (this.limit <= 0) return undefined;
+    this.refresh();
+    return this.labelRoles.size === 0 ? undefined : this.labelRoles.get(table);
   }
 
   /**
@@ -177,6 +244,7 @@ export class GraphIndexes {
     }
     g.out = new GraphLists();
     g.in = new GraphLists();
+    g.labels = g.labelTable ? new GraphLabels() : null;
     g.counter = counter;
     g.builds++;
     if (!this.fill(g, 0)) {
@@ -188,11 +256,28 @@ export class GraphIndexes {
     return g;
   }
 
-  /** Reads the edge tables from position `from` on into the lists. False, with `off` set, when they can't hold them. */
+  /**
+   * Reads the edge tables from position `from` on into the lists and, from the start, the label index into its sets.
+   * False, with `off` set, when they can't hold them.
+   */
   private fill(g: GraphIndex, from: number): boolean {
     const out = g.out!;
     const inn = g.in!;
     const run = new Float64Array(3);
+    if (from === 0 && g.labelTable && g.labels) {
+      const t = g.labelTable;
+      for (const r of this.host.rows(t.table, t.node, t.label)) {
+        if (!isId(r[0]) || typeof r[1] !== 'string') {
+          g.off = `${t.table.name} has a node that is not an integer from 0 to ${MAX_ID}, or a label that is not text`;
+          return false;
+        }
+        g.labels.add(r[1], r[0]);
+      }
+      if (g.bytes() > this.limit) {
+        g.off = `its index needs more than ${this.limit} bytes`;
+        return false;
+      }
+    }
     for (let type = from; type < g.edges.length; type++) {
       const e = g.edges[type]!;
       for (const [lists, a, b] of [
@@ -295,6 +380,59 @@ export class GraphIndexes {
     for (const role of roles) role.graph.drop();
   }
 
+  // ---------------------------------------------------------------- the label index's writes
+
+  private label(role: LabelRole, row: readonly SqlValue[], add: boolean): void {
+    const g = role.graph;
+    const node = row[role.node];
+    const label = row[role.label];
+    if (!isId(node) || typeof label !== 'string') {
+      if (add) this.stop(g, `${role.table.name} has a node that is not an integer from 0 to ${MAX_ID}, or a label that is not text`);
+      else g.drop();
+      return;
+    }
+    if (add) {
+      g.labels!.add(label, node);
+      if (g.bytes() > this.limit) this.stop(g, `its index needs more than ${this.limit} bytes`);
+    } else if (!g.labels!.remove(label, node)) g.drop(); // an entry the sets don't have: build them again
+  }
+
+  /** A row was written to a label index table. */
+  labelInserted(roles: readonly LabelRole[], row: readonly SqlValue[]): void {
+    for (const role of roles) {
+      const g = role.graph;
+      if (g.labels === null) continue;
+      g.dirty = true;
+      this.label(role, row, true);
+    }
+  }
+
+  /** A row of a label index table was deleted. */
+  labelDeleted(roles: readonly LabelRole[], row: readonly SqlValue[]): void {
+    for (const role of roles) {
+      const g = role.graph;
+      if (g.labels === null) continue;
+      g.dirty = true;
+      this.label(role, row, false);
+    }
+  }
+
+  /** A row of a label index table was changed in place. */
+  labelUpdated(roles: readonly LabelRole[], old: readonly SqlValue[], next: readonly SqlValue[]): void {
+    for (const role of roles) {
+      const g = role.graph;
+      if (g.labels === null || (old[role.node] === next[role.node] && old[role.label] === next[role.label])) continue;
+      g.dirty = true;
+      this.label(role, old, false);
+      if (g.labels !== null) this.label(role, next, true);
+    }
+  }
+
+  /** A label index table was emptied. */
+  labelTruncated(roles: readonly LabelRole[]): void {
+    for (const role of roles) role.graph.drop();
+  }
+
   // ---------------------------------------------------------------- transactions
 
   /**
@@ -325,9 +463,9 @@ export class GraphIndexes {
   // ---------------------------------------------------------------- tests
 
   /** Each graph's index as it stands (after a refresh). */
-  state(): { graph: string; built: boolean; off: string | null; entries: number; bytes: number; builds: number }[] {
+  state(): { graph: string; built: boolean; off: string | null; entries: number; labels: number; bytes: number; builds: number }[] {
     this.refresh();
-    return [...this.graphs.values()].map((g) => ({ graph: g.name, built: g.out !== null, off: g.off, entries: g.out?.entries ?? 0, bytes: g.bytes(), builds: g.builds }));
+    return [...this.graphs.values()].map((g) => ({ graph: g.name, built: g.out !== null, off: g.off, entries: g.out?.entries ?? 0, labels: g.labels?.entries ?? 0, bytes: g.bytes(), builds: g.builds }));
   }
 
   /** Compares every built index with its tables; throws when they differ (a test setting, ADR 0040 section 3). */
@@ -335,6 +473,17 @@ export class GraphIndexes {
     this.refresh();
     for (const g of this.graphs.values()) {
       if (g.out === null || g.counter !== this.host.changeCounter()) continue;
+      if (g.labels !== null && g.labelTable !== null) {
+        const have: string[] = [];
+        g.labels.forEach((label, node) => void have.push(`${node}/${label}`));
+        const want = this.host.rows(g.labelTable.table, g.labelTable.node, g.labelTable.label).map((r) => `${String(r[0])}/${String(r[1])}`);
+        have.sort();
+        want.sort();
+        if (have.length !== want.length || have.some((x, i) => x !== want[i])) {
+          const at = have.findIndex((x, i) => x !== want[i]);
+          throw new SmaltError('SMALT_CORRUPT', `graph index of ${g.name} (labels) differs from ${g.labelTable.table.name}: ${have.length} entries against ${want.length} rows; first difference at ${at} (${have[at]} against ${want[at]})`);
+        }
+      }
       for (const [lists, from] of [
         [g.out, true],
         [g.in!, false],
