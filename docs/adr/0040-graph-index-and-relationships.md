@@ -157,16 +157,21 @@ This keeps ADR 0033's model, patterns are joins, and gives the join the one thin
 relationship from either end. smaltcy's compiler emits it for hops and drops its `iterate` hops and the splitting of a
 pattern into branches.
 
-**2.3 `paths`.** Its lowering gets 2.1 at once. On the index it also gets an operator of its own for the selectors
-`any` and `anyShortest`: a breadth-first search with a bitmap of the nodes seen, visiting in the lowering's order, so it
-picks the path the lowering picks. And `paths` gains an optional `target` column: only paths that end at that node, so
-the search stops when it reaches it. Without the index, `target` is a filter on the lowering.
+**2.3 `paths`.** Its lowering gets 2.1 at once. Over a property graph's edge tables it also gets a search of its own
+for the selectors `any` and `anyShortest`: breadth-first, keeping the first path found to each node, reading each
+node's relationships in the endpoint indexes' order. And `paths` gains an optional `target` column: only paths that
+end at that node, so the search stops when it reaches it. Elsewhere `target` is a filter on the lowering.
+
+Corrected 2026-11-20: this section first said the search "picks the path the lowering picks". Building it showed that
+the lowering has no one answer: which of two paths as short it keeps follows how its planner reads the edge table (by
+rowid on a small table, by the endpoint index on a large one), and `paths` never specified it. The search's answer is
+fixed, and is the same with and without the index.
 
 ### 3. Without the index
 
-Every plan means the same and returns the same rows. `relationships` and 2.1's scan read the endpoint indexes of each
-type's table, and `paths` is lowered to `iterate`. An operator chooses when it opens, so a prepared statement stays
-valid when the index comes or goes.
+Every plan means the same and returns the same rows. `relationships`, 2.1's scan and the search of `paths` read the
+endpoint indexes of each type's table. An operator chooses when it opens, so a prepared statement stays valid when the
+index comes or goes.
 
 A test setting checks the index against the tables after every write, and runs every read with and without it,
 comparing rows in order. smaltdb's graph tests and smaltcy's differential suite run with it.
@@ -193,6 +198,29 @@ it meets its gate.
 | 5 | Properties kept in memory, by column (its own record first) | Every read at or under smaltcy, the label scan and filter and group by city among them |
 
 If 2b's hop to a labelled node is over the bar, the index also holds each node's labels, measured then.
+
+**Built since, on branches, not merged** (2026-11-20; the same benchmarks; before, with 2a, with 2a and 2c):
+
+| | 2a: `claude/graph-index` (`8904484`) | 2c: `claude/graph-paths` (`95189f6`), smaltcy `claude/shortest-path-target` (`e0dffcb`) |
+|---|---|---|
+| Variable length 1..3, the same text | 1.05x, 0.58x | 0.63x |
+| Shortest path | 0.95x, 0.89x | 0.88x |
+| Shortest path, 5 hops | 1.36x, 0.86x | 0.16x |
+| Shortest path, directed, no path | 1.91x, 1.55x | 1.20x (0.033 ms against 0.029) |
+| Shortest path, no path | 2.53x, 1.25x | 0.25x |
+| Shortest path, a literal, a parameter | 0.62x and 0.96x, 0.49x and 0.67x | 0.13x and 0.18x |
+| Shortest path, directed | 1.50x and 1.63x, 1.13x and 1.22x | 1.03x and 0.90x |
+| Shortest path, no path | 2.29x and 2.81x, 1.28x and 1.24x | 0.28x and 0.29x |
+| 1, 2 and 3 hops, the same text | 1.89x, 2.58x, 2.94x; 1.28x, 1.51x, 1.68x | 1.32x, 1.58x, 1.59x |
+
+- **2a meets its gate.** No write is slower with the index kept (in turns against a database with none: 0.98x to
+  1.04x; deleting 1,000 nodes 0.84x). In the engine the index builds in 13.9 ms for the 60,025 relationships and 191.5
+  ms for 599,834, and takes 39 to 55 bytes per relationship.
+- **2c misses its gate by two statements of under 0.15 ms** (1.20x and 1.03x above). Their time is the statement's
+  fixed cost, not the search: of smaltdb's 32.0 µs for the directed search with no path, the prepared statement is
+  9.4 µs, turning the Cypher into its plan is 13.2 µs (smaltcy's engine does that too), and finding the kept statement
+  by its shape is the rest. The seek by name is the same case (1.04x). That cost is smaltcy's to cut, in its own step.
+- Their pull requests wait for this record.
 
 Later, each only with its own measurement: the index shared with reader workers, an undo log for rollbacks, the index
 kept in pager pages so opening a large graph doesn't wait for a build, and whether a graph's edge tables still need
