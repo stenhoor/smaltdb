@@ -77,6 +77,8 @@ export class TableWriter {
   /** Forget cached state at the start of a statement execution. */
   resetStatement(): void {
     this.maxRowid = null;
+    this.atEnd = null;
+    this.endRun = true;
   }
 
   newRowid(): number | bigint {
@@ -117,6 +119,14 @@ export class TableWriter {
 
   rowExists(rowid: number | bigint): boolean {
     return this.tree.has(this.key(rowid));
+  }
+
+  /**
+   * Whether `rowid` is past every row of the table: one walk down the tree's right edge, where `rowExists` searches
+   * it. A writer whose rows are not all in its tree says no.
+   */
+  protected pastEnd(rowid: number | bigint): boolean {
+    return this.tree.beyondLast(this.key(rowid));
   }
 
   /** Decode a full row (all columns; the rowid alias column gets the rowid). */
@@ -249,6 +259,16 @@ export class TableWriter {
   }
 
   private resolveRowid(rowid: number | bigint, except: number | bigint | null, mode: ConflictMode): boolean {
+    // A new row past the table's last (rows written in rowid order, as most are): no row has its rowid, and it is
+    // written at the end without a search (`writeRow`). Asked while the statement's rows have all been past the end:
+    // once one isn't, the rest are searched for as before, so rows in any other order pay for one look at most.
+    if (except === null && this.endRun) {
+      if (this.pastEnd(rowid)) {
+        this.atEnd = rowid;
+        return true;
+      }
+      this.endRun = false;
+    }
     // eslint-disable-next-line eqeqeq
     if ((except === null || rowid != except) && this.rowExists(rowid)) {
       if (mode === 'IGNORE') return false;
@@ -292,6 +312,10 @@ export class TableWriter {
   }
 
   private readonly newKeys: (Uint8Array | null)[] = [];
+  /** The rowid `resolveRowid` last found past the table's last row, until a row is written. */
+  private atEnd: number | bigint | null = null;
+  /** Every new row of this statement so far was past the table's last. */
+  private endRun = true;
 
   /** Write a row whose conflicts were already resolved. */
   writeRow(row: SqlValue[], rowid: number | bigint): void {
@@ -311,7 +335,11 @@ export class TableWriter {
       saved = row[alias];
       row[alias] = null; // the alias column lives in the key, not the record
     }
-    this.tree.put(this.key(rowid), this.enc.encode(row));
+    // A row `resolveRowid` found past the table's last goes in at the end, if it still is the last.
+    const atEnd = this.atEnd !== null && this.atEnd === rowid;
+    this.atEnd = null;
+    const record = this.enc.encode(row);
+    if (!atEnd || !this.tree.appendIfLast(this.key(rowid), record)) this.tree.put(this.key(rowid), record);
     if (alias >= 0) row[alias] = saved;
     for (let i = 0; i < keys.length; i++) {
       const k = keys[i];

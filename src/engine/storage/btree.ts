@@ -266,6 +266,33 @@ export class BTree {
     }
   }
 
+  /**
+   * Whether `key` is greater than every key in the tree (true for an empty tree): one walk down the right edge and
+   * one comparison, where {@link has} searches every level. Such a key is not in the tree, and {@link append} takes it.
+   */
+  beyondLast(key: Uint8Array): boolean {
+    const pager = this.pager;
+    let pg = this.root;
+    for (let d = 0; ; d++) {
+      const f = pager.get(pg);
+      if (isLeaf(f)) {
+        try {
+          const n = nCells(f);
+          return n === 0 || cmpLeafKey(key, f, slot(f, n - 1)) > 0;
+        } finally {
+          pager.release(f);
+        }
+      }
+      if (d >= MAX_DEPTH) {
+        pager.release(f);
+        throw new CorruptionError('b-tree too deep');
+      }
+      const child = rightPtr(f);
+      pager.release(f);
+      pg = child;
+    }
+  }
+
   has(key: Uint8Array): boolean {
     const leaf = this.descend(key, false);
     try {
@@ -355,6 +382,14 @@ export class BTree {
    * no key comparisons on the way down, and full pages are left full.
    */
   append(key: Uint8Array, value: Uint8Array): void {
+    if (!this.appendIfLast(key, value)) throw new MisuseError('append: key out of order');
+  }
+
+  /**
+   * {@link append} for a key that may not be the greatest: false, with nothing written, when a key in the tree is as
+   * great (a table's rows written in rowid order go in this way, and any other row by {@link put}).
+   */
+  appendIfLast(key: Uint8Array, value: Uint8Array): boolean {
     if (key.length > this.maxKeySize) throw new MisuseError(`key too large (${key.length} > ${this.maxKeySize} bytes)`);
     const pager = this.pager;
     let pg = this.root;
@@ -376,14 +411,12 @@ export class BTree {
     }
     this.depth = d;
     try {
-      pager.markDirty(leaf);
       const n = nCells(leaf);
-      if (n > 0) {
-        const off = slot(leaf, n - 1);
-        if (cmpLeafKey(key, leaf, off) <= 0) throw new MisuseError('append: key out of order');
-      }
+      if (n > 0 && cmpLeafKey(key, leaf, slot(leaf, n - 1)) <= 0) return false;
+      pager.markDirty(leaf);
       const size = this.buildLeafCell(key, value);
       if (!this.insertCell(leaf, n, this.cellBuf, size)) this.splitLeaf(leaf, n, this.cellBuf.slice(0, size));
+      return true;
     } finally {
       pager.release(leaf);
     }
