@@ -261,6 +261,8 @@ interface Program {
   memory?: boolean;
   /** The language of the statement's source: it words the statement's errors (ADR 0016 section 10). */
   language?: SmaltLanguage;
+  /** How its result rows are given (`resultForm` of `columnTypes`), worked out at the first run. */
+  form?: ResultForm;
 }
 
 let graphCheck: boolean | undefined;
@@ -336,7 +338,7 @@ export class Database implements FunctionContext {
   private readonly trees = new Map<number, BTree>();
   private readonly cacheSize: number;
   /** Open read cursors (a write while one is open would invalidate it). */
-  readonly activeCursors = new Set<RowCursor>();
+  readonly activeCursors = new OpenCursors();
   private closed = false;
 
   /**
@@ -498,11 +500,17 @@ export class Database implements FunctionContext {
   }
 
   /**
-   * @internal Changes when committed data changes, in the file or in the memory store (TEMP
-   * tables): statements re-check their row-count assumptions when it moves.
+   * @internal Changes when committed data changes in the file: statements re-check their row-count assumptions
+   * when it or {@link memChangeCount} moves. Two numbers, read on every run of a statement (as one text they were
+   * built three times a run).
    */
-  changeStamp(): string {
-    return this.mem ? `${this.pager.changeCounter}/${this.mem.changeCounter}` : String(this.pager.changeCounter);
+  changeCount(): number {
+    return this.pager.changeCounter;
+  }
+
+  /** @internal The same for the memory store (TEMP tables); -1 where there is none. */
+  memChangeCount(): number {
+    return this.mem ? this.mem.changeCounter : -1;
   }
 
   /** Copy the WAL into the database file (also happens automatically and on close). */
@@ -879,7 +887,7 @@ export class Database implements FunctionContext {
 
   close(): void {
     if (this.closed) return;
-    for (const c of [...this.activeCursors]) c.close();
+    for (const c of this.activeCursors.all()) c.close();
     this.pager.close();
     this.mem?.close();
     this.spill.close();
@@ -3049,8 +3057,8 @@ export class Database implements FunctionContext {
    * returned release function is called: morsels running on readers must all see one commit.
    */
   holdReads(): () => void {
-    const token = { close: () => void this.activeCursors.delete(token as unknown as RowCursor) };
-    this.activeCursors.add(token as unknown as RowCursor);
+    const token: OpenCursor = { place: -1, close: () => void this.activeCursors.delete(token) };
+    this.activeCursors.add(token);
     return token.close;
   }
 
@@ -5823,7 +5831,9 @@ export abstract class PreparedStatement {
 
   constructor(readonly db: Database) {}
 
-  private checkedAt = '';
+  /** The change counters (the file's, and the memory store's) the plan's row counts were last checked at. */
+  private checkedAt = -1;
+  private checkedMemAt = -1;
 
   /** The program for the current schema. */
   protected abstract compileProgram(): Program;
@@ -5841,7 +5851,8 @@ export abstract class PreparedStatement {
     if (this.program === null || this.version !== this.db.schemaVersion || this.statsDrifted(this.program)) {
       this.program = this.compileProgram();
       this.version = this.db.schemaVersion;
-      this.checkedAt = this.db.changeStamp();
+      this.checkedAt = this.db.changeCount();
+      this.checkedMemAt = this.db.memChangeCount();
     }
     return this.program;
   }
@@ -5851,9 +5862,11 @@ export abstract class PreparedStatement {
    * grown or shrunk 4x or more: a plan made for an empty table should not survive it filling up.
    */
   private statsDrifted(p: Program): boolean {
-    const cc = this.db.changeStamp();
-    if (cc === this.checkedAt || !p.rowAssumptions || p.rowAssumptions.size === 0) return false;
+    const cc = this.db.changeCount();
+    const mc = this.db.memChangeCount();
+    if ((cc === this.checkedAt && mc === this.checkedMemAt) || !p.rowAssumptions || p.rowAssumptions.size === 0) return false;
     this.checkedAt = cc;
+    this.checkedMemAt = mc;
     for (const [root, assumed] of p.rowAssumptions) {
       const now = this.db.tree(root).estimateCount();
       if (Math.max(now, 64) >= Math.max(assumed, 64) * 4 || Math.max(assumed, 64) >= Math.max(now, 64) * 4) return true;
@@ -5894,9 +5907,10 @@ export abstract class PreparedStatement {
 
   /** SMALT_GRAPH_INDEX_CHECK (tests): a query that read a graph index gives the same rows, in order, without it. */
   private checkGraphIndex(rows: SqlValue[][], params: BindParams | undefined): void {
+    if (!graphCheckOn()) return;
     const p = this.prog();
     const ix = this.db.graphIndexState;
-    if (!p.readonly || p.graphIndex !== true || !graphCheckOn() || ix.suspended) return;
+    if (!p.readonly || p.graphIndex !== true || ix.suspended) return;
     ix.suspended = true;
     const without: SqlValue[][] = [];
     try {
@@ -5920,8 +5934,8 @@ export abstract class PreparedStatement {
   }
   private memoryUse: { version: number; value: boolean } | null = null;
 
-  private registers(params: BindParams | undefined): SqlValue[] {
-    const regs: SqlValue[] = new Array(this.prog().regCount).fill(null);
+  private registers(p: Program, params: BindParams | undefined): SqlValue[] {
+    const regs: SqlValue[] = new Array(p.regCount).fill(null);
     this.bindParams(params, regs);
     return regs;
   }
@@ -5929,7 +5943,7 @@ export abstract class PreparedStatement {
   /** Execute for side effects. */
   run(params?: BindParams): RunResult {
     const p = this.prog();
-    const regs = this.registers(params);
+    const regs = this.registers(p, params);
     if (p.exec) return this.db.execute(p, () => p.exec!(regs));
     // A query run for side effects: drain it.
     this.db.execute(p, () => {
@@ -5969,7 +5983,8 @@ export abstract class PreparedStatement {
       const rows: SqlValue[][] = [];
       for (let row = c.next(); row !== null; row = c.next()) rows.push(row);
       this.checkGraphIndex(rows, params);
-      return { columns: c.columns, columnTypes: c.columnTypes, rows, ...(c.run ?? {}) };
+      const run = c.run;
+      return run === null ? { columns: c.columns, columnTypes: c.columnTypes, rows } : { columns: c.columns, columnTypes: c.columnTypes, rows, ...run };
     } finally {
       c.close();
     }
@@ -5978,19 +5993,21 @@ export abstract class PreparedStatement {
   /** Execute and return a cursor over the result rows. */
   cursor(params?: BindParams): RowCursor {
     const p = this.prog();
-    const regs = this.registers(params);
+    const regs = this.registers(p, params);
+    // How its rows are given, worked out once for the program (a cursor is made for every run).
+    const form = (p.form ??= resultForm(p.columnTypes));
     if (p.exec) {
       const run = this.db.execute(p, () => p.exec!(regs));
-      return new RowCursor(this.db, null, [], regs, p.columns, p.columnTypes, p.readonly ? null : run);
+      return new RowCursor(this.db, null, [], regs, p.columns, p.columnTypes, p.readonly ? null : run, form);
     }
     if (p.rows) {
       const rows = this.db.execute(p, () => p.rows!(regs));
       // A write with RETURNING: its counts, as `run` would give them.
       const run = p.readonly ? null : { changes: this.db.changes(), lastInsertRowid: this.db.lastInsertRowid() };
-      return new RowCursor(this.db, null, rows, regs, p.columns, p.columnTypes, run);
+      return new RowCursor(this.db, null, rows, regs, p.columns, p.columnTypes, run, form);
     }
     this.db.execute(p, () => undefined); // bump epoch
-    return new RowCursor(this.db, p.plan!, null, regs, p.columns, p.columnTypes);
+    return new RowCursor(this.db, p.plan!, null, regs, p.columns, p.columnTypes, null, form);
   }
 }
 
@@ -6106,20 +6123,14 @@ function normalizeParam(v: SqlValue | boolean | undefined, slot: number | string
 }
 
 /** Iterates result rows. Holds b-tree pins until exhausted or closed. */
-export class RowCursor {
+export class RowCursor implements OpenCursor {
   private open = false;
   private done = false;
   private i = 0;
-  /**
-   * Columns typed `bool` (ADR 0018) or a temporal type (ADR 0019): `next()` gives the first's 0 / 1 as `false` /
-   * `true` and the others' days or µs as text.
-   */
-  private readonly bools: readonly number[];
-  private readonly temporals: readonly [number, TemporalType][];
-  /** The list and struct columns (ADR 0020): given as JS arrays and objects. */
-  private readonly nested: readonly [number, NestedTypeName][];
-  /** The columns typed `any`: a typed value in one (ADR 0039) is given as its JavaScript value. */
-  private readonly anys: readonly number[];
+  /** @internal Its place among the database's open cursors (`OpenCursors`), -1 when it is not one. */
+  place = -1;
+  /** How a row's columns are given (`resultForm`). */
+  private readonly form: ResultForm;
 
   constructor(
     readonly db: Database,
@@ -6131,11 +6142,10 @@ export class RowCursor {
     readonly columnTypes: StaticType[] = columns.map(() => 'any'),
     /** A write's counts (null for a query). */
     readonly run: RunResult | null = null,
+    /** @internal `resultForm(columnTypes)`, where the caller keeps it. */
+    form?: ResultForm,
   ) {
-    this.bools = boolColumns(columnTypes);
-    this.temporals = temporalColumns(columnTypes);
-    this.nested = columnTypes.flatMap((t, i): [number, NestedTypeName][] => (isNestedType(t) ? [[i, t]] : []));
-    this.anys = columnTypes.flatMap((t, i) => (t === 'any' ? [i] : []));
+    this.form = form ?? resultForm(columnTypes);
     if (plan) {
       try {
         plan.root.open(regs);
@@ -6155,7 +6165,7 @@ export class RowCursor {
     if (this.fixedRows) {
       if (this.i < this.fixedRows.length) {
         const row = this.fixedRows[this.i++];
-        return this.bools.length === 0 && this.temporals.length === 0 && this.nested.length === 0 && this.anys.length === 0 ? row : this.converted(row.slice());
+        return this.form.plain ? row : this.converted(row.slice());
       }
       this.done = true;
       return null;
@@ -6179,15 +6189,16 @@ export class RowCursor {
     const r = this.regs;
     const row = new Array(out.length);
     for (let j = 0; j < out.length; j++) row[j] = r[out[j]];
-    return this.bools.length === 0 && this.temporals.length === 0 && this.nested.length === 0 && this.anys.length === 0 ? row : this.converted(row);
+    return this.form.plain ? row : this.converted(row);
   }
 
   /** `row` with its bool and temporal columns as results give them. */
   private converted(row: SqlValue[]): SqlValue[] {
-    if (this.bools.length) asBooleans(row, this.bools);
-    for (const [c, t] of this.temporals) row[c] = temporalText(t, row[c]);
-    for (const [c, t] of this.nested) row[c] = nestedResult(t, row[c]) as SqlValue;
-    for (const c of this.anys) row[c] = anyResult(row[c]) as SqlValue;
+    const f = this.form;
+    if (f.bools.length) asBooleans(row, f.bools);
+    for (const [c, t] of f.temporals) row[c] = temporalText(t, row[c]);
+    for (const [c, t] of f.nested) row[c] = nestedResult(t, row[c]) as SqlValue;
+    for (const c of f.anys) row[c] = anyResult(row[c]) as SqlValue;
     return row;
   }
 
@@ -6241,6 +6252,74 @@ export class RowCursor {
   }
 }
 
+
+/**
+ * How a result's rows are given, from its columns' types. Columns typed `bool` (ADR 0018) or a temporal type (ADR
+ * 0019): the first's 0 / 1 as `false` / `true`, the others' days or µs as text. The list and struct columns (ADR
+ * 0020): as JS arrays and objects. The columns typed `any`: a typed value in one (ADR 0039) as its JavaScript value.
+ * `plain`: no column is any of those, so a row is given as it is.
+ */
+interface ResultForm {
+  readonly bools: readonly number[];
+  readonly temporals: readonly [number, TemporalType][];
+  readonly nested: readonly [number, NestedTypeName][];
+  readonly anys: readonly number[];
+  readonly plain: boolean;
+}
+
+function resultForm(types: readonly StaticType[]): ResultForm {
+  const bools = boolColumns(types);
+  const temporals = temporalColumns(types);
+  const nested: [number, NestedTypeName][] = [];
+  const anys: number[] = [];
+  for (let i = 0; i < types.length; i++) {
+    const t = types[i];
+    if (isNestedType(t)) nested.push([i, t]);
+    if (t === 'any') anys.push(i);
+  }
+  return { bools, temporals, nested, anys, plain: bools.length === 0 && temporals.length === 0 && nested.length === 0 && anys.length === 0 };
+}
+
+/** What the list of open cursors holds: a cursor, or a hold on writes (`Database.holdReads`). */
+interface OpenCursor {
+  /** Its place in the list, -1 when it is not in it. */
+  place: number;
+  close(): void;
+}
+
+/**
+ * The cursors that are open, each holding its place in the list: adding and removing one are an array's push and
+ * pop. (A `Set`'s add and delete were a tenth of a small query's time.)
+ */
+class OpenCursors {
+  private readonly list: OpenCursor[] = [];
+
+  get size(): number {
+    return this.list.length;
+  }
+
+  add(c: OpenCursor): void {
+    if (c.place >= 0) return;
+    c.place = this.list.length;
+    this.list.push(c);
+  }
+
+  delete(c: OpenCursor): void {
+    const at = c.place;
+    if (at < 0) return;
+    const last = this.list.pop()!;
+    if (last !== c) {
+      this.list[at] = last;
+      last.place = at;
+    }
+    c.place = -1;
+  }
+
+  /** The open cursors, as a list of its own (closing one removes it). */
+  all(): OpenCursor[] {
+    return this.list.slice();
+  }
+}
 
 /** `r` with its temporal columns in `form` (text when left out). */
 function inForm(r: QueryResult, form: TemporalForm | undefined): QueryResult {

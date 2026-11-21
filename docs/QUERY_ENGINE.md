@@ -208,7 +208,12 @@ Decisions and their rationale: [ADR 0005](adr/0005-cost-based-optimizer.md).
 - **Join method per step**: index nested loop, hash join, or nested loop over a materialized inner side,
   whichever is cheapest for the estimated outer rows.
 - **Plan drift.** Cached plans record the table sizes they assumed and are re-planned when a table grows
-  or shrinks 4×.
+  or shrinks 4×. A run looks at the sizes only when the file's or the memory store's change counter has moved.
+- **What a run costs besides its plan.** A run checks those two counters (two numbers, once), makes its registers
+  and a cursor, and puts the cursor among the database's open cursors, which keep writes out: an array in which
+  each cursor holds its place (`OpenCursors`), so opening and closing one are a push and a pop. How its rows are
+  given (booleans, dates as text, lists, typed values under `any`) is worked out once for a compiled statement
+  (`ResultForm`), not for each cursor. On a seek that gives one row this is 0.5 µs of 2.6 less than it was.
 - **`EXPLAIN ANALYZE`** shows, per operator, the planner's estimate (rows per loop), loops, actual rows and
   inclusive time. Operators without an EXPLAIN QUERY PLAN line appear under their class name (FILTER, PROJECT, …).
 - **Generated code in joins.** Standalone scans of join sources run as fused scan + filter pipelines. Text
