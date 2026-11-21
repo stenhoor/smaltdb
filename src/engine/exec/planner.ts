@@ -82,6 +82,7 @@ import {
   Sort,
   type SortKey,
   TableAccess,
+  type ColumnUse,
   TableScan,
   Values,
   ColumnValues,
@@ -286,13 +287,16 @@ class Scope {
   constructor(readonly parent: Scope | null) {}
 }
 
-/** A Filter on a pool conjunct: compiled from its bound form (bound once, when the pool was built). */
-function filterOnConjunct(child: Operator, c: ConjunctInfo, ctx: FunctionContext): Filter {
-  if (!c.compilable) {
-    const b = c.lazy!();
-    return new Filter(child, compileBoundExpr(b, ctx).fn, b);
-  }
-  return new Filter(child, compileBoundExpr(c.bound, ctx).fn, c.bound);
+/**
+ * A Filter on a pool conjunct: compiled from its bound form (bound once, when the pool was built). `readAs` compiles
+ * it with its columns marked read by the filter's own reader (`Filter.use`), which a generated scan can take over.
+ */
+function filterOnConjunct(child: Operator, c: ConjunctInfo, ctx: FunctionContext, readAs: <T>(use: ColumnUse, f: () => T) => T): Filter {
+  const b = c.compilable ? c.bound : c.lazy!();
+  const use: ColumnUse = { gone: false };
+  const filter = new Filter(child, readAs(use, () => compileBoundExpr(b, ctx).fn), b);
+  filter.use = use;
+  return filter;
 }
 
 /** The comparison operators that can probe an index or the rowid (from a function's `compare` trait). */
@@ -488,6 +492,20 @@ export class Planner {
     readonly regs: Registers,
   ) {}
 
+  /** The reader the columns of the expression being compiled are marked read by, when it is one that may go away. */
+  private columnUse: ColumnUse | undefined = undefined;
+
+  /** Runs `f` (a compile) with the columns it reads marked as read by `use` (`TableAccess.use`). */
+  private readonly readAs = <T>(use: ColumnUse, f: () => T): T => {
+    const before = this.columnUse;
+    this.columnUse = use;
+    try {
+      return f();
+    } finally {
+      this.columnUse = before;
+    }
+  };
+
   // ================================================================ SELECT
 
   /** Resolve `OVER name` / `OVER (base ...)` against the core's WINDOW clause, like SQLite. */
@@ -495,19 +513,25 @@ export class Planner {
    * Fuse `Filter* -> full TableScan` under an ungrouped aggregate into one generated function
    * (FusedScanAggregate). Returns null when the shape or the aggregates do not qualify.
    */
-  /** Match `Filter* -> forward full TableScan`; returns the scan and the predicate ASTs (outermost last). */
-  private scanChain(src: Operator): { scan: TableScan | ColumnScan | ColumnarTableScan; preds: BoundExpr[] } | null {
+  /**
+   * Match `Filter* -> forward full TableScan`; returns the scan, the predicate ASTs (outermost last) and the filters'
+   * readers (`Filter.use`: `null` when one of them has none).
+   */
+  private scanChain(src: Operator): { scan: TableScan | ColumnScan | ColumnarTableScan; preds: BoundExpr[]; uses: ColumnUse[] | null } | null {
     if (!codegenEnabled()) return null;
     const preds: BoundExpr[] = [];
+    let uses: ColumnUse[] | null = [];
     let node: Operator = src;
     while (node instanceof Filter) {
       if (!node.expr || planHasSubquery(node.expr)) return null;
       preds.push(node.expr);
+      if (node.use === null) uses = null;
+      else uses?.push(node.use);
       node = node.child;
     }
-    if (node instanceof ColumnScan || node instanceof ColumnarTableScan) return { scan: node, preds: preds.reverse() };
+    if (node instanceof ColumnScan || node instanceof ColumnarTableScan) return { scan: node, preds: preds.reverse(), uses };
     if (!(node instanceof TableScan) || node.lo || node.hi || node.reverse) return null;
-    return { scan: node, preds: preds.reverse() };
+    return { scan: node, preds: preds.reverse(), uses };
   }
 
   private fusedAggSpecs(aggs: AggSpec[]): FusedAggSpec[] | null {
@@ -553,13 +577,18 @@ export class Planner {
     const ctx = this.env.funcCtx;
     const helpers = this.fusedHelpers(access);
     const table = access.table!;
+    // The generated code decides these conjuncts itself, on the row's bytes where it can: a column only they read
+    // is not given to the plan (it would be copied out of the page for every row that passes).
+    for (const use of chain.uses ?? []) access.decides(use);
     const build = (cap: number) => {
-      const spec = access.loaderSpec();
+      // At the first open: the plan around the scan is compiled, so what reads each column is known.
+      const reads = access.reads();
       const outs: { reg: number; type: StaticType }[] = [];
-      for (let i = 0; i < spec.decode.length; i += 2) {
-        const t = table.columns[spec.decode[i]].type;
-        outs.push({ reg: spec.decode[i + 1], type: t === 'INTEGER' ? 'int' : t === 'REAL' ? 'real' : isInt64Storage(t) ? planTypeOfStorage(t) : 'any' });
+      for (let i = 0; i < reads.length; i += 2) {
+        const t = table.columns[reads[i]].type;
+        outs.push({ reg: reads[i + 1], type: t === 'INTEGER' ? 'int' : t === 'REAL' ? 'real' : isInt64Storage(t) ? planTypeOfStorage(t) : 'any' });
       }
+      const spec = access.loaderSpec();
       for (const reg of spec.rowidRegs) outs.push({ reg, type: 'int' });
       const fill = generateScanFilter(preds, outs, cap, () => access.loaderSpec(), helpers, pipelineCompiler(ctx));
       return { fill, regs: outs.map((o) => o.reg) };
@@ -795,7 +824,7 @@ export class Planner {
     const fromRow: FromCell[] = [];
     const useOf = (f: FromCell): (() => void) => {
       const { reg, src, col } = f;
-      if (src.access) return col < 0 ? () => this.dryCompile || src.access!.useRowid(reg) : () => this.dryCompile || src.access!.use(col, reg);
+      if (src.access) return col < 0 ? () => this.dryCompile || src.access!.useRowid(reg) : () => this.dryCompile || src.access!.use(col, reg, this.columnUse);
       if (src.subReads) return () => this.dryCompile || (src.subReads![col] = true);
       if (src.rel) return () => this.dryCompile || (src.rel!.reads[col] = true);
       return () => this.dryCompile || src.external?.projection?.add(src.cols[col].name.toLowerCase());
@@ -1101,7 +1130,10 @@ export class Planner {
     // Result expressions, then ORDER BY expressions that are not results, then HAVING (planCore's order).
     const n = s.width;
     const boundOut = s.project.slice(0, n).map((e) => bind(e, readSlot));
-    const compiled = boundOut.map(compile);
+    // An output that can be skipped reads its columns as a reader that may go (`Project.uses`).
+    const skippable = boundOut.map(cannotFail);
+    const outUses: (ColumnUse | null)[] = skippable.map((can) => (can ? { gone: false } : null));
+    const compiled = boundOut.map((e, i) => (outUses[i] ? this.readAs(outUses[i]!, () => compile(e)) : compile(e)));
     const regs = outRegs ?? compiled.map(() => this.regs.alloc());
     const columns: ResultColumnInfo[] =
       given ?? compiled.map((c) => ({ name: '', type: c.type, collation: c.collSrc !== CollSrc.None ? c.collation : Collation.Binary, affinity: c.affinity }));
@@ -1161,7 +1193,8 @@ export class Planner {
     }
     const projection = new Project(root, [...compiled.map((c) => c.fn), ...extraFns], [...regs, ...extraRegs]);
     // Which outputs need not be computed when nothing reads them (`addPlannedSource` says what is read).
-    projection.canSkip = [...boundOut.map(cannotFail), ...extraFns.map(() => false)];
+    projection.canSkip = [...skippable, ...extraFns.map(() => false)];
+    projection.uses = [...outUses, ...extraFns.map(() => null)];
     root = projection;
     if (s.distinct) root = new Distinct(root, regs, s.distinct.map(collationId));
     if (sortNeeded) {
@@ -1439,7 +1472,7 @@ export class Planner {
         outerRows = Math.max(outerRows, this.tableRows(src));
         for (const c of pool) {
           if (c.placed || c.deps === null || c.deps.size === 0 || (c.minStep ?? -1) > p || ![...c.deps].every((d) => placed.has(d))) continue;
-          root = filterOnConjunct(root, c, ctx);
+          root = filterOnConjunct(root, c, ctx, this.readAs);
           c.placed = true;
         }
         continue;
@@ -1463,7 +1496,7 @@ export class Planner {
       for (const c of local) {
         if (planHasSubquery(c.bound)) localReadsOuter = true;
         else forEachSlot(c.bound, (reg) => (this.slotSource(reg, scope) ? undefined : (localReadsOuter = true)));
-        leaf = filterOnConjunct(leaf, c, ctx);
+        leaf = filterOnConjunct(leaf, c, ctx, this.readAs);
         c.placed = true;
       }
       // In joins, standalone full scans of this source run as generated scan + filter pipelines.
@@ -1505,14 +1538,14 @@ export class Planner {
       // Remaining WHERE / inner-ON conjuncts whose dependencies are now all available.
       for (const c of pool) {
         if (c.placed || c.deps === null || c.deps.size === 0 || (c.minStep ?? -1) > p || ![...c.deps].every((d) => placed.has(d))) continue;
-        root = filterOnConjunct(root, c, ctx);
+        root = filterOnConjunct(root, c, ctx, this.readAs);
         c.placed = true;
       }
     }
     // Constant / correlated-only / subquery conjuncts.
     for (const c of pool) {
       if (c.placed) continue;
-      root = filterOnConjunct(root!, c, ctx);
+      root = filterOnConjunct(root!, c, ctx, this.readAs);
       c.placed = true;
     }
     return root!;

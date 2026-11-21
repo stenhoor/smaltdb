@@ -198,7 +198,8 @@ Added 2026-11-21, with step 5b. Each number says what it compares:
 | 5a | [#283](https://github.com/stenhoor/smaltdb/pull/283), stenhoor/smaltcy#30 | Against smaltcy: label scan and filter 1.01x to 0.57x, with a literal and a parameter 2.63x and 1.64x to 0.95x and 0.67x. Relationship filter 2.64x to 1.87x, with a literal and a parameter 1.40x and 1.45x to 1.05x and 1.09x |
 | Section 3, projections | [#285](https://github.com/stenhoor/smaltdb/pull/285) | Against `main`: group by city 0.87x and 0.88x |
 | 5c | [#286](https://github.com/stenhoor/smaltdb/pull/286) | Against `main`: group by city 0.74x and 0.75x |
-| 5b | The pull request that adds this section | Below |
+| 5b | [#287](https://github.com/stenhoor/smaltdb/pull/287) | Below |
+| 5d, the columns of an output nothing reads | The pull request that adds this row | Below |
 
 ### Step 5b: where it differs from section 2
 
@@ -253,3 +254,42 @@ Still over the bar after 5b, against smaltcy: seek by name (1.04x to 1.08x) and 
 no path (1.17x to 1.19x), each under 0.04 ms, whose time is finding the kept statement; and the label scan with a
 literal in the text, at parity (1.07x and 0.99x in two full runs; this change does not touch its plan). Section 3
 has what is left in it: the columns of an output nothing reads.
+
+### Step 5d: a column nothing reads is not decoded
+
+Added 2026-11-21. Section 3's third item, and more than it names: the label scan's property map was copied out of
+the page for every row that passed because two things read it, an output nothing reads and the scan's own
+condition, which the generated scan decides on the row's bytes.
+
+- **What is built.** An expression marks the columns it reads as it is compiled, and a table's row is decoded for
+  the readers its columns have when its scan first opens. Two kinds of reader can be gone by then: an output a
+  nested plan's projection leaves out (#278), and a conjunct that a generated scan decides in its own code. A row
+  loader decodes the columns that still have a reader, and a generated scan gives the plan only those
+  (docs/QUERY_ENGINE.md, "A column nothing reads is not decoded").
+- **A node found by its id** (section 2's scan) follows it. Where nothing reads the node's props, a row the graph
+  index knows is there, and no copy of its props is made; a row it doesn't know is looked up in the table, and its
+  props are read from the lookup's row. A first build looked every such row up in the table, and the triangles took
+  6.4 to 9.5 ms (1.50x): the index had been answering for them.
+- **Not in it:** `IN` over text literals as a set, the other item of this step.
+
+Measured against the commit before it (`1d28327`, step 5b), on the statements smaltcy keeps, prepared on both
+builds, the two taking turns (the commit before first, then this change first). The gate: faster on the plans it
+changes, no slower on the others.
+
+| Statement | The commit before first | This change first |
+|---|---|---|
+| Label scan and filter | 1.144 to 0.974 ms (0.86x) | 1.151 to 0.987 ms (0.86x) |
+| A label scan that 19 rows in 20 pass | 4.554 to 3.201 ms (0.69x) | 4.496 to 3.145 ms (0.70x) |
+| All relationships | 2.773 to 2.408 ms (0.88x) | 2.664 to 2.375 ms (0.88x) |
+| Triangles (bounded) | 6.507 to 5.678 ms (0.85x) | 6.331 to 5.515 ms (0.87x) |
+| The other fourteen of smaltcy's 17 | 0.99x to 1.09x | 0.91x to 1.04x |
+
+The statement at 1.09x and 0.91x is the variable-length pattern; in six runs of it alone it read 0.91x to 1.07x.
+
+Against smaltcy, with smaltcy `main` (`4e7b43c`, whose kept statements are found by tokens) on a build of this
+change: each of the 17 reads with the same text is under the bar in three runs (0.14x to 0.89x). With a literal in
+the text the label scan reads 0.75x and 0.72x, where it reads 1.06x and 1.01x on `main` (smaltcy's benchmarks on
+the pin `13c4493`, a series of its own). One read is still at the bar or over it: the seek by name with a literal
+in the text, 1.08x and 1.05x (0.95x and 0.93x with a parameter; 1.00x and 1.01x on `main` in that series). It is
+the first case smaltcy's benchmark times, and its statements run before the code is optimized (smaltcy's
+docs/research/benchmarks.md, "A kept statement found by its tokens"). This change does not touch its plan.

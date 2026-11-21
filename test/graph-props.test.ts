@@ -218,6 +218,34 @@ describe('a node found by its id', () => {
     expect(rows(db, left)).toEqual([[5, 5, person(5)], [999, null, null], [3, 3, null]]);
   });
 
+  it('is found in memory where nothing reads its props, once its row was looked up', () => {
+    const db = open();
+    addPeople(db, [500], [{ name: 'p500' }]);
+    const props = (id: number): Props => (id === 500 ? { name: 'p500' } : person(id));
+    // A nested plan gives each node's id and props. The plan around it counts its rows: the props have no reader.
+    const nested = (ids: number[]): PlanOp => {
+      const found = p.join('inner', p.fromColumns([ids], ['int']), p.scan('person', [0, 1]), eq(p.col(1, 0, 'int'), p.col(0, 0, 'int')));
+      return p.join('cross', p.project(found, [p.col(0, 1, 'int'), p.col(0, 2, M)]), p.fromColumns([[1]], ['int']));
+    };
+    const counted = (ids: number[]) => ({ op: 'aggregate', input: nested(ids), keys: [], aggs: [{ fn: 'count', args: [], star: true, distinct: false, collation: 'binary', type: 'int' }], carry: [] }) as unknown as PlanOp;
+    const ids = [4, 3, 60, 999, 61, 500];
+    expect(explain(db, counted(ids))).toContain('SEARCH person USING GRAPH INDEX (rowid=?)');
+    expect(state(db).props).toBe(0);
+    for (let again = 0; again < 3; again++) expect(rows(db, counted(ids))).toEqual([[5]]);
+    // The rows it found are known from then on, with their props as the table has them (person 3 has none).
+    expect(state(db).props).toBe(5);
+    for (const id of [3, 4, 60, 61, 500]) expect(read(db, id)).toEqual([[id, props(id)]]);
+    expect(state(db).props).toBe(5);
+    // A row that goes is found no more, and one that comes is.
+    db.exec('DELETE FROM person WHERE id = 500');
+    expect(rows(db, counted(ids))).toEqual([[4]]);
+    expect(state(db).props).toBe(4);
+    addPeople(db, [999], [null]);
+    expect(rows(db, counted(ids))).toEqual([[5]]);
+    // With the props read around the nested plan: from the index, as a row's are.
+    expect(rows(db, p.project(nested(ids), [p.col(0, 0, 'int'), p.col(0, 1, M)]))).toEqual([4, 3, 60, 999, 61].map((id) => [id, id === 999 ? null : person(id)]));
+  });
+
   it('is read from the table by a plan whose scan names another of its columns', () => {
     const db = open();
     // A scan's columns are all a plan may read of the table: its props, with its id or its rowid or neither.
