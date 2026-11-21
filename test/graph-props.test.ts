@@ -8,12 +8,14 @@
  */
 import { describe, expect, it } from 'vitest';
 import { Database, type DatabaseOptions } from '../src/engine/database.js';
-import { GraphProps } from '../src/engine/exec/graph-props.js';
+import { GraphProps, type PropsCheck } from '../src/engine/exec/graph-props.js';
+import { MapCompare } from '../src/engine/exec/nested-ops.js';
 import { plan as p } from '../src/engine/index.js';
 import type { PlanExpr } from '../src/engine/plan/expr.js';
 import type { PlanOp } from '../src/engine/plan/ops.js';
 import type { PlanStatementInput } from '../src/engine/plan/statement.js';
 import type { PlanType } from '../src/engine/plan/types.js';
+import { encodeKey } from '../src/engine/storage/key-codec.js';
 import { MemoryVfs } from '../src/engine/vfs/memory.js';
 
 const M = 'map<text, any>' as PlanType;
@@ -155,6 +157,34 @@ describe('property maps', () => {
     expect(m.rows).toBe(50);
     for (let row = 1; row < 100; row += 2) expect(m.get(row)).toEqual(value(row, 499));
     expect(m.bytes()).toBeLessThan(4096 * 8 + 32 * 1024);
+  });
+
+  it("check a known row's map where it lies, and rule out no row they do not know", () => {
+    const m = new GraphProps();
+    const key = (k: string): Uint8Array => encodeKey([k]);
+    const is = (k: string, v: number | string): PropsCheck => ({ key: key(k), op: MapCompare.Eq, lit: encodeKey([v]) });
+    const has = (k: string): PropsCheck => ({ key: key(k), op: MapCompare.None, lit: null });
+    m.set(1, encodeKey(['age', 30, 'name', 'Ada']));
+    m.set(2, encodeKey(['age', 31]));
+    m.set(3, null);
+    m.set(4, new Uint8Array(0));
+    m.set(4096, encodeKey(['name', 'Bo']));
+    // A row is ruled out when its map fails a check: a key it lacks, or a value of the literal's kind that differs.
+    expect([1, 2, 4, 4096].map((row) => m.rulesOut(row, [is('age', 30)]))).toEqual([false, true, true, true]);
+    expect([1, 2, 4, 4096].map((row) => m.rulesOut(row, [has('name')]))).toEqual([false, true, true, false]);
+    expect([m.rulesOut(1, [is('age', 30), is('name', 'Ada')]), m.rulesOut(1, [is('age', 30), is('name', 'Bo')]), m.rulesOut(1, [is('name', 'Bo'), is('age', 30)])]).toEqual([false, true, true]);
+    // A value of another kind than the literal's is left to the conjunct. No check rules nothing out.
+    expect([m.rulesOut(1, [is('age', '30')]), m.rulesOut(1, []), m.rulesOut(2, [])]).toEqual([false, false, false]);
+    // A row with no props passes no condition on a key; a row not known is never ruled out.
+    expect([m.rulesOut(3, [has('age')]), m.rulesOut(3, [])]).toEqual([true, true]);
+    expect([0, 5, 4095, 4097, 9000, 2 ** 31 - 1].map((row) => m.rulesOut(row, [is('age', 30)]))).toEqual([false, false, false, false, false, false]);
+    // A changed row is checked on its new map, wherever the buffer was written again; a forgotten one is not known.
+    for (let round = 0; round < 300; round++) m.set(2, encodeKey(['age', round, 'pad', 'x'.repeat(50)]));
+    expect([m.rulesOut(2, [is('age', 299)]), m.rulesOut(2, [is('age', 31)]), m.rulesOut(1, [is('age', 30)]), m.rulesOut(4096, [has('name')])]).toEqual([false, true, false, false]);
+    m.forget(1);
+    expect(m.rulesOut(1, [is('age', 31)])).toBe(false);
+    m.closed = true;
+    expect([m.rulesOut(2, [is('age', 31)]), m.rulesOut(3, [has('age')])]).toEqual([false, false]);
   });
 
   it('say when they take more memory, and know no row once they are let go', () => {

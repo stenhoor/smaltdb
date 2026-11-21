@@ -5908,12 +5908,15 @@ export abstract class PreparedStatement {
     return this.prog().graphIndex === true;
   }
 
-  /** SMALT_GRAPH_INDEX_CHECK (tests): a query that read a graph index gives the same rows, in order, without it. */
+  /**
+   * SMALT_GRAPH_INDEX_CHECK (tests): a query that read a graph index gives the same rows, in order, without it. Not an
+   * EXPLAIN: its rows are the plan and what one run of it counted and took.
+   */
   private checkGraphIndex(rows: SqlValue[][], params: BindParams | undefined): void {
     if (!graphCheckOn()) return;
     const p = this.prog();
     const ix = this.db.graphIndexState;
-    if (!p.readonly || p.graphIndex !== true || ix.suspended) return;
+    if (!p.readonly || p.graphIndex !== true || ix.suspended || p.bound?.kind === 'explain') return;
     ix.suspended = true;
     const without: SqlValue[][] = [];
     try {

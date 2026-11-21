@@ -11,10 +11,12 @@ import { SmaltError } from '../errors.js';
 import type { BTreeCursor } from '../storage/btree.js';
 import { ROWID_KEY_SIZE, writeRowidKey } from '../storage/key-codec.js';
 import type { SqlValue } from '../values.js';
-import type { Fn } from './expr.js';
-import type { GraphLabels } from './graph-labels.js';
+import type { BoundExpr } from '../plan/expr.js';
+import type { MapCondition } from './codegen.js';
+import { CODEGEN_HELPERS_FOR_FUSION, type Fn } from './expr.js';
+import { type GraphLabels, LABEL_PAGE_BITS, LABEL_PAGE_WORDS } from './graph-labels.js';
 import { type GraphLists, ListCursor } from './graph-lists.js';
-import { type GraphProps, holdable } from './graph-props.js';
+import { type GraphProps, type PropsCheck, holdable } from './graph-props.js';
 import { type ExecState, type IndexScan, type Operator, RowidLookup, type TableAccess, rowidProbe } from './operators.js';
 
 export class GraphIndexScan implements Operator {
@@ -219,6 +221,126 @@ export class GraphLabelScan implements Operator {
 }
 
 /**
+ * A graph's label index asked for one label's entries: the rows its unique index on label and node gives for
+ * `label = x`, in the same order (by node), from the label's set in the graph's index in memory, without reading the
+ * index's B+tree.
+ *
+ * As {@link GraphLabelScan}, it answers from memory only when the plan reads nothing of an entry but its node and
+ * its label. The planner offers it where the plan's scan names no other column; an entry's rowid is in the table,
+ * so where the plan reads that, and when the graph isn't indexed (asked once per execution), it is the index's own
+ * scan.
+ *
+ * Where the plan then finds each node's row in its node table by this node (`rows`), the nodes whose props that scan
+ * says cannot pass the plan's conditions are not given: neither scan does anything more for them.
+ */
+export class GraphLabelEntries implements Operator {
+  readonly children: Operator[] = [];
+  private r!: SqlValue[];
+  private labels: GraphLabels | null = null;
+  private epoch = -1;
+  /** Decided when the scan first opens (planning may add columns until then). */
+  private covered: boolean | undefined;
+  private nodeReg = -1;
+  private labelReg = -1;
+  private label = '';
+  /** The label's pages, the page and word the scan is at, and the bit of that word it goes on from. */
+  private pages: readonly (Uint32Array | undefined)[] | undefined;
+  private page = 0;
+  private word = -1;
+  private from = 32;
+  /**
+   * The scan that finds each node given here in its node table, by this node as its rowid, in an inner join of the
+   * two (set by the planner): a node that scan says cannot pass the plan's conditions on its props is not given.
+   */
+  rows: GraphNodeScan | null = null;
+  private ruledOut: ((rowid: number) => boolean) | null = null;
+
+  constructor(
+    readonly access: TableAccess,
+    /** The unique index's scan with the same probe: what runs when the sets can't answer. */
+    readonly fallback: IndexScan,
+    /** The graph's label sets, or null when it isn't indexed. Asked once per execution. */
+    readonly source: () => GraphLabels | null,
+    readonly state: ExecState,
+    readonly labelKey: { readonly value: Fn; readonly convert: (v: SqlValue) => SqlValue },
+    readonly nodeCol: number,
+    readonly labelCol: number,
+    readonly labelName: string,
+  ) {}
+
+  get detail(): string {
+    return `SEARCH ${this.access.tableName} USING GRAPH INDEX (${this.labelName}=?)${this.rows === null ? '' : ` CHECKING ${this.rows.access.tableName}`}`;
+  }
+
+  open(r: SqlValue[]): void {
+    this.r = r;
+    if (this.covered === undefined) {
+      const a = this.access;
+      this.covered = a.rowidReg < 0;
+      for (let i = 0; i < a.decode.length; i += 2) {
+        if (a.decode[i] === this.nodeCol) this.nodeReg = a.decode[i + 1]!;
+        else this.labelReg = a.decode[i + 1]!;
+      }
+    }
+    if (this.covered && this.epoch !== this.state.epoch) {
+      this.epoch = this.state.epoch;
+      this.labels = this.source();
+    }
+    const labels = this.covered ? this.labels : null;
+    if (labels === null) {
+      this.fallback.open(r);
+      return;
+    }
+    const label = this.labelKey.convert(this.labelKey.value(r));
+    // A label that is not text is in no entry.
+    this.pages = typeof label === 'string' ? labels.pagesOf(label) : undefined;
+    if (typeof label === 'string') this.label = label;
+    this.page = 0;
+    this.word = -1;
+    this.from = 32;
+    this.ruledOut = this.rows === null ? null : this.rows.ruledOut(r);
+  }
+
+  next(): boolean {
+    if (!this.covered || this.labels === null) return this.fallback.next();
+    const pages = this.pages;
+    if (pages === undefined) return false;
+    const out = this.ruledOut;
+    let page = this.page;
+    let word = this.word;
+    let set = pages[page];
+    // The word is read again each time: the statement may have written the label since the last node was given.
+    let bits = set === undefined || this.from > 31 ? 0 : set[word]! & (-1 << this.from);
+    for (;;) {
+      while (bits === 0) {
+        // The next word with a node, in this page or a later one.
+        if (set === undefined || ++word >= LABEL_PAGE_WORDS) {
+          if (++page >= pages.length) return (this.pages = undefined), false;
+          set = pages[page];
+          word = -1;
+          continue;
+        }
+        bits = set[word]!;
+      }
+      const b = 31 - Math.clz32(bits & -bits);
+      bits &= bits - 1;
+      const node = page * (1 << LABEL_PAGE_BITS) + (word << 5) + b;
+      if (out !== null && out(node)) continue;
+      this.page = page;
+      this.word = word;
+      this.from = b + 1;
+      if (this.nodeReg >= 0) this.r[this.nodeReg] = node;
+      if (this.labelReg >= 0) this.r[this.labelReg] = this.label;
+      return true;
+    }
+  }
+
+  close(): void {
+    this.fallback.close();
+  }
+}
+
+/**
  * A node or edge table of an indexed graph asked for one row by its rowid (ADR 0041, section 2), by a plan that reads
  * its `props` and nothing else of the row but its rowid: a row the graph index's property maps know is given from
  * memory, without descending the table's B+tree. Where nothing reads the props either (an output of a nested plan
@@ -247,6 +369,11 @@ export class GraphNodeScan implements Operator {
   private keyValue: SqlValue = null;
   /** The table's rowid lookup for the same key: what runs for a row the maps don't know. */
   readonly fallback: RowidLookup;
+  /**
+   * Conditions on keys of the row's props that the plan's conjuncts on it need to be true (`mapKeyConditions`,
+   * codegen.ts), set by the planner for the scan that gives this one its rowids (`GraphLabelEntries.rows`).
+   */
+  conditions: readonly MapCondition[] = [];
 
   constructor(
     readonly access: TableAccess,
@@ -255,6 +382,8 @@ export class GraphNodeScan implements Operator {
     readonly state: ExecState,
     readonly key: Fn,
     readonly propsCol: number,
+    /** The key as the plan has it (lets the planner tell which scan gives it). */
+    readonly keyExpr?: BoundExpr,
   ) {
     this.fallback = new RowidLookup(access, [() => this.keyValue]);
   }
@@ -278,14 +407,34 @@ export class GraphNodeScan implements Operator {
     if (!only) this.propsReg = -1;
   }
 
-  open(r: SqlValue[]): void {
-    this.r = r;
+  /** The maps, where they can answer: asked for once per execution. */
+  private held(): GraphProps | null {
     if (!this.ready) this.prepare();
-    if (this.inMemory && this.epoch !== this.state.epoch) {
+    if (!this.inMemory) return null;
+    if (this.epoch !== this.state.epoch) {
       this.epoch = this.state.epoch;
       this.maps = this.source();
     }
-    const maps = this.inMemory ? this.maps : null;
+    return this.maps;
+  }
+
+  /**
+   * For the scan that gives this one its rowids: what tells, of a rowid, that the row cannot pass the plan's
+   * conditions on its props (`conditions`), read from the maps where the row's map lies, so that scan does not give
+   * it and this one is not opened for it. A row the maps don't know is never ruled out. Null when the maps cannot
+   * answer. Asked for when that scan opens: a parameter a condition compares with has its value of this execution
+   * (`r`).
+   */
+  ruledOut(r: SqlValue[]): ((rowid: number) => boolean) | null {
+    const maps = this.held();
+    if (maps === null) return null;
+    const checks = this.conditions.map((c): PropsCheck => ({ key: c.key, op: c.op, lit: c.param ? CODEGEN_HELPERS_FOR_FUSION.probeValue(r[c.param.index]!, c.param.numbers, c.param.text) : c.lit }));
+    return (rowid) => maps.rulesOut(rowid, checks);
+  }
+
+  open(r: SqlValue[]): void {
+    this.r = r;
+    const maps = this.held();
     const key = (this.keyValue = this.key(r));
     // The key as the rowid lookup takes it. One the maps hold no row for is the lookup's.
     let k = maps === null ? null : rowidProbe(key);

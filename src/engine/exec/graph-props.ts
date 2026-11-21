@@ -12,6 +12,7 @@
  */
 
 import { type SqlValue, TypedValue } from '../values.js';
+import { type MapCompare, mapProbe } from './nested-ops.js';
 
 const PAGE_BITS = 12;
 const PAGE = 1 << PAGE_BITS;
@@ -22,6 +23,13 @@ const NULL_PROPS = -2;
 
 /** A props value the maps can hold: a map's bytes as a row stores them, or NULL. */
 export const holdable = (v: SqlValue): v is Uint8Array | null => v === null || (v instanceof Uint8Array && !(v instanceof TypedValue));
+
+/** A condition on one key of a row's props, as `mapProbe` (nested-ops.ts) checks it on a map's bytes. */
+export interface PropsCheck {
+  readonly key: Uint8Array;
+  readonly op: MapCompare;
+  readonly lit: Uint8Array | null;
+}
 
 export class GraphProps {
   private buf = new Uint8Array(0);
@@ -60,6 +68,27 @@ export class GraphProps {
     const s = p[i]!;
     if (s < 0) return s === NULL_PROPS ? null : undefined;
     return this.buf.slice(s, this.ends[page]![i]!);
+  }
+
+  /**
+   * Whether a row's props rule out one of `checks`, each a condition a plan needs to be true of them: the row is known
+   * and has NULL props, or a map that fails one. The map is read where it lies, with no copy. False for a row not
+   * known: its reader reads the table.
+   */
+  rulesOut(rowid: number, checks: readonly PropsCheck[]): boolean {
+    const page = rowid >>> PAGE_BITS;
+    const p = this.starts[page];
+    if (p === undefined || this.closed) return false;
+    const i = rowid & MASK;
+    const s = p[i]!;
+    if (s < 0) return s === NULL_PROPS;
+    const e = this.ends[page]![i]!;
+    const buf = this.buf;
+    for (let c = 0; c < checks.length; c++) {
+      const x = checks[c]!;
+      if (!mapProbe(buf, s, e, x.key, x.op, x.lit)) return true;
+    }
+    return false;
   }
 
   /** The row's slot, with its bytes (if it had any) counted dead. */

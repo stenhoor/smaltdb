@@ -128,8 +128,15 @@ relation, reads a node's relationships of every type from it (`SEARCH RELATIONSH
 - **Labels too:** the index also holds the graph's [label index](#nodes-with-several-labels), which nodes have which labels,
   where that table has a unique index on its node and label (the one `addLabelIndex` makes has). A plan that asks
   whether one node has one label (`node = x AND label = 'L'`) is answered from it: `EXPLAIN` shows
-  `SEARCH <table> USING GRAPH INDEX (label=? AND node=?)`. A plan that reads the entry's rowid or another column reads
-  the table.
+  `SEARCH <table> USING GRAPH INDEX (label=? AND node=?)`. So is a plan that asks for one label's nodes
+  (`label = 'L'`), in the order of their ids, where the unique index has the label first:
+  `SEARCH <table> USING GRAPH INDEX (label=?)`. A plan that reads the entry's rowid or another column reads the
+  table.
+- **A label's nodes, checked in memory:** where a plan joins a label's nodes with their rows in a node table whose
+  property maps the index remembers (next), and has conditions on a property (`map_get(props, 'k')` compared with a
+  number or text, or a key that must be there), a node whose remembered map cannot pass them is skipped before its
+  row is asked for: `EXPLAIN` shows `SEARCH <labels> USING GRAPH INDEX (label=?) CHECKING <nodes>`. The rows are the
+  same. The first such read of a label reads each of its nodes' rows from the table; later ones read the maps.
 - **Properties too:** the index remembers the property maps of rows that are read by their rowid, in the graph's
   node and edge tables that name a `props` column
   ([ADR 0041](../../adr/0041-properties-in-the-graph-index.md)). A relationship's `props` in `relationships` is read
