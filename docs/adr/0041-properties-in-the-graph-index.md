@@ -285,6 +285,10 @@ changes, no slower on the others.
 | The other fourteen of smaltcy's 17 | 0.99x to 1.09x | 0.91x to 1.04x |
 
 The statement at 1.09x and 0.91x is the variable-length pattern; in six runs of it alone it read 0.91x to 1.07x.
+The relationship filter read 1.02x and 1.04x, so it was run alone sixteen times: 1.02x on average (0.98x to
+1.06x). This build against a second copy of itself reads 1.01x on that statement, on average of sixteen runs (0.97x
+to 1.05x): the measurement times the second engine it loads a little slower, and tells no difference under about
+3%. The two builds make the same plan for it, and no code it runs for a row is changed.
 
 Against smaltcy, with smaltcy `main` (`4e7b43c`, whose kept statements are found by tokens) on a build of this
 change: each of the 17 reads with the same text is under the bar in three runs (0.14x to 0.89x). With a literal in
