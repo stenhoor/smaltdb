@@ -15,6 +15,12 @@ import { typedResult } from './nested.js';
  */
 export type Params = readonly (SqlValue | boolean | undefined)[] | Readonly<Record<string, SqlValue | boolean>>;
 
+/**
+ * A plan's parameters: positional. Besides what `Params` holds, a parameter the plan reads as a list, struct or map
+ * (ADR 0020, "Parameters") takes a JS array, an object or a `Map`, as a column of `values` of that type takes one.
+ */
+export type PlanParams = readonly (SqlValue | boolean | undefined | readonly unknown[] | { readonly [field: string]: unknown } | ReadonlyMap<string, unknown>)[];
+
 export interface OpenRequest {
   op: 'open';
   name: string;
@@ -42,10 +48,10 @@ export type Request = { id: number } & (
    * `encodeDataJSON`), in plan format `planVersion`. Parameters are positional.
    */
   /** `data`: the plan's typed arrays (values given as columns), which its JSON refers to as `{$data: i}`; `transfer`: their buffers were handed over. */
-  | { op: 'queryPlan'; plan: string; planVersion: number; data?: unknown[]; transfer?: true; params?: readonly (SqlValue | boolean | undefined)[]; batchSize?: number; credit?: number }
+  | { op: 'queryPlan'; plan: string; planVersion: number; data?: unknown[]; transfer?: true; params?: PlanParams; batchSize?: number; credit?: number }
   | { op: 'preparePlan'; plan: string; planVersion: number; data?: unknown[]; transfer?: true }
-  | { op: 'stmtRun'; stmt: number; params?: Params }
-  | { op: 'stmtQuery'; stmt: number; params?: Params; batchSize?: number; credit?: number }
+  | { op: 'stmtRun'; stmt: number; params?: Params | PlanParams }
+  | { op: 'stmtQuery'; stmt: number; params?: Params | PlanParams; batchSize?: number; credit?: number }
   | { op: 'finalize'; stmt: number }
   /** The logical catalog as plain data (engine/plan/catalog.ts `CatalogData`), in the reply's `value`. */
   | { op: 'catalog' }

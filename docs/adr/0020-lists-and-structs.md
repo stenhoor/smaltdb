@@ -148,3 +148,25 @@ Each as recommended. The questions as they were put, with the recommendation tak
 5. **Maps.**
    - **Recommendation:** a map is a `list<struct<key K, value V>>`, as Arrow and Parquet store it, with no map type.
    - **Alternative:** a `map<K, V>` type with key lookup.
+
+## Parameters (2026-11-21)
+
+Added after the steps above, for statements that are kept and run again (issue #274).
+
+- **A parameter read as a list, struct or map takes a JS array or object.** A plan names each parameter's type
+  (`param(0, 'map<text, any>')`). A parameter of a list, struct or map type is bound with the JS value a column of
+  `values` of that type takes (section 5): an array for a list; an object, or an array by position, for a struct; an
+  object or a `Map` for a map. The engine makes the type's bytes of it when the statement runs (`encodeNested`), and
+  the parameter has that static type, so the list, struct and map operations read it as they read a column.
+- **Why.** A statement kept and run again could not be given a list or a map. A language that writes rows holding
+  them (smaltcy: a node's properties) wrote each value into the plan, as a column of `values`, so every statement was
+  a plan of its own, planned from nothing. Measured on the graph of smaltcy's benchmark (20,008 nodes), a node row and
+  its label entry written by two statements, the two ways taking turns (two runs; the medians of 30 batches of 300):
+  45 and 45 µs with the values in the plans, 13 and 14 µs as two kept statements whose values are parameters.
+- **What is bound is checked.** NULL, or an array or object that is a value of the type; anything else is
+  `SMALT_MISMATCH`. Bytes are not taken, though a column of `values` takes them: nothing checks that bytes are a
+  value of the type, and a parameter's value comes from whoever runs the statement.
+- **One type for a parameter.** A parameter read as a list, struct or map in one place and as another type in another
+  is refused when the statement is prepared (`SMALT_PLAN`): it is encoded once, for one type.
+- **Not changed.** A parameter of any other type (`any` too) is whatever value is bound and takes no array or
+  object, as before. SQL statements bind as their language says.
