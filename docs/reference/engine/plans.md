@@ -256,7 +256,8 @@ section 2.2), whatever tables its types are in. A row is a relationship at one o
 - **Where it reads.** At a node it reads [the graph's index](./schema#the-graph-index) in memory. Without one (a reader,
   a graph the index can't hold) it reads each type's table through its indexes on `(start, end)` and `(end, start)`,
   or the table itself where one is missing. The rows are the same either way.
-- **`props`** is read from the relationship's row, and only when the plan reads the column.
+- **`props`** is read only when the plan reads the column: from the relationship's row the first time, and from the
+  graph index, which remembers it, after that.
 - **`asOf`** reads the graph as it was after a commit, as a scan's does; the graph must keep history. A past version is
   read from the tables' history, whole.
 - **Order:** none is promised. A plan that needs one sorts.

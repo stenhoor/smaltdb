@@ -14,7 +14,8 @@ import type { SqlValue } from '../values.js';
 import type { Fn } from './expr.js';
 import type { GraphLabels } from './graph-labels.js';
 import { type GraphLists, ListCursor } from './graph-lists.js';
-import type { ExecState, IndexScan, Operator, TableAccess } from './operators.js';
+import { type GraphProps, holdable } from './graph-props.js';
+import { type ExecState, type IndexScan, type Operator, RowidLookup, type TableAccess, rowidProbe } from './operators.js';
 
 export class GraphIndexScan implements Operator {
   readonly children: Operator[] = [];
@@ -209,6 +210,117 @@ export class GraphLabelScan implements Operator {
     this.found = false;
     if (this.nodeReg >= 0) this.r[this.nodeReg] = this.node;
     if (this.labelReg >= 0) this.r[this.labelReg] = this.label;
+    return true;
+  }
+
+  close(): void {
+    this.fallback.close();
+  }
+}
+
+/**
+ * A node or edge table of an indexed graph asked for one row by its rowid (ADR 0041, section 2), by a plan that reads
+ * its `props` and nothing else of the row but its rowid: a row the graph index's property maps know is given from
+ * memory, without descending the table's B+tree.
+ *
+ * A row they don't know is read by the table's own rowid lookup, and they are told the props of the row it found.
+ * The lookup also runs for a key the maps hold no row for (not a whole number from 0 to 2^31 - 1), and for every row
+ * when the index holds no maps for the table (asked once per execution: the graph isn't indexed, or its maps didn't
+ * fit).
+ */
+export class GraphNodeScan implements Operator {
+  readonly children: Operator[] = [];
+  private r!: SqlValue[];
+  private maps: GraphProps | null = null;
+  private epoch = -1;
+  /** The register of the row's props; -1 until the scan first opens, or where the plan doesn't read them. */
+  private propsReg = -1;
+  private ready = false;
+  /** What `next` does: nothing more, the row from memory, the lookup's row, or the lookup's row told to the maps. */
+  private mode: 'none' | 'held' | 'lookup' | 'learn' = 'none';
+  private rowid = -1;
+  private props: SqlValue = null;
+  /** The key of this opening, computed once: the lookup takes it from here. */
+  private keyValue: SqlValue = null;
+  /** The table's rowid lookup for the same key: what runs for a row the maps don't know. */
+  readonly fallback: RowidLookup;
+
+  constructor(
+    readonly access: TableAccess,
+    /** The table's property maps in its graph's index, or null when it holds none. Asked once per execution. */
+    readonly source: () => GraphProps | null,
+    readonly state: ExecState,
+    readonly key: Fn,
+    readonly propsCol: number,
+  ) {
+    this.fallback = new RowidLookup(access, [() => this.keyValue]);
+  }
+
+  get detail(): string {
+    return `SEARCH ${this.access.tableName} USING GRAPH INDEX (rowid=?)`;
+  }
+
+  /** Once, when the scan first opens: what the plan reads of the row is known by then. */
+  private prepare(): void {
+    this.ready = true;
+    const d = this.access.decode;
+    // The planner offers this scan where the plan may read no column but the props: any other is in the table.
+    let only = true;
+    for (let i = 0; i < d.length; i += 2) {
+      if (d[i] === this.propsCol) this.propsReg = d[i + 1]!;
+      else only = false;
+    }
+    if (!only) this.propsReg = -1;
+  }
+
+  open(r: SqlValue[]): void {
+    this.r = r;
+    if (!this.ready) this.prepare();
+    if (this.propsReg >= 0 && this.epoch !== this.state.epoch) {
+      this.epoch = this.state.epoch;
+      this.maps = this.source();
+    }
+    const maps = this.propsReg >= 0 ? this.maps : null;
+    const key = (this.keyValue = this.key(r));
+    // The key as the rowid lookup takes it. One the maps hold no row for is the lookup's.
+    let k = maps === null ? null : rowidProbe(key);
+    if (typeof k === 'bigint' && k >= 0n && k <= 2147483647n) k = Number(k);
+    if (maps === null || typeof k !== 'number' || k < 0 || k > 2147483647 || !Number.isInteger(k)) {
+      this.mode = 'lookup';
+      this.fallback.open(r);
+      return;
+    }
+    this.rowid = k;
+    const props = maps.get(k);
+    if (props === undefined) {
+      this.mode = 'learn';
+      this.fallback.open(r);
+    } else {
+      this.mode = 'held';
+      this.props = props;
+    }
+  }
+
+  next(): boolean {
+    const mode = this.mode;
+    if (mode === 'lookup') return this.fallback.next();
+    if (mode === 'none') return false;
+    const r = this.r;
+    if (mode === 'learn') {
+      // The lookup's one row, which the maps know from here on, or none. After it the lookup says there is no other.
+      this.mode = 'lookup';
+      if (!this.fallback.next()) return false;
+      const props = r[this.propsReg]!;
+      if (holdable(props)) this.maps!.set(this.rowid, props);
+      return true;
+    }
+    this.mode = 'none';
+    const a = this.access;
+    if (a.rowidReg >= 0) {
+      r[a.rowidReg] = this.rowid;
+      for (const x of a.extraRowidRegs) r[x] = this.rowid;
+    }
+    r[this.propsReg] = this.props;
     return true;
   }
 

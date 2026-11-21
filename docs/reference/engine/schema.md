@@ -130,13 +130,24 @@ relation, reads a node's relationships of every type from it (`SEARCH RELATIONSH
   whether one node has one label (`node = x AND label = 'L'`) is answered from it: `EXPLAIN` shows
   `SEARCH <table> USING GRAPH INDEX (label=? AND node=?)`. A plan that reads the entry's rowid or another column reads
   the table.
+- **Properties too:** the index remembers the property maps of rows that are read by their rowid, in the graph's
+  node and edge tables that name a `props` column
+  ([ADR 0041](../../adr/0041-properties-in-the-graph-index.md)). A relationship's `props` in `relationships` is read
+  this way. So is a row of such a table found by its rowid, where the plan's scan names its `props` and nothing else
+  but its id: `EXPLAIN` shows `SEARCH <table> USING GRAPH INDEX (rowid=?)`. The first read of a row comes from the
+  table; later reads come from memory. A scan that names another column reads the row each time. A remembered row
+  is followed when its props change, and forgotten when it is deleted.
 - **Built on first use** from the endpoint indexes, and kept as rows are written, by any language. It is never written
   to the file, so opening a database costs nothing, and the first statement that reads a graph builds its index.
 - **Dropped and built again** when a rollback undid a change to it (of a statement, a savepoint or a transaction), or
-  when the graph's edge tables change.
+  when the graph's edge tables change. A rollback of a transaction that wrote a table whose property maps are
+  remembered, or that read a row through them, makes the index forget those maps' rows: they are read from the
+  tables again as they are asked for.
 - **Not held** for a graph with a node id or a relationship rowid outside 0 to 2^31 - 1, or that needs more memory
   than `graphIndexMem` ([options](../api/engine), 256 MiB by default; `0` turns graph indexes off). Its plans read the
-  B+trees, with the same results.
+  B+trees, with the same results. The property maps count towards the limit and are given up first: a graph whose
+  lists and labels fit and whose remembered properties don't keeps its hops in memory and reads properties from the
+  tables.
 - **Readers hold none:** a [parallel reader](../../ARCHITECTURE.md) reads the B+trees, and a statement that reads a
   graph index runs on the engine that writes.
 

@@ -17,9 +17,10 @@ import { KEY_AFTER_NULL, decodeKey, rowidSuffixStart } from '../storage/key-code
 import { RecordReader, isInt64Storage } from '../storage/record.js';
 import { endpointIndex, labelKeyIndex } from './graph-index.js';
 import type { GraphLabels } from './graph-labels.js';
+import type { GraphProps } from './graph-props.js';
 import { PATHS_FUNCTION } from './plan-normalize.js';
 import type { GraphLists } from './graph-lists.js';
-import { GraphIndexScan, GraphLabelScan } from './graph-scan.js';
+import { GraphIndexScan, GraphLabelScan, GraphNodeScan } from './graph-scan.js';
 import { type RelationshipKey, type RelationshipLists, type RelationshipType, RelationshipsScan } from './graph-relationships.js';
 import { relationshipEdges } from './plan-normalize.js';
 import { Collation, type SqlValue, normalizeInt } from '../values.js';
@@ -149,6 +150,11 @@ export interface PhysicalEnv {
    * the graph's label sets, asked when a scan opens (null when the graph isn't indexed then).
    */
   graphLabels?(table: TableSchema): { node: number; label: number; labels(): GraphLabels | null } | undefined;
+  /**
+   * A node or edge table of a property graph whose property maps its index may hold (ADR 0041): its `props` column,
+   * and the maps, asked when a scan opens (null when the index holds none then).
+   */
+  graphProps?(table: TableSchema): { column: number; maps(): GraphProps | null } | undefined;
   /** M8: an external table by name (its columns from the catalog; its rows once loaded). */
   externalTable?(name: string): ExternalScan | undefined;
   /** M8: a table function over external data (`read_csv`, `read_json`) called with constant arguments; undefined for other functions. */
@@ -162,6 +168,8 @@ export interface PlannedGraph {
   readonly edges: readonly { readonly type: string; readonly table: TableSchema; readonly start: number; readonly end: number; readonly props: number }[];
   readonly indexed: boolean;
   lists(): RelationshipLists | null;
+  /** The property maps the graph's index holds for the edge table at a position, or null when it holds none. */
+  props(type: number): GraphProps | null;
 }
 
 /** The names of a `relationships` operation's columns (`RELATIONSHIP_TYPES`). */
@@ -1937,6 +1945,17 @@ export class Planner {
           const leaf = new RowidLookup(access, [compileBoundExpr(pr.other, ctx).fn]);
           return { leaf, dependsOnOuter: pr.deps.size > 0, consumed: [pr.conj] };
         });
+        // A table whose property maps its graph's index may hold, read for its props and nothing else but its rowid:
+        // a row read this way before is in memory (ADR 0041). A scan's columns are all it may read, so a plan that
+        // could read another column is not offered this. Its scan runs this lookup for a row the index doesn't know.
+        const held = this.env.graphProps?.(table);
+        const reads = src.reads ?? src.cols.map((c) => c.index);
+        if (held && reads.includes(held.column) && reads.every((c) => c === -1 || c === table.rowidAlias || c === held.column)) {
+          consider('rowid= graph', Math.min(COST.graphOpen, seek(1)), 1, pr.deps.size > 0, () => {
+            const leaf = this.graphNodeScan([access, () => held.maps(), this.env.state, compileBoundExpr(pr.other, ctx).fn, held.column]);
+            return { leaf, dependsOnOuter: pr.deps.size > 0, consumed: [pr.conj] };
+          });
+        }
       } else if (pr.op === 'in') {
         const k = pr.list!.length;
         consider('rowid in', seek(k), k, pr.deps.size > 0, () => ({ leaf: new RowidLookup(access, pr.list!.map((x) => compileBoundExpr(x, ctx).fn)), dependsOnOuter: pr.deps.size > 0, consumed: [pr.conj] }));
@@ -2418,11 +2437,17 @@ export class Planner {
           if (e.props >= 0) access.use(e.props, props);
         },
         fetch,
+        held: () => rel.graph.props(rel.graph.edges.indexOf(e)),
       };
     });
     // A scan at a node reads the graph's index: the statement runs where the index is.
     if (keys.length > 0 && rel.graph.indexed && !this.dryCompile) this.readsGraphIndex = true;
     return new RelationshipsScan(rel.graph.name, rel.direction, types, rel.edges.length === rel.graph.edges.length, regs, rel.reads, () => rel.graph.lists(), this.env.state, nodeKey, otherKey);
+  }
+
+  private graphNodeScan(args: ConstructorParameters<typeof GraphNodeScan>): GraphNodeScan {
+    if (!this.dryCompile) this.readsGraphIndex = true;
+    return new GraphNodeScan(...args);
   }
 
   private graphLabelScan(args: ConstructorParameters<typeof GraphLabelScan>): GraphLabelScan {
