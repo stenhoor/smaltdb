@@ -1,8 +1,9 @@
 # ADR 0041: Properties in the graph index, and what else the reads over the bar need
 
-- **Status:** proposed, for the owner's review (2026-11-20). Section 1 is built and in review
-  ([#283](https://github.com/stenhoor/smaltdb/pull/283)); nothing else here is built. The numbers marked "by hand" come
-  from a spike that was measured and thrown away.
+- **Status:** merged 2026-11-20 ([#284](https://github.com/stenhoor/smaltdb/pull/284)) without answers to its two
+  questions, so the steps follow what it proposes. Built: sections 1 and 2, and the first two of section 3; see
+  [As built](#as-built) for the pull requests, what they measured and where they differ from the text. The numbers
+  marked "by hand" come from a spike that was measured and thrown away.
 - **Date:** 2026-11-20
 - **Builds on:** [ADR 0040](0040-graph-index-and-relationships.md), whose step 5 is "Properties kept in memory, by
   column (its own record first)": this is that record, and it differs from that line on one point (section 2).
@@ -108,10 +109,11 @@ in one buffer, with where each row's begins and ends, by rowid.
 What reads it:
 
 - **`relationships`' `props` column.** Today the relationship's row is fetched by rowid when a plan reads its
-  properties. With the maps held, the column is a view of the map's bytes.
+  properties. With the maps held, the column is the map's bytes from memory (a copy of them: see
+  [As built](#as-built)).
 - **A node found by its id.** A plan that seeks a node table by rowid and reads only its id and its `props` gets one
   more access path beside the rowid lookup, as the label check did in #282: `SEARCH <table> USING GRAPH INDEX
-  (rowid=?)`. The node is there if the index has its row, and its `props` is a view of the bytes. A plan that reads
+  (rowid=?)`. The node is there if the index has its row, and its `props` is the bytes from memory. A plan that reads
   another column, a table without a `props` column and a graph that isn't indexed run the rowid lookup, as today.
 - **Not scans.** A scan of a node or edge table reads its pages, where a generated scan checks a key of a map on the
   stored bytes at 32 ns a row (section 1's 0.64 ms for 20,000 rows).
@@ -159,17 +161,95 @@ pull request that finds it says what is left, measured.
 
 - Reads of a relationship's or a node's properties by id come from memory on the writing engine; storage, the file
   format and durability don't change.
-- Memory: one more copy of every property map of an indexed graph whose properties are read by id, 1.6 MB for the
-  benchmark's graph, under the lists' limit and let go before them.
-- A write to a node or edge table with a `props` column also copies the row's map. Measured when built; the gate is
-  no write slower.
-- The first statement that reads a table's properties by id scans that table once.
+- Memory: one more copy of the property map of every row of an indexed graph that is read by id, under the lists'
+  limit and let go before them. (As proposed: of every row of a table whose properties are read by id, 1.6 MB for
+  the benchmark's graph. See [As built](#as-built).)
+- A write to a node or edge table with a `props` column copies the row's map again where the index knows the row
+  and its props change. (As proposed: every write copies it.)
+- A row's first read by id costs more than it did, once; no table is scanned. (As proposed: the first statement
+  that reads a table's properties by id scans that table once.)
 - Reader workers and `asOf` reads run as today, as with the lists (ADR 0040).
-- Nothing changes for smaltql, smaltdf, smaltts or the plugins. smaltcy changes a few lines for 5a and nothing for
-  5b to 5d.
+- Nothing changes for smaltql, smaltdf, smaltts or the plugins. smaltcy changes a few lines for 5a. For 5b it
+  changes two tests that asserted a seek of a property's index on a label of 17 nodes, which the planner now reads
+  from the graph index. (As proposed: nothing for 5b to 5d.)
 
 ## Questions for the owner
 
 1. **By row, not by column** (section 2): a change from ADR 0040's wording, on the measurements above. Agreed?
 2. **The memory:** a second copy of the graph's property maps, under the same limit as the lists (256 MB by
    default), given up first. Acceptable, or its own limit?
+
+Neither was answered before this record was merged. Step 5b is built as proposed on both: by row, and under the
+lists' limit, given up first.
+
+## As built
+
+Added 2026-11-21, with step 5b. Each number says what it compares:
+
+- **Against smaltcy:** smaltdb's time over the time of smaltcy's in-memory engine, on the same Cypher and the same
+  network (20,008 nodes, 60,025 relationships), the engines taking turns, from smaltcy's benchmarks. This is the bar:
+  1.00x or less.
+- **Against `main`:** smaltdb with the change over smaltdb `main` without it, on the statements smaltcy keeps for its
+  17 benchmark queries, prepared on both, the two taking turns. It says what one change did, and nothing about
+  smaltcy.
+
+| Step | Pull requests | Measured |
+|---|---|---|
+| 5a | [#283](https://github.com/stenhoor/smaltdb/pull/283), stenhoor/smaltcy#30 | Against smaltcy: label scan and filter 1.01x to 0.57x, with a literal and a parameter 2.63x and 1.64x to 0.95x and 0.67x. Relationship filter 2.64x to 1.87x, with a literal and a parameter 1.40x and 1.45x to 1.05x and 1.09x |
+| Section 3, projections | [#285](https://github.com/stenhoor/smaltdb/pull/285) | Against `main`: group by city 0.87x and 0.88x |
+| 5c | [#286](https://github.com/stenhoor/smaltdb/pull/286) | Against `main`: group by city 0.74x and 0.75x |
+| 5b | The pull request that adds this section | Below |
+
+### Step 5b: where it differs from section 2
+
+A first build did what section 2 says: a table's maps read in by one scan on the first read through the index, and
+every write to such a table copied into them. It was measured and changed in three ways. The reads it speeds up read
+the same either way (against `main`: relationship filter 0.32x, group by city 0.69x to 0.71x, triangles 0.60x to
+0.63x on the first build; 0.34x, 0.70x and 0.62x to 0.64x on the one kept).
+
+1. **A row's map is remembered when the row is first read by its rowid. No table is read in.** Reading in the
+   node table's maps took 25.8 ms for 20,008 rows (the median of five; 19.2 to 50.7), and an edge table's 12.2 ms for
+   40,025. One lookup of one node paid for the whole table, and so did the first read after every rollback that
+   undid a property. As built, a row the index doesn't know is found by the table's rowid lookup, as before, and
+   known from then on; the index holds the rows that were asked for.
+2. **A write follows only a row the index knows, and only where its props change.** A new row is not read in, and a
+   deleted row is forgotten. Copying every written row's map cost 3% on creating 1,000 nodes and 1.5% on merging
+   1,000 new ones (means of eight runs, the first build with its maps against the same build without them).
+3. **A rollback makes the index forget the rows it remembers, where the transaction wrote a table of theirs or
+   remembered a row.** The maps keep their memory, and their rows are read again as they are asked for. Any other
+   rollback leaves them.
+
+Two more points the text left open:
+
+- **A reader gets a copy of the row's map, not a view.** A view measured 8% to 11% faster on the relationship filter
+  and on triangles and 1% to 2% on group by city (against the first build with copies). It is not taken: a view is
+  a window on the index's own buffer, and a value that reached a caller through one (a result's bytes, or a part of
+  a map that an operation gives without copying) would let the caller change what the index holds. A row decoded
+  from a page is a copy for the same reason.
+- **Which plans read a row by its rowid from the index** is decided when the plan is made, from the columns its scan
+  names: its `props`, and nothing else but its id. So the planner never costs as a read from memory a lookup that
+  must fetch the row. smaltql's scans name every column of a table, so SQL reads this way only a table whose columns
+  are its id and its `props`. The path is costed as a read from memory, so on a label of a few nodes the planner now
+  reads the label's nodes by id where it sought a property's index (with 17 nodes of the label; not with 117).
+
+### Step 5b: measured against its gate
+
+- **The relationship filter, against smaltcy:** 0.60x to 0.66x with the same text (three runs); with a literal and a
+  parameter 0.84x and 0.76x, then 0.76x and 0.72x (two runs). It was 1.87x, and 1.05x and 1.09x.
+- **Group by city, against smaltcy:** 0.87x, 0.87x and 0.93x (three runs). It was 1.85x. Against `main`: 24.1 to
+  16.4 ms and 24.7 to 17.4 ms (0.70x).
+- **The other reads, against `main`:** triangles 0.62x and 0.64x. Thirteen statements run the same plan and read
+  0.96x to 1.08x in the two runs; the one that read 1.08x read 0.96x to 1.04x in eight runs of it alone.
+- **Writes, the build with its maps against the same build without them** (smaltcy's nine write cases, eight runs):
+  each case's mean is 0.98x to 1.03x. With the index kept against graph indexes off, the gate as it was worded: 0.85x
+  to 1.01x.
+- **A row's first read** costs more than a read without the maps, once: with the maps just cleared, group by city
+  took 26.3 to 27.2 ms against 23.8 to 25.2 ms without maps, and 15.2 to 16.1 ms on every run after; the
+  relationship filter 1.47 to 1.59 ms against 1.19 to 1.27 ms, and 0.41 to 0.45 ms after.
+- **Memory:** the lists and labels take 3.29 MB. The 20,008 node rows group by city reads take 1.23 MB more, and the
+  1,594 relationship rows the relationship filter reads 0.52 MB, most of it the pages of offsets their rowids fall on.
+
+Still over the bar after 5b, against smaltcy: seek by name (1.04x to 1.08x) and a shortest path with a direction and
+no path (1.17x to 1.19x), each under 0.04 ms, whose time is finding the kept statement; and the label scan with a
+literal in the text, at parity (1.07x and 0.99x in two full runs; this change does not touch its plan). Section 3
+has what is left in it: the columns of an output nothing reads.

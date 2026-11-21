@@ -157,7 +157,7 @@ export class TableAccess {
 }
 
 /** Convert a probe value for a rowid comparison: number, or 'text' (sorts above all numbers), or null. */
-function rowidProbe(v: SqlValue): number | bigint | 'text' | null {
+export function rowidProbe(v: SqlValue): number | bigint | 'text' | null {
   if (v === null) return null;
   const n = applyNumericAffinity(v);
   if (typeof n === 'number' || typeof n === 'bigint') return n;

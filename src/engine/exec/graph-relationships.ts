@@ -21,6 +21,7 @@ import { ROWID_KEY_SIZE, writeRowidKey } from '../storage/key-codec.js';
 import { type SqlValue, compareValues } from '../values.js';
 import type { Fn } from './expr.js';
 import { type GraphLists, ListCursor } from './graph-lists.js';
+import { type GraphProps, holdable } from './graph-props.js';
 import type { ExecState, Operator, TableAccess } from './operators.js';
 
 /** The largest node id a graph's index holds. */
@@ -51,6 +52,12 @@ export interface RelationshipType {
   readonly readProps: () => void;
   /** The table by rowid, giving a row's props to the scan's own `props` register; null when the table has none. */
   readonly fetch: TableAccess | null;
+  /**
+   * The table's property maps in the graph's index (ADR 0041), or null when the index holds none. A row they know
+   * is read from them; any other is fetched, and they then know it. Asked once per execution, and only by a scan
+   * that reads props through the index.
+   */
+  readonly held: () => GraphProps | null;
 }
 
 /** The lists of a graph's index: by start node and by end node. */
@@ -121,6 +128,8 @@ export class RelationshipsScan implements Operator {
   private lastRowid = -1;
   private readonly tabs: (BTreeCursor | undefined)[] = [];
   private readonly keyBuf = new Uint8Array(ROWID_KEY_SIZE);
+  /** By a type's position: its property maps in the index, for this execution (null: none, every row is fetched). */
+  private readonly maps: (GraphProps | null)[] = [];
 
   // Without it.
   private sub: Operator | null = null;
@@ -185,6 +194,7 @@ export class RelationshipsScan implements Operator {
     if (this.epoch !== this.state.epoch) {
       this.epoch = this.state.epoch;
       this.lists = this.near ? this.source() : null;
+      if (this.lists !== null && this.propsReg >= 0) for (const t of this.types) this.maps[t.position] = t.fetch === null ? null : t.held();
     }
     this.sub?.close();
     this.sub = null;
@@ -313,18 +323,33 @@ export class RelationshipsScan implements Operator {
     }
   }
 
-  /** A relationship's props, from its row. */
+  /**
+   * A relationship's props: from the index's property maps where they know the row, else from its row, which they
+   * know from then on.
+   */
   private fetchProps(t: RelationshipType, rowid: number): void {
     const access = t.fetch;
     if (access === null) {
       this.r[this.propsReg] = null;
       return;
     }
+    const maps = this.maps[t.position];
+    if (maps) {
+      const props = maps.get(rowid);
+      if (props !== undefined) {
+        this.r[this.propsReg] = props;
+        return;
+      }
+    }
     let tab = this.tabs[t.position];
     if (tab === undefined) tab = this.tabs[t.position] = access.tree.cursor();
     writeRowidKey(this.keyBuf, 0, rowid);
     if (!tab.seek(this.keyBuf) || tab.compareKey(this.keyBuf) !== 0) throw new SmaltError('SMALT_CORRUPT', `graph index of ${access.tableName} references missing row ${rowid}`);
     access.load(tab, this.r);
+    if (maps) {
+      const read = this.r[this.propsReg]!;
+      if (holdable(read)) maps.set(rowid, read);
+    }
   }
 
   /** The next relationship from the types' tables and their endpoint indexes. */

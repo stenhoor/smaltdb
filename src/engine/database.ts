@@ -983,6 +983,18 @@ export class Database implements FunctionContext {
         truncated: () => ix.labelTruncated(labelRoles),
       };
     }
+    // A node or edge table of an indexed graph with a props column: the index may know its rows' maps (ADR 0041).
+    const propRoles = c ? undefined : this.graphIndexes.propRolesOf(table);
+    if (propRoles) {
+      const ix = this.graphIndexes;
+      const other = w.graph;
+      w.graph = {
+        inserted: (row, rowid) => (other?.inserted(row, rowid), ix.propsChanged(propRoles, rowid)),
+        updated: (old, next, rowid) => (other?.updated(old, next, rowid), ix.propsUpdated(propRoles, old, next, rowid)),
+        deleted: (row, rowid) => (other?.deleted(row, rowid), ix.propsChanged(propRoles, rowid)),
+        truncated: () => (other?.truncated(), ix.propsTruncated(propRoles)),
+      };
+    }
     if (table.history) {
       const get = (name: string): TableSchema => {
         const t = this.tables.get(name.toLowerCase());
@@ -1059,6 +1071,10 @@ export class Database implements FunctionContext {
         const open = role ? ix.open(role.graph) : null;
         return open === null ? null : { out: open.out!, in: open.in! };
       },
+      props: (type) => {
+        const held = role ? ix.propRolesOf(edges[type]!.table)?.find((r) => r.graph === role.graph) : undefined;
+        return held ? ix.propsOf(held) : null;
+      },
     };
   }
 
@@ -1068,6 +1084,14 @@ export class Database implements FunctionContext {
     if (!role) return undefined;
     const ix = this.graphIndexes;
     return { node: role.node, label: role.label, labels: () => ix.open(role.graph)?.labels ?? null };
+  }
+
+  /** What the planner needs to read a table's props from its graph's index (PhysicalEnv.graphProps). */
+  private graphProps(t: TableSchema): ReturnType<NonNullable<PhysicalEnv['graphProps']>> {
+    const role = this.graphIndexes.propRolesOf(t)?.[0];
+    if (!role) return undefined;
+    const ix = this.graphIndexes;
+    return { column: role.column, maps: () => ix.propsOf(role) };
   }
 
   /** What the planner needs to read an edge table through its graph's index (PhysicalEnv.graphEdge). */
@@ -2148,6 +2172,7 @@ export class Database implements FunctionContext {
       graphEdge: (t) => this.graphEdge(t),
       graph: (name) => this.plannedGraph(name),
       graphLabels: (t) => this.graphLabels(t),
+      graphProps: (t) => this.graphProps(t),
       deletedRows: (t) => this.deletedRowsOf(t),
       funcCtx: this,
       state: this.state,

@@ -12,6 +12,11 @@
  *
  * It also holds the graph's label index, where that table has a unique index on its node and label: which nodes have
  * which labels (exec/graph-labels.ts), built, kept and dropped with the relationships.
+ *
+ * And property maps of its node and edge tables that have a `props` column (ADR 0041, exec/graph-props.ts): the map
+ * of each row that was read by its rowid, as the table stores it. A row's map is remembered when a scan first reads
+ * it, followed by the table's writer from then on, and dropped with the lists. They count towards the limit, and are
+ * let go before the lists are: a graph over it keeps its lists and reads properties from the tables.
  */
 import { type IndexSchema, type TableSchema, findColumn } from '../catalog/schema.js';
 import { SmaltError } from '../errors.js';
@@ -20,6 +25,7 @@ import type { BTree } from '../storage/btree.js';
 import { decodeSmallRun } from '../storage/key-codec.js';
 import { Collation, type SqlValue } from '../values.js';
 import { GraphLabels } from './graph-labels.js';
+import { GraphProps, holdable } from './graph-props.js';
 import { GraphLists } from './graph-lists.js';
 
 export interface GraphIndexHost {
@@ -64,6 +70,18 @@ export class GraphIndex {
   /** The graph's label index table, when it can be held, and its entries: built and dropped with the lists. */
   labelTable: LabelTable | null = null;
   labels: GraphLabels | null = null;
+  /**
+   * The property maps held, by table name (lower case): each with the table's root page and the column they are of,
+   * so a table made again is not read from another's maps.
+   */
+  readonly props = new Map<string, { root: number; column: number; maps: GraphProps }>();
+  /** The property maps didn't fit under the limit: properties are read from the tables until the index is built again. */
+  propsOff = false;
+  /**
+   * The property maps may know what isn't committed: a table they hold was written in this transaction, or a scan
+   * asked for them inside one. (The lists' own flag is `dirty`.)
+   */
+  propsDirty = false;
   /** Why the graph isn't indexed, until its edge tables change. */
   off: string | null = null;
   /** It may hold changes that aren't committed. */
@@ -78,11 +96,54 @@ export class GraphIndex {
   drop(): void {
     this.out = this.in = null;
     this.labels = null;
+    this.forget();
+    this.propsOff = false;
     this.dirty = false;
   }
 
-  bytes(): number {
+  /** Lets every property map go. A scan that still has one reads its rows from the table. */
+  forget(): void {
+    for (const p of this.props.values()) p.maps.closed = true;
+    this.props.clear();
+    this.propsDirty = false;
+  }
+
+  /** The property maps know no row any more, and keep their memory for the rows read next. */
+  unlearn(): void {
+    for (const p of this.props.values()) p.maps.clear();
+    this.propsDirty = false;
+  }
+
+  /** Lets one table's property maps go. */
+  forgetTable(key: string): void {
+    const p = this.props.get(key);
+    if (p === undefined) return;
+    p.maps.closed = true;
+    this.props.delete(key);
+  }
+
+  /** The memory of the lists and the labels. */
+  private listBytes(): number {
     return this.out === null ? 0 : this.out.bytes() + this.in!.bytes() + (this.labels?.bytes() ?? 0);
+  }
+
+  /** The memory of the property maps held. */
+  private propBytes(): number {
+    let n = 0;
+    for (const p of this.props.values()) n += p.maps.bytes();
+    return n;
+  }
+
+  bytes(): number {
+    return this.listBytes() + this.propBytes();
+  }
+
+  /** Lets the property maps go, when the index is over the limit with them. True when it then fits. */
+  shed(limit: number): boolean {
+    if (this.props.size === 0) return false;
+    this.forget();
+    this.propsOff = true;
+    return this.listBytes() <= limit;
   }
 }
 
@@ -102,6 +163,15 @@ export interface LabelRole {
   readonly table: TableSchema;
   readonly node: number;
   readonly label: number;
+}
+
+/** A table's place in a graph's index as one whose property maps it may hold: a node or edge table with a `props` column. */
+export interface PropRole {
+  readonly graph: GraphIndex;
+  readonly table: TableSchema;
+  readonly column: number;
+  /** What the graph's index holds the table's maps by: its name in lower case. */
+  readonly key: string;
 }
 
 /**
@@ -139,6 +209,7 @@ export class GraphIndexes {
   suspended = false;
   private roles = new Map<TableSchema, EdgeRole[]>();
   private labelRoles = new Map<TableSchema, LabelRole[]>();
+  private propRoles = new Map<TableSchema, PropRole[]>();
   private readonly graphs = new Map<string, GraphIndex>();
 
   constructor(
@@ -153,6 +224,7 @@ export class GraphIndexes {
     this.version = v;
     this.roles = new Map();
     this.labelRoles = new Map();
+    this.propRoles = new Map();
     const seen = new Set<string>();
     for (const def of this.host.graphs()) {
       const key = def.name.toLowerCase();
@@ -211,7 +283,25 @@ export class GraphIndexes {
           if (list) list.push(role);
           else this.labelRoles.set(labelTable.table, [role]);
         }
-      }
+        // The node and edge tables with a props column: their maps may be held.
+        const held = new Set<string>();
+        for (const t of [...def.nodes, ...def.edges]) {
+          const table = t.props === undefined ? undefined : this.host.getTable(t.table);
+          const column = table ? findColumn(table, t.props!) : -1;
+          if (!table || column < 0 || table.columnar || table.temp || table.columns[column]!.type !== 'MAP') continue;
+          const key = table.name.toLowerCase();
+          if (held.has(key)) continue;
+          held.add(key);
+          const role: PropRole = { graph: g, table, column, key };
+          const list = this.propRoles.get(table);
+          if (list) list.push(role);
+          else this.propRoles.set(table, [role]);
+          // Maps read from a table that was since made again, or whose column moved, are not this table's.
+          const have = g.props.get(key);
+          if (have && (have.root !== table.rootPage || have.column !== column)) g.forgetTable(key);
+        }
+        for (const key of [...g.props.keys()]) if (!held.has(key)) g.forgetTable(key);
+      } else g.forget();
     }
     for (const k of [...this.graphs.keys()]) if (!seen.has(k)) this.graphs.delete(k);
   }
@@ -228,6 +318,35 @@ export class GraphIndexes {
     if (this.limit <= 0) return undefined;
     this.refresh();
     return this.labelRoles.size === 0 ? undefined : this.labelRoles.get(table);
+  }
+
+  /** The table's roles as one whose property maps indexed graphs may hold. Undefined for any other table. */
+  propRolesOf(table: TableSchema): readonly PropRole[] | undefined {
+    if (this.limit <= 0) return undefined;
+    this.refresh();
+    return this.propRoles.size === 0 ? undefined : this.propRoles.get(table);
+  }
+
+  /**
+   * The property maps of one of the graph's tables, for a scan to read and to add the rows it reads to: empty until
+   * then. Null when the index holds none (the graph isn't indexed, or its property maps didn't fit under the limit):
+   * the scan then reads the table. Asked once per execution.
+   */
+  propsOf(role: PropRole): GraphProps | null {
+    const g = this.open(role.graph);
+    if (g === null || g.propsOff) return null;
+    let have = g.props.get(role.key);
+    if (have === undefined) {
+      // They grow as rows are read: over the limit they are let go, and the lists stay.
+      const maps = new GraphProps(() => {
+        if (g.bytes() > this.limit) g.shed(this.limit);
+      });
+      have = { root: role.table.rootPage, column: role.column, maps };
+      g.props.set(role.key, have);
+    }
+    // Rows remembered inside a transaction may be what a rollback undoes.
+    if (this.host.uncommitted()) g.propsDirty = true;
+    return have.maps;
   }
 
   /**
@@ -333,7 +452,7 @@ export class GraphIndexes {
     if (!isId(s) || !isId(e) || !isId(rowid)) return this.stop(g, `${role.table.name} has an endpoint or a rowid that is not an integer from 0 to ${MAX_ID}`);
     g.out!.add(s, role.type, e, rowid);
     g.in!.add(e, role.type, s, rowid);
-    if (g.bytes() > this.limit) this.stop(g, `its index needs more than ${this.limit} bytes`);
+    if (g.bytes() > this.limit && !g.shed(this.limit)) this.stop(g, `its index needs more than ${this.limit} bytes`);
   }
 
   private remove(role: EdgeRole, row: readonly SqlValue[], rowid: number | bigint): void {
@@ -393,7 +512,7 @@ export class GraphIndexes {
     }
     if (add) {
       g.labels!.add(label, node);
-      if (g.bytes() > this.limit) this.stop(g, `its index needs more than ${this.limit} bytes`);
+      if (g.bytes() > this.limit && !g.shed(this.limit)) this.stop(g, `its index needs more than ${this.limit} bytes`);
     } else if (!g.labels!.remove(label, node)) g.drop(); // an entry the sets don't have: build them again
   }
 
@@ -433,6 +552,49 @@ export class GraphIndexes {
     for (const role of roles) role.graph.drop();
   }
 
+  // ---------------------------------------------------------------- property maps' writes
+
+  /** The maps held for a role's table, when its graph holds any: none once its index is dropped. */
+  private held(role: PropRole): GraphProps | undefined {
+    return role.graph.props.get(role.key)?.maps;
+  }
+
+  /**
+   * A row of a table whose property maps may be held was changed in place, from `old` to `row`. Only a row the maps
+   * know is followed (one read before), and only where its props are another value: any other row is read from the
+   * table when a scan first asks for it.
+   */
+  propsUpdated(roles: readonly PropRole[], old: readonly SqlValue[], row: readonly SqlValue[], rowid: number | bigint): void {
+    for (const role of roles) {
+      const props = row[role.column]!;
+      if (props === old[role.column]) continue;
+      const maps = this.held(role);
+      if (maps === undefined) continue;
+      role.graph.propsDirty = true;
+      if (!isId(rowid) || !maps.known(rowid)) continue;
+      if (holdable(props)) maps.set(rowid, props);
+      else maps.forget(rowid);
+    }
+  }
+
+  /**
+   * A row of such a table was written new, or deleted: the maps know nothing of it from here on. A new row is not
+   * read in: most are never asked for by their rowid.
+   */
+  propsChanged(roles: readonly PropRole[], rowid: number | bigint): void {
+    for (const role of roles) {
+      const maps = this.held(role);
+      if (maps === undefined) continue;
+      role.graph.propsDirty = true;
+      if (isId(rowid)) maps.forget(rowid);
+    }
+  }
+
+  /** Such a table was emptied. */
+  propsTruncated(roles: readonly PropRole[]): void {
+    for (const role of roles) role.graph.forgetTable(role.key);
+  }
+
   // ---------------------------------------------------------------- transactions
 
   /**
@@ -450,22 +612,39 @@ export class GraphIndexes {
         continue;
       }
       g.dirty = false;
+      g.propsDirty = false;
       g.counter = counter;
     }
   }
 
-  /** A statement, a savepoint or the transaction was rolled back: an index that may hold what it undid is dropped. */
+  /**
+   * A statement, a savepoint or the transaction was rolled back: an index that may hold what it undid is dropped.
+   * Where only its property maps may (a table of theirs was written, or a row was remembered, inside the
+   * transaction), they know no row any more: their rows are read from the tables again as they are asked for.
+   */
   rolledBack(): void {
     if (this.graphs.size === 0) return;
-    for (const g of this.graphs.values()) if (g.dirty) g.drop();
+    for (const g of this.graphs.values()) {
+      if (g.dirty) g.drop();
+      else if (g.propsDirty) g.unlearn();
+    }
   }
 
   // ---------------------------------------------------------------- tests
 
   /** Each graph's index as it stands (after a refresh). */
-  state(): { graph: string; built: boolean; off: string | null; entries: number; labels: number; bytes: number; builds: number }[] {
+  state(): { graph: string; built: boolean; off: string | null; entries: number; labels: number; props: number; bytes: number; builds: number }[] {
     this.refresh();
-    return [...this.graphs.values()].map((g) => ({ graph: g.name, built: g.out !== null, off: g.off, entries: g.out?.entries ?? 0, labels: g.labels?.entries ?? 0, bytes: g.bytes(), builds: g.builds }));
+    return [...this.graphs.values()].map((g) => ({
+      graph: g.name,
+      built: g.out !== null,
+      off: g.off,
+      entries: g.out?.entries ?? 0,
+      labels: g.labels?.entries ?? 0,
+      props: [...g.props.values()].reduce((n, p) => n + p.maps.rows, 0),
+      bytes: g.bytes(),
+      builds: g.builds,
+    }));
   }
 
   /** Compares every built index with its tables; throws when they differ (a test setting, ADR 0040 section 3). */
@@ -483,6 +662,17 @@ export class GraphIndexes {
           const at = have.findIndex((x, i) => x !== want[i]);
           throw new SmaltError('SMALT_CORRUPT', `graph index of ${g.name} (labels) differs from ${g.labelTable.table.name}: ${have.length} entries against ${want.length} rows; first difference at ${at} (${have[at]} against ${want[at]})`);
         }
+      }
+      for (const [name, held] of g.props) {
+        const table = this.host.getTable(name);
+        if (!table) throw new SmaltError('SMALT_CORRUPT', `graph index of ${g.name} holds the properties of ${name}, which is no table`);
+        // Every row the maps know is in the table, with those props.
+        const hex = (v: SqlValue): string => (v === null ? 'NULL' : Array.from(v as Uint8Array, (b) => b.toString(16).padStart(2, '0')).join(''));
+        const stored = new Map<string, string>(this.host.rows(table, held.column, held.column).map((r) => [String(r[2]), hex(r[0]!)]));
+        held.maps.forEach((rowid, props) => {
+          const want = stored.get(String(rowid)) ?? 'no row';
+          if (hex(props) !== want) throw new SmaltError('SMALT_CORRUPT', `graph index of ${g.name} (properties) differs from ${table.name} at row ${rowid}: ${hex(props)} against ${want}`);
+        });
       }
       for (const [lists, from] of [
         [g.out, true],

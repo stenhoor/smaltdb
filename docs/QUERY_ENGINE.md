@@ -286,9 +286,27 @@ See [ADR 0008](adr/0008-materialized-views-and-columnar-segments.md).
   their endpoints), so a plan is the same whether or not the graph is indexed. `RelationshipsScan`
   (`exec/graph-relationships.ts`) reads a node's lists by start and by end from the graph's index; without it, each
   type's endpoint index scan in turn, which gives the same order; read whole, each type's table. It writes only the
-  columns the plan reads, and fetches a relationship's row only for `props`. With `asOf` the operation is rewritten
+  columns the plan reads. `props` comes from the index's property maps (below) for a row they know, else from the
+  relationship's row, fetched by rowid, which they know from then on. With `asOf` the operation is rewritten
   to a union of the types' tables as of then (`relationshipsAsOf`, `exec/plan-normalize.ts`).
-- **EXPLAIN** shows `SEARCH t USING GRAPH INDEX (start=?)`, `SCAN smalt_paths() VIRTUAL TABLE` for a path search, and
-  `SEARCH RELATIONSHIPS OF g (node=?)`, `(other=?)`, `(node=? AND other=?)` or `SCAN RELATIONSHIPS OF g`.
+- **Properties.** The index also remembers property maps of the graph's node and edge tables that name a `props`
+  column (`GraphProps`, `exec/graph-props.ts`): the map of each row that was read by its rowid, as the table stores
+  it, a table's maps in one buffer with where each row's begins and ends, by rowid. Nothing is read in ahead: a scan
+  that reads a row it doesn't know reads the table and tells the maps (`GraphIndexes.propsOf` gives a scan the
+  table's maps, empty at first). The table's `TableWriter` reports writes through the same hooks as the lists: a
+  known row whose props change is copied again, at the buffer's end; a row deleted, or written new, is forgotten.
+  A buffer that needs room and is half bytes no row points at is written again without them. A rollback makes the
+  maps know no row (`GraphIndex.unlearn`) where they may know what it undid (`propsDirty`: a table of theirs was
+  written, or a scan asked for them, inside the transaction); they keep their memory for the rows read next. An
+  index over `graphIndexMem` with them lets them go and keeps its lists and labels (`GraphIndex.shed`).
+- **A row by its rowid.** A node or edge table whose maps the index may hold, read by `rowid = x` for its `props` and
+  nothing else but its rowid (the columns its scan names are all a plan may read), has one more access path beside
+  the rowid lookup: `GraphNodeScan` (`exec/graph-scan.ts`), costed at `COST.graphOpen`. A row the maps know is given
+  from memory: its `props` is a copy of the stored bytes, as a row decoded from a page gives, so every map operation
+  reads it as it reads a row's. Any other row is found by the rowid lookup the scan carries, and known from then on.
+  So is every row where the index holds no maps when the scan opens.
+- **EXPLAIN** shows `SEARCH t USING GRAPH INDEX (start=?)`, `SEARCH t USING GRAPH INDEX (rowid=?)`,
+  `SCAN smalt_paths() VIRTUAL TABLE` for a path search, and `SEARCH RELATIONSHIPS OF g (node=?)`, `(other=?)`,
+  `(node=? AND other=?)` or `SCAN RELATIONSHIPS OF g`.
 
-See [ADR 0040](adr/0040-graph-index-and-relationships.md).
+See [ADR 0040](adr/0040-graph-index-and-relationships.md) and [ADR 0041](adr/0041-properties-in-the-graph-index.md).
