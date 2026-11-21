@@ -139,6 +139,8 @@ export default defineConfig({
           { text: '0038 A map type', link: '/adr/0038-map-type' },
           { text: '0039 Typed values under any', link: '/adr/0039-typed-values-under-any' },
           { text: '0040 A graph index and relationships', link: '/adr/0040-graph-index-and-relationships' },
+          { text: '0041 Properties in the graph index', link: '/adr/0041-properties-in-the-graph-index' },
+          { text: '0042 A graph\'s writes (proposed)', link: '/adr/0042-graph-writes' },
         ],
       },
       {
