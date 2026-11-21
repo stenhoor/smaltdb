@@ -20,7 +20,7 @@ while (f !== null) {
     if (!(!v0n && v0 != 0)) continue;
     const v1n = c2n; const v1 = v1n ? 0 : ((c2 > (10) || c2 !== c2) ? 1 : 0);
     if (!(!v1n && v1 != 0)) continue;
-    out[k * 3 + 0] = (c1n ? null : c1); out[k * 3 + 1] = (c2n ? null : c2); out[k * 3 + 2] = (c0n ? null : c0);
+    out[k * 1 + 0] = (c0n ? null : c0);
     k++;
     if (k === 256) { st.i = i + 1; return k; }
   }

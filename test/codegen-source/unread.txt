@@ -1,0 +1,147 @@
+> SELECT id FROM t WHERE i = 3 AND r > 10
+expression:
+const $c0 = K[0]; const v0n = (r[1] === null); const v0 = v0n ? 0 : (r[1] == $c0 ? 1 : 0);
+return (v0n ? null : v0);
+--
+expression:
+const $c0 = K[0]; const v0n = (r[2] === null); const v0 = v0n ? 0 : ((r[2] > $c0 || r[2] !== r[2]) ? 1 : 0);
+return (v0n ? null : v0);
+--
+pipeline(H, K, T):
+return function smaltScanFilter(st, r, out) {
+let f = st.f; let i = st.i; let k = 0;
+while (f !== null) {
+  const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
+  for (; i < n; i++) {
+    const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);
+    let c1 = 0, c1n = true, c2 = 0, c2n = true, c0 = 0, c0n = true;
+    if ((b[off] < 128 && (b[off + 1] & 1) === 0 && (b[off + 1] < 128 || b[off + 2] < 128)) && (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 1] | (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 2] << 8)) === 8) { const ko = off + (b[off + 1] < 128 ? 2 : 3); const vo = ko + b[off]; const bm = vo + 3; const fx = bm + 1; const vt = fx + 24; if ((b[bm + 0] & 2) !== 0) { c1n = true; c1 = 0; } else { { const o = fx + 8; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24); c1n = false; c1 = (hi === 0 && lo >= 0) || (hi === -1 && lo < 0) ? lo : (hi >= -2097152 && hi <= 2097151) ? hi * 4294967296 + (lo >>> 0) : H.readInt64(dv, o); } } if ((b[bm + 0] & 4) !== 0) { c2n = true; c2 = 0; } else { c2n = false; c2 = dv.getFloat64(fx + 16, true); } { const id = H.rowid(b, ko); c0n = false; c0 = id; } } else { H.slow(f, off, r); { const t = r[1]; c1n = t === null; c1 = c1n ? 0 : t; } { const t = r[2]; c2n = t === null; c2 = c2n ? 0 : t; } { const t = r[0]; c0n = t === null; c0 = c0n ? 0 : t; } }
+    const v0n = c1n; const v0 = v0n ? 0 : (c1 == (3) ? 1 : 0);
+    if (!(!v0n && v0 != 0)) continue;
+    const v1n = c2n; const v1 = v1n ? 0 : ((c2 > (10) || c2 !== c2) ? 1 : 0);
+    if (!(!v1n && v1 != 0)) continue;
+    out[k * 1 + 0] = (c0n ? null : c0);
+    k++;
+    if (k === 256) { st.i = i + 1; return k; }
+  }
+  f = H.next(f); st.f = f; i = 0; st.i = 0;
+}
+return k;
+};
+
+> SELECT id, i FROM t WHERE i = 3 AND r > 10
+expression:
+const $c0 = K[0]; const v0n = (r[1] === null); const v0 = v0n ? 0 : (r[1] == $c0 ? 1 : 0);
+return (v0n ? null : v0);
+--
+expression:
+const $c0 = K[0]; const v0n = (r[2] === null); const v0 = v0n ? 0 : ((r[2] > $c0 || r[2] !== r[2]) ? 1 : 0);
+return (v0n ? null : v0);
+--
+pipeline(H, K, T):
+return function smaltScanFilter(st, r, out) {
+let f = st.f; let i = st.i; let k = 0;
+while (f !== null) {
+  const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
+  for (; i < n; i++) {
+    const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);
+    let c1 = 0, c1n = true, c2 = 0, c2n = true, c0 = 0, c0n = true;
+    if ((b[off] < 128 && (b[off + 1] & 1) === 0 && (b[off + 1] < 128 || b[off + 2] < 128)) && (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 1] | (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 2] << 8)) === 8) { const ko = off + (b[off + 1] < 128 ? 2 : 3); const vo = ko + b[off]; const bm = vo + 3; const fx = bm + 1; const vt = fx + 24; if ((b[bm + 0] & 2) !== 0) { c1n = true; c1 = 0; } else { { const o = fx + 8; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24); c1n = false; c1 = (hi === 0 && lo >= 0) || (hi === -1 && lo < 0) ? lo : (hi >= -2097152 && hi <= 2097151) ? hi * 4294967296 + (lo >>> 0) : H.readInt64(dv, o); } } if ((b[bm + 0] & 4) !== 0) { c2n = true; c2 = 0; } else { c2n = false; c2 = dv.getFloat64(fx + 16, true); } { const id = H.rowid(b, ko); c0n = false; c0 = id; } } else { H.slow(f, off, r); { const t = r[1]; c1n = t === null; c1 = c1n ? 0 : t; } { const t = r[2]; c2n = t === null; c2 = c2n ? 0 : t; } { const t = r[0]; c0n = t === null; c0 = c0n ? 0 : t; } }
+    const v0n = c1n; const v0 = v0n ? 0 : (c1 == (3) ? 1 : 0);
+    if (!(!v0n && v0 != 0)) continue;
+    const v1n = c2n; const v1 = v1n ? 0 : ((c2 > (10) || c2 !== c2) ? 1 : 0);
+    if (!(!v1n && v1 != 0)) continue;
+    out[k * 2 + 0] = (c1n ? null : c1); out[k * 2 + 1] = (c0n ? null : c0);
+    k++;
+    if (k === 256) { st.i = i + 1; return k; }
+  }
+  f = H.next(f); st.f = f; i = 0; st.i = 0;
+}
+return k;
+};
+
+> SELECT count(*) FROM t a LEFT JOIN (SELECT id, s, r, n FROM t WHERE i > 3) x ON x.id = a.i
+expression:
+const $c0 = K[0]; const v0n = (r[10] === null); const v0 = v0n ? 0 : (r[10] > $c0 ? 1 : 0);
+return (v0n ? null : v0);
+--
+pipeline(H, K, T):
+return function smaltScanFilter(st, r, out) {
+let f = st.f; let i = st.i; let k = 0;
+while (f !== null) {
+  const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
+  for (; i < n; i++) {
+    const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);
+    let c10 = 0, c10n = true, c9 = 0, c9n = true;
+    if ((b[off] < 128 && (b[off + 1] & 1) === 0 && (b[off + 1] < 128 || b[off + 2] < 128)) && (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 1] | (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 2] << 8)) === 8) { const ko = off + (b[off + 1] < 128 ? 2 : 3); const vo = ko + b[off]; const bm = vo + 3; const fx = bm + 1; const vt = fx + 24; if ((b[bm + 0] & 2) !== 0) { c10n = true; c10 = 0; } else { { const o = fx + 8; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24); c10n = false; c10 = (hi === 0 && lo >= 0) || (hi === -1 && lo < 0) ? lo : (hi >= -2097152 && hi <= 2097151) ? hi * 4294967296 + (lo >>> 0) : H.readInt64(dv, o); } } { const id = H.rowid(b, ko); c9n = false; c9 = id; } } else { H.slow(f, off, r); { const t = r[10]; c10n = t === null; c10 = c10n ? 0 : t; } { const t = r[9]; c9n = t === null; c9 = c9n ? 0 : t; } }
+    const v0n = c10n; const v0 = v0n ? 0 : (c10 > (3) ? 1 : 0);
+    if (!(!v0n && v0 != 0)) continue;
+    out[k * 1 + 0] = (c9n ? null : c9);
+    k++;
+    if (k === 256) { st.i = i + 1; return k; }
+  }
+  f = H.next(f); st.f = f; i = 0; st.i = 0;
+}
+return k;
+};
+--
+pipeline(H, K, T):
+return function smaltScanFilter(st, r, out) {
+let f = st.f; let i = st.i; let k = 0;
+while (f !== null) {
+  const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
+  for (; i < n; i++) {
+    const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);
+    let c1 = 0, c1n = true;
+    if ((b[off] < 128 && (b[off + 1] & 1) === 0 && (b[off + 1] < 128 || b[off + 2] < 128)) && (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 1] | (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 2] << 8)) === 8) { const ko = off + (b[off + 1] < 128 ? 2 : 3); const vo = ko + b[off]; const bm = vo + 3; const fx = bm + 1; const vt = fx + 24; if ((b[bm + 0] & 2) !== 0) { c1n = true; c1 = 0; } else { { const o = fx + 8; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24); c1n = false; c1 = (hi === 0 && lo >= 0) || (hi === -1 && lo < 0) ? lo : (hi >= -2097152 && hi <= 2097151) ? hi * 4294967296 + (lo >>> 0) : H.readInt64(dv, o); } } } else { H.slow(f, off, r); { const t = r[1]; c1n = t === null; c1 = c1n ? 0 : t; } }
+    out[k * 1 + 0] = (c1n ? null : c1);
+    k++;
+    if (k === 256) { st.i = i + 1; return k; }
+  }
+  f = H.next(f); st.f = f; i = 0; st.i = 0;
+}
+return k;
+};
+
+> SELECT a.id, x.s FROM t a LEFT JOIN (SELECT id, s, r, n FROM t WHERE i > 3) x ON x.id = a.i
+expression:
+const $c0 = K[0]; const v0n = (r[10] === null); const v0 = v0n ? 0 : (r[10] > $c0 ? 1 : 0);
+return (v0n ? null : v0);
+--
+pipeline(H, K, T):
+return function smaltScanFilter(st, r, out) {
+let f = st.f; let i = st.i; let k = 0;
+while (f !== null) {
+  const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
+  for (; i < n; i++) {
+    const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);
+    let c10 = 0, c10n = true, c12 = null, c9 = 0, c9n = true;
+    if ((b[off] < 128 && (b[off + 1] & 1) === 0 && (b[off + 1] < 128 || b[off + 2] < 128)) && (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 1] | (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 2] << 8)) === 8) { const ko = off + (b[off + 1] < 128 ? 2 : 3); const vo = ko + b[off]; const bm = vo + 3; const fx = bm + 1; const vt = fx + 24; const wide = (b[vo] & 1) === 1; const vd = vt + 5 * (wide ? 4 : 2); if ((b[bm + 0] & 2) !== 0) { c10n = true; c10 = 0; } else { { const o = fx + 8; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24); c10n = false; c10 = (hi === 0 && lo >= 0) || (hi === -1 && lo < 0) ? lo : (hi >= -2097152 && hi <= 2097151) ? hi * 4294967296 + (lo >>> 0) : H.readInt64(dv, o); } } if ((b[bm + 0] & 8) !== 0) { c12 = null; } else { c12 = H.utf8(b, vd, vd + (wide ? dv.getUint32(vt + 0, true) : (b[vt + 0] | (b[vt + 1] << 8)))); } { const id = H.rowid(b, ko); c9n = false; c9 = id; } } else { H.slow(f, off, r); { const t = r[10]; c10n = t === null; c10 = c10n ? 0 : t; } c12 = r[12]; { const t = r[9]; c9n = t === null; c9 = c9n ? 0 : t; } }
+    const v0n = c10n; const v0 = v0n ? 0 : (c10 > (3) ? 1 : 0);
+    if (!(!v0n && v0 != 0)) continue;
+    out[k * 2 + 0] = c12; out[k * 2 + 1] = (c9n ? null : c9);
+    k++;
+    if (k === 256) { st.i = i + 1; return k; }
+  }
+  f = H.next(f); st.f = f; i = 0; st.i = 0;
+}
+return k;
+};
+--
+pipeline(H, K, T):
+return function smaltScanFilter(st, r, out) {
+let f = st.f; let i = st.i; let k = 0;
+while (f !== null) {
+  const b = f.bytes; const dv = f.view; const n = b[2] | (b[3] << 8);
+  for (; i < n; i++) {
+    const off = b[24 + 2 * i] | (b[25 + 2 * i] << 8);
+    let c1 = 0, c1n = true, c0 = 0, c0n = true;
+    if ((b[off] < 128 && (b[off + 1] & 1) === 0 && (b[off + 1] < 128 || b[off + 2] < 128)) && (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 1] | (b[(off + (b[off + 1] < 128 ? 2 : 3) + b[off]) + 2] << 8)) === 8) { const ko = off + (b[off + 1] < 128 ? 2 : 3); const vo = ko + b[off]; const bm = vo + 3; const fx = bm + 1; const vt = fx + 24; if ((b[bm + 0] & 2) !== 0) { c1n = true; c1 = 0; } else { { const o = fx + 8; const lo = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); const hi = b[o + 4] | (b[o + 5] << 8) | (b[o + 6] << 16) | (b[o + 7] << 24); c1n = false; c1 = (hi === 0 && lo >= 0) || (hi === -1 && lo < 0) ? lo : (hi >= -2097152 && hi <= 2097151) ? hi * 4294967296 + (lo >>> 0) : H.readInt64(dv, o); } } { const id = H.rowid(b, ko); c0n = false; c0 = id; } } else { H.slow(f, off, r); { const t = r[1]; c1n = t === null; c1 = c1n ? 0 : t; } { const t = r[0]; c0n = t === null; c0 = c0n ? 0 : t; } }
+    out[k * 2 + 0] = (c1n ? null : c1); out[k * 2 + 1] = (c0n ? null : c0);
+    k++;
+    if (k === 256) { st.i = i + 1; return k; }
+  }
+  f = H.next(f); st.f = f; i = 0; st.i = 0;
+}
+return k;
+};

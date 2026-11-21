@@ -58,6 +58,14 @@ const CORPUS: Record<string, string[]> = {
     'SELECT count(*) FROM t WHERE i NOT BETWEEN 2 AND 9 AND s NOT LIKE ? AND i NOT IN (3, 4)',
     "SELECT count(*) FROM t WHERE c = 'abc' AND s COLLATE NOCASE = 'V1' AND +i > 2",
   ],
+  // What is decoded follows what is read (ADR 0041, section 3): a scan gives the plan the columns something after its
+  // own conjuncts reads, and a row loader decodes those of a nested plan's outputs that are read.
+  unread: [
+    'SELECT id FROM t WHERE i = 3 AND r > 10',
+    'SELECT id, i FROM t WHERE i = 3 AND r > 10',
+    'SELECT count(*) FROM t a LEFT JOIN (SELECT id, s, r, n FROM t WHERE i > 3) x ON x.id = a.i',
+    'SELECT a.id, x.s FROM t a LEFT JOIN (SELECT id, s, r, n FROM t WHERE i > 3) x ON x.id = a.i',
+  ],
   'fused-columnar': [
     'SELECT count(*) FROM k WHERE v > 10',
     'SELECT g, sum(v), avg(w), max(w) FROM k GROUP BY g',

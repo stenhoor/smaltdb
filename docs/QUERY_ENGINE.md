@@ -156,6 +156,13 @@ Source: `src/engine/exec/` — `planner.ts`, `operators.ts`, `expr.ts`, `functio
   compiled, and looked at when the projection first opens). Only an output that cannot fail is left out: a column, a
   constant, a parameter, or logic and CASE over those. A function call, a conversion or a subquery is computed whether
   or not it is read, so no error is hidden.
+- **A column nothing reads is not decoded** (ADR 0041, section 3). An expression marks the columns it reads as it
+  is compiled (`TableAccess.use`), and a table's row is decoded for the readers its columns have when its scan first
+  opens. Two kinds of reader can be gone by then: an output a projection leaves out (above), and a conjunct that a
+  generated scan decides in its own code, on the row's bytes where it can (`TableAccess.decides`). A row loader
+  decodes the columns that still have a reader, and a generated scan gives the plan only those: for
+  `SELECT id FROM t WHERE i = 3 AND r > 10` it hands on the id, where it also copied `i` and `r` out of the page for
+  every row that passed. What a generated pipeline's own code reads it still decodes, whoever else reads it.
 - **A projection over a projection is one projection** in a plan statement (`composed` in `exec/plan-normalize.ts`):
   the outer one's columns are replaced by the inner one's expressions, so one operator copies the row where two did,
   and the planner sees the inner one's input (a join region) rather than a nested plan. Only where that changes

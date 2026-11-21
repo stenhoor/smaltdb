@@ -41,11 +41,25 @@ export interface ExecState {
 
 // ------------------------------------------------------------------ table access
 
+/**
+ * A reader of a table's column that can go away once the plan around its scan is compiled: an output of a nested
+ * plan's projection that nothing reads (`Project.reads`), or a conjunct that a generated scan decides in its own code
+ * (`TableAccess.decides`). A column whose readers are all gone is not decoded (`TableAccess.needed`).
+ */
+export interface ColumnUse {
+  gone: boolean;
+}
+
 /** How a table's rows are decoded into registers. Mutable during planning (columns are added as referenced). */
 export class TableAccess {
   /** [column index, register] pairs to decode. */
   readonly decode: number[] = [];
   private readonly decoded = new Set<number>();
+  /** The columns read by something that always runs, and each column's readers that may go away. */
+  private readonly always = new Set<number>();
+  private readonly maybe = new Map<number, ColumnUse[]>();
+  /** Readers the scan of this table answers in its own code: no register is read for them. */
+  private readonly own = new Set<ColumnUse>();
   rowidReg = -1;
   /** The table scanned (a TEMP table and a main table may share `tableName`). */
   table: import('../catalog/schema.js').TableSchema | null = null;
@@ -58,15 +72,50 @@ export class TableAccess {
     readonly rowidAlias: number,
   ) {}
 
-  /** Ensure column `col` is decoded into register `reg`. */
-  use(col: number, reg: number): void {
+  /** Ensure column `col` is decoded into register `reg`. `by`: its reader, when that is one that may go away. */
+  use(col: number, reg: number, by?: ColumnUse): void {
     if (col === this.rowidAlias) {
       this.useRowid(reg);
       return;
     }
+    if (by === undefined) this.always.add(col);
+    else {
+      const uses = this.maybe.get(col);
+      if (uses) uses.push(by);
+      else this.maybe.set(col, [by]);
+    }
     if (this.decoded.has(col)) return;
     this.decoded.add(col);
     this.decode.push(col, reg);
+  }
+
+  /** The scan of this table answers the reader `use` itself (a generated scan and its conjuncts). */
+  decides(use: ColumnUse): void {
+    this.own.add(use);
+  }
+
+  /**
+   * Whether anything that runs after the scan reads `col`'s register. Settled once the plan around the scan is
+   * compiled and its projections have dropped the outputs nothing reads: ask at the scan's first open, or later.
+   */
+  needed(col: number): boolean {
+    if (this.always.has(col)) return true;
+    const uses = this.maybe.get(col);
+    if (uses === undefined) return false;
+    for (const u of uses) if (!u.gone && !this.own.has(u)) return true;
+    return false;
+  }
+
+  /** The [column index, register] pairs of the columns `needed`: `decode` where each still has a reader. */
+  reads(): number[] {
+    const d = this.decode;
+    let out: number[] | null = null;
+    for (let i = 0; i < d.length; i += 2) {
+      if (this.needed(d[i])) {
+        if (out !== null) out.push(d[i], d[i + 1]);
+      } else if (out === null) out = d.slice(0, i);
+    }
+    return out ?? d;
   }
 
   useRowid(reg: number): void {
@@ -87,7 +136,10 @@ export class TableAccess {
     this.loadGeneric(c, r);
   }
 
-  /** Layout + decode list for generated decoders (call once the decode list is final). */
+  /**
+   * Layout + decode list for generated decoders (call once the decode list is final). Every column an expression
+   * was compiled to read: a generated pipeline decodes those its own code reads, whoever else reads them.
+   */
   loaderSpec(): LoaderSpec {
     const layout = this.reader.layout;
     return {
@@ -100,9 +152,10 @@ export class TableAccess {
     };
   }
 
+  /** `load`'s decoder, built at the first row: the columns that still have a reader (`reads`). */
   private buildLoader(): ((c: BTreeCursor, r: SqlValue[]) => boolean) | null {
     if (!codegenEnabled()) return null;
-    return generateLoader(this.loaderSpec(), LOADER_HELPERS) as unknown as (c: BTreeCursor, r: SqlValue[]) => boolean;
+    return generateLoader({ ...this.loaderSpec(), decode: this.reads() }, LOADER_HELPERS) as unknown as (c: BTreeCursor, r: SqlValue[]) => boolean;
   }
 
   /** Generic decode of the cell at `off` in leaf `page` (for generated scans' slow path). */
@@ -340,6 +393,15 @@ export class RowidLookup implements Operator {
       }
     }
     return false;
+  }
+
+  /** Column `col` of the row `next` found last, read from the table: for a caller that wants one the plan doesn't read. */
+  column(col: number): SqlValue {
+    const c = this.cursor!;
+    c.loadValue();
+    const rd = this.access.reader;
+    rd.reset(c.valueBytes, c.valueOffset, c.valueLength);
+    return rd.column(col);
   }
 
   close(): void {
@@ -810,6 +872,8 @@ export class Filter implements Operator {
   readonly kind = 'FILTER';
   readonly children: Operator[];
   private r!: SqlValue[];
+  /** Set by the planner on a conjunct's filter: the reader its columns were marked read by (`TableAccess.use`). */
+  use: ColumnUse | null = null;
   constructor(
     readonly child: Operator,
     readonly pred: Fn,
@@ -1099,6 +1163,11 @@ export class Project implements Operator {
    * the projection first opens.
    */
   reads: readonly boolean[] | null = null;
+  /**
+   * Set by the planner: for each output that can be skipped, the reader its columns were marked read by. An output
+   * that is dropped reads none of them, so its reader is gone (`TableAccess.needed`).
+   */
+  uses: readonly (ColumnUse | null)[] | null = null;
   /** The outputs computed: all of them, or those left once the unread are dropped. Settled at the first open. */
   private liveFns: Fn[] | null = null;
   private liveOut: number[] = [];
@@ -1125,7 +1194,11 @@ export class Project implements Operator {
     const fns: Fn[] = [];
     const out: number[] = [];
     for (let i = 0; i < this.fns.length; i++) {
-      if (can[i] === true && reads[i] === false) continue;
+      if (can[i] === true && reads[i] === false) {
+        const use = this.uses?.[i];
+        if (use) use.gone = true;
+        continue;
+      }
       fns.push(this.fns[i]);
       out.push(this.outRegs[i]);
     }

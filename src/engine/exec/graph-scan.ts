@@ -221,7 +221,8 @@ export class GraphLabelScan implements Operator {
 /**
  * A node or edge table of an indexed graph asked for one row by its rowid (ADR 0041, section 2), by a plan that reads
  * its `props` and nothing else of the row but its rowid: a row the graph index's property maps know is given from
- * memory, without descending the table's B+tree.
+ * memory, without descending the table's B+tree. Where nothing reads the props either (an output of a nested plan
+ * that is dropped), a row they know is there, and that is all the plan asks.
  *
  * A row they don't know is read by the table's own rowid lookup, and they are told the props of the row it found.
  * The lookup also runs for a key the maps hold no row for (not a whole number from 0 to 2^31 - 1), and for every row
@@ -235,6 +236,8 @@ export class GraphNodeScan implements Operator {
   private epoch = -1;
   /** The register of the row's props; -1 until the scan first opens, or where the plan doesn't read them. */
   private propsReg = -1;
+  /** Whether the maps can answer: the plan reads nothing of the row but its rowid and, where it does, its props. */
+  private inMemory = false;
   private ready = false;
   /** What `next` does: nothing more, the row from memory, the lookup's row, or the lookup's row told to the maps. */
   private mode: 'none' | 'held' | 'lookup' | 'learn' = 'none';
@@ -263,24 +266,26 @@ export class GraphNodeScan implements Operator {
   /** Once, when the scan first opens: what the plan reads of the row is known by then. */
   private prepare(): void {
     this.ready = true;
-    const d = this.access.decode;
-    // The planner offers this scan where the plan may read no column but the props: any other is in the table.
+    // The columns the plan still reads (`TableAccess.reads`): the lookup decodes those, and no others. The planner
+    // offers this scan where the plan may read no column but the props: any other is in the table.
+    const d = this.access.reads();
     let only = true;
     for (let i = 0; i < d.length; i += 2) {
       if (d[i] === this.propsCol) this.propsReg = d[i + 1]!;
       else only = false;
     }
+    this.inMemory = only;
     if (!only) this.propsReg = -1;
   }
 
   open(r: SqlValue[]): void {
     this.r = r;
     if (!this.ready) this.prepare();
-    if (this.propsReg >= 0 && this.epoch !== this.state.epoch) {
+    if (this.inMemory && this.epoch !== this.state.epoch) {
       this.epoch = this.state.epoch;
       this.maps = this.source();
     }
-    const maps = this.propsReg >= 0 ? this.maps : null;
+    const maps = this.inMemory ? this.maps : null;
     const key = (this.keyValue = this.key(r));
     // The key as the rowid lookup takes it. One the maps hold no row for is the lookup's.
     let k = maps === null ? null : rowidProbe(key);
@@ -291,6 +296,15 @@ export class GraphNodeScan implements Operator {
       return;
     }
     this.rowid = k;
+    if (this.propsReg < 0) {
+      // Nothing reads the props: a row the maps know is there, and no copy of its props is made.
+      if (maps.known(k)) this.mode = 'held';
+      else {
+        this.mode = 'learn';
+        this.fallback.open(r);
+      }
+      return;
+    }
     const props = maps.get(k);
     if (props === undefined) {
       this.mode = 'learn';
@@ -310,7 +324,8 @@ export class GraphNodeScan implements Operator {
       // The lookup's one row, which the maps know from here on, or none. After it the lookup says there is no other.
       this.mode = 'lookup';
       if (!this.fallback.next()) return false;
-      const props = r[this.propsReg]!;
+      // The props as the lookup decoded them, or read from its row where the plan reads none.
+      const props = this.propsReg >= 0 ? r[this.propsReg]! : this.fallback.column(this.propsCol);
       if (holdable(props)) this.maps!.set(this.rowid, props);
       return true;
     }
@@ -320,7 +335,7 @@ export class GraphNodeScan implements Operator {
       r[a.rowidReg] = this.rowid;
       for (const x of a.extraRowidRegs) r[x] = this.rowid;
     }
-    r[this.propsReg] = this.props;
+    if (this.propsReg >= 0) r[this.propsReg] = this.props;
     return true;
   }
 
