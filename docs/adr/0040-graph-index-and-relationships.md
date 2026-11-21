@@ -282,6 +282,36 @@ they were rebased onto `main`):
   The planner's costs were left as they are: it reads a label's nodes this way where it read the label's entries
   before, and where the label's own count, lower than the statistics' number for a label, now makes that cheaper
   than scanning the node table.
+- **The graph's rules ask the index, and a plan run inside a statement gives its writers back** (added 2026-11-21,
+  beside ADR 0042's steps: it changes no plan). One statement that deletes 1,000 nodes was the write furthest from
+  the bar, 26x to 29x smaltcy's time. Each node's row is deleted after the engine has kept the graph's rules for it
+  (ADR 0033): it asks whether a relationship starts or ends at the node, with a plan for each edge table and end,
+  and deletes the node's label entries with another. In a profile of that statement on `main`, this was 57% of the
+  time: the plans that ask for relationships 10%, and making a `TableWriter` for the label index 16%, since a
+  writer taken inside a statement stayed taken until the statement ended, and each node's plan made its own. Now:
+  - the rule asks the graph's index whether the node has a relationship of each type at each end
+    (`GraphIndexes.connected`: a seek in the node's list), and runs its plans only where the graph isn't indexed
+    and for an id the index holds no node for. A node is refused for the same table and end as before;
+  - the writers a plan takes are free again when the plan ends (`Database.internalPlan`), so the next node's plan
+    takes the same writer. This holds for every plan the engine runs inside a statement, a foreign key's actions
+    too: one statement that deletes 60 rows whose children go with them wrote through 61 writers and writes
+    through 2. A plan that writes the table a statement or plan that has not ended is writing still makes its own.
+
+  Measured against smaltcy (smaltdb's time over smaltcy's on its network of 20,000 people, `main` and this in
+  turns): deleting 1,000 nodes in `bench/writes.ts`, three runs, 26.04x, 28.87x and 29.00x to 17.27x, 18.72x and
+  20.39x (13.4, 12.6 and 12.1 ms to 9.7, 8.7 and 9.1); in `bench/vary.ts`, two runs, 19.70x and 20.30x to 15.00x
+  and 15.30x (15.3 and 15.3 ms to 9.8 and 9.8). The other writes and the reads stayed within the spread between
+  runs. In the engine alone, 1,000 nodes with a label entry and no relationship deleted inside one transaction
+  (three runs in turns, µs a node): by one statement 12.1, 9.1 and 8.7 to 4.6, 4.8 and 4.6; by a statement for
+  each node, the lowest of 25 rounds, 6.6, 6.7 and 6.6 to 6.1, 6.2 and 6.0. In the profile the rules are now 43% of
+  the delete, 37% of it the label entries' own delete from their B+tree and its two indexes: rows written as the
+  statement runs, which is what ADR 0042's step 4 changes.
+
+  A table that keeps history and is written by such plans lost a history row where two of a statement's plans
+  each made a writer: every writer of the table had its own writer for the history table, with its own idea of
+  that table's last row. With one writer for the plans the rows are kept (`test/history-log.test.ts`). The same
+  loss remains where the plans write the table their statement is writing (a foreign key from a table that keeps
+  history to itself): it is on `main` before this, and is not fixed here.
 
 Later, each only with its own measurement: the index shared with reader workers, an undo log for rollbacks, the index
 kept in pager pages so opening a large graph doesn't wait for a build, and whether a graph's edge tables still need

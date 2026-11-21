@@ -221,6 +221,14 @@ Decisions and their rationale: [ADR 0005](adr/0005-cost-based-optimizer.md).
   which each cursor holds its place (`OpenCursors`), so opening and closing one are a push and a pop. How its rows
   are given (booleans, dates as text, lists, typed values under `any`) is worked out once for a compiled statement
   (`ResultForm`), not for each cursor. Measured on a seek that gives one row: 2.6 µs a run before #289, 2.1 after.
+- **Writers, and the plans a statement runs inside itself.** A row table keeps one `TableWriter`, taken by the
+  statement that writes it and busy until that statement ends (`Database.writerFor`); a write to a table whose
+  writer is busy makes a writer of its own. A foreign key's actions and a property graph's rules are plans the
+  engine runs inside the statement (`Database.internalPlan`), once for each row that needs them. The writers such a
+  plan takes are free again when it ends, so its next run takes the same ones: a statement that deletes 1,000 rows
+  whose children go with them writes through two writers, where it made one for each row. A plan that writes the
+  table a statement or a plan that has not ended is writing (a foreign key from a table to itself) still makes its
+  own.
 - **`EXPLAIN ANALYZE`** shows, per operator, the planner's estimate (rows per loop), loops, actual rows and
   inclusive time. Operators without an EXPLAIN QUERY PLAN line appear under their class name (FILTER, PROJECT, …).
 - **Generated code in joins.** Standalone scans of join sources run as fused scan + filter pipelines. Text
@@ -276,6 +284,12 @@ See [ADR 0008](adr/0008-materialized-views-and-columnar-segments.md).
 - **Kept by writers.** An edge table's `TableWriter` reports every row written, changed and deleted to the index
   (`GraphHooks`, `exec/write.ts`). A rollback drops an index that may hold what it undid; a commit confirms it at the
   pager's new change counter.
+- **Asked by the graph's rules.** Before a node is deleted, or its id changed, the engine asks whether a relationship
+  starts or ends at it (`GraphRules.refuseIfConnected`, `exec/graph-rules.ts`). The graph's index answers
+  (`GraphIndexes.connected`: a seek in the node's list for the edge table's type), built if it isn't. Where the graph
+  isn't indexed, and for an id the index holds no node for, the endpoint index is searched by a plan, as before the
+  index answered. Either way the node is refused for the first edge table and end, in the graph's order, that has a
+  relationship of it.
 - **Tests.** With `SMALT_GRAPH_INDEX_CHECK=1` (set for every test, `test/setup-sql.ts`) the engine compares each index
   with its tables after every statement that writes, and runs every query that read one again without it: the rows
   must be the same, in order.
