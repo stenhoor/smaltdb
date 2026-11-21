@@ -42,6 +42,11 @@ export interface GraphHost {
   nextRowid(t: TableSchema): number | bigint;
   /** Run an internal query plan with positional parameters, inside the current statement. */
   run(plan: PlanOp, params: SqlValue[]): SqlValue[][];
+  /**
+   * Whether node `id` has a relationship in edge table `t`, as its start (or as its end), where that is known
+   * without a plan (a graph's index in memory holds the table's relationships); undefined where it isn't.
+   */
+  connected(t: TableSchema, byStart: boolean, id: number | bigint): boolean | undefined;
 }
 
 interface Edge {
@@ -360,7 +365,7 @@ export class GraphRules {
         [e.byStart, e.start],
         [e.byEnd, e.end],
       ] as const) {
-        if (this.host.run(plan, [id]).length > 0) {
+        if (this.host.connected(e.table, column === e.start, id) ?? this.host.run(plan, [id]).length > 0) {
           throw new ConstraintError('SMALT_CONSTRAINT_FOREIGNKEY', `property graph ${graph.name}: can't ${what} node ${id} of ${table.name}: relationships in ${e.table.name}.${e.table.columns[column]!.name} refer to it (delete them first)`, {
             table: e.table.name,
             columns: [e.table.columns[column]!.name],

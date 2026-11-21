@@ -153,3 +153,35 @@ describe('the log', () => {
     expect(() => db.queryPlan(bad as unknown as PlanStatementInput)).toThrow(/has a name history uses/);
   });
 });
+
+describe("a table written by a statement's internal plans", () => {
+  /** `emp(id, boss)` keeps history, and its rows go with their row of `boss` (ON DELETE CASCADE). */
+  const emp = (history: string): PlanStatementInput => {
+    const t = create('emp', history) as unknown as { op: { table: { columns: unknown[]; foreignKeys: unknown[] } } };
+    t.op.table.columns = [column('id', 'INTEGER'), column('boss', 'INTEGER')];
+    t.op.table.foreignKeys = [{ columns: [1], table: 'boss', onDelete: 'CASCADE', onUpdate: 'NO ACTION', deferrable: false, isDeferrable: false }];
+    return t as unknown as PlanStatementInput;
+  };
+
+  for (const history of ['log', 'versions']) {
+    it(`${history}: every change the plans make is kept`, () => {
+      const db = Database.openMemory();
+      db.exec('CREATE TABLE boss(id INTEGER PRIMARY KEY)');
+      db.queryPlan(emp(history));
+      db.exec('INSERT INTO boss VALUES (1), (2), (3)');
+      db.exec('INSERT INTO emp VALUES (11, 1), (12, 2), (13, 3), (14, 3)');
+      const full = db.pager.commitId;
+      const kept = (): number => Number(db.query(`SELECT count(*) FROM smalt_${history}_emp`).rows[0]![0]);
+      const before = kept();
+      // Each boss deleted takes its row of emp in a plan of its own, inside the one statement; then two more go.
+      db.exec('DELETE FROM boss WHERE id IN (1, 2)');
+      const two = db.pager.commitId;
+      db.exec('DELETE FROM emp WHERE id = 13');
+      db.exec('DELETE FROM emp WHERE id = 14');
+      expect(kept()).toBe(before + 4);
+      expect(asOf(db, 'emp', full)).toEqual([[11, 1], [12, 2], [13, 3], [14, 3]]);
+      expect(asOf(db, 'emp', two)).toEqual([[13, 3], [14, 3]]);
+      expect(db.query('SELECT count(*) FROM emp').rows).toEqual([[0]]);
+    });
+  }
+});

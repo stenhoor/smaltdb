@@ -82,6 +82,66 @@ describe('statement re-planning', () => {
   });
 });
 
+describe("a statement's internal plans", () => {
+  /** Writers made since the database was opened. */
+  const made = (db: Database): number => (db as unknown as { writersMade: number }).writersMade;
+
+  it("take a table's writer again for each row, where each run made one", () => {
+    const db = Database.openMemory();
+    db.exec('CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parent(id) ON DELETE CASCADE); CREATE INDEX child_parent ON child(parent)');
+    db.exec('WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100) INSERT INTO parent SELECT i FROM n');
+    db.exec('INSERT INTO child(parent) SELECT p.id FROM parent p, (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3)');
+    // A foreign key that deletes the children of each deleted row: one writer for the parents, one for the children.
+    let before = made(db);
+    db.exec('DELETE FROM parent WHERE id <= 60');
+    expect(made(db) - before).toBeLessThanOrEqual(2);
+    expect(db.query('SELECT count(*), min(parent) FROM child').rows).toEqual([[120, 61]]);
+    // The next statement takes the same two, and none is held once a statement ends.
+    before = made(db);
+    db.exec('DELETE FROM parent WHERE id <= 80');
+    expect(made(db) - before).toBe(0);
+    expect(db.query('SELECT count(*), min(parent) FROM child').rows).toEqual([[60, 81]]);
+    const held = db as unknown as { writersBusy: Set<unknown>; writersTaken: unknown[] };
+    expect([held.writersBusy.size, held.writersTaken.length]).toEqual([0, 0]);
+  });
+
+  it('a write to the table a statement is writing takes a writer of its own', () => {
+    const db = Database.openMemory();
+    db.exec('CREATE TABLE node(id INTEGER PRIMARY KEY, up INTEGER REFERENCES node(id) ON DELETE CASCADE); CREATE INDEX node_up ON node(up)');
+    // Ten trees, each a chain of five with two leaves on every link.
+    db.exec('WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 49) INSERT INTO node SELECT i, CASE WHEN i % 5 = 0 THEN NULL ELSE i - 1 END FROM n');
+    db.exec('INSERT INTO node SELECT 1000 + 2 * id, id FROM node WHERE id < 50; INSERT INTO node SELECT 1001 + 2 * id, id FROM node WHERE id < 50');
+    expect(db.query('SELECT count(*) FROM node').rows).toEqual([[150]]);
+    const before = made(db);
+    db.exec('DELETE FROM node WHERE id IN (0, 5, 22)');
+    // Two whole trees, and the lower part of a third.
+    expect(db.query('SELECT count(*), count(*) FILTER (WHERE id < 50) FROM node').rows).toEqual([[111, 37]]);
+    // Thirteen of the deleted rows have rows under them (five a tree, and 22, 23 and 24): deleting those is a plan
+    // run inside the delete that is still running, on its table, so each makes a writer. None takes the writer of a
+    // statement or a plan that has not ended, however many plans ended before it.
+    expect(made(db) - before).toBe(13);
+    expect(db.query('SELECT id FROM node WHERE id BETWEEN 20 AND 24').rows).toEqual([[20], [21]]);
+    db.exec('DELETE FROM node WHERE up IS NULL');
+    expect(db.query('SELECT count(*) FROM node').rows).toEqual([[0]]);
+  });
+
+  it('a node deleted with its labels', () => {
+    const db = Database.openMemory();
+    db.exec('CREATE TABLE person(id INTEGER PRIMARY KEY, name TEXT); CREATE TABLE admin(id INTEGER PRIMARY KEY); CREATE TABLE knows(start INTEGER, end INTEGER)');
+    db.exec('CREATE INDEX knows_start ON knows(start, end); CREATE INDEX knows_end ON knows(end, start)');
+    const schema = (op: Record<string, unknown>): void => void db.queryPlan({ kind: 'schema', op } as never);
+    schema({ op: 'createPropertyGraph', ifNotExists: false, graph: { name: 'g', nodes: [{ label: 'Person', table: 'person', id: 'id' }, { label: 'Admin', table: 'admin', id: 'id' }], edges: [{ type: 'KNOWS', table: 'knows', start: 'start', end: 'end' }] } });
+    schema({ op: 'alterPropertyGraph', name: 'g', action: { kind: 'addLabelIndex' } });
+    db.exec("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 199) INSERT INTO person SELECT i, 'p' || i FROM n");
+    db.exec("INSERT INTO g_labels SELECT id, 'Admin' FROM person");
+    const before = made(db);
+    db.exec('DELETE FROM person WHERE id < 150');
+    // The people's writer and the label index's, whatever the number of people.
+    expect(made(db) - before).toBeLessThanOrEqual(2);
+    expect(db.query('SELECT count(*), min(node) FROM g_labels').rows).toEqual([[50, 150]]);
+  });
+});
+
 describe('cached morsel merge statements', () => {
   it('merge the rows of each run, not the first run\'s', async () => {
     const db = await Database.open(new MemoryVfs(), 'db');
