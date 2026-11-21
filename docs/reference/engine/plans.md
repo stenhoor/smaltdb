@@ -305,7 +305,7 @@ integer primary key, `null` any).
 |---|---|---|
 | `col` | `input`, `index`, `depth`, `type`, `collation` | column `index` of input `input`; `depth` d > 0 reads the input of the operation d dependent evaluations out (a correlated reference) |
 | `lit` | `value`, `type` | a constant |
-| `param` | `index`, `type` | positional parameter `index` (0-based) |
+| `param` | `index`, `type` | positional parameter `index` (0-based). With a `list<…>`, `struct<…>` or `map<text, …>` type it takes a JS array or object ([running plans](./running#parameters)) |
 | `call` | `fn`, `args`, `type`, `collation?` | a function; `collation` is the rule a comparison-like function compares text by |
 | `cast` | `fn`, `to`, `arg` | a conversion, `fn` naming it (`cast_integer`, …) |
 | `and`, `or` | `args`, `type?` | three-valued logic; `type` is `bool` (left out) or `int` (see below) |

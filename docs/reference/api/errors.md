@@ -167,6 +167,8 @@ A value of the wrong kind where one kind is required. Message: `datatype mismatc
 - `LIMIT` or `OFFSET` that is NULL or not an integer;
 - a rowid (`INTEGER PRIMARY KEY`) value that is not an integer;
 - a parameter of an unsupported JavaScript type, such as a `Date` or an `ArrayBuffer` (`unsupported parameter type`);
+- a value bound to a parameter a plan reads as a list, struct or map that is no array or object, or no value of that
+  type ([parameters](../engine/running#parameters));
 - a materialized view whose query produced a value that does not fit a view column.
 
 **Remedy:** pass a value of the right type. See [values](https://stenhoor.github.io/smaltql/guide/queries#values).

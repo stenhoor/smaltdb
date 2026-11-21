@@ -16,7 +16,7 @@ import { MisuseError, SmaltError, constraintMessage, withDetails, wordError } fr
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
 import { type ConflictAction, PATH_TYPE, type PlanOp } from './plan/ops.js';
 import { type EncodedPlan, canonicalJSON, decodeData, decodePlan, encodeData, encodePlan, plainJSON, planFromJSON, planToJSON } from './plan/codec.js';
-import { type PlanStatementInput, paramCount, toBoundStatement, toPlanStatement } from './plan/statement.js';
+import { type PlanStatementInput, nestedParams, paramCount, toBoundStatement, toPlanStatement } from './plan/statement.js';
 import { type NormalizeCatalog, PATHS_FUNCTION, type TableTypes, normalizePlan, normalizeWrite } from './exec/plan-normalize.js';
 import { type ValidateCatalog, validatePlan, validateSchemaOp } from './plan/validate.js';
 import { type PlanExpr, forEachCol, typeOf } from './plan/expr.js';
@@ -38,8 +38,8 @@ import type { BindContext } from './plan/bind-context.js';
 import { type PlanMatview, matchMatviews } from './exec/plan-mv-match.js';
 import { type ConflictMode, TableWriter, constraintError } from './exec/write.js';
 import { type TemporalForm, type TemporalType, datetimeFromDate, isTemporal, rowsInForm, temporalText } from '../shared/temporal.js';
-import { type NestedTypeName, anyResult, isNestedType, nestedResult } from '../shared/nested.js';
-import type { ReaderSettings } from '../shared/protocol.js';
+import { type NestedTypeName, anyResult, encodeNested, isNestedType, nestedResult } from '../shared/nested.js';
+import type { PlanParams, ReaderSettings } from '../shared/protocol.js';
 import { describeTable, logicalCatalog } from './catalog/logical.js';
 import { outputTypes } from './plan/output.js';
 import { type Catalog, type CatalogTable, type ViewInterfaceColumn, planTypeOfStorage } from './plan/catalog.js';
@@ -689,12 +689,12 @@ export class Database implements FunctionContext {
   }
 
   /** Run a query given as plan data and return all rows (statements are cached by the plan's canonical form). */
-  queryPlan(stmt: PlanStatementInput, params?: readonly SqlValue[], options: { temporal?: TemporalForm } = {}): QueryResult {
+  queryPlan(stmt: PlanStatementInput, params?: PlanParams, options: { temporal?: TemporalForm } = {}): QueryResult {
     return inForm(this.cachedPlan(stmt).result(params as BindParams | undefined), options.temporal);
   }
 
   /** `queryPlan` for a plan that may read external data: its sources are fetched first. */
-  async queryPlanAsync(stmt: PlanStatementInput, params?: readonly SqlValue[], options: { signal?: AbortSignal; temporal?: TemporalForm } = {}): Promise<QueryResult> {
+  async queryPlanAsync(stmt: PlanStatementInput, params?: PlanParams, options: { signal?: AbortSignal; temporal?: TemporalForm } = {}): Promise<QueryResult> {
     const st = this.cachedPlan(stmt);
     return this.withExternal(options.signal, st, () => inForm(st.result(params as BindParams | undefined), options.temporal));
   }
@@ -2985,7 +2985,9 @@ export class Database implements FunctionContext {
     const m = this.morselOf(st);
     if (!m) throw new SmaltError('SMALT_ERROR', 'statement cannot run as partial aggregates');
     const values: SqlValue[] = new Array(m.parsed.paramCount + 2).fill(null);
-    bindParamValues(m.parsed, params, values);
+    // A plan statement binds its own: a parameter it reads as a list, struct or map is given as a JS array or object.
+    if (st instanceof PlanStatement) st.bindInto(params, values);
+    else bindParamValues(m.parsed, params, values);
     values[m.parsed.paramCount] = lo;
     values[m.parsed.paramCount + 1] = hi;
     return { plan: m.partial, key: m.key, params: values };
@@ -3017,7 +3019,8 @@ export class Database implements FunctionContext {
     this.morsel = { rows: partials, keys: m.q.keyCount, width: m.q.types.length, types: m.q.types };
     try {
       const values: SqlValue[] = new Array(m.parsed.paramCount).fill(null);
-      bindParamValues(m.parsed, params, values);
+      if (st instanceof PlanStatement) st.bindInto(params, values);
+      else bindParamValues(m.parsed, params, values);
       const p = (m.merge ??= this.planProgram(m.q.merge, m.columns, m.parsed.paramCount));
       return { columns: p.columns, rows: this.runProgram(p, values) };
     } finally {
@@ -6045,8 +6048,22 @@ export class Statement extends PreparedStatement {
   }
 }
 
+/**
+ * A plan statement's parameters: an array, whose values for the parameters the plan reads as a list, struct or map
+ * are JS arrays, objects or `Map`s (`PlanParams`).
+ */
+export interface PlanStatement {
+  run(params?: BindParams | PlanParams): RunResult;
+  all(params?: BindParams | PlanParams): SqlValue[][];
+  result(params?: BindParams | PlanParams): QueryResult;
+  cursor(params?: BindParams | PlanParams): RowCursor;
+}
+
 /** A statement given as plan data (`Database.preparePlan`): parameters are positional. */
 export class PlanStatement extends PreparedStatement {
+  /** The parameters the plan reads as a list, struct or map, by index (`nestedParams`); null when it reads none as one. */
+  private readonly nestedParams: readonly (NestedTypeName | undefined)[] | null;
+
   /** @internal */
   constructor(
     db: Database,
@@ -6055,6 +6072,7 @@ export class PlanStatement extends PreparedStatement {
     readonly paramCount: number,
   ) {
     super(db);
+    this.nestedParams = nestedParams(bound, paramCount);
   }
 
   protected compileProgram(): Program {
@@ -6066,11 +6084,44 @@ export class PlanStatement extends PreparedStatement {
     if (params !== undefined && !Array.isArray(params)) throw new SmaltError('SMALT_RANGE', "a plan's parameters are positional: bind them with an array");
     const values = (params ?? []) as readonly (SqlValue | boolean | undefined)[];
     if (values.length !== n) throw new SmaltError('SMALT_RANGE', `statement expects ${n} parameter(s), got ${values.length}`);
-    for (let i = 0; i < n; i++) regs[i] = normalizeParam(values[i], i + 1);
+    const nested = this.nestedParams;
+    if (nested === null) {
+      for (let i = 0; i < n; i++) regs[i] = normalizeParam(values[i], i + 1);
+      return;
+    }
+    for (let i = 0; i < n; i++) {
+      const t = nested[i];
+      regs[i] = t === undefined ? normalizeParam(values[i], i + 1) : nestedParam(t, values[i], i + 1);
+    }
+  }
+
+  /** @internal The statement's parameters as it binds them, in `regs[0..paramCount)`: for a morsel task's values. */
+  bindInto(params: BindParams | undefined, regs: SqlValue[]): void {
+    this.bindParams(params, regs);
   }
 
   protected readsMemoryObjects(): boolean {
     return this.db.planUsesMemoryObjects(this.bound);
+  }
+}
+
+/**
+ * The value bound to a parameter a plan reads as the list, struct or map type `t` (ADR 0020, "Parameters"): NULL, or
+ * a JS array or object as a column of `values` of that type takes one, as the bytes the type holds. Nothing else is
+ * one: the plan reads the parameter as a `t`, so bytes that are no `t` would be read as one.
+ */
+function nestedParam(t: NestedTypeName, v: unknown, slot: number): SqlValue {
+  if (v === null || v === undefined) return null;
+  if (typeof v !== 'object' || ArrayBuffer.isView(v) || v instanceof Date) {
+    const what = typeof v === 'object' ? (v instanceof Date ? 'a Date' : 'a blob') : typeof v === 'string' ? JSON.stringify(v) : String(v);
+    const takes = t.startsWith('list<') ? 'an array' : t.startsWith('map<') ? 'an object or a Map' : 'an object or an array';
+    throw new SmaltError('SMALT_MISMATCH', `parameter ?${slot}: a ${t} is bound with ${takes}, not ${what}`);
+  }
+  try {
+    return encodeNested(t, v, `parameter ?${slot}`);
+  } catch (e) {
+    if (e instanceof TypeError) throw new SmaltError('SMALT_MISMATCH', e.message);
+    throw e;
   }
 }
 

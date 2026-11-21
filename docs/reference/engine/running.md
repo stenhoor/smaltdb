@@ -96,6 +96,24 @@ const rows = await db.queryPlan<{ name: string }>({ kind: 'query', plan: byId, c
 Parameters are positional: a plan reads `param` 0, 1, …, and runs with an array of that many values (a statement reads
 at most 32766). Integers beyond ±(2^53 − 1) are `bigint`s; blobs are `Uint8Array`s.
 
+A parameter the plan reads as a list, a struct or a map (`param(0, 'list<int>')`, `param(1, 'map<text, any>')`) takes
+a JS array, an object or a `Map`, as [a column of `values`](./plans#operations) of that type takes one: the engine
+makes the type's bytes of it each time the statement runs. So a statement prepared once takes another list or map
+each run, where a list written into the plan makes each a plan of its own, planned from nothing. `null` and
+`undefined` are NULL. Any other value, bytes included, is refused (`SMALT_MISMATCH`): the plan reads the parameter as
+that type. A parameter read as one has that one type wherever the plan reads it (`SMALT_PLAN` otherwise).
+
+```ts
+import { open } from 'smaltdb';
+import * as p from 'smaltdb/plan';
+
+const db = await open('app');
+const named = p.project(p.filter(p.scan('fruit', [0, 1]), p.call('list_contains', [p.param(0, 'list<text>'), p.col(0, 1, 'text')], 'bool')), [p.col(0, 0, 'int')]);
+const some = await db.preparePlan({ kind: 'query', plan: named, columns: [{ name: 'id', type: 'int' }] });
+const two = await some.query<{ id: number }>([['apple', 'pear']]);
+const none = await some.query<{ id: number }>([[]]);
+```
+
 ## Validation
 
 The engine validates every plan before it plans it, whoever built it. One pass checks:

@@ -10,14 +10,14 @@ import type { PlanStatementInput } from '../engine/plan/statement.js';
 import { PLAN_FORMAT_VERSION, type PlanType } from '../engine/plan/types.js';
 import { type TemporalForm, isTemporal, temporalInForm, temporalText } from '../shared/temporal.js';
 import { isNestedType, nestedResult } from '../shared/nested.js';
-import { type BusMessage, type Params, type Request, type RequestBody, type Response, type WireColumn, columnValue } from '../shared/protocol.js';
+import { type BusMessage, type Params, type PlanParams, type Request, type RequestBody, type Response, type WireColumn, columnValue } from '../shared/protocol.js';
 
 /** A statement as plan data (the plan format is experimental): its types, builders and codec are in `smaltdb/plan`. */
 export type { SqlValue, Params, PlanStatementInput };
 export type { TemporalForm } from '../shared/temporal.js';
 
-/** A plan's parameters: positional. */
-export type PlanParams = readonly (SqlValue | boolean | undefined)[];
+/** A plan's parameters: positional (a parameter read as a list, struct or map takes a JS array, an object or a `Map`). */
+export type { PlanParams };
 
 /**
  * A statement as plan data, as the worker protocol carries it: JSON text, with the typed arrays of values given as
@@ -235,9 +235,9 @@ export interface TransactionStatement {
   readonly columns: string[];
   readonly columnTypes: PlanType[];
   readonly paramCount: number;
-  query<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params, options?: QueryOptions & { rowMode?: M }): Promise<QueryResultFor<M, T>>;
-  stream<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params, options?: StreamOptions & { rowMode?: M }): AsyncIterableIterator<QueryResultFor<M, T>>;
-  run(params?: Params, options?: { signal?: AbortSignal }): Promise<RunResult>;
+  query<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params | PlanParams, options?: QueryOptions & { rowMode?: M }): Promise<QueryResultFor<M, T>>;
+  stream<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params | PlanParams, options?: StreamOptions & { rowMode?: M }): AsyncIterableIterator<QueryResultFor<M, T>>;
+  run(params?: Params | PlanParams, options?: { signal?: AbortSignal }): Promise<RunResult>;
 }
 
 /** Where requests go: this tab's engine worker, or another tab's over a BroadcastChannel. */
@@ -784,38 +784,38 @@ export class PreparedStatement {
   }
 
   /** Run and return the rows (see Database.query); waits for a running transaction, like it. */
-  async query<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params, options: QueryOptions & { rowMode?: M } = {}): Promise<QueryResultFor<M, T>> {
+  async query<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params | PlanParams, options: QueryOptions & { rowMode?: M } = {}): Promise<QueryResultFor<M, T>> {
     this.check();
     return this.db.afterTransaction(() => this.rawQuery(params, options)) as Promise<QueryResultFor<M, T>>;
   }
 
   /** Stream the statement's result in batches (see Database.stream); starts after a running transaction. */
-  stream<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params, options: StreamOptions & { rowMode?: M } = {}): AsyncIterableIterator<QueryResultFor<M, T>> {
+  stream<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(params?: Params | PlanParams, options: StreamOptions & { rowMode?: M } = {}): AsyncIterableIterator<QueryResultFor<M, T>> {
     this.check();
     return this.db.openStream({ op: 'stmtQuery', stmt: this.id, params, batchSize: options.batchSize }, options, true) as AsyncIterableIterator<QueryResultFor<M, T>>;
   }
 
   /** Run for effect (see Database.exec); runs in call order with exec and waits for a running transaction. */
-  async run(params?: Params, options: { signal?: AbortSignal } = {}): Promise<RunResult> {
+  async run(params?: Params | PlanParams, options: { signal?: AbortSignal } = {}): Promise<RunResult> {
     this.check();
     return this.db.withLock(() => this.rawRun(params, options));
   }
 
   /** @internal Unlocked query (inside a transaction). */
-  async rawQuery(params: Params | undefined, options: QueryOptions): Promise<unknown> {
+  async rawQuery(params: Params | PlanParams | undefined, options: QueryOptions): Promise<unknown> {
     this.check();
     const res = (await this.db.request({ op: 'stmtQuery', stmt: this.id, params, batchSize: options.batchSize }, options.signal)) as Collected;
     return materialize(res, options.rowMode ?? 'object', options.temporal);
   }
 
   /** @internal */
-  rawStream(params: Params | undefined, options: StreamOptions): AsyncIterableIterator<unknown> {
+  rawStream(params: Params | PlanParams | undefined, options: StreamOptions): AsyncIterableIterator<unknown> {
     this.check();
     return this.db.openStream({ op: 'stmtQuery', stmt: this.id, params, batchSize: options.batchSize }, options);
   }
 
   /** @internal */
-  async rawRun(params: Params | undefined, options: { signal?: AbortSignal }): Promise<RunResult> {
+  async rawRun(params: Params | PlanParams | undefined, options: { signal?: AbortSignal }): Promise<RunResult> {
     this.check();
     const r = (await this.db.request({ op: 'stmtRun', stmt: this.id, params }, options.signal)) as { changes: number; lastInsertRowid: number | bigint };
     return { changes: r.changes, lastInsertRowid: r.lastInsertRowid };

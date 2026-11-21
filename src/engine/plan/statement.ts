@@ -10,6 +10,7 @@ import type { Affinity } from '../exec/convert.js';
 import type { ResultColumnInfo } from '../exec/planner.js';
 import { SmaltError } from '../errors.js';
 import { Collation } from '../values.js';
+import { type NestedTypeName, isNestedType } from '../../shared/nested.js';
 import type { BoundQuery, BoundStatement, BoundWrite } from './bound.js';
 import type { PlanOp } from './ops.js';
 import type { CollationName, PlanType } from './types.js';
@@ -121,6 +122,40 @@ export function paramCount(stmt: unknown): number {
 
 /** SQLite's limit on parameters (SQLITE_MAX_VARIABLE_NUMBER). */
 export const MAX_PARAMS = 32766;
+
+/**
+ * The parameters a statement reads as a list, struct or map (ADR 0020, "Parameters"): by index, the type each is read
+ * with; null when it reads none as one. Such a parameter is bound with a JS array or object, which becomes the bytes
+ * of that type, so the statement must read it with that one type wherever it reads it: SMALT_PLAN otherwise.
+ */
+export function nestedParams(stmt: unknown, count: number): readonly (NestedTypeName | undefined)[] | null {
+  if (count === 0) return null;
+  /** The type each parameter is first read with. */
+  const read: (string | undefined)[] = new Array(count).fill(undefined);
+  let nested: (NestedTypeName | undefined)[] | null = null;
+  const walk = (x: unknown): void => {
+    if (Array.isArray(x)) {
+      for (const v of x) walk(v);
+      return;
+    }
+    if (!x || typeof x !== 'object' || x instanceof Uint8Array) return;
+    const o = x as Record<string, unknown>;
+    if (o.k === 'param' && typeof o.index === 'number' && typeof o.type === 'string') {
+      const i = o.index;
+      const t = o.type;
+      const first = read[i];
+      if (first === undefined) {
+        read[i] = t;
+        if (isNestedType(t)) (nested ??= new Array(count).fill(undefined))[i] = t;
+      } else if (first !== t && (isNestedType(t) || isNestedType(first))) {
+        throw new SmaltError('SMALT_PLAN', `parameter ${i} is read as a ${first} and as a ${t}: a parameter read as a list, struct or map has that one type`);
+      }
+    }
+    for (const k in o) walk(o[k]);
+  };
+  walk(stmt);
+  return nested;
+}
 
 const COLLATION_NAMES: Readonly<Record<number, CollationName>> = { [Collation.Binary]: 'binary', [Collation.NoCase]: 'nocase', [Collation.RTrim]: 'rtrim' };
 

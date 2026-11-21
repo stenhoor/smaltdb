@@ -17,6 +17,7 @@ import { type AggregateState, type CompiledArg, type Fn, type FunctionContext, a
 import { type CodegenHelpers, type FallbackNode, codegenEnabled, generate, generatedType, isCodegenRoot } from './codegen.js';
 import { daysAsUs } from './temporal-ops.js';
 import { type MapCompare, mapProbe } from './nested-ops.js';
+import { isNestedType } from '../../shared/nested.js';
 import { WINDOW_ARITY } from './window.js';
 import { type SqlMeta, getMeta, setMeta } from './sql-meta.js';
 import { type BoundExpr, type ExprMeaning, call, eachParts, lit, param, typeOf } from '../plan/expr.js';
@@ -203,7 +204,8 @@ function compileBound(e: BoundExpr, ctx: FunctionContext): Compiled {
       return konst(e.value, e.type);
     case 'param': {
       const reg = e.index;
-      return { fn: (r) => r[reg], type: 'any', collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false, reg };
+      // A parameter is whatever value was bound, but one read as a list, struct or map holds one (`nestedParams`).
+      return { fn: (r) => r[reg], type: isNestedType(e.type) ? e.type : 'any', collation: Collation.Binary, collSrc: CollSrc.None, affinity: 'NONE', constant: false, reg };
     }
     case 'slot':
       e.use?.();
