@@ -20,7 +20,7 @@ import type { GraphLabels } from './graph-labels.js';
 import type { GraphProps } from './graph-props.js';
 import { PATHS_FUNCTION } from './plan-normalize.js';
 import type { GraphLists } from './graph-lists.js';
-import { GraphIndexScan, GraphLabelScan, GraphNodeScan } from './graph-scan.js';
+import { GraphIndexScan, GraphLabelEntries, GraphLabelScan, GraphNodeScan } from './graph-scan.js';
 import { type RelationshipKey, type RelationshipLists, type RelationshipType, RelationshipsScan } from './graph-relationships.js';
 import { relationshipEdges } from './plan-normalize.js';
 import { Collation, type SqlValue, normalizeInt } from '../values.js';
@@ -38,7 +38,7 @@ import {
   comparisonConverters,
 } from './expr.js';
 import { type AggregateState, type FunctionContext, aggregateFunctions, scalarFunctions } from './functions.js';
-import { type ColumnarHelpers, type FusedAggSpec, type FusedHelpers, type PipelineSource, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter } from './codegen.js';
+import { type ColumnarHelpers, type FusedAggSpec, type FusedHelpers, type PipelineSource, codegenEnabled, generateFusedAggregate, generateGroupAggregate, generateScanFilter, mapKeyConditions } from './codegen.js';
 import { CODEGEN_HELPERS_FOR_FUSION } from './expr.js';
 import { getMeta, isFlattened, isOpaque, setMeta } from './sql-meta.js';
 import { type CompareOp, traitsOf, withoutComparisonConversion } from './traits.js';
@@ -1511,6 +1511,7 @@ export class Planner {
         const innerRegs = (): number[] => this.sourceRegs(src);
         const rest = isLeft ? onInfos.filter((c) => !c.placed) : [];
         if (method === 'inl') {
+          if (!isLeft) this.checkLabelNodes(root, leaf, local, scope, ctx);
           root = new NestedLoopJoin(root, leaf, isLeft, innerRegs, this.andAll(rest, ctx));
           rest.forEach((c) => (c.placed = true));
         } else {
@@ -1549,6 +1550,29 @@ export class Planner {
       c.placed = true;
     }
     return root!;
+  }
+
+  /**
+   * A label's nodes read from the graph's index (`outer`, the one source placed so far), each then found by that
+   * node as its rowid in its node table, through the index's property maps (`inner`, under the filters of the
+   * conjuncts `local`), in an inner join: the label's scan is told the node table's scan, and that one the conditions
+   * the conjuncts need of the row's props (the one map its plan reads), so a node whose props rule it out is not
+   * given, and the node table's scan is not opened for it (`GraphLabelEntries.rows`).
+   */
+  private checkLabelNodes(outer: Operator, inner: Operator, local: ConjunctInfo[], scope: Scope, ctx: FunctionContext): void {
+    if (!(outer instanceof GraphLabelEntries)) return;
+    let scan = inner;
+    while (scan instanceof Filter) scan = scan.child;
+    // The key is the entry's node itself: the label's scan gives the rowid asked for.
+    if (!(scan instanceof GraphNodeScan) || scan.keyExpr?.k !== 'slot' || this.slotSource(scan.keyExpr.reg, scope)?.col !== outer.nodeCol) return;
+    // Nothing is compiled to run: the conjuncts' filters read the props already.
+    this.dryCompile++;
+    try {
+      scan.conditions = mapKeyConditions(local.map((c) => c.bound), pipelineCompiler(ctx));
+    } finally {
+      this.dryCompile--;
+    }
+    if (scan.conditions.length > 0) outer.rows = scan;
   }
 
   private andAll(conjs: ConjunctInfo[], ctx: FunctionContext): Fn | undefined {
@@ -1985,7 +2009,7 @@ export class Planner {
         const reads = src.reads ?? src.cols.map((c) => c.index);
         if (held && reads.includes(held.column) && reads.every((c) => c === -1 || c === table.rowidAlias || c === held.column)) {
           consider('rowid= graph', Math.min(COST.graphOpen, seek(1)), 1, pr.deps.size > 0, () => {
-            const leaf = this.graphNodeScan([access, () => held.maps(), this.env.state, compileBoundExpr(pr.other, ctx).fn, held.column]);
+            const leaf = this.graphNodeScan([access, () => held.maps(), this.env.state, compileBoundExpr(pr.other, ctx).fn, held.column, pr.other]);
             return { leaf, dependsOnOuter: pr.deps.size > 0, consumed: [pr.conj] };
           });
         }
@@ -2083,10 +2107,16 @@ export class Planner {
         // Expression columns have no statistics: assume ~10 rows per value, like SQLite without ANALYZE.
         for (let j = 0; j < k; j++) matches /= idx.columns[j].column < 0 ? Math.max(1, N / 10) : this.ndv(src, idx.columns[j].column);
       }
-      // Equalities on literals: the entries the index holds for them, counted up to a cap, when fewer than the
+      // A label of an indexed graph, given as text: its nodes are counted in the graph's index, however many they are.
+      const ofLabel = k === 1 && !lo && !hi ? this.env.graphLabels?.(table) : undefined;
+      const byLabel = ofLabel !== undefined && idx === labelKeyIndex(table, ofLabel.node, ofLabel.label) && idx.columns[0].column === ofLabel.label;
+      const label = byLabel && eqs[0].other.k === 'lit' ? eqs[0].other.value : undefined;
+      const inLabel = typeof label === 'string' ? ofLabel!.labels()?.count(label) : undefined;
+      if (inLabel !== undefined) matches = inLabel;
+      // Other equalities on literals: the entries the index holds for them, counted up to a cap, when fewer than the
       // estimate. A column with few values often has very different counts per value (a label index: most nodes
       // are one label, and a new label has none), where the average overestimates the rare ones.
-      if (!unique && k > 0 && !lo && !hi && !idx.where && matches > 1 && eqs.every((x) => x.other.k === 'lit')) {
+      else if (!unique && k > 0 && !lo && !hi && !idx.where && matches > 1 && eqs.every((x) => x.other.k === 'lit')) {
         const counted = this.countEntries(table, idx, eqs.map((x) => compileBoundExpr(x.other, ctx).fn), converters, Math.min(COUNT_CAP, Math.ceil(matches)));
         if (counted !== null) matches = counted;
       }
@@ -2141,6 +2171,26 @@ export class Planner {
             idx.columns[0].column,
             idx.columns[1].column,
             table.columns[idx.columns[0].column].name,
+          ]),
+          dependsOnOuter: deps,
+          consumed,
+        }));
+        if (orderBy) options[options.length - 1].orderBy = orderBy;
+      }
+      // A graph's label index, asked for one label's entries through its unique index on label and node, by a plan
+      // whose scan names no column the index doesn't have: the label's nodes are a set in the graph's index in memory,
+      // read in the index's order. Its scan is this index's when the graph isn't indexed.
+      if (ofLabel && byLabel && covering) {
+        consider(`index ${idx.name} graph`, COST.graphOpen + matches * COST.graphEntry, matches, deps, () => ({
+          leaf: this.graphLabelEntries([
+            access,
+            indexScan(),
+            () => ofLabel.labels(),
+            this.env.state,
+            { value: compileBoundExpr(eqs[0].other, ctx).fn, convert: converters[0] },
+            ofLabel.node,
+            ofLabel.label,
+            table.columns[ofLabel.label].name,
           ]),
           dependsOnOuter: deps,
           consumed,
@@ -2481,6 +2531,11 @@ export class Planner {
   private graphNodeScan(args: ConstructorParameters<typeof GraphNodeScan>): GraphNodeScan {
     if (!this.dryCompile) this.readsGraphIndex = true;
     return new GraphNodeScan(...args);
+  }
+
+  private graphLabelEntries(args: ConstructorParameters<typeof GraphLabelEntries>): GraphLabelEntries {
+    if (!this.dryCompile) this.readsGraphIndex = true;
+    return new GraphLabelEntries(...args);
   }
 
   private graphLabelScan(args: ConstructorParameters<typeof GraphLabelScan>): GraphLabelScan {

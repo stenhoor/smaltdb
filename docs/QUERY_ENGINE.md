@@ -291,6 +291,24 @@ See [ADR 0008](adr/0008-materialized-views-and-columnar-segments.md).
   relationship lists. It gives the row's node and label; a plan that reads the rowid or another column, and a graph
   that isn't indexed, run the unique index's scan it carries. Costed at `COST.graphOpen`, it also makes a scan of the
   nodes with a label check for each cheaper than the label's entries with a row fetch for each.
+- **A label's nodes.** The same table asked for one label's entries (`label = x`, where the unique index has the
+  label first), by a plan whose scan names no column but the node and the label, has an access path beside that
+  index's: `GraphLabelEntries` (`exec/graph-scan.ts`) reads the label's set, node by node in id order, which is the
+  index's order. It costs `COST.graphOpen`, and `COST.graphEntry` an entry. A plan that reads an entry's rowid, and
+  a graph that isn't indexed, run the index's scan it carries. A label given as text is costed with the count its
+  set keeps, however many nodes it has (an index's entries are counted only up to `COUNT_CAP`). The rows the planner
+  expects of the label are that count where it is under what the table's statistics give for a label, and the
+  statistics' number otherwise, as with a count of entries.
+- **A label's nodes, checked before their rows are asked for.** Where an inner join then finds each of those nodes
+  in its node table by `rowid = node`, through `GraphNodeScan`, the planner gives that scan the conditions the
+  conjuncts on its row need of the props (`mapKeyConditions`, `exec/codegen.ts`: what a generated scan checks on a
+  stored map before it decodes a row, section 7) and tells the label's scan of it (`Planner.checkLabelNodes`). The
+  label's scan asks, node by node, whether the property maps rule the row out (`GraphProps.rulesOut`: `mapProbe` on
+  the row's map where it lies in the maps' buffer, with no copy; a parameter's bytes are made when the scan opens)
+  and gives only the other nodes, so nothing more runs for a node ruled out. A row the maps don't know is never
+  ruled out: the node's scan reads it from the table and it is known from then on, so the first read of a label
+  costs a row lookup for each of its nodes. The conjuncts' filters still decide each row given. An outer join, and
+  a node found by anything but the entry's node, are not checked.
 - **Relationships.** A `relationships` operation is a source of a join region, like a table (`Source.rel` in
   `exec/planner.ts`), with four access paths (`relationshipOptions`): every relationship; those at the node a
   condition gives for `node`, or for `other`; those between the two nodes when conditions give both. The conditions
@@ -318,7 +336,10 @@ See [ADR 0008](adr/0008-materialized-views-and-columnar-segments.md).
   reads it as it reads a row's. Any other row is found by the rowid lookup the scan carries, and known from then on.
   So is every row where the index holds no maps when the scan opens.
 - **EXPLAIN** shows `SEARCH t USING GRAPH INDEX (start=?)`, `SEARCH t USING GRAPH INDEX (rowid=?)`,
+  `SEARCH t USING GRAPH INDEX (label=? AND node=?)`, `SEARCH t USING GRAPH INDEX (label=?)` and, where the label's
+  nodes are checked, `SEARCH t USING GRAPH INDEX (label=?) CHECKING <node table>`,
   `SCAN smalt_paths() VIRTUAL TABLE` for a path search, and `SEARCH RELATIONSHIPS OF g (node=?)`, `(other=?)`,
-  `(node=? AND other=?)` or `SCAN RELATIONSHIPS OF g`.
+  `(node=? AND other=?)` or `SCAN RELATIONSHIPS OF g`. Under `EXPLAIN ANALYZE` the rows of a checked label's scan
+  are the nodes it gave: those the maps did not rule out.
 
 See [ADR 0040](adr/0040-graph-index-and-relationships.md) and [ADR 0041](adr/0041-properties-in-the-graph-index.md).

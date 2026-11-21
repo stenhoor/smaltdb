@@ -12,7 +12,7 @@ import { encodeKey } from '../storage/key-codec.js';
 import { MapCompare } from './nested-ops.js';
 
 /** A condition on one key of a map column (see `Pipeline.mapKeys`). */
-interface MapCondition {
+export interface MapCondition {
   reg: number;
   key: Uint8Array;
   op: MapCompare;
@@ -741,6 +741,12 @@ class Pipeline {
    */
   private readonly exact: { cond: MapCondition; fn: string; line: number }[] = [];
 
+  /** The conditions on map keys that the conjuncts `preds` need to be true (`mapKeys`), with nothing emitted. */
+  conditionsOf(preds: BoundExpr[]): MapCondition[] {
+    for (const p of preds) this.mapConditions(p);
+    return this.mapKeys;
+  }
+
   /** WHERE: every conjunct must be true (NULL counts as false). */
   addPredicates(preds: BoundExpr[]): void {
     for (const p of preds) {
@@ -1103,6 +1109,15 @@ function compileFn<T>(params: string[], src: string, args: unknown[]): T {
  * Generate one function that scans every leaf of a table, decodes the needed columns, evaluates
  * the WHERE conjuncts and steps the aggregates — no per-row operator calls.
  */
+/**
+ * The conditions on keys of map columns that the conjuncts `preds` need to be true, as a generated scan finds them
+ * (`Pipeline.mapKeys`), each with the register its map is read into: for a reader that holds a row's map as it is
+ * stored and can check it there (`mapProbe`) before giving the row. The conjuncts still decide each row given.
+ */
+export function mapKeyConditions(preds: BoundExpr[], fallback: (e: BoundExpr) => FallbackNode): MapCondition[] {
+  return new Pipeline(fallback).conditionsOf(preds);
+}
+
 export function generateFusedAggregate(
   preds: BoundExpr[],
   aggs: FusedAggSpec[],

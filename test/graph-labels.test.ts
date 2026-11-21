@@ -71,6 +71,14 @@ describe('label sets', () => {
     expect([l.has('A', 31), l.has('B', 31), l.entries]).toEqual([false, true, 5]);
     // Four pages of 4 KiB: A's at 0, at 1,000,000 and at the top, and B's.
     expect(l.bytes()).toBe(4 * 4096);
+    // Each label's nodes are counted, and its pages are there for a scan: one for every 32,768 ids, where it has any.
+    expect([l.count('A'), l.count('B'), l.count('C')]).toEqual([4, 1, 0]);
+    expect(l.pagesOf('C')).toBe(undefined);
+    const pages = l.pagesOf('A')!;
+    expect([pages.length, pages[0]!.length, pages[1], pages[30] !== undefined, pages[65_535] !== undefined]).toEqual([65_536, 1024, undefined, true, true]);
+    expect([pages[0]![0], pages[0]![1], pages[65_535]![1023]]).toEqual([1, 1, 2 ** 31]);
+    expect(l.remove('B', 31)).toBe(true);
+    expect([l.count('B'), l.pagesOf('B')!.length, l.entries]).toEqual([0, 1, 4]);
   });
 });
 
@@ -103,9 +111,9 @@ describe('asking whether a node has a label', () => {
     const sql = "SELECT count(*) FROM knows k JOIN g_labels l ON l.node = k.end AND l.label = 'Admin' WHERE k.start < 100";
     expect(plan(db, sql)).toContain('GRAPH INDEX (label=? AND node=?)');
     expect(db.query(sql).rows).toEqual(db.query("SELECT count(*) FROM knows k WHERE k.start < 100 AND (k.end % 3) = 0").rows);
-    // The label's own nodes are still read from its index.
+    // The label's own nodes are read from its set (test/graph-label-nodes.test.ts).
     expect(db.query("SELECT count(*) FROM g_labels WHERE label = 'Owner'").rows).toEqual([[20]]);
-    expect(plan(db, "SELECT node FROM g_labels WHERE label = 'Owner'")).not.toContain('GRAPH INDEX');
+    expect(plan(db, "SELECT node FROM g_labels WHERE label = 'Owner'")).toBe('SEARCH g_labels USING GRAPH INDEX (label=?)');
   });
 });
 

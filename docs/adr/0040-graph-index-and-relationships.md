@@ -243,6 +243,45 @@ they were rebased onto `main`):
   2.18x to 1.02x (4.48 to 2.11 ms), group by city 2.69x to 1.65x (53.7 to 37.4 ms). The other queries did not move.
 - Their pull requests come in the steps' order of building: 2a (#279), then 2c on it (#280), then 2b (#281), then
   the labels.
+- **A label's nodes are read from its set** (added 2026-11-21, after ADR 0041's steps; it is step 1 of what ADR 0042
+  proposes, [#292](https://github.com/stenhoor/smaltdb/pull/292), and stands without the rest of it). No benchmark
+  read a small label. A statement that finds a node of a label of a few hundred nodes by a property that has no
+  index read the label's entries from the label index's B+tree, looked each node's row up and filtered it: 3.7x to
+  4.6x smaltcy's time for 401 nodes. For 3,000 nodes, more than the planner counts in an index, it scanned the node
+  table: 8.4x to 9.1x. Now:
+  - the label's entries come from its set in the graph index (`GraphLabelEntries`), in the index's order;
+  - the planner takes a label's count from its set, however many nodes it has;
+  - where an inner join then finds each node's row through the property maps (ADR 0041), the label's scan first
+    asks them whether the row can pass the plan's conditions on its props, checked on the map's bytes where they
+    lie, and gives only the nodes that can. A node that fails costs a step in the set and that check.
+
+  Measured against smaltcy (smaltdb's time over smaltcy's, the engines in turns, three runs of `main` and then of
+  this), each statement another value of `MATCH (n:Bench {i: …}) RETURN n.i`:
+
+  | Nodes of the label | `main` | With this |
+  |---|---|---|
+  | 50 | 1.28x, 1.27x, 0.96x | 0.73x, 0.85x, 0.87x |
+  | 401 | 4.61x, 3.80x, 3.70x | 0.82x, 0.77x, 0.81x |
+  | 801 | 5.76x, 6.03x, 5.60x | 0.82x, 0.86x, 0.80x |
+  | 3,000 | 8.82x, 8.44x, 9.10x | 0.77x, 0.68x, 0.66x |
+
+  Other reads through a label, on smaltcy's network of 20,000 people with a label of 401 nodes and one of 3,000
+  added (two runs each): a range of a property of the small label 2.30x and 2.62x to 0.70x and 0.64x, its nodes
+  counted 1.92x and 1.94x to 0.94x and 0.91x, a hop from one of its nodes 2.90x and 2.90x to 0.78x and 0.76x, a node
+  with two labels by a property 1.96x and 2.12x to 0.93x and 1.00x, an `OPTIONAL MATCH` of one 1.75x and 1.58x to
+  0.42x and 0.44x; a range of the larger label 4.70x and 3.96x to 0.51x and 0.47x. smaltcy's three benchmarks did not
+  move (two runs of each), but for deleting one node of a label of some 440, which finds its node this way: with the
+  value in the text 9.52x and 7.63x to 2.20x and 2.57x (0.247 and 0.215 ms to 0.057 and 0.058), as a parameter 8.47x
+  and 8.16x to 2.47x and 2.39x.
+
+  Found here and still over the bar, or at it: every node of the small label returned (3.06x and 2.60x to 2.41x and
+  2.19x), the larger label's nodes counted (2.97x and 2.91x to 1.12x and 1.12x), the nodes with two labels counted
+  (1.49x and 1.47x to 0.95x and 1.07x) and a label of 8 nodes returned (1.26x and 1.18x; 1.21x and 1.27x with this,
+  15 µs against 13). In each, every node's row is still asked for through the join, a node at a time. The first
+  read of a label reads each of its nodes' rows from the table: the maps know a row once it was read by its rowid.
+  The planner's costs were left as they are: it reads a label's nodes this way where it read the label's entries
+  before, and where the label's own count, lower than the statistics' number for a label, now makes that cheaper
+  than scanning the node table.
 
 Later, each only with its own measurement: the index shared with reader workers, an undo log for rollbacks, the index
 kept in pager pages so opening a large graph doesn't wait for a build, and whether a graph's edge tables still need
