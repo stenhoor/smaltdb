@@ -159,6 +159,55 @@ describe('property maps', () => {
     expect(m.bytes()).toBeLessThan(4096 * 8 + 32 * 1024);
   });
 
+  it('know a row that is gone from the index while its table still has it, and take rows the table has not yet', () => {
+    const m = new GraphProps();
+    m.set(1, bytes(1, 1));
+    m.set(2, null);
+    m.setGone(1);
+    m.setGone(7);
+    // A gone row is known (its table is not read for it), has no props, and passes no condition.
+    expect([m.gone(1), m.gone(7), m.gone(2), m.gone(3), m.gone(5000)]).toEqual([true, true, false, false, false]);
+    expect([m.known(1), m.known(7), m.get(1), m.get(7), m.rows]).toEqual([true, true, undefined, undefined, 1]);
+    expect([m.rulesOut(1, []), m.rulesOut(7, []), m.rulesOut(3, [])]).toEqual([true, true, false]);
+    const all: number[] = [];
+    m.forEach((rowid) => void all.push(rowid));
+    expect(all).toEqual([2]);
+    // Forgotten, nothing is known of it; set again, it is a row as any.
+    m.forget(7);
+    m.put(1, bytes(3));
+    expect([m.gone(7), m.known(7), m.gone(1), m.get(1), m.rows]).toEqual([false, false, false, bytes(3), 2]);
+    // Full, the maps take no more rows read from the table, follow the rows they know, and take what is put.
+    m.full = true;
+    m.set(9, bytes(9));
+    m.set(1, bytes(4, 4));
+    m.put(10, bytes(5));
+    expect([m.get(9), m.get(1), m.get(10), m.rows]).toEqual([undefined, bytes(4, 4), bytes(5), 3]);
+    m.full = false;
+    m.set(9, bytes(9));
+    expect(m.get(9)).toEqual(bytes(9));
+    m.closed = true;
+    expect([m.gone(1), m.known(1)]).toEqual([false, false]);
+  });
+
+  it('let a page of rowids go when none of its rows is known, so rows made and deleted with ids that go up take no room', () => {
+    const m = new GraphProps();
+    m.set(0, bytes(1));
+    const base = m.bytes();
+    const value = (row: number): Uint8Array => Uint8Array.from({ length: 30 }, (_, i) => (row + i) & 255);
+    // 200,000 rows, 1,000 at a time: put, some set gone or set again, all forgotten.
+    for (let from = 4096; from < 204096; from += 1000) {
+      for (let row = from; row < from + 1000; row++) m.put(row, value(row));
+      for (let row = from; row < from + 1000; row += 3) m.setGone(row);
+      for (let row = from + 1; row < from + 1000; row += 3) m.put(row, value(row + 1));
+      expect(m.get(from + 1)).toEqual(value(from + 2));
+      for (let row = from; row < from + 1000; row++) m.forget(row);
+    }
+    expect([m.rows, m.get(0), m.known(4096), m.known(204095)]).toEqual([1, bytes(1), false, false]);
+    // The page of row 0 and a buffer that held 1,000 rows at most: no page for the 49 that came and went.
+    expect(m.bytes()).toBeLessThan(base + 256 * 1024);
+    expect(m.bytes()).toBeLessThan(2 * 4096 * 8 + 256 * 1024);
+  });
+
   it("check a known row's map where it lies, and rule out no row they do not know", () => {
     const m = new GraphProps();
     const key = (k: string): Uint8Array => encodeKey([k]);
