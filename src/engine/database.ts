@@ -64,7 +64,7 @@ import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordEncoder, RecordReader } from './storage/record.js';
 import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec/stats.js';
 import { type CatalogSnapshot, informationSchema } from './catalog/information-schema.js';
-import { type LanguageStatement, type SmaltLanguage, languagePart, registeredLanguage } from './plan/language.js';
+import { type LanguageStatement, type SmaltLanguage, type StatementParams, languagePart, parseOneWith, registeredLanguage } from './plan/language.js';
 import { ForeignKeys } from './exec/fk.js';
 import { GraphRules } from './exec/graph-rules.js';
 import { type GraphIds, type GraphLayout, GraphWrite, type GraphWriteHost, STAGE_ROWS, writesGraph } from './exec/graph-write.js';
@@ -97,6 +97,11 @@ export interface QueryResult {
 
 /** Parameters: positional array (slot 1 = index 0) or named object (`{ a: 1 }` matches `:a`, `@a`, `$a`). */
 export type BindParams = readonly (SqlValue | boolean | undefined)[] | Readonly<Record<string, SqlValue | boolean>>;
+/**
+ * A text statement's parameters: by position or by name. One the statement reads as a list, struct or map takes a JS
+ * array, object or `Map` (a statement of a language that reads its parameters so; SQL's are scalars).
+ */
+export type TextParams = BindParams | StatementParams;
 
 export interface DatabaseOptions extends PagerOptions {
   /** Plugins to install (ADR 0012), e.g. `@smaltdb/parquet`. */
@@ -266,6 +271,8 @@ interface Program {
   memory?: boolean;
   /** The language of the statement's source: it words the statement's errors (ADR 0016 section 10). */
   language?: SmaltLanguage;
+  /** For a language's statement: the parameters it reads as a list, struct or map (`nestedParams`), found at the first run. */
+  nested?: { readonly of: readonly (NestedTypeName | undefined)[] | null };
   /** How its result rows are given (`resultForm` of `columnTypes`), worked out at the first run. */
   form?: ResultForm;
 }
@@ -631,11 +638,58 @@ export class Database implements FunctionContext {
 
   // ---------------------------------------------------------------- public API
 
-  /** Compile a single statement. */
-  prepare(sql: string): Statement {
+  /** Compile a single statement: SQL, or with `language` a statement of that registered language (ADR 0042, section 4). */
+  prepare(sql: string, options: { language?: string } = {}): Statement {
     this.checkOpen();
-    return new Statement(this, this.parseOneSql(sql), sql);
+    const language = this.textLanguage(options.language);
+    return this.statementOf(parseOneWith(language, sql), sql, language);
   }
+
+  /** The language of a text given to the string API: SQL, or the registered language named. */
+  private textLanguage(name: string | undefined): SmaltLanguage {
+    return name === undefined || name === 'sql' ? this.sql : this.languageOf(name);
+  }
+
+  /**
+   * A parsed statement as a compiled one. One whose language gives it a shape (`LanguageStatement.shape`) runs what
+   * the first statement of that shape bound to, with its own values, where that one is still kept: it binds nothing.
+   */
+  private statementOf(parsed: LanguageStatement, text: string, language: SmaltLanguage): Statement {
+    const shape = parsed.shape;
+    if (shape === undefined) return new Statement(this, parsed, text, language);
+    let byHash = this.shapes.get(language.name);
+    if (byHash === undefined) this.shapes.set(language.name, (byHash = new Map()));
+    const sameHash = byHash.get(shape.hash);
+    if (sameHash !== undefined) {
+      for (const kept of sameHash) {
+        if (!shape.same(kept.parsed)) continue;
+        // What the kept statement bound to reads this one's parameters and values: it must have as many of each.
+        if (kept.parsed.paramCount !== parsed.paramCount || kept.parsed.shape!.values.length !== shape.values.length) {
+          throw new SmaltError('SMALT_MISUSE', `the ${language.name} language gives two statements one shape that do not take the same parameters: ${JSON.stringify(kept.sql)} and ${JSON.stringify(text)}`);
+        }
+        return new Statement(this, parsed, text, language, kept);
+      }
+    }
+    const st = new Statement(this, parsed, text, language);
+    if (sameHash === undefined) byHash.set(shape.hash, [st]);
+    else sameHash.push(st);
+    // The oldest shape goes when there are too many: statements made for it keep running what it bound to.
+    this.shapeOrder.push(st);
+    if (this.shapeOrder.length > SHAPE_CACHE_FACTOR * this.cacheSize) {
+      const old = this.shapeOrder.shift()!;
+      const of = this.shapes.get(old.language.name)!;
+      const hash = old.parsed.shape!.hash;
+      const left = of.get(hash)!.filter((s) => s !== old);
+      if (left.length > 0) of.set(hash, left);
+      else of.delete(hash);
+    }
+    return st;
+  }
+
+  /** Statements kept by their shape: by their language's name, then by the shape's hash. */
+  private readonly shapes = new Map<string, Map<number, Statement[]>>();
+  /** The statements in `shapes`, the oldest first. */
+  private readonly shapeOrder: Statement[] = [];
 
   /** SQL, the language of the string API: registered by smaltql (`import '@smaltworks/smaltql/register'`, or a worker's `defineWorker`). */
   private get sql(): SmaltLanguage {
@@ -650,7 +704,7 @@ export class Database implements FunctionContext {
 
   /** SQL text holding exactly one statement. */
   private parseOneSql(sql: string): LanguageStatement {
-    return languagePart(this.sql, 'parseOne')(sql);
+    return parseOneWith(this.sql, sql);
   }
 
   /** @internal Whether `sql` holds more than one statement (false when it does not parse: running it reports that). */
@@ -662,22 +716,30 @@ export class Database implements FunctionContext {
     }
   }
 
-  /** Run one or more statements, discarding any rows. */
-  exec(sql: string, params?: BindParams): void {
+  /** Run one or more statements, discarding any rows. `language`: the registered language they are written in (SQL without). */
+  exec(sql: string, params?: TextParams, options: { language?: string } = {}): void {
     this.checkOpen();
-    const stmts = this.parseSql(sql);
+    const language = this.textLanguage(options.language);
+    const stmts = languagePart(language, 'parse')(sql);
     if (params !== undefined && stmts.length > 1) throw new MisuseError('parameters can only be bound with a single statement');
-    for (const ps of stmts) new Statement(this, ps, ps.text).run(params);
+    for (const ps of stmts) this.statementOf(ps, ps.text, language).run(params);
   }
 
-  /** Run a single statement and return all rows; `temporal` gives dates and times as text (default), `Date`s or `Temporal` objects (ADR 0019). */
-  query(sql: string, params?: BindParams, options: { temporal?: TemporalForm } = {}): QueryResult {
-    const st = this.cached(sql);
-    return { columns: st.columns, rows: rowsInForm(st.all(params), st.columnTypes, options.temporal) };
+  /**
+   * Run a single statement and return all rows; `temporal` gives dates and times as text (default), `Date`s or
+   * `Temporal` objects (ADR 0019). `language`: the registered language it is written in (SQL without). The statement
+   * is kept by its text, so the same text binds once.
+   */
+  query(sql: string, params?: TextParams, options: { temporal?: TemporalForm; language?: string } = {}): QueryResult {
+    const st = this.cached(sql, options.language);
+    const r = st.result(params);
+    const rows = rowsInForm(r.rows, r.columnTypes!, options.temporal);
+    // What a write of a property graph did comes with its rows (`RunResult.graph`).
+    return r.graph === undefined ? { columns: r.columns, rows } : { columns: r.columns, rows, graph: r.graph };
   }
 
-  run(sql: string, params?: BindParams): RunResult {
-    return this.cached(sql).run(params);
+  run(sql: string, params?: TextParams, options: { language?: string } = {}): RunResult {
+    return this.cached(sql, options.language).run(params);
   }
 
   // ---------------------------------------------------------------- plans (ADR 0014 section 4)
@@ -688,9 +750,15 @@ export class Database implements FunctionContext {
    */
   preparePlan(stmt: PlanStatementInput): PlanStatement {
     this.checkOpen();
+    const bound = this.receivedStatement(stmt);
+    return new PlanStatement(this, bound, paramCount(bound));
+  }
+
+  /** A statement given as plan data, as it is received: its plans validated, and in the engine's terms. */
+  private receivedStatement(stmt: PlanStatementInput): BoundStatement {
     const bound = normalizeBound(toBoundStatement(stmt, (plan) => this.receivedPlan(plan), (plan) => outputTypes(plan, this.tableTypes)), this.normalizeCatalog);
     if (bound.kind === 'schema') validateSchemaOp(bound.op, this.validateCatalog);
-    return new PlanStatement(this, bound, paramCount(bound));
+    return bound;
   }
 
   /** Run a query given as plan data and return all rows (statements are cached by the plan's canonical form). */
@@ -781,26 +849,30 @@ export class Database implements FunctionContext {
    * Run one statement that may read external tables or `read_csv` / `read_json`, returning all
    * rows. Its sources are fetched first (concurrently), then it runs like `query`.
    */
-  async queryAsync(sql: string, params?: BindParams, options: { signal?: AbortSignal } = {}): Promise<QueryResult> {
+  async queryAsync(sql: string, params?: TextParams, options: { signal?: AbortSignal; language?: string } = {}): Promise<QueryResult> {
     this.checkOpen();
-    const st = this.prepare(sql);
-    return this.runExternal(options.signal, st, () => ({ columns: st.columns, rows: st.all(params) }));
+    const st = this.prepare(sql, options);
+    return this.runExternal(options.signal, st, () => {
+      const r = st.result(params);
+      return { columns: r.columns, rows: r.rows, ...(r.graph ? { graph: r.graph } : {}) };
+    });
   }
 
   /** `run` for a statement that may read external data. */
-  async runAsync(sql: string, params?: BindParams, options: { signal?: AbortSignal } = {}): Promise<RunResult> {
+  async runAsync(sql: string, params?: TextParams, options: { signal?: AbortSignal; language?: string } = {}): Promise<RunResult> {
     this.checkOpen();
-    const st = this.prepare(sql);
+    const st = this.prepare(sql, options);
     return this.runExternal(options.signal, st, () => st.run(params));
   }
 
   /** `exec` for statements that may read external data (CREATE EXTERNAL TABLE, materialized views over it, …). */
-  async execAsync(sql: string, params?: BindParams, options: { signal?: AbortSignal } = {}): Promise<void> {
+  async execAsync(sql: string, params?: TextParams, options: { signal?: AbortSignal; language?: string } = {}): Promise<void> {
     this.checkOpen();
-    const stmts = this.parseSql(sql);
+    const language = this.textLanguage(options.language);
+    const stmts = languagePart(language, 'parse')(sql);
     if (params !== undefined && stmts.length > 1) throw new MisuseError('parameters can only be bound with a single statement');
     for (const ps of stmts) {
-      const st = new Statement(this, ps, ps.text);
+      const st = this.statementOf(ps, ps.text, language);
       await this.runExternal(options.signal, st, () => st.run(params));
     }
   }
@@ -899,18 +971,26 @@ export class Database implements FunctionContext {
     this.closed = true;
   }
 
-  private cached(sql: string): Statement {
-    let st = this.cache.get(sql);
+  /** A statement by its text, kept: SQL's in `cache`, another language's among its own. */
+  private cached(sql: string, language?: string): Statement {
+    let cache: Map<string, Statement> | undefined = this.cache;
+    if (language !== undefined && language !== 'sql') cache = this.otherCaches.get(language);
+    let st = cache !== undefined ? cache.get(sql) : undefined;
     if (st) {
-      this.cache.delete(sql);
-      this.cache.set(sql, st);
+      cache!.delete(sql);
+      cache!.set(sql, st);
       return st;
     }
-    st = this.prepare(sql);
-    this.cache.set(sql, st);
-    if (this.cache.size > this.cacheSize) this.cache.delete(this.cache.keys().next().value!);
+    st = this.prepare(sql, { language });
+    // A language's statements are kept once it has one (a name that is not registered has failed above).
+    if (cache === undefined) this.otherCaches.set(language!, (cache = new Map()));
+    cache.set(sql, st);
+    if (cache.size > this.cacheSize) cache.delete(cache.keys().next().value!);
     return st;
   }
+
+  /** The statements of the registered languages other than SQL, kept by their text: by the language's name. */
+  private readonly otherCaches = new Map<string, Map<string, Statement>>();
 
   private checkOpen(): void {
     if (this.closed) throw new MisuseError('database is closed');
@@ -1630,7 +1710,7 @@ export class Database implements FunctionContext {
   planOf(sql: string): { root: Operator; columns: { name: string; type: StaticType }[]; subplans: readonly { label: string; root: Operator }[]; estimates: WeakMap<Operator, number> } {
     this.checkOpen();
     const ps = this.parseOneSql(sql);
-    const b = this.receivedBound(ps.bind(this.bindContext()));
+    const b = this.receivedBound(ps.bind(this.bindContext()) as BoundStatement);
     if (b.kind !== 'query') throw new MisuseError('planOf takes a SELECT statement');
     const bound: BoundQuery = b;
     const planner = new Planner(this.plannerDeps(this.rewritePolicy(bound)), new Registers(ps.paramCount));
@@ -1646,7 +1726,7 @@ export class Database implements FunctionContext {
    */
   boundPlan(text: string): PlanStatementInput {
     this.checkOpen();
-    return toPlanStatement(this.parseOneSql(text).bind(this.bindContext()));
+    return toPlanStatement(this.parseOneSql(text).bind(this.bindContext()) as BoundStatement);
   }
 
   /** What the SQL front end (ADR 0014, step 5) reads of the catalog (it reads the database's state when called). */
@@ -2021,12 +2101,16 @@ export class Database implements FunctionContext {
    * @internal Compile a statement into a program for the current schema: the language binds it,
    * and the engine dispatches on the bound statement (plan/bound.ts).
    */
-  compile(ps: LanguageStatement): Program {
+  compile(ps: LanguageStatement, language: SmaltLanguage = this.sql, params?: BindParams): Program {
     const reads = this.recordingContext();
-    const bound = this.receivedBound(ps.bind(reads.ctx));
-    const p = this.compileBound(bound, ps.paramCount, ps.text);
-    // Settings (work_mem, foreign_keys) belong to this connection. Statements given as text are SQL.
-    return { ...p, bound, memory: reads.memory() || bound.kind === 'setting', language: this.sql };
+    const given = ps.bind(reads.ctx, params);
+    // A language whose statements are plan data: received as a plan given to `preparePlan` is.
+    const data = language.plans === 'data';
+    const bound = data ? this.receivedStatement(given as PlanStatementInput) : this.receivedBound(given as BoundStatement);
+    // Its parameters, then the values its language took out of it (`LanguageStatement.shape`).
+    const p = this.compileBound(bound, ps.paramCount + (ps.shape?.values.length ?? 0), ps.text);
+    // Settings (work_mem, foreign_keys) belong to this connection. Plan data names its tables without looking them up.
+    return { ...p, bound, memory: reads.memory() || bound.kind === 'setting' || (data && this.planUsesMemoryObjects(bound)), language };
   }
 
   /**
@@ -2915,7 +2999,8 @@ export class Database implements FunctionContext {
   /** A query as partial aggregates over rowid ranges and their merge, in any language or given as a plan; or null. */
   private morselOf(st: PreparedStatement | string): MorselEntry | null {
     if (typeof st === 'string') return this.morselQuery(st);
-    if (st instanceof Statement) return this.morselQuery(st.sql);
+    // A text statement's morsels are found by its text, which is read as SQL: another language's has none.
+    if (st instanceof Statement) return st.language.name === 'sql' ? this.morselQuery(st.sql) : null;
     if (!(st instanceof PlanStatement) || st.bound.kind !== 'query') return null;
     const hit = this.planMorsels.get(st);
     if (hit !== undefined && hit.version === this.schemaVersion) return hit.entry;
@@ -2954,7 +3039,7 @@ export class Database implements FunctionContext {
     let entry: MorselEntry | null = null;
     try {
       const parsed = this.parseOneSql(sql);
-      const fe = this.receivedBound(parsed.bind(this.bindContext()));
+      const fe = this.receivedBound(parsed.bind(this.bindContext()) as BoundStatement);
       if (fe.kind === 'query') {
         const q = planMorsels(fe.plan, parsed.paramCount, (name, db) => this.morselTable(name, db));
         if (q) entry = { version: this.schemaVersion, parsed, plan: fe.plan, columns: fe.columns, q, partial: encodePlan(q.partial), key: `${this.schemaVersion}:${sql}` };
@@ -6078,8 +6163,13 @@ export abstract class PreparedStatement {
   /** The program for the current schema. */
   protected abstract compileProgram(): Program;
 
-  /** Parameter values into the first registers. */
-  protected abstract bindParams(params: BindParams | undefined, regs: SqlValue[]): void;
+  /** Parameter values into the first registers of `p`, the program they are bound for. */
+  protected abstract bindParams(params: BindParams | undefined, regs: SqlValue[], p: Program): void;
+
+  /** @internal The program to run with these values: the statement's one, but for a language's statement that binds by its values. */
+  progFor(_params: BindParams | undefined): Program {
+    return this.prog();
+  }
 
   /** Whether it reads memory-resident objects, for the current schema. */
   protected abstract readsMemoryObjects(): boolean;
@@ -6095,6 +6185,17 @@ export abstract class PreparedStatement {
       this.checkedMemAt = this.db.memChangeCount();
     }
     return this.program;
+  }
+
+  /** Its program, if it has one that stands for the current schema and its tables' sizes: nothing is compiled. */
+  protected progIfCurrent(): Program | null {
+    const p = this.program;
+    if (p === null || this.version !== this.db.schemaVersion) return null;
+    if (this.statsDrifted(p)) {
+      this.program = null;
+      return null;
+    }
+    return p;
   }
 
   /**
@@ -6151,7 +6252,7 @@ export abstract class PreparedStatement {
    */
   private checkGraphIndex(rows: SqlValue[][], params: BindParams | undefined): void {
     if (!graphCheckOn()) return;
-    const p = this.prog();
+    const p = this.progFor(params);
     const ix = this.db.graphIndexState;
     if (!p.readonly || p.graphIndex !== true || ix.suspended || p.bound?.kind === 'explain') return;
     ix.suspended = true;
@@ -6179,13 +6280,13 @@ export abstract class PreparedStatement {
 
   private registers(p: Program, params: BindParams | undefined): SqlValue[] {
     const regs: SqlValue[] = new Array(p.regCount).fill(null);
-    this.bindParams(params, regs);
+    this.bindParams(params, regs, p);
     return regs;
   }
 
   /** Execute for side effects. */
   run(params?: BindParams): RunResult {
-    const p = this.prog();
+    const p = this.progFor(params);
     const regs = this.registers(p, params);
     if (p.exec) return this.db.execute(p, () => p.exec!(regs));
     // A query run for side effects: drain it.
@@ -6236,7 +6337,7 @@ export abstract class PreparedStatement {
 
   /** Execute and return a cursor over the result rows. */
   cursor(params?: BindParams): RowCursor {
-    const p = this.prog();
+    const p = this.progFor(params);
     const regs = this.registers(p, params);
     // How its rows are given, worked out once for the program (a cursor is made for every run).
     const form = (p.form ??= resultForm(p.columnTypes));
@@ -6256,25 +6357,128 @@ export abstract class PreparedStatement {
   }
 }
 
-/** A SQL statement. */
-export class Statement extends PreparedStatement {
+/** The most variants kept for one statement (`LanguageStatement.variant`); the oldest goes first. */
+const VARIANTS_PER_STATEMENT = 16;
+/** The shapes kept for a database, as a multiple of its statement cache's size. */
+const SHAPE_CACHE_FACTOR = 4;
+
+/** A text statement's parameters may hold arrays and objects, for the parameters it reads as lists, structs or maps (`TextParams`). */
+export interface Statement {
+  run(params?: TextParams): RunResult;
+  all(params?: TextParams): SqlValue[][];
+  result(params?: TextParams): QueryResult;
+  cursor(params?: TextParams): RowCursor;
+}
+
+/**
+ * What a statement binds to for one variant of its values (`LanguageStatement.variant`): a program, compiled again as
+ * any statement's is. It is bound with the values of the run at hand, which have its key: it keeps no values, so
+ * what a caller does to them later is nothing to it.
+ */
+class Variant extends PreparedStatement {
+  /** The values it is being bound with: set while `progWith` runs. */
+  private values: BindParams | undefined;
+
   constructor(
     db: Database,
-    readonly parsed: LanguageStatement,
-    readonly sql: string,
+    private readonly of: Statement,
   ) {
     super(db);
   }
 
-  protected compileProgram(): Program {
-    return this.db.compile(this.parsed);
+  /** Its program, bound with `params` where it has to be bound now. */
+  progWith(params: BindParams | undefined): Program {
+    this.values = params ?? [];
+    try {
+      return this.prog();
+    } finally {
+      this.values = undefined;
+    }
   }
 
-  protected bindParams(params: BindParams | undefined, regs: SqlValue[]): void {
-    bindParamValues(this.parsed, params, regs);
+  /** Its program while that stands; null where it would have to be bound again, which takes values. */
+  current(): Program | null {
+    return this.progIfCurrent();
+  }
+
+  protected compileProgram(): Program {
+    return this.db.compile(this.of.parsed, this.of.language, this.values);
+  }
+
+  // It is run by its statement, never by itself.
+  protected bindParams(): void {}
+
+  protected readsMemoryObjects(): boolean {
+    return false;
+  }
+
+  get paramCount(): number {
+    return this.of.parsed.paramCount;
+  }
+}
+
+/** A statement given as text: SQL, or another registered language's (ADR 0042, section 4). */
+export class Statement extends PreparedStatement {
+  /** @internal The language it is written in. */
+  readonly language: SmaltLanguage;
+  /** What it bound to for each variant of its values (`LanguageStatement.variant`), by the variant's key. */
+  private variants: Map<string | number, Variant> | null = null;
+  /** The variant it ran last. */
+  private lastVariant: Variant | null = null;
+
+  constructor(
+    db: Database,
+    readonly parsed: LanguageStatement,
+    readonly sql: string,
+    language: SmaltLanguage,
+    /** The statement kept for its shape (`LanguageStatement.shape`): it runs what that one bound to, with its own values. */
+    private readonly like?: Statement,
+  ) {
+    super(db);
+    this.language = language;
+  }
+
+  protected compileProgram(): Program {
+    return this.db.compile(this.parsed, this.language);
+  }
+
+  /**
+   * @internal What it says of itself (its columns, whether it writes): what the variant it ran last says, while that
+   * one stands, and otherwise what it binds to without values.
+   */
+  override prog(): Program {
+    if (this.like !== undefined) return this.like.prog();
+    return this.lastVariant?.current() ?? super.prog();
+  }
+
+  /** @internal */
+  override progFor(params: BindParams | undefined): Program {
+    if (this.like !== undefined) return this.like.progFor(params);
+    const parsed = this.parsed;
+    // One program, but for a statement whose language binds it by its values: one for each variant of them.
+    if (parsed.variant === undefined) return super.prog();
+    const key = parsed.variant(params);
+    const variants = (this.variants ??= new Map());
+    let v = variants.get(key);
+    if (v === undefined) {
+      v = new Variant(this.db, this);
+      variants.set(key, v);
+      if (variants.size > VARIANTS_PER_STATEMENT) variants.delete(variants.keys().next().value!);
+    }
+    this.lastVariant = v;
+    return v.progWith(params);
+  }
+
+  protected bindParams(params: BindParams | undefined, regs: SqlValue[], p: Program): void {
+    const parsed = this.parsed;
+    const n = parsed.paramCount;
+    bindParamValues(parsed, params, regs, (p.nested ??= { of: nestedParams(p.bound, n + (parsed.shape?.values.length ?? 0)) }).of);
     // The statement's language converts its parameters as it means them (ADR 0018: SQL binds NaN as NULL).
-    const convert = this.prog().language?.parameter;
-    if (convert) for (let i = 0; i < this.parsed.paramCount; i++) regs[i] = convert(regs[i]);
+    const convert = this.language.parameter;
+    if (convert) for (let i = 0; i < n; i++) regs[i] = convert(regs[i]!);
+    // The values its language took out of it follow its parameters.
+    const values = parsed.shape?.values;
+    if (values !== undefined) for (let i = 0; i < values.length; i++) regs[n + i] = values[i]!;
   }
 
   protected readsMemoryObjects(): boolean {
@@ -6368,7 +6572,13 @@ function nestedParam(t: NestedTypeName, v: unknown, slot: number): SqlValue {
 }
 
 /** Write `params` for `parsed` into `regs[0..paramCount)` (positional, or by name). */
-function bindParamValues(parsed: Pick<LanguageStatement, 'paramCount' | 'paramNames'>, params: BindParams | undefined, regs: SqlValue[]): void {
+function bindParamValues(
+  parsed: Pick<LanguageStatement, 'paramCount' | 'paramNames'>,
+  params: BindParams | undefined,
+  regs: SqlValue[],
+  /** The parameters the statement reads as a list, struct or map, by index: each takes a JS array or object. */
+  nested: readonly (NestedTypeName | undefined)[] | null = null,
+): void {
   const n = parsed.paramCount;
   if (params === undefined) {
     if (n > 0) throw new SmaltError('SMALT_RANGE', `statement expects ${n} parameter(s)`);
@@ -6376,7 +6586,14 @@ function bindParamValues(parsed: Pick<LanguageStatement, 'paramCount' | 'paramNa
   }
   if (Array.isArray(params)) {
     if (params.length !== n) throw new SmaltError('SMALT_RANGE', `statement expects ${n} parameter(s), got ${params.length}`);
-    for (let i = 0; i < n; i++) regs[i] = normalizeParam(params[i], i + 1);
+    if (nested === null) {
+      for (let i = 0; i < n; i++) regs[i] = normalizeParam(params[i], i + 1);
+      return;
+    }
+    for (let i = 0; i < n; i++) {
+      const t = nested[i];
+      regs[i] = t === undefined ? normalizeParam(params[i], i + 1) : nestedParam(t, params[i], i + 1);
+    }
     return;
   }
   const names = parsed.paramNames;
@@ -6387,7 +6604,8 @@ function bindParamValues(parsed: Pick<LanguageStatement, 'paramCount' | 'paramNa
     const bare = name.slice(1);
     const v = Object.prototype.hasOwnProperty.call(named, name) ? named[name] : named[bare];
     if (v === undefined) throw new SmaltError('SMALT_RANGE', `missing value for parameter ${name}`);
-    regs[slot - 1] = normalizeParam(v, name);
+    const t = nested === null ? undefined : nested[slot - 1];
+    regs[slot - 1] = t === undefined ? normalizeParam(v, name) : nestedParam(t, v, slot);
   }
 }
 

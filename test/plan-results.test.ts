@@ -76,6 +76,18 @@ describe('in process', () => {
     const removed = d.queryPlan({ kind: 'write', plan: p.remove('t', p.filter(p.scan('t', [-1]), p.call('cmp_gt', [p.col(0, 0, 'int'), p.lit(5)], 'int')), 0) });
     expect(removed.changes).toBe(2);
   });
+
+  it("a write's returned columns may be named without their types, which the plan gives", () => {
+    const d = db();
+    const named = d.queryPlan({ ...insert(12, true), returning: [{ name: 'id' }, { name: 'label' }] });
+    expect(named).toMatchObject({ columns: ['id', 'label'], columnTypes: ['int', 'text'], rows: [[12, 'n12']] });
+    // A type that is given is the column's.
+    const typed = d.queryPlan({ ...insert(13, true), returning: [{ name: 'id', type: 'num' }, { name: 'label' }] });
+    expect(typed).toMatchObject({ columns: ['id', 'label'], columnTypes: ['num', 'text'], rows: [[13, 'n13']] });
+    // As many are described as the plan gives back.
+    expect(() => d.queryPlan({ ...insert(14, true), returning: [{ name: 'id' }] })).toThrow(expect.objectContaining({ code: 'SMALT_PLAN', message: 'the plan gives 2 column(s) back, but 1 are described' }));
+    expect(d.queryPlan(scanT).rows.length).toBe(4);
+  });
 });
 
 describe('through the client', () => {

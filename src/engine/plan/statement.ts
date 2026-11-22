@@ -39,8 +39,11 @@ export interface PlanQuery {
 export interface PlanWrite {
   readonly kind: 'write';
   readonly plan: PlanOp;
-  /** RETURNING columns: names and types of the plan's `returning` expressions. */
-  readonly returning?: readonly { readonly name: string; readonly type: PlanType }[];
+  /**
+   * What the plan gives back: the names and types of an append's, update's or delete's `returning` expressions, or of
+   * the rows of a plan that writes a graph. A column named without a type has the type the plan gives it.
+   */
+  readonly returning?: readonly { readonly name: string; readonly type?: PlanType }[];
   /** An `append`'s input columns (its `input` plan's output). */
   readonly source?: readonly PlanColumn[];
 }
@@ -79,8 +82,11 @@ export function toBoundStatement(stmt: PlanStatementInput, width: (plan: PlanOp)
     case 'write': {
       // What the plan gives back: an append's, update's or delete's RETURNING, or the rows of a plan that writes a graph.
       const n = width(input.plan);
-      // Columns not described are named as a query's are, and typed from the plan.
-      const returning = input.returning ?? (n > 0 ? types(input.plan).map((type, i) => ({ name: `column${i + 1}`, type })) : undefined);
+      // Columns not described are named as a query's are, and typed from the plan; so is one named without a type.
+      const given = input.returning;
+      if (given && given.length !== n) throw new SmaltError('SMALT_PLAN', `the plan gives ${n} column(s) back, but ${given.length} are described`);
+      const planned = given?.every((r) => r.type !== undefined) ? [] : types(input.plan);
+      const returning = given ? given.map((r, i) => ({ name: r.name, type: r.type ?? planned[i] ?? 'any' })) : n > 0 ? planned.map((type, i) => ({ name: `column${i + 1}`, type })) : undefined;
       return { kind: 'write', plan: input.plan, ...(returning ? { returning: returning.map((r) => ({ name: r.name, type: r.type })) } : {}), ...(input.source ? { source: input.source.map(resultColumn) } : {}) };
     }
     case 'transaction':

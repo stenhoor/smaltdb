@@ -12,8 +12,10 @@ export { type Conversion, conversion, isLossless } from './plan/conversions.js';
 export { describeTableDef, engineFunctions } from './catalog/logical.js';
 export type { BoundQuery, BoundStatement } from './plan/bound.js';
 export { type BoundExpr, type PlanExpr, call, lit, param, typeOf } from './plan/expr.js';
-export { type LanguageStatement, type ObjectReference, type SmaltLanguage, registerLanguage } from './plan/language.js';
+export { type LanguageStatement, type ObjectReference, type SmaltLanguage, type StatementParams, type StatementShape, type StatementValue, registerLanguage } from './plan/language.js';
 export type { AggCall, ConflictAction, JoinKind, PlanOp, SortKey, WindowCall, WindowFrame } from './plan/ops.js';
+// What a language whose statements are plan data (`SmaltLanguage.plans`) binds a statement to.
+export type { PlanColumn, PlanStatementInput } from './plan/statement.js';
 export type { AlterAction, CheckDef, ColumnDef, DefaultDef, DeferredError, ExprDef, ForeignKeyDef, IndexColumnDef, IndexDef, KeyColumnDef, KeyDef, Source, SourceEditor, TableDef } from './plan/schema.js';
 export type { CollationName } from './plan/types.js';
 

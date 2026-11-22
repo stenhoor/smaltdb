@@ -13,6 +13,7 @@ import type { CatalogTable } from './catalog.js';
 import type { SqlValue } from '../values.js';
 import type { BindContext } from './bind-context.js';
 import type { BoundQuery, BoundStatement } from './bound.js';
+import type { PlanStatementInput } from './statement.js';
 import type { PlanExpr } from './expr.js';
 import type { Source, SourceEditor } from './schema.js';
 
@@ -20,6 +21,29 @@ import type { Source, SourceEditor } from './schema.js';
 export interface ObjectReference {
   readonly name: string;
   readonly schema?: string;
+}
+
+/**
+ * A value a statement is run with, as it is given: a scalar, or, for a parameter the statement reads as a list, struct
+ * or map, a JS array, object or `Map`.
+ */
+export type StatementValue = SqlValue | boolean | undefined | readonly unknown[] | { readonly [field: string]: unknown } | ReadonlyMap<string, unknown>;
+/** The values a statement is run with: by position, or by name. */
+export type StatementParams = readonly StatementValue[] | Readonly<Record<string, StatementValue>>;
+
+/**
+ * A statement's shape (ADR 0042, section 4): what is left of it with the values written in it taken out. Statements
+ * of one shape bind to the same statement, which reads the values taken out as the parameters after the statement's
+ * own. So the engine keeps what the first statement of a shape bound to, and runs it for the next one with that one's
+ * values, without binding it. What a statement's shape is, is its language's to say.
+ */
+export interface StatementShape {
+  /** A number statements of one shape share: a hash of the shape. */
+  readonly hash: number;
+  /** The values taken out, in the order of the parameters that read them: positions `paramCount + 1` on. */
+  readonly values: readonly SqlValue[];
+  /** Whether `other`, a statement of the same language whose shape has this hash, has this shape. */
+  same(other: LanguageStatement): boolean;
 }
 
 /**
@@ -33,8 +57,21 @@ export interface LanguageStatement {
   readonly paramCount: number;
   /** Parameters with names, by the name as written (SQL: `:min`, `$min`, `@min`), at their 1-based position. */
   readonly paramNames: ReadonlyMap<string, number>;
-  /** The statement bound against the catalog. */
-  bind(ctx: BindContext): BoundStatement;
+  /**
+   * The statement bound against the catalog: a bound statement in the engine's terms, or, from a language whose
+   * statements are plan data (`SmaltLanguage.plans`), a plan statement as `Database.preparePlan` takes one. `params`:
+   * the values it is to run with, given where the statement has a {@link variant}; without them it binds for values it
+   * knows nothing of.
+   */
+  bind(ctx: BindContext, params?: StatementParams): BoundStatement | PlanStatementInput;
+  /**
+   * For a statement that binds differently for different values (a language that compares a parameter as a value of
+   * its kind binds a comparison with a text and one with a number differently): a key that is the same for values it
+   * binds the same for. The engine keeps what it bound for each key, and gives `bind` the values.
+   */
+  variant?(params: StatementParams | undefined): string | number;
+  /** Its shape, where the language takes the values written in a statement out of it. */
+  readonly shape?: StatementShape;
   /**
    * Table functions the statement calls with constant arguments (`read_csv('…')`): the engine fetches their data
    * before binding, all together. Optional: other calls are found while binding.
@@ -52,6 +89,12 @@ export interface LanguageStatement {
 export interface SmaltLanguage {
   /** The language's name, as sources record it (`sql`). */
   readonly name: string;
+  /**
+   * `'data'`: its statements bind to plan data, built with the plan builders as a plan given to `Database.preparePlan`
+   * is (a query's columns may be left to the engine). The engine validates and normalizes what they bind to, as it
+   * does there. Left out by a language whose binder gives the engine's own terms, as SQL's does.
+   */
+  readonly plans?: 'data';
   /** Source text as its statements (a script), parsed. Throws the language's syntax error. */
   parse?(source: string): LanguageStatement[];
   /** Source text that must hold exactly one statement. */
@@ -101,6 +144,12 @@ export function languagePart<K extends keyof typeof PARTS>(language: SmaltLangua
   const member = language[part];
   if (member === undefined) throw new SmaltError('SMALT_MISUSE', `the ${language.name} language does not ${PARTS[part]}`);
   return (typeof member === 'function' ? (member as (...a: never[]) => unknown).bind(language) : member) as NonNullable<SmaltLanguage[K]>;
+}
+
+/** `source`, which must hold exactly one statement, parsed by `language`. */
+export function parseOneWith(language: SmaltLanguage, source: string): LanguageStatement {
+  // Called for every statement prepared: the language's own method, with no function made to hold it.
+  return language.parseOne !== undefined ? language.parseOne(source) : languagePart(language, 'parseOne')(source);
 }
 
 const registered = new Map<string, SmaltLanguage>();

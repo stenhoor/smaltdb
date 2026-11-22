@@ -8,13 +8,13 @@ export { Pager, Frame, type PagerOptions, type PagerStats } from './storage/page
 export { BTree, BTreeCursor, type IntegrityReport } from './storage/btree.js';
 export { KeyEncoder, encodeKey, decodeKey, Collation, type KeyColumn, type SqlValue } from './storage/key-codec.js';
 export { crc32c } from './storage/crc32c.js';
-export { Database, PreparedStatement, Statement, PlanStatement, RowCursor, type RunResult, type QueryResult, type BindParams, type DatabaseOptions } from './database.js';
+export { Database, PreparedStatement, Statement, PlanStatement, RowCursor, type RunResult, type QueryResult, type BindParams, type TextParams, type DatabaseOptions } from './database.js';
 export type { PlanParams } from '../shared/protocol.js';
 export * as plan from './plan/public.js';
 export type { PlanStatementInput, PlanColumn } from './plan/statement.js';
 export type { TemporalForm } from '../shared/temporal.js';
 // The engine carries no language: SQL is smaltql's (`import '@smaltworks/smaltql/register'`), ADR 0015.
-export { registerLanguage, type SmaltLanguage, type LanguageStatement, type ObjectReference } from './plan/language.js';
+export { registerLanguage, type SmaltLanguage, type LanguageStatement, type StatementShape, type StatementParams, type StatementValue, type ObjectReference } from './plan/language.js';
 export {
   PLUGIN_API_VERSION,
   type SmaltPlugin,
