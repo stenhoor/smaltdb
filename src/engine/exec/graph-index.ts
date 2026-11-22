@@ -86,6 +86,11 @@ export class GraphIndex {
   off: string | null = null;
   /** It may hold changes that aren't committed. */
   dirty = false;
+  /**
+   * It holds rows its tables have not yet (ADR 0042, section 2; exec/graph-pending.ts): until they are written, it
+   * is not dropped and its property maps are not let go.
+   */
+  pinned = false;
   /** The pager's change counter it is of. */
   counter = -1;
   /** How many times it was built (tests). */
@@ -94,6 +99,7 @@ export class GraphIndex {
   constructor(readonly name: string) {}
 
   drop(): void {
+    this.unpinned();
     this.out = this.in = null;
     this.labels = null;
     this.forget();
@@ -101,8 +107,14 @@ export class GraphIndex {
     this.dirty = false;
   }
 
+  /** What lets go of something the index holds asks first: rows only the index holds would be lost. */
+  private unpinned(): void {
+    if (this.pinned) throw new SmaltError('SMALT_INTERNAL', `graph index of ${this.name} holds rows its tables have not: it can't be let go`);
+  }
+
   /** Lets every property map go. A scan that still has one reads its rows from the table. */
   forget(): void {
+    this.unpinned();
     for (const p of this.props.values()) p.maps.closed = true;
     this.props.clear();
     this.propsDirty = false;
@@ -110,6 +122,7 @@ export class GraphIndex {
 
   /** The property maps know no row any more, and keep their memory for the rows read next. */
   unlearn(): void {
+    this.unpinned();
     for (const p of this.props.values()) p.maps.clear();
     this.propsDirty = false;
   }
@@ -118,6 +131,7 @@ export class GraphIndex {
   forgetTable(key: string): void {
     const p = this.props.get(key);
     if (p === undefined) return;
+    this.unpinned();
     p.maps.closed = true;
     this.props.delete(key);
   }
@@ -204,6 +218,11 @@ export function endpointIndex(table: TableSchema, a: number, b: number): IndexSc
 }
 
 export class GraphIndexes {
+  /**
+   * While set, the tables' writers tell the indexes nothing: they are writing rows the indexes already hold
+   * (`Database.settle`, ADR 0042, section 2).
+   */
+  muted = false;
   private version = -1;
   /** Tests: while set, no index is read (scans read the B+trees); the indexes are still kept. */
   suspended = false;
@@ -354,7 +373,11 @@ export class GraphIndexes {
     if (have === undefined) {
       // They grow as rows are read: over the limit they are let go, and the lists stay.
       const maps = new GraphProps(() => {
-        if (g.bytes() > this.limit) g.shed(this.limit);
+        if (g.bytes() <= this.limit) return;
+        // Maps that hold rows their tables have not can't be let go: they take no more rows read from the tables
+        // until those are written (`settled`).
+        if (g.pinned) for (const p of g.props.values()) p.maps.full = true;
+        else g.shed(this.limit);
       });
       have = { root: role.table.rootPage, column: role.column, maps };
       g.props.set(role.key, have);
@@ -478,8 +501,23 @@ export class GraphIndexes {
     if (!isId(s) || !isId(e) || !isId(rowid) || !g.out!.remove(s, role.type, e, rowid) || !g.in!.remove(e, role.type, s, rowid)) g.drop();
   }
 
+  /**
+   * The rows a graph's index held ahead of its tables are written (ADR 0042, section 2): it is held to its limit
+   * again, as when a row is written to one of its tables.
+   */
+  settled(g: GraphIndex): void {
+    for (const p of g.props.values()) p.maps.full = false;
+    if (g.out !== null && g.bytes() > this.limit && !g.shed(this.limit)) this.stop(g, `its index needs more than ${this.limit} bytes`);
+  }
+
+  /** Whether a graph's index is over its limit. */
+  over(g: GraphIndex): boolean {
+    return g.bytes() > this.limit;
+  }
+
   /** A row was written to an edge table. */
   inserted(roles: readonly EdgeRole[], row: readonly SqlValue[], rowid: number | bigint): void {
+    if (this.muted) return;
     for (const role of roles) {
       const g = role.graph;
       if (g.out === null) continue;
@@ -490,6 +528,7 @@ export class GraphIndexes {
 
   /** A row of an edge table was deleted. */
   deleted(roles: readonly EdgeRole[], row: readonly SqlValue[], rowid: number | bigint): void {
+    if (this.muted) return;
     for (const role of roles) {
       const g = role.graph;
       if (g.out === null) continue;
@@ -500,6 +539,7 @@ export class GraphIndexes {
 
   /** A row of an edge table was changed in place (its rowid kept). */
   updated(roles: readonly EdgeRole[], old: readonly SqlValue[], next: readonly SqlValue[], rowid: number | bigint): void {
+    if (this.muted) return;
     for (const role of roles) {
       const g = role.graph;
       if (g.out === null || (old[role.start] === next[role.start] && old[role.end] === next[role.end])) continue;
@@ -533,6 +573,7 @@ export class GraphIndexes {
 
   /** A row was written to a label index table. */
   labelInserted(roles: readonly LabelRole[], row: readonly SqlValue[]): void {
+    if (this.muted) return;
     for (const role of roles) {
       const g = role.graph;
       if (g.labels === null) continue;
@@ -543,6 +584,7 @@ export class GraphIndexes {
 
   /** A row of a label index table was deleted. */
   labelDeleted(roles: readonly LabelRole[], row: readonly SqlValue[]): void {
+    if (this.muted) return;
     for (const role of roles) {
       const g = role.graph;
       if (g.labels === null) continue;
@@ -553,6 +595,7 @@ export class GraphIndexes {
 
   /** A row of a label index table was changed in place. */
   labelUpdated(roles: readonly LabelRole[], old: readonly SqlValue[], next: readonly SqlValue[]): void {
+    if (this.muted) return;
     for (const role of roles) {
       const g = role.graph;
       if (g.labels === null || (old[role.node] === next[role.node] && old[role.label] === next[role.label])) continue;
@@ -580,6 +623,7 @@ export class GraphIndexes {
    * table when a scan first asks for it.
    */
   propsUpdated(roles: readonly PropRole[], old: readonly SqlValue[], row: readonly SqlValue[], rowid: number | bigint): void {
+    if (this.muted) return;
     for (const role of roles) {
       const props = row[role.column]!;
       if (props === old[role.column]) continue;
@@ -597,6 +641,7 @@ export class GraphIndexes {
    * read in: most are never asked for by their rowid.
    */
   propsChanged(roles: readonly PropRole[], rowid: number | bigint): void {
+    if (this.muted) return;
     for (const role of roles) {
       const maps = this.held(role);
       if (maps === undefined) continue;
@@ -640,6 +685,10 @@ export class GraphIndexes {
   rolledBack(): void {
     if (this.graphs.size === 0) return;
     for (const g of this.graphs.values()) {
+      // An index that holds rows ahead of its tables holds what their log says, and the log is as it was before
+      // what was rolled back: a rollback that takes from the log lets the index go first (`Database`), and a write
+      // of one of its tables writes those rows first. So nothing it holds was undone.
+      if (g.pinned) continue;
       if (g.dirty) g.drop();
       else if (g.propsDirty) g.unlearn();
     }

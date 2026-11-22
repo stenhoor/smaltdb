@@ -28,6 +28,11 @@
  * (a foreign key's actions, the graph's rules), and deletes of rows by their rowids (`GraphWriteHost.deleteRows`):
  * each goes through its table's writer, so the graph's rules, history, foreign keys and the graph's index are kept
  * as for any write.
+ *
+ * **Into the index first.** Where the graph's writes land in its index (`GraphWriteHost.direct`: ADR 0042, section
+ * 2), each of these is a change of the index instead, with the graph's rules kept against it, and the tables are
+ * written behind. A row the index can't take goes through its table as above, which brings the tables up to date
+ * first.
  */
 import { SmaltError } from '../errors.js';
 import { append, filter, join, limit as limitOf, project, remove, scan, update, values } from '../plan/build.js';
@@ -37,7 +42,8 @@ import type { PlanType } from '../plan/types.js';
 import { decodeKey, encodeKey } from '../storage/key-codec.js';
 import type { SqlValue } from '../values.js';
 import { compareCodePoints, parseNested } from '../../shared/nested.js';
-import { toAny } from './nested-ops.js';
+import { type DirectGraph, PASS } from './graph-pending.js';
+import { setMapKey, toAny } from './nested-ops.js';
 
 type Row = SqlValue[];
 type Sink = (row: Row) => boolean;
@@ -88,6 +94,11 @@ export interface GraphWriteHost {
   /** Adds a label or a relationship type to the graph; `table` names the table made for it, which must not exist. */
   addLabel(graph: string, label: string, table?: string): void;
   addType(graph: string, type: string, table?: string): void;
+  /**
+   * The graph's writes into its index, where they land there first and its tables are written behind (ADR 0042,
+   * section 2; exec/graph-pending.ts); null where they go to its tables as the statement runs. Asked for each write.
+   */
+  direct?(graph: string): DirectGraph | null;
 }
 
 /** A graph's next node id and relationship rowid (`GraphWriteHost.ids`). */
@@ -511,23 +522,73 @@ export class GraphWrite {
     if (rows.length > 0) this.runOver(`rows:${table}:${columns.join()}`, types, (held) => append(table, held, columns), rows);
   }
 
+  /** The graph's writes into its index, or null where they go to its tables. Asked for each write: it may change with one. */
+  private directOf(g: GraphLayout): DirectGraph | null {
+    return this.host.direct?.(g.name) ?? null;
+  }
+
+  /** New nodes (an id and props each): into the graph's index, or appended to its node table in one pass. */
+  private putNodes(g: GraphLayout, rows: Row[]): void {
+    const d = this.directOf(g);
+    if (d !== null) {
+      let i = 0;
+      while (i < rows.length && d.node(rows[i]![0] as number, rows[i]![1] as Uint8Array)) i++;
+      if (i === rows.length) return;
+      // The index takes no more: the rest go through the table.
+      rows = rows.slice(i);
+    }
+    this.appendRows(g.nodes.table, [g.nodes.id, g.nodes.props], ['int', 'map<text, any>'], rows);
+  }
+
+  /** New label entries (a node and a label each, which the node has not): into the graph's index, or appended to its label index. */
+  private putLabels(g: GraphLayout, rows: Row[]): void {
+    const d = this.directOf(g);
+    if (d !== null) {
+      let i = 0;
+      while (i < rows.length && d.addLabel(rows[i]![0]!, rows[i]![1] as string)) i++;
+      if (i === rows.length) return;
+      rows = rows.slice(i);
+    }
+    this.appendRows(g.labels.table, [g.labels.node, g.labels.label], ['int', 'text'], rows);
+  }
+
+  /** New relationships of one type (a rowid, a start, an end and, where its table has them, props each): into the index, or appended to the table. */
+  private putEdges(g: GraphLayout, e: { readonly table: string; readonly start: number; readonly end: number; readonly props: number }, rows: Row[]): void {
+    const d = this.directOf(g);
+    const at = d?.at(e.table);
+    if (d !== null && at !== undefined && at >= 0) {
+      let i = 0;
+      while (i < rows.length && d.edge(at, rows[i]![0] as number, rows[i]![1]!, rows[i]![2]!, e.props < 0 ? EMPTY_MAP : (rows[i]![3] as Uint8Array))) i++;
+      if (i === rows.length) return;
+      rows = rows.slice(i);
+    }
+    if (e.props < 0) this.appendRows(e.table, [-1, e.start, e.end], ['int', 'int', 'int'], rows);
+    else this.appendRows(e.table, [-1, e.start, e.end, e.props], ['int', 'int', 'int', 'map<text, any>'], rows);
+  }
+
   private appendNode(g: GraphLayout, id: number, props: Uint8Array): void {
+    if (this.directOf(g)?.node(id, props)) return;
     const t = g.nodes;
     this.write(this.kept(`node:${t.table}`, () => append(t.table, values([[param(0, 'int'), param(1, 'map<text, any>')]], ['int', 'map<text, any>']), [t.id, t.props])), [id, props]);
   }
 
   private appendLabel(g: GraphLayout, id: SqlValue, label: string): void {
+    if (this.directOf(g)?.addLabel(id, label)) return;
     const t = g.labels;
     this.write(this.kept(`label:${t.table}`, () => append(t.table, values([[param(0, 'int'), param(1, 'text')]], ['int', 'text']), [t.node, t.label])), [id, label]);
   }
 
   private hasLabel(g: GraphLayout, id: SqlValue, label: string): boolean {
+    const d = this.directOf(g);
+    if (d !== null) return d.hasLabel(id, label);
     const t = g.labels;
     const plan = this.kept(`has:${t.table}`, () => limitOf(project(filter(scan(t.table, [t.node, t.label]), { k: 'and', args: [eq(INT(0), param(0, 'int')), eq(col(0, 1, 'text'), param(1, 'text'))] }), [lit(1)]), 1));
     return this.host.run(plan, [id, label])!.length > 0;
   }
 
   private dropLabel(g: GraphLayout, id: SqlValue, label: string): number {
+    const d = this.directOf(g);
+    if (d !== null) return d.dropLabel(id, label);
     const t = g.labels;
     const plan = this.kept(`drop:${t.table}`, () => remove(t.table, filter(scan(t.table, [-1, t.node, t.label]), { k: 'and', args: [eq(INT(1), param(0, 'int')), eq(col(0, 2, 'text'), param(1, 'text'))] }), 0));
     return this.write(plan, [id, label]);
@@ -535,8 +596,11 @@ export class GraphWrite {
 
   private appendEdge(g: GraphLayout, type: string, rowid: number, start: SqlValue, end: SqlValue, props: Uint8Array, keys: number): void {
     const e = g.edge(type)!;
+    if (e.props < 0 && keys > 0) throw new SmaltError('SMALT_ERROR', `property graph ${g.name}: relationship type ${type} keeps no properties`);
+    const d = this.directOf(g);
+    const at = d?.at(e.table);
+    if (d !== null && at !== undefined && at >= 0 && d.edge(at, rowid, start, end, props)) return;
     if (e.props < 0) {
-      if (keys > 0) throw new SmaltError('SMALT_ERROR', `property graph ${g.name}: relationship type ${type} keeps no properties`);
       this.write(this.kept(`edge:${e.table}`, () => append(e.table, values([[param(0, 'int'), param(1, 'int'), param(2, 'int')]], ['int', 'int', 'int']), [-1, e.start, e.end])), [rowid, start, end]);
       return;
     }
@@ -545,18 +609,42 @@ export class GraphWrite {
   }
 
   /** The properties of a node or a relationship, by its table and rowid: undefined when it is not there. */
-  private propsOf(table: string, propsColumn: number, rowid: SqlValue): Uint8Array | undefined {
+  private propsOf(g: GraphLayout, table: string, propsColumn: number, rowid: SqlValue): Uint8Array | undefined {
+    const d = this.directOf(g);
+    const at = d?.at(table);
+    if (d !== null && at !== undefined) {
+      const held = d.props(at, rowid);
+      if (held !== PASS) return held === null ? EMPTY_MAP : held;
+    }
     const plan = this.kept(`props:${table}`, () => project(filter(scan(table, [-1, propsColumn]), eq(INT(0), param(0, 'int'))), [col(0, 1, 'map<text, any>')]));
     const row = this.host.run(plan, [rowid])![0];
     return row === undefined ? undefined : row[0] === null ? EMPTY_MAP : (row[0] as Uint8Array);
   }
 
-  private setProps(table: string, propsColumn: number, rowid: SqlValue, props: Uint8Array): void {
+  /** New props for a row that is there; `before`: the props it has, where the caller read them (`propsOf`). */
+  private setProps(g: GraphLayout, table: string, propsColumn: number, rowid: SqlValue, props: Uint8Array, before: Uint8Array | null = null): void {
+    const d = this.directOf(g);
+    const at = d?.at(table);
+    if (d !== null && at !== undefined && d.setProps(at, rowid, props, before)) return;
     this.write(this.kept(`set:${table}`, () => update(table, filter(scan(table, [-1]), eq(INT(0), param(0, 'int'))), 0, [{ column: propsColumn, value: param(1, 'map<text, any>') }])), [rowid, props]);
   }
 
-  private deleteRow(table: string, rowid: SqlValue): number {
-    return this.host.deleteRows(table, [rowid]);
+  /**
+   * Deletes the rows of one of the graph's tables with these rowids: nodes and relationships from the graph's index
+   * where its writes land there, else through the table's writer. How many were there.
+   */
+  private deleteRows(g: GraphLayout, table: string, rowids: readonly SqlValue[]): number {
+    const d = this.directOf(g);
+    const at = d?.at(table);
+    if (d === null || at === undefined) return this.host.deleteRows(table, rowids);
+    let n = 0;
+    let rest: SqlValue[] | undefined;
+    for (const rowid of rowids) {
+      const there = at < 0 ? d.deleteNode(rowid) : d.deleteEdge(at, rowid);
+      if (there === PASS) (rest ??= []).push(rowid);
+      else n += there;
+    }
+    return rest === undefined ? n : n + this.host.deleteRows(table, rest);
   }
 
   // ---------------------------------------------------------------- graphCreate
@@ -650,13 +738,16 @@ export class GraphWrite {
         const labelRows: Row[] = [];
         const edges = relParts.map((r) => g.edge(r.type)!);
         const edgeRows = new Map<string, Row[]>();
+        // The graph's next ids, asked for once for all the rows.
+        const nodeIds = nodes.length > 0 ? this.idsOf(ctx, g, 'node') : null;
+        const relIds = relParts.length > 0 ? this.idsOf(ctx, g, 'relationship') : null;
         const outs = rows.map((row, i) => {
           const out: Row = new Array(width + nodes.length + rels.length).fill(null);
           for (let c = 0; c < width; c++) out[c] = row[c]!;
           const vals = ev.over(ctx, out, early?.[i]);
           nodes.forEach((n, k) => {
             const props = propsOf(nodeProps[k]!, vals);
-            const id = this.newId(ctx, g, 'node');
+            const id = nodeIds!.node++;
             nodeRows.push([id, props.map]);
             for (const l of labels[k]!) labelRows.push([id, l]);
             out[width + k] = id;
@@ -669,7 +760,7 @@ export class GraphWrite {
             const props = propsOf(r.props, vals);
             const e = edges[j]!;
             if (e.props < 0 && props.keys.length > 0) throw new SmaltError('SMALT_ERROR', `property graph ${g.name}: relationship type ${r.type} keeps no properties`);
-            const rowid = this.newId(ctx, g, 'relationship');
+            const rowid = relIds!.relationship++;
             let held = edgeRows.get(e.table);
             if (held === undefined) edgeRows.set(e.table, (held = []));
             held.push(e.props < 0 ? [rowid, end(r.start), end(r.end)] : [rowid, end(r.start), end(r.end), props.map]);
@@ -679,13 +770,12 @@ export class GraphWrite {
           });
           return out;
         });
-        this.appendRows(g.nodes.table, [g.nodes.id, g.nodes.props], ['int', 'map<text, any>'], nodeRows);
-        this.appendRows(g.labels.table, [g.labels.node, g.labels.label], ['int', 'text'], labelRows);
+        this.putNodes(g, nodeRows);
+        this.putLabels(g, labelRows);
         for (const e of new Set(edges)) {
           const held = edgeRows.get(e.table);
           if (held === undefined) continue;
-          if (e.props < 0) this.appendRows(e.table, [-1, e.start, e.end], ['int', 'int', 'int'], held);
-          else this.appendRows(e.table, [-1, e.start, e.end, e.props], ['int', 'int', 'int', 'map<text, any>'], held);
+          this.putEdges(g, e, held);
           edgeRows.delete(e.table);
         }
         return outs;
@@ -773,6 +863,8 @@ export class GraphWrite {
       // A property's value is one of any kind in the map: a boolean, a list or a map keeps its type there (ADR 0039).
       typed: it.kind === 'property' ? toAny(typeOf(it.value)) : null,
       props: it.kind === 'properties' ? asProps(typeOf(it.value)) : null,
+      // A property's key as a map holds it.
+      key: it.kind === 'property' ? encodeKey([it.key]) : null,
     }));
     type Part = (typeof parts)[number];
     /** A relationship of a type whose table has no column for properties is given none. */
@@ -806,37 +898,40 @@ export class GraphWrite {
           continue;
         }
         if (target.props < 0) noProps(target);
-        const cur = this.propsOf(target.table, target.props, target.rowid);
+        const cur = this.propsOf(this.layoutOf(op.graph), target.table, target.props, target.rowid);
         // The value is computed for one that is gone too: an error in it is raised either way.
         const given = vals.get(p.value!);
         const value = p.typed ? p.typed(given) : given;
         if (cur === undefined) continue;
-        const entries = entriesOf(cur);
         if (it.kind === 'property') {
-          if (value === null) entries.delete(it.key);
-          else entries.set(it.key, value);
+          // One key, set in the map's bytes: its other entries are not decoded.
           ctx.counts.propertiesSet++;
+          const next = setMapKey(cur, p.key!, value === null ? null : encodeKey([value]));
+          // A value set to what it is writes nothing: a table that keeps history gets no version that changes nothing.
+          if (!sameBytes(cur, next)) this.setProps(this.layoutOf(op.graph), target.table, target.props, target.rowid, next, cur);
+          continue;
+        }
+        // A map over the properties, or merged into them.
+        const entries = entriesOf(cur);
+        const m = asMap(value, op.graph);
+        const settled = settable(p.props ? p.props(m) : m);
+        const map = entriesOf(settled.map);
+        if (it.merge) {
+          for (const k of settled.nulls) entries.delete(k);
+          for (const [k, v] of map) entries.set(k, v);
+          ctx.counts.propertiesSet += settled.nulls.length + settled.keys.length;
         } else {
-          const m = asMap(value, op.graph);
-          const given = settable(p.props ? p.props(m) : m);
-          const map = entriesOf(given.map);
-          if (it.merge) {
-            for (const k of given.nulls) entries.delete(k);
-            for (const [k, v] of map) entries.set(k, v);
-            ctx.counts.propertiesSet += given.nulls.length + given.keys.length;
-          } else {
-            let removed = 0;
-            for (const k of [...entries.keys()]) {
-              if (!map.has(k)) removed++;
-              entries.delete(k);
-            }
-            for (const [k, v] of map) entries.set(k, v);
-            ctx.counts.propertiesSet += removed + given.keys.length;
+          let removed = 0;
+          for (const k of [...entries.keys()]) {
+            if (!map.has(k)) removed++;
+            entries.delete(k);
           }
+          for (const [k, v] of map) entries.set(k, v);
+          ctx.counts.propertiesSet += removed + settled.keys.length;
         }
         const next = mapOf(entries);
         // A value set to what it is writes nothing: a table that keeps history gets no version that changes nothing.
-        if (!sameBytes(cur, next)) this.setProps(target.table, target.props, target.rowid, next);
+        if (!sameBytes(cur, next)) this.setProps(this.layoutOf(op.graph), target.table, target.props, target.rowid, next, cur);
       }
     };
     // All the rows at once: every item sets one property, or labels, and reads only its row, so no row reads what
@@ -874,9 +969,10 @@ export class GraphWrite {
             const label = this.labelOf(op, l);
             const g = this.layoutOf(op.graph);
             if (label === g.nodes.label) continue;
-            const has = new Set(this.labelled(g, ids, label));
+            const d = this.directOf(g);
+            const has = new Set(d !== null ? ids.filter((id) => d.hasLabel(id, label)) : this.labelled(g, ids, label));
             const missing = ids.filter((id) => !has.has(id));
-            this.appendRows(g.labels.table, [g.labels.node, g.labels.label], ['int', 'text'], missing.map((id) => [id, label]));
+            this.putLabels(g, missing.map((id) => [id, label]));
             ctx.counts.labelsAdded += missing.length;
           }
           for (const l of it.remove) {
@@ -948,6 +1044,8 @@ export class GraphWrite {
 
   /** Takes the label from the nodes `ids` that have it: how many had it. */
   private dropLabels(g: GraphLayout, ids: readonly SqlValue[], label: string): number {
+    const d = this.directOf(g);
+    if (d !== null) return ids.reduce((n: number, id) => n + d.dropLabel(id, label), 0);
     const t = g.labels;
     const entries = this.runOver(
       `entries:${t.table}`,
@@ -965,6 +1063,35 @@ export class GraphWrite {
    * would be a version that changes nothing.
    */
   private setKey(g: GraphLayout, table: string, propsColumn: number, key: string, rows: Row[]): number {
+    const d = this.directOf(g);
+    const at = d?.at(table);
+    let there = 0;
+    if (d !== null && at !== undefined) {
+      // In the index: each row's props read there, and written there where the key's value is another.
+      const rest: Row[] = [];
+      const keyBytes = encodeKey([key]);
+      let last: SqlValue | undefined;
+      let value: Uint8Array | null = null;
+      for (const row of rows) {
+        const held = d.props(at, row[0]!);
+        if (held === PASS) {
+          rest.push(row);
+          continue;
+        }
+        if (held === undefined) continue;
+        there++;
+        const cur = held ?? EMPTY_MAP;
+        // The value's bytes are made once for rows that are given the same one.
+        if (row[1] !== last) {
+          last = row[1]!;
+          value = last === null ? null : encodeKey([last]);
+        }
+        const next = setMapKey(cur, keyBytes, value);
+        if (!sameBytes(cur, next)) this.setProps(g, table, propsColumn, row[0]!, next, cur);
+      }
+      if (rest.length === 0) return there;
+      rows = rest;
+    }
     const M: PlanType = 'map<text, any>';
     const cur = col(0, 1, M);
     const given = col(0, 3, 'any');
@@ -980,9 +1107,9 @@ export class GraphWrite {
       update(table, filter(join('cross', scan(table, [-1, propsColumn]), held), changedOnly ? { k: 'and', args: [named, call('cmp_is_not', [value, cur], 'bool')] } : named), 0, [{ column: propsColumn, value }], { from: true });
     if (!g.history) {
       this.runOver(`key:${table}:${key}`, ['int', 'any'], write(false), rows);
-      return this.host.changes();
+      return there + this.host.changes();
     }
-    const there = this.runOver(`there:${table}`, ['int', 'any'], (held) => project(filter(join('cross', scan(table, [-1]), held), eq(INT(0), INT(1))), [lit(1)]), rows)!.length;
+    there += this.runOver(`there:${table}`, ['int', 'any'], (held) => project(filter(join('cross', scan(table, [-1]), held), eq(INT(0), INT(1))), [lit(1)]), rows)!.length;
     this.runOver(`changed:${table}:${key}`, ['int', 'any'], write(true), rows);
     return there;
   }
@@ -1043,15 +1170,15 @@ export class GraphWrite {
         // Its relationships first, from either end: one from the node to itself is named once.
         const touching = new Map<string, Set<SqlValue>>();
         this.touching(g, id, touching);
-        for (const [table, rowids] of touching) ctx.counts.relationshipsDeleted += this.host.deleteRows(table, [...rowids]);
+        for (const [table, rowids] of touching) ctx.counts.relationshipsDeleted += this.deleteRows(g, table, [...rowids]);
       }
-      ctx.counts.nodesDeleted += this.deleteRow(g.nodes.table, id);
+      ctx.counts.nodesDeleted += this.deleteRows(g, g.nodes.table, [id]);
     };
     const one = (ctx: Ctx, row: Row, early: Row | undefined): void =>
       named(
         ev.over(ctx, row, early),
         (id) => deleteNode(ctx, id),
-        (table, rowid) => void (ctx.counts.relationshipsDeleted += this.deleteRow(table, rowid)),
+        (table, rowid) => void (ctx.counts.relationshipsDeleted += this.deleteRows(this.layoutOf(op.graph), table, [rowid])),
       );
     // All the rows at once: what they name is read from the rows alone, and a node goes with its relationships (the
     // check that it has none left would see what later rows delete).
@@ -1071,14 +1198,14 @@ export class GraphWrite {
         ),
       );
       const g = this.layoutOf(op.graph);
-      for (const [table, ids] of rels) ctx.counts.relationshipsDeleted += this.host.deleteRows(table, [...ids]);
+      for (const [table, ids] of rels) ctx.counts.relationshipsDeleted += this.deleteRows(g, table, [...ids]);
       if (nodes.size === 0) return;
       const ids = [...nodes];
       // The nodes' relationships, read from either end: one that joins two of them is named at both, and deleted once.
       const touching = new Map<string, Set<SqlValue>>();
       for (const id of ids) this.touching(g, id, touching);
-      for (const [table, rowids] of touching) ctx.counts.relationshipsDeleted += this.host.deleteRows(table, [...rowids]);
-      ctx.counts.nodesDeleted += this.host.deleteRows(g.nodes.table, ids);
+      for (const [table, rowids] of touching) ctx.counts.relationshipsDeleted += this.deleteRows(g, table, [...rowids]);
+      ctx.counts.nodesDeleted += this.deleteRows(g, g.nodes.table, ids);
     };
     return {
       types: input.types,
@@ -1103,6 +1230,17 @@ export class GraphWrite {
    * node has, the average over the nodes that have any, is high.)
    */
   private touching(g: GraphLayout, node: SqlValue, into: Map<string, Set<SqlValue>>): void {
+    // Where the graph's writes land in its index, the node's lists give them.
+    const d = this.directOf(g);
+    if (
+      d !== null &&
+      d.touching(node, (table, rowid) => {
+        const held = into.get(table);
+        if (held === undefined) into.set(table, new Set([rowid]));
+        else held.add(rowid);
+      })
+    )
+      return;
     const at = this.kept(`touching:${g.name}`, () => project(filter({ op: 'relationships', graph: g.name, direction: 'both' }, eq(INT(0), param(0, 'int'))), [col(0, 2, 'text'), INT(3)]));
     for (const [type, rowid] of this.host.run(at, [node])!) {
       const e = g.edge(type as string);

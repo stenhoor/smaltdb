@@ -156,6 +156,12 @@ export interface PhysicalEnv {
    * and the maps, asked when a scan opens (null when the index holds none then).
    */
   graphProps?(table: TableSchema): { column: number; maps(): GraphProps | null } | undefined;
+  /**
+   * For an index of a table whose rows a graph's index may hold before the table does (ADR 0042, section 2): asked
+   * when a search of the index for a value opens, whether the search may read the index and the table as they are
+   * (`IndexScanSpec.ahead`). Undefined for any other index.
+   */
+  graphAhead?(table: TableSchema, index: IndexSchema): (() => boolean) | undefined;
   /** M8: an external table by name (its columns from the catalog; its rows once loaded). */
   externalTable?(name: string): ExternalScan | undefined;
   /** M8: a table function over external data (`read_csv`, `read_json`) called with constant arguments; undefined for other functions. */
@@ -1907,14 +1913,19 @@ export class Planner {
       // Nothing is decoded: every entry is counted from the index alone.
       keyColumns: idx.columns.map((c) => c.column),
     });
-    scan.open([]);
-    let n = 0;
-    try {
-      while (scan.next()) if (++n >= cap) return null;
-    } finally {
-      scan.close();
-    }
-    return n;
+    // A table that is behind its graph's index (ADR 0042, section 2) is counted as it is: an estimate may be behind.
+    return access.tree.trusted(() =>
+      scan.spec.tree.trusted(() => {
+        let n = 0;
+        try {
+          scan.open([]);
+          while (scan.next()) if (++n >= cap) return null;
+        } finally {
+          scan.close();
+        }
+        return n;
+      }),
+    );
   }
 
   private accessOptions(src: Source, p: number, candidates: ConjunctInfo[], scope: Scope, ctx: FunctionContext): AccessOption[] {
@@ -2134,6 +2145,7 @@ export class Planner {
       // The order its entries come in: by the column after the equalities, or by rowid when they cover the index.
       const next = idx.columns[k];
       const orderBy = !next ? { column: -1, collation: Collation.Binary } : next.column >= 0 && !next.desc ? { column: next.column, collation: next.collation } : undefined;
+      const ahead = this.env.graphAhead?.(table, idx);
       const indexScan = (): IndexScan =>
         new IndexScan(access, {
           indexName: idx.name,
@@ -2143,6 +2155,8 @@ export class Planner {
           lo: lo ? { fn: compileBoundExpr(lo.other, ctx).fn, inclusive: lo.op === '>=' } : undefined,
           hi: hi ? { fn: compileBoundExpr(hi.other, ctx).fn, inclusive: hi.op === '<=' } : undefined,
           convert: [...converters, ...(rangeConv ? [rangeConv] : [])],
+          ahead,
+          held: ahead !== undefined ? this.env.graphProps?.(table) : undefined,
           // Key columns usable for index-only scans: plain columns whose key form is the value itself.
           keyColumns: idx.columns.map((c) => {
             if (c.column < 0) return -1;
@@ -2774,6 +2788,8 @@ export class Planner {
   private indexMinMax(idx: TableSchema['indexes'][number]): { min: number; max: number } | undefined {
     const tree = this.env.openTree(idx.rootPage);
     const cur = new BTreeCursor(tree);
+    // An index of a table that is behind its graph's index is read as it is: an estimate may be behind.
+    cur.trusted = true;
     const cols = idx.columns.map((c) => ({ desc: c.desc, collation: c.collation }));
     try {
       // The first non-NULL value, and the last value.

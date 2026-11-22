@@ -647,6 +647,49 @@ export function findMapKey(m: Uint8Array, start: number, end: number, key: Uint8
   return -1;
 }
 
+/**
+ * The map whose bytes are `m`, with the key whose component is `key` (a text component, encoded) given the value
+ * whose component is `value`, or taken away (`value` null): the other entries' bytes are copied as they are, in
+ * their order, so no entry is decoded. The key is found as {@link findMapKey} finds it. `m` itself where taking the
+ * key away changes nothing.
+ */
+export function setMapKey(m: Uint8Array, key: Uint8Array, value: Uint8Array | null): Uint8Array {
+  const kl = key.length;
+  const end = m.length;
+  // Where the key's entry starts (or goes), and where the entry after it starts.
+  let at = end;
+  let after = end;
+  let pos = 0;
+  while (pos < end) {
+    let i = 0;
+    while (i < kl && m[pos + i] === key[i]) i++;
+    if (i === kl) {
+      at = pos;
+      after = skipComponent(m, pos + kl);
+      break;
+    }
+    if (m[pos + i]! > key[i]!) {
+      at = after = pos;
+      break;
+    }
+    pos = skipComponent(m, skipComponent(m, pos));
+  }
+  if (value === null) {
+    if (at === after) return m;
+    const out = new Uint8Array(at + end - after);
+    out.set(m.subarray(0, at));
+    out.set(m.subarray(after), at);
+    return out;
+  }
+  const vl = value.length;
+  const out = new Uint8Array(at + kl + vl + end - after);
+  out.set(m.subarray(0, at));
+  out.set(key, at);
+  out.set(value, at + kl);
+  out.set(m.subarray(after), at + kl + vl);
+  return out;
+}
+
 /** The tag of a NULL component. */
 const NULL_TAG = encodeKey([null])[0]!;
 

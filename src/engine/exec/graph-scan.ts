@@ -351,6 +351,10 @@ export class GraphLabelEntries implements Operator {
  * The lookup also runs for a key the maps hold no row for (not a whole number from 0 to 2^31 - 1), and for every row
  * when the index holds no maps for the table (asked once per execution: the graph isn't indexed, or its maps didn't
  * fit).
+ *
+ * The maps know every row the index holds that the table has not yet, and every row of the table that is gone from
+ * the index (ADR 0042, section 2). So with them the lookup is only asked for rows that are in the table as it is,
+ * and reads it whether it is behind the index or not.
  */
 export class GraphNodeScan implements Operator {
   readonly children: Operator[] = [];
@@ -442,27 +446,38 @@ export class GraphNodeScan implements Operator {
     if (typeof k === 'bigint' && k >= 0n && k <= 2147483647n) k = Number(k);
     if (maps === null || typeof k !== 'number' || k < 0 || k > 2147483647 || !Number.isInteger(k)) {
       this.mode = 'lookup';
+      // With the maps, such a key is no row the index holds ahead of the table.
+      this.fallback.trusted = maps !== null;
       this.fallback.open(r);
       return;
     }
     this.rowid = k;
     if (this.propsReg < 0) {
       // Nothing reads the props: a row the maps know is there, and no copy of its props is made.
-      if (maps.known(k)) this.mode = 'held';
-      else {
-        this.mode = 'learn';
-        this.fallback.open(r);
-      }
+      if (maps.here(k)) this.mode = 'held';
+      else this.unknown(maps, k, r);
       return;
     }
     const props = maps.get(k);
-    if (props === undefined) {
-      this.mode = 'learn';
-      this.fallback.open(r);
-    } else {
+    if (props === undefined) this.unknown(maps, k, r);
+    else {
       this.mode = 'held';
       this.props = props;
     }
+  }
+
+  /**
+   * A row the maps give nothing for. One deleted in the index whose table still has it (ADR 0042, section 2) is no
+   * row, and the table is not read. Any other is the table's, as it is: the lookup reads it.
+   */
+  private unknown(maps: GraphProps, k: number, r: SqlValue[]): void {
+    if (maps.gone(k)) {
+      this.mode = 'none';
+      return;
+    }
+    this.mode = 'learn';
+    this.fallback.trusted = true;
+    this.fallback.open(r);
   }
 
   next(): boolean {

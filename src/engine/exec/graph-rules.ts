@@ -164,8 +164,15 @@ export class GraphRules {
     }
   }
 
+  /**
+   * While set, no table is the rules': the rows written are ones a graph's index held ahead of its tables, with the
+   * rules kept when the index took them (ADR 0042, section 2).
+   */
+  muted = false;
+
   /** Whether `table` is a node or edge table of a graph. */
   involved(table: TableSchema): boolean {
+    if (this.muted) return false;
     this.refresh();
     return this.roles.size !== 0 && this.roles.has(table);
   }

@@ -401,6 +401,34 @@ and what reads the graph above a write reads it as it is then.
 - **A merge's match** is the plan the statement gives, with its `working` leaf replaced: by the row, numbered 0,
   when rows are matched one at a time, and by the rows held, each numbered, when the plan gives a `key` and the rows
   can be matched in one query. The numbers say whose a match is.
+- **Into the index first, in memory.** In a database in memory, for a graph whose index is held and whose tables
+  are the plain ones a graph is made with, those writes change the graph's index and not its tables
+  ([ADR 0042](adr/0042-graph-writes.md), section 2; `exec/graph-pending.ts`, `Database.directGraph`): a node's
+  properties in the property maps, its labels in the label sets, a relationship in the lists of its two ends, each
+  with the graph's rules kept against the index and the errors the tables' writers give. Each change also goes in a
+  log, with its values. The tables are written behind: a table with rows in the log has its B+trees guarded
+  (`BTree.guard`), and a search of one stops the statement (`PENDING_READ`), which then has the log written to the
+  tables (`Database.settle`: what is left of each row's entries, through the tables' writers, with the index and the
+  rules not told) and runs again. A statement that was stopped once has the tables written before it runs from then
+  on. A statement of any other kind than a query or a plan that writes a graph has them written before it starts,
+  and so has a cursor before it opens. What reads the graph through its index stops nowhere: a node by its id,
+  whether a node has a label, the relationships at a node, a relationship's properties. Nor does a search for a
+  value of an index on one key of the node table's `props` (`map_get(props, 'k') = ?`; `IndexScanSpec.ahead`),
+  while every node in the log has under that key what its row in the table has (`DirectGraph.keyClear`): no new
+  node has the key, no change gave a node another value under it, and no node of the table was deleted. The
+  index's entries for values are then all there and right, so the index is read as it is, and a row it leads to is
+  given with the props the property maps hold for it, where they hold them (`IndexScanSpec.held`). A statement
+  stopped at such a search is remembered by the search, and has the tables written before a later run only when
+  the search could not read its index then either. A node or a relationship deleted while its table still has its
+  row is marked gone in the property maps (`GraphProps.setGone`): no reader of the maps is given it, or reads it
+  from the table for them. A row made and deleted
+  again before a table is read is never written; a commit sweeps such rows out of the log, and makes the log what
+  is left of it once it has grown to twice that. A rollback takes what it undid from the log, the index is dropped
+  as after any rollback, and the rows of earlier commits still in the log are written before it is built again.
+  With a file, with history, with copies, with a foreign key or a unique index on a graph's table, with a
+  materialized view in the database, and wherever the index is not held, the tables are written as each statement
+  runs, as above. `test/graph-write-behind.test.ts` runs random statements on both and compares rows, errors and
+  tables.
 - **Ids** are kept for the connection (`Database.graphIdsOf`): the next node id and relationship rowid of each
   graph, brought up to the tables as they are when a statement first asks, and moved on as it makes nodes and
   relationships. A table's past versions are read for them once.

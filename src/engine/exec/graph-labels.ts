@@ -47,6 +47,30 @@ export class GraphLabels {
     return page !== undefined && (page[(node >>> 5) & (PAGE_WORDS - 1)]! & (1 << (node & 31))) !== 0;
   }
 
+  /** Whether the node has a label. */
+  any(node: number): boolean {
+    const at = node >>> PAGE_BITS;
+    const word = (node >>> 5) & (PAGE_WORDS - 1);
+    const bit = 1 << (node & 31);
+    for (const set of this.sets.values()) {
+      const page = set.pages[at];
+      if (page !== undefined && (page[word]! & bit) !== 0) return true;
+    }
+    return false;
+  }
+
+  /** The labels the node has. */
+  labelsOf(node: number): string[] {
+    const out: string[] = [];
+    const word = (node >>> 5) & (PAGE_WORDS - 1);
+    const bit = 1 << (node & 31);
+    for (const [label, set] of this.sets) {
+      const page = set.pages[node >>> PAGE_BITS];
+      if (page !== undefined && (page[word]! & bit) !== 0) out.push(label);
+    }
+    return out;
+  }
+
   /** How many nodes have the label. */
   count(label: string): number {
     return this.sets.get(label)?.count ?? 0;

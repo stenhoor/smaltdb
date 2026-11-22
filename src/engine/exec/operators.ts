@@ -10,6 +10,7 @@ const LOADER_HELPERS: LoaderHelpers = { readInt64, utf8: decodeUtf8, tagged: dec
 import { Collation, type SqlValue, compareValues } from '../values.js';
 import { applyNumericAffinity, hashKey, hashKeyMulti, toNumeric, truthy } from './convert.js';
 import { type Fn, isTrue } from './expr.js';
+import type { GraphProps } from './graph-props.js';
 import { type AggregateFunction, type AggregateState, MinMaxState } from './functions.js';
 import { deletedBitmap, rowidsOf, zoneOf } from './columnar-table.js';
 import { type Run, RunReader, RunWriter, type SpillArea, SpillRestart, partitionHash, rowBytes, valueBytes } from './spill.js';
@@ -353,6 +354,11 @@ export class RowidLookup implements Operator {
   private keys: (number | bigint)[] = [];
   private i = 0;
   private readonly keyBuf = new Uint8Array(ROWID_KEY_SIZE);
+  /**
+   * The rows it is asked for are in the table as it is, whatever its graph's index holds ahead of it (`BTree.guard`):
+   * set, before it opens, by a scan that asks it only for rows the index does not hold.
+   */
+  trusted = false;
 
   constructor(
     readonly access: TableAccess,
@@ -366,6 +372,7 @@ export class RowidLookup implements Operator {
   open(r: SqlValue[]): void {
     this.r = r;
     if (this.cursor === null) this.cursor = this.access.tree.cursor();
+    this.cursor.trusted = this.trusted;
     this.keys = [];
     for (const f of this.keyFns) {
       const p = rowidProbe(f(r));
@@ -427,6 +434,19 @@ export interface IndexScanSpec {
    * (an expression, or text stored in a non-BINARY collated form). Enables index-only scans.
    */
   keyColumns?: number[];
+  /**
+   * For an index of a table that may be behind its graph's index (ADR 0042, section 2; `BTree.guard`): whether a
+   * search for a value of the index's first column may read the index and the table as they are now. Asked when
+   * such a search opens; it stops the statement itself where the index is behind for the search. Any other scan of
+   * the index stops at the guard. Either way the tables are written, and the statement runs again.
+   */
+  ahead?: () => boolean;
+  /**
+   * With `ahead`: the table's column of props and its graph's property maps (asked when a search opens; null when
+   * the index holds none). A row a search reads as it is (`ahead`) is given with the props the maps hold for it,
+   * where they hold them: the table's row may be an older one.
+   */
+  held?: { column: number; maps(): GraphProps | null };
 }
 
 /** Index range/equality scan followed by a table lookup per entry. */
@@ -455,6 +475,9 @@ export class IndexScan implements Operator {
   private bn = 0;
   private bi = 0;
   private idxDone = false;
+  /** For a search that reads the index as it is (`IndexScanSpec.ahead`): the maps its rows' props are taken from, and their register. */
+  private heldMaps: GraphProps | null = null;
+  private heldReg = -2;
 
   constructor(
     readonly access: TableAccess,
@@ -513,6 +536,21 @@ export class IndexScan implements Operator {
       const v = s.convert[i](s.eq[i](this.r));
       if (v === null) return false;
       e.add(v, s.columns[i]);
+    }
+    if (s.ahead !== undefined) {
+      // A value for the first column: the entries read are those of rows that have one.
+      const asIs = i > 0 && s.ahead();
+      this.idx!.trusted = asIs;
+      if (this.tab !== null) this.tab.trusted = asIs;
+      this.heldMaps = null;
+      if (asIs && s.held !== undefined && this.tab !== null) {
+        if (this.heldReg === -2) {
+          const d = this.access.decode;
+          this.heldReg = -1;
+          for (let j = 0; j < d.length; j += 2) if (d[j] === s.held.column) this.heldReg = d[j + 1]!;
+        }
+        if (this.heldReg >= 0) this.heldMaps = s.held.maps();
+      }
     }
     if (!s.lo && !s.hi) {
       // Equalities only (an index nested loop's probe, run per outer row): the bounds in one buffer, kept between
@@ -592,7 +630,14 @@ export class IndexScan implements Operator {
       throw new SmaltError('SMALT_CORRUPT', `index ${this.spec.indexName} references missing row ${rowid}`);
     }
     this.access.load(t, this.r);
+    if (this.heldMaps !== null) this.current(rowid);
     return true;
+  }
+
+  /** The row's props as its graph's index holds them, where it does (`IndexScanSpec.held`). */
+  private current(rowid: number | bigint): void {
+    const props = this.heldMaps!.get(Number(rowid));
+    if (props !== undefined) this.r[this.heldReg] = props;
   }
 
   close(): void {
@@ -615,6 +660,7 @@ export class IndexScan implements Operator {
       throw new SmaltError('SMALT_CORRUPT', `index ${this.spec.indexName} references missing row ${rowid}`);
     }
     this.access.load(t, this.r);
+    if (this.heldMaps !== null) this.current(rowid);
     return true;
   }
 

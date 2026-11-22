@@ -343,6 +343,8 @@ export class RelationshipsScan implements Operator {
     }
     let tab = this.tabs[t.position];
     if (tab === undefined) tab = this.tabs[t.position] = access.tree.cursor();
+    // With the maps, a row they don't know is in the table as it is: they know every row the index holds ahead of it.
+    tab.trusted = !!maps;
     writeRowidKey(this.keyBuf, 0, rowid);
     if (!tab.seek(this.keyBuf) || tab.compareKey(this.keyBuf) !== 0) throw new SmaltError('SMALT_CORRUPT', `graph index of ${access.tableName} references missing row ${rowid}`);
     access.load(tab, this.r);

@@ -225,6 +225,26 @@ export class BTree {
   private readonly cellBuf: Uint8Array;
   private readonly cellView: DataView;
 
+  /**
+   * Set while the tree is not to be read or written through this handle: the table it is of has rows that only its
+   * property graph's index holds (ADR 0042, section 2), so what a search of the tree finds is not what the table
+   * has. A search then calls it, and it throws. `estimateCount` is not stopped: an estimate may be behind. A read of
+   * a row the guard does not protect passes it with `trusted`, or through a cursor marked `trusted`.
+   */
+  guard: (() => void) | null = null;
+
+  /** Runs `f` past the guard: a read that is right whatever the guard protects. */
+  trusted<T>(f: () => T): T {
+    const g = this.guard;
+    if (g === null) return f();
+    this.guard = null;
+    try {
+      return f();
+    } finally {
+      this.guard = g;
+    }
+  }
+
   constructor(
     readonly pager: Pager,
     readonly root: number,
@@ -271,6 +291,7 @@ export class BTree {
    * one comparison, where {@link has} searches every level. Such a key is not in the tree, and {@link append} takes it.
    */
   beyondLast(key: Uint8Array): boolean {
+    if (this.guard !== null) this.guard();
     const pager = this.pager;
     let pg = this.root;
     for (let d = 0; ; d++) {
@@ -391,6 +412,7 @@ export class BTree {
    */
   appendIfLast(key: Uint8Array, value: Uint8Array): boolean {
     if (key.length > this.maxKeySize) throw new MisuseError(`key too large (${key.length} > ${this.maxKeySize} bytes)`);
+    if (this.guard !== null) this.guard();
     const pager = this.pager;
     let pg = this.root;
     let d = 0;
@@ -602,6 +624,7 @@ export class BTree {
 
   /** Remove all entries, keeping the (now empty) root page. */
   clear(): void {
+    if (this.guard !== null) this.guard();
     const pager = this.pager;
     const f = pager.get(this.root);
     const children: number[] = [];
@@ -742,6 +765,7 @@ export class BTree {
 
   /** Descend to the leaf that would hold `key` (pinned). Records the path when `record`. */
   private descend(key: Uint8Array, record: boolean): Frame {
+    if (this.guard !== null) this.guard();
     const pager = this.pager;
     let pg = this.root;
     let d = 0;
@@ -772,6 +796,7 @@ export class BTree {
   /** @internal Descend for cursors: leftmost (dir<0) or rightmost (dir>0) leaf, or toward `key`. */
   descendForCursor(key: Uint8Array | null, rightmost: boolean): Frame {
     if (key !== null) return this.descend(key, false);
+    if (this.guard !== null) this.guard();
     const pager = this.pager;
     let pg = this.root;
     for (;;) {
@@ -1325,8 +1350,16 @@ export class BTreeCursor {
   private idx = 0;
   /** The pager's `writes` when the cursor last sought: its leaf is reused by `seekNear` only while nothing changed. */
   private seenWrites = -1;
+  /** Its searches pass the tree's guard (`BTree.guard`): what it reads is right whatever the guard protects. */
+  trusted = false;
 
   constructor(private readonly tree: BTree) {}
+
+  /** The leaf a search starts at, past the tree's guard for a trusted cursor. */
+  private descend(key: Uint8Array | null, rightmost: boolean): Frame {
+    const tree = this.tree;
+    return this.trusted && tree.guard !== null ? tree.trusted(() => tree.descendForCursor(key, rightmost)) : tree.descendForCursor(key, rightmost);
+  }
 
   get valid(): boolean {
     return this.frame !== null;
@@ -1335,7 +1368,7 @@ export class BTreeCursor {
   /** Position at the first key >= `key` (or the first key when omitted). */
   seek(key?: Uint8Array): boolean {
     this.close();
-    const f = this.tree.descendForCursor(key ?? null, false);
+    const f = this.descend(key ?? null, false);
     this.frame = f;
     this.seenWrites = this.tree.pager.writes;
     this.idx = key === undefined ? 0 : this.tree.leafLowerBound(f, key);
@@ -1407,7 +1440,7 @@ export class BTreeCursor {
 
   last(): boolean {
     this.close();
-    const f = this.tree.descendForCursor(null, true);
+    const f = this.descend(null, true);
     this.frame = f;
     this.idx = nCells(f) - 1;
     return this.settleBackward();
