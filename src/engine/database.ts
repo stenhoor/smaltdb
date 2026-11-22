@@ -24,7 +24,8 @@ import type { CollationName } from './plan/types.js';
 import { type Compiled, type Fn, collationName } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, TableAccess, explainAnalyze, explainRows } from './exec/operators.js';
-import { GraphIndexes, endpointIndex } from './exec/graph-index.js';
+import { GraphIndexes, endpointIndex, labelKeyIndex } from './exec/graph-index.js';
+import { type DirectEdge, DirectGraph, type DirectTable, GraphPending, PENDING_READ, type SettleTables } from './exec/graph-pending.js';
 import { searchPaths } from './exec/graph-paths.js';
 import { type ExternalScan, type PhysicalEnv, type PlannedGraph, Planner, type QueryPlan, Registers, type ResultColumnInfo } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
@@ -58,7 +59,7 @@ import {
 } from './external/external.js';
 import { BTree } from './storage/btree.js';
 import { ColumnStore, ColumnStoreAppender, ColumnStoreWriter, ROW_GROUP_ROWS, chunkValue } from './storage/columnar.js';
-import { KeyEncoder, type KeyColumn, ROWID_KEY_SIZE, decodeKey, readRowidKey, rowidSuffixStart, writeRowidKey } from './storage/key-codec.js';
+import { KeyEncoder, type KeyColumn, ROWID_KEY_SIZE, decodeKey, encodeKey, readRowidKey, rowidSuffixStart, writeRowidKey } from './storage/key-codec.js';
 import { compareRanges } from './util/bytes.js';
 import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordEncoder, RecordReader } from './storage/record.js';
@@ -131,6 +132,12 @@ export interface DatabaseOptions extends PagerOptions {
    * indexed, and its plans read the B+trees; 0 turns graph indexes off. Readers hold none.
    */
   graphIndexMem?: number;
+  /**
+   * Whether a property graph's writes land in its index first, its tables written behind (ADR 0042, section 2): in
+   * a database in memory, for a graph whose index is held. Default true; false writes the tables as each statement
+   * runs, as a database with a file does.
+   */
+  graphWriteBehind?: boolean;
 }
 
 const DEFAULT_GRAPH_INDEX_MEM = 256 * 1024 * 1024;
@@ -278,7 +285,32 @@ interface Program {
   nested?: readonly (NestedTypeName | undefined)[] | null;
   /** How its result rows are given (`resultForm` of `columnTypes`), worked out at the first run. */
   form?: ResultForm;
+  /** A plan that writes a property graph: what it writes may land in the graph's index, the tables written behind. */
+  graphWrite?: boolean;
+  /**
+   * It read a table that was behind its graph's index (ADR 0042, section 2): from then on the tables are brought up
+   * to date before it runs, where it would be stopped and run again.
+   */
+  settles?: boolean;
+  /**
+   * The searches it was stopped at that may read their index as it is another time (`PendingRead.search`): the
+   * tables are brought up to date before it runs when one of them may not then.
+   */
+  searches?: (() => boolean)[];
 }
+
+/** Whether the tables are brought up to date before a program runs: it reads them, or a search of its can't read its index as it is. */
+const settlesFirst = (p: Program): boolean => p.settles === true || (p.searches !== undefined && !p.searches.every((s) => s()));
+
+/** A program was stopped at a table that is behind: what it is remembered by. */
+function stoppedAt(p: Program, search: (() => boolean) | null): void {
+  if (search === null) p.settles = true;
+  else if (p.searches === undefined) p.searches = [search];
+  else if (!p.searches.includes(search)) p.searches.push(search);
+}
+
+/** The statement that brings the tables up to date with the graph indexes: it writes, and gives nothing. */
+const SETTLE: Program = { regCount: 0, readonly: false, columns: [], columnTypes: [] };
 
 let graphCheck: boolean | undefined;
 /**
@@ -404,6 +436,7 @@ export class Database implements FunctionContext {
     this.spill = new SpillArea(spillFile?.file ?? null, options.workMem ?? DEFAULT_WORK_MEM, spillFile?.release ?? null);
     this.mem = file === null ? null : Pager.openMemory({ pageSize: this.pager.pageSize });
     this.cacheSize = options.statementCacheSize ?? 64;
+    this.writeBehind = file === null && !reader && options.graphWriteBehind !== false;
     this.graphIndexes = new GraphIndexes(
       {
         schemaVersion: () => this.schemaVersion,
@@ -520,7 +553,8 @@ export class Database implements FunctionContext {
    * built three times a run).
    */
   changeCount(): number {
-    return this.pager.changeCounter;
+    // Rows a graph's index holds ahead of its tables count as the tables' (`rowsNow`): a commit that left some moves it.
+    return this.pager.changeCounter + this.pending.commits;
   }
 
   /** @internal The same for the memory store (TEMP tables); -1 where there is none. */
@@ -563,26 +597,31 @@ export class Database implements FunctionContext {
     beginStatement: (): void => {
       this.pager.beginStatement();
       this.mem?.beginStatement();
+      this.pending.begin();
     },
     commitStatement: (): void => {
       this.pager.commitStatement();
       this.mem?.commitStatement();
+      this.pending.release(this.pending.depth);
     },
     rollbackStatement: (): void => {
       this.pager.rollbackStatement();
       this.mem?.rollbackStatement();
       this.dropColumnarCaches();
+      this.pendingRolledBack(this.pending.rollbackTo(this.pending.depth, false));
       this.graphIndexes.rolledBack();
     },
     commit: (): void => {
       this.pager.commit();
       this.mem?.commit();
+      this.pending.commit();
       this.graphIndexes.committed();
     },
     rollback: (): void => {
       this.pager.rollback();
       this.mem?.rollback();
       this.dropColumnarCaches();
+      this.pendingRolledBack(this.pending.rollback());
       this.graphIndexes.rolledBack();
     },
     releaseAllPins: (): void => {
@@ -592,16 +631,19 @@ export class Database implements FunctionContext {
     beginSavepoint: (): number => {
       const d = this.pager.beginSavepoint();
       this.mem?.beginSavepoint();
+      this.pending.begin();
       return d;
     },
     releaseSavepoint: (d: number): void => {
       this.pager.releaseSavepoint(d);
       this.mem?.releaseSavepoint(d);
+      this.pending.release(d);
     },
     rollbackToSavepoint: (d: number, keep: boolean): void => {
       this.pager.rollbackToSavepoint(d, keep);
       this.mem?.rollbackToSavepoint(d, keep);
       this.dropColumnarCaches();
+      this.pendingRolledBack(this.pending.rollbackTo(d, keep));
       this.graphIndexes.rolledBack();
     },
   };
@@ -1028,6 +1070,11 @@ export class Database implements FunctionContext {
 
   /** Writer for user DML: deletions it makes (DELETE, REPLACE conflicts) run foreign-key processing. */
   private writerFor(table: TableSchema): TableWriter {
+    // A node table that a graph's writes into its index need empty is written: they are asked again.
+    if (this.directWatched.size > 0 && this.directWatched.has(table)) {
+      this.directs.clear();
+      this.directWatched.clear();
+    }
     this.touchTable(table);
     const c = table.columnar;
     // Row tables keep one writer per schema object, reused by later statements (its encoders and buffers cost
@@ -1179,6 +1226,301 @@ export class Database implements FunctionContext {
     return this.graphIndexes;
   }
 
+  // ---------------------------------------------------------------- a graph's writes into its index (ADR 0042, section 2)
+
+  /** The rows property graphs' indexes hold ahead of their tables (exec/graph-pending.ts). */
+  private readonly pending = new GraphPending();
+  /** Whether graphs' writes may land in their indexes: a database in memory, unless it was opened without. */
+  private readonly writeBehind: boolean;
+  /** Each graph's writes into its index, or null where they go to its tables: by name in lower case, for a schema. */
+  private readonly directs = new Map<string, { version: number; d: DirectGraph | null }>();
+  /** The node tables those writes need empty: a write to one asks again (`writerFor`). */
+  private readonly directWatched = new Set<TableSchema>();
+  /** Above zero while a statement that writes runs: the tables can be brought up to date inside it. */
+  private writing = 0;
+  /** A rollback left the log another than the indexes took it for: what is left of it is to be written (`recoverPending`). */
+  private pendingRecover = false;
+  /** @internal SMALT_GRAPH_INDEX_CHECK for this database (tests turn it off to leave rows ahead of the tables). */
+  graphChecks = graphCheckOn();
+
+  /** @internal The rows graph indexes hold ahead of their tables, for tests and benchmarks. */
+  get graphPendingState(): GraphPending {
+    return this.pending;
+  }
+
+  /** @internal Whether a graph's index holds rows its tables have not yet. */
+  get behind(): boolean {
+    return this.pending.any;
+  }
+
+  /**
+   * A graph's writes into its index, or null where they go to its tables as the statement runs. Asked for every
+   * write: an index that was dropped, or let its property maps go, is not written into.
+   */
+  private directGraph(name: string): DirectGraph | null {
+    if (!this.writeBehind || this.graphIndexes.suspended) return null;
+    const key = name.toLowerCase();
+    const have = this.directs.get(key);
+    if (have !== undefined && have.version === this.schemaVersion && (have.d === null || have.d.valid)) return have.d;
+    // Another schema, or another index: what the one before took is written first.
+    this.settle();
+    const d = this.makeDirect(key);
+    this.directs.set(key, { version: this.schemaVersion, d });
+    return d;
+  }
+
+  /**
+   * What takes a graph's writes into its index, when the graph can be written so: its index is held, with its label
+   * sets and the property maps of its tables, and its tables are the plain ones a graph is made with. That is: a node
+   * table of an id and props, the label index with its unique index, edge tables of a start, an end and props or
+   * none, and other node tables with no rows; no history, no copies, no foreign key, no check, no unique index but
+   * the label index's, no index but on columns or on a key of props; no table in another graph; and no materialized
+   * view in the database (one may read a table and is not told of rows its table has not).
+   */
+  private makeDirect(key: string): DirectGraph | null {
+    const def = this.graphs.get(key)?.graph;
+    if (!def || def.history !== undefined || def.nodes.some((n) => n.copy) || this.matviewTables().length > 0) return null;
+    let layout: GraphLayout;
+    try {
+      layout = this.graphLayout(def.name);
+    } catch {
+      return null;
+    }
+    const get = (n: string): TableSchema | undefined => this.tables.get(n.toLowerCase());
+    const nodeT = get(layout.nodes.table);
+    const labelT = get(layout.labels.table);
+    const edgeTs = def.edges.map((e) => get(e.table));
+    const others = def.nodes.map((n) => get(n.table)).filter((t) => t !== nodeT);
+    if (!nodeT || !labelT || edgeTs.includes(undefined) || others.includes(undefined)) return null;
+    const all = [nodeT, labelT, ...(edgeTs as TableSchema[]), ...(others as TableSchema[])];
+    if (new Set(all).size !== all.length) return null;
+    this.fk.sync(this.schemaVersion);
+    for (const t of all) {
+      if (t.columnar || t.temp || t.history || t.matview || t.system || t.checks.length > 0 || t.foreignKeys.length > 0 || this.fk.involved(t)) return null;
+    }
+    const names = new Set(all.map((t) => t.name.toLowerCase()));
+    for (const [k, other] of this.graphs) {
+      if (k === key) continue;
+      const g = other.graph;
+      if ([...g.nodes.map((n) => n.table), ...g.edges.map((e) => e.table), ...(g.labels ? [g.labels.table] : [])].some((n) => names.has(n.toLowerCase()))) return null;
+    }
+    // An index on columns, or on a key of a map (`map_get(props, 'k')`, which gives a value or NULL for any map): its
+    // keys are computed when the tables are written, and that must not fail.
+    const plain = (t: TableSchema, unique?: IndexSchema): boolean =>
+      t.indexes.every((x) => (x === unique || !x.unique) && !x.where && x.columns.every((c) => c.column >= 0 || (c.expr?.expr?.k === 'call' && c.expr.expr.fn === 'map_get' && c.expr.expr.args.length === 2 && c.expr.expr.args[1]!.k === 'lit')));
+    if (nodeT.columns.length !== 2 || nodeT.rowidAlias !== layout.nodes.id || nodeT.columns[layout.nodes.props]!.type !== 'MAP' || !plain(nodeT)) return null;
+    const unique = labelKeyIndex(labelT, layout.labels.node, layout.labels.label);
+    if (labelT.columns.length !== 2 || labelT.rowidAlias >= 0 || !unique || !plain(labelT, unique)) return null;
+    for (const t of others as TableSchema[]) {
+      const c = this.tree(t.rootPage).cursor();
+      try {
+        if (c.first()) return null;
+      } finally {
+        c.close();
+      }
+    }
+    // The index, built now if it isn't: with its label sets and the tables' property maps.
+    const ix = this.graphIndexes;
+    const labelRole = ix.labelRolesOf(labelT)?.find((r) => r.graph.name.toLowerCase() === key);
+    if (!labelRole) return null;
+    const g = ix.open(labelRole.graph);
+    if (g === null || g.labels === null || g.propsOff) return null;
+    const mapsOf = (t: TableSchema) => {
+      const role = ix.propRolesOf(t)?.find((r) => r.graph === g);
+      return role ? ix.propsOf(role) : null;
+    };
+    const trees = (t: TableSchema): BTree[] => [this.tree(t.rootPage), ...t.indexes.map((x) => this.tree(x.rootPage))];
+    // A key of an index on props holds a value of the map and the rowid: props this long have no value that doesn't fit.
+    const keyRoom = (ts: readonly BTree[]): number => (ts.length > 1 ? Math.min(...ts.slice(1).map((x) => x.maxKeySize)) - 64 : Infinity);
+    const part = (t: TableSchema, props: number, maps: DirectTable['maps']): DirectTable => {
+      const ts = trees(t);
+      return { table: t, trees: ts, reader: new RecordReader(t.layout, t.recordDefaults), props, maps, maxProps: t.indexes.some((x) => x.columns.some((c) => c.column < 0)) ? keyRoom(ts) : Infinity };
+    };
+    const nodeMaps = mapsOf(nodeT);
+    if (nodeMaps === null) return null;
+    const edges: DirectEdge[] = [];
+    for (const [i, e] of def.edges.entries()) {
+      const t = edgeTs[i]!;
+      const start = findColumn(t, e.start);
+      const end = findColumn(t, e.end);
+      const props = e.props === undefined ? -1 : findColumn(t, e.props);
+      const role = ix.rolesOf(t)?.find((r) => r.graph === g);
+      if (!role || role.type !== i || role.start !== start || role.end !== end) return null;
+      if (t.columns.length !== (props < 0 ? 2 : 3) || t.rowidAlias >= 0 || !plain(t) || (props >= 0 && t.columns[props]!.type !== 'MAP')) return null;
+      const maps = props < 0 ? null : mapsOf(t);
+      if (props >= 0 && maps === null) return null;
+      edges.push({ ...part(t, props, maps), start, end });
+    }
+    const labelTrees = trees(labelT);
+    for (const t of others as TableSchema[]) this.directWatched.add(t);
+    return new DirectGraph(key, def.name, g, part(nodeT, layout.nodes.props, nodeMaps), { table: labelT, trees: labelTrees, node: layout.labels.node, maxLabel: Math.floor(keyRoom(labelTrees) / 4) }, edges, this.pending);
+  }
+
+  /**
+   * Writes the rows graph indexes hold ahead of their tables, inside the statement or transaction that is running:
+   * through the tables' writers, with the indexes and the graphs' rules not told (they have them already).
+   */
+  private settle(): void {
+    if (!this.pending.any) return;
+    const ix = this.graphIndexes;
+    const taken = this.writersTaken.length;
+    ix.muted = true;
+    this.graphRules.muted = true;
+    // The writers are the tables' own, as for a statement's rows.
+    this.executeDepth++;
+    for (const w of this.settleWriters.values()) w.fresh();
+    try {
+      this.pending.settle((graph) => this.settleTables(graph));
+    } finally {
+      ix.muted = false;
+      this.graphRules.muted = false;
+      this.executeDepth--;
+      while (this.writersTaken.length > taken) this.writersBusy.delete(this.writersTaken.pop()!);
+    }
+    // An index that grew past its limit while it could not be let go is held to it now.
+    for (const e of this.directs.values()) if (e.d !== null) ix.settled(e.d.index);
+  }
+
+  /**
+   * @internal Brings the tables up to date as a statement of its own, before a statement that reads them. Where
+   * another statement's cursor is open nothing can be written: that statement is the one to stop and run again.
+   */
+  settleNow(): void {
+    if (!this.pending.any) return;
+    if (this.activeCursors.size > 0) {
+      PENDING_READ.search = null;
+      throw PENDING_READ;
+    }
+    this.execute(SETTLE, () => undefined);
+  }
+
+  /** Whether an index that holds rows ahead of its tables is over its limit. */
+  private pendingOver(): boolean {
+    for (const e of this.directs.values()) if (e.d !== null && e.d.index.pinned && this.graphIndexes.over(e.d.index)) return true;
+    return false;
+  }
+
+  /** A rollback took entries from the log, or undid what was written of it: the indexes that took them hold what it has not. */
+  private pendingRolledBack(changed: boolean): void {
+    if (!changed) return;
+    // They are dropped with the rollback, and built again from the tables at their next use.
+    for (const e of this.directs.values()) if (e.d !== null) e.d.index.dirty = true;
+    this.pendingRecover = true;
+  }
+
+  /**
+   * After such a rollback, once the schema is loaded again: what is left of the log (rows of earlier commits, or of
+   * the open transaction before the savepoint) is written to the tables, which the indexes are built again from.
+   */
+  private recoverPending(): void {
+    if (!this.pendingRecover) return;
+    if (this.pending.any) {
+      // Nothing is written under an open cursor: what is left waits for the next statement (`executeInner`).
+      if (this.activeCursors.size > 0) return;
+      this.pendingRecover = false;
+      if (this.autocommit) this.execute(SETTLE, () => undefined);
+      else this.settle();
+    }
+    this.pendingRecover = false;
+  }
+
+  /** Each graph's tables as its index's rows are written to them, for a schema; `fresh` before each use (the writers are a statement's). */
+  private readonly settleWriters = new Map<string, { version: number; tables: SettleTables; fresh: () => void }>();
+
+  /** A graph's tables as its index's rows are written to them (`GraphPending.settle`). */
+  private settleTables(key: string): SettleTables {
+    const have = this.settleWriters.get(key);
+    if (have !== undefined && have.version === this.schemaVersion) return have.tables;
+    const made = this.makeSettleTables(key);
+    this.settleWriters.set(key, { version: this.schemaVersion, ...made });
+    return made.tables;
+  }
+
+  private makeSettleTables(key: string): { tables: SettleTables; fresh: () => void } {
+    const def = this.graphs.get(key)?.graph;
+    if (!def) throw new SmaltError('SMALT_INTERNAL', `no property graph ${key} for the rows its index holds`);
+    const layout = this.graphLayout(def.name);
+    const table = (n: string): TableSchema => {
+      const t = this.tables.get(n.toLowerCase());
+      if (!t) throw new SmaltError('SMALT_INTERNAL', `property graph ${def.name}: no table ${n} for the rows its index holds`);
+      return t;
+    };
+    const put = (w: TableWriter, row: SqlValue[], rowid: number | bigint): void => {
+      if (w.resolveConflicts(row, rowid, null, undefined)) w.writeRow(row, rowid);
+    };
+    const setProps = (w: TableWriter, column: number, rowid: number, props: Uint8Array): void => {
+      const old = w.readRow(rowid);
+      if (old === null) throw new SmaltError('SMALT_INTERNAL', `property graph ${def.name}: row ${rowid} of ${w.table.name}, whose properties its index holds, is not in the table`);
+      const next = old.slice();
+      next[column] = props;
+      w.updateRow(old, rowid, next, rowid);
+    };
+    const nodeT = table(layout.nodes.table);
+    const labelT = table(layout.labels.table);
+    const unique = labelKeyIndex(labelT, layout.labels.node, layout.labels.label);
+    const uniqueAt = unique ? labelT.indexes.indexOf(unique) : -1;
+    let nodeW: TableWriter | undefined;
+    let labelW: TableWriter | undefined;
+    const labelRow = (node: number, label: string): SqlValue[] => {
+      const row: SqlValue[] = [null, null];
+      row[layout.labels.node] = node;
+      row[layout.labels.label] = label;
+      return row;
+    };
+    let edges: { add(rowid: number, start: number, end: number, props: Uint8Array | null): void; set(rowid: number, props: Uint8Array): void; del(rowid: number): void }[] = [];
+    const fresh = (): void => {
+      nodeW = labelW = undefined;
+      edges = [];
+    };
+    const tables: SettleTables = {
+      node: {
+        add: (id, props) => {
+          const row: SqlValue[] = [null, null];
+          row[layout.nodes.id] = id;
+          row[layout.nodes.props] = props;
+          put((nodeW ??= this.writerFor(nodeT)), row, id);
+        },
+        set: (id, props) => setProps((nodeW ??= this.writerFor(nodeT)), layout.nodes.props, id, props),
+        del: (id) => void (nodeW ??= this.writerFor(nodeT)).deleteRow(id),
+      },
+      label: {
+        add: (node, label) => {
+          const w = (labelW ??= this.writerFor(labelT));
+          put(w, labelRow(node, label), w.newRowid());
+        },
+        del: (node, label) => {
+          const w = (labelW ??= this.writerFor(labelT));
+          const rowid = uniqueAt < 0 ? null : w.conflictOn(uniqueAt, labelRow(node, label), 0, null);
+          if (rowid !== null) w.deleteRow(rowid);
+        },
+      },
+      edge: (at) => {
+        let e = edges[at];
+        if (e === undefined) {
+          const d = def.edges[at]!;
+          const t = table(d.table);
+          const start = findColumn(t, d.start);
+          const end = findColumn(t, d.end);
+          const props = d.props === undefined ? -1 : findColumn(t, d.props);
+          const w = this.writerFor(t);
+          e = edges[at] = {
+            add: (rowid, s, f, map) => {
+              const row: SqlValue[] = new Array(t.columns.length).fill(null);
+              row[start] = s;
+              row[end] = f;
+              if (props >= 0) row[props] = map;
+              put(w, row, rowid);
+            },
+            set: (rowid, map) => setProps(w, props, rowid, map),
+            del: (rowid) => void w.deleteRow(rowid),
+          };
+        }
+        return e;
+      },
+    };
+    return { tables, fresh };
+  }
+
   /** A property graph as the planner reads it for `relationships` (PhysicalEnv.graph). */
   private plannedGraph(name: string): PlannedGraph | undefined {
     const g = this.graphs.get(name.toLowerCase())?.graph;
@@ -1221,6 +1563,42 @@ export class Database implements FunctionContext {
     if (!role) return undefined;
     const ix = this.graphIndexes;
     return { column: role.column, maps: () => ix.propsOf(role) };
+  }
+
+  /**
+   * For an index on one key of a node table's props, and no more (`map_get(props, 'k')`), in a database whose
+   * graphs' writes may land in their indexes: whether a search of it for a value may read it and the table as they
+   * are (PhysicalEnv.graphAhead). True while the table is the node table of a graph written so and every node its
+   * index holds ahead of the table has under that key what its row in the table has (`DirectGraph.keyClear`).
+   */
+  private graphAhead(t: TableSchema, idx: IndexSchema): (() => boolean) | undefined {
+    if (!this.writeBehind) return undefined;
+    // The key alone: an index with more columns has entries that a change of another of them moves.
+    const first = idx.columns.length === 1 ? idx.columns[0]!.expr?.expr : undefined;
+    if (first === undefined || first.k !== 'call' || first.fn !== 'map_get' || first.args.length !== 2) return undefined;
+    const [of, name] = first.args;
+    const role = this.graphIndexes.propRolesOf(t)?.[0];
+    if (!role || of!.k !== 'col' || of!.index !== role.column || name!.k !== 'lit' || typeof name!.value !== 'string') return undefined;
+    const key = name!.value;
+    const component = encodeKey([key]);
+    const clear = (): boolean => {
+      for (const e of this.directs.values()) {
+        const d = e.d;
+        if (d !== null && d.nodes.table === t) return e.version === this.schemaVersion && d.valid && d.keyClear(key, component);
+      }
+      return false;
+    };
+    const tree = this.tree(idx.rootPage);
+    return () => {
+      if (clear()) return true;
+      if (tree.guard !== null) {
+        // The index is behind for this search now. The statement is stopped here, and remembered by the search:
+        // the tables are written before a later run of it only if the search could not read the index then either.
+        PENDING_READ.search = clear;
+        throw PENDING_READ;
+      }
+      return false;
+    };
   }
 
   /** What the planner needs to read an edge table through its graph's index (PhysicalEnv.graphEdge). */
@@ -1281,6 +1659,25 @@ export class Database implements FunctionContext {
    * the current statement: no transaction handling, and changes() is not affected.
    */
   private internalPlan(plan: PlanOp, params: SqlValue[]): SqlValue[][] | null {
+    for (;;) {
+      let p: Program | undefined;
+      try {
+        p = this.internalProgram(plan);
+        // A plan that writes a table, or one known to read a table that was behind its graph's index: the tables
+        // are brought up to date first (ADR 0042, section 2). Any other is stopped at such a table, and runs again.
+        if (this.pending.any && (p.exec !== undefined || settlesFirst(p))) this.settleInside(null);
+        return this.runInternal(p, params);
+      } catch (e) {
+        if (e !== PENDING_READ || !this.pending.any) throw e;
+        const search = PENDING_READ.search;
+        if (p !== undefined) stoppedAt(p, search);
+        this.settleInside(search);
+      }
+    }
+  }
+
+  /** An internal plan's program, compiled once for a schema and kept by the plan itself. */
+  private internalProgram(plan: PlanOp): Program {
     let c = this.internalPrograms.get(plan);
     if (!c || c.version !== this.schemaVersion) {
       const write = plan.op === 'append' || plan.op === 'update' || plan.op === 'delete';
@@ -1288,7 +1685,20 @@ export class Database implements FunctionContext {
       c = { version: this.schemaVersion, prog: this.compileBound(bound, paramCount(bound), '') };
       this.internalPrograms.set(plan, c);
     }
-    const p = c.prog;
+    return c.prog;
+  }
+
+  /** Brings the tables up to date inside the statement that is running, when it is one that writes. */
+  private settleInside(search: (() => boolean) | null): void {
+    // A statement that only reads can't write here: it is stopped, and starts again once the tables are written.
+    if (this.writing === 0) {
+      PENDING_READ.search = search;
+      throw PENDING_READ;
+    }
+    this.settle();
+  }
+
+  private runInternal(p: Program, params: SqlValue[]): SqlValue[][] | null {
     const regs: SqlValue[] = new Array(p.regCount).fill(null);
     params.forEach((v, i) => (regs[i] = v));
     const saved = [this.lastChanges, this.total, this.lastRowid] as const;
@@ -2320,6 +2730,7 @@ export class Database implements FunctionContext {
       graph: (name) => this.plannedGraph(name),
       graphLabels: (t) => this.graphLabels(t),
       graphProps: (t) => this.graphProps(t),
+      graphAhead: (t, idx) => this.graphAhead(t, idx),
       deletedRows: (t) => this.deletedRowsOf(t),
       funcCtx: this,
       state: this.state,
@@ -2376,6 +2787,7 @@ export class Database implements FunctionContext {
           this.restoreMem(this.memSnapshots[i]);
           this.memSnapshots.length = i + 1;
           this.loadSchema();
+          this.recoverPending();
         } else this.rollbackTransaction();
         break;
       case 'savepoint':
@@ -2465,6 +2877,7 @@ export class Database implements FunctionContext {
     this.autocommit = true;
     // Reload the in-memory schema if DDL was rolled back.
     this.loadSchema();
+    this.recoverPending();
   }
 
   /** @internal Run a write/utility program inside statement + (auto)transaction boundaries. */
@@ -2485,6 +2898,10 @@ export class Database implements FunctionContext {
     this.executeDepth++;
     try {
       return this.executeInner(program, body);
+    } catch (e) {
+      // A statement that writes brings the tables up to date before it reads one: it is not stopped at a table.
+      if (e === PENDING_READ && !program.readonly) throw new SmaltError('SMALT_INTERNAL', 'a statement that writes read a table that is behind its property graph index');
+      throw e;
     } finally {
       // The outermost statement is done: its row writers can serve the next statement.
       if (--this.executeDepth === 0 && this.writersBusy.size > 0) {
@@ -2500,6 +2917,14 @@ export class Database implements FunctionContext {
   private executeInner<T>(program: Program, body: () => T): T {
     if (!program.readonly && this.activeCursors.size > 0) {
       throw new SmaltError('SMALT_BUSY', 'cannot modify the database while a query cursor is open; finish or close it first');
+    }
+    if (this.pendingRecover) {
+      // A rollback while a cursor was open left rows of a property graph to write to its tables (ADR 0042, section
+      // 2), and its index to build again from them: no statement runs before that.
+      if (this.activeCursors.size > 0 && this.pending.any) {
+        throw new SmaltError('SMALT_BUSY', 'a rollback left rows of a property graph to write to its tables, which waits for the open query cursors; finish or close them first');
+      }
+      this.recoverPending();
     }
     this.state.epoch++;
     this.stmtNow = undefined;
@@ -2518,9 +2943,19 @@ export class Database implements FunctionContext {
     this.fk.stmt = 0;
     const deferredBefore = this.fk.deferred;
     this.columnarTouched.clear();
+    this.writing++;
     try {
+      // Anything but a plan that writes a property graph may read or write any table: they are brought up to date
+      // first (ADR 0042, section 2). Such a plan's own reads and writes of the tables do that when they come.
+      if (this.pending.any && program.graphWrite !== true) this.settle();
       result = body();
-      if (graphCheckOn()) this.graphIndexes.check();
+      // An index over its limit with rows its tables have not: they are written, and it is held to its limit.
+      if (program.graphWrite === true && this.pending.any && this.pendingOver()) this.settle();
+      if (this.graphChecks) {
+        // The check compares each index with its tables.
+        this.settle();
+        this.graphIndexes.check();
+      }
       // Columnar tables written by this statement: move full row groups out of the delta store.
       // Needs a way to undo a failure part-way: a statement journal or the autocommit transaction.
       if (this.columnarTouched.size > 0 && (journal || this.autocommit)) this.compactTouched();
@@ -2542,10 +2977,13 @@ export class Database implements FunctionContext {
         this.memDirty = false;
         this.loadSchema();
       } else this.loadSchemaIfChanged();
+      this.recoverPending();
       // A constraint failure under ROLLBACK (INSERT OR ROLLBACK, or ON CONFLICT ROLLBACK) also
       // rolls back the enclosing transaction, as in SQLite.
       if (e instanceof ConstraintError && e.rollback && !this.autocommit) this.rollbackTransaction();
       throw e;
+    } finally {
+      this.writing--;
     }
     if (journal) pager.commitStatement();
     if (this.autocommit) {
@@ -3239,8 +3677,16 @@ export class Database implements FunctionContext {
   /** Estimated rows of a table (columnar: segment rows, plus the delta store for a columnar table). */
   private liveRows(t: TableSchema): number {
     if (t.matview?.storage === 'columnar') return this.storeOf(t).rows;
-    const tree = this.tree(t.rootPage).estimateCount();
+    const tree = this.rowsNow(t.rootPage);
     return t.columnar ? this.storeOf(t, true).rows + tree : tree;
+  }
+
+  /**
+   * @internal Estimated rows of the row table with this root: its tree's, and the rows its graph's index holds that
+   * it has not yet (ADR 0042, section 2).
+   */
+  rowsNow(root: number): number {
+    return Math.max(0, this.tree(root).estimateCount() + this.pending.ahead(root));
   }
 
   /**
@@ -3628,7 +4074,8 @@ export class Database implements FunctionContext {
     const live = tree.estimateCount();
     const hit = this.sampled.get(t);
     if (hit && Math.max(live, 64) < Math.max(hit.at, 64) * 4 && Math.max(hit.at, 64) < Math.max(live, 64) * 4) return hit.stats;
-    const stats = sampleTable(tree, t, live);
+    // A table that is behind its graph's index (ADR 0042, section 2) is sampled as it is: an estimate may be behind.
+    const stats = tree.trusted(() => sampleTable(tree, t, live));
     this.sampled.set(t, { stats, at: live });
     return stats;
   }
@@ -5284,6 +5731,7 @@ export class Database implements FunctionContext {
     const columns = fe.returning ?? [];
     return {
       readonly: false,
+      graphWrite: true,
       rows: (r) => {
         const outer = this.stageOwner;
         this.stageOwner = write;
@@ -5327,11 +5775,15 @@ export class Database implements FunctionContext {
     changes: () => this.internalChanges,
     deleteRows: (table, rowids) => this.deleteRowids(this.targetTable(table), rowids),
     ids: (graph, of) => this.graphIdsOf(graph, of),
+    direct: (graph) => this.directGraph(graph),
     addLabel: (graph, label, table) => {
+      // The graph is another from here on: what its index holds ahead of its tables is written first.
+      this.settle();
       this.newGraphTable(graph, table);
       this.alterPropertyGraph({ op: 'alterPropertyGraph', name: graph, action: { kind: 'addLabel', label, ...(table !== undefined ? { table } : {}) } });
     },
     addType: (graph, type, table) => {
+      this.settle();
       this.newGraphTable(graph, table);
       this.alterPropertyGraph({ op: 'alterPropertyGraph', name: graph, action: { kind: 'addType', type, ...(table !== undefined ? { table } : {}) } });
     },
@@ -5343,6 +5795,8 @@ export class Database implements FunctionContext {
    * that is no rowid names no row.
    */
   private deleteRowids(table: TableSchema, rowids: readonly SqlValue[]): number {
+    // A table is written: what the graph indexes hold ahead of the tables is written first.
+    this.settle();
     // The writers taken are free again when this ends, as after an internal plan.
     const taken = this.writersTaken.length;
     try {
@@ -5432,6 +5886,8 @@ export class Database implements FunctionContext {
     if (!t) throw new SmaltError('SMALT_ERROR', `no such table: ${name}`);
     let max = -1;
     const c = this.tree(t.rootPage).cursor();
+    // A table that is behind its graph's index is read all the same: the ids given since are counted here, not there.
+    c.trusted = true;
     try {
       if (c.last()) {
         c.loadKey();
@@ -6185,7 +6641,15 @@ export abstract class PreparedStatement {
   /** @internal */
   prog(): Program {
     if (this.program === null || this.version !== this.db.schemaVersion || this.statsDrifted(this.program)) {
-      this.program = this.compileProgram();
+      try {
+        this.program = this.compileProgram();
+      } catch (e) {
+        // Planning read a table that is behind its graph's index (ADR 0042, section 2): once the tables are
+        // written, it plans again.
+        if (e !== PENDING_READ) throw e;
+        this.db.settleNow();
+        this.program = this.compileProgram();
+      }
       this.version = this.db.schemaVersion;
       this.checkedAt = this.db.changeCount();
       this.checkedMemAt = this.db.memChangeCount();
@@ -6215,7 +6679,7 @@ export abstract class PreparedStatement {
     this.checkedAt = cc;
     this.checkedMemAt = mc;
     for (const [root, assumed] of p.rowAssumptions) {
-      const now = this.db.tree(root).estimateCount();
+      const now = this.db.rowsNow(root);
       if (Math.max(now, 64) >= Math.max(assumed, 64) * 4 || Math.max(assumed, 64) >= Math.max(now, 64) * 4) return true;
     }
     return false;
@@ -6257,14 +6721,14 @@ export abstract class PreparedStatement {
    * EXPLAIN: its rows are the plan and what one run of it counted and took.
    */
   private checkGraphIndex(rows: SqlValue[][], params: BindParams | undefined): void {
-    if (!graphCheckOn()) return;
+    if (!this.db.graphChecks) return;
     const p = this.progFor(params);
     const ix = this.db.graphIndexState;
     if (!p.readonly || p.graphIndex !== true || ix.suspended || p.bound?.kind === 'explain') return;
     ix.suspended = true;
     const without: SqlValue[][] = [];
     try {
-      const c = this.cursor(params);
+      const c = this.open(params);
       try {
         for (let row = c.next(); row !== null; row = c.next()) without.push(row);
       } finally {
@@ -6290,8 +6754,33 @@ export abstract class PreparedStatement {
     return regs;
   }
 
+  /**
+   * Runs `f`, a run of this statement. Where the statement only reads, and a table it reads is behind its graph's
+   * index (ADR 0042, section 2), it is stopped there: the tables are written, and it runs again. It is remembered as
+   * one that reads the tables, which are then brought up to date before it runs.
+   */
+  private reading<T>(params: BindParams | undefined, f: () => T): T {
+    const db = this.db;
+    if (!db.behind) return f();
+    const p = this.progFor(params);
+    if (!p.readonly) return f();
+    if (settlesFirst(p)) db.settleNow();
+    try {
+      return f();
+    } catch (e) {
+      if (e !== PENDING_READ) throw e;
+      stoppedAt(p, PENDING_READ.search);
+      db.settleNow();
+      return f();
+    }
+  }
+
   /** Execute for side effects. */
   run(params?: BindParams): RunResult {
+    return this.reading(params, () => this.runOnce(params));
+  }
+
+  private runOnce(params?: BindParams): RunResult {
     const p = this.progFor(params);
     const regs = this.registers(p, params);
     if (p.exec) return this.db.execute(p, () => p.exec!(regs));
@@ -6313,15 +6802,17 @@ export abstract class PreparedStatement {
 
   /** Execute and return every row as an array of values. */
   all(params?: BindParams): SqlValue[][] {
-    const c = this.cursor(params);
-    try {
-      const out: SqlValue[][] = [];
-      for (let row = c.next(); row !== null; row = c.next()) out.push(row);
-      this.checkGraphIndex(out, params);
-      return out;
-    } finally {
-      c.close();
-    }
+    return this.reading(params, () => {
+      const c = this.open(params);
+      try {
+        const out: SqlValue[][] = [];
+        for (let row = c.next(); row !== null; row = c.next()) out.push(row);
+        this.checkGraphIndex(out, params);
+        return out;
+      } finally {
+        c.close();
+      }
+    });
   }
 
   /**
@@ -6329,20 +6820,32 @@ export abstract class PreparedStatement {
    * `lastInsertRowid`.
    */
   result(params?: BindParams): QueryResult {
-    const c = this.cursor(params);
-    try {
-      const rows: SqlValue[][] = [];
-      for (let row = c.next(); row !== null; row = c.next()) rows.push(row);
-      this.checkGraphIndex(rows, params);
-      const run = c.run;
-      return run === null ? { columns: c.columns, columnTypes: c.columnTypes, rows } : { columns: c.columns, columnTypes: c.columnTypes, rows, ...run };
-    } finally {
-      c.close();
-    }
+    return this.reading(params, () => {
+      const c = this.open(params);
+      try {
+        const rows: SqlValue[][] = [];
+        for (let row = c.next(); row !== null; row = c.next()) rows.push(row);
+        this.checkGraphIndex(rows, params);
+        const run = c.run;
+        return run === null ? { columns: c.columns, columnTypes: c.columnTypes, rows } : { columns: c.columns, columnTypes: c.columnTypes, rows, ...run };
+      } finally {
+        c.close();
+      }
+    });
   }
 
-  /** Execute and return a cursor over the result rows. */
+  /**
+   * Execute and return a cursor over the result rows. Nothing is written while a cursor is open, so the tables are
+   * brought up to date with the graph indexes before one that reads opens (ADR 0042, section 2): it is not stopped
+   * at a table half way.
+   */
   cursor(params?: BindParams): RowCursor {
+    if (this.db.behind && this.progFor(params).readonly) this.db.settleNow();
+    return this.open(params);
+  }
+
+  /** A cursor over the result rows, for a caller that reads them all before it returns (`reading`). */
+  private open(params?: BindParams): RowCursor {
     const p = this.progFor(params);
     const regs = this.registers(p, params);
     // How its rows are given, worked out once for the program (a cursor is made for every run).
