@@ -4,7 +4,9 @@
  * tables after each write, and a query that reads it is run again without it.
  */
 import { describe, expect, it } from 'vitest';
+import type { TableSchema } from '../src/engine/catalog/schema.js';
 import { Database, type DatabaseOptions } from '../src/engine/database.js';
+import type { GraphIndexes } from '../src/engine/exec/graph-index.js';
 import { plan as p } from '../src/engine/index.js';
 import type { PlanStatementInput } from '../src/engine/plan/statement.js';
 import type { PlanType } from '../src/engine/plan/types.js';
@@ -174,6 +176,97 @@ describe('writes keep the index', () => {
     db.exec('COMMIT');
     expect(db.query('SELECT end FROM knows WHERE start = 7').rows).toEqual([[8], [9], [10], [44]]);
     expect(state(db).builds).toBe(1);
+  });
+});
+
+describe("the graph's rules read the index", () => {
+  /** People with no relationship, or one: 101 knows someone, 102 is known, 103 likes, 104 is liked, 105 likes itself, 106 knows and is liked. */
+  const more = (db: Database): Database => {
+    db.exec("INSERT INTO person SELECT 100 + value, 'q' FROM (SELECT 0 AS value UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6)");
+    db.exec('INSERT INTO knows VALUES (101, 0, 1), (0, 102, 1), (106, 0, 1); INSERT INTO likes VALUES (103, 0), (0, 104), (105, 105), (0, 106)');
+    return db;
+  };
+  const refusal = (db: Database, sql: string): string => {
+    try {
+      db.exec(sql);
+    } catch (e) {
+      return /relationships in (\S+) refer to it/.exec((e as Error).message)?.[1] ?? (e as Error).message;
+    }
+    return 'done';
+  };
+  /** What deleting each of those people gives: the table and end that refuses it, or done. */
+  const deletes = (db: Database): string[] => [101, 102, 103, 104, 105, 106, 100].map((id) => refusal(db, `DELETE FROM person WHERE id = ${id}`));
+  const WANT = ['knows.start', 'knows.end', 'likes.start', 'likes.end', 'likes.start', 'knows.start', 'done'];
+
+  it('a node with a relationship is refused as the tables refuse it: the first table and end, in the graph\'s order', () => {
+    const built = more(open());
+    built.query('SELECT end FROM knows WHERE start = 7');
+    expect(state(built).built).toBe(true);
+    expect(deletes(built)).toEqual(WANT);
+    expect(state(built)).toMatchObject({ built: true, builds: 1 });
+    // Changing a node's id is refused the same way.
+    expect([101, 104, 105].map((id) => refusal(built, `UPDATE person SET id = id + 1000 WHERE id = ${id}`))).toEqual(['knows.start', 'likes.end', 'likes.start']);
+    // With graph indexes off the tables are asked; with none built yet, the first node asked about builds it.
+    expect(deletes(more(open({ graphIndexMem: 0 })))).toEqual(WANT);
+    const fresh = more(open());
+    expect(state(fresh).built).toBe(false);
+    expect(deletes(fresh)).toEqual(WANT);
+    expect(state(fresh)).toMatchObject({ built: true, builds: 1 });
+  });
+
+  it('follows what the statement and the transaction wrote, and what a rollback undid', () => {
+    const db = more(open());
+    db.query('SELECT end FROM knows WHERE start = 7');
+    // Its relationships deleted, a node goes; a relationship given to a free node holds it.
+    db.exec('DELETE FROM knows WHERE start = 101');
+    expect(refusal(db, 'DELETE FROM person WHERE id = 101')).toBe('done');
+    db.exec('INSERT INTO likes VALUES (0, 100)');
+    expect(refusal(db, 'DELETE FROM person WHERE id = 100')).toBe('likes.end');
+    // In a transaction, and after it is undone: the index is dropped, and the tables refuse until it is built again.
+    db.exec('BEGIN; DELETE FROM likes WHERE end = 100; DELETE FROM knows WHERE end = 102');
+    expect([refusal(db, 'DELETE FROM person WHERE id = 100'), refusal(db, 'DELETE FROM person WHERE id = 102')]).toEqual(['done', 'done']);
+    db.exec('ROLLBACK');
+    expect(state(db).built).toBe(false);
+    expect([refusal(db, 'DELETE FROM person WHERE id = 100'), refusal(db, 'DELETE FROM person WHERE id = 102')]).toEqual(['likes.end', 'knows.end']);
+    db.query('SELECT end FROM knows WHERE start = 7');
+    expect([refusal(db, 'DELETE FROM person WHERE id = 100'), refusal(db, 'DELETE FROM person WHERE id = 102')]).toEqual(['likes.end', 'knows.end']);
+    // One statement that deletes a node's relationships and then the node, row by row.
+    db.exec('DELETE FROM likes WHERE start = 105; DELETE FROM person WHERE id = 105');
+    expect(db.query('SELECT count(*) FROM person WHERE id >= 100').rows).toEqual([[5]]);
+    expect(state(db)).toMatchObject({ built: true, off: null });
+  });
+
+  it('asks the tables about an id the index holds no node for, and in a graph it cannot hold', () => {
+    const db = more(open());
+    db.query('SELECT end FROM knows WHERE start = 7');
+    db.query('INSERT INTO person VALUES (?, ?), (?, ?)', [2 ** 31, 'far', 2n ** 60n, 'further']);
+    expect([refusal(db, `DELETE FROM person WHERE id = ${2 ** 31}`), refusal(db, `DELETE FROM person WHERE id = ${2n ** 60n}`)]).toEqual(['done', 'done']);
+    expect(state(db)).toMatchObject({ built: true, off: null, builds: 1 });
+    // A relationship of a node past 2^31 - 1: the index holds the graph no more, and the tables refuse as before.
+    db.query('INSERT INTO person VALUES (?, ?)', [2 ** 31 + 5, 'far']);
+    db.query('INSERT INTO likes VALUES (?, 0)', [2 ** 31 + 5]);
+    expect(state(db).off).not.toBe(null);
+    expect(deletes(db)).toEqual(WANT);
+    expect(refusal(db, `DELETE FROM person WHERE id = ${2 ** 31 + 5}`)).toBe('likes.start');
+  });
+
+  it("finds a relationship that starts a block of the node's list", () => {
+    // Node 0 starts 1,024 KNOWS and one LIKES: built from the tables, its list is a full block and a block of one.
+    const db = Database.openMemory();
+    db.exec('CREATE TABLE person(id INTEGER PRIMARY KEY); CREATE TABLE knows(start INTEGER, end INTEGER); CREATE TABLE likes(start INTEGER, end INTEGER)');
+    db.exec('CREATE INDEX knows_start ON knows(start, end); CREATE INDEX knows_end ON knows(end, start); CREATE INDEX likes_start ON likes(start, end); CREATE INDEX likes_end ON likes(end, start)');
+    const edges = [
+      { type: 'KNOWS', table: 'knows', start: 'start', end: 'end' },
+      { type: 'LIKES', table: 'likes', start: 'start', end: 'end' },
+    ];
+    schema(db, { op: 'createPropertyGraph', ifNotExists: false, graph: { name: 'big', nodes: [{ label: 'Person', table: 'person', id: 'id' }], edges } });
+    db.exec('WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 1024) INSERT INTO person SELECT i FROM n');
+    db.exec('INSERT INTO knows SELECT 0, id FROM person WHERE id > 0; INSERT INTO likes VALUES (0, 7)');
+    const inside = db as unknown as { graphIndexes: GraphIndexes; tables: Map<string, TableSchema> };
+    const likes = inside.graphIndexes.rolesOf(inside.tables.get('likes')!)![0]!;
+    expect(inside.graphIndexes.connected(likes, true, 0)).toBe(true);
+    expect(state(db)).toMatchObject({ built: true, entries: 1025, builds: 1 });
+    expect([inside.graphIndexes.connected(likes, false, 7), inside.graphIndexes.connected(likes, false, 0), inside.graphIndexes.connected(likes, true, 7)]).toEqual([true, false, false]);
   });
 });
 

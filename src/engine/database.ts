@@ -956,7 +956,7 @@ export class Database implements FunctionContext {
       const cached = e !== undefined && e.version === this.schemaVersion && e.indexes === table.indexes && e.count === table.indexes.length ? e.w : undefined;
       if (cached !== undefined && !this.writersBusy.has(cached)) {
         cached.resetStatement();
-        this.writersBusy.add(cached);
+        this.take(cached);
         return cached;
       }
     }
@@ -970,6 +970,7 @@ export class Database implements FunctionContext {
           }
         })
       : new TableWriter(table, this.pager, (root) => this.tree(root));
+    this.writersMade++;
     w.beforeDelete = (row) => {
       if (this.fk.involved(table)) this.fk.beforeDelete(table, row);
       if (this.graphRules.involved(table)) this.graphRules.beforeDelete(table, row);
@@ -1028,14 +1029,24 @@ export class Database implements FunctionContext {
     if (reuse) {
       const e = this.writers.get(table);
       if (e === undefined || this.writersBusy.has(e.w) === false) this.writers.set(table, { w, version: this.schemaVersion, indexes: table.indexes, count: table.indexes.length });
-      this.writersBusy.add(w);
+      this.take(w);
     }
     return w;
+  }
+
+  /** The running statement takes writer `w`: busy until the statement ends, or the internal plan it runs in. */
+  private take(w: TableWriter): void {
+    this.writersBusy.add(w);
+    this.writersTaken.push(w);
   }
 
   /** Reusable row-table writers (see writerFor), by schema object: DDL replaces the object. */
   private readonly writers = new WeakMap<TableSchema, { w: TableWriter; version: number; indexes: TableSchema['indexes']; count: number }>();
   private readonly writersBusy = new Set<TableWriter>();
+  /** The busy writers in the order they were taken: an internal plan frees the ones it took when it ends. */
+  private readonly writersTaken: TableWriter[] = [];
+  /** Writers made since the database was opened (tests read it: a writer made for every row is the cost this avoids). */
+  private writersMade = 0;
 
   /** Foreign-key enforcement (on by default; PRAGMA foreign_keys = OFF disables it). */
   private readonly fk = new ForeignKeys({
@@ -1053,6 +1064,11 @@ export class Database implements FunctionContext {
     rowExists: (t, rowid) => this.rowExists(t, rowid),
     nextRowid: (t) => this.writerFor(t).newRowid(),
     run: (plan, params) => this.internalPlan(plan, params) ?? [],
+    // Any graph that indexes the table holds its relationships: the first tells.
+    connected: (t, byStart, id) => {
+      const role = this.graphIndexes.rolesOf(t)?.[0];
+      return role === undefined ? undefined : this.graphIndexes.connected(role, byStart, id);
+    },
   });
 
   /** Property graphs' indexes in memory (ADR 0040; exec/graph-index.ts). */
@@ -1176,6 +1192,9 @@ export class Database implements FunctionContext {
     const regs: SqlValue[] = new Array(p.regCount).fill(null);
     params.forEach((v, i) => (regs[i] = v));
     const saved = [this.lastChanges, this.total, this.lastRowid] as const;
+    // The writers the plan takes are free again when it ends: the next run of it, for the statement's next row,
+    // takes them again where it would make its own.
+    const taken = this.writersTaken.length;
     try {
       if (p.exec) {
         this.internalChanges = p.exec(regs).changes;
@@ -1192,6 +1211,7 @@ export class Database implements FunctionContext {
       return out;
     } finally {
       [this.lastChanges, this.total, this.lastRowid] = saved;
+      while (this.writersTaken.length > taken) this.writersBusy.delete(this.writersTaken.pop()!);
     }
   }
 
@@ -2360,7 +2380,10 @@ export class Database implements FunctionContext {
       return this.executeInner(program, body);
     } finally {
       // The outermost statement is done: its row writers can serve the next statement.
-      if (--this.executeDepth === 0 && this.writersBusy.size > 0) this.writersBusy.clear();
+      if (--this.executeDepth === 0 && this.writersBusy.size > 0) {
+        this.writersBusy.clear();
+        this.writersTaken.length = 0;
+      }
     }
   }
 
@@ -5336,7 +5359,7 @@ export class Database implements FunctionContext {
       writer ??= this.writerFor(table);
       writer.resetStatement();
       // Kept across runs: busy for this run too, so a nested write to the table takes another writer.
-      if (this.executeDepth > 0) this.writersBusy.add(writer);
+      if (this.executeDepth > 0) this.take(writer);
       const w = writer;
       let changes = 0;
       let last = this.lastRowid;

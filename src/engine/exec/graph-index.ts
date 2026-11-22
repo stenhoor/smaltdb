@@ -26,7 +26,7 @@ import { decodeSmallRun } from '../storage/key-codec.js';
 import { Collation, type SqlValue } from '../values.js';
 import { GraphLabels } from './graph-labels.js';
 import { GraphProps, holdable } from './graph-props.js';
-import { GraphLists } from './graph-lists.js';
+import { GraphLists, ListCursor } from './graph-lists.js';
 
 export interface GraphIndexHost {
   schemaVersion(): number;
@@ -312,6 +312,21 @@ export class GraphIndexes {
     this.refresh();
     return this.roles.size === 0 ? undefined : this.roles.get(table);
   }
+
+  /**
+   * Whether a node has a relationship in an edge table of an indexed graph, as its start (or as its end), read from
+   * the graph's index, which is built if it isn't. Undefined when the graph isn't indexed, and for an id the index
+   * holds no node for: the table tells.
+   */
+  connected(role: EdgeRole, byStart: boolean, node: number | bigint): boolean | undefined {
+    if (!isId(node)) return undefined;
+    const g = this.open(role.graph);
+    if (g === null) return undefined;
+    const c = this.cursor;
+    (byStart ? g.out! : g.in!).seek(c, node, role.type);
+    return (c.i < c.end || c.more()) && c.a[c.i] === role.type;
+  }
+  private readonly cursor = new ListCursor();
 
   /** The table's roles as the label index of indexed graphs. Undefined for any other table, and with the indexes off. */
   labelRolesOf(table: TableSchema): readonly LabelRole[] | undefined {

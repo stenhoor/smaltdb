@@ -246,6 +246,54 @@ describe("a label's nodes", () => {
     // Opened again, it reads the label from its first node.
     scan.open(r);
     expect([next(), next(), next()]).toEqual([1, 3, 5]);
+    // A label emptied under the scan ends it; given nodes again, it is read from the first of them.
+    for (const node of [1, 3, 5, 7, 34, 39, 63, 70_000, 100_000]) labels.remove('A', node);
+    expect([labels.count('A'), next()]).toEqual([0, null]);
+    for (const node of [40_000, 200_000, 39_999]) labels.add('A', node);
+    scan.open(r);
+    expect([next(), next(), next(), next()]).toEqual([39_999, 40_000, 200_000, null]);
+  });
+
+  it('read the words between the lowest and the highest node of the label, and no other', () => {
+    // The scan over a set whose pages tell which of their words were read.
+    const labels = new GraphLabels();
+    const read = new Set<number>();
+    const told = (page: Uint32Array, at: number): Uint32Array =>
+      new Proxy(page, { get: (t, k) => (typeof k === 'string' && /^\d+$/.test(k) ? (read.add(at * 1024 + Number(k)), t[Number(k)]) : Reflect.get(t, k)) });
+    // And the set tells how many times a page was asked for.
+    let asked = 0;
+    const counted = (pages: (Uint32Array | undefined)[]): (Uint32Array | undefined)[] =>
+      new Proxy(pages, { get: (t, k) => (typeof k === 'string' && /^-?\d+$/.test(k) ? (asked++, t[Number(k)]) : Reflect.get(t, k)) });
+    const source = { setOf: (label: string) => ((set) => set && { ...set, pages: counted(set.pages.map((page, at) => page && told(page, at))), first: set.first, last: set.last })(labels.setOf(label)) };
+    const access = { decode: [0, 0, 1, 1], rowidReg: -1, tableName: 'l' };
+    const unused = { open: () => undefined, next: () => false, close: () => undefined };
+    let label = 'A';
+    const scan = new GraphLabelEntries(access as never, unused as never, () => source as never, { epoch: 1 }, { value: () => label, convert: (v) => v }, 0, 1, 'label');
+    const r: SqlValue[] = [null, null];
+    const all = (of = label): SqlValue[] => {
+      const out: SqlValue[] = [];
+      label = of;
+      read.clear();
+      asked = 0;
+      scan.open(r);
+      while (scan.next()) out.push(r[0]!);
+      return out;
+    };
+    const words = (): number[] => [...read].sort((a, b) => a - b);
+    // Eight nodes at the start of a page: its first word.
+    for (let node = 0; node < 8; node++) labels.add('A', node);
+    expect([all(), words()]).toEqual([[0, 1, 2, 3, 4, 5, 6, 7], [0]]);
+    // Nodes in the middle of a page, over three words.
+    for (const node of [20_008, 20_040, 20_079]) labels.add('B', node);
+    expect([all('B'), words()]).toEqual([[20_008, 20_040, 20_079], [625, 626, 627]]);
+    // The last word of a page and the first of the next; then a node four pages on: the pages between are not there.
+    for (const node of [32_767, 32_768]) labels.add('C', node);
+    expect([all('C'), words()]).toEqual([[32_767, 32_768], [1023, 1024]]);
+    labels.add('C', 5 * 32_768 + 1);
+    expect([all().length, words().length, words()[0], words().at(-1)]).toEqual([3, 1024 + 2, 1023, 5 * 1024]);
+    // A page that is not there is passed in one step: a page is asked for once for each word read, once for each of
+    // the three pages between, and once for each row given and for the end.
+    expect(asked).toBe(1024 + 2 + 3 + 4);
   });
 
   it('are counted in the graph index for the plan, however many they are', () => {
