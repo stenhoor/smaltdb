@@ -326,7 +326,13 @@ export const append = (table: string, input: PlanOp | null, columns: readonly nu
 });
 
 /** For each row of `input`, sets the row of `table` whose rowid is in column `rowid`. */
-export const update = (table: string, input: PlanOp, rowid: number, sets: readonly { column: number; value: PlanExpr }[], options: { db?: 'main' | 'temp'; onConflict?: ConflictAction; returning?: readonly PlanExpr[] } = {}): Op<'update'> => ({
+export const update = (
+  table: string,
+  input: PlanOp,
+  rowid: number,
+  sets: readonly { column: number; value: PlanExpr }[],
+  options: { db?: 'main' | 'temp'; onConflict?: ConflictAction; returning?: readonly PlanExpr[]; from?: boolean } = {},
+): Op<'update'> => ({
   op: 'update',
   table,
   db: options.db ?? 'main',
@@ -334,7 +340,7 @@ export const update = (table: string, input: PlanOp, rowid: number, sets: readon
   input,
   rowid,
   sets,
-  from: false,
+  from: options.from ?? false,
   ...(options.returning ? { returning: options.returning } : {}),
 });
 
@@ -380,15 +386,16 @@ export const graphDelete = (graph: string, input: PlanOp, targets: readonly Grap
 });
 
 /**
- * For each row of `input`: the rows of `match` (which reads the row through `working(id, …)`), or, when it gives
- * none, `nodes` and `relationships` made and `created` in `match`'s columns.
+ * For each row of `input`: the rows of `match` (which reads the row and its number through `working(id, …)`, and gives
+ * the number before its own columns), or, when it gives none, `nodes` and `relationships` made and `created` in the
+ * columns `match` adds.
  */
 export const graphMerge = (
   graph: string,
   id: number,
   input: PlanOp,
   match: PlanOp,
-  make: { nodes?: readonly GraphNewNode[]; relationships?: readonly GraphNewRelationship[]; created: readonly PlanExpr[]; onMatch?: readonly GraphSetItem[]; onCreate?: readonly GraphSetItem[]; tables?: readonly GraphNewTable[] },
+  make: { nodes?: readonly GraphNewNode[]; relationships?: readonly GraphNewRelationship[]; created: readonly PlanExpr[]; onMatch?: readonly GraphSetItem[]; onCreate?: readonly GraphSetItem[]; tables?: readonly GraphNewTable[]; key?: readonly PlanExpr[] },
 ): Op<'graphMerge'> => ({
   op: 'graphMerge',
   graph,
@@ -401,6 +408,7 @@ export const graphMerge = (
   onMatch: make.onMatch ?? [],
   onCreate: make.onCreate ?? [],
   ...(make.tables ? { tables: make.tables } : {}),
+  ...(make.key ? { key: make.key } : {}),
 });
 
 /** `input`'s rows, passed on once all of them are read. */

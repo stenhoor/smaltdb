@@ -5233,6 +5233,7 @@ export class Database implements FunctionContext {
       return this.internalPlan(plan, params as SqlValue[]);
     },
     changes: () => this.internalChanges,
+    deleteRows: (table, rowids) => this.deleteRowids(this.targetTable(table), rowids),
     ids: (graph, of) => this.graphIdsOf(graph, of),
     addLabel: (graph, label, table) => {
       this.newGraphTable(graph, table);
@@ -5243,6 +5244,27 @@ export class Database implements FunctionContext {
       this.alterPropertyGraph({ op: 'alterPropertyGraph', name: graph, action: { kind: 'addType', type, ...(table !== undefined ? { table } : {}) } });
     },
   };
+
+  /**
+   * Deletes the rows of `table` with these rowids inside the running statement, as a DELETE of them does once it
+   * has read which rows it deletes (`compileDelete`): each through the table's writer. How many were there; a value
+   * that is no rowid names no row.
+   */
+  private deleteRowids(table: TableSchema, rowids: readonly SqlValue[]): number {
+    // The writers taken are free again when this ends, as after an internal plan.
+    const taken = this.writersTaken.length;
+    try {
+      const writer = this.writerFor(table);
+      let n = 0;
+      for (const rowid of rowids) {
+        if (typeof rowid !== 'bigint' && !(typeof rowid === 'number' && Number.isInteger(rowid))) continue;
+        if (writer.deleteRow(rowid)) n++;
+      }
+      return n;
+    } finally {
+      while (this.writersTaken.length > taken) this.writersBusy.delete(this.writersTaken.pop()!);
+    }
+  }
 
   private readonly graphLayouts = new WeakMap<PropertyGraphDef, GraphLayout>();
 
@@ -5272,7 +5294,6 @@ export class Database implements FunctionContext {
         return [fold(e.type), { table: t.name, start: findColumn(t, e.start), end: findColumn(t, e.end), props: e.props === undefined ? -1 : findColumn(t, e.props) }] as const;
       }),
     );
-    const byTable = new Map([...edges.values()].map((e) => [e.table.toLowerCase(), e]));
     const nodes = table(home.table);
     const index = table(g.labels.table);
     layout = {
@@ -5283,7 +5304,7 @@ export class Database implements FunctionContext {
       edgeTables: g.edges.map((e) => table(e.table).name),
       label: (l) => labels.get(fold(l)),
       edge: (t) => edges.get(fold(t)),
-      edgeColumns: (t) => byTable.get(t.toLowerCase()),
+      history: g.history !== undefined,
     };
     this.graphLayouts.set(g, layout);
     return layout;

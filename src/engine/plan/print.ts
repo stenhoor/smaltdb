@@ -142,7 +142,7 @@ export function printPlan(op: PlanOp, depth = 0): string {
     case 'graphDelete':
       return `${pad}graphDelete ${op.graph}${op.detach ? ' detach' : ''} [${op.targets.map(deleteTarget).join(', ')}]\n${sub(op.input)}`;
     case 'graphMerge':
-      return `${pad}graphMerge #${op.id} ${op.graph} nodes ${op.nodes.length} relationships ${op.relationships.length} created [${list(op.created)}] onMatch [${op.onMatch.map(setItem).join(', ')}] onCreate [${op.onCreate.map(setItem).join(', ')}]\n${sub(op.input)}\n${sub(op.match)}`;
+      return `${pad}graphMerge #${op.id} ${op.graph} nodes ${op.nodes.length} relationships ${op.relationships.length} created [${list(op.created)}] onMatch [${op.onMatch.map(setItem).join(', ')}] onCreate [${op.onCreate.map(setItem).join(', ')}]${op.key ? ` key [${list(op.key)}]` : ''}\n${sub(op.input)}\n${sub(op.match)}`;
     case 'eager':
       return `${pad}eager\n${sub(op.input)}`;
     case 'window': {

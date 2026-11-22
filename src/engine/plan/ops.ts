@@ -486,12 +486,26 @@ export type PlanOp = OpMeaning & (
    */
   | { readonly op: 'graphDelete'; readonly graph: string; readonly input: PlanOp; readonly targets: readonly GraphDeleteTarget[]; readonly detach: boolean }
   /**
-   * For each row of `input`, runs `match`, a plan that reads the graph for the row: inside it, a `working` operation
-   * with this operation's `id` gives the row, as a relation of that one row. If `match` gives rows, each is passed on
-   * after `onMatch` is applied to it. If it gives none, the `nodes` and `relationships` are made as a `graphCreate`
-   * makes them, `created` gives the columns `match` would have (expressions over the input's columns, then the new
-   * nodes' ids, then the new relationships' rowids), and the row is passed on after `onCreate`. A row sees what
-   * earlier rows made. Outputs the input's columns, then `match`'s; `onMatch` and `onCreate` read that row.
+   * For each row of `input`, the rows `match` gives for it or, when it gives none, the row with what the operation
+   * makes for it.
+   *
+   * `match` is a plan that reads the graph for rows of the input: inside it, a `working` operation with this
+   * operation's `id` gives them, each the input's columns and then the row's number (an int), which says whose a row
+   * of `match` is. For each row `working` holds, `match` gives a row for each of its matches: the row's number, then
+   * the columns `match` adds. The engine gives it one row, or several at once (`key`).
+   *
+   * If `match` gives rows for an input row, each is passed on after `onMatch` is applied to it. If it gives none, the
+   * `nodes` and `relationships` are made as a `graphCreate` makes them, `created` gives the columns `match` adds
+   * (expressions over the input's columns, then the new nodes' ids, then the new relationships' rowids), and the row
+   * is passed on after `onCreate`. A row sees what earlier rows made. Outputs the input's columns, then those `match`
+   * adds; `onMatch` and `onCreate` read that row.
+   *
+   * `key` is what lets the engine match all the rows at once, before it makes anything. The plan gives it where this
+   * holds of expressions over the input's row: two rows that have the same values of them have the same matches, and
+   * a row finds what an earlier row made exactly when it has that row's values, `match` then adding what `created`
+   * gave that row. Of the rows that match nothing, the first with each key's values then makes, and the later ones
+   * with those values are passed on with what it made. A NULL among a row's values says nothing of the row: with
+   * one, as without a `key`, each row is matched when its turn comes.
    */
   | {
       readonly op: 'graphMerge';
@@ -505,6 +519,7 @@ export type PlanOp = OpMeaning & (
       readonly onMatch: readonly GraphSetItem[];
       readonly onCreate: readonly GraphSetItem[];
       readonly tables?: readonly GraphNewTable[];
+      readonly key?: readonly PlanExpr[];
     }
   /**
    * Passes its input's rows on once it has read them all: what is below it is done before what is above it starts

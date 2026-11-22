@@ -77,7 +77,8 @@ export function outputTypes(op: PlanOp, tableTypes: TableTypes): PlanType[] {
     case 'eager':
       return outputTypes(op.input, tableTypes);
     case 'graphMerge':
-      return [...outputTypes(op.input, tableTypes), ...outputTypes(op.match, tableTypes)];
+      // The match gives its row's number, then its own columns.
+      return [...outputTypes(op.input, tableTypes), ...outputTypes(op.match, tableTypes).slice(1)];
     default: {
       // Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
       const unhandled: never = op;

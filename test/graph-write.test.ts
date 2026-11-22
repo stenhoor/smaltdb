@@ -157,26 +157,69 @@ describe('graphDelete', () => {
 });
 
 describe('graphMerge', () => {
-  it('passes on what matches, or makes it, and a row sees what earlier rows made', () => {
-    const db = graph();
-    // For each name: the nodes that have it (their ids), or a new node with it.
-    const names = p.values([[p.lit('Ada')], [p.lit('Bo')], [p.lit('Ada')]], ['text']);
-    const row = p.working(7, ['text']);
+  /** For each name: the nodes that have it (their ids), or a new node with it. */
+  const byName = (names: PlanOp, more: { onCreate?: boolean; key?: boolean } = {}): PlanOp => {
+    // The row (its name, then its number), then a node: its id and its properties.
+    const row = p.working(7, ['text', 'int']);
     const match = p.project(
-      p.filter(p.join('cross', row, p.scan('node', [0, 1])), p.call('cmp_eq', [p.call('map_get', [p.col(0, 2, M), p.lit('name')], 'any'), any(p.col(0, 0, 'text'))], 'bool')),
-      [p.col(0, 1, 'int')],
+      p.filter(p.join('cross', row, p.scan('node', [0, 1])), p.call('cmp_eq', [p.call('map_get', [p.col(0, 3, M), p.lit('name')], 'any'), any(p.col(0, 0, 'text'))], 'bool')),
+      [p.col(0, 1, 'int'), p.col(0, 2, 'int')],
     );
-    const merge = p.graphMerge('g', 7, names, match, {
+    return p.graphMerge('g', 7, names, match, {
       nodes: [{ labels: ['Person'], props: map('name', any(p.col(0, 0, 'text'))) }],
       created: [p.col(0, 1, 'int')],
-      onCreate: [{ node: p.col(0, 1, 'int'), kind: 'property', key: 'made', value: p.lit(1) }],
-      onMatch: [{ node: p.col(0, 1, 'int'), kind: 'property', key: 'seen', value: p.lit(1) }],
+      ...(more.onCreate
+        ? {
+            onCreate: [{ node: p.col(0, 1, 'int'), kind: 'property', key: 'made', value: p.lit(1) }],
+            onMatch: [{ node: p.col(0, 1, 'int'), kind: 'property', key: 'seen', value: p.lit(1) }],
+          }
+        : {}),
+      ...(more.key ? { key: [p.col(0, 0, 'text')] } : {}),
     });
-    const r = write(db, merge);
+  };
+  const named = (...names: (string | null)[]): PlanOp => p.values(names.map((n) => [p.lit(n, 'text')]), ['text']);
+
+  it('passes on what matches, or makes it, and a row sees what earlier rows made', () => {
+    const db = graph();
+    const r = write(db, byName(named('Ada', 'Bo', 'Ada'), { onCreate: true }));
     // The third row finds the node the first made.
     expect(r.rows).toEqual([['Ada', 0], ['Bo', 1], ['Ada', 0]]);
     expect(r.graph).toEqual(counts({ nodesCreated: 2, labelsAdded: 2, propertiesSet: 5 }));
     expect(nodes(db)).toEqual([[0, { made: 1, name: 'Ada', seen: 1 }], [1, { made: 1, name: 'Bo' }]]);
+  });
+
+  it('gives the same with a key, all its rows matched at once, as without', () => {
+    const run = (key: boolean): unknown[] => {
+      const db = graph();
+      write(db, p.graphCreate('g', one, [{ labels: [], props: map('name', p.lit('Cy')) }, { labels: [], props: map('name', p.lit('Cy')) }]));
+      // Two nodes are named Cy already: a row with that name is passed on once for each.
+      const r = write(db, byName(named('Ada', 'Cy', 'Bo', 'Ada', 'Bo', 'Di'), { key }));
+      return [r.rows, r.graph, nodes(db), labels(db)];
+    };
+    const rows = [['Ada', 2], ['Cy', 0], ['Cy', 1], ['Bo', 3], ['Ada', 2], ['Bo', 3], ['Di', 4]];
+    const made = [[0, { name: 'Cy' }], [1, { name: 'Cy' }], [2, { name: 'Ada' }], [3, { name: 'Bo' }], [4, { name: 'Di' }]];
+    const expected = [rows, counts({ nodesCreated: 3, labelsAdded: 3, propertiesSet: 3 }), made, [[2, 'Person'], [3, 'Person'], [4, 'Person']]];
+    expect(run(false)).toEqual(expected);
+    expect(run(true)).toEqual(expected);
+  });
+
+  it('with a NULL in a key, matches each row when its turn comes', () => {
+    const db = graph();
+    // A name that is NULL equals none: each such row makes a node, as it does without a key.
+    const r = write(db, byName(named('Ada', null, null, 'Ada'), { key: true }));
+    expect(r.rows).toEqual([['Ada', 0], [null, 1], [null, 2], ['Ada', 0]]);
+    expect(nodes(db)).toEqual([[0, { name: 'Ada' }], [1, {}], [2, {}]]);
+  });
+
+  it('refuses a match that gives no column for its row, and a created list of another width', () => {
+    const db = graph();
+    const row = p.working(7, ['text', 'int']);
+    const none = p.project(row, []);
+    expect(() => write(db, p.graphMerge('g', 7, named('Ada'), none, { created: [] }))).toThrow(/gives no column for its row's number/);
+    const number = p.project(row, [p.col(0, 1, 'int')]);
+    expect(() => write(db, p.graphMerge('g', 7, named('Ada'), number, { created: [p.lit(1)] }))).toThrow(/gives 1 columns for the 0 the match adds/);
+    // The row a `working` gives has the input's columns and its number.
+    expect(() => write(db, p.graphMerge('g', 7, named('Ada'), p.working(7, ['text']), { created: [] }))).toThrow(/expected 2 columns/);
   });
 });
 

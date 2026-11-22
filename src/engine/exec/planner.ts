@@ -3377,7 +3377,7 @@ export function planWidth(op: PlanOp): number {
     case 'eager':
       return planWidth(op.input);
     case 'graphMerge':
-      return planWidth(op.input) + planWidth(op.match);
+      return planWidth(op.input) + planWidth(op.match) - 1;
     default: {
       // Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
       const unhandled: never = op;

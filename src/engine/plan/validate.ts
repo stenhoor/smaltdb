@@ -781,23 +781,26 @@ class Validator {
         graphName(o.graph);
         const w = sub(o.input, 'input');
         newTables(o.tables, o.graph);
-        // The match is run for each input row, which a `working` with this id gives it.
+        // The match is run for input rows, which a `working` with this id gives it: each with its number after it.
         if (!Number.isInteger(o.id)) this.fail('expected an id', 'id');
         if (this.iterates.has(o.id)) this.fail(`iterate ${o.id} is already open`, 'id');
-        this.iterates.set(o.id, w);
+        this.iterates.set(o.id, w + 1);
         let m: number;
         try {
           m = sub(o.match, 'match');
         } finally {
           this.iterates.delete(o.id);
         }
+        // The match gives the row's number, then its own columns.
+        if (m < 1) this.fail(`gives no column for its row's number`, 'match');
         const made = newEntities(o.nodes, o.relationships, w);
         const created = this.list(o.created, 'created');
-        if (created.length !== m) this.fail(`gives ${created.length} columns for the match's ${m}`, 'created');
+        if (created.length !== m - 1) this.fail(`gives ${created.length} columns for the ${m - 1} the match adds`, 'created');
         exprs(created, reading(w + made), 'created');
-        setItems(o.onMatch, reading(w + m), 'onMatch');
-        setItems(o.onCreate, reading(w + m), 'onCreate');
-        return w + m;
+        setItems(o.onMatch, reading(w + m - 1), 'onMatch');
+        setItems(o.onCreate, reading(w + m - 1), 'onCreate');
+        if (o.key !== undefined) exprs(this.list(o.key, 'key'), reading(w), 'key');
+        return w + m - 1;
       }
       case 'eager':
         return sub(o.input, 'input');
