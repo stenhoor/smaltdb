@@ -271,8 +271,11 @@ interface Program {
   memory?: boolean;
   /** The language of the statement's source: it words the statement's errors (ADR 0016 section 10). */
   language?: SmaltLanguage;
-  /** For a language's statement: the parameters it reads as a list, struct or map (`nestedParams`), found at the first run. */
-  nested?: { readonly of: readonly (NestedTypeName | undefined)[] | null };
+  /**
+   * For a statement of a language whose statements are plan data: the parameters it reads as a list, struct or map
+   * (`nestedParams`), null when it reads none as one. Any other language's parameters are scalars.
+   */
+  nested?: readonly (NestedTypeName | undefined)[] | null;
   /** How its result rows are given (`resultForm` of `columnTypes`), worked out at the first run. */
   form?: ResultForm;
 }
@@ -2108,9 +2111,12 @@ export class Database implements FunctionContext {
     const data = language.plans === 'data';
     const bound = data ? this.receivedStatement(given as PlanStatementInput) : this.receivedBound(given as BoundStatement);
     // Its parameters, then the values its language took out of it (`LanguageStatement.shape`).
-    const p = this.compileBound(bound, ps.paramCount + (ps.shape?.values.length ?? 0), ps.text);
-    // Settings (work_mem, foreign_keys) belong to this connection. Plan data names its tables without looking them up.
-    return { ...p, bound, memory: reads.memory() || bound.kind === 'setting' || (data && this.planUsesMemoryObjects(bound)), language };
+    const count = ps.paramCount + (ps.shape?.values.length ?? 0);
+    const p = this.compileBound(bound, count, ps.text);
+    // Settings (work_mem, foreign_keys) belong to this connection.
+    if (!data) return { ...p, bound, memory: reads.memory() || bound.kind === 'setting', language };
+    // Plan data names its tables without looking them up, and may read a parameter as a list, struct or map.
+    return { ...p, bound, memory: reads.memory() || bound.kind === 'setting' || this.planUsesMemoryObjects(bound), language, nested: nestedParams(bound, count) };
   }
 
   /**
@@ -6472,7 +6478,7 @@ export class Statement extends PreparedStatement {
   protected bindParams(params: BindParams | undefined, regs: SqlValue[], p: Program): void {
     const parsed = this.parsed;
     const n = parsed.paramCount;
-    bindParamValues(parsed, params, regs, (p.nested ??= { of: nestedParams(p.bound, n + (parsed.shape?.values.length ?? 0)) }).of);
+    bindParamValues(parsed, params, regs, p.nested ?? null);
     // The statement's language converts its parameters as it means them (ADR 0018: SQL binds NaN as NULL).
     const convert = this.language.parameter;
     if (convert) for (let i = 0; i < n; i++) regs[i] = convert(regs[i]!);
