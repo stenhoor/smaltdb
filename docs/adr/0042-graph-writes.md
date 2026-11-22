@@ -1,8 +1,8 @@
 # ADR 0042: A graph's writes: run by smaltdb, in memory first, the tables written behind
 
 - **Status:** merged 2026-11-21 ([#292](https://github.com/stenhoor/smaltdb/pull/292)) without answers to its three
-  questions, so the steps follow what it proposes. Built: steps 1 and 2; see [As built](#as-built) for the pull
-  requests, what they measured and where they differ from the text. The numbers in the Context come from a spike that
+  questions, so the steps follow what it proposes. Built: steps 1 and 2, and of step 3 the engine's side; see
+  [As built](#as-built) for the pull requests, what they measured and where they differ from the text. The numbers in the Context come from a spike that
   was measured and thrown away (2026-11-21); what is an estimate is marked as one.
 - **Date:** 2026-11-21
 - **Builds on:** [ADR 0033](0033-property-graphs-and-history.md) (a graph's tables; its step 8, Cypher's writes; its
@@ -270,7 +270,8 @@ Added 2026-11-22, with step 2. Each number says what it compares:
 | Step | Pull requests | Measured |
 |---|---|---|
 | 1 | [#293](https://github.com/stenhoor/smaltdb/pull/293), [#294](https://github.com/stenhoor/smaltdb/pull/294), [#295](https://github.com/stenhoor/smaltdb/pull/295), stenhoor/smaltcy#37 | Against smaltcy, before and after (smaltcy's `docs/research/benchmarks.md`, "Small labels, and nodes deleted"): a node of a small label found by a property 5.14x to 6.69x and 0.75x to 0.86x; one of 8 cities found by a property 1.06x to 1.09x and 0.83x to 0.85x; the 8 cities returned 1.23x to 1.43x and 1.15x to 1.16x, still over the bar; delete 1 node 7.50x to 9.75x and 2.23x to 2.66x |
-| 2 | The pull request that adds this section | Below |
+| 2 | [#297](https://github.com/stenhoor/smaltdb/pull/297) | Below |
+| 3 | stenhoor/smaltcy#38 (writes as one plan), the pull request that adds this row (section 4 in the engine); smaltcy registered as a language is to come | Below |
 
 ### Step 2: its gate
 
@@ -374,3 +375,193 @@ One thing the measurements showed about the planner, not changed here: its estim
 is the average over the nodes that have any at that end. For a type that ends at few nodes that is high, and a join
 of many nodes with the graph's relationships is then planned as a read of every relationship (a `graphDelete` of
 1,000 nodes spent half its time there). The delete reads each node's relationships by a search at the node instead.
+
+### Step 3: three pull requests
+
+Step 3 is smaltcy's as section 5 has it: it compiles writes to plans and registers as a language, and its runner and
+its kept statements go. Registering as a language needs section 4 in the engine, which no step names. So the step is
+built as three pull requests. The split was made while building it; the owner did not decide it.
+
+1. smaltcy: a statement that writes is compiled to one plan of section 1's operations, and the runner goes
+   (stenhoor/smaltcy#38). It needs step 2 alone.
+2. smaltdb: section 4 in the engine (the pull request that adds this section).
+3. smaltcy: Cypher registered as a language, and what smaltcy keeps by shape gone. It needs the two above, and is
+   not built; a prototype of it measured the second (below).
+
+### Step 3: its gate
+
+"Every single write faster than with smaltcy#36; the cases still over the bar listed with their profiles."
+
+**As one plan** (stenhoor/smaltcy#38). Against smaltcy, through the runner (smaltcy `main` on smaltdb `6b5f100`) and
+as one plan (on `38118db`), the two in turns, six turns each. The same text every run, the lowest and highest turn:
+
+| Write | Through the runner | As one plan |
+|---|---|---|
+| Create 1 node | 3.71x to 4.35x | 3.21x to 3.76x |
+| Create 1 relationship | 2.89x to 3.96x | 2.20x to 2.49x |
+| Set 1 property by name | 2.42x to 2.67x | 1.71x to 1.92x |
+| Merge an existing node | 1.15x to 1.24x | 1.01x to 1.11x |
+
+Statements that differ each time, the median of the six turns, with a literal and with a parameter: create 1 node
+4.51x and 4.08x through the runner, 3.91x and 3.26x as one plan; create 1 relationship 2.92x and 2.97x, 2.30x and
+2.29x; set 1 property 2.21x and 2.33x, 2.02x and 1.81x; merge an existing node 1.10x and 1.10x, 1.00x and 0.99x;
+delete 1 node 2.45x and 2.29x, 1.58x and 1.63x. Every single write is faster as one plan, and every one is still
+over the bar but the merge of a node that is there, with statements that differ. smaltcy's
+`docs/research/benchmarks.md`, "Writes as one plan", has the three benchmarks whole and each write's profile.
+
+**As text, through the language** (the pull request that adds this section). Cypher registered as a language is a
+prototype here, written to measure the engine's side: smaltcy's branch `claude/cypher-language-prototype`, not
+merged. Its statements carry a shape and a variant (below), and smaltcy's tests of writes and of history on smaltdb
+give the same through it (112 tests). What is compared, both against smaltcy and both on this pull request's
+source (its first commit, `602de9f`; the one after it changes no statement's run), the two in turns:
+
+- **As one plan:** smaltcy#38's path. For every statement smaltcy compiles the Cypher, finds its shape and runs the
+  smaltdb statement it prepared for that shape.
+- **As text:** the Cypher goes to `db.query(text, params, { language: 'cypher' })`. smaltdb finds the statement by
+  its text, and where the text is new asks the language to parse it and finds it by its shape.
+
+The same text every run (`bench/writes.ts`; four turns each, the lowest and highest):
+
+| Write | As one plan | As text | smaltdb, as one plan and as text (ms) | smaltcy (ms) |
+|---|---|---|---|---|
+| Create 1 node | 3.22x to 3.48x | 2.00x to 2.16x | 0.020 and 0.017 | 0.007 |
+| Create 1,000 nodes | 11.3x to 11.9x | 10.4x to 12.1x | 8.24 and 8.38 | 0.714 |
+| Create 1 relationship | 2.10x to 2.34x | 1.29x to 1.39x | 0.033 and 0.021 | 0.014 |
+| Create 1,000 relationships | 8.18x to 9.17x | 8.54x to 9.44x | 11.51 and 11.82 | 1.36 |
+| Set 1 property by name | 1.72x to 1.79x | 0.93x to 1.00x | 0.019 and 0.011 | 0.011 |
+| Set 1,000 properties | 9.38x to 12.2x | 9.97x to 11.3x | 6.03 and 5.74 | 0.595 |
+| Merge existing node | 1.04x to 1.13x | 0.45x to 0.49x | 0.011 and 0.005 | 0.010 |
+| Merge 1,000 new nodes | 0.64x to 0.68x | 0.62x to 0.69x | 9.56 and 9.66 | 14.63 |
+| Delete 1,000 nodes | 14.6x to 16.5x | 14.2x to 16.0x | 7.62 and 7.62 | 0.481 |
+
+Statements that differ each time (`bench/vary.ts`; four turns each, the lowest and highest). With a literal every
+text is new; with a parameter the text is the same and its value differs:
+
+| Statement | A literal: as one plan | A literal: as text | A parameter: as one plan | A parameter: as text |
+|---|---|---|---|---|
+| Seek by name | 0.95x to 1.01x | 0.95x to 1.12x | 0.84x to 0.92x | 0.27x to 0.30x |
+| 1 hop | 0.53x to 0.55x | 0.62x to 0.64x | 0.50x to 0.63x | 0.20x to 0.24x |
+| 2 hops | 0.38x to 0.41x | 0.39x to 0.42x | 0.39x to 0.41x | 0.22x to 0.23x |
+| 3 hops | 0.29x to 0.34x | 0.31x to 0.34x | 0.30x to 0.32x | 0.25x to 0.29x |
+| 3 hops, directed | 0.31x to 0.40x | 0.33x to 0.36x | 0.41x to 0.47x | 0.23x to 0.25x |
+| 2 hops to a label | 0.26x to 0.29x | 0.24x to 0.30x | 0.23x to 0.27x | 0.17x to 0.19x |
+| 2 hops, relationship filter | 0.67x to 0.79x | 0.69x to 0.78x | 0.66x to 0.80x | 0.47x to 0.52x |
+| Var-length 1..3, distinct | 0.49x to 0.53x | 0.51x to 0.54x | 0.50x to 0.55x | 0.47x to 0.55x |
+| Shortest path | 0.11x to 0.13x | 0.12x to 0.13x | 0.13x to 0.15x | 0.12x to 0.14x |
+| Shortest path, directed | 0.89x to 0.94x | 0.87x to 0.90x | 0.56x to 0.77x | 0.26x to 0.39x |
+| Shortest path, none | 0.22x to 0.25x | 0.22x to 0.23x | 0.23x to 0.24x | 0.21x to 0.25x |
+| Label scan + filter | 0.68x to 0.76x | 0.65x to 0.77x | 0.53x to 0.56x | 0.51x to 0.54x |
+| Node of a small label | 0.76x to 1.07x | 0.76x to 0.96x | 0.77x to 0.80x | 0.47x to 0.48x |
+| Create 1 node | 3.48x to 3.60x | 3.66x to 3.99x | 2.87x to 3.42x | 2.52x to 2.86x |
+| Create 1,000 nodes | 9.99x to 10.8x | 10.3x to 10.9x | 10.2x to 11.3x | 10.1x to 10.9x |
+| Create 1 relationship | 2.06x to 2.41x | 1.98x to 2.48x | 2.24x to 2.45x | 1.51x to 1.75x |
+| Create 1,000 relationships | 6.10x to 6.97x | 6.62x to 6.79x | 6.39x to 6.79x | 6.13x to 6.89x |
+| Set 1 property by name | 1.68x to 2.18x | 1.90x to 2.10x | 1.69x to 2.53x | 1.08x to 1.32x |
+| Set 1,000 properties | 9.23x to 9.78x | 9.49x to 9.97x | 9.07x to 9.76x | 8.52x to 9.51x |
+| Merge existing node | 0.87x to 1.07x | 0.92x to 1.14x | 0.94x to 1.06x | 0.43x to 0.50x |
+| Merge 1,000 new nodes | 0.60x to 0.68x | 0.61x to 0.65x | 0.62x to 0.66x | 0.61x to 0.67x |
+| Delete 1 node | 1.43x to 1.69x | 1.36x to 1.72x | 1.47x to 1.65x | 1.00x to 1.10x |
+| Delete 1,000 nodes | 10.7x to 13.3x | 11.5x to 12.4x | 11.6x to 13.1x | 11.9x to 12.7x |
+
+The reads with the same text every run (`BENCH_INDEXES=1`; three turns each):
+
+| Query | As one plan | As text | smaltcy, smaltdb as text (ms) |
+|---|---|---|---|
+| Seek by name | 0.81x to 0.84x | 0.24x to 0.25x | 0.018, 0.005 |
+| 1 hop | 0.57x to 0.58x | 0.22x to 0.24x | 0.034, 0.007 |
+| 2 hops | 0.29x to 0.30x | 0.25x to 0.26x | 0.336, 0.086 |
+| 3 hops | 0.26x to 0.27x | 0.24x to 0.27x | 4.29, 1.13 |
+| 1 hop, directed | 0.59x to 0.61x | 0.23x to 0.24x | 0.027, 0.006 |
+| 3 hops, directed | 0.24x to 0.25x | 0.24x to 0.24x | 2.20, 0.528 |
+| 2 hops to a label | 0.21x to 0.23x | 0.19x to 0.22x | 0.692, 0.139 |
+| 2 hops, relationship filter | 0.59x to 0.64x | 0.56x to 0.60x | 0.538, 0.325 |
+| Var-length 1..3, distinct | 0.48x to 0.50x | 0.47x to 0.49x | 12.33, 5.82 |
+| Shortest path | 0.63x to 0.65x | 0.22x to 0.23x | 0.046, 0.010 |
+| Shortest path, 5 hops | 0.15x to 0.15x | 0.14x to 0.16x | 32.20, 4.84 |
+| Shortest path, none (out) | 0.85x to 0.87x | 0.27x to 0.30x | 0.029, 0.007 |
+| Shortest path, none (all) | 0.20x to 0.23x | 0.20x to 0.22x | 31.90, 7.25 |
+| Label scan + filter | 0.46x to 0.47x | 0.44x to 0.44x | 2.03, 0.926 |
+| Small label + filter | 0.83x to 0.84x | 0.26x to 0.27x | 0.013, 0.003 |
+| Small label | 1.18x to 1.19x | 0.47x to 0.56x | 0.009, 0.004 |
+| Group by city | 0.65x to 0.68x | 0.64x to 0.70x | 23.62, 15.58 |
+| All relationships | 0.13x to 0.14x | 0.12x to 0.13x | 16.64, 2.17 |
+| Triangles (bounded) | 0.40x to 0.41x | 0.40x to 0.40x | 12.20, 5.31 |
+
+What it says:
+
+- **With the same text, and with a parameter, smaltdb compiles no Cypher:** it finds the statement by its text, where
+  smaltcy's engine compiles the text on every run. So every single write is faster as text. The same text: create 1
+  node 3.22x to 3.48x as one plan and 2.00x to 2.16x as text; create 1 relationship 2.10x to 2.34x and 1.29x to
+  1.39x; set 1 property 1.72x to 1.79x and 0.93x to 1.00x; merge a node that is there 1.04x to 1.13x and 0.45x to
+  0.49x. With a parameter: create 1 node 2.87x to 3.42x and 2.52x to 2.86x; create 1 relationship 2.24x to 2.45x and
+  1.51x to 1.75x; set 1 property 1.69x to 2.53x and 1.08x to 1.32x; delete 1 node 1.47x to 1.65x and 1.00x to 1.10x;
+  merge a node that is there 0.94x to 1.06x and 0.43x to 0.50x.
+- **Every read is under the bar as text with the same text,** the 8 cities returned among them (1.18x to 1.19x as one
+  plan, 0.47x to 0.56x as text), which was the one read over it. Reads whose time is the query itself read the same
+  both ways (3 hops, the var-length match, the group by city).
+- **With a literal that differs in every statement the two cost the same, or the text a few percent more.** Every
+  text is new, so both compile the Cypher and find its shape; as text smaltdb also keeps a statement for the text.
+  Measured by itself, the two paths in one process (40 rounds of 200 statements each way, in turns, three runs; as
+  text over as one plan, the median of the rounds): create 1 node 1.02x, 1.02x, 1.07x; create 1 relationship 1.00x,
+  1.04x, 1.04x; set 1 property 0.92x, 1.02x, 0.98x; merge a node that is there 1.03x, 1.00x, 1.03x; seek by name
+  1.02x, 1.01x, 1.05x. In the benchmark's own runs two early cases read higher as text than that: 1 hop 0.62x to
+  0.64x against 0.53x to 0.55x, and seek by name up to 1.12x against up to 1.01x. Run alone, 1 hop reads the same on
+  both (0.68x, 0.71x, 0.74x as text; 0.71x, 0.77x, 0.68x as one plan), and both paths bind it to the same plan. An
+  assumption, not checked: the difference is how warm the code is. In a full run the case before it has run its
+  parameter half without compiling any Cypher on the text path, so the code a new text goes through has run half as
+  often as on the plan path.
+- **The writes of 1,000 rows are where they were:** their time is the rows written, which is step 4's.
+- **Still over the bar as text:** create 1 node (2.00x to 2.16x with the same text, 2.52x to 2.86x with a parameter,
+  3.66x to 3.99x with a literal), create 1 relationship (1.29x to 1.39x, 1.51x to 1.75x, 1.98x to 2.48x), set 1
+  property where its values differ (1.08x to 1.32x with a parameter, 1.90x to 2.10x with a literal), delete 1 node
+  with a literal (1.36x to 1.72x), and every write of 1,000 rows but the merge. At the bar, and over it in some
+  turns: delete 1 node with a parameter (1.00x to 1.10x), and with a literal the merge of a node that is there
+  (0.92x to 1.14x) and the seek by name (0.95x to 1.12x). Each write's profile is in smaltcy's
+  `docs/research/benchmarks.md`, "Writes as one plan": with the same text or a parameter, the Cypher's compile and
+  the search for its shape are what the text path leaves out, and the smaltdb statement is what is left.
+
+**SQL's own text path** runs through the same code now. Measured on `main` and on this pull request's source, in
+turns:
+
+| Statement (µs a statement; a table of 1,000 rows; each turn the median of 7 rounds of 200,000) | `main` (`7ba41fa`), six turns | This pull request, six turns |
+|---|---|---|
+| `query`, a point lookup by `?` | 0.846, 0.918, 0.974, 1.116, 0.667, 0.949 | 0.706, 0.719, 0.710, 0.703, 1.079, 0.657 |
+| `query`, the same by a named parameter | 1.066, 1.427, 1.156, 0.919, 0.807, 0.940 | 0.771, 1.022, 0.785, 0.805, 0.791, 0.755 |
+| `run`, an update by key | 4.779, 5.020, 5.184, 5.696, 4.723, 4.926 | 5.049, 5.099, 4.590, 4.894, 4.320, 4.505 |
+| A prepared point lookup | 0.637, 0.686, 0.590, 0.902, 0.663, 0.640 | 0.575, 0.638, 0.565, 0.537, 0.837, 0.559 |
+
+No case is slower. The machine's times moved between the turns more than the two differ (five turns taken earlier
+that day, on the step's first commit, read level: a point lookup 0.645 to 0.699 on `main` and 0.623 to 0.685 with
+one turn at 1.322), so this says no more than that.
+
+### Step 3: where it differs from section 4
+
+1. **The entry points are the engine's own.** `query`, `run`, `exec`, `prepare`, `queryAsync`, `runAsync` and
+   `execAsync` take `{ language }` in process. The worker and the client still take SQL and plans: giving them the
+   language's name is a pull request of its own.
+2. **A shape is a hash and a comparison, not a key.** Section 4 says a statement "may carry a key for its shape".
+   smaltcy measured what a key costs: built as a text for each statement it was most of the time of finding a kept
+   statement, 6.5 µs for a seek by name against 1.7 µs for a hash and a comparison of the shape's tokens (its ADR
+   0004). So a statement carries `shape: { hash, values, same(other) }`: the engine keeps statements by the hash
+   and asks `same` to tell shapes with one hash apart. The values taken out are read as the parameters after the
+   statement's own.
+3. **A statement may bind by its values** (`variant`). smaltcy compiles a comparison with a parameter for the kind
+   of the parameter's value (its ADR 0004: "a value of another kind is another statement"), so one text binds to
+   one plan for a text and to another for a number. The statement gives a key for its values, the same for values
+   it binds the same for, and the engine keeps what it bound for each key (16 a statement). Without this a
+   statement with parameters could not be kept by its text.
+4. **A language may bind to plan data** (`SmaltLanguage.plans: 'data'`). SQL's binder gives the engine's own terms.
+   smaltcy's compiler builds plans as data, as a caller of `preparePlan` does, so the engine receives what such a
+   language binds to as it receives those: validated, then put in its own terms.
+5. **What a write gives back may be named without its types** (`returning: [{ name }]`): the plan types it. As many
+   columns must be described as the plan gives back (`SMALT_PLAN`); until now another number was taken as given.
+6. **A parameter may be a list, a struct or a map** in a statement of a language that binds to plan data, given as
+   a JS array, object or `Map` as a plan's is. SQL's parameters stay scalars.
+7. **`query` gives `graph`,** what a write of a property graph did, with its rows. It gave the columns and rows
+   alone.
+8. **What is kept:** each language its own `statementCacheSize` texts; four times that many shapes a database, the
+   oldest going first.
+
+What section 4 says and is as built: a statement of a registered language is found by its text and kept as SQL's
+is; a statement whose values differ is found by its shape, and runs what the first of its shape bound to with its
+own values; what the shape of a statement is stays its language's to say.

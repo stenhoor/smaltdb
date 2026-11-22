@@ -13,7 +13,7 @@ const { columns, rows } = db.query('SELECT a, b FROM t'); // ['a', 'b'], [[1, 'x
 db.close();
 ```
 
-The engine carries no language: the text methods (`exec`, `query`, `run`, `prepare`) run SQL from [smaltql](https://stenhoor.github.io/smaltql/), registered with `import '@smaltworks/smaltql/register'`, and without it they fail with `SMALT_MISUSE`. Statements given as [plans](../engine/) need no language. The SQL, the values, the parameters and the errors are the same as in the client. Results differ: the engine returns `{ columns, rows }` with rows as value arrays.
+The engine carries no language: the text methods (`exec`, `query`, `run`, `prepare`) run SQL from [smaltql](https://stenhoor.github.io/smaltql/), registered with `import '@smaltworks/smaltql/register'`, and without it they fail with `SMALT_MISUSE`. They run another [registered language's](../engine/languages#running-statements) text when it is named (`{ language }`). Statements given as [plans](../engine/) need no language. The SQL, the values, the parameters and the errors are the same as in the client. Results differ: the engine returns `{ columns, rows }` with rows as value arrays.
 
 ## Exports
 
@@ -64,7 +64,7 @@ console.log(again.query('SELECT a FROM t').rows); // [['kept']]
 | `workMem` | `number` | 256 MiB | Bytes a sort or hash aggregate may use before it spills to the scratch file; `0` never spills. `PRAGMA work_mem` changes it at run time. |
 | `spillPath` | `string` \| `false` | `<path>-spill` | The scratch file, or `false` for none (operators then stay in memory). In-memory databases never spill. |
 | `graphIndexMem` | `number` | 256 MiB | Bytes a property graph's [index in memory](../engine/schema#the-graph-index) may take, the property maps it remembers included. A graph that needs more gives up the property maps first, and is then read from its B+trees; `0` turns graph indexes off. |
-| `statementCacheSize` | `number` | `64` | Compiled statements kept by `run` and `query`, by SQL text. |
+| `statementCacheSize` | `number` | `64` | Compiled statements kept by `run` and `query`, by their text: this many for SQL, and for each other language whose text they are given. |
 | `verifyChecksums` | `boolean` | `true` | Check page checksums on every read from storage. |
 | `walAutoCheckpointBytes` | `number` | 4 MiB | Copy the write-ahead log into the database file once it reaches this size. |
 | `readAheadBytes` | `number` | 64 KiB | On a cache miss, read this aligned extent around the page in one call (`0` disables). |
@@ -75,10 +75,10 @@ console.log(again.query('SELECT a FROM t').rows); // [['kept']]
 
 | Method | Description |
 |---|---|
-| `exec(sql: string, params?: BindParams): void` | Run one or more statements, discarding rows. With `params`, `sql` must be one statement (else `SMALT_MISUSE`). |
-| `query(sql: string, params?: BindParams, options?: { temporal?: TemporalForm }): QueryResult` | Run one statement and return `{ columns, rows }`. `temporal` picks how dates and times come back. |
-| `run(sql: string, params?: BindParams): RunResult` | Run one statement for effect and return `{ changes, lastInsertRowid }`. |
-| `prepare(sql: string): Statement` | Compile one statement. See [Statement](#statement). |
+| `exec(sql: string, params?: TextParams, options?: { language?: string }): void` | Run one or more statements, discarding rows. With `params`, `sql` must be one statement (else `SMALT_MISUSE`). |
+| `query(sql: string, params?: TextParams, options?: { temporal?: TemporalForm; language?: string }): QueryResult` | Run one statement and return `{ columns, rows }`. `temporal` picks how dates and times come back. |
+| `run(sql: string, params?: TextParams, options?: { language?: string }): RunResult` | Run one statement for effect and return `{ changes, lastInsertRowid }`. |
+| `prepare(sql: string, options?: { language?: string }): Statement` | Compile one statement. See [Statement](#statement). |
 | `changes(): number` | Rows changed by the most recent `INSERT`, `UPDATE` or `DELETE`. |
 | `totalChanges(): number` | Rows changed since the database was opened. |
 | `lastInsertRowid(): number \| bigint` | Rowid of the most recent successful `INSERT`. |
@@ -88,7 +88,9 @@ console.log(again.query('SELECT a FROM t').rows); // [['kept']]
 
 `query` and `run` keep compiled statements in a cache keyed by the SQL text (see `statementCacheSize`); `exec` compiles each time.
 
-`BindParams` is `readonly (SqlValue | boolean | undefined)[] | Readonly<Record<string, SqlValue | boolean>>`, the same as the client's [`Params`](https://stenhoor.github.io/smaltql/reference/api/client#params). `QueryResult` is `{ columns: string[]; rows: SqlValue[][] }`.
+`language` names the [registered language](../engine/languages#running-statements) the text is written in; without it the text is SQL. A language's statements are kept by their text as SQL's are, and where the language says so by their shape and by the kinds of their values ([statements the engine keeps](../engine/languages#statements-the-engine-keeps)). A language that is not registered is `SMALT_MISUSE`.
+
+`BindParams` is `readonly (SqlValue | boolean | undefined)[] | Readonly<Record<string, SqlValue | boolean>>`, the same as the client's [`Params`](https://stenhoor.github.io/smaltql/reference/api/client#params). `TextParams` is `BindParams`, or the same with a JS array, an object or a `Map` for a parameter a language's statement reads as a list, a struct or a map; SQL's parameters are scalars. `QueryResult` is `{ columns: string[]; rows: SqlValue[][] }`; for a statement that [writes a property graph](../engine/plans#graph-writes) it also has `graph`: what it did, counted.
 
 Engine calls are synchronous: a long query blocks the thread until it finishes. There is no `signal`. A host can install an interrupt check with `setInterruptCheck(fn)`, which the engine calls every few hundred page reads; `fn` stops the statement by throwing a `SmaltError` with code `SMALT_INTERRUPT`, and must reset its own trigger before it throws.
 
@@ -98,7 +100,7 @@ Statements that read [external data](https://stenhoor.github.io/smaltql/guide/ex
 
 | Method | Description |
 |---|---|
-| `queryAsync(sql, params?, options?: { signal?: AbortSignal }): Promise<QueryResult>` | `query` that fetches external sources first. |
+| `queryAsync(sql, params?, options?: { signal?: AbortSignal; language?: string }): Promise<QueryResult>` | `query` that fetches external sources first. |
 | `runAsync(sql, params?, options?): Promise<RunResult>` | `run` that fetches external sources first. |
 | `execAsync(sql, params?, options?): Promise<void>` | `exec` that fetches external sources first, statement by statement. |
 
