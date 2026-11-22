@@ -28,7 +28,7 @@ to `NONE`.
 | `Database` method | |
 |---|---|
 | `preparePlan(stmt): PlanStatement` | Compile a statement. A `PlanStatement` has the members of a [`Statement`](../api/engine#statement) (`run`, `all`, `cursor`, `columns`, `columnTypes`, `readonly`, `paramCount`), without `sql`. It compiles again by itself after schema changes. |
-| `queryPlan(stmt, params?): QueryResult` | Run a statement and return `{ columns, columnTypes, rows }`. A write's `rows` are its RETURNING rows, and it also gives `changes` and `lastInsertRowid`, as `run` does. Compiled plans are cached by their canonical form, so running the same plan again, built anew or read from JSON, plans it once. |
+| `queryPlan(stmt, params?): QueryResult` | Run a statement and return `{ columns, columnTypes, rows }`. A write's `rows` are its RETURNING rows, and it also gives `changes` and `lastInsertRowid`, as `run` does, and `graph` where it [wrote a property graph](./plans#graph-writes): what it did, counted. Compiled plans are cached by their canonical form, so running the same plan again, built anew or read from JSON, plans it once. |
 | `queryPlanAsync(stmt, params?, options?)` | `queryPlan` for a plan that reads external data: fetches it first. |
 
 ```ts
@@ -61,8 +61,9 @@ results, options, transactions and parallel readers work as for SQL queries. The
 arrays are unusable afterwards. A plan that carries data is not cached by the worker.
 
 Results carry each column's plan type: `columnTypes` on `rowMode: 'array'` and `'columnar'` results and on prepared
-statements. A write run with `queryPlan` gives `changes` and `lastInsertRowid` on its result, beside any RETURNING rows;
-they are not enumerable, so the rows compare and serialize as before.
+statements. A write run with `queryPlan` gives `changes` and `lastInsertRowid` on its result, beside any RETURNING rows, and
+`graph` where it [wrote a property graph](./plans#graph-writes); they are not enumerable, so the rows compare and
+serialize as before. A prepared write's `run` gives the same three.
 
 Dates and times (`date`, `datetime`, `time`, `duration`) come back as text, such as `2026-11-07` or
 `2026-11-07 12:30:00.500` ([ADR 0019](../../adr/0019-dates-and-times.md)). The option `temporal` asks for another

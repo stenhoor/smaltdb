@@ -141,7 +141,7 @@ A compiled statement, from `db.prepare()`. It compiles again by itself after sch
 
 | Member | Description |
 |---|---|
-| `run(params?: BindParams): RunResult` | Run for effect. A query is run to the end and its rows discarded. |
+| `run(params?: BindParams): RunResult` | Run for effect. A query is run to the end and its rows discarded. A plan that [writes a property graph](../engine/plans#graph-writes) also gives `graph`: what it did, counted. |
 | `all(params?: BindParams): SqlValue[][]` | Run and return every row. |
 | `cursor(params?: BindParams): RowCursor` | Run and return a cursor over the rows. |
 | `columns: string[]` | Result column names (getter). |
