@@ -57,7 +57,15 @@ export function printExpr(e: BoundExpr): string {
 const relRef = (r: GraphRelationshipRef): string => `${printExpr(r.type)}:${printExpr(r.id)}`;
 
 const deleteTarget = (t: GraphDeleteTarget): string =>
-  'node' in t ? `node ${printExpr(t.node)}` : 'nodes' in t ? `nodes ${printExpr(t.nodes)}` : 'relationship' in t ? `relationship ${relRef(t.relationship)}` : `relationships ${printExpr(t.relationships.types)}:${printExpr(t.relationships.ids)}`;
+  'node' in t
+    ? `node ${printExpr(t.node)}`
+    : 'nodes' in t
+      ? `nodes ${printExpr(t.nodes)}`
+      : 'relationship' in t
+        ? `relationship ${relRef(t.relationship)}`
+        : 'hops' in t
+          ? `hops ${printExpr(t.hops)}`
+          : `path ${printExpr(t.path.start)} ${printExpr(t.path.hops)}`;
 
 /** A `graphSet` item: its node or relationship, then what it changes. */
 function setItem(it: GraphSetItem): string {

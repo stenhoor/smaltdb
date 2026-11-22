@@ -75,6 +75,13 @@ class Validator {
   /** The path: segments `at[0..top)` of the shared array (validation does not re-enter itself). */
   private readonly at = PATH;
   private top = 1;
+  /**
+   * The tables and relationship types the plan's graph writes add (`GraphNewTable`), known from the write that names
+   * them on: its own expressions and the operations above it may read them. A table by its name in lower case, with
+   * its width; a graph's new types by the graph's name in lower case.
+   */
+  private newTables: Map<string, number> | null = null;
+  private newTypes: Map<string, string[]> | null = null;
 
   constructor(private readonly catalog: ValidateCatalog) {}
 
@@ -167,7 +174,7 @@ class Validator {
   private tableWidth(name: unknown, db: unknown): number {
     if (typeof name !== 'string') this.fail('expected a table name', 'table');
     if (db !== undefined && db !== 'main' && db !== 'temp') this.fail(`unknown schema ${JSON.stringify(db)}`, 'db');
-    const n = this.catalog.tableColumns(name, db as 'main' | 'temp' | undefined);
+    const n = this.catalog.tableColumns(name, db as 'main' | 'temp' | undefined) ?? (db === 'temp' ? undefined : this.newTables?.get(name.toLowerCase()));
     if (n === undefined) this.fail(`no such table: ${name}`, 'table');
     return n;
   }
@@ -268,6 +275,29 @@ class Validator {
       ex(ref.type, scopes, 'type');
       ex(ref.id, scopes, 'id');
     };
+    /**
+     * The tables a graph write names for the labels and types it adds: known from here on, as the engine makes them
+     * (a label's `id` and `props`; a type's `start`, `end` and `props`).
+     */
+    const newTables = (tables: unknown, graph: string): void => {
+      if (tables === undefined) return;
+      const ts = this.list(tables, 'tables') as { label?: unknown; type?: unknown; table?: unknown }[];
+      for (let i = 0; i < ts.length; i++) {
+        this.under('tables', i, () => {
+          this.object(ts[i]);
+          if ((ts[i].label === undefined) === (ts[i].type === undefined)) this.fail('expected a label or a relationship type (one of them)');
+          const name = ts[i].label ?? ts[i].type;
+          if (typeof name !== 'string' || name === '') this.fail(`expected ${ts[i].label !== undefined ? 'a label' : 'a relationship type'}`, ts[i].label !== undefined ? 'label' : 'type');
+          if (typeof ts[i].table !== 'string' || ts[i].table === '') this.fail('expected a table name', 'table');
+          (this.newTables ??= new Map()).set((ts[i].table as string).toLowerCase(), ts[i].label !== undefined ? 2 : 3);
+          if (ts[i].type !== undefined) {
+            const types = (this.newTypes ??= new Map()).get(graph.toLowerCase());
+            if (types) types.push(name as string);
+            else this.newTypes.set(graph.toLowerCase(), [name as string]);
+          }
+        });
+      }
+    };
     /** The nodes and relationships a `graphCreate` or `graphMerge` makes over an input of width `w`: how many. */
     const newEntities = (nodes: unknown, relationships: unknown, w: number): number => {
       const ns = this.list(nodes, 'nodes') as { labels: unknown; props?: PlanExpr }[];
@@ -357,7 +387,8 @@ class Validator {
             if (typeof name !== 'string') this.fail('expected a relationship type name', 'types', i);
             if (seen.has(fold(name as string))) this.fail(`${String(name)} is listed twice`, 'types', i);
             seen.add(fold(name as string));
-            if (g && !g.types.some((t) => fold(t) === fold(name as string))) this.fail(`property graph ${o.graph} has no relationship type ${String(name)}`, 'types', i);
+            const has = (types: readonly string[] | undefined): boolean => types !== undefined && types.some((t) => fold(t) === fold(name as string));
+            if (g && !has(g.types) && !has(this.newTypes?.get(o.graph.toLowerCase()))) this.fail(`property graph ${o.graph} has no relationship type ${String(name)}`, 'types', i);
           }
         }
         if (o.asOf !== undefined)
@@ -710,11 +741,13 @@ class Validator {
       case 'graphCreate': {
         graphName(o.graph);
         const w = sub(o.input, 'input');
+        newTables(o.tables, o.graph);
         return w + newEntities(o.nodes, o.relationships, w);
       }
       case 'graphSet': {
         graphName(o.graph);
         const w = sub(o.input, 'input');
+        newTables(o.tables, o.graph);
         setItems(o.items, reading(w), 'items');
         return w;
       }
@@ -726,16 +759,17 @@ class Validator {
         for (let i = 0; i < targets.length; i++) {
           this.under('targets', i, () => {
             this.object(targets[i]);
-            const t = targets[i] as { node?: PlanExpr; nodes?: PlanExpr; relationship?: unknown; relationships?: { types: PlanExpr; ids: PlanExpr } };
-            if ([t.node, t.nodes, t.relationship, t.relationships].filter((x) => x !== undefined).length !== 1) this.fail('expected a node, nodes, a relationship or relationships (one of them)');
+            const t = targets[i] as { node?: PlanExpr; nodes?: PlanExpr; relationship?: unknown; hops?: PlanExpr; path?: { start: PlanExpr; hops: PlanExpr } };
+            if ([t.node, t.nodes, t.relationship, t.hops, t.path].filter((x) => x !== undefined).length !== 1) this.fail('expected a node, nodes, a relationship, hops or a path (one of them)');
             optEx(t.node, scopes, 'node');
             optEx(t.nodes, scopes, 'nodes');
             if (t.relationship !== undefined) this.under('relationship', undefined, () => relationshipRef(t.relationship, scopes));
-            if (t.relationships !== undefined) {
-              this.under('relationships', undefined, () => {
-                this.object(t.relationships);
-                ex(t.relationships!.types, scopes, 'types');
-                ex(t.relationships!.ids, scopes, 'ids');
+            optEx(t.hops, scopes, 'hops');
+            if (t.path !== undefined) {
+              this.under('path', undefined, () => {
+                this.object(t.path);
+                ex(t.path!.start, scopes, 'start');
+                ex(t.path!.hops, scopes, 'hops');
               });
             }
           });
@@ -746,6 +780,7 @@ class Validator {
       case 'graphMerge': {
         graphName(o.graph);
         const w = sub(o.input, 'input');
+        newTables(o.tables, o.graph);
         // The match is run for each input row, which a `working` with this id gives it.
         if (!Number.isInteger(o.id)) this.fail('expected an id', 'id');
         if (this.iterates.has(o.id)) this.fail(`iterate ${o.id} is already open`, 'id');

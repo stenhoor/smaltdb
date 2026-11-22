@@ -141,6 +141,13 @@ export interface GraphRelationshipRef {
  */
 export type GraphEnd = { readonly node: number } | { readonly id: PlanExpr };
 
+/**
+ * The table a graph write makes for a label or a relationship type it adds to the graph, where the plan names it: a
+ * table of that name must not exist. Without one the table is named as `alterPropertyGraph` names it. A plan that
+ * names tables reads them by those names, so it holds for the graph as it was when the plan was made.
+ */
+export type GraphNewTable = { readonly label: string; readonly table: string } | { readonly type: string; readonly table: string };
+
 /** A node a `graphCreate` or `graphMerge` makes: its labels, and its properties (a map; a NULL value sets no key). */
 export interface GraphNewNode {
   readonly labels: readonly string[];
@@ -174,14 +181,16 @@ export type GraphSetItem = ({ readonly node: PlanExpr; readonly relationship?: u
 
 /**
  * What a `graphDelete` deletes for a row: a node (an expression that gives its id), a list of nodes (`list<int>`),
- * a relationship, or relationships given as two lists of one length (their types' names and their rowids). A NULL
- * one, a NULL in a list, and one that is gone already, is passed over.
+ * a relationship, the relationships of a list of hops ({@link PATH_TYPE}, as `paths` gives them: a hop's `edge` is
+ * its type's position in the graph), or a path: the relationships of its hops, then its nodes (`start`, then each
+ * hop's `to`). A NULL one, a NULL in a list, and one that is gone already, is passed over.
  */
 export type GraphDeleteTarget =
   | { readonly node: PlanExpr }
   | { readonly nodes: PlanExpr }
   | { readonly relationship: GraphRelationshipRef }
-  | { readonly relationships: { readonly types: PlanExpr; readonly ids: PlanExpr } };
+  | { readonly hops: PlanExpr }
+  | { readonly path: { readonly start: PlanExpr; readonly hops: PlanExpr } };
 
 /** What a statement's graph writes did (ADR 0042, section 1): given back with its result. */
 export interface GraphWriteCounts {
@@ -453,8 +462,8 @@ export type PlanOp = OpMeaning & (
    * far as it is made: the input's columns, then the ids of the nodes and relationships made before it. Outputs the
    * input's columns, then each new node's id, then each new relationship's rowid.
    *
-   * A label or a relationship type the graph has not is added to it when the statement starts. A relationship whose
-   * end is NULL is an error.
+   * A label or a relationship type the graph has not is added to it when the statement starts (`tables` names the
+   * tables made for them, in the order they are added). A relationship whose end is NULL is an error.
    */
   | {
       readonly op: 'graphCreate';
@@ -462,9 +471,14 @@ export type PlanOp = OpMeaning & (
       readonly input: PlanOp;
       readonly nodes: readonly GraphNewNode[];
       readonly relationships: readonly GraphNewRelationship[];
+      readonly tables?: readonly GraphNewTable[];
     }
-  /** Changes properties and labels of the nodes and relationships each row of `input` names, item by item. Outputs the input's columns. */
-  | { readonly op: 'graphSet'; readonly graph: string; readonly input: PlanOp; readonly items: readonly GraphSetItem[] }
+  /**
+   * Changes properties and labels of the nodes and relationships each row of `input` names, item by item. A label it
+   * adds that the graph has not is added to the graph when the statement starts, as a `graphCreate`'s. Outputs the
+   * input's columns.
+   */
+  | { readonly op: 'graphSet'; readonly graph: string; readonly input: PlanOp; readonly items: readonly GraphSetItem[]; readonly tables?: readonly GraphNewTable[] }
   /**
    * Deletes what each row of `input` names, target by target in the order given, each before the next is looked at.
    * A node that still has relationships then is an error; with `detach` they are deleted first. Outputs the input's
@@ -490,6 +504,7 @@ export type PlanOp = OpMeaning & (
       readonly created: readonly PlanExpr[];
       readonly onMatch: readonly GraphSetItem[];
       readonly onCreate: readonly GraphSetItem[];
+      readonly tables?: readonly GraphNewTable[];
     }
   /**
    * Passes its input's rows on once it has read them all: what is below it is done before what is above it starts

@@ -9,7 +9,7 @@
 import type { SqlValue } from '../values.js';
 import { call, col, type EachAggCall, lit, param, type PlanExpr, typeOf } from './expr.js';
 import { parseNested } from '../../shared/nested-types.js';
-import type { AggCall, ConflictAction, GraphDeleteTarget, GraphNewNode, GraphNewRelationship, GraphSetItem, JoinKind, PathEdges, PlanOp, SortKey, ValueColumn, WindowCall, WindowFrame } from './ops.js';
+import type { AggCall, ConflictAction, GraphDeleteTarget, GraphNewNode, GraphNewRelationship, GraphNewTable, GraphSetItem, JoinKind, PathEdges, PlanOp, SortKey, ValueColumn, WindowCall, WindowFrame } from './ops.js';
 import type { CollationName, PlanType } from './types.js';
 
 type Op<K extends PlanOp['op']> = Extract<PlanOp, { op: K }>;
@@ -348,17 +348,27 @@ export const remove = (table: string, input: PlanOp, rowid: number, options: { d
   ...(options.returning ? { returning: options.returning } : {}),
 });
 
-/** For each row of `input`: makes `nodes`, then `relationships`, in the property graph `graph` (ADR 0042). */
-export const graphCreate = (graph: string, input: PlanOp, nodes: readonly GraphNewNode[], relationships: readonly GraphNewRelationship[] = []): Op<'graphCreate'> => ({
+/**
+ * For each row of `input`: makes `nodes`, then `relationships`, in the property graph `graph` (ADR 0042). `tables`
+ * names the tables of the labels and types it adds to the graph.
+ */
+export const graphCreate = (graph: string, input: PlanOp, nodes: readonly GraphNewNode[], relationships: readonly GraphNewRelationship[] = [], tables?: readonly GraphNewTable[]): Op<'graphCreate'> => ({
   op: 'graphCreate',
   graph,
   input,
   nodes,
   relationships,
+  ...(tables ? { tables } : {}),
 });
 
 /** For each row of `input`: changes the properties and labels its `items` name. */
-export const graphSet = (graph: string, input: PlanOp, items: readonly GraphSetItem[]): Op<'graphSet'> => ({ op: 'graphSet', graph, input, items });
+export const graphSet = (graph: string, input: PlanOp, items: readonly GraphSetItem[], tables?: readonly GraphNewTable[]): Op<'graphSet'> => ({
+  op: 'graphSet',
+  graph,
+  input,
+  items,
+  ...(tables ? { tables } : {}),
+});
 
 /** For each row of `input`: deletes its `targets`, in order (`detach`: a node's relationships first). */
 export const graphDelete = (graph: string, input: PlanOp, targets: readonly GraphDeleteTarget[], options: { detach?: boolean } = {}): Op<'graphDelete'> => ({
@@ -378,7 +388,7 @@ export const graphMerge = (
   id: number,
   input: PlanOp,
   match: PlanOp,
-  make: { nodes?: readonly GraphNewNode[]; relationships?: readonly GraphNewRelationship[]; created: readonly PlanExpr[]; onMatch?: readonly GraphSetItem[]; onCreate?: readonly GraphSetItem[] },
+  make: { nodes?: readonly GraphNewNode[]; relationships?: readonly GraphNewRelationship[]; created: readonly PlanExpr[]; onMatch?: readonly GraphSetItem[]; onCreate?: readonly GraphSetItem[]; tables?: readonly GraphNewTable[] },
 ): Op<'graphMerge'> => ({
   op: 'graphMerge',
   graph,
@@ -390,6 +400,7 @@ export const graphMerge = (
   created: make.created,
   onMatch: make.onMatch ?? [],
   onCreate: make.onCreate ?? [],
+  ...(make.tables ? { tables: make.tables } : {}),
 });
 
 /** `input`'s rows, passed on once all of them are read. */

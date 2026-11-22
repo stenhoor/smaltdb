@@ -67,7 +67,7 @@ import { type CatalogSnapshot, informationSchema } from './catalog/information-s
 import { type LanguageStatement, type SmaltLanguage, languagePart, registeredLanguage } from './plan/language.js';
 import { ForeignKeys } from './exec/fk.js';
 import { GraphRules } from './exec/graph-rules.js';
-import { type GraphLayout, GraphWrite, type GraphWriteHost, STAGE_ROWS, writesGraph } from './exec/graph-write.js';
+import { type GraphIds, type GraphLayout, GraphWrite, type GraphWriteHost, STAGE_ROWS, writesGraph } from './exec/graph-write.js';
 import { HISTORY_COLUMN_NAMES, LOG_COLUMNS, VERSION_COLUMNS, historyHooks, logHooks, logTableName, sinceTableName, versionsTableName } from './exec/history.js';
 import { PluginRegistry, type SmaltPlugin } from './plugin.js';
 import { Collation, type SqlValue } from './values.js';
@@ -3818,6 +3818,7 @@ export class Database implements FunctionContext {
     this.dirtySchema = true;
     this.removeCatalogRow(g.graph.name, graphKey(g.graph.name));
     this.graphs.delete(stmt.name.toLowerCase());
+    this.graphIds.delete(stmt.name.toLowerCase());
     this.schemaChanged();
     return none;
   }
@@ -5225,19 +5226,30 @@ export class Database implements FunctionContext {
   private readonly graphWriteHost: GraphWriteHost = {
     layout: (name) => this.graphLayout(name),
     schemaVersion: () => this.schemaVersion,
-    types: (plan) => outputTypes(plan, this.tableTypes),
+    types: (plan, more) => outputTypes(plan, more ? (t, db) => this.tableTypes(t, db) ?? (db === 'temp' ? undefined : more(t)) : this.tableTypes),
     run: (plan, params) => {
       // A stage reads the graph as it is now: what was asked once for the statement so far is asked again.
       this.state.epoch++;
       return this.internalPlan(plan, params as SqlValue[]);
     },
     changes: () => this.internalChanges,
-    nextId: (table) => this.nextIdOf(table),
-    addLabel: (graph, label) => void this.alterPropertyGraph({ op: 'alterPropertyGraph', name: graph, action: { kind: 'addLabel', label } }),
-    addType: (graph, type) => void this.alterPropertyGraph({ op: 'alterPropertyGraph', name: graph, action: { kind: 'addType', type } }),
+    ids: (graph, of) => this.graphIdsOf(graph, of),
+    addLabel: (graph, label, table) => {
+      this.newGraphTable(graph, table);
+      this.alterPropertyGraph({ op: 'alterPropertyGraph', name: graph, action: { kind: 'addLabel', label, ...(table !== undefined ? { table } : {}) } });
+    },
+    addType: (graph, type, table) => {
+      this.newGraphTable(graph, table);
+      this.alterPropertyGraph({ op: 'alterPropertyGraph', name: graph, action: { kind: 'addType', type, ...(table !== undefined ? { table } : {}) } });
+    },
   };
 
   private readonly graphLayouts = new WeakMap<PropertyGraphDef, GraphLayout>();
+
+  /** A table a plan names for a label or type it adds to a graph is a new one: an existing table is not taken for it. */
+  private newGraphTable(graph: string, table: string | undefined): void {
+    if (table !== undefined && this.catalog.table(table, 'main')) throw new SmaltError('SMALT_ERROR', `property graph ${graph}: table ${table} exists already`);
+  }
 
   /** A graph's tables as a plan that writes it needs them (a graph changed is another definition). */
   private graphLayout(name: string): GraphLayout {
@@ -5280,7 +5292,29 @@ export class Database implements FunctionContext {
   private readonly pastIdPlans = new Map<string, PlanOp>();
 
   /** One more than the largest rowid a table has had: its rows', and where it keeps history its past versions'. 0 for none. */
-  private nextIdOf(name: string): number {
+  /**
+   * A graph's next ids (`GraphWriteHost.ids`), `of` brought up to the graph's tables as they are now. A table's past
+   * versions are read the first time the table is asked of: after that every id it has had was either in its rows,
+   * or given through these ids.
+   */
+  private graphIdsOf(name: string, of: 'node' | 'relationship'): GraphIds {
+    const g = this.graphLayout(name);
+    const key = g.name.toLowerCase();
+    let kept = this.graphIds.get(key);
+    if (!kept) this.graphIds.set(key, (kept = { ids: { node: 0, relationship: 0 }, past: new Set() }));
+    for (const table of of === 'node' ? g.nodeTables : g.edgeTables) {
+      const first = !kept.past.has(table);
+      if (first) kept.past.add(table);
+      kept.ids[of] = Math.max(kept.ids[of], this.nextIdOf(table, first));
+    }
+    return kept.ids;
+  }
+
+  /** The graphs' next ids, by the graph's name in lower case, with the tables whose past versions were read for them. */
+  private readonly graphIds = new Map<string, { ids: GraphIds; past: Set<string> }>();
+
+  /** One more than the largest rowid of a table; with `past`, of its past versions too where it keeps history. */
+  private nextIdOf(name: string, past: boolean): number {
     const t = this.tables.get(name.toLowerCase());
     if (!t) throw new SmaltError('SMALT_ERROR', `no such table: ${name}`);
     let max = -1;
@@ -5293,7 +5327,7 @@ export class Database implements FunctionContext {
     } finally {
       c.close();
     }
-    if (t.history) {
+    if (t.history && past) {
       // A past version holds its row's rowid as a column: an id is not given again while a version has it.
       const past = t.history === 'log' ? logTableName(t.name) : versionsTableName(t.name);
       const column = t.history === 'log' ? LOG_COLUMNS.indexOf('$rowid') : VERSION_COLUMNS.indexOf('$rowid');

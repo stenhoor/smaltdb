@@ -5,11 +5,15 @@
  * Its rows go through its operations stage by stage, so that a write handles its rows in order, each before the next
  * is read, and what reads the graph above a write reads it as it is then:
  *
- * - **A part that writes nothing is one query.** All its rows are read before anything above it runs, so no scan is
- *   open on a table while it is written.
+ * - **A part that writes nothing is one query,** all its rows read before anything above it runs, unless operations
+ *   at its top that pass rows on as they come read the graph for each row (a nested plan in a `filter`, `project`,
+ *   `explode` or `unpivot`; `paths`): those run for each row when its turn comes, over the one query below them, so
+ *   they read what the writes above them wrote for earlier rows. Under an `eager` it is one query whatever it reads.
+ *   Either way no scan is open on a table while it is written.
  * - **A write** takes its input's rows one at a time and passes each on once it is written.
  * - **An operation above a write that passes rows on as they come** (`filter`, `project`, `explode`, `unpivot`,
- *   `paths`, a `join` whose left input is the one that writes) is run for each row, as a plan over that row.
+ *   `paths`, a `join` whose left input is the one that writes) is run for each row, as a plan over that row: those
+ *   one above the other as one plan.
  * - **An operation that needs all its rows** (`eager`, `sort`, `aggregate`, `distinct`, `window`, `sample`, `pivot`)
  *   reads them all first, then runs once over them.
  * - **`limit`** passes rows on until it has its count and then stops what feeds it: a write below it writes no more.
@@ -21,11 +25,12 @@
 import { SmaltError } from '../errors.js';
 import { append, filter, limit as limitOf, project, remove, scan, update, values } from '../plan/build.js';
 import { call, col, lit, param, type PlanExpr, typeOf } from '../plan/expr.js';
-import { GRAPH_WRITE_OPS, type GraphDeleteTarget, type GraphEnd, type GraphNewNode, type GraphNewRelationship, type GraphRelationshipRef, type GraphSetItem, type GraphWriteCounts, type PlanOp } from '../plan/ops.js';
+import { GRAPH_WRITE_OPS, type GraphDeleteTarget, type GraphEnd, type GraphNewNode, type GraphNewRelationship, type GraphNewTable, type GraphSetItem, type GraphWriteCounts, type PlanOp } from '../plan/ops.js';
 import type { PlanType } from '../plan/types.js';
 import { decodeKey, encodeKey } from '../storage/key-codec.js';
 import type { SqlValue } from '../values.js';
-import { compareCodePoints } from '../../shared/nested.js';
+import { compareCodePoints, parseNested } from '../../shared/nested.js';
+import { toAny } from './nested-ops.js';
 
 type Row = SqlValue[];
 type Sink = (row: Row) => boolean;
@@ -54,25 +59,39 @@ export interface GraphWriteHost {
   /** The graph's tables, or an error when the graph can't be written this way. */
   layout(graph: string): GraphLayout;
   schemaVersion(): number;
-  /** A plan's output types. */
-  types(plan: PlanOp): PlanType[];
+  /** A plan's output types; `more` gives the column types of tables the database has not yet. */
+  types(plan: PlanOp, more?: (table: string) => readonly PlanType[] | undefined): PlanType[];
   /** Runs a plan inside the running statement: a query's rows, or null for a write (`changes` tells its count). */
   run(plan: PlanOp, params: readonly SqlValue[]): SqlValue[][] | null;
   /** How many rows the write last run changed. */
   changes(): number;
-  /** One more than the largest rowid `table` has had, its past versions' too where it keeps history; 0 for none. */
-  nextId(table: string): number;
-  addLabel(graph: string, label: string): void;
-  addType(graph: string, type: string): void;
+  /**
+   * The graph's next ids: `node`, the id its next new node takes, and `relationship`, the rowid its next new
+   * relationship takes. Each is one more than the largest the graph has had as far as this connection knows: in its
+   * tables, in their past versions where they keep history, and given by a statement of this connection, whether
+   * that statement ended, failed or was rolled back. Asked for one of the two, it is brought up to the tables as they
+   * are now; the write moves it on as it makes nodes and relationships.
+   */
+  ids(graph: string, of: 'node' | 'relationship'): GraphIds;
+  /** Adds a label or a relationship type to the graph; `table` names the table made for it, which must not exist. */
+  addLabel(graph: string, label: string, table?: string): void;
+  addType(graph: string, type: string, table?: string): void;
+}
+
+/** A graph's next node id and relationship rowid (`GraphWriteHost.ids`). */
+export interface GraphIds {
+  node: number;
+  relationship: number;
 }
 
 /** One run of the statement. */
 interface Ctx {
   readonly params: readonly SqlValue[];
   readonly counts: GraphWriteCounts;
-  /** The next node id and relationship rowid, read when first needed (-1 until then). */
-  nextNode: number;
-  nextRel: number;
+  /** The graphs' next ids, asked for when a node or a relationship is first made: by kind and graph. */
+  readonly ids: Map<string, GraphIds>;
+  /** The writes whose labels and types the graph has, or was given in this run. */
+  readonly ready: Set<object>;
 }
 
 /** A stage's rows: `rows` gives them all at once where the stage is one query. */
@@ -163,6 +182,21 @@ function asMap(v: SqlValue, graph: string): Uint8Array {
 const isMapType = (t: PlanType): boolean => t === 'null' || t.startsWith('map<');
 
 /**
+ * What a map of static type `t` becomes as properties, a map of values of any kind: a map of bools, lists or maps has
+ * each value typed (ADR 0039), where its own bytes hold them bare. Null where the bytes are properties as they are.
+ */
+function asProps(t: PlanType): ((m: Uint8Array) => Uint8Array) | null {
+  const n = t.startsWith('map<') ? parseNested(t) : null;
+  const typed = n !== null && n.kind === 'map' ? toAny(n.of) : null;
+  if (typed === null) return null;
+  return (m) => {
+    const flat = decodeKey(m);
+    for (let i = 1; i < flat.length; i += 2) flat[i] = typed(flat[i]!);
+    return encodeKey(flat);
+  };
+}
+
+/**
  * A statement's plan that writes a graph, compiled into stages when it first runs and again when the schema has
  * changed since (the stages' own plans are compiled and kept by the database, as its other internal plans are).
  */
@@ -171,24 +205,34 @@ export class GraphWrite {
   /** The rows the stages' plans read through `smalt_stage_rows_<k>` (see `stageSource`). */
   private readonly stages: { types: readonly PlanType[]; rows: Row[] }[] = [];
   private readonly plans = new Map<string, PlanOp>();
+  /** The tables the plan's writes name for the labels and types they add, by name in lower case: their column types. */
+  private readonly named = new Map<string, readonly PlanType[]>();
+  private layouts: { version: number; of: Map<string, GraphLayout> } | null = null;
 
   constructor(
     private readonly plan: PlanOp,
     /** The statement's parameters: a stage's own parameters come after them. */
     private readonly paramCount: number,
     private readonly host: GraphWriteHost,
-  ) {}
+  ) {
+    const collect = (op: PlanOp): void => {
+      inputsOf(op).forEach(collect);
+      if (op.op === 'graphMerge') collect(op.match);
+      if (op.op !== 'graphCreate' && op.op !== 'graphSet' && op.op !== 'graphMerge') return;
+      // As the engine makes them: a label's `id` and `props`; a type's `start`, `end` and `props`.
+      for (const t of op.tables ?? []) this.named.set(t.table.toLowerCase(), 'label' in t ? ['int', 'map<text, any>'] : ['int', 'int', 'map<text, any>']);
+    };
+    collect(plan);
+  }
 
   /** Runs the statement: its rows, and what it wrote. */
   run(params: readonly SqlValue[]): { rows: Row[]; counts: GraphWriteCounts } {
     if (this.compiled === null || this.compiled.version !== this.host.schemaVersion()) {
-      this.ensure(this.plan);
       this.stages.length = 0;
       this.plans.clear();
-      // The labels and types are there now: the version is the schema's after they were added.
       this.compiled = { version: this.host.schemaVersion(), root: this.stream(this.plan, true) };
     }
-    const ctx: Ctx = { params: this.paramCount === params.length ? params : params.slice(0, this.paramCount), counts: noCounts(), nextNode: -1, nextRel: -1 };
+    const ctx: Ctx = { params: this.paramCount === params.length ? params : params.slice(0, this.paramCount), counts: noCounts(), ids: new Map(), ready: new Set() };
     const rows: Row[] = [];
     try {
       this.compiled.root.run(ctx, (row) => (rows.push(row), true));
@@ -203,30 +247,39 @@ export class GraphWrite {
     return this.stages[k];
   }
 
-  // ---------------------------------------------------------------- before the stages
+  // ---------------------------------------------------------------- the graph
 
-  /** Adds the labels and relationship types the plan's writes name that their graph has not. */
-  private ensure(op: PlanOp): void {
-    for (const i of inputsOf(op)) this.ensure(i);
-    if (!GRAPH_WRITE_OPS.has(op.op)) return;
-    const w = op as Op<'graphCreate'> | Op<'graphSet'> | Op<'graphDelete'> | Op<'graphMerge'>;
-    const label = (l: string): void => {
-      if (this.host.layout(w.graph).label(l) === undefined) this.host.addLabel(w.graph, l);
-    };
-    const made = (nodes: readonly GraphNewNode[], rels: readonly GraphNewRelationship[]): void => {
-      for (const n of nodes) n.labels.forEach(label);
-      for (const r of rels) if (this.host.layout(w.graph).edge(r.type) === undefined) this.host.addType(w.graph, r.type);
-    };
-    const items = (list: readonly GraphSetItem[]): void => {
-      for (const it of list) if (it.kind === 'labels') it.add.forEach(label);
-    };
-    if (w.op === 'graphCreate') made(w.nodes, w.relationships);
-    else if (w.op === 'graphSet') items(w.items);
-    else if (w.op === 'graphMerge') {
-      made(w.nodes, w.relationships);
-      items(w.onMatch);
-      items(w.onCreate);
-    }
+  /** A graph's tables as they are now: a label or a type added while the statement runs makes them others. */
+  private layoutOf(graph: string): GraphLayout {
+    const version = this.host.schemaVersion();
+    if (this.layouts === null || this.layouts.version !== version) this.layouts = { version, of: new Map() };
+    let g = this.layouts.of.get(graph);
+    if (g === undefined) this.layouts.of.set(graph, (g = this.host.layout(graph)));
+    return g;
+  }
+
+  /** A plan's output types, the tables its writes are still to make among them. */
+  private typesOf(plan: PlanOp): PlanType[] {
+    return this.named.size === 0 ? this.host.types(plan) : this.host.types(plan, (table) => this.named.get(table.toLowerCase()));
+  }
+
+  /**
+   * The label as the graph spells it, added to the graph when it has it not: when a row first needs it, so a
+   * statement no row of which reaches the write adds nothing.
+   */
+  private labelOf(op: { graph: string; tables?: readonly GraphNewTable[] }, l: string): string {
+    const known = this.layoutOf(op.graph).label(l);
+    if (known !== undefined) return known;
+    this.host.addLabel(op.graph, l, op.tables?.find((t) => 'label' in t && t.label === l)?.table);
+    return this.layoutOf(op.graph).label(l) ?? l;
+  }
+
+  /** The labels and relationship types a write's new nodes and relationships have, added to the graph where it has them not: once a run, when its first row is made. */
+  private ready(ctx: Ctx, op: { graph: string; tables?: readonly GraphNewTable[] }, nodes: readonly GraphNewNode[], rels: readonly GraphNewRelationship[]): void {
+    if (ctx.ready.has(op)) return;
+    ctx.ready.add(op);
+    for (const n of nodes) for (const l of n.labels) this.labelOf(op, l);
+    for (const r of rels) if (this.layoutOf(op.graph).edge(r.type) === undefined) this.host.addType(op.graph, r.type, op.tables?.find((t) => 'type' in t && t.type === r.type)?.table);
   }
 
   // ---------------------------------------------------------------- stages
@@ -236,8 +289,8 @@ export class GraphWrite {
    * graph, writes or stops early, so a write here may write all its rows at once.
    */
   private stream(op: PlanOp, quiet: boolean): Stream {
-    if (!writesGraph(op)) return this.query(op);
     if (holdsWrite(op)) refuse('a write in a nested plan of an expression');
+    if (!writesGraph(op)) return this.reads(op);
     switch (op.op) {
       case 'graphCreate':
         return this.create(op, this.stream(op.input, false), quiet);
@@ -249,7 +302,7 @@ export class GraphWrite {
         return this.merge(op, this.stream(op.input, false));
       case 'eager': {
         const input = this.stream(op.input, true);
-        return { types: input.types, run: (ctx, sink) => all(input, ctx).every(sink) };
+        return { types: input.types, rows: (ctx) => all(input, ctx), run: (ctx, sink) => all(input, ctx).every(sink) };
       }
       case 'limit':
         return this.limit(op, this.stream(op.input, false));
@@ -258,11 +311,13 @@ export class GraphWrite {
       case 'explode':
       case 'unpivot':
       case 'paths':
-        return this.perRow(op, this.stream(op.input, quiet && !holdsPlan(ownExprs(op))), (leaf) => ({ ...op, input: leaf }));
       case 'join': {
-        if (writesGraph(op.inputs[1])) refuse('a join whose right input writes');
-        if (op.kind === 'right' || op.kind === 'full' || op.kind === 'asof') refuse(`a ${op.kind} join over rows that were written`);
-        return this.perRow(op, this.stream(op.inputs[0], false), (leaf) => ({ ...op, inputs: [leaf, op.inputs[1]] }));
+        // These and the ones like them below, down to the first that is not, are one plan over a row.
+        const steps: Step[] = [];
+        for (let s = step(op); s !== null; s = step(s.input)) steps.push(s);
+        const bottom = steps[steps.length - 1]!.input;
+        const calm = steps.every((s) => s.calm);
+        return this.perRow(op, this.stream(bottom, quiet && calm), (leaf) => steps.reduceRight((below, s) => s.over(below), leaf));
       }
       case 'sort':
       case 'aggregate':
@@ -276,10 +331,23 @@ export class GraphWrite {
     }
   }
 
-  /** A part that writes nothing: one query, all its rows read when they are first wanted. */
+  /**
+   * A part that writes nothing. One query, unless operations at its top that pass rows on as they come read the graph
+   * for each row: from the lowest of those up they are a plan run for each row of the query below them.
+   */
+  private reads(op: PlanOp): Stream {
+    const steps: Step[] = [];
+    for (let s = op.op === 'join' ? null : step(op); s !== null; s = s.input.op === 'join' ? null : step(s.input)) steps.push(s);
+    let lowest = steps.length - 1;
+    while (lowest >= 0 && steps[lowest]!.calm) lowest--;
+    if (lowest < 0) return this.query(op);
+    return this.perRow(op, this.query(steps[lowest]!.input), (leaf) => steps.slice(0, lowest + 1).reduceRight((below, s) => s.over(below), leaf));
+  }
+
+  /** One query, all its rows read when they are first wanted. */
   private query(op: PlanOp): Stream {
     const rows = (ctx: Ctx): Row[] => this.host.run(op, ctx.params)!;
-    return { types: this.host.types(op), rows, run: (ctx, sink) => rows(ctx).every(sink) };
+    return { types: this.typesOf(op), rows, run: (ctx, sink) => rows(ctx).every(sink) };
   }
 
   /** A row as a relation, its values the plan's parameters after the statement's. */
@@ -313,7 +381,7 @@ export class GraphWrite {
   private perRow(op: PlanOp, input: Stream, over: (leaf: PlanOp) => PlanOp): Stream {
     const plan = over(this.rowLeaf(input.types));
     return {
-      types: this.host.types(op),
+      types: this.typesOf(op),
       run: (ctx, sink) => input.run(ctx, (row) => this.host.run(plan, this.withRow(ctx, row))!.every(sink)),
     };
   }
@@ -323,7 +391,7 @@ export class GraphWrite {
     const source = this.stageSource(input.types);
     const plan = over(source.op);
     return {
-      types: this.host.types(op),
+      types: this.typesOf(op),
       run: (ctx, sink) => {
         source.give(all(input, ctx));
         return this.host.run(plan, ctx.params)!.every(sink);
@@ -400,14 +468,12 @@ export class GraphWrite {
 
   // ---------------------------------------------------------------- ids
 
-  private nodeId(ctx: Ctx, g: GraphLayout): number {
-    if (ctx.nextNode < 0) ctx.nextNode = g.nodeTables.reduce((m, t) => Math.max(m, this.host.nextId(t)), 0);
-    return ctx.nextNode++;
-  }
-
-  private relId(ctx: Ctx, g: GraphLayout): number {
-    if (ctx.nextRel < 0) ctx.nextRel = g.edgeTables.reduce((m, t) => Math.max(m, this.host.nextId(t)), 0);
-    return ctx.nextRel++;
+  /** A new node's id (or a new relationship's rowid): the graph's next, asked for once a run and moved on. */
+  private newId(ctx: Ctx, g: GraphLayout, of: 'node' | 'relationship'): number {
+    const key = `${of}:${g.name}`;
+    let ids = ctx.ids.get(key);
+    if (ids === undefined) ctx.ids.set(key, (ids = this.host.ids(g.name, of)));
+    return ids[of]++;
   }
 
   // ---------------------------------------------------------------- the tables' writes
@@ -473,10 +539,9 @@ export class GraphWrite {
   // ---------------------------------------------------------------- graphCreate
 
   private create(op: Op<'graphCreate'>, input: Stream, quiet: boolean): Stream {
-    const g = this.host.layout(op.graph);
     const w = input.types.length;
     const outTypes: PlanType[] = [...input.types, ...op.nodes.map((): PlanType => 'int'), ...op.relationships.map((): PlanType => 'int')];
-    const make = this.maker(g, op.nodes, op.relationships, input.types);
+    const make = this.maker(op, op.nodes, op.relationships, input.types);
     void quiet;
     return {
       types: outTypes,
@@ -496,21 +561,32 @@ export class GraphWrite {
    * What makes a row's nodes and relationships (`graphCreate`, and `graphMerge` when nothing matches): `row` gives
    * the row with their ids after its own columns.
    */
-  private maker(g: GraphLayout, nodes: readonly GraphNewNode[], rels: readonly GraphNewRelationship[], types: readonly PlanType[]): { early: (ctx: Ctx, rows: Row[]) => Row[] | undefined; row: (ctx: Ctx, row: Row, early: Row | undefined, w: number) => Row } {
+  private maker(op: { graph: string; tables?: readonly GraphNewTable[] }, nodes: readonly GraphNewNode[], rels: readonly GraphNewRelationship[], types: readonly PlanType[]): { early: (ctx: Ctx, rows: Row[]) => Row[] | undefined; row: (ctx: Ctx, row: Row, early: Row | undefined, w: number) => Row } {
     const w = types.length;
     const rowTypes: PlanType[] = [...types, ...nodes.map((): PlanType => 'int'), ...rels.map((): PlanType => 'int')];
     const ev = this.evaluator(rowTypes, w);
     const nodeProps = nodes.map((n, k) => {
       if (n.props && !isMapType(typeOf(n.props))) throw new SmaltError('SMALT_PLAN', `graphCreate: a node's props is a map, not ${typeOf(n.props)}`);
-      return n.props ? ev.add(n.props, w + k) : null;
+      return n.props ? { ref: ev.add(n.props, w + k), typed: asProps(typeOf(n.props)) } : null;
     });
-    // The labels as the graph spells them, each once; the node's own table gives it its label without an entry.
-    const labels = nodes.map((n) => [...new Set(n.labels.map((l) => g.label(l) ?? l))].filter((l) => l !== g.nodes.label));
+    /** A props expression's value as properties. */
+    const propsOf = (p: { ref: EvalRef; typed: ((m: Uint8Array) => Uint8Array) | null } | null, vals: Values) => {
+      if (p === null) return settable(EMPTY_MAP);
+      const m = asMap(vals.get(p.ref), op.graph);
+      return settable(p.typed ? p.typed(m) : m);
+    };
+    // The labels as the graph spells them, each once; the node's own table gives it its label without an entry. Read
+    // again when the graph is another (a label added to it).
+    let spelled: { g: GraphLayout; labels: string[][] } | null = null;
+    const labelsIn = (g: GraphLayout): string[][] => {
+      if (spelled === null || spelled.g !== g) spelled = { g, labels: nodes.map((n) => [...new Set(n.labels.map((l) => g.label(l) ?? l))].filter((l) => l !== g.nodes.label)) };
+      return spelled.labels;
+    };
     const ends = (e: GraphEnd, at: number): { node: number } | { value: EvalRef } => ('node' in e ? { node: e.node } : { value: ev.add(e.id, at) });
     const relParts = rels.map((r, j) => {
       if (r.props && !isMapType(typeOf(r.props))) throw new SmaltError('SMALT_PLAN', `graphCreate: a relationship's props is a map, not ${typeOf(r.props)}`);
       const at = w + nodes.length + j;
-      return { type: r.type, start: ends(r.start, at), end: ends(r.end, at), props: r.props ? ev.add(r.props, at) : null };
+      return { type: r.type, start: ends(r.start, at), end: ends(r.end, at), props: r.props ? { ref: ev.add(r.props, at), typed: asProps(typeOf(r.props)) } : null };
     });
     return {
       early: (ctx, rows) => ev.early(ctx, rows),
@@ -518,10 +594,13 @@ export class GraphWrite {
         const out: Row = new Array(width + nodes.length + rels.length).fill(null);
         for (let i = 0; i < width; i++) out[i] = row[i]!;
         const vals = ev.over(ctx, out, early);
+        // The labels and types the graph has not are added now, when a row is first made.
+        this.ready(ctx, op, nodes, rels);
+        const g = this.layoutOf(op.graph);
+        const labels = labelsIn(g);
         nodes.forEach((n, k) => {
-          const p = nodeProps[k];
-          const props = settable(p === null ? EMPTY_MAP : asMap(vals.get(p!), g.name));
-          const id = this.nodeId(ctx, g);
+          const props = propsOf(nodeProps[k]!, vals);
+          const id = this.newId(ctx, g, 'node');
           this.appendNode(g, id, props.map);
           for (const l of labels[k]!) this.appendLabel(g, id, l);
           out[width + k] = id;
@@ -533,8 +612,8 @@ export class GraphWrite {
           const end = (e: { node: number } | { value: EvalRef }): SqlValue => ('node' in e ? out[width + e.node]! : vals.get(e.value));
           const start = end(r.start);
           const finish = end(r.end);
-          const props = settable(r.props === null ? EMPTY_MAP : asMap(vals.get(r.props), g.name));
-          const rowid = this.relId(ctx, g);
+          const props = propsOf(r.props, vals);
+          const rowid = this.newId(ctx, g, 'relationship');
           this.appendEdge(g, r.type, rowid, start, finish, props.map, props.keys.length);
           out[width + nodes.length + j] = rowid;
           ctx.counts.relationshipsCreated++;
@@ -548,13 +627,12 @@ export class GraphWrite {
   // ---------------------------------------------------------------- graphSet
 
   private set(op: Op<'graphSet'>, input: Stream): Stream {
-    const g = this.host.layout(op.graph);
-    const apply = this.setter(g, op.items, input.types);
+    const apply = this.setter(op, op.items, input.types);
     return { types: input.types, run: (ctx, sink) => input.run(ctx, (row) => (apply(ctx, row), sink(row))) };
   }
 
   /** What applies `items` to a row, item by item. */
-  private setter(g: GraphLayout, items: readonly GraphSetItem[], types: readonly PlanType[]): (ctx: Ctx, row: Row) => void {
+  private setter(op: { graph: string; tables?: readonly GraphNewTable[] }, items: readonly GraphSetItem[], types: readonly PlanType[]): (ctx: Ctx, row: Row) => void {
     if (items.length === 0) return () => undefined;
     const w = types.length;
     // Each item's expressions are computed when its turn comes: an item reads what the items before it wrote.
@@ -564,38 +642,47 @@ export class GraphWrite {
       node: it.node !== undefined ? ev.late(it.node) : null,
       rel: it.relationship !== undefined ? { type: ev.late(it.relationship.type), id: ev.late(it.relationship.id) } : null,
       value: it.kind === 'labels' ? null : ev.late(it.value),
+      // A property's value is one of any kind in the map: a boolean, a list or a map keeps its type there (ADR 0039).
+      typed: it.kind === 'property' ? toAny(typeOf(it.value)) : null,
+      props: it.kind === 'properties' ? asProps(typeOf(it.value)) : null,
     }));
     return (ctx, row) => {
       const vals = ev.over(ctx, row, undefined);
       for (const p of parts) {
         // The node or relationship first: for a NULL one, the value is not computed.
-        const target = this.target(g, p.node === null ? null : vals.get(p.node), p.rel === null ? null : { type: vals.get(p.rel.type), id: vals.get(p.rel.id) });
+        const target = this.target(this.layoutOf(op.graph), p.node === null ? null : vals.get(p.node), p.rel === null ? null : { type: vals.get(p.rel.type), id: vals.get(p.rel.id) });
         if (target === null) continue;
         const it = p.it;
         if (it.kind === 'labels') {
           if (p.node === null) continue;
           for (const l of it.add) {
-            const label = g.label(l) ?? l;
+            // A label the graph has not is added to it now, when a node first takes it.
+            const label = this.labelOf(op, l);
+            const g = this.layoutOf(op.graph);
             if (label === g.nodes.label || this.hasLabel(g, target.rowid, label)) continue;
             this.appendLabel(g, target.rowid, label);
             ctx.counts.labelsAdded++;
           }
           for (const l of it.remove) {
+            const g = this.layoutOf(op.graph);
             const label = g.label(l);
             if (label !== undefined && label !== g.nodes.label) ctx.counts.labelsRemoved += this.dropLabel(g, target.rowid, label);
           }
           continue;
         }
         const cur = this.propsOf(target.table, target.props, target.rowid);
+        // The value is computed for one that is gone too: an error in it is raised either way.
+        const given = vals.get(p.value!);
+        const value = p.typed ? p.typed(given) : given;
         if (cur === undefined) continue;
-        const value = vals.get(p.value!);
         const entries = entriesOf(cur);
         if (it.kind === 'property') {
           if (value === null) entries.delete(it.key);
           else entries.set(it.key, value);
           ctx.counts.propertiesSet++;
         } else {
-          const given = settable(asMap(value, g.name));
+          const m = asMap(value, op.graph);
+          const given = settable(p.props ? p.props(m) : m);
           const map = entriesOf(given.map);
           if (it.merge) {
             for (const k of given.nulls) entries.delete(k);
@@ -629,7 +716,6 @@ export class GraphWrite {
   // ---------------------------------------------------------------- graphDelete
 
   private delete(op: Op<'graphDelete'>, input: Stream): Stream {
-    const g = this.host.layout(op.graph);
     const ev = this.evaluator(input.types, input.types.length);
     const parts = op.targets.map((t: GraphDeleteTarget) =>
       'node' in t
@@ -638,18 +724,32 @@ export class GraphWrite {
           ? { nodes: ev.late(t.nodes) }
           : 'relationship' in t
             ? { rel: { type: ev.late(t.relationship.type), id: ev.late(t.relationship.id) } }
-            : { rels: { types: ev.late(t.relationships.types), ids: ev.late(t.relationships.ids) } },
+            : 'hops' in t
+              ? { hops: ev.late(t.hops) }
+              : { path: { start: ev.late(t.path.start), hops: ev.late(t.path.hops) } },
     );
     const node = (ctx: Ctx, id: SqlValue): void => {
       if (id === null) return;
+      const g = this.layoutOf(op.graph);
       if (op.detach) for (const type of g.edgeTables) ctx.counts.relationshipsDeleted += this.detach(g, type, id);
       ctx.counts.nodesDeleted += this.deleteRow(g.nodes.table, id);
     };
     const rel = (ctx: Ctx, type: SqlValue, id: SqlValue): void => {
-      const t = this.target(g, null, { type, id });
+      const t = this.target(this.layoutOf(op.graph), null, { type, id });
       if (t !== null) ctx.counts.relationshipsDeleted += this.deleteRow(t.table, t.rowid);
     };
     const list = (v: SqlValue): readonly SqlValue[] => (v === null ? [] : v instanceof Uint8Array ? decodeKey(v) : refuse('a delete of a value that is not a list'));
+    // A list of hops: each a struct of its type's position in the graph, its rowid and its two ends.
+    const hops = (v: SqlValue): { edge: SqlValue; rowid: SqlValue; to: SqlValue }[] =>
+      list(v).flatMap((h) => {
+        if (h === null) return [];
+        const [edge, rowid, , to] = decodeKey(h as Uint8Array);
+        return [{ edge: edge ?? null, rowid: rowid ?? null, to: to ?? null }];
+      });
+    const hop = (ctx: Ctx, h: { edge: SqlValue; rowid: SqlValue }): void => {
+      const table = typeof h.edge === 'number' ? this.layoutOf(op.graph).edgeTables[h.edge] : undefined;
+      if (table !== undefined && h.rowid !== null) ctx.counts.relationshipsDeleted += this.deleteRow(table, h.rowid);
+    };
     return {
       types: input.types,
       run: (ctx, sink) =>
@@ -659,9 +759,15 @@ export class GraphWrite {
             if ('node' in p) node(ctx, vals.get(p.node!));
             else if ('nodes' in p) for (const id of list(vals.get(p.nodes!))) node(ctx, id);
             else if ('rel' in p) rel(ctx, vals.get(p.rel!.type), vals.get(p.rel!.id));
+            else if ('hops' in p) for (const h of hops(vals.get(p.hops!))) hop(ctx, h);
             else {
-              const types = list(vals.get(p.rels!.types));
-              list(vals.get(p.rels!.ids)).forEach((id, i) => rel(ctx, types[i] ?? null, id));
+              // A path: its relationships, then its nodes. A NULL start or list is no path.
+              const start = vals.get(p.path!.start);
+              const given = vals.get(p.path!.hops);
+              if (start === null || given === null) continue;
+              const path = hops(given);
+              for (const h of path) hop(ctx, h);
+              for (const id of [start, ...path.map((h) => h.to)]) node(ctx, id);
             }
           }
           return sink(row);
@@ -684,24 +790,26 @@ export class GraphWrite {
   // ---------------------------------------------------------------- graphMerge
 
   private merge(op: Op<'graphMerge'>, input: Stream): Stream {
-    const g = this.host.layout(op.graph);
     const w = input.types.length;
     const leaf = this.rowLeaf(input.types);
     // The match over one row: its `working` leaves are the row.
     const match = replaceWorking(op.match, op.id, leaf);
     if (writesGraph(op.match)) refuse('a match that writes');
-    const matchTypes = this.host.types(match);
+    const matchTypes = this.typesOf(match);
     const m = matchTypes.length;
-    const make = this.maker(g, op.nodes, op.relationships, input.types);
+    const make = this.maker(op, op.nodes, op.relationships, input.types);
     const madeTypes: PlanType[] = [...input.types, ...op.nodes.map((): PlanType => 'int'), ...op.relationships.map((): PlanType => 'int')];
     const created = [...op.created];
     const outTypes = [...input.types, ...matchTypes];
-    const onMatch = this.setter(g, op.onMatch, outTypes);
-    const onCreate = this.setter(g, op.onCreate, outTypes);
+    const onMatch = this.setter(op, op.onMatch, outTypes);
+    const onCreate = this.setter(op, op.onCreate, outTypes);
     return {
       types: outTypes,
       run: (ctx, sink) =>
         input.run(ctx, (row) => {
+          // What the match reads of the labels and types it would make is there before it runs: a row of a label or
+          // type the graph has not finds nothing, and makes it.
+          this.ready(ctx, op, op.nodes, op.relationships);
           const found = this.host.run(match, this.withRow(ctx, row))!;
           if (found.length > 0) {
             for (const f of found) {
@@ -718,6 +826,34 @@ export class GraphWrite {
           return sink(out);
         }),
     };
+  }
+}
+
+/** An operation that passes rows on as they come: its input that writes, itself over another input, and whether it reads only its row. */
+interface Step {
+  readonly input: PlanOp;
+  readonly over: (leaf: PlanOp) => PlanOp;
+  readonly calm: boolean;
+}
+
+/** `op` as a step of a plan run for each row, or null when it is not one that passes rows on as they come. */
+function step(op: PlanOp): Step | null {
+  switch (op.op) {
+    case 'filter':
+    case 'project':
+    case 'explode':
+    case 'unpivot':
+      return { input: op.input, over: (leaf) => ({ ...op, input: leaf }), calm: !holdsPlan(ownExprs(op)) };
+    case 'paths':
+      // It reads the graph's relationships.
+      return { input: op.input, over: (leaf) => ({ ...op, input: leaf }), calm: false };
+    case 'join':
+      if (!writesGraph(op.inputs[0])) return refuse('a join whose right input writes');
+      if (writesGraph(op.inputs[1])) return refuse('a join whose inputs both write');
+      if (op.kind === 'right' || op.kind === 'full' || op.kind === 'asof') return refuse(`a ${op.kind} join over rows that were written`);
+      return { input: op.inputs[0], over: (leaf) => ({ ...op, inputs: [leaf, op.inputs[1]] }), calm: false };
+    default:
+      return null;
   }
 }
 
