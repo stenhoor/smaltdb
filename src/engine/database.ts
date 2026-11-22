@@ -14,7 +14,7 @@ import {
 } from './catalog/schema.js';
 import { MisuseError, SmaltError, constraintMessage, withDetails, wordError } from './errors.js';
 import { type StaticType, staticTypeOfStorage, truthy } from './exec/convert.js';
-import { type ConflictAction, PATH_TYPE, type PlanOp } from './plan/ops.js';
+import { type ConflictAction, type GraphWriteCounts, PATH_TYPE, type PlanOp } from './plan/ops.js';
 import { type EncodedPlan, canonicalJSON, decodeData, decodePlan, encodeData, encodePlan, plainJSON, planFromJSON, planToJSON } from './plan/codec.js';
 import { type PlanStatementInput, nestedParams, paramCount, toBoundStatement, toPlanStatement } from './plan/statement.js';
 import { type NormalizeCatalog, PATHS_FUNCTION, type TableTypes, normalizePlan, normalizeWrite } from './exec/plan-normalize.js';
@@ -67,6 +67,7 @@ import { type CatalogSnapshot, informationSchema } from './catalog/information-s
 import { type LanguageStatement, type SmaltLanguage, languagePart, registeredLanguage } from './plan/language.js';
 import { ForeignKeys } from './exec/fk.js';
 import { GraphRules } from './exec/graph-rules.js';
+import { type GraphIds, type GraphLayout, GraphWrite, type GraphWriteHost, STAGE_ROWS, writesGraph } from './exec/graph-write.js';
 import { HISTORY_COLUMN_NAMES, LOG_COLUMNS, VERSION_COLUMNS, historyHooks, logHooks, logTableName, sinceTableName, versionsTableName } from './exec/history.js';
 import { PluginRegistry, type SmaltPlugin } from './plugin.js';
 import { Collation, type SqlValue } from './values.js';
@@ -77,6 +78,8 @@ export interface RunResult {
   lastInsertRowid: number | bigint;
   /** A `drop` or `alterTable` with `cascade`: the views it dropped because it broke their interface (ADR 0027). */
   cascaded?: string[];
+  /** What a plan that writes a property graph did (ADR 0042). */
+  graph?: GraphWriteCounts;
 }
 
 export interface QueryResult {
@@ -88,6 +91,8 @@ export interface QueryResult {
   changes?: number;
   /** A write's last inserted rowid, as `run` gives it. */
   lastInsertRowid?: number | bigint;
+  /** What a plan that writes a property graph did (ADR 0042). */
+  graph?: GraphWriteCounts;
 }
 
 /** Parameters: positional array (slot 1 = index 0) or named object (`{ a: 1 }` matches `:a`, `@a`, `$a`). */
@@ -1185,6 +1190,8 @@ export class Database implements FunctionContext {
   }
 
   private internalPrograms = new WeakMap<PlanOp, { version: number; prog: Program }>();
+  /** How many rows the write last run by `internalPlan` changed. */
+  private internalChanges = 0;
 
   /**
    * Run an internal statement (foreign-key checks and actions) with positional parameters, inside
@@ -1207,7 +1214,7 @@ export class Database implements FunctionContext {
     const taken = this.writersTaken.length;
     try {
       if (p.exec) {
-        p.exec(regs);
+        this.internalChanges = p.exec(regs).changes;
         return null;
       }
       const root = p.plan!.root;
@@ -1248,6 +1255,11 @@ export class Database implements FunctionContext {
     // As in SQLite, a schema qualifier on a pragma function (main.pragma_table_info) changes nothing.
     const lower = name.toLowerCase().replace(/^(main|temp)\./, '');
     if (schema === undefined && lower === PATHS_FUNCTION) return this.pathsFunction;
+    if (schema === undefined && lower.startsWith(STAGE_ROWS)) {
+      // The rows a stage of the running plan that writes a graph holds (exec/graph-write.ts): read when the plan runs.
+      const stage = this.stageOwner?.stage(Number(lower.slice(STAGE_ROWS.length)));
+      return stage && { columns: stage.types.map((type, i) => ({ name: `c${i}`, type })), rows: () => stage.rows };
+    }
     if (schema === undefined && lower === 'list_elements') return LIST_ELEMENTS;
     if (schema === undefined && lower === 'range') return RANGE;
     if (!lower.startsWith('pragma_')) return undefined;
@@ -3806,6 +3818,7 @@ export class Database implements FunctionContext {
     this.dirtySchema = true;
     this.removeCatalogRow(g.graph.name, graphKey(g.graph.name));
     this.graphs.delete(stmt.name.toLowerCase());
+    this.graphIds.delete(stmt.name.toLowerCase());
     this.schemaChanged();
     return none;
   }
@@ -5152,6 +5165,8 @@ export class Database implements FunctionContext {
 
   private compileWriteOp(fe: BoundWrite, planner: Planner): Omit<Program, 'regCount'> {
     const op = fe.plan;
+    // A plan that writes a property graph, wherever in it the write is: run in stages, which refuse what they can't run.
+    if (writesGraph(op)) return this.graphWriteProgram(fe);
     switch (op.op) {
       case 'append': {
         const table = this.targetTable(op.table, op.db);
@@ -5164,8 +5179,190 @@ export class Database implements FunctionContext {
       case 'delete':
         return this.dmlProgram(this.compileDelete(op, fe, this.targetTable(op.table, op.db), planner));
       default:
-        throw new SmaltError('SMALT_INTERNAL', `not a write plan: ${op.op}`);
+        throw new SmaltError('SMALT_PLAN', `a write statement's plan is an append, an update, a delete or a plan that writes a property graph, not ${op.op}`);
     }
+  }
+
+  /**
+   * A plan that writes a property graph (ADR 0042, section 1): run in stages (exec/graph-write.ts). Its rows are the
+   * statement's, all of them read before it returns, and what it wrote is kept for the statement's result.
+   */
+  private graphWriteProgram(fe: BoundWrite): Omit<Program, 'regCount'> {
+    const params = paramCount(fe);
+    const write = new GraphWrite(fe.plan, params, this.graphWriteHost);
+    const columns = fe.returning ?? [];
+    return {
+      readonly: false,
+      rows: (r) => {
+        const outer = this.stageOwner;
+        this.stageOwner = write;
+        try {
+          const { rows, counts } = write.run(r.slice(0, params));
+          const changes = counts.nodesCreated + counts.nodesDeleted + counts.relationshipsCreated + counts.relationshipsDeleted + counts.propertiesSet + counts.labelsAdded + counts.labelsRemoved;
+          this.lastChanges = changes;
+          this.total += changes;
+          this.graphWritten = counts;
+          return rows;
+        } finally {
+          this.stageOwner = outer;
+        }
+      },
+      columns: columns.map((c) => c.name),
+      columnTypes: columns.map((c) => c.type),
+    };
+  }
+
+  /** The plan that writes a graph whose stages are being compiled or run: its stages' rows are read through it (`virtualTable`). */
+  private stageOwner: GraphWrite | null = null;
+  /** What the last plan that wrote a graph did, until its statement's result takes it. */
+  private graphWritten: GraphWriteCounts | null = null;
+
+  /** @internal What the statement just run wrote of a graph, once. */
+  takeGraphWritten(): GraphWriteCounts | undefined {
+    const g = this.graphWritten ?? undefined;
+    this.graphWritten = null;
+    return g;
+  }
+
+  private readonly graphWriteHost: GraphWriteHost = {
+    layout: (name) => this.graphLayout(name),
+    schemaVersion: () => this.schemaVersion,
+    types: (plan, more) => outputTypes(plan, more ? (t, db) => this.tableTypes(t, db) ?? (db === 'temp' ? undefined : more(t)) : this.tableTypes),
+    run: (plan, params) => {
+      // A stage reads the graph as it is now: what was asked once for the statement so far is asked again.
+      this.state.epoch++;
+      return this.internalPlan(plan, params as SqlValue[]);
+    },
+    changes: () => this.internalChanges,
+    deleteRows: (table, rowids) => this.deleteRowids(this.targetTable(table), rowids),
+    ids: (graph, of) => this.graphIdsOf(graph, of),
+    addLabel: (graph, label, table) => {
+      this.newGraphTable(graph, table);
+      this.alterPropertyGraph({ op: 'alterPropertyGraph', name: graph, action: { kind: 'addLabel', label, ...(table !== undefined ? { table } : {}) } });
+    },
+    addType: (graph, type, table) => {
+      this.newGraphTable(graph, table);
+      this.alterPropertyGraph({ op: 'alterPropertyGraph', name: graph, action: { kind: 'addType', type, ...(table !== undefined ? { table } : {}) } });
+    },
+  };
+
+  /**
+   * Deletes the rows of `table` with these rowids inside the running statement, as a DELETE of them does once it
+   * has read which rows it deletes (`compileDelete`): each through the table's writer. How many were there; a value
+   * that is no rowid names no row.
+   */
+  private deleteRowids(table: TableSchema, rowids: readonly SqlValue[]): number {
+    // The writers taken are free again when this ends, as after an internal plan.
+    const taken = this.writersTaken.length;
+    try {
+      const writer = this.writerFor(table);
+      let n = 0;
+      for (const rowid of rowids) {
+        if (typeof rowid !== 'bigint' && !(typeof rowid === 'number' && Number.isInteger(rowid))) continue;
+        if (writer.deleteRow(rowid)) n++;
+      }
+      return n;
+    } finally {
+      while (this.writersTaken.length > taken) this.writersBusy.delete(this.writersTaken.pop()!);
+    }
+  }
+
+  private readonly graphLayouts = new WeakMap<PropertyGraphDef, GraphLayout>();
+
+  /** A table a plan names for a label or type it adds to a graph is a new one: an existing table is not taken for it. */
+  private newGraphTable(graph: string, table: string | undefined): void {
+    if (table !== undefined && this.catalog.table(table, 'main')) throw new SmaltError('SMALT_ERROR', `property graph ${graph}: table ${table} exists already`);
+  }
+
+  /** A graph's tables as a plan that writes it needs them (a graph changed is another definition). */
+  private graphLayout(name: string): GraphLayout {
+    const g = this.graphs.get(name.toLowerCase())?.graph;
+    if (!g) throw new SmaltError('SMALT_ERROR', `no such property graph: ${name}`);
+    let layout = this.graphLayouts.get(g);
+    if (layout) return layout;
+    const home = g.nodes.find((n) => n.props !== undefined);
+    if (!home || !g.labels) throw new SmaltError('SMALT_ERROR', `property graph ${g.name} can't be written by a plan: it needs a node table with a props column and a label index`);
+    const table = (n: string): TableSchema => {
+      const t = this.tables.get(n.toLowerCase());
+      if (!t) throw new SmaltError('SMALT_ERROR', `property graph ${g.name}: no such table: ${n}`);
+      return t;
+    };
+    const fold = g.caseSensitive === false ? (s: string) => s.toLowerCase() : (s: string) => s;
+    const labels = new Map(g.nodes.map((n) => [fold(n.label), n.label]));
+    const edges = new Map(
+      g.edges.map((e) => {
+        const t = table(e.table);
+        return [fold(e.type), { table: t.name, start: findColumn(t, e.start), end: findColumn(t, e.end), props: e.props === undefined ? -1 : findColumn(t, e.props) }] as const;
+      }),
+    );
+    const nodes = table(home.table);
+    const index = table(g.labels.table);
+    layout = {
+      name: g.name,
+      nodes: { table: nodes.name, id: findColumn(nodes, home.id), props: findColumn(nodes, home.props!), label: home.label },
+      labels: { table: index.name, node: findColumn(index, g.labels.node), label: findColumn(index, g.labels.label) },
+      nodeTables: g.nodes.map((n) => table(n.table).name),
+      edgeTables: g.edges.map((e) => table(e.table).name),
+      label: (l) => labels.get(fold(l)),
+      edge: (t) => edges.get(fold(t)),
+      history: g.history !== undefined,
+    };
+    this.graphLayouts.set(g, layout);
+    return layout;
+  }
+
+  private readonly pastIdPlans = new Map<string, PlanOp>();
+
+  /** One more than the largest rowid a table has had: its rows', and where it keeps history its past versions'. 0 for none. */
+  /**
+   * A graph's next ids (`GraphWriteHost.ids`), `of` brought up to the graph's tables as they are now. A table's past
+   * versions are read the first time the table is asked of: after that every id it has had was either in its rows,
+   * or given through these ids.
+   */
+  private graphIdsOf(name: string, of: 'node' | 'relationship'): GraphIds {
+    const g = this.graphLayout(name);
+    const key = g.name.toLowerCase();
+    let kept = this.graphIds.get(key);
+    if (!kept) this.graphIds.set(key, (kept = { ids: { node: 0, relationship: 0 }, past: new Set() }));
+    for (const table of of === 'node' ? g.nodeTables : g.edgeTables) {
+      const first = !kept.past.has(table);
+      if (first) kept.past.add(table);
+      kept.ids[of] = Math.max(kept.ids[of], this.nextIdOf(table, first));
+    }
+    return kept.ids;
+  }
+
+  /** The graphs' next ids, by the graph's name in lower case, with the tables whose past versions were read for them. */
+  private readonly graphIds = new Map<string, { ids: GraphIds; past: Set<string> }>();
+
+  /** One more than the largest rowid of a table; with `past`, of its past versions too where it keeps history. */
+  private nextIdOf(name: string, past: boolean): number {
+    const t = this.tables.get(name.toLowerCase());
+    if (!t) throw new SmaltError('SMALT_ERROR', `no such table: ${name}`);
+    let max = -1;
+    const c = this.tree(t.rootPage).cursor();
+    try {
+      if (c.last()) {
+        c.loadKey();
+        max = Number(readRowidKey(c.keyBytes, c.keyOffset));
+      }
+    } finally {
+      c.close();
+    }
+    if (t.history && past) {
+      // A past version holds its row's rowid as a column: an id is not given again while a version has it.
+      const past = t.history === 'log' ? logTableName(t.name) : versionsTableName(t.name);
+      const column = t.history === 'log' ? LOG_COLUMNS.indexOf('$rowid') : VERSION_COLUMNS.indexOf('$rowid');
+      let plan = this.pastIdPlans.get(past);
+      if (!plan) {
+        plan = { op: 'aggregate', input: { op: 'scan', table: past, columns: [column] }, keys: [], aggs: [{ fn: 'max', args: [{ k: 'col', input: 0, index: 0, depth: 0, type: 'int', collation: 'binary' }], star: false, distinct: false, collation: 'binary', type: 'int' }], carry: [] };
+        this.pastIdPlans.set(past, plan);
+      }
+      const m = this.internalPlan(plan, [])?.[0]?.[0];
+      if (typeof m === 'number' && m > max) max = m;
+      else if (typeof m === 'bigint' && Number(m) > max) max = Number(m);
+    }
+    return max + 1;
   }
 
   /** Normalize a rowid value (INTEGER PRIMARY KEY must hold an integer). */
@@ -6003,7 +6200,8 @@ export abstract class PreparedStatement {
       }
       return null;
     });
-    return { changes: 0, lastInsertRowid: this.db.lastInsertRowid() };
+    const graph = this.db.takeGraphWritten();
+    return graph ? { changes: this.db.changes(), lastInsertRowid: this.db.lastInsertRowid(), graph } : { changes: 0, lastInsertRowid: this.db.lastInsertRowid() };
   }
 
   /** Execute and return every row as an array of values. */
@@ -6049,7 +6247,8 @@ export abstract class PreparedStatement {
     if (p.rows) {
       const rows = this.db.execute(p, () => p.rows!(regs));
       // A write with RETURNING: its counts, as `run` would give them.
-      const run = p.readonly ? null : { changes: this.db.changes(), lastInsertRowid: this.db.lastInsertRowid() };
+      const graph = this.db.takeGraphWritten();
+      const run = p.readonly ? null : { changes: this.db.changes(), lastInsertRowid: this.db.lastInsertRowid(), ...(graph ? { graph } : {}) };
       return new RowCursor(this.db, null, rows, regs, p.columns, p.columnTypes, run, form);
     }
     this.db.execute(p, () => undefined); // bump epoch
@@ -6672,7 +6871,8 @@ function normalizeBound(b: BoundStatement, types?: NormalizeCatalog): BoundState
     case 'explain':
       return { ...b, query: { ...b.query, plan: normalizePlan(b.query.plan, types) } };
     case 'write':
-      return { ...b, plan: normalizeWrite(b.plan, types) };
+      // A plan that writes a graph is run in stages, each normalized when it is compiled (exec/graph-write.ts).
+      return writesGraph(b.plan) ? b : { ...b, plan: normalizeWrite(b.plan, types) };
     default:
       return b;
   }
@@ -6717,6 +6917,12 @@ const REWRITES: { readonly [K in PlanOp['op']]: boolean | ((o: Record<string, un
   append: false,
   update: false,
   delete: false,
+  graphCreate: false,
+  graphSet: false,
+  graphDelete: false,
+  graphMerge: false,
+  // In a plan that writes no graph: dropped.
+  eager: true,
 };
 
 /** Whether `v` (a plan, or any part of one) holds an operation that normalizePlan rewrites into others. */

@@ -546,7 +546,7 @@ export class EngineServer {
           : st instanceof Statement
             ? await this.withAbort(session, id, (signal) => d.runAsync(st.sql, params, { signal }))
             : await this.withAbort(session, id, (signal) => d.withExternal(signal, st, () => st.run(params)));
-        this.send(session, { id, kind: 'ok', changes: r.changes, lastInsertRowid: r.lastInsertRowid });
+        this.send(session, { id, kind: 'ok', changes: r.changes, lastInsertRowid: r.lastInsertRowid, ...(r.graph ? { graph: r.graph } : {}) });
         return;
       }
       case 'stmtQuery': {
@@ -779,7 +779,7 @@ export class EngineServer {
     if (n < s.batchSize) {
       this.endStream(s);
       const run = s.cursor.run;
-      this.send(s.session, run ? { id: s.id, kind: 'done', changes: run.changes, lastInsertRowid: run.lastInsertRowid } : { id: s.id, kind: 'done' });
+      this.send(s.session, run ? { id: s.id, kind: 'done', changes: run.changes, lastInsertRowid: run.lastInsertRowid, ...(run.graph ? { graph: run.graph } : {}) } : { id: s.id, kind: 'done' });
     }
   }
 

@@ -150,6 +150,15 @@ function rewriteAll(x: unknown): unknown {
     case 'update':
     case 'delete':
       return op;
+    // In a plan that writes no graph, what is below is done before what is above starts whichever way it is run.
+    case 'eager':
+      return op.input;
+    // A plan that writes a graph is not normalized whole: it is run in stages (exec/graph-write.ts), each normalized.
+    case 'graphCreate':
+    case 'graphSet':
+    case 'graphDelete':
+    case 'graphMerge':
+      return op;
     default: {
       // Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
       const unhandled: never = op;
@@ -1163,6 +1172,13 @@ function from(op: PlanOp): PlanOp {
     case 'update':
     case 'delete':
       return block(op);
+    // Not reached: `eager` is rewritten away, and a plan that writes a graph is run in stages (exec/graph-write.ts).
+    case 'graphCreate':
+    case 'graphSet':
+    case 'graphDelete':
+    case 'graphMerge':
+    case 'eager':
+      throw new SmaltError('SMALT_INTERNAL', `${op.op} in a plan the planner reads`);
     default: {
       // Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
       const unhandled: never = op;

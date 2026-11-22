@@ -6,6 +6,7 @@ import type { SqlValue } from '../engine/values.js';
 import { decodeDataJSON, encodeDataJSON } from '../engine/plan/codec.js';
 import type { ErrorDetails } from '../engine/errors.js';
 import type { CatalogData } from '../engine/plan/catalog.js';
+import type { GraphWriteCounts } from '../engine/plan/ops.js';
 import type { PlanStatementInput } from '../engine/plan/statement.js';
 import { PLAN_FORMAT_VERSION, type PlanType } from '../engine/plan/types.js';
 import { type TemporalForm, isTemporal, temporalInForm, temporalText } from '../shared/temporal.js';
@@ -13,7 +14,7 @@ import { isNestedType, nestedResult } from '../shared/nested.js';
 import { type BusMessage, type Params, type PlanParams, type Request, type RequestBody, type Response, type WireColumn, columnValue } from '../shared/protocol.js';
 
 /** A statement as plan data (the plan format is experimental): its types, builders and codec are in `smaltdb/plan`. */
-export type { SqlValue, Params, PlanStatementInput };
+export type { SqlValue, Params, PlanStatementInput, GraphWriteCounts };
 export type { TemporalForm } from '../shared/temporal.js';
 
 /** A plan's parameters: positional (a parameter read as a list, struct or map takes a JS array, an object or a `Map`). */
@@ -88,6 +89,8 @@ export interface StreamOptions extends QueryOptions {
 export interface RunResult {
   changes: number;
   lastInsertRowid: number | bigint;
+  /** What a plan that wrote a property graph did: its nodes, relationships, properties and labels, counted. */
+  graph?: GraphWriteCounts;
 }
 
 /** Result of a query in 'array' mode: rows plus column names and plan types. */
@@ -416,7 +419,7 @@ export class Database implements Queryable {
         break;
       case 'done':
         this.pending.delete(msg.id);
-        p.resolve({ columns: p.columns!, types: p.types, batches: p.batches!, ...(msg.changes !== undefined ? { run: { changes: msg.changes, lastInsertRowid: msg.lastInsertRowid! } } : {}) } satisfies Collected);
+        p.resolve({ columns: p.columns!, types: p.types, batches: p.batches!, ...(msg.changes !== undefined ? { run: { changes: msg.changes, lastInsertRowid: msg.lastInsertRowid!, ...(msg.graph ? { graph: msg.graph } : {}) } } : {}) } satisfies Collected);
         break;
     }
   }
@@ -477,7 +480,8 @@ export class Database implements Queryable {
    * Run a statement given as plan data instead of SQL (the plan format is experimental; see the `plan` export): a
    * query plan, or a query, write or other statement as `PlanStatementInput` describes. Parameters are positional.
    * Rows come back as `query` returns them; like `query`, it may run on a parallel reader. A write's result (its
-   * RETURNING rows, if any) also has `changes` and `lastInsertRowid`, as `run` gives them.
+   * RETURNING rows, if any) also has `changes` and `lastInsertRowid`, as `run` gives them, and `graph` where it wrote
+   * a property graph.
    */
   queryPlan<T = Record<string, SqlValue>, M extends RowMode | undefined = undefined>(stmt: PlanStatementInput, params?: PlanParams, options: QueryOptions & { rowMode?: M } = {}): Promise<QueryResultFor<M, T> & Partial<RunResult>> {
     return this.afterTransaction(() => this.rawQueryPlan(stmt, params, options)) as Promise<QueryResultFor<M, T> & Partial<RunResult>>;
@@ -817,8 +821,8 @@ export class PreparedStatement {
   /** @internal */
   async rawRun(params: Params | PlanParams | undefined, options: { signal?: AbortSignal }): Promise<RunResult> {
     this.check();
-    const r = (await this.db.request({ op: 'stmtRun', stmt: this.id, params }, options.signal)) as { changes: number; lastInsertRowid: number | bigint };
-    return { changes: r.changes, lastInsertRowid: r.lastInsertRowid };
+    const r = (await this.db.request({ op: 'stmtRun', stmt: this.id, params }, options.signal)) as RunResult;
+    return { changes: r.changes, lastInsertRowid: r.lastInsertRowid, ...(r.graph ? { graph: r.graph } : {}) };
   }
 
   async finalize(): Promise<void> {
@@ -846,14 +850,15 @@ interface Collected {
 }
 
 /**
- * `res` in `mode`. A write's counts are `changes` and `lastInsertRowid` on the result, not enumerable, so rows compare
- * and serialize as before.
+ * `res` in `mode`. A write's counts are `changes` and `lastInsertRowid` on the result (and `graph`, where it wrote a
+ * property graph), not enumerable, so rows compare and serialize as before.
  */
 function materialize(res: Collected, mode: RowMode, temporal?: TemporalForm): unknown {
   const out = materializeRows(res.columns, res.types ?? res.columns.map(() => 'any'), res.batches, mode, temporal);
   if (res.run) {
     Object.defineProperty(out, 'changes', { value: res.run.changes, enumerable: false });
     Object.defineProperty(out, 'lastInsertRowid', { value: res.run.lastInsertRowid, enumerable: false });
+    if (res.run.graph) Object.defineProperty(out, 'graph', { value: res.run.graph, enumerable: false });
   }
   return out;
 }
