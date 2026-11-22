@@ -3,25 +3,34 @@
  * `eager`, run in stages by the engine (exec/graph-write.ts). The graph is laid out as a language for graphs lays one
  * out: one node table (id, props), a label index, a table for each label and each relationship type.
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import * as client from '../src/client/index.js';
 import { Database } from '../src/engine/database.js';
 import { plan as p } from '../src/engine/index.js';
 import type { PlanExpr } from '../src/engine/plan/expr.js';
 import type { GraphWriteCounts, PlanOp } from '../src/engine/plan/ops.js';
 import type { PlanStatementInput } from '../src/engine/plan/statement.js';
+import { EngineServer } from '../src/engine/server.js';
+import type { Request, Response } from '../src/shared/protocol.js';
 
 const M = 'map<text, any>';
 const schema = (db: Database, op: Record<string, unknown>): void => void db.queryPlan({ kind: 'schema', op } as unknown as PlanStatementInput);
 const column = (name: string, type: string, declaredType = type) => ({ name, declaredType, type, notNull: false, collation: 'binary' });
 
-/** An empty graph `g`: nodes in `node(id, props)`, their labels in `g_labels`, and the label `Person`. */
+/** What makes an empty graph `g`: nodes in `node(id, props)`, their labels in `g_labels`, and the label `Person`. */
+function graphSchema(options: { history?: 'versions' | 'log' } = {}): Record<string, unknown>[] {
+  const key = [{ kind: 'primaryKey', columns: [{ column: 0, desc: false, collation: 'binary' }], ofColumn: 0 }];
+  return [
+    { op: 'createTable', table: { name: 'node', columns: [column('id', 'INTEGER'), column('props', 'MAP', M)], keys: key, checks: [], foreignKeys: [], storage: 'row', ...options }, temp: false, ifNotExists: false },
+    { op: 'createPropertyGraph', ifNotExists: false, graph: { name: 'g', nodes: [{ label: 'Node', table: 'node', id: 'id', props: 'props' }], edges: [], ...options } },
+    { op: 'alterPropertyGraph', name: 'g', action: { kind: 'addLabelIndex' } },
+    { op: 'alterPropertyGraph', name: 'g', action: { kind: 'addLabel', label: 'Person', table: 'l_person' } },
+  ];
+}
+
 function graph(options: { history?: 'versions' | 'log' } = {}): Database {
   const db = Database.openMemory();
-  const key = [{ kind: 'primaryKey', columns: [{ column: 0, desc: false, collation: 'binary' }], ofColumn: 0 }];
-  schema(db, { op: 'createTable', table: { name: 'node', columns: [column('id', 'INTEGER'), column('props', 'MAP', M)], keys: key, checks: [], foreignKeys: [], storage: 'row', ...options }, temp: false, ifNotExists: false });
-  schema(db, { op: 'createPropertyGraph', ifNotExists: false, graph: { name: 'g', nodes: [{ label: 'Node', table: 'node', id: 'id', props: 'props' }], edges: [], ...options } });
-  schema(db, { op: 'alterPropertyGraph', name: 'g', action: { kind: 'addLabelIndex' } });
-  schema(db, { op: 'alterPropertyGraph', name: 'g', action: { kind: 'addLabel', label: 'Person', table: 'l_person' } });
+  for (const op of graphSchema(options)) schema(db, op);
   return db;
 }
 
@@ -182,8 +191,9 @@ describe('graphMerge', () => {
   it('passes on what matches, or makes it, and a row sees what earlier rows made', () => {
     const db = graph();
     const r = write(db, byName(named('Ada', 'Bo', 'Ada'), { onCreate: true }));
-    // The third row finds the node the first made.
+    // The third row finds the node the first made. Its columns are the row's, then the ones the match adds.
     expect(r.rows).toEqual([['Ada', 0], ['Bo', 1], ['Ada', 0]]);
+    expect(r.columnTypes).toEqual(['text', 'int']);
     expect(r.graph).toEqual(counts({ nodesCreated: 2, labelsAdded: 2, propertiesSet: 5 }));
     expect(nodes(db)).toEqual([[0, { made: 1, name: 'Ada', seen: 1 }], [1, { made: 1, name: 'Bo' }]]);
   });
@@ -237,6 +247,18 @@ describe('what is above a write', () => {
     expect(nodes(db).length).toBe(9);
   });
 
+  it('a write whose row reads the graph reads it as the rows before left it, and an eager above it waits for them all', () => {
+    const db = graph();
+    const total = p.scalar(p.aggregate(p.scan('node', [0]), [], [{ fn: 'count', args: [], star: true, distinct: false, collation: 'binary', type: 'int' }]), 'int');
+    // Each node holds how many there were before it.
+    const counted = p.graphCreate('g', numbers(3), [{ labels: [], props: map('before', any(total)) }]);
+    write(db, counted);
+    expect(nodes(db)).toEqual([[0, { before: 0 }], [1, { before: 1 }], [2, { before: 2 }]]);
+    // What is above the eager starts when all three more are made.
+    expect(write(db, p.project(p.eager(counted), [p.col(0, 1, 'int'), total])).rows).toEqual([[3, 6], [4, 6], [5, 6]]);
+    expect(nodes(db).slice(3)).toEqual([[3, { before: 3 }], [4, { before: 4 }], [5, { before: 5 }]]);
+  });
+
   it('a limit stops the write below it', () => {
     const db = graph();
     const r = write(db, p.limit(p.graphCreate('g', numbers(5), [{ labels: [] }]), 2));
@@ -251,6 +273,331 @@ describe('what is above a write', () => {
     const total = p.scalar(p.aggregate(p.scan('node', [0]), [], [{ fn: 'count', args: [], star: true, distinct: false, collation: 'binary', type: 'int' }]), 'int');
     write(db, p.graphSet('g', p.graphCreate('g', numbers(2), [{ labels: [] }]), [{ node: p.col(0, 1, 'int'), kind: 'property', key: 'n', value: any(total) }]));
     expect(nodes(db)).toEqual([[0, { n: 1 }], [1, { n: 2 }]]);
+  });
+});
+
+describe('labels, types and ids', () => {
+  const COUNT = { fn: 'count', args: [], star: true, distinct: false, collation: 'binary', type: 'int' } as const;
+  const tablesNamed = (db: Database, ...names: string[]): unknown[] => db.query(`SELECT name FROM sqlite_schema WHERE name IN (${names.map((n) => `'${n}'`).join(', ')}) ORDER BY name`).rows.map((r) => r[0]);
+
+  it('names the tables of the labels and types it adds, and adds them when a row first needs them', () => {
+    const db = graph();
+    const tables = [{ label: 'City', table: 'l_city' }, { type: 'NEAR', table: 'e_near' }];
+    const cities = (input: PlanOp): PlanOp => p.graphCreate('g', input, [{ labels: ['City'] }, { labels: [] }], [{ type: 'NEAR', start: { node: 0 }, end: { node: 1 } }], tables);
+    // No row reaches the write: the graph is as it was.
+    expect(write(db, cities(numbers(0))).graph).toEqual(counts({}));
+    expect(tablesNamed(db, 'l_city', 'e_near')).toEqual([]);
+    // The plan reads the table it names for the new type: for each row, the relationships made so far.
+    const made = p.scalar(p.aggregate(p.scan('e_near', [-1]), [], [COUNT]), 'int');
+    expect(write(db, p.project(cities(numbers(2)), [p.col(0, 3, 'int'), made])).rows).toEqual([[0, 1], [1, 2]]);
+    expect(tablesNamed(db, 'l_city', 'e_near')).toEqual(['e_near', 'l_city']);
+    // The graph has them now: the same plan adds nothing more.
+    expect(write(db, cities(one)).graph).toEqual(counts({ nodesCreated: 2, labelsAdded: 1, relationshipsCreated: 1 }));
+    // A table of the name there already is not taken for a label.
+    expect(() => write(db, p.graphCreate('g', one, [{ labels: ['Town'] }], [], [{ label: 'Town', table: 'node' }]))).toThrow(/table node exists already/);
+    expect(() => write(db, p.graphCreate('g', one, [{ labels: [] }], [], [{ label: 'Town' } as never]))).toThrow(/expected a table name/);
+    expect(() => write(db, p.graphCreate('g', one, [{ labels: [] }], [], [{ label: 'Town', type: 'T', table: 't' } as never]))).toThrow(/expected a label or a relationship type/);
+  });
+
+  it('a label a graphSet adds, and a type a graphMerge makes, are added the same way', () => {
+    const db = graph();
+    write(db, p.graphCreate('g', numbers(2), [{ labels: [] }]));
+    const id = p.col(0, 0, 'int');
+    write(db, p.graphSet('g', p.scan('node', [0]), [{ node: id, kind: 'labels', add: ['Seen'], remove: [] }], [{ label: 'Seen', table: 'l_seen' }]));
+    expect([tablesNamed(db, 'l_seen'), labels(db)]).toEqual([['l_seen'], [[0, 'Seen'], [1, 'Seen']]]);
+    // A merge that matches nothing makes a relationship of a type the graph has not: from the row's node to itself.
+    const row = p.working(3, ['int', 'int']);
+    const none = p.project(p.filter(row, p.call('cmp_lt', [p.col(0, 0, 'int'), p.lit(0)], 'bool')), [p.col(0, 1, 'int')]);
+    const merge = p.graphMerge('g', 3, p.scan('node', [0]), none, { relationships: [{ type: 'SELF', start: { id }, end: { id } }], created: [], tables: [{ type: 'SELF', table: 'e_self' }] });
+    expect(write(db, merge).graph).toEqual(counts({ relationshipsCreated: 2 }));
+    expect(rels(db, 'e_self')).toEqual([[0, 0, 0, {}], [1, 1, 1, {}]]);
+  });
+
+  it('a statement kept and run again adds its labels once, and runs on the graph they made', () => {
+    const db = graph();
+    const kept = db.preparePlan({ kind: 'write', plan: p.graphCreate('g', p.values([[p.param(0, 'int')], [p.param(1, 'int')]], ['int']), [{ labels: ['Town'], props: map('n', any(p.col(0, 0, 'int'))) }], [{ type: 'AT', start: { node: 0 }, end: { node: 0 } }]) } as PlanStatementInput);
+    // The first run adds the label and the type, which changes the schema under the statement; the second runs on it.
+    expect(kept.result([1, 2] as never).rows).toEqual([[1, 0, 0], [2, 1, 1]]);
+    expect(kept.result([3, 4] as never).rows).toEqual([[3, 2, 2], [4, 3, 3]]);
+    expect([nodes(db).length, labels(db).length, rels(db, 'AT').length]).toEqual([4, 4, 4]);
+  });
+
+  it('gives each new node and relationship an id the graph has not had in this connection', () => {
+    const db = graph();
+    const pair = p.graphCreate('g', one, [{ labels: [] }, { labels: [] }], [{ type: 'KNOWS', start: { node: 0 }, end: { node: 1 } }]);
+    expect(write(db, pair).rows).toEqual([[0, 1, 0]]);
+    // The last node and the last relationship deleted: their ids are not given again.
+    write(db, p.graphDelete('g', one, [{ node: p.lit(1) }], { detach: true }));
+    expect(write(db, pair).rows).toEqual([[2, 3, 1]]);
+    // A statement that fails has taken its ids: a node and a relationship here, before its second relationship is refused.
+    const broken = p.graphCreate('g', one, [{ labels: [] }], [{ type: 'KNOWS', start: { node: 0 }, end: { node: 0 } }, { type: 'KNOWS', start: { node: 0 }, end: { id: p.lit(99) } }]);
+    expect(() => write(db, broken)).toThrow(/is not a node of the graph/);
+    expect(write(db, pair).rows).toEqual([[5, 6, 4]]);
+    expect(nodes(db).map((n) => n[0])).toEqual([0, 2, 3, 5, 6]);
+  });
+});
+
+describe('a relationship type whose table has no column for properties', () => {
+  /** A graph `g` whose type PLAIN is a table of two ends and nothing else. */
+  const plain = (): Database => {
+    const db = Database.openMemory();
+    const key = [{ kind: 'primaryKey', columns: [{ column: 0, desc: false, collation: 'binary' }], ofColumn: 0 }];
+    schema(db, { op: 'createTable', table: { name: 'node', columns: [column('id', 'INTEGER'), column('props', 'MAP', M)], keys: key, checks: [], foreignKeys: [], storage: 'row' }, temp: false, ifNotExists: false });
+    schema(db, { op: 'createTable', table: { name: 'plain', columns: [column('start', 'INTEGER'), column('end', 'INTEGER')], keys: [], checks: [], foreignKeys: [], storage: 'row' }, temp: false, ifNotExists: false });
+    schema(db, { op: 'createPropertyGraph', ifNotExists: false, graph: { name: 'g', nodes: [{ label: 'Node', table: 'node', id: 'id', props: 'props' }], edges: [{ type: 'PLAIN', table: 'plain', start: 'start', end: 'end' }] } });
+    schema(db, { op: 'alterPropertyGraph', name: 'g', action: { kind: 'addLabelIndex' } });
+    return db;
+  };
+  const pair = (props?: PlanExpr): PlanOp => p.graphCreate('g', numbers(2), [{ labels: [] }, { labels: [] }], [{ type: 'PLAIN', start: { node: 0 }, end: { node: 1 }, ...(props ? { props } : {}) }]);
+  const ends = (db: Database): unknown[][] => db.query('SELECT rowid, start, "end" FROM plain ORDER BY rowid').rows;
+
+  it('takes relationships without properties, all its rows at once or one at a time', () => {
+    for (const shape of [(w: PlanOp) => w, (w: PlanOp) => p.limit(w, 10)]) {
+      const db = plain();
+      expect(write(db, shape(pair())).graph).toEqual(counts({ nodesCreated: 4, relationshipsCreated: 2 }));
+      expect(ends(db)).toEqual([[0, 0, 1], [1, 2, 3]]);
+      // An empty map, and one whose values are NULL, are no properties.
+      write(db, shape(pair(map('none', p.lit(null)))));
+      expect(ends(db).length).toBe(4);
+      expect(() => write(db, shape(pair(map('w', any(p.lit(1))))))).toThrow(/relationship type PLAIN keeps no properties/);
+      const one = { relationship: { type: p.lit('PLAIN'), id: p.col(0, 0, 'int') }, kind: 'property', key: 'w', value: any(p.lit(1)) } as const;
+      expect(() => write(db, shape(p.graphSet('g', numbers(2), [one])))).toThrow(/table plain keeps no properties/);
+      expect(ends(db).length).toBe(4);
+    }
+  });
+});
+
+describe('property values', () => {
+  it('keep their kind: a truth value, a list', () => {
+    const db = graph();
+    const yes = p.call('cmp_eq', [p.lit(1), p.lit(1)], 'bool');
+    // A map of truth values holds them bare: as properties each is a truth value.
+    write(db, p.graphCreate('g', one, [{ labels: [], props: p.call('map_of', [p.lit('ok'), yes], 'map<text, bool>') }]));
+    const id = p.col(0, 0, 'int');
+    write(db, p.graphSet('g', p.scan('node', [0]), [
+      { node: id, kind: 'property', key: 'also', value: yes },
+      { node: id, kind: 'property', key: 'list', value: p.call('list_of', [p.lit(1), p.lit(2)], 'list<int>') },
+      { node: id, kind: 'properties', value: p.call('map_of', [p.lit('more'), yes], 'map<text, bool>'), merge: true },
+    ]));
+    expect(nodes(db)).toEqual([[0, { also: true, list: [1, 2], more: true, ok: true }]]);
+    // Properties are a map: anything else is an error.
+    expect(() => write(db, p.graphSet('g', p.scan('node', [0]), [{ node: id, kind: 'properties', value: p.lit(1), merge: false }]))).toThrow(/properties are given as a map/);
+    expect(() => write(db, p.graphCreate('g', one, [{ labels: [], props: p.lit('x') }]))).toThrow(/a node's props is a map, not text/);
+  });
+});
+
+describe('all the rows of a write at once', () => {
+  const COUNT = { fn: 'count', args: [], star: true, distinct: false, collation: 'binary', type: 'int' } as const;
+  /** Under a limit a write handles a row at a time: it could stop between two. Without, where no row could tell, all at once. */
+  const bothWays = <T>(run: (shape: (write: PlanOp) => PlanOp) => T): [T, T] => [run((w) => w), run((w) => p.limit(w, 1000))];
+  /** Ten people, each knowing the next (the last knows itself), a second label on every other one. */
+  const people = (): Database => {
+    const db = graph();
+    write(db, p.graphCreate('g', numbers(10), [{ labels: ['Person'], props: map('i', any(p.col(0, 0, 'int'))) }]));
+    const next = p.call('min', [p.call('add', [p.col(0, 0, 'int'), p.lit(1)], 'int'), p.lit(9)], 'int');
+    write(db, p.graphCreate('g', p.scan('node', [0]), [], [{ type: 'KNOWS', start: { id: p.col(0, 0, 'int') }, end: { id: next }, props: map('w', any(p.col(0, 0, 'int'))) }]));
+    return db;
+  };
+  const state = (db: Database, r: { rows: unknown; graph?: unknown }): unknown[] => [r.rows, r.graph, nodes(db), labels(db), rels(db, 'KNOWS')];
+  const id = p.col(0, 0, 'int');
+
+  it('graphCreate gives what it gives row by row', () => {
+    const [once, each] = bothWays((shape) => {
+      const db = people();
+      const made = p.graphCreate('g', p.scan('node', [0]), [{ labels: ['Person', 'Copy'], props: map('of', any(id)) }, { labels: [] }], [
+        { type: 'COPIES', start: { node: 0 }, end: { id }, props: map('n', any(id)) },
+        { type: 'KNOWS', start: { node: 0 }, end: { node: 1 } },
+      ]);
+      const r = write(db, shape(made));
+      return [...state(db, r), rels(db, 'COPIES')];
+    });
+    expect(once).toEqual(each);
+    expect((once[1] as GraphWriteCounts).nodesCreated).toBe(20);
+  });
+
+  it('graphSet gives what it gives row by row: properties of nodes and relationships, and labels', () => {
+    const [once, each] = bothWays((shape) => {
+      const db = people();
+      const r = write(db, shape(p.graphSet('g', p.scan('node', [0]), [
+        { node: id, kind: 'property', key: 'double', value: any(p.call('mul', [id, p.lit(2)], 'int')) },
+        // Every other one loses `i`: a NULL takes the key away.
+        { node: id, kind: 'property', key: 'i', value: p.caseWhen([{ when: p.call('cmp_eq', [p.call('mod_trunc', [id, p.lit(2)], 'int'), p.lit(0)], 'bool'), then: p.lit(null, 'int') }], 'any', any(id)) },
+        // The relationship that has the node's id for its rowid; a type the graph has not is passed over.
+        { relationship: { type: p.lit('KNOWS'), id }, kind: 'property', key: 'w', value: any(p.lit(0)) },
+        { relationship: { type: p.lit('NONE'), id }, kind: 'property', key: 'w', value: any(p.lit(0)) },
+        { node: id, kind: 'labels', add: ['Seen'], remove: ['Person'] },
+      ])));
+      return state(db, r);
+    });
+    expect(once).toEqual(each);
+    expect(once[1]).toEqual(counts({ propertiesSet: 30, labelsAdded: 10, labelsRemoved: 10 }));
+    expect((once[2] as unknown[][])[2]).toEqual([2, { double: 4 }]);
+  });
+
+  it('graphSet goes row by row where two rows name one node: the later one is set over the earlier', () => {
+    const db = people();
+    // Rows 0 to 9, each naming node 0 or 1.
+    const r = write(db, p.graphSet('g', numbers(10), [{ node: p.call('mod_trunc', [id, p.lit(2)], 'int'), kind: 'property', key: 'last', value: any(id) }]));
+    expect(r.graph).toEqual(counts({ propertiesSet: 10 }));
+    expect(nodes(db).slice(0, 2)).toEqual([[0, { i: 0, last: 8 }], [1, { i: 1, last: 9 }]]);
+  });
+
+  it('graphDelete gives what it gives row by row: nodes with their relationships, relationships, lists', () => {
+    const [once, each] = bothWays((shape) => {
+      const db = people();
+      // Nodes 0 to 8 with what they are at; node 9's relationship to itself; and a list of nodes gone by then.
+      const r = write(db, shape(p.graphDelete('g', p.filter(p.scan('node', [0]), p.call('cmp_lt', [id, p.lit(9)], 'bool')), [
+        { relationship: { type: p.lit('KNOWS'), id: p.lit(9) } },
+        { node: id },
+        { nodes: p.call('list_of', [id, p.lit(null, 'int')], 'list<int>') },
+      ], { detach: true })));
+      return state(db, r);
+    });
+    expect(once).toEqual(each);
+    // Nine relationships between the nodes deleted, each deleted once though it is at two of them, and node 9's own.
+    expect(once.slice(1)).toEqual([counts({ nodesDeleted: 9, relationshipsDeleted: 10 }), [[9, { i: 9 }]], [[9, 'Person']], []]);
+  });
+
+  it('graphDelete of many nodes that still have relationships fails as one of one does, and leaves the graph as it was', () => {
+    const db = people();
+    const before = state(db, { rows: null });
+    expect(() => write(db, p.graphDelete('g', p.scan('node', [0]), [{ node: id }]))).toThrow(/relationships in KNOWS/);
+    expect(state(db, { rows: null })).toEqual(before);
+    // What names no node deletes none: text, a number that is no integer.
+    const r = write(db, p.graphDelete('g', numbers(10), [{ node: any(p.lit('x')) }, { node: any(p.lit(1.5)) }], { detach: true }));
+    expect(r.graph).toEqual(counts({}));
+  });
+
+  it('where the graph keeps history, a property set to what it is makes no version', () => {
+    const db = graph({ history: 'versions' });
+    write(db, p.graphCreate('g', numbers(10), [{ labels: [], props: map('i', any(id)) }]));
+    const versions = (): unknown => db.queryPlan({ kind: 'query', plan: p.aggregate(p.scan('smalt_versions_node', [0]), [], [COUNT]), columns: [{ name: 'n', type: 'int' }] } as PlanStatementInput).rows[0]![0];
+    const before = versions();
+    const same = write(db, p.graphSet('g', p.scan('node', [0]), [{ node: id, kind: 'property', key: 'i', value: any(id) }]));
+    // Each is counted as set, and none is written.
+    expect([same.graph, versions()]).toEqual([counts({ propertiesSet: 10 }), before]);
+    write(db, p.graphSet('g', p.scan('node', [0]), [{ node: id, kind: 'property', key: 'i', value: any(p.lit(0)) }]));
+    // Node 0 had 0 already: nine rows changed.
+    expect(versions()).toBe((before as number) + 9);
+  });
+});
+
+describe('hops and paths', () => {
+  const HOP = 'struct<edge int, rowid int, from int, to int>';
+  const hop = (edge: number, rowid: number, from: number, to: number): PlanExpr => p.call('struct_of', [p.lit(edge), p.lit(rowid), p.lit(from), p.lit(to)], HOP);
+  const hops = (...h: PlanExpr[]): PlanExpr => p.call('list_of', h, `list<${HOP}>`);
+  /** Four nodes in a line, 0 to 3: KNOWS from 0 to 1 and from 2 to 3, LIKES from 1 to 2. */
+  const line = (): Database => {
+    const db = graph();
+    write(db, p.graphCreate('g', one, [{ labels: [] }, { labels: [] }, { labels: [] }, { labels: [] }], [
+      { type: 'KNOWS', start: { node: 0 }, end: { node: 1 } },
+      { type: 'LIKES', start: { node: 1 }, end: { node: 2 } },
+      { type: 'KNOWS', start: { node: 2 }, end: { node: 3 } },
+    ]));
+    return db;
+  };
+
+  it('deletes the relationships of a list of hops, each by its type in the graph and its rowid', () => {
+    const db = line();
+    // KNOWS is the graph's first type and LIKES its second: KNOWS 2 and LIKES 1. A hop of a type the graph has not,
+    // and a NULL, are passed over.
+    const r = write(db, p.graphDelete('g', one, [{ hops: hops(hop(0, 2, 2, 3), hop(1, 1, 1, 2), hop(7, 0, 0, 0), p.lit(null, HOP)) }, { hops: p.lit(null, `list<${HOP}>`) }]));
+    expect(r.graph).toEqual(counts({ relationshipsDeleted: 2 }));
+    expect([rels(db, 'KNOWS'), rels(db, 'LIKES'), nodes(db).length]).toEqual([[[0, 0, 1, {}]], [], 4]);
+  });
+
+  it('deletes a path: its relationships, then its nodes', () => {
+    const db = line();
+    // From 0 over the first two relationships to 2: node 2 still has a relationship, so it is refused without detach.
+    const path = { path: { start: p.lit(0), hops: hops(hop(0, 0, 0, 1), hop(1, 1, 1, 2)) } };
+    expect(() => write(db, p.graphDelete('g', one, [path]))).toThrow(/relationships in KNOWS/);
+    const r = write(db, p.graphDelete('g', one, [path, { path: { start: p.lit(null, 'int'), hops: hops() } }], { detach: true }));
+    expect(r.graph).toEqual(counts({ relationshipsDeleted: 3, nodesDeleted: 3 }));
+    expect([nodes(db), rels(db, 'KNOWS'), rels(db, 'LIKES')]).toEqual([[[3, {}]], [], []]);
+    // A path that is all its nodes have needs no detach: its relationships go before its nodes.
+    const whole = line();
+    const all = write(whole, p.graphDelete('g', one, [{ path: { start: p.lit(0), hops: hops(hop(0, 0, 0, 1), hop(1, 1, 1, 2), hop(0, 2, 2, 3)) } }]));
+    expect([all.graph, nodes(whole)]).toEqual([counts({ relationshipsDeleted: 3, nodesDeleted: 4 }), []]);
+  });
+});
+
+describe('what a write reads', () => {
+  const named = (...names: string[]): PlanOp => p.values(names.map((n) => [p.lit(n)]), ['text']);
+  /** Whether a node has the row's name: a plan nested in the filter, read for each row. */
+  const there = p.exists(p.filter(p.scan('node', [1]), p.call('cmp_eq', [p.call('map_get', [p.col(0, 0, M), p.lit('name')], 'any'), any(p.col(0, 0, 'text', 'binary', 1))], 'bool')));
+  const create = (input: PlanOp): PlanOp => p.graphCreate('g', input, [{ labels: [], props: map('name', any(p.col(0, 0, 'text'))) }]);
+
+  it('below it, an operation that reads the graph for each row reads what the rows before it wrote', () => {
+    const db = graph();
+    // A node for each name that has none: the second Ada finds the first one's.
+    const r = write(db, create(p.filter(named('Ada', 'Ada', 'Bo'), p.not(there))));
+    expect(r.rows).toEqual([['Ada', 0], ['Bo', 1]]);
+    // Under an eager everything below is read first: no node has either name then.
+    const all = write(db, create(p.eager(p.filter(named('Cy', 'Cy'), p.not(there)))));
+    expect(all.rows).toEqual([['Cy', 2], ['Cy', 3]]);
+  });
+
+  it('above it, operations that read only their rows give the same over all the rows as for each', () => {
+    const shaped = (input: PlanOp): PlanOp => p.project(p.filter(create(input), p.call('cmp_ne', [p.col(0, 0, 'text'), p.lit('Bo')], 'bool')), [p.call('text_concat', [p.col(0, 0, 'text'), p.lit('!')], 'text'), p.col(0, 1, 'int')]);
+    const rows = [['Ada!', 0], ['Cy!', 2]];
+    expect(write(graph(), shaped(named('Ada', 'Bo', 'Cy'))).rows).toEqual(rows);
+    // Under a limit they run for each row as it is written: the limit stops the write when it has its rows.
+    expect(write(graph(), p.limit(shaped(named('Ada', 'Bo', 'Cy')), 5)).rows).toEqual(rows);
+    const db = graph();
+    expect(write(db, p.limit(shaped(named('Ada', 'Bo', 'Cy')), 1)).rows).toEqual([['Ada!', 0]]);
+    expect(nodes(db)).toEqual([[0, { name: 'Ada' }]]);
+    // A sort reads all the rows written, then sorts them.
+    const sorted = write(graph(), p.sort(create(named('Bo', 'Ada')), [{ expr: p.col(0, 0, 'text'), desc: false, nullsFirst: true, collation: 'binary' }]));
+    expect(sorted.rows).toEqual([['Ada', 1], ['Bo', 0]]);
+  });
+
+  it('refuses a write where no row order says when it runs', () => {
+    const db = graph();
+    const made = p.graphCreate('g', one, [{ labels: [] }]);
+    // In a plan nested in an expression.
+    expect(() => write(db, p.graphSet('g', one, [{ node: p.scalar(made, 'int'), kind: 'labels', add: ['X'], remove: [] }]))).toThrow(/a write in a nested plan of an expression is not supported/);
+    // On the right of a join, and on both sides of one.
+    expect(() => write(db, p.join('cross', one, made))).toThrow(/a join whose right input writes is not supported/);
+    expect(() => write(db, p.join('cross', made, made))).toThrow(/a join whose inputs both write is not supported/);
+    // As the rows a table is given, and under a limit counted from the end.
+    expect(() => write(db, p.append('node', made, [0]))).toThrow(/append over rows that were written is not supported/);
+    expect(() => write(db, p.limit(made, 1, undefined, { fromEnd: true }))).toThrow(/a limit counted from the end over rows that were written is not supported/);
+    // In a merge's match.
+    expect(() => write(db, p.graphMerge('g', 4, one, p.project(p.graphCreate('g', p.working(4, ['int']), [{ labels: [] }]), [p.col(0, 0, 'int')]), { created: [] }))).toThrow(/a match that writes is not supported/);
+    expect(nodes(db)).toEqual([]);
+  });
+});
+
+describe('through the client', () => {
+  class FakeWorker {
+    onmessage: ((e: { data: Response }) => void) | null = null;
+    onerror: unknown = null;
+    private readonly server = new EngineServer((_s, msg) => setTimeout(() => this.onmessage?.({ data: structuredClone(msg) })), { open: () => Database.openMemory(), refreshTimer: false });
+    postMessage(req: Request, transfer: Transferable[] = []): void {
+      const r = structuredClone(req, { transfer });
+      setTimeout(() => this.server.receive(EngineServer.LOCAL, r));
+    }
+    terminate(): void {}
+  }
+  (globalThis as { Worker?: unknown }).Worker ??= FakeWorker;
+  const opened: client.Database[] = [];
+  afterEach(async () => {
+    for (const d of opened.splice(0)) await d.close();
+  });
+
+  it('a write gives what it did with its rows, and a kept one with its counts', async () => {
+    const db = await client.open(':memory:', { storage: 'memory', worker: new FakeWorker() as unknown as Worker });
+    opened.push(db);
+    for (const op of graphSchema()) await db.queryPlan({ kind: 'schema', op } as unknown as PlanStatementInput);
+    const made = { kind: 'write', plan: p.graphCreate('g', numbers(2), [{ labels: ['Person'], props: map('i', any(p.col(0, 0, 'int'))) }]) } as PlanStatementInput;
+    const r = await db.queryPlan(made, [], { rowMode: 'array' });
+    expect([[...r], r.changes, r.graph]).toEqual([[[0, 0], [1, 1]], 6, counts({ nodesCreated: 2, labelsAdded: 2, propertiesSet: 2 })]);
+    const kept = await db.preparePlan(made);
+    expect((await kept.run()).graph).toEqual(counts({ nodesCreated: 2, labelsAdded: 2, propertiesSet: 2 }));
+    // A statement that writes no graph has none.
+    const read = await db.queryPlan({ kind: 'query', plan: p.scan('node', [0]) } as PlanStatementInput, [], { rowMode: 'array' });
+    expect([read.length, (read as { graph?: unknown }).graph]).toEqual([4, undefined]);
+    await kept.finalize();
   });
 });
 

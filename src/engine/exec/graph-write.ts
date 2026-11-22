@@ -18,9 +18,16 @@
  *   reads them all first, then runs once over them.
  * - **`limit`** passes rows on until it has its count and then stops what feeds it: a write below it writes no more.
  *
- * The writes are appends, updates and deletes of the graph's tables, run inside the statement as the engine's own
- * plans are (a foreign key's actions, the graph's rules): each goes through its table's writer, so the graph's
- * rules, history, foreign keys and the graph's index are kept as for any write.
+ * **All a write's rows at once.** That order is what a plan means, not always how it is run. Where no row could tell
+ * (`quiet`: nothing above the write, up to an operation that reads all its rows, reads the graph, writes or stops
+ * early; and what the write computes reads only its row), a write's rows are written together, a pass over each
+ * table, and the steps above it that read only their rows run once over all of them. The rows and the graph are the
+ * same; a statement that would fail for more than one reason may report another of them.
+ *
+ * The writes are appends and updates of the graph's tables, run inside the statement as the engine's own plans are
+ * (a foreign key's actions, the graph's rules), and deletes of rows by their rowids (`GraphWriteHost.deleteRows`):
+ * each goes through its table's writer, so the graph's rules, history, foreign keys and the graph's index are kept
+ * as for any write.
  */
 import { SmaltError } from '../errors.js';
 import { append, filter, join, limit as limitOf, project, remove, scan, update, values } from '../plan/build.js';
@@ -729,6 +736,10 @@ export class GraphWrite {
       props: it.kind === 'properties' ? asProps(typeOf(it.value)) : null,
     }));
     type Part = (typeof parts)[number];
+    /** A relationship of a type whose table has no column for properties is given none. */
+    const noProps = (t: Target): never => {
+      throw new SmaltError('SMALT_ERROR', `property graph ${op.graph}: table ${t.table} keeps no properties`);
+    };
     const targetOf = (p: Part, vals: Values): Target | null =>
       this.target(this.layoutOf(op.graph), p.node === null ? null : vals.get(p.node), p.rel === null ? null : { type: vals.get(p.rel.type), id: vals.get(p.rel.id) });
     const row = (ctx: Ctx, row: Row, early: Row | undefined): void => {
@@ -755,6 +766,7 @@ export class GraphWrite {
           }
           continue;
         }
+        if (target.props < 0) noProps(target);
         const cur = this.propsOf(target.table, target.props, target.rowid);
         // The value is computed for one that is gone too: an error in it is raised either way.
         const given = vals.get(p.value!);
@@ -836,6 +848,7 @@ export class GraphWrite {
         const byTable = new Map<string, { props: number; rows: Row[] }>();
         ts.forEach((t, i) => {
           if (t === null) return;
+          if (t.props < 0) noProps(t);
           const given = vals[i]!.get(p.value!);
           let held = byTable.get(t.table);
           if (held === undefined) byTable.set(t.table, (held = { props: t.props, rows: [] }));
@@ -1013,14 +1026,6 @@ export class GraphWrite {
           },
         ),
       );
-      let count = nodes.size;
-      for (const ids of rels.values()) count += ids.size;
-      // A few of them: each by the plan kept for one, which seeks it by its id.
-      if (count <= FEW) {
-        for (const [table, ids] of rels) for (const rowid of ids) ctx.counts.relationshipsDeleted += this.deleteRow(table, rowid);
-        for (const id of nodes) deleteNode(ctx, id);
-        return;
-      }
       const g = this.layoutOf(op.graph);
       for (const [table, ids] of rels) ctx.counts.relationshipsDeleted += this.host.deleteRows(table, [...ids]);
       if (nodes.size === 0) return;
@@ -1247,9 +1252,6 @@ function replaceWorking(plan: PlanOp, id: number, leaf: PlanOp): PlanOp {
   };
   return walk(plan) as PlanOp;
 }
-
-/** The most nodes and relationships a `graphDelete` deletes one by one where it could delete all its rows' at once. */
-const FEW = 8;
 
 /** A node or a relationship a write names: its table, that table's props column (-1: none) and its rowid. */
 interface Target {

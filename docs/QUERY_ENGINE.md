@@ -359,3 +359,58 @@ See [ADR 0008](adr/0008-materialized-views-and-columnar-segments.md).
   are the nodes it gave: those the maps did not rule out.
 
 See [ADR 0040](adr/0040-graph-index-and-relationships.md) and [ADR 0041](adr/0041-properties-in-the-graph-index.md).
+
+## 10. Plans that write a property graph
+
+A plan that holds a `graphCreate`, `graphSet`, `graphDelete` or `graphMerge`
+([the plan format](reference/engine/plans.md#graph-writes); [ADR 0042](adr/0042-graph-writes.md), section 1) is not
+one physical plan. `GraphWrite` (`exec/graph-write.ts`) runs it in stages, so that a write handles its rows in order
+and what reads the graph above a write reads it as it is then.
+
+- **Stages.** The plan is cut where it writes. A part that writes nothing is one physical plan, run inside the
+  statement (`Database.internalPlan`) with all its rows read at once; operations at its top that read the graph for
+  each row run as a plan over one row, for each row of the plan below them. A write takes its input's rows one at a
+  time. Operations above a write that pass rows on are one plan over a row; those that need all their rows are a
+  plan over the rows held. The stages are made when the statement first runs, and again when the schema version has
+  moved since: a label or a type the statement added itself moves it.
+- **A stage's rows are a relation.** A plan over rows the statement holds reads them through a table function,
+  `smalt_stage_rows_<k>`, that the database serves from the `GraphWrite` that is running
+  (`Database.virtualTable`). A plan over one row reads it as parameters after the statement's own.
+- **The writes are the tables' writes.** A node's row, a label's entry, a relationship's row and a change of
+  properties are appends and updates the engine runs inside the statement, each kept as a plan and compiled once;
+  a delete names its rows by their rowids and goes through the table's writer as a `delete` does once it has read
+  which rows it deletes (`Database.deleteRowids`). The graph's rules, foreign keys, history and the graph index are
+  kept by the code that keeps them for any write.
+- **All a write's rows at once.** Where nothing above a write, up to an operation that reads all its rows, reads the
+  graph, writes or stops early, and what the write computes reads only its row, its rows are written together:
+  one append a table for a `graphCreate`; for a property a `graphSet` sets, one update a table joined with the rows
+  held (`map_merge`, or `map_remove` for a NULL), where the graph keeps history only of the rows it changes; label
+  entries read by one join and appended or deleted together; a `graphDelete`'s rows deleted table by table. Steps
+  above the write that read only their rows then run once over all of them. A `graphSet` that names one node or
+  relationship in two rows, or sets a whole map, goes row by row.
+- **A deleted node's relationships** are read at the node, one search a node (`SEARCH RELATIONSHIPS OF g (node=?)`),
+  and deleted by their rowids. A join of the nodes held with the graph's relationships is not used for it: the
+  planner estimates the relationships at a node as the average over the nodes that have any at that end, which is
+  high for a type that ends at few nodes, and plans such a join as a read of every relationship.
+- **A merge's match** is the plan the statement gives, with its `working` leaf replaced: by the row, numbered 0,
+  when rows are matched one at a time, and by the rows held, each numbered, when the plan gives a `key` and the rows
+  can be matched in one query. The numbers say whose a match is.
+- **Ids** are kept for the connection (`Database.graphIdsOf`): the next node id and relationship rowid of each
+  graph, brought up to the tables as they are when a statement first asks, and moved on as it makes nodes and
+  relationships. A table's past versions are read for them once.
+
+Measured with smaltcy's `bench/writes.ts` on 20,008 nodes and 60,025 relationships (2026-11-22; smaltdb's time in ms
+for the same Cypher through smaltcy's runner on `5388845`, one smaltdb statement for each thing a write does, and
+through one plan; in turns, three turns):
+
+| Write | Through the runner | Through one plan |
+|---|---|---|
+| Create 1 node | 0.025, 0.024, 0.025 | 0.023, 0.021, 0.020 |
+| Create 1,000 nodes | 7.73, 7.54, 8.29 | 7.59, 7.72, 8.12 |
+| Create 1 relationship | 0.042, 0.042, 0.045 | 0.030, 0.030, 0.030 |
+| Create 1,000 relationships | 11.78, 12.36, 12.17 | 11.03, 10.72, 10.92 |
+| Set 1 property by name | 0.026, 0.026, 0.028 | 0.019, 0.018, 0.018 |
+| Set 1,000 properties | 7.19, 7.33, 7.28 | 5.62, 5.44, 5.54 |
+| Merge an existing node | 0.012, 0.012, 0.012 | 0.011, 0.011, 0.011 |
+| Merge 1,000 new nodes | 10.04, 9.76, 9.89 | 8.35, 8.93, 9.18 |
+| Delete 1,000 nodes | 8.53, 8.28, 9.13 | 7.09, 7.07, 6.85 |

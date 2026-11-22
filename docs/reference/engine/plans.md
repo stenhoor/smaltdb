@@ -110,10 +110,15 @@ Each operation's output columns, in order:
 | `window` | `input`, `partition`, `order`, `frame`, `calls` | its input's, then one per window call |
 | `setop` | `kind` (`union` / `unionAll` / `intersect` / `except`), `inputs`, `collations` | the first input's |
 | `iterate` | `id`, `name`, `init`, `steps`, `distinct`, `collations`, `order?`, `limit?`, `offset?`, `key?`, `maxDepth?` | `init`'s: its rows, then each step's until a step gives none (a recursive query). `key` (with `distinct`) keeps one row per value of those columns: the first, or with `order` the lowest, so shortest paths by hops or by cost keep one row per node. `maxDepth` runs the steps only for rows fewer than that many steps from `init` |
-| `working` | `id`, `types` | inside an `iterate` with the same `id`: the previous step's rows |
+| `working` | `id`, `types` | inside an `iterate` with the same `id`: the previous step's rows. Inside the `match` of a `graphMerge` with the same `id`: the rows it is matching, each with its number after its columns |
 | `append` | `table`, `db`, `input` (null: one row of defaults), `columns`, `upserts`, `onConflict?`, `returning?` | the RETURNING rows |
 | `update` | `table`, `db`, `input`, `rowid`, `sets`, `from`, `onConflict?`, `returning?` | the RETURNING rows |
 | `delete` | `table`, `db`, `input`, `rowid`, `returning?` | the RETURNING rows |
+| `graphCreate` | `graph`, `input`, `nodes`, `relationships`, `tables?` | its input's, then each new node's id (`int`), then each new relationship's rowid (`int`). See [writing a property graph](#graph-writes) |
+| `graphSet` | `graph`, `input`, `items`, `tables?` | its input's |
+| `graphDelete` | `graph`, `input`, `targets`, `detach` | its input's |
+| `graphMerge` | `graph`, `id`, `input`, `match`, `nodes`, `relationships`, `created`, `onMatch`, `onCreate`, `key?`, `tables?` | its input's, then the columns `match` adds |
+| `eager` | `input` | its input's, all of them read before the first is passed on |
 
 **Joins.** `kind` is `inner`, `left`, `right`, `full`, `cross`, `semi` (left rows with a match), `anti` (left rows
 without one) or `asof`. The condition reads input 0 (the left side) and input 1 (the right side).
@@ -298,6 +303,101 @@ assign `{ column, value }` with `value` over the input row. `returning` expressi
 columns, then its rowid. `onConflict` (`rollback`, `abort`, `fail`, `ignore`, `replace`) overrides each constraint's
 own action; `upserts` handle conflicts of an `append` (`{ target, update? }`, `target` an index of the table, -1 its
 integer primary key, `null` any).
+
+<a id="graph-writes"></a>**Writing a property graph.** `graphCreate`, `graphSet`, `graphDelete` and `graphMerge` write
+a [property graph](./schema#property-graphs) ([ADR 0042](../../adr/0042-graph-writes.md), section 1). Each passes its
+input's rows on, so a write can sit in the middle of a plan and the plan can read on from it; a plan that holds one is
+a `write` statement's. They write the graph's tables through the tables' writers, as an `append`, an `update` or a
+`delete` of them does, so the graph's rules, foreign keys, history and [the graph's index](./schema#the-graph-index)
+are kept, and a statement that fails leaves nothing.
+
+- **The graph** must be laid out for it: a node table with a properties column, where new nodes go and where
+  `graphSet` and `graphDelete` find a node by its id, and a [label index](./schema#nodes-with-several-labels). A
+  graph without them is refused.
+- **`graphCreate`** makes, for each row, its `nodes` and then its `relationships`. A node is `{ labels, props? }`. A
+  relationship is `{ type, start, end, props? }`, each end `{ node: i }` (the i-th node the operation makes) or
+  `{ id }` (an expression that gives a node's id). `props` is a map; a NULL value in it sets no key. An expression
+  reads the row as far as it is made: the input's columns, then the ids of the nodes and relationships before it.
+- **Ids.** A new node's id is one more than the largest the graph's node tables have had, and a new relationship's
+  rowid one more than the largest its relationship tables have had, as far as the connection knows: in the tables,
+  in their past versions where they [keep history](./schema#history), and given by an earlier statement of the
+  connection, whether that statement ended, failed or was rolled back.
+- **A label or a relationship type the graph has not** is added to it, as `alterPropertyGraph` adds one, when a row
+  first needs it, inside the statement's transaction. A statement that fails adds none, and neither does one no row
+  of which reaches the write. `tables` names the table made for one (`{ label, table }` or `{ type, table }`), which
+  must not exist; a plan may read a table it names, which has the columns the engine gives it (a label's `id` and
+  `props`; a type's `start`, `end` and `props`).
+- **`graphSet`** applies its `items` to each row, in order. An item names a node (`node`, its id) or a relationship
+  (`relationship: { type, id }`) and is one of: `{ kind: 'property', key, value }` (a NULL `value` removes the key);
+  `{ kind: 'properties', value, merge }`, `value` a map that replaces the properties or, with `merge`, is set over
+  them key by key (a NULL value then removes its key); `{ kind: 'labels', add, remove }`, a node's. A NULL node or
+  relationship, one that is not in the graph, and a relationship of a type the graph has not, is passed over, and the
+  item's `value` is not computed for it. A relationship whose type's table has no properties column takes none.
+- **Values keep their kind** in a node's or a relationship's properties, which are a `map<text, any>`: a truth
+  value, a list or a map given as a property is one there ([ADR 0039](../../adr/0039-typed-values-under-any.md)),
+  whether it is an item's `value` or a value of a map of that type (`map<text, bool>`).
+- **`graphDelete`** deletes what its `targets` name for each row, in order: `{ node }`, `{ nodes }` (a `list<int>`),
+  `{ relationship: { type, id } }`, `{ hops }` (the relationships of a path, as `paths` gives it: a hop's `edge` is
+  its type's position in the graph) or `{ path: { start, hops } }` (the path's relationships, then its nodes). A NULL,
+  a NULL in a list, and what is gone already, is passed over. A node that still has relationships is an error
+  (`SMALT_CONSTRAINT_FOREIGNKEY`); with `detach` they are deleted first.
+- **`graphMerge`** gives, for each row, the rows of `match` for it or, when there are none, the row with what it
+  makes. `match` is a plan that reads the graph: inside it, a `working` with the operation's `id` gives the rows
+  being matched, each with its number (an `int`) after its columns, and `match` gives a row for each match: the
+  row's number, then the columns it adds. A row that has matches is passed on once for each, after `onMatch` (items,
+  as a `graphSet`'s). A row that has none gets `nodes` and `relationships` made as a `graphCreate` makes them;
+  `created` gives the columns `match` adds (expressions over the input's columns, then the new ids), and the row is
+  passed on after `onCreate`. A row finds what an earlier row made.
+- **`key`** lets the engine match all of a `graphMerge`'s rows in one query, before it makes anything. Give it where
+  this holds of expressions over the input's row: two rows with the same values of them have the same matches, and a
+  row finds what an earlier row made exactly when it has that row's values, `match` then adding what `created` gave
+  that row. Of the rows that match nothing, the first with each key makes, and the later ones with it are passed on
+  with what it made. With a NULL in a row's key, as without a `key`, each row is matched when its turn comes.
+- **What a statement did** comes with its result as `graph`: `nodesCreated`, `nodesDeleted`,
+  `relationshipsCreated`, `relationshipsDeleted`, `propertiesSet` (keys set or removed, counted for each write that
+  names one, whether or not it changed the value), `labelsAdded` and `labelsRemoved`. `changes` is their sum.
+
+<a id="graph-write-order"></a>**The order a plan that writes a graph runs in.** A write handles its input's rows in
+order, each before the next is read, and what a row's expressions read of the graph is the graph as it is then: a
+property set from itself counts up over rows that name one node, and a `graphMerge` finds what it made for an
+earlier row.
+
+- **Below a write,** a part of the plan that writes nothing is read to its end before anything above it runs, so no
+  scan is open on a table while it is written. One exception: operations at the top of such a part that read the
+  graph for each row (a `filter`, `project`, `explode` or `unpivot` with a nested plan; `paths`) run when each row's
+  turn comes, so they read what the rows before it wrote. An `eager` has everything below it done first, whatever it
+  reads.
+- **Above a write,** `filter`, `project`, `explode`, `unpivot`, `paths` and a `join` whose left input is the one that
+  writes pass each row on as it is written, through every operation above before the next row is written. `sort`,
+  `aggregate`, `distinct`, `window`, `sample` and `pivot` read all the rows first. A `limit` stops the write below
+  it once it has its rows.
+- **All a write's rows at once.** Where no row could tell the difference, the engine writes a write's rows
+  together, a pass over each table, and runs the operations above over all of them: when nothing above the write, up
+  to an operation that reads all its rows, reads the graph, writes or stops early, and what the write computes reads
+  only its row. The rows and the graph are what row by row gives. A statement that would fail for more than one
+  reason may report another of them.
+- **Refused** (`SMALT_UNSUPPORTED`): a write in a plan nested in an expression or in a `graphMerge`'s `match`, on
+  the right of a join or on both sides of one, under a `right`, `full` or `asof` join, under a `limit` counted from
+  the end, and under a `setop` or an `iterate`.
+
+```ts
+import { plan as p } from 'smaltdb/engine';
+
+// For each name, the Person that has it, or a new one: the row's name, then the node's id.
+const names = p.values([[p.lit('Ada')], [p.lit('Bo')], [p.lit('Ada')]], ['text']);
+// The match reads the row through `working`: its name, then its number.
+const person = p.filter(
+  p.join('cross', p.working(1, ['text', 'int']), p.scan('person', [0, 1])),
+  p.call('cmp_eq', [p.call('map_get', [p.col(0, 3, 'map<text, any>'), p.lit('name')], 'any'), p.col(0, 0, 'text')], 'bool'),
+);
+const merge = p.graphMerge('social', 1, names, p.project(person, [p.col(0, 1, 'int'), p.col(0, 2, 'int')]), {
+  nodes: [{ labels: ['Person'], props: p.call('map_of', [p.lit('name'), p.col(0, 0, 'text')], 'map<text, any>') }],
+  created: [p.col(0, 1, 'int')],
+  // Rows with the same name match the same nodes, and find the node an earlier row with that name made.
+  key: [p.col(0, 0, 'text')],
+});
+const statement = { kind: 'write', plan: merge };
+```
 
 ## Expressions
 
@@ -520,6 +620,7 @@ NULLs first). They check nothing: the engine validates every plan it is given, b
 | Windows | `window(input, calls, options?)` (`partition`, `collations`, `order`, `frame`; the frame defaults to the partition's rows up to the current row and its peers), `windowCall(fn, args, type, options?)`, `frame(unit, start, end, exclude?)` with `unboundedPreceding`, `preceding(n)`, `currentRow`, `following(n)`, `unboundedFollowing` |
 | Sources and recursion | `source(kind, name, args, types, options?)`, `iterate(id, name, init, steps, options?)`, `working(id, types)` |
 | Writes | `append(table, input, columns, options?)`, `update(table, input, rowid, sets, options?)`, `remove(table, input, rowid, options?)` |
+| Graph writes | `graphCreate(graph, input, nodes, relationships?, tables?)`, `graphSet(graph, input, items, tables?)`, `graphDelete(graph, input, targets, options?)` (`detach`), `graphMerge(graph, id, input, match, make)` (`nodes`, `relationships`, `created`, `onMatch`, `onCreate`, `key`, `tables`), `eager(input)` |
 
 ```ts
 import { plan as p } from 'smaltdb/engine';

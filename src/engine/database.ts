@@ -5165,6 +5165,8 @@ export class Database implements FunctionContext {
 
   private compileWriteOp(fe: BoundWrite, planner: Planner): Omit<Program, 'regCount'> {
     const op = fe.plan;
+    // A plan that writes a property graph, wherever in it the write is: run in stages, which refuse what they can't run.
+    if (writesGraph(op)) return this.graphWriteProgram(fe);
     switch (op.op) {
       case 'append': {
         const table = this.targetTable(op.table, op.db);
@@ -5177,7 +5179,6 @@ export class Database implements FunctionContext {
       case 'delete':
         return this.dmlProgram(this.compileDelete(op, fe, this.targetTable(op.table, op.db), planner));
       default:
-        if (writesGraph(op)) return this.graphWriteProgram(fe);
         throw new SmaltError('SMALT_PLAN', `a write statement's plan is an append, an update, a delete or a plan that writes a property graph, not ${op.op}`);
     }
   }

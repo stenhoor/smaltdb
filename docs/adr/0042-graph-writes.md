@@ -1,7 +1,9 @@
 # ADR 0042: A graph's writes: run by smaltdb, in memory first, the tables written behind
 
-- **Status:** proposed, for the owner to accept, change or refuse. Nothing of it is built. The numbers in the Context
-  come from a spike that was measured and thrown away (2026-11-21); what is an estimate is marked as one.
+- **Status:** merged 2026-11-21 ([#292](https://github.com/stenhoor/smaltdb/pull/292)) without answers to its three
+  questions, so the steps follow what it proposes. Built: steps 1 and 2; see [As built](#as-built) for the pull
+  requests, what they measured and where they differ from the text. The numbers in the Context come from a spike that
+  was measured and thrown away (2026-11-21); what is an estimate is marked as one.
 - **Date:** 2026-11-21
 - **Builds on:** [ADR 0033](0033-property-graphs-and-history.md) (a graph's tables; its step 8, Cypher's writes; its
   decision 12, the engine keeps a graph's rules), [ADR 0040](0040-graph-index-and-relationships.md) (the graph index:
@@ -253,3 +255,119 @@ and merged only if it meets its gate. The step numbers are this record's.
 3. **The order of the steps:** the read first (it stands alone), then the operations and smaltcy's compiler, then the
    tables written behind. Steps 2 and 3 move the execution and by themselves leave bulk writes where they are; step 4
    is what reaches for the bar. The other order is possible: step 4 under the runner as it is. Which first?
+
+## As built
+
+Added 2026-11-22, with step 2. Each number says what it compares:
+
+- **Against smaltcy:** smaltdb's time over the time of smaltcy's in-memory engine, on the same Cypher and the same
+  network (20,008 nodes, 60,025 relationships), the engines taking turns, from smaltcy's benchmarks. This is the bar:
+  1.00x or less.
+- **The runner and one plan:** smaltdb's time for the same Cypher through smaltcy's runner, which sends smaltdb a
+  statement for each thing a write does, on smaltdb `main` without the step, and through one plan on the step's
+  branch, the two run in turns. It says what the step did, and nothing about smaltcy's engine.
+
+| Step | Pull requests | Measured |
+|---|---|---|
+| 1 | [#293](https://github.com/stenhoor/smaltdb/pull/293), [#294](https://github.com/stenhoor/smaltdb/pull/294), [#295](https://github.com/stenhoor/smaltdb/pull/295), stenhoor/smaltcy#37 | Against smaltcy, before and after (smaltcy's `docs/research/benchmarks.md`, "Small labels, and nodes deleted"): a node of a small label found by a property 5.14x to 6.69x and 0.75x to 0.86x; one of 8 cities found by a property 1.06x to 1.09x and 0.83x to 0.85x; the 8 cities returned 1.23x to 1.43x and 1.15x to 1.16x, still over the bar; delete 1 node 7.50x to 9.75x and 2.23x to 2.66x |
+| 2 | The pull request that adds this section | Below |
+
+### Step 2: its gate
+
+**smaltcy's write tests give the same through a plan as through its runner.** A compiler from smaltcy's plans for
+writes to the operations of section 1 was written to check it: a prototype of step 3, on smaltcy's branch
+`claude/writes-as-plans`, not merged. smaltcy has five test files that run writes on smaltdb (writes, history, kept
+writes, statement shapes, and the differential test against its own engine): 609 tests. Through plans 607 pass. The
+two that fail read the runner's own statements (how many it sends for a `SET`, and which tables its id lookups
+read), which a plan does not have.
+
+**No write slower than with smaltcy#36.** smaltcy's `bench/writes.ts`, the same text every run: smaltdb's time in
+ms through the runner on `5388845` and through one plan, three turns.
+
+| Write | Through the runner | Through one plan |
+|---|---|---|
+| Create 1 node | 0.025, 0.024, 0.025 | 0.023, 0.021, 0.020 |
+| Create 1,000 nodes | 7.73, 7.54, 8.29 | 7.59, 7.72, 8.12 |
+| Create 1 relationship | 0.042, 0.042, 0.045 | 0.030, 0.030, 0.030 |
+| Create 1,000 relationships | 11.78, 12.36, 12.17 | 11.03, 10.72, 10.92 |
+| Set 1 property by name | 0.026, 0.026, 0.028 | 0.019, 0.018, 0.018 |
+| Set 1,000 properties | 7.19, 7.33, 7.28 | 5.62, 5.44, 5.54 |
+| Merge an existing node | 0.012, 0.012, 0.012 | 0.011, 0.011, 0.011 |
+| Merge 1,000 new nodes | 10.04, 9.76, 9.89 | 8.35, 8.93, 9.18 |
+| Delete 1,000 nodes | 8.53, 8.28, 9.13 | 7.09, 7.07, 6.85 |
+
+Create 1,000 nodes is level; the others are faster. smaltcy's `bench/vary.ts`, statements that differ each time,
+measured the same way (three turns; the median of the three, in ms, with a literal and with a parameter):
+
+| Write | Through the runner | Through one plan |
+|---|---|---|
+| Create 1 node | 0.054 and 0.046 | 0.046 and 0.039 |
+| Create 1,000 nodes | 9.44 and 9.72 | 8.77 and 8.53 |
+| Create 1 relationship | 0.101 and 0.075 | 0.067 and 0.055 |
+| Create 1,000 relationships | 14.54 and 14.07 | 12.65 and 12.57 |
+| Set 1 property by name | 0.055 and 0.048 | 0.048 and 0.038 |
+| Set 1,000 properties | 8.92 and 8.65 | 5.64 and 5.95 |
+| Merge an existing node | 0.019 and 0.019 | 0.016 and 0.016 |
+| Merge 1,000 new nodes | 12.06 and 12.01 | 9.02 and 9.09 |
+| Delete 1 node | 0.057 and 0.057 | 0.035 and 0.034 |
+| Delete 1,000 nodes | 9.44 and 9.42 | 7.90 and 7.63 |
+
+Single turns of that benchmark read up to twice their case's other turns, on either side (create 1 node through one
+plan 0.045, 0.046 and 0.109 ms; delete 1 node through the runner 0.117, 0.056 and 0.057), which is why the table
+gives medians.
+
+**Against smaltcy, through one plan** (`bench/writes.ts`, the same three turns): create 1 node 3.26x, 3.30x, 3.27x;
+create 1 relationship 2.12x, 2.19x, 2.18x; set 1 property 1.76x, 1.78x, 1.72x; merge an existing node 1.09x, 1.11x,
+1.12x; create 1,000 nodes 10.31x, 11.57x, 11.55x; create 1,000 relationships 8.30x, 8.36x, 7.76x; set 1,000
+properties 11.22x, 10.63x, 11.04x; delete 1,000 nodes 14.89x, 15.25x, 15.07x; merge 1,000 new nodes 0.62x, 0.64x,
+0.63x. Every write but the last is still over the bar: step 2 moves where a write runs, and steps 3 to 5 are what
+reach for the bar.
+
+### Step 2: where it differs from section 1
+
+1. **A write's rows are written all at once where no row could tell.** Section 1 says row by row, which is what a
+   plan means. Run that way, a plan's writes of 1,000 rows measured slower than the runner's on every case (create
+   1,000 nodes 10.6 and 10.5 ms against the runner's 8.6 and 8.0; delete 1,000 nodes 26.68x and 26.17x against
+   smaltcy where the runner's read 18.99x and 19.71x), since the runner already wrote such rows in one statement a
+   table. So where nothing above a write, up to an operation that reads all its rows, reads the graph, writes or
+   stops early, and what the write computes reads only its row, the engine writes its rows together, a pass over
+   each table. The rows and the graph are the same. One thing is not: a statement that would fail for more than one
+   reason may report another of them.
+2. **`graphMerge`'s plan reads numbered rows, and a plan may say what lets all its rows be matched at once.** Matched
+   one row at a time, 1,000 new nodes took 435 and 431 ms (31x smaltcy's time; the runner's 9.1 and 9.4 ms): each
+   row's match read the label's nodes, 1,000 times over a label that grows. Inside the match, `working` gives each
+   row with its number, and the match gives the number back, so one query can match many rows. `key` is what makes
+   that sound: the plan says which values decide a row's matches, and that a row finds what an earlier row made
+   exactly when it has that row's values. Without it the engine matches each row when its turn comes.
+3. **A label or a type is added when a row first needs it,** not when the statement starts. A statement no row of
+   which reaches the write then changes nothing: smaltcy's history tests expect such a statement to make no commit,
+   and one that adds a label makes one.
+4. **A statement may name the tables of the labels and types it adds** (`tables`), so that what the plan reads after
+   a write can name them: a match that reads a label the same statement adds.
+5. **A part that writes nothing is not always read to its end first.** Operations at its top that read the graph for
+   each row (a nested plan in a `filter`, `project`, `explode` or `unpivot`; `paths`) run when each row's turn
+   comes, over the one query below them. Cypher's `WITH x WHERE NOT EXISTS { … } CREATE …` needs it: the second of
+   two rows that are the same must find what the first made. No scan is open on a table while it is written either
+   way: such an operation's plan for a row is run to its end before the row goes on. Under an `eager` everything is
+   read first.
+6. **Ids are kept for the connection.** Section 1 says one more than the largest. As built it is one more than the
+   largest the graph has had as far as the connection knows: an id is not given again after its node is deleted, nor
+   after the statement that took it failed or was rolled back. smaltcy's runner did this with ids its caller kept
+   from one statement to the next; without it the ids differed from those of smaltcy's engine after a delete and
+   after a statement that failed, and smaltcy's tests compare them.
+7. **`graphDelete` also takes lists of nodes, the hops of a path, and a path,** which Cypher deletes.
+8. **A language's own errors are expressions that raise** (`raise_error`, with the language's code), in the plan,
+   when a row reaches them: Cypher's "Can't create a relationship to NULL". The engine's errors are the tables':
+   deleting a node that still has relationships is `SMALT_CONSTRAINT_FOREIGNKEY`, which a language words.
+9. **The graph a plan writes** has a node table with a properties column and a label index, as smaltcy lays one
+   out. `graphSet` and `graphDelete` find a node by its id in that table; any other graph is refused.
+
+What section 1 says and is as built: the five operations; each passes its rows on with columns for what it made;
+the writes go through the tables' writers as the statement runs (appends and updates as plans the engine runs
+inside the statement, deletes by rowid through the writer); a statement that fails leaves nothing; what a statement
+did comes back with its result (`graph`, also through the worker to the client).
+
+One thing the measurements showed about the planner, not changed here: its estimate of the relationships at a node
+is the average over the nodes that have any at that end. For a type that ends at few nodes that is high, and a join
+of many nodes with the graph's relationships is then planned as a read of every relationship (a `graphDelete` of
+1,000 nodes spent half its time there). The delete reads each node's relationships by a search at the node instead.
