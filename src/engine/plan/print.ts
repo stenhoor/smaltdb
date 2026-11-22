@@ -1,7 +1,7 @@
 /** Text form of plan expressions, for tests, debugging and (later) EXPLAIN. */
 import type { SqlValue } from '../values.js';
 import type { BoundExpr } from './expr.js';
-import type { PlanOp } from './ops.js';
+import type { GraphEnd, GraphRelationshipRef, GraphSetItem, PlanOp } from './ops.js';
 
 function literal(v: SqlValue): string {
   if (v === null) return 'NULL';
@@ -52,6 +52,16 @@ export function printExpr(e: BoundExpr): string {
     case 'native':
       return '<compiled>';
   }
+}
+
+const relRef = (r: GraphRelationshipRef): string => `${printExpr(r.type)}:${printExpr(r.id)}`;
+
+/** A `graphSet` item: its node or relationship, then what it changes. */
+function setItem(it: GraphSetItem): string {
+  const target = it.node !== undefined ? printExpr(it.node) : relRef(it.relationship);
+  if (it.kind === 'property') return `${target}.${it.key} = ${printExpr(it.value)}`;
+  if (it.kind === 'properties') return `${target} ${it.merge ? '+=' : '='} ${printExpr(it.value)}`;
+  return `${target}${it.add.map((l) => ` +:${l}`).join('')}${it.remove.map((l) => ` -:${l}`).join('')}`;
 }
 
 /** Indented text form of a plan, one operation per line, for tests and debugging. */
@@ -110,6 +120,20 @@ export function printPlan(op: PlanOp, depth = 0): string {
       return `${pad}update ${op.db}.${op.table} rowid #0.${op.rowid} set ${op.sets.map((x) => `${x.column} = ${printExpr(x.value)}`).join(', ')}${op.returning ? ` returning ${list(op.returning)}` : ''}\n${sub(op.input)}`;
     case 'delete':
       return `${pad}delete ${op.db}.${op.table} rowid #0.${op.rowid}${op.returning ? ` returning ${list(op.returning)}` : ''}\n${sub(op.input)}`;
+    case 'graphCreate': {
+      const end = (e: GraphEnd): string => ('node' in e ? `node ${e.node}` : printExpr(e.id));
+      const nodes = op.nodes.map((n) => `(${n.labels.map((l) => `:${l}`).join('')}${n.props ? ` ${printExpr(n.props)}` : ''})`);
+      const rels = op.relationships.map((r) => `${end(r.start)} -[:${r.type}${r.props ? ` ${printExpr(r.props)}` : ''}]-> ${end(r.end)}`);
+      return `${pad}graphCreate ${op.graph} nodes [${nodes.join(', ')}] relationships [${rels.join(', ')}]\n${sub(op.input)}`;
+    }
+    case 'graphSet':
+      return `${pad}graphSet ${op.graph} [${op.items.map(setItem).join(', ')}]\n${sub(op.input)}`;
+    case 'graphDelete':
+      return `${pad}graphDelete ${op.graph}${op.detach ? ' detach' : ''} nodes [${list(op.nodes)}] relationships [${op.relationships.map(relRef).join(', ')}]\n${sub(op.input)}`;
+    case 'graphMerge':
+      return `${pad}graphMerge ${op.graph} nodes ${op.nodes.length} relationships ${op.relationships.length} created [${list(op.created)}] onMatch [${op.onMatch.map(setItem).join(', ')}] onCreate [${op.onCreate.map(setItem).join(', ')}]\n${sub(op.input)}\n${sub(op.match)}`;
+    case 'eager':
+      return `${pad}eager\n${sub(op.input)}`;
     case 'window': {
       const calls = op.calls.map((c) => `${c.fn}(${c.star ? '*' : list(c.args)})`).join(', ');
       const part = op.partition.length ? ` partition [${list(op.partition.map((p) => p.expr))}]` : '';

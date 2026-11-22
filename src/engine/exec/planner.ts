@@ -3370,6 +3370,14 @@ export function planWidth(op: PlanOp): number {
     case 'update':
     case 'append':
       return op.returning?.length ?? 0;
+    case 'graphCreate':
+      return planWidth(op.input) + op.nodes.length + op.relationships.length;
+    case 'graphSet':
+    case 'graphDelete':
+    case 'eager':
+      return planWidth(op.input);
+    case 'graphMerge':
+      return planWidth(op.input) + planWidth(op.match);
     default: {
       // Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
       const unhandled: never = op;
@@ -3534,6 +3542,14 @@ function supportedLeaf(op: PlanOp, level: number): boolean {
     case 'update':
     case 'delete':
       return supportedPlan(op, level);
+    // A plan that writes a graph is run in stages (exec/graph-write.ts), each a plan without these; `eager` is
+    // rewritten away in any other plan (exec/plan-normalize.ts).
+    case 'graphCreate':
+    case 'graphSet':
+    case 'graphDelete':
+    case 'graphMerge':
+    case 'eager':
+      return false;
     default: {
       // Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
       const unhandled: never = op;

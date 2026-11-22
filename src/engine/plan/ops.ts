@@ -126,6 +126,67 @@ export const PATH_TYPE = 'list<struct<edge int, rowid int, from int, to int>>';
  */
 export const RELATIONSHIP_TYPES = ['int', 'int', 'text', 'int', 'bool', 'map<text, any>'] as const;
 
+/**
+ * A relationship a graph write is given (ADR 0042, section 1): its type's name and its rowid in that type's table,
+ * each an expression over the write's input row. A NULL rowid names no relationship.
+ */
+export interface GraphRelationshipRef {
+  readonly type: PlanExpr;
+  readonly id: PlanExpr;
+}
+
+/**
+ * An end of a relationship a `graphCreate` makes: a node the same operation makes for the row (`node`: its position
+ * in the operation's `nodes`), or a node the row names (`id`: an expression over the input row that gives its id).
+ */
+export type GraphEnd = { readonly node: number } | { readonly id: PlanExpr };
+
+/** A node a `graphCreate` or `graphMerge` makes: its labels, and its properties (a map; a NULL value sets no key). */
+export interface GraphNewNode {
+  readonly labels: readonly string[];
+  readonly props?: PlanExpr;
+}
+
+/** A relationship a `graphCreate` or `graphMerge` makes, from `start` to `end`. */
+export interface GraphNewRelationship {
+  readonly type: string;
+  readonly start: GraphEnd;
+  readonly end: GraphEnd;
+  readonly props?: PlanExpr;
+}
+
+/**
+ * What a `graphSet` changes of one node (`node`: an expression that gives its id) or one relationship
+ * (`relationship`): exactly one of the two is given. A NULL node or relationship, and one that is not in the graph
+ * (it was deleted), is left alone, and the item's `value` is not computed for it.
+ *
+ * - `property`: sets the key to `value`; a NULL `value` removes the key.
+ * - `properties`: `value` is a map. Without `merge` it replaces the properties (its NULL values set no key); with
+ *   `merge` its keys are set over the properties there are, and a NULL value removes its key.
+ * - `labels` (a node's): adds the labels of `add` the node has not, and removes those of `remove` it has.
+ */
+export type GraphSetItem = ({ readonly node: PlanExpr; readonly relationship?: undefined } | { readonly relationship: GraphRelationshipRef; readonly node?: undefined }) &
+  (
+    | { readonly kind: 'property'; readonly key: string; readonly value: PlanExpr }
+    | { readonly kind: 'properties'; readonly value: PlanExpr; readonly merge: boolean }
+    | { readonly kind: 'labels'; readonly add: readonly string[]; readonly remove: readonly string[] }
+  );
+
+/** What a statement's graph writes did (ADR 0042, section 1): given back with its result. */
+export interface GraphWriteCounts {
+  nodesCreated: number;
+  nodesDeleted: number;
+  relationshipsCreated: number;
+  relationshipsDeleted: number;
+  /** Keys set or removed, counted for each write that names one, whether or not it changed the value. */
+  propertiesSet: number;
+  labelsAdded: number;
+  labelsRemoved: number;
+}
+
+/** The operations that write a property graph, and `eager`: a plan that holds one is a write statement's. */
+export const GRAPH_WRITE_OPS: ReadonlySet<string> = new Set(['graphCreate', 'graphSet', 'graphDelete', 'graphMerge']);
+
 export type PlanOp = OpMeaning & (
   /**
    * Rows of a table: `columns` lists table column indexes, -1 for the rowid. `db` names the schema when the query
@@ -374,6 +435,62 @@ export type PlanOp = OpMeaning & (
       readonly from: boolean;
       readonly returning?: readonly PlanExpr[];
     }
+  /**
+   * Makes nodes and relationships of a property graph for each row of `input` (ADR 0042, section 1): first the
+   * `nodes`, in order, then the `relationships`. A node's id is one more than the largest the graph has had; a
+   * relationship's rowid one more than the largest across the graph's relationship tables. `props` reads the row as
+   * far as it is made: the input's columns, then the ids of the nodes and relationships made before it. Outputs the
+   * input's columns, then each new node's id, then each new relationship's rowid.
+   *
+   * A label or a relationship type the graph has not is added to it when the statement starts. A relationship whose
+   * end is NULL is an error.
+   */
+  | {
+      readonly op: 'graphCreate';
+      readonly graph: string;
+      readonly input: PlanOp;
+      readonly nodes: readonly GraphNewNode[];
+      readonly relationships: readonly GraphNewRelationship[];
+    }
+  /** Changes properties and labels of the nodes and relationships each row of `input` names, item by item. Outputs the input's columns. */
+  | { readonly op: 'graphSet'; readonly graph: string; readonly input: PlanOp; readonly items: readonly GraphSetItem[] }
+  /**
+   * Deletes the relationships, then the nodes, that each row of `input` names: `relationships`, and `nodes` (each
+   * an expression that gives a node's id). A node that still has relationships is an error; with `detach` they are
+   * deleted first. A NULL one, and one that is gone already, is passed over. Outputs the input's columns.
+   */
+  | {
+      readonly op: 'graphDelete';
+      readonly graph: string;
+      readonly input: PlanOp;
+      readonly nodes: readonly PlanExpr[];
+      readonly relationships: readonly GraphRelationshipRef[];
+      readonly detach: boolean;
+    }
+  /**
+   * For each row of `input`, runs `match`, a plan that reads the graph for the row (its expressions read the row's
+   * columns one evaluation out). If it gives rows, each is passed on after `onMatch` is applied to it. If it gives
+   * none, the `nodes` and `relationships` are made as a `graphCreate` makes them, `created` gives the columns
+   * `match` would have (expressions over the input's columns, then the new nodes' ids, then the new relationships'
+   * rowids), and the row is passed on after `onCreate`. A row sees what earlier rows made. Outputs the input's
+   * columns, then `match`'s; `onMatch` and `onCreate` read that row.
+   */
+  | {
+      readonly op: 'graphMerge';
+      readonly graph: string;
+      readonly input: PlanOp;
+      readonly match: PlanOp;
+      readonly nodes: readonly GraphNewNode[];
+      readonly relationships: readonly GraphNewRelationship[];
+      readonly created: readonly PlanExpr[];
+      readonly onMatch: readonly GraphSetItem[];
+      readonly onCreate: readonly GraphSetItem[];
+    }
+  /**
+   * Passes its input's rows on once it has read them all: what is below it is done before what is above it starts
+   * (ADR 0042, section 1). Outputs the input's columns.
+   */
+  | { readonly op: 'eager'; readonly input: PlanOp }
   /** One window (PARTITION BY, ORDER BY, frame): outputs its input's columns, then one column per call. */
   | {
       readonly op: 'window';

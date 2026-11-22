@@ -253,6 +253,80 @@ class Validator {
     const orderedFirst = (v: unknown): void => {
       if (v !== undefined && v !== 'first') this.fail("expected 'first'", 'ordered');
     };
+    // Graph writes (ADR 0042, section 1).
+    const graphName = (g: unknown): void => {
+      if (typeof g !== 'string') this.fail('expected a property graph name', 'graph');
+      if (this.catalog.graph && !this.catalog.graph(g as string)) this.fail(`no such property graph: ${g as string}`, 'graph');
+    };
+    const names = (l: unknown, what: string, field: string): void => {
+      const list = this.list(l, field);
+      for (let i = 0; i < list.length; i++) if (typeof list[i] !== 'string' || list[i] === '') this.fail(`expected ${what}`, field, i);
+    };
+    const relationshipRef = (r: unknown, scopes: readonly Scope[]): void => {
+      this.object(r);
+      const ref = r as { type: PlanExpr; id: PlanExpr };
+      ex(ref.type, scopes, 'type');
+      ex(ref.id, scopes, 'id');
+    };
+    /** The nodes and relationships a `graphCreate` or `graphMerge` makes over an input of width `w`: how many. */
+    const newEntities = (nodes: unknown, relationships: unknown, w: number): number => {
+      const ns = this.list(nodes, 'nodes') as { labels: unknown; props?: PlanExpr }[];
+      for (let i = 0; i < ns.length; i++) {
+        this.under('nodes', i, () => {
+          this.object(ns[i]);
+          names(ns[i].labels, 'a label', 'labels');
+          optEx(ns[i].props, reading(w + i), 'props');
+        });
+      }
+      const rs = this.list(relationships, 'relationships') as { type: unknown; start: unknown; end: unknown; props?: PlanExpr }[];
+      for (let i = 0; i < rs.length; i++) {
+        const scopes = reading(w + ns.length + i);
+        this.under('relationships', i, () => {
+          this.object(rs[i]);
+          if (typeof rs[i].type !== 'string' || rs[i].type === '') this.fail('expected a relationship type', 'type');
+          for (const side of ['start', 'end'] as const) {
+            this.under(side, undefined, () => {
+              this.object(rs[i][side]);
+              const e = rs[i][side] as { node?: unknown; id?: PlanExpr };
+              if ((e.node === undefined) === (e.id === undefined)) this.fail('expected a node of this operation or an id (one of them)');
+              if (e.node !== undefined && (!Number.isInteger(e.node) || (e.node as number) < 0 || (e.node as number) >= ns.length)) this.fail(`the operation makes no node ${String(e.node)}`, 'node');
+              optEx(e.id, scopes, 'id');
+            });
+          }
+          optEx(rs[i].props, scopes, 'props');
+        });
+      }
+      return ns.length + rs.length;
+    };
+    const setItems = (items: unknown, scopes: readonly Scope[], field: string): void => {
+      const l = this.list(items, field);
+      for (let i = 0; i < l.length; i++) {
+        this.under(field, i, () => {
+          this.object(l[i]);
+          const it = l[i] as { kind?: unknown; node?: PlanExpr; relationship?: unknown; key?: unknown; value?: PlanExpr; merge?: unknown; add?: unknown; remove?: unknown };
+          if ((it.node === undefined) === (it.relationship === undefined)) this.fail('expected a node or a relationship (one of them)');
+          optEx(it.node, scopes, 'node');
+          if (it.relationship !== undefined) this.under('relationship', undefined, () => relationshipRef(it.relationship, scopes));
+          switch (it.kind) {
+            case 'property':
+              if (typeof it.key !== 'string') this.fail('expected a key', 'key');
+              ex(it.value, scopes, 'value');
+              break;
+            case 'properties':
+              ex(it.value, scopes, 'value');
+              if (typeof it.merge !== 'boolean') this.fail('expected true or false', 'merge');
+              break;
+            case 'labels':
+              if (it.node === undefined) this.fail('labels are a node\'s');
+              names(it.add, 'a label', 'add');
+              names(it.remove, 'a label', 'remove');
+              break;
+            default:
+              this.fail(`unknown kind ${JSON.stringify(it.kind)}`, 'kind');
+          }
+        });
+      }
+    };
     switch (o.op) {
       case 'scan': {
         const n = this.tableWidth(o.table, o.db);
@@ -633,6 +707,42 @@ class Validator {
         }
         return returning(o.returning, n);
       }
+      case 'graphCreate': {
+        graphName(o.graph);
+        const w = sub(o.input, 'input');
+        return w + newEntities(o.nodes, o.relationships, w);
+      }
+      case 'graphSet': {
+        graphName(o.graph);
+        const w = sub(o.input, 'input');
+        setItems(o.items, reading(w), 'items');
+        return w;
+      }
+      case 'graphDelete': {
+        graphName(o.graph);
+        const w = sub(o.input, 'input');
+        const scopes = reading(w);
+        exprs(o.nodes, scopes, 'nodes');
+        const rels = this.list(o.relationships, 'relationships');
+        for (let i = 0; i < rels.length; i++) this.under('relationships', i, () => relationshipRef(rels[i], scopes));
+        if (typeof o.detach !== 'boolean') this.fail('expected true or false', 'detach');
+        return w;
+      }
+      case 'graphMerge': {
+        graphName(o.graph);
+        const w = sub(o.input, 'input');
+        // The match is run for each input row: its expressions read the row one evaluation out.
+        const m = this.under('match', undefined, () => this.op(o.match, reading(w), d, null));
+        const made = newEntities(o.nodes, o.relationships, w);
+        const created = this.list(o.created, 'created');
+        if (created.length !== m) this.fail(`gives ${created.length} columns for the match's ${m}`, 'created');
+        exprs(created, reading(w + made), 'created');
+        setItems(o.onMatch, reading(w + m), 'onMatch');
+        setItems(o.onCreate, reading(w + m), 'onCreate');
+        return w + m;
+      }
+      case 'eager':
+        return sub(o.input, 'input');
       default: {
         // Plans arrive as JSON, so an unknown operation is an error here. Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
         const unhandled: never = o;

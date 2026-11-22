@@ -70,6 +70,14 @@ export function outputTypes(op: PlanOp, tableTypes: TableTypes): PlanType[] {
     case 'update':
     case 'delete':
       return (op.returning ?? []).map(typeOf);
+    case 'graphCreate':
+      return [...outputTypes(op.input, tableTypes), ...op.nodes.map((): PlanType => 'int'), ...op.relationships.map((): PlanType => 'int')];
+    case 'graphSet':
+    case 'graphDelete':
+    case 'eager':
+      return outputTypes(op.input, tableTypes);
+    case 'graphMerge':
+      return [...outputTypes(op.input, tableTypes), ...outputTypes(op.match, tableTypes)];
     default: {
       // Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
       const unhandled: never = op;

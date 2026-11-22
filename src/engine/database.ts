@@ -6677,6 +6677,12 @@ const REWRITES: { readonly [K in PlanOp['op']]: boolean | ((o: Record<string, un
   append: false,
   update: false,
   delete: false,
+  graphCreate: false,
+  graphSet: false,
+  graphDelete: false,
+  graphMerge: false,
+  // In a plan that writes no graph: dropped.
+  eager: true,
 };
 
 /** Whether `v` (a plan, or any part of one) holds an operation that normalizePlan rewrites into others. */
