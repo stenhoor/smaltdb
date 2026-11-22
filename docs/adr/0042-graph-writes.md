@@ -286,41 +286,42 @@ ms through the runner on `5388845` and through one plan, three turns.
 
 | Write | Through the runner | Through one plan |
 |---|---|---|
-| Create 1 node | 0.025, 0.024, 0.025 | 0.023, 0.021, 0.020 |
-| Create 1,000 nodes | 7.73, 7.54, 8.29 | 7.59, 7.72, 8.12 |
-| Create 1 relationship | 0.042, 0.042, 0.045 | 0.030, 0.030, 0.030 |
-| Create 1,000 relationships | 11.78, 12.36, 12.17 | 11.03, 10.72, 10.92 |
-| Set 1 property by name | 0.026, 0.026, 0.028 | 0.019, 0.018, 0.018 |
-| Set 1,000 properties | 7.19, 7.33, 7.28 | 5.62, 5.44, 5.54 |
-| Merge an existing node | 0.012, 0.012, 0.012 | 0.011, 0.011, 0.011 |
-| Merge 1,000 new nodes | 10.04, 9.76, 9.89 | 8.35, 8.93, 9.18 |
-| Delete 1,000 nodes | 8.53, 8.28, 9.13 | 7.09, 7.07, 6.85 |
+| Create 1 node | 0.026, 0.024, 0.024 | 0.019, 0.019, 0.025 |
+| Create 1,000 nodes | 8.00, 7.63, 7.95 | 7.36, 7.78, 7.76 |
+| Create 1 relationship | 0.041, 0.042, 0.040 | 0.030, 0.031, 0.031 |
+| Create 1,000 relationships | 11.81, 11.58, 11.64 | 10.47, 10.98, 10.58 |
+| Set 1 property by name | 0.026, 0.026, 0.027 | 0.018, 0.018, 0.018 |
+| Set 1,000 properties | 7.16, 7.00, 6.99 | 5.42, 5.86, 5.41 |
+| Merge an existing node | 0.012, 0.012, 0.012 | 0.011, 0.011, 0.010 |
+| Merge 1,000 new nodes | 9.40, 9.24, 9.26 | 8.98, 8.65, 8.04 |
+| Delete 1,000 nodes | 8.39, 8.28, 8.50 | 6.78, 6.72, 6.83 |
 
-Create 1,000 nodes is level; the others are faster. smaltcy's `bench/vary.ts`, statements that differ each time,
-measured the same way (three turns; the median of the three, in ms, with a literal and with a parameter):
+By its medians every write is faster through one plan. Turn by turn, create 1 node and create 1,000 nodes each
+have one turn of the three slower than the runner's (0.025 ms against 0.024, and 7.78 against 7.63), and the other
+writes none. smaltcy's `bench/vary.ts`, statements that differ each time, measured the same way (three turns; the
+median of the three, in ms, with a literal and with a parameter):
 
 | Write | Through the runner | Through one plan |
 |---|---|---|
-| Create 1 node | 0.054 and 0.046 | 0.046 and 0.039 |
-| Create 1,000 nodes | 9.44 and 9.72 | 8.77 and 8.53 |
-| Create 1 relationship | 0.101 and 0.075 | 0.067 and 0.055 |
-| Create 1,000 relationships | 14.54 and 14.07 | 12.65 and 12.57 |
-| Set 1 property by name | 0.055 and 0.048 | 0.048 and 0.038 |
-| Set 1,000 properties | 8.92 and 8.65 | 5.64 and 5.95 |
-| Merge an existing node | 0.019 and 0.019 | 0.016 and 0.016 |
-| Merge 1,000 new nodes | 12.06 and 12.01 | 9.02 and 9.09 |
-| Delete 1 node | 0.057 and 0.057 | 0.035 and 0.034 |
-| Delete 1,000 nodes | 9.44 and 9.42 | 7.90 and 7.63 |
+| Create 1 node | 0.055 and 0.049 | 0.047 and 0.039 |
+| Create 1,000 nodes | 9.63 and 9.60 | 8.26 and 8.55 |
+| Create 1 relationship | 0.099 and 0.079 | 0.063 and 0.056 |
+| Create 1,000 relationships | 14.54 and 14.53 | 12.55 and 12.58 |
+| Set 1 property by name | 0.056 and 0.051 | 0.050 and 0.036 |
+| Set 1,000 properties | 8.81 and 8.80 | 5.85 and 5.81 |
+| Merge an existing node | 0.019 and 0.018 | 0.017 and 0.016 |
+| Merge 1,000 new nodes | 11.93 and 11.88 | 9.20 and 9.56 |
+| Delete 1 node | 0.059 and 0.054 | 0.037 and 0.034 |
+| Delete 1,000 nodes | 9.54 and 9.60 | 8.13 and 8.34 |
 
-Single turns of that benchmark read up to twice their case's other turns, on either side (create 1 node through one
-plan 0.045, 0.046 and 0.109 ms; delete 1 node through the runner 0.117, 0.056 and 0.057), which is why the table
-gives medians.
+Single turns of that benchmark read up to twice their case's other turns (through one plan, with a literal: set 1
+property 0.050, 0.090 and 0.048 ms; delete 1 node 0.034, 0.080 and 0.037), which is why the table gives medians.
 
-**Against smaltcy, through one plan** (`bench/writes.ts`, the same three turns): create 1 node 3.26x, 3.30x, 3.27x;
-create 1 relationship 2.12x, 2.19x, 2.18x; set 1 property 1.76x, 1.78x, 1.72x; merge an existing node 1.09x, 1.11x,
-1.12x; create 1,000 nodes 10.31x, 11.57x, 11.55x; create 1,000 relationships 8.30x, 8.36x, 7.76x; set 1,000
-properties 11.22x, 10.63x, 11.04x; delete 1,000 nodes 14.89x, 15.25x, 15.07x; merge 1,000 new nodes 0.62x, 0.64x,
-0.63x. Every write but the last is still over the bar: step 2 moves where a write runs, and steps 3 to 5 are what
+**Against smaltcy, through one plan** (`bench/writes.ts`, the same three turns): create 1 node 3.39x, 3.35x, 3.58x;
+create 1 relationship 2.15x, 2.27x, 2.38x; set 1 property 1.82x, 1.77x, 1.76x; merge an existing node 1.13x, 1.10x,
+1.10x; create 1,000 nodes 11.77x, 11.78x, 11.37x; create 1,000 relationships 8.25x, 8.55x, 8.15x; set 1,000
+properties 10.45x, 10.70x, 11.34x; delete 1,000 nodes 16.27x, 14.53x, 15.29x; merge 1,000 new nodes 0.63x, 0.66x,
+0.65x. Every write but the last is still over the bar: step 2 moves where a write runs, and steps 3 to 5 are what
 reach for the bar.
 
 ### Step 2: where it differs from section 1
@@ -331,8 +332,10 @@ reach for the bar.
    smaltcy where the runner's read 18.99x and 19.71x), since the runner already wrote such rows in one statement a
    table. So where nothing above a write, up to an operation that reads all its rows, reads the graph, writes or
    stops early, and what the write computes reads only its row, the engine writes its rows together, a pass over
-   each table. The rows and the graph are the same. One thing is not: a statement that would fail for more than one
-   reason may report another of them.
+   each table. The rows and the graph are the same: a test runs random plans both ways and compares them, and rows
+   that would not give the same go one by one (a `graphSet` that would write one key of one node twice; a
+   `graphCreate` row that names a node a later row makes). One thing is not the same: a statement that would fail
+   for more than one reason may report another of them.
 2. **`graphMerge`'s plan reads numbered rows, and a plan may say what lets all its rows be matched at once.** Matched
    one row at a time, 1,000 new nodes took 435 and 431 ms (31x smaltcy's time; the runner's 9.1 and 9.4 ms): each
    row's match read the label's nodes, 1,000 times over a label that grows. Inside the match, `working` gives each

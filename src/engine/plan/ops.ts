@@ -164,8 +164,10 @@ export interface GraphNewRelationship {
 
 /**
  * What a `graphSet` changes of one node (`node`: an expression that gives its id) or one relationship
- * (`relationship`): exactly one of the two is given. A NULL node or relationship, and one that is not in the graph
- * (it was deleted), is left alone, and the item's `value` is not computed for it.
+ * (`relationship`): exactly one of the two is given. A NULL node or relationship is left alone, and the item's
+ * `value` is not computed for it. One that is not in the graph (it was deleted) has no property set and no label
+ * removed; a label added to a node that is not in the graph is refused, as the graph's rules refuse its entry in
+ * the label index.
  *
  * - `property`: sets the key to `value`; a NULL `value` removes the key.
  * - `properties`: `value` is a map. Without `merge` it replaces the properties (its NULL values set no key); with

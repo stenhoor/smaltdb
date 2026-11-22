@@ -87,6 +87,22 @@ describe('graphCreate', () => {
     expect(nodes(db).length).toBe(6);
   });
 
+  it('refuses a relationship to a node a later row makes, though all its rows are made at once', () => {
+    const db = graph();
+    // Two rows, a node each: the first row's relationship ends at node 1, which the second row makes; the second's at
+    // node 0. Row by row the first is refused: node 1 is not there yet.
+    const other = p.call('sub', [p.lit(1), p.col(0, 0, 'int')], 'int');
+    const made = p.graphCreate('g', numbers(2), [{ labels: [] }], [{ type: 'NEXT', start: { node: 0 }, end: { id: other } }]);
+    expect(() => write(db, made)).toThrow(/= 1 is not a node of the graph/);
+    expect(() => write(db, p.limit(made, 5))).toThrow(/is not a node of the graph/);
+    expect(nodes(db)).toEqual([]);
+    // To the row's own node, and to one an earlier row made, it is made: both rows' relationships end at node 0.
+    const fresh = graph();
+    const back = p.graphCreate('g', numbers(2), [{ labels: [] }], [{ type: 'NEXT', start: { node: 0 }, end: { id: p.lit(0) } }]);
+    expect(write(fresh, back).rows).toEqual([[0, 0, 0], [1, 1, 1]]);
+    expect(rels(fresh, 'NEXT')).toEqual([[0, 0, 0, {}], [1, 1, 0, {}]]);
+  });
+
   it('reads the row as far as it is made', () => {
     const db = graph();
     // The second node's property is the first node's id.
@@ -120,6 +136,28 @@ describe('graphSet', () => {
     expect(none.graph).toEqual(counts({}));
   });
 
+  it('computes no value for a NULL node or relationship', () => {
+    const db = graph();
+    people(db);
+    // A value that raises: computed only for a row whose node is there to set. Node 1's row has it; the others' node
+    // is NULL.
+    const target = p.caseWhen([{ when: p.call('cmp_eq', [p.col(0, 0, 'int'), p.lit(1)], 'bool'), then: p.col(0, 0, 'int') }], 'int', p.lit(null, 'int'));
+    const loud = p.caseWhen([{ when: p.call('cmp_eq', [p.col(0, 0, 'int'), p.lit(1)], 'bool'), then: any(p.lit('set')) }], 'any', p.call('raise_error', [p.lit('computed for a NULL node')], 'any'));
+    const items = [
+      { node: target, kind: 'property', key: 'x', value: loud },
+      { relationship: { type: p.lit(null, 'text'), id: p.col(0, 0, 'int') }, kind: 'property', key: 'x', value: p.call('raise_error', [p.lit('computed for a NULL relationship')], 'any') },
+      // Beside one that is computed for every row.
+      { node: p.col(0, 0, 'int'), kind: 'property', key: 'y', value: any(p.col(0, 0, 'int')) },
+    ] as const;
+    for (const shape of [(w: PlanOp) => w, (w: PlanOp) => p.limit(w, 10)]) {
+      const r = write(db, shape(p.graphSet('g', ids, [...items])));
+      expect(r.graph).toEqual(counts({ propertiesSet: 4 }));
+    }
+    expect(nodes(db)).toEqual([[0, { i: 0, y: 0 }], [1, { i: 1, x: 'set', y: 1 }], [2, { i: 2, y: 2 }]]);
+    // For a node that is there, it raises.
+    expect(() => write(db, p.graphSet('g', ids, [{ node: p.col(0, 0, 'int'), kind: 'property', key: 'x', value: loud }]))).toThrow(/computed for a NULL node/);
+  });
+
   it('adds and removes labels', () => {
     const db = graph();
     people(db);
@@ -129,6 +167,13 @@ describe('graphSet', () => {
     const gone = write(db, p.graphSet('g', p.filter(ids, p.call('cmp_lt', [id, p.lit(2)], 'bool')), [{ node: id, kind: 'labels', add: [], remove: ['Person', 'Nothing'] }]));
     expect(gone.graph).toEqual(counts({ labelsRemoved: 2 }));
     expect(labels(db)).toEqual([[0, 'Admin'], [1, 'Admin'], [2, 'Admin'], [2, 'Person']]);
+    // A node that is not in the graph: a label is not removed from it, and one added to it is refused by the graph's
+    // rule on the label index, for one row or several.
+    for (const missing of [p.values([[p.lit(70)]], ['int']), p.values([[p.lit(70)], [p.lit(71)]], ['int'])]) {
+      expect(write(db, p.graphSet('g', missing, [{ node: id, kind: 'labels', add: [], remove: ['Admin'] }])).graph).toEqual(counts({}));
+      expect(() => write(db, p.graphSet('g', missing, [{ node: id, kind: 'labels', add: ['Admin'], remove: [] }]))).toThrow(/g_labels.node = 70 is not a node of the graph/);
+    }
+    expect(labels(db).length).toBe(4);
   });
 
   it('an item reads what the items before it wrote, row by row', () => {
@@ -434,12 +479,45 @@ describe('all the rows of a write at once', () => {
     expect((once[2] as unknown[][])[2]).toEqual([2, { double: 4 }]);
   });
 
+  it('graphSet sets a property of a row whose properties are NULL, and takes none away from it', () => {
+    const [once, each] = bothWays((shape) => {
+      const db = people();
+      // Two nodes written to the node table without properties.
+      db.exec('INSERT INTO node(id) VALUES (50), (51)');
+      write(db, shape(p.graphSet('g', p.filter(p.scan('node', [0]), p.call('cmp_ge', [id, p.lit(8)], 'bool')), [
+        { node: id, kind: 'property', key: 'set', value: p.caseWhen([{ when: p.call('cmp_eq', [id, p.lit(51)], 'bool'), then: p.lit(null, 'int') }], 'any', any(id)) },
+      ])));
+      return nodes(db).slice(8);
+    });
+    expect(once).toEqual(each);
+    expect(once).toEqual([[8, { i: 8, set: 8 }], [9, { i: 9, set: 9 }], [50, { set: 50 }], [51, null]]);
+  });
+
   it('graphSet goes row by row where two rows name one node: the later one is set over the earlier', () => {
     const db = people();
     // Rows 0 to 9, each naming node 0 or 1.
     const r = write(db, p.graphSet('g', numbers(10), [{ node: p.call('mod_trunc', [id, p.lit(2)], 'int'), kind: 'property', key: 'last', value: any(id) }]));
     expect(r.graph).toEqual(counts({ propertiesSet: 10 }));
     expect(nodes(db).slice(0, 2)).toEqual([[0, { i: 0, last: 8 }], [1, { i: 1, last: 9 }]]);
+  });
+
+  it('graphSet goes row by row where two items write one key of one node in different rows', () => {
+    const run = (shape: (w: PlanOp) => PlanOp): unknown[][] => {
+      const db = people();
+      // Two rows of two nodes, each the other's the other way round: the first item sets `x` on the second node, the
+      // second item on the first. Row by row, node 0 is last written by the second row's first item.
+      const pairs = p.values([[p.lit(0), p.lit(1)], [p.lit(1), p.lit(0)]], ['int', 'int']);
+      write(db, shape(p.graphSet('g', pairs, [
+        { node: p.col(0, 1, 'int'), kind: 'property', key: 'x', value: any(p.lit('first item')) },
+        { node: p.col(0, 0, 'int'), kind: 'property', key: 'x', value: any(p.lit('second item')) },
+        { node: p.col(0, 1, 'int'), kind: 'labels', add: ['Seen'], remove: [] },
+        { node: p.col(0, 0, 'int'), kind: 'labels', add: [], remove: ['Seen'] },
+      ])));
+      return [...nodes(db).slice(0, 2), ...labels(db).filter((l) => l[1] === 'Seen')];
+    };
+    const rowByRow = [[0, { i: 0, x: 'first item' }], [1, { i: 1, x: 'second item' }], [0, 'Seen']];
+    expect(run((w) => p.limit(w, 10))).toEqual(rowByRow);
+    expect(run((w) => w)).toEqual(rowByRow);
   });
 
   it('graphDelete gives what it gives row by row: nodes with their relationships, relationships, lists', () => {
@@ -479,6 +557,141 @@ describe('all the rows of a write at once', () => {
     write(db, p.graphSet('g', p.scan('node', [0]), [{ node: id, kind: 'property', key: 'i', value: any(p.lit(0)) }]));
     // Node 0 had 0 already: nine rows changed.
     expect(versions()).toBe((before as number) + 9);
+  });
+});
+
+describe('all at once and row by row give the same, on random plans', () => {
+  /** A generator of numbers from a seed (mulberry32): the same plans every run. */
+  const random = (seed: number) => {
+    let a = seed >>> 0;
+    const next = (): number => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const int = (n: number): number => Math.floor(next() * n);
+    return { next, int, pick: <T>(xs: readonly T[]): T => xs[int(xs.length)]!, chance: (x: number): boolean => next() < x };
+  };
+  type Random = ReturnType<typeof random>;
+  const NODES = 8;
+  const a = p.col(0, 0, 'int');
+  const b = p.col(0, 1, 'int');
+  const eq = (x: PlanExpr, y: PlanExpr): PlanExpr => p.call('cmp_eq', [x, y], 'bool');
+
+  /** Eight nodes (two without properties, one written with NULL ones), some labelled, and relationships of two types. */
+  const world = (r: Random): Database => {
+    const db = graph();
+    write(db, p.graphCreate('g', numbers(NODES - 1), [{ labels: ['Person'], props: p.caseWhen([{ when: p.call('cmp_lt', [a, p.lit(2)], 'bool'), then: p.lit(null, M) }], M, map('i', any(a), 'x', any(p.lit('old')))) }]));
+    db.exec(`INSERT INTO node(id) VALUES (${NODES - 1})`);
+    write(db, p.graphSet('g', p.filter(p.scan('node', [0]), eq(p.call('mod_trunc', [a, p.lit(3)], 'int'), p.lit(0))), [{ node: a, kind: 'labels', add: ['Seen'], remove: [] }]));
+    const pairs = p.values(Array.from({ length: 10 }, () => [p.lit(r.int(NODES)), p.lit(r.int(NODES))]), ['int', 'int']);
+    write(db, p.graphCreate('g', pairs, [], [{ type: 'KNOWS', start: { id: a }, end: { id: b }, props: map('w', any(a)) }, { type: 'LIKES', start: { id: b }, end: { id: a } }]));
+    return db;
+  };
+  /** A node id, sometimes of no node, sometimes NULL. */
+  const someId = (r: Random): PlanExpr => (r.chance(0.12) ? p.lit(null, 'int') : p.lit(r.int(NODES + 3)));
+  const input = (r: Random): PlanOp => p.values(Array.from({ length: 2 + r.int(9) }, () => [someId(r), someId(r)]), ['int', 'int']);
+  const value = (r: Random): PlanExpr =>
+    r.pick([
+      (): PlanExpr => any(a),
+      (): PlanExpr => any(p.call('add', [p.call('coalesce', [a, p.lit(0)], 'int'), p.call('coalesce', [b, p.lit(0)], 'int')], 'int')),
+      (): PlanExpr => any(p.lit('new')),
+      (): PlanExpr => p.lit(null),
+      (): PlanExpr => p.call('cmp_lt', [a, b], 'bool'),
+      // One that raises for some rows: both ways fail, or neither does.
+      (): PlanExpr => p.caseWhen([{ when: eq(a, p.lit(r.int(NODES + 3))), then: p.call('raise_error', [p.lit('a value that raises')], 'any') }], 'any', any(b)),
+    ])();
+  const item = (r: Random): Record<string, unknown> => {
+    const target = r.chance(0.75) ? { node: r.pick([a, b]) } : { relationship: { type: p.lit(r.pick(['KNOWS', 'LIKES', 'NONE'])), id: r.pick([a, b]) } };
+    const kind = r.int(10);
+    if (kind < 6) return { ...target, kind: 'property', key: r.pick(['x', 'y']), value: value(r) };
+    if (kind < 8 || 'relationship' in target) return { ...target, kind: 'properties', value: map('x', value(r), 'z', any(p.lit(1))), merge: r.chance(0.5) };
+    return { ...target, kind: 'labels', add: r.chance(0.6) ? [r.pick(['Seen', 'Tag'])] : [], remove: r.chance(0.6) ? [r.pick(['Seen', 'Person', 'Tag'])] : [] };
+  };
+  /** A write, sometimes under steps that read only its rows. */
+  const plan = (r: Random): PlanOp => {
+    const w = aWrite(r);
+    return r.chance(0.3) ? p.project(p.filter(w, p.isNotNull(a)), [b, a]) : w;
+  };
+  const aWrite = (r: Random): PlanOp => {
+    const rows = input(r);
+    switch (r.int(4)) {
+      case 0: {
+        // Sometimes two items that write one key, each of another column's node, over two rows that hold two nodes
+        // the other way round: each node is written by both items, and which write is the later depends on the row.
+        if (r.chance(0.3)) {
+          const key = r.pick(['x', 'y']);
+          const x = r.int(NODES);
+          const y = (x + 1 + r.int(NODES - 1)) % NODES;
+          const swapped = p.values([[p.lit(x), p.lit(y)], [p.lit(y), p.lit(x)]], ['int', 'int']);
+          return p.graphSet('g', swapped, [{ node: b, kind: 'property', key, value: any(p.lit('of b')) }, { node: a, kind: 'property', key, value: any(p.lit('of a')) }]);
+        }
+        return p.graphSet('g', rows, Array.from({ length: 1 + r.int(3) }, () => item(r)) as never);
+      }
+      case 1: {
+        const target = (): Record<string, unknown> =>
+          r.pick([
+            (): Record<string, unknown> => ({ node: r.pick([a, b]) }),
+            (): Record<string, unknown> => ({ nodes: p.call('list_of', [a, b], 'list<int>') }),
+            (): Record<string, unknown> => ({ relationship: { type: p.lit(r.pick(['KNOWS', 'LIKES', 'NONE'])), id: r.pick([a, b]) } }),
+          ])();
+        return p.graphDelete('g', rows, Array.from({ length: 1 + r.int(2) }, target) as never, { detach: r.chance(0.7) });
+      }
+      case 2: {
+        const node = (): { labels: string[]; props?: PlanExpr } => ({ labels: r.chance(0.5) ? [r.pick(['Person', 'Tag'])] : [], ...(r.chance(0.7) ? { props: map('x', value(r)) } : {}) });
+        const nodes = Array.from({ length: r.int(3) }, node);
+        const end = (): { node: number } | { id: PlanExpr } => (nodes.length > 0 && r.chance(0.5) ? { node: r.int(nodes.length) } : { id: r.pick([a, b, p.call('add', [a, p.lit(NODES)], 'int')]) });
+        const rels = Array.from({ length: r.int(3) }, () => ({ type: r.pick(['KNOWS', 'LIKES', 'NEW']), start: end(), end: end(), ...(r.chance(0.4) ? { props: map('w', value(r)) } : {}) }));
+        return p.graphCreate('g', rows, nodes, rels);
+      }
+      default: {
+        // The nodes whose `x` is the row's first column, or a new one with it.
+        const row = p.working(9, ['int', 'int', 'int']);
+        const found = p.filter(p.join('cross', row, p.scan('node', [0, 1])), p.call('cmp_eq', [p.call('map_get', [p.col(0, 4, M), p.lit('x')], 'any'), any(a)], 'bool'));
+        return p.graphMerge('g', 9, rows, p.project(found, [p.col(0, 2, 'int'), p.col(0, 3, 'int')]), {
+          nodes: [{ labels: r.chance(0.5) ? ['Tag'] : [], props: map('x', any(a)) }],
+          created: [p.col(0, 2, 'int')],
+          ...(r.chance(0.7) ? { key: [a] } : {}),
+        });
+      }
+    }
+  };
+  /** What a plan gives and leaves: its rows and counts, or that it failed, and the graph after. */
+  const outcome = (seed: number, shape: (w: PlanOp) => PlanOp): unknown[] => {
+    const r = random(seed);
+    const db = world(r);
+    let result: unknown;
+    try {
+      const done = write(db, shape(plan(r)));
+      result = [done.rows, done.graph];
+    } catch (e) {
+      // Which of two failures is reported may differ: that it failed may not.
+      result = 'failed';
+      void e;
+    }
+    const types = db.query("SELECT name FROM sqlite_schema WHERE name IN ('KNOWS', 'LIKES', 'NEW') ORDER BY name").rows.map((t) => t[0] as string);
+    return [result, nodes(db), labels(db), ...types.map((t) => rels(db, t))];
+  };
+
+  // SMALT_GRAPH_PLANS: how many plans (150 unless set), from seed SMALT_GRAPH_SEED (1 unless set).
+  const PLANS = Number(process.env.SMALT_GRAPH_PLANS ?? 150);
+  const FIRST = Number(process.env.SMALT_GRAPH_SEED ?? 1);
+
+  it(`${PLANS} plans`, { timeout: 30_000 + 100 * PLANS }, () => {
+    let failed = 0;
+    let wrote = 0;
+    for (let seed = FIRST; seed < FIRST + PLANS; seed++) {
+      const once = outcome(seed, (w) => w);
+      const each = outcome(seed, (w) => p.limit(w, 1000));
+      expect(once, `seed ${seed}`).toEqual(each);
+      if (once[0] === 'failed') failed++;
+      else if (Object.values((once[0] as [unknown, GraphWriteCounts])[1]).some((n) => n > 0)) wrote++;
+    }
+    // The plans are worth running: most write something, and some fail.
+    expect(wrote).toBeGreaterThan(PLANS / 2);
+    expect(failed).toBeGreaterThan(PLANS / 20);
   });
 });
 

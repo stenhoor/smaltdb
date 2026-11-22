@@ -489,10 +489,14 @@ export class GraphWrite {
 
   /** A new node's id (or a new relationship's rowid): the graph's next, asked for once a run and moved on. */
   private newId(ctx: Ctx, g: GraphLayout, of: 'node' | 'relationship'): number {
+    return this.idsOf(ctx, g, of)[of]++;
+  }
+
+  private idsOf(ctx: Ctx, g: GraphLayout, of: 'node' | 'relationship'): GraphIds {
     const key = `${of}:${g.name}`;
     let ids = ctx.ids.get(key);
     if (ids === undefined) ctx.ids.set(key, (ids = this.host.ids(g.name, of)));
-    return ids[of]++;
+    return ids;
   }
 
   // ---------------------------------------------------------------- the tables' writes
@@ -569,7 +573,10 @@ export class GraphWrite {
           const rows = input.rows(ctx);
           // And where nothing could tell (nothing above reads the graph or stops between two rows, and what the rows
           // make reads only them), all of them are written at once: a pass over each table.
-          if (quiet && make.settled && rows.length > 1) return make.rows(ctx, rows, w).every(sink);
+          if (quiet && make.settled && rows.length > 1) {
+            const made = make.rows(ctx, rows, w);
+            if (made !== null) return made.every(sink);
+          }
           const early = make.early(ctx, rows);
           return rows.every((row, i) => sink(make.row(ctx, row, early?.[i], w)));
         }
@@ -603,7 +610,14 @@ export class GraphWrite {
       if (spelled === null || spelled.g !== g) spelled = { g, labels: nodes.map((n) => [...new Set(n.labels.map((l) => g.label(l) ?? l))].filter((l) => l !== g.nodes.label)) };
       return spelled.labels;
     };
-    const ends = (e: GraphEnd, at: number): { node: number } | { value: EvalRef } => ('node' in e ? { node: e.node } : { value: ev.add(e.id, at) });
+    /** The ends that are nodes a row names, not ones the operation makes. */
+    const named: EvalRef[] = [];
+    const ends = (e: GraphEnd, at: number): { node: number } | { value: EvalRef } => {
+      if ('node' in e) return { node: e.node };
+      const value = ev.add(e.id, at);
+      named.push(value);
+      return { value };
+    };
     const relParts = rels.map((r, j) => {
       if (r.props && !isMapType(typeOf(r.props))) throw new SmaltError('SMALT_PLAN', `graphCreate: a relationship's props is a map, not ${typeOf(r.props)}`);
       const at = w + nodes.length + j;
@@ -612,13 +626,24 @@ export class GraphWrite {
     const make: Maker = {
       early: (ctx, rows) => ev.early(ctx, rows),
       settled: ev.settled,
-      rows: (ctx, rows, width, several = true) => {
+      rows: (ctx, rows, width, several = true): Row[] | null => {
         if (rows.length === 0) return [];
         // One row is written as a row is: a plan over rows held here costs more than the row.
         if (rows.length === 1 && !several) return [make.row(ctx, rows[0]!, undefined, width)];
         const early = ev.early(ctx, rows);
         this.ready(ctx, op, nodes, rels);
         const g = this.layoutOf(op.graph);
+        // A node a row names for a relationship must be there when the row is written, and one that a later row of
+        // these makes is not: written all at once it would be. Such rows go one by one, where the graph's rules
+        // refuse it.
+        if (named.length > 0 && nodes.length > 0 && early !== undefined) {
+          const first = this.idsOf(ctx, g, 'node').node;
+          const end = first + rows.length * nodes.length;
+          for (let i = 0; i < rows.length; i++) {
+            const mine = first + (i + 1) * nodes.length;
+            if (named.some((ref) => ref.early && typeof early[i]![ref.at] === 'number' && (early[i]![ref.at] as number) >= mine && (early[i]![ref.at] as number) < end)) return null;
+          }
+        }
         const labels = labelsIn(g);
         // What each table gets, in the order row by row would write it.
         const nodeRows: Row[] = [];
@@ -726,11 +751,25 @@ export class GraphWrite {
     // What reads only the row is computed ahead. The rest is computed when its item's turn comes: an item reads what
     // the items before it wrote.
     const ev = this.evaluator(types, w);
+    const ahead = (e: PlanExpr): boolean => highestColumn(e) < w && !holdsPlan(e);
+    /**
+     * An item's value. It is not computed for a NULL node or relationship: what is computed ahead for a row is
+     * computed together, so a value that could be is NULL where the item's node or relationship is, and one whose
+     * node or relationship is known only when its turn comes is computed then too.
+     */
+    const valueOf = (it: Exclude<GraphSetItem, { kind: 'labels' }>): EvalRef => {
+      const names = it.node !== undefined ? [it.node] : [it.relationship.type, it.relationship.id];
+      if (!ahead(it.value)) return ev.add(it.value, w);
+      if (!names.every(ahead)) return ev.late(it.value);
+      const none: PlanExpr = names.length === 1 ? { k: 'isNull', arg: names[0]!, not: false } : { k: 'or', args: names.map((arg): PlanExpr => ({ k: 'isNull', arg, not: false })) };
+      const type = typeOf(it.value);
+      return ev.add({ k: 'case', whens: [{ when: none, then: lit(null) }], else: it.value, type: type === 'null' ? 'any' : type }, w);
+    };
     const parts = items.map((it) => ({
       it,
       node: it.node !== undefined ? ev.add(it.node, w) : null,
       rel: it.relationship !== undefined ? { type: ev.add(it.relationship.type, w), id: ev.add(it.relationship.id, w) } : null,
-      value: it.kind === 'labels' ? null : ev.add(it.value, w),
+      value: it.kind === 'labels' ? null : valueOf(it),
       // A property's value is one of any kind in the map: a boolean, a list or a map keeps its type there (ADR 0039).
       typed: it.kind === 'property' ? toAny(typeOf(it.value)) : null,
       props: it.kind === 'properties' ? asProps(typeOf(it.value)) : null,
@@ -808,14 +847,18 @@ export class GraphWrite {
       const early = ev.early(ctx, rows);
       const vals = rows.map((r, i) => ev.over(ctx, r, early?.[i]));
       const targets = parts.map((p) => vals.map((v) => targetOf(p, v)));
-      // A node or relationship that an item names in two rows is written twice, the second over the first: the rows
-      // then go one by one.
-      for (const ts of targets) {
-        const seen = new Map<string, Set<SqlValue>>();
-        for (const t of ts) {
+      // Item by item over all the rows is not row by row over all the items where one thing is written twice: a key
+      // of one node or relationship (by one item in two rows, or by two items), or the labels of one node. The
+      // later write is over the earlier, and which is later differs. The rows then go one by one.
+      const seen = new Map<string, Set<SqlValue>>();
+      for (let k = 0; k < parts.length; k++) {
+        const it = parts[k]!.it;
+        const what = it.kind === 'property' ? `key:${it.key}` : 'labels';
+        for (const t of targets[k]!) {
           if (t === null) continue;
-          let ids = seen.get(t.table);
-          if (ids === undefined) seen.set(t.table, (ids = new Set()));
+          const written = `${what}:${t.table}`;
+          let ids = seen.get(written);
+          if (ids === undefined) seen.set(written, (ids = new Set()));
           if (ids.has(t.rowid)) return false;
           ids.add(t.rowid);
         }
@@ -925,10 +968,11 @@ export class GraphWrite {
     const M: PlanType = 'map<text, any>';
     const cur = col(0, 1, M);
     const given = col(0, 3, 'any');
+    // A row whose properties are NULL has none: a key is set into an empty map, and taking one away leaves NULL.
     const value: PlanExpr = {
       k: 'case',
       whens: [{ when: { k: 'isNull', arg: given, not: false }, then: call('map_remove', [cur, call('list_of', [lit(key)], 'list<text>')], M) }],
-      else: call('map_merge', [cur, call('map_of', [lit(key), given], M)], M),
+      else: call('map_merge', [call('coalesce', [cur, call('map_of', [], M)], M), call('map_of', [lit(key), given], M)], M),
       type: M,
     };
     const named = eq(INT(0), INT(2));
@@ -1153,6 +1197,8 @@ export class GraphWrite {
           toMake.push(i);
         });
         const made = make.rows(ctx, toMake.map((i) => rows[i]!), w, false);
+        // Nothing is written yet: the rows can still go one by one.
+        if (made === null) return rows.every((row) => one(ctx, row, sink));
         let added: Row[] = made.map(() => []);
         if (m > 0 && made.length > 0) {
           all.made.give(made);
@@ -1278,8 +1324,11 @@ interface Maker {
   readonly settled: boolean;
   /** Makes a row's nodes, then its relationships: the row with their ids after its `w` columns. */
   row(ctx: Ctx, row: Row, early: Row | undefined, w: number): Row;
-  /** `row` for all the rows, each table written in one pass (`several` false: a single row as `row` writes it). */
-  rows(ctx: Ctx, rows: Row[], w: number, several?: boolean): Row[];
+  /**
+   * `row` for all the rows, each table written in one pass (`several` false: a single row as `row` writes it). Null,
+   * and nothing written, where that would not give what row by row gives.
+   */
+  rows(ctx: Ctx, rows: Row[], w: number, several?: boolean): Row[] | null;
 }
 
 /** An expression a write computes: where its value is found (`Values.get`). */

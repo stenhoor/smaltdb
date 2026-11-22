@@ -386,8 +386,11 @@ and what reads the graph above a write reads it as it is then.
   one append a table for a `graphCreate`; for a property a `graphSet` sets, one update a table joined with the rows
   held (`map_merge`, or `map_remove` for a NULL), where the graph keeps history only of the rows it changes; label
   entries read by one join and appended or deleted together; a `graphDelete`'s rows deleted table by table. Steps
-  above the write that read only their rows then run once over all of them. A `graphSet` that names one node or
-  relationship in two rows, or sets a whole map, goes row by row.
+  above the write that read only their rows then run once over all of them. Some rows still go one by one, where
+  all at once would not give the same: a `graphSet` that would write one key of one node or relationship twice, or
+  one node's labels twice (one item in two rows, or two items), or that sets a whole map; a `graphCreate` one of
+  whose rows names, for a relationship, a node a later row makes. `test/graph-write.test.ts` runs random plans both
+  ways and compares the rows, the counts and the graph.
 - **A deleted node's relationships** are read at the node, one search a node (`SEARCH RELATIONSHIPS OF g (node=?)`),
   and deleted by their rowids. A join of the nodes held with the graph's relationships is not used for it: the
   planner estimates the relationships at a node as the average over the nodes that have any at that end, which is
@@ -405,12 +408,12 @@ through one plan; in turns, three turns):
 
 | Write | Through the runner | Through one plan |
 |---|---|---|
-| Create 1 node | 0.025, 0.024, 0.025 | 0.023, 0.021, 0.020 |
-| Create 1,000 nodes | 7.73, 7.54, 8.29 | 7.59, 7.72, 8.12 |
-| Create 1 relationship | 0.042, 0.042, 0.045 | 0.030, 0.030, 0.030 |
-| Create 1,000 relationships | 11.78, 12.36, 12.17 | 11.03, 10.72, 10.92 |
-| Set 1 property by name | 0.026, 0.026, 0.028 | 0.019, 0.018, 0.018 |
-| Set 1,000 properties | 7.19, 7.33, 7.28 | 5.62, 5.44, 5.54 |
-| Merge an existing node | 0.012, 0.012, 0.012 | 0.011, 0.011, 0.011 |
-| Merge 1,000 new nodes | 10.04, 9.76, 9.89 | 8.35, 8.93, 9.18 |
-| Delete 1,000 nodes | 8.53, 8.28, 9.13 | 7.09, 7.07, 6.85 |
+| Create 1 node | 0.026, 0.024, 0.024 | 0.019, 0.019, 0.025 |
+| Create 1,000 nodes | 8.00, 7.63, 7.95 | 7.36, 7.78, 7.76 |
+| Create 1 relationship | 0.041, 0.042, 0.040 | 0.030, 0.031, 0.031 |
+| Create 1,000 relationships | 11.81, 11.58, 11.64 | 10.47, 10.98, 10.58 |
+| Set 1 property by name | 0.026, 0.026, 0.027 | 0.018, 0.018, 0.018 |
+| Set 1,000 properties | 7.16, 7.00, 6.99 | 5.42, 5.86, 5.41 |
+| Merge an existing node | 0.012, 0.012, 0.012 | 0.011, 0.011, 0.010 |
+| Merge 1,000 new nodes | 9.40, 9.24, 9.26 | 8.98, 8.65, 8.04 |
+| Delete 1,000 nodes | 8.39, 8.28, 8.50 | 6.78, 6.72, 6.83 |

@@ -331,8 +331,10 @@ are kept, and a statement that fails leaves nothing.
   (`relationship: { type, id }`) and is one of: `{ kind: 'property', key, value }` (a NULL `value` removes the key);
   `{ kind: 'properties', value, merge }`, `value` a map that replaces the properties or, with `merge`, is set over
   them key by key (a NULL value then removes its key); `{ kind: 'labels', add, remove }`, a node's. A NULL node or
-  relationship, one that is not in the graph, and a relationship of a type the graph has not, is passed over, and the
-  item's `value` is not computed for it. A relationship whose type's table has no properties column takes none.
+  relationship is passed over, and the item's `value` is not computed for it. One that is not in the graph, and a
+  relationship of a type the graph has not, has no property set and no label removed; a label added to a node that
+  is not in the graph is refused (`SMALT_CONSTRAINT_FOREIGNKEY`), as the graph's rules refuse its entry in the label
+  index. A relationship whose type's table has no properties column takes none.
 - **Values keep their kind** in a node's or a relationship's properties, which are a `map<text, any>`: a truth
   value, a list or a map given as a property is one there ([ADR 0039](../../adr/0039-typed-values-under-any.md)),
   whether it is an item's `value` or a value of a map of that type (`map<text, bool>`).
@@ -378,7 +380,7 @@ earlier row.
   reason may report another of them.
 - **Refused** (`SMALT_UNSUPPORTED`): a write in a plan nested in an expression or in a `graphMerge`'s `match`, on
   the right of a join or on both sides of one, under a `right`, `full` or `asof` join, under a `limit` counted from
-  the end, and under a `setop` or an `iterate`.
+  the end, under a `setop` or an `iterate`, and as the input of an `append`, an `update` or a `delete`.
 
 ```ts
 import { plan as p } from 'smaltdb/engine';
