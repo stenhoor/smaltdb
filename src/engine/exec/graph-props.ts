@@ -55,14 +55,14 @@ export class GraphProps {
 
   /** Whether the row is known: read before, and not written since in a way the maps did not follow. */
   known(rowid: number): boolean {
-    const p = this.starts[rowid >>> PAGE_BITS];
+    const p = this.page(rowid >>> PAGE_BITS);
     return p !== undefined && p[rowid & MASK] !== UNKNOWN && !this.closed;
   }
 
   /** The row's props: its map's bytes, or null where they are NULL; undefined for a row not known. */
   get(rowid: number): Uint8Array | null | undefined {
     const page = rowid >>> PAGE_BITS;
-    const p = this.starts[page];
+    const p = this.page(page);
     if (p === undefined || this.closed) return undefined;
     const i = rowid & MASK;
     const s = p[i]!;
@@ -77,7 +77,7 @@ export class GraphProps {
    */
   rulesOut(rowid: number, checks: readonly PropsCheck[]): boolean {
     const page = rowid >>> PAGE_BITS;
-    const p = this.starts[page];
+    const p = this.page(page);
     if (p === undefined || this.closed) return false;
     const i = rowid & MASK;
     const s = p[i]!;
@@ -89,6 +89,17 @@ export class GraphProps {
       if (!mapProbe(buf, s, e, x.key, x.op, x.lit)) return true;
     }
     return false;
+  }
+
+  /**
+   * A page of rowids' starts, or undefined for one no row of is known. A page past the last one held is not read
+   * from the list: a read past an array's end makes V8 drop the optimized code of the scan that asked (a bailout,
+   * `out of bounds`), and the scan runs slower until it is optimized again. A row with a rowid past every row read
+   * before, which a new node is, asks for such a page.
+   */
+  private page(page: number): Int32Array | undefined {
+    const starts = this.starts;
+    return page < starts.length ? starts[page] : undefined;
   }
 
   /** The row's slot, with its bytes (if it had any) counted dead. */
