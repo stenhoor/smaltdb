@@ -313,6 +313,11 @@ they were rebased onto `main`):
   loss remains where the plans write the table their statement is writing (a foreign key from a table that keeps
   history to itself): it is on `main` before this, and is not fixed here.
 
+  **2026-11-22: fixed.** A history table has one writer, whichever writer of its table reports to it
+  (`Database.historyWriter`). Before, one statement that deleted two rows of such a table and the four rows under
+  them kept 4 of the 6 history rows due, and the history row of the next statement, which deleted one row more,
+  replaced an earlier one: 4 of 7 kept, by both methods (`test/history-log.test.ts`).
+
 Later, each only with its own measurement: the index shared with reader workers, an undo log for rollbacks, the index
 kept in pager pages so opening a large graph doesn't wait for a build, and whether a graph's edge tables still need
 both endpoint B+trees once the index exists (step 4 asks this: a relationship is three B+tree writes today).
