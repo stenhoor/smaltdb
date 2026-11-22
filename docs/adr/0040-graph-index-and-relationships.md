@@ -314,8 +314,9 @@ they were rebased onto `main`):
   history to itself): it is on `main` before this, and is not fixed here.
 
   **2026-11-22: fixed.** A history table has one writer, whichever writer of its table reports to it
-  (`Database.historyWriter`). Before, one statement that deleted two rows of such a table, with five more rows
-  under them, kept 4 of the 7 history rows due, by both methods (`test/history-log.test.ts`).
+  (`Database.historyWriter`). Before, one statement that deleted two rows of such a table and the four rows under
+  them kept 4 of the 6 history rows due, and the history row of the next statement, which deleted one row more,
+  replaced an earlier one: 4 of 7 kept, by both methods (`test/history-log.test.ts`).
 
 Later, each only with its own measurement: the index shared with reader workers, an undo log for rollbacks, the index
 kept in pager pages so opening a large graph doesn't wait for a build, and whether a graph's edge tables still need
