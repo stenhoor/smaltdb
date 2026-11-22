@@ -14,7 +14,7 @@ import type { SqlValue } from '../values.js';
 import type { BoundExpr } from '../plan/expr.js';
 import type { MapCondition } from './codegen.js';
 import { CODEGEN_HELPERS_FOR_FUSION, type Fn } from './expr.js';
-import { type GraphLabels, LABEL_PAGE_BITS, LABEL_PAGE_WORDS } from './graph-labels.js';
+import { type GraphLabels, type LabelNodes, LABEL_PAGE_WORD_BITS } from './graph-labels.js';
 import { type GraphLists, ListCursor } from './graph-lists.js';
 import { type GraphProps, type PropsCheck, holdable } from './graph-props.js';
 import { type ExecState, type IndexScan, type Operator, RowidLookup, type TableAccess, rowidProbe } from './operators.js';
@@ -243,9 +243,8 @@ export class GraphLabelEntries implements Operator {
   private nodeReg = -1;
   private labelReg = -1;
   private label = '';
-  /** The label's pages, the page and word the scan is at, and the bit of that word it goes on from. */
-  private pages: readonly (Uint32Array | undefined)[] | undefined;
-  private page = 0;
+  /** The label's set, the word the scan is at (counted from the first page's first), and the bit of it it goes on from. */
+  private set: LabelNodes | undefined;
   private word = -1;
   private from = 32;
   /**
@@ -293,40 +292,42 @@ export class GraphLabelEntries implements Operator {
     }
     const label = this.labelKey.convert(this.labelKey.value(r));
     // A label that is not text is in no entry.
-    this.pages = typeof label === 'string' ? labels.pagesOf(label) : undefined;
-    if (typeof label === 'string') this.label = label;
-    this.page = 0;
-    this.word = -1;
-    this.from = 32;
+    this.set = typeof label === 'string' ? labels.setOf(label) : undefined;
+    if (this.set !== undefined) {
+      this.label = label as string;
+      // From the word of the label's lowest node.
+      this.word = (this.set.first >> 5) - 1;
+      this.from = 32;
+    }
     this.ruledOut = this.rows === null ? null : this.rows.ruledOut(r);
   }
 
   next(): boolean {
     if (!this.covered || this.labels === null) return this.fallback.next();
-    const pages = this.pages;
-    if (pages === undefined) return false;
+    const set = this.set;
+    if (set === undefined) return false;
+    const pages = set.pages;
     const out = this.ruledOut;
-    let page = this.page;
+    const inPage = (1 << LABEL_PAGE_WORD_BITS) - 1;
     let word = this.word;
-    let set = pages[page];
-    // The word is read again each time: the statement may have written the label since the last node was given.
-    let bits = set === undefined || this.from > 31 ? 0 : set[word]! & (-1 << this.from);
+    let page = pages[word >> LABEL_PAGE_WORD_BITS];
+    // The word, and the word of the label's highest node, are read again each time: the statement may have written
+    // the label since the last node was given.
+    const end = set.last >> 5;
+    let bits = page === undefined || this.from > 31 ? 0 : page[word & inPage]! & (-1 << this.from);
     for (;;) {
       while (bits === 0) {
-        // The next word with a node, in this page or a later one.
-        if (set === undefined || ++word >= LABEL_PAGE_WORDS) {
-          if (++page >= pages.length) return (this.pages = undefined), false;
-          set = pages[page];
-          word = -1;
-          continue;
-        }
-        bits = set[word]!;
+        // The next word with a node, up to the highest node's.
+        if (++word > end) return (this.set = undefined), false;
+        page = pages[word >> LABEL_PAGE_WORD_BITS];
+        // A page no node of the label is in: on from its last word.
+        if (page === undefined) word |= inPage;
+        else bits = page[word & inPage]!;
       }
       const b = 31 - Math.clz32(bits & -bits);
       bits &= bits - 1;
-      const node = page * (1 << LABEL_PAGE_BITS) + (word << 5) + b;
+      const node = word * 32 + b;
       if (out !== null && out(node)) continue;
-      this.page = page;
       this.word = word;
       this.from = b + 1;
       if (this.nodeReg >= 0) this.r[this.nodeReg] = node;

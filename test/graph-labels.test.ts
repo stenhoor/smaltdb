@@ -73,12 +73,37 @@ describe('label sets', () => {
     expect(l.bytes()).toBe(4 * 4096);
     // Each label's nodes are counted, and its pages are there for a scan: one for every 32,768 ids, where it has any.
     expect([l.count('A'), l.count('B'), l.count('C')]).toEqual([4, 1, 0]);
-    expect(l.pagesOf('C')).toBe(undefined);
-    const pages = l.pagesOf('A')!;
+    expect(l.setOf('C')).toBe(undefined);
+    const pages = l.setOf('A')!.pages;
     expect([pages.length, pages[0]!.length, pages[1], pages[30] !== undefined, pages[65_535] !== undefined]).toEqual([65_536, 1024, undefined, true, true]);
     expect([pages[0]![0], pages[0]![1], pages[65_535]![1023]]).toEqual([1, 1, 2 ** 31]);
     expect(l.remove('B', 31)).toBe(true);
-    expect([l.count('B'), l.pagesOf('B')!.length, l.entries]).toEqual([0, 1, 4]);
+    expect([l.count('B'), l.setOf('B')!.pages.length, l.entries]).toEqual([0, 1, 4]);
+  });
+
+  it('know the ids the nodes of a label lie between', () => {
+    const l = new GraphLabels();
+    const between = (label: string): number[] => [l.setOf(label)!.first, l.setOf(label)!.last];
+    l.add('A', 700);
+    expect(between('A')).toEqual([700, 700]);
+    l.add('A', 40_000);
+    l.add('A', 90);
+    l.add('A', 800);
+    expect(between('A')).toEqual([90, 40_000]);
+    // A node taken away leaves them where they were: the nodes left lie between them still.
+    l.remove('A', 90);
+    l.remove('A', 40_000);
+    expect(between('A')).toEqual([90, 40_000]);
+    // An empty set starts again from the next node it is given.
+    l.remove('A', 700);
+    l.remove('A', 800);
+    expect([l.count('A'), ...between('A')]).toEqual([0, 0, -1]);
+    l.add('A', 5_000);
+    expect(between('A')).toEqual([5_000, 5_000]);
+    l.add('A', 5_000);
+    l.add('A', 6_000);
+    l.add('A', 3);
+    expect(between('A')).toEqual([3, 6_000]);
   });
 });
 

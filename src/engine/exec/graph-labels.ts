@@ -5,21 +5,28 @@
  * graph's index (exec/graph-index.ts): built with it from the label index table, kept by that table's writer, and
  * dropped with it.
  *
- * A set is a bitmap over node ids, in pages of 32,768 ids made as they are needed, so ids need not be dense.
+ * A set is a bitmap over node ids, in pages of 32,768 ids made as they are needed, so ids need not be dense. It
+ * knows the lowest and the highest node it has had since it was last empty, so a scan of a label of a few nodes
+ * reads the words between them and not its page's 1,024.
  */
 
 /** Node ids per page, as a power of two, and a page's 32-bit words. */
 const PAGE_BITS = 15;
 const PAGE_WORDS = 1 << (PAGE_BITS - 5);
-/** For a scan of a label's pages (`pagesOf`). */
-export const LABEL_PAGE_BITS = PAGE_BITS;
-export const LABEL_PAGE_WORDS = PAGE_WORDS;
+/** For a scan of a label's set (`setOf`): the words of a page, as a power of two. */
+export const LABEL_PAGE_WORD_BITS = PAGE_BITS - 5;
 
-/** A label's set: its pages, and how many nodes have the label. */
+/** A label's set: its pages, how many nodes have the label, and the ids its nodes lie between. */
 interface LabelSet {
   readonly pages: (Uint32Array | undefined)[];
   count: number;
+  /** No node has the label below `first` or above `last`: the lowest and highest since the set was last empty (0 and -1 while it is). */
+  first: number;
+  last: number;
 }
+
+/** A label's set as a scan reads it. */
+export type LabelNodes = Readonly<Omit<LabelSet, 'pages'>> & { readonly pages: readonly (Uint32Array | undefined)[] };
 
 export class GraphLabels {
   private readonly sets = new Map<string, LabelSet>();
@@ -46,17 +53,18 @@ export class GraphLabels {
   }
 
   /**
-   * A label's set, for a scan of its nodes in id order: its pages of 32,768 ids (`LABEL_PAGE_BITS`), each a bitmap of
-   * 1,024 words or undefined where no node of the page has the label. Undefined for a label no node has had.
+   * A label's set, for a scan of its nodes in id order: its pages of 32,768 ids, each a bitmap of 1,024 words
+   * (`LABEL_PAGE_WORD_BITS`) or undefined where no node of the page has the label, and the ids its nodes lie
+   * between. Undefined for a label no node has had. The set is the one writes change: a scan reads it as it is.
    */
-  pagesOf(label: string): readonly (Uint32Array | undefined)[] | undefined {
-    return this.sets.get(label)?.pages;
+  setOf(label: string): LabelNodes | undefined {
+    return this.sets.get(label);
   }
 
   /** Gives the node the label. False when it had it already. */
   add(label: string, node: number): boolean {
     let set = this.sets.get(label);
-    if (set === undefined) this.sets.set(label, (set = { pages: [], count: 0 }));
+    if (set === undefined) this.sets.set(label, (set = { pages: [], count: 0, first: 0, last: -1 }));
     const at = node >>> PAGE_BITS;
     let page = set.pages[at];
     if (page === undefined) {
@@ -67,7 +75,9 @@ export class GraphLabels {
     const bit = 1 << (node & 31);
     if ((page[word]! & bit) !== 0) return false;
     page[word] = page[word]! | bit;
-    set.count++;
+    if (set.count++ === 0) set.first = set.last = node;
+    else if (node < set.first) set.first = node;
+    else if (node > set.last) set.last = node;
     this.entries++;
     return true;
   }
@@ -81,7 +91,11 @@ export class GraphLabels {
     const bit = 1 << (node & 31);
     if ((page[word]! & bit) === 0) return false;
     page[word] = page[word]! & ~bit;
-    set!.count--;
+    // The nodes left lie between the same ids, or closer; an empty set starts again.
+    if (--set!.count === 0) {
+      set!.first = 0;
+      set!.last = -1;
+    }
     this.entries--;
     return true;
   }
