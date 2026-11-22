@@ -75,6 +75,13 @@ class Validator {
   /** The path: segments `at[0..top)` of the shared array (validation does not re-enter itself). */
   private readonly at = PATH;
   private top = 1;
+  /**
+   * The tables and relationship types the plan's graph writes add (`GraphNewTable`), known from the write that names
+   * them on: its own expressions and the operations above it may read them. A table by its name in lower case, with
+   * its width; a graph's new types by the graph's name in lower case.
+   */
+  private newTables: Map<string, number> | null = null;
+  private newTypes: Map<string, string[]> | null = null;
 
   constructor(private readonly catalog: ValidateCatalog) {}
 
@@ -167,7 +174,7 @@ class Validator {
   private tableWidth(name: unknown, db: unknown): number {
     if (typeof name !== 'string') this.fail('expected a table name', 'table');
     if (db !== undefined && db !== 'main' && db !== 'temp') this.fail(`unknown schema ${JSON.stringify(db)}`, 'db');
-    const n = this.catalog.tableColumns(name, db as 'main' | 'temp' | undefined);
+    const n = this.catalog.tableColumns(name, db as 'main' | 'temp' | undefined) ?? (db === 'temp' ? undefined : this.newTables?.get(name.toLowerCase()));
     if (n === undefined) this.fail(`no such table: ${name}`, 'table');
     return n;
   }
@@ -253,6 +260,103 @@ class Validator {
     const orderedFirst = (v: unknown): void => {
       if (v !== undefined && v !== 'first') this.fail("expected 'first'", 'ordered');
     };
+    // Graph writes (ADR 0042, section 1).
+    const graphName = (g: unknown): void => {
+      if (typeof g !== 'string') this.fail('expected a property graph name', 'graph');
+      if (this.catalog.graph && !this.catalog.graph(g as string)) this.fail(`no such property graph: ${g as string}`, 'graph');
+    };
+    const names = (l: unknown, what: string, field: string): void => {
+      const list = this.list(l, field);
+      for (let i = 0; i < list.length; i++) if (typeof list[i] !== 'string' || list[i] === '') this.fail(`expected ${what}`, field, i);
+    };
+    const relationshipRef = (r: unknown, scopes: readonly Scope[]): void => {
+      this.object(r);
+      const ref = r as { type: PlanExpr; id: PlanExpr };
+      ex(ref.type, scopes, 'type');
+      ex(ref.id, scopes, 'id');
+    };
+    /**
+     * The tables a graph write names for the labels and types it adds: known from here on, as the engine makes them
+     * (a label's `id` and `props`; a type's `start`, `end` and `props`).
+     */
+    const newTables = (tables: unknown, graph: string): void => {
+      if (tables === undefined) return;
+      const ts = this.list(tables, 'tables') as { label?: unknown; type?: unknown; table?: unknown }[];
+      for (let i = 0; i < ts.length; i++) {
+        this.under('tables', i, () => {
+          this.object(ts[i]);
+          if ((ts[i].label === undefined) === (ts[i].type === undefined)) this.fail('expected a label or a relationship type (one of them)');
+          const name = ts[i].label ?? ts[i].type;
+          if (typeof name !== 'string' || name === '') this.fail(`expected ${ts[i].label !== undefined ? 'a label' : 'a relationship type'}`, ts[i].label !== undefined ? 'label' : 'type');
+          if (typeof ts[i].table !== 'string' || ts[i].table === '') this.fail('expected a table name', 'table');
+          (this.newTables ??= new Map()).set((ts[i].table as string).toLowerCase(), ts[i].label !== undefined ? 2 : 3);
+          if (ts[i].type !== undefined) {
+            const types = (this.newTypes ??= new Map()).get(graph.toLowerCase());
+            if (types) types.push(name as string);
+            else this.newTypes.set(graph.toLowerCase(), [name as string]);
+          }
+        });
+      }
+    };
+    /** The nodes and relationships a `graphCreate` or `graphMerge` makes over an input of width `w`: how many. */
+    const newEntities = (nodes: unknown, relationships: unknown, w: number): number => {
+      const ns = this.list(nodes, 'nodes') as { labels: unknown; props?: PlanExpr }[];
+      for (let i = 0; i < ns.length; i++) {
+        this.under('nodes', i, () => {
+          this.object(ns[i]);
+          names(ns[i].labels, 'a label', 'labels');
+          optEx(ns[i].props, reading(w + i), 'props');
+        });
+      }
+      const rs = this.list(relationships, 'relationships') as { type: unknown; start: unknown; end: unknown; props?: PlanExpr }[];
+      for (let i = 0; i < rs.length; i++) {
+        const scopes = reading(w + ns.length + i);
+        this.under('relationships', i, () => {
+          this.object(rs[i]);
+          if (typeof rs[i].type !== 'string' || rs[i].type === '') this.fail('expected a relationship type', 'type');
+          for (const side of ['start', 'end'] as const) {
+            this.under(side, undefined, () => {
+              this.object(rs[i][side]);
+              const e = rs[i][side] as { node?: unknown; id?: PlanExpr };
+              if ((e.node === undefined) === (e.id === undefined)) this.fail('expected a node of this operation or an id (one of them)');
+              if (e.node !== undefined && (!Number.isInteger(e.node) || (e.node as number) < 0 || (e.node as number) >= ns.length)) this.fail(`the operation makes no node ${String(e.node)}`, 'node');
+              optEx(e.id, scopes, 'id');
+            });
+          }
+          optEx(rs[i].props, scopes, 'props');
+        });
+      }
+      return ns.length + rs.length;
+    };
+    const setItems = (items: unknown, scopes: readonly Scope[], field: string): void => {
+      const l = this.list(items, field);
+      for (let i = 0; i < l.length; i++) {
+        this.under(field, i, () => {
+          this.object(l[i]);
+          const it = l[i] as { kind?: unknown; node?: PlanExpr; relationship?: unknown; key?: unknown; value?: PlanExpr; merge?: unknown; add?: unknown; remove?: unknown };
+          if ((it.node === undefined) === (it.relationship === undefined)) this.fail('expected a node or a relationship (one of them)');
+          optEx(it.node, scopes, 'node');
+          if (it.relationship !== undefined) this.under('relationship', undefined, () => relationshipRef(it.relationship, scopes));
+          switch (it.kind) {
+            case 'property':
+              if (typeof it.key !== 'string') this.fail('expected a key', 'key');
+              ex(it.value, scopes, 'value');
+              break;
+            case 'properties':
+              ex(it.value, scopes, 'value');
+              if (typeof it.merge !== 'boolean') this.fail('expected true or false', 'merge');
+              break;
+            case 'labels':
+              if (it.node === undefined) this.fail('labels are a node\'s');
+              names(it.add, 'a label', 'add');
+              names(it.remove, 'a label', 'remove');
+              break;
+            default:
+              this.fail(`unknown kind ${JSON.stringify(it.kind)}`, 'kind');
+          }
+        });
+      }
+    };
     switch (o.op) {
       case 'scan': {
         const n = this.tableWidth(o.table, o.db);
@@ -283,7 +387,8 @@ class Validator {
             if (typeof name !== 'string') this.fail('expected a relationship type name', 'types', i);
             if (seen.has(fold(name as string))) this.fail(`${String(name)} is listed twice`, 'types', i);
             seen.add(fold(name as string));
-            if (g && !g.types.some((t) => fold(t) === fold(name as string))) this.fail(`property graph ${o.graph} has no relationship type ${String(name)}`, 'types', i);
+            const has = (types: readonly string[] | undefined): boolean => types !== undefined && types.some((t) => fold(t) === fold(name as string));
+            if (g && !has(g.types) && !has(this.newTypes?.get(o.graph.toLowerCase()))) this.fail(`property graph ${o.graph} has no relationship type ${String(name)}`, 'types', i);
           }
         }
         if (o.asOf !== undefined)
@@ -633,6 +738,72 @@ class Validator {
         }
         return returning(o.returning, n);
       }
+      case 'graphCreate': {
+        graphName(o.graph);
+        const w = sub(o.input, 'input');
+        newTables(o.tables, o.graph);
+        return w + newEntities(o.nodes, o.relationships, w);
+      }
+      case 'graphSet': {
+        graphName(o.graph);
+        const w = sub(o.input, 'input');
+        newTables(o.tables, o.graph);
+        setItems(o.items, reading(w), 'items');
+        return w;
+      }
+      case 'graphDelete': {
+        graphName(o.graph);
+        const w = sub(o.input, 'input');
+        const scopes = reading(w);
+        const targets = this.list(o.targets, 'targets');
+        for (let i = 0; i < targets.length; i++) {
+          this.under('targets', i, () => {
+            this.object(targets[i]);
+            const t = targets[i] as { node?: PlanExpr; nodes?: PlanExpr; relationship?: unknown; hops?: PlanExpr; path?: { start: PlanExpr; hops: PlanExpr } };
+            if ([t.node, t.nodes, t.relationship, t.hops, t.path].filter((x) => x !== undefined).length !== 1) this.fail('expected a node, nodes, a relationship, hops or a path (one of them)');
+            optEx(t.node, scopes, 'node');
+            optEx(t.nodes, scopes, 'nodes');
+            if (t.relationship !== undefined) this.under('relationship', undefined, () => relationshipRef(t.relationship, scopes));
+            optEx(t.hops, scopes, 'hops');
+            if (t.path !== undefined) {
+              this.under('path', undefined, () => {
+                this.object(t.path);
+                ex(t.path!.start, scopes, 'start');
+                ex(t.path!.hops, scopes, 'hops');
+              });
+            }
+          });
+        }
+        if (typeof o.detach !== 'boolean') this.fail('expected true or false', 'detach');
+        return w;
+      }
+      case 'graphMerge': {
+        graphName(o.graph);
+        const w = sub(o.input, 'input');
+        newTables(o.tables, o.graph);
+        // The match is run for input rows, which a `working` with this id gives it: each with its number after it.
+        if (!Number.isInteger(o.id)) this.fail('expected an id', 'id');
+        if (this.iterates.has(o.id)) this.fail(`iterate ${o.id} is already open`, 'id');
+        this.iterates.set(o.id, w + 1);
+        let m: number;
+        try {
+          m = sub(o.match, 'match');
+        } finally {
+          this.iterates.delete(o.id);
+        }
+        // The match gives the row's number, then its own columns.
+        if (m < 1) this.fail(`gives no column for its row's number`, 'match');
+        const made = newEntities(o.nodes, o.relationships, w);
+        const created = this.list(o.created, 'created');
+        if (created.length !== m - 1) this.fail(`gives ${created.length} columns for the ${m - 1} the match adds`, 'created');
+        exprs(created, reading(w + made), 'created');
+        setItems(o.onMatch, reading(w + m - 1), 'onMatch');
+        setItems(o.onCreate, reading(w + m - 1), 'onCreate');
+        if (o.key !== undefined) exprs(this.list(o.key, 'key'), reading(w), 'key');
+        return w + m - 1;
+      }
+      case 'eager':
+        return sub(o.input, 'input');
       default: {
         // Plans arrive as JSON, so an unknown operation is an error here. Every operation is handled above: a new one fails to compile here until it is (ADR 0033 step 0).
         const unhandled: never = o;
