@@ -77,10 +77,10 @@ export function toBoundStatement(stmt: PlanStatementInput, width: (plan: PlanOp)
     case 'explain':
       return { kind: 'explain', mode: input.mode, query: query(input.query, width, types) };
     case 'write': {
-      width(input.plan);
-      // RETURNING columns not described are named as a query's are, and typed from the plan.
-      const exprs = (input.plan as { returning?: readonly unknown[] }).returning;
-      const returning = input.returning ?? (exprs?.length ? types(input.plan).map((type, i) => ({ name: `column${i + 1}`, type })) : undefined);
+      // What the plan gives back: an append's, update's or delete's RETURNING, or the rows of a plan that writes a graph.
+      const n = width(input.plan);
+      // Columns not described are named as a query's are, and typed from the plan.
+      const returning = input.returning ?? (n > 0 ? types(input.plan).map((type, i) => ({ name: `column${i + 1}`, type })) : undefined);
       return { kind: 'write', plan: input.plan, ...(returning ? { returning: returning.map((r) => ({ name: r.name, type: r.type })) } : {}), ...(input.source ? { source: input.source.map(resultColumn) } : {}) };
     }
     case 'transaction':

@@ -172,6 +172,17 @@ export type GraphSetItem = ({ readonly node: PlanExpr; readonly relationship?: u
     | { readonly kind: 'labels'; readonly add: readonly string[]; readonly remove: readonly string[] }
   );
 
+/**
+ * What a `graphDelete` deletes for a row: a node (an expression that gives its id), a list of nodes (`list<int>`),
+ * a relationship, or relationships given as two lists of one length (their types' names and their rowids). A NULL
+ * one, a NULL in a list, and one that is gone already, is passed over.
+ */
+export type GraphDeleteTarget =
+  | { readonly node: PlanExpr }
+  | { readonly nodes: PlanExpr }
+  | { readonly relationship: GraphRelationshipRef }
+  | { readonly relationships: { readonly types: PlanExpr; readonly ids: PlanExpr } };
+
 /** What a statement's graph writes did (ADR 0042, section 1): given back with its result. */
 export interface GraphWriteCounts {
   nodesCreated: number;
@@ -455,29 +466,23 @@ export type PlanOp = OpMeaning & (
   /** Changes properties and labels of the nodes and relationships each row of `input` names, item by item. Outputs the input's columns. */
   | { readonly op: 'graphSet'; readonly graph: string; readonly input: PlanOp; readonly items: readonly GraphSetItem[] }
   /**
-   * Deletes the relationships, then the nodes, that each row of `input` names: `relationships`, and `nodes` (each
-   * an expression that gives a node's id). A node that still has relationships is an error; with `detach` they are
-   * deleted first. A NULL one, and one that is gone already, is passed over. Outputs the input's columns.
+   * Deletes what each row of `input` names, target by target in the order given, each before the next is looked at.
+   * A node that still has relationships then is an error; with `detach` they are deleted first. Outputs the input's
+   * columns.
    */
-  | {
-      readonly op: 'graphDelete';
-      readonly graph: string;
-      readonly input: PlanOp;
-      readonly nodes: readonly PlanExpr[];
-      readonly relationships: readonly GraphRelationshipRef[];
-      readonly detach: boolean;
-    }
+  | { readonly op: 'graphDelete'; readonly graph: string; readonly input: PlanOp; readonly targets: readonly GraphDeleteTarget[]; readonly detach: boolean }
   /**
-   * For each row of `input`, runs `match`, a plan that reads the graph for the row (its expressions read the row's
-   * columns one evaluation out). If it gives rows, each is passed on after `onMatch` is applied to it. If it gives
-   * none, the `nodes` and `relationships` are made as a `graphCreate` makes them, `created` gives the columns
-   * `match` would have (expressions over the input's columns, then the new nodes' ids, then the new relationships'
-   * rowids), and the row is passed on after `onCreate`. A row sees what earlier rows made. Outputs the input's
-   * columns, then `match`'s; `onMatch` and `onCreate` read that row.
+   * For each row of `input`, runs `match`, a plan that reads the graph for the row: inside it, a `working` operation
+   * with this operation's `id` gives the row, as a relation of that one row. If `match` gives rows, each is passed on
+   * after `onMatch` is applied to it. If it gives none, the `nodes` and `relationships` are made as a `graphCreate`
+   * makes them, `created` gives the columns `match` would have (expressions over the input's columns, then the new
+   * nodes' ids, then the new relationships' rowids), and the row is passed on after `onCreate`. A row sees what
+   * earlier rows made. Outputs the input's columns, then `match`'s; `onMatch` and `onCreate` read that row.
    */
   | {
       readonly op: 'graphMerge';
       readonly graph: string;
+      readonly id: number;
       readonly input: PlanOp;
       readonly match: PlanOp;
       readonly nodes: readonly GraphNewNode[];

@@ -722,17 +722,40 @@ class Validator {
         graphName(o.graph);
         const w = sub(o.input, 'input');
         const scopes = reading(w);
-        exprs(o.nodes, scopes, 'nodes');
-        const rels = this.list(o.relationships, 'relationships');
-        for (let i = 0; i < rels.length; i++) this.under('relationships', i, () => relationshipRef(rels[i], scopes));
+        const targets = this.list(o.targets, 'targets');
+        for (let i = 0; i < targets.length; i++) {
+          this.under('targets', i, () => {
+            this.object(targets[i]);
+            const t = targets[i] as { node?: PlanExpr; nodes?: PlanExpr; relationship?: unknown; relationships?: { types: PlanExpr; ids: PlanExpr } };
+            if ([t.node, t.nodes, t.relationship, t.relationships].filter((x) => x !== undefined).length !== 1) this.fail('expected a node, nodes, a relationship or relationships (one of them)');
+            optEx(t.node, scopes, 'node');
+            optEx(t.nodes, scopes, 'nodes');
+            if (t.relationship !== undefined) this.under('relationship', undefined, () => relationshipRef(t.relationship, scopes));
+            if (t.relationships !== undefined) {
+              this.under('relationships', undefined, () => {
+                this.object(t.relationships);
+                ex(t.relationships!.types, scopes, 'types');
+                ex(t.relationships!.ids, scopes, 'ids');
+              });
+            }
+          });
+        }
         if (typeof o.detach !== 'boolean') this.fail('expected true or false', 'detach');
         return w;
       }
       case 'graphMerge': {
         graphName(o.graph);
         const w = sub(o.input, 'input');
-        // The match is run for each input row: its expressions read the row one evaluation out.
-        const m = this.under('match', undefined, () => this.op(o.match, reading(w), d, null));
+        // The match is run for each input row, which a `working` with this id gives it.
+        if (!Number.isInteger(o.id)) this.fail('expected an id', 'id');
+        if (this.iterates.has(o.id)) this.fail(`iterate ${o.id} is already open`, 'id');
+        this.iterates.set(o.id, w);
+        let m: number;
+        try {
+          m = sub(o.match, 'match');
+        } finally {
+          this.iterates.delete(o.id);
+        }
         const made = newEntities(o.nodes, o.relationships, w);
         const created = this.list(o.created, 'created');
         if (created.length !== m) this.fail(`gives ${created.length} columns for the match's ${m}`, 'created');

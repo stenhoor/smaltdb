@@ -9,7 +9,7 @@
 import type { SqlValue } from '../values.js';
 import { call, col, type EachAggCall, lit, param, type PlanExpr, typeOf } from './expr.js';
 import { parseNested } from '../../shared/nested-types.js';
-import type { AggCall, ConflictAction, JoinKind, PathEdges, PlanOp, SortKey, ValueColumn, WindowCall, WindowFrame } from './ops.js';
+import type { AggCall, ConflictAction, GraphDeleteTarget, GraphNewNode, GraphNewRelationship, GraphSetItem, JoinKind, PathEdges, PlanOp, SortKey, ValueColumn, WindowCall, WindowFrame } from './ops.js';
 import type { CollationName, PlanType } from './types.js';
 
 type Op<K extends PlanOp['op']> = Extract<PlanOp, { op: K }>;
@@ -347,6 +347,53 @@ export const remove = (table: string, input: PlanOp, rowid: number, options: { d
   rowid,
   ...(options.returning ? { returning: options.returning } : {}),
 });
+
+/** For each row of `input`: makes `nodes`, then `relationships`, in the property graph `graph` (ADR 0042). */
+export const graphCreate = (graph: string, input: PlanOp, nodes: readonly GraphNewNode[], relationships: readonly GraphNewRelationship[] = []): Op<'graphCreate'> => ({
+  op: 'graphCreate',
+  graph,
+  input,
+  nodes,
+  relationships,
+});
+
+/** For each row of `input`: changes the properties and labels its `items` name. */
+export const graphSet = (graph: string, input: PlanOp, items: readonly GraphSetItem[]): Op<'graphSet'> => ({ op: 'graphSet', graph, input, items });
+
+/** For each row of `input`: deletes its `targets`, in order (`detach`: a node's relationships first). */
+export const graphDelete = (graph: string, input: PlanOp, targets: readonly GraphDeleteTarget[], options: { detach?: boolean } = {}): Op<'graphDelete'> => ({
+  op: 'graphDelete',
+  graph,
+  input,
+  targets,
+  detach: options.detach ?? false,
+});
+
+/**
+ * For each row of `input`: the rows of `match` (which reads the row through `working(id, …)`), or, when it gives
+ * none, `nodes` and `relationships` made and `created` in `match`'s columns.
+ */
+export const graphMerge = (
+  graph: string,
+  id: number,
+  input: PlanOp,
+  match: PlanOp,
+  make: { nodes?: readonly GraphNewNode[]; relationships?: readonly GraphNewRelationship[]; created: readonly PlanExpr[]; onMatch?: readonly GraphSetItem[]; onCreate?: readonly GraphSetItem[] },
+): Op<'graphMerge'> => ({
+  op: 'graphMerge',
+  graph,
+  id,
+  input,
+  match,
+  nodes: make.nodes ?? [],
+  relationships: make.relationships ?? [],
+  created: make.created,
+  onMatch: make.onMatch ?? [],
+  onCreate: make.onCreate ?? [],
+});
+
+/** `input`'s rows, passed on once all of them are read. */
+export const eager = (input: PlanOp): Op<'eager'> => ({ op: 'eager', input });
 
 const expr = (x: PlanExpr | number): PlanExpr => (typeof x === 'number' ? lit(x) : x);
 

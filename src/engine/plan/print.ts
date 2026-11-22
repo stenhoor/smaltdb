@@ -1,7 +1,7 @@
 /** Text form of plan expressions, for tests, debugging and (later) EXPLAIN. */
 import type { SqlValue } from '../values.js';
 import type { BoundExpr } from './expr.js';
-import type { GraphEnd, GraphRelationshipRef, GraphSetItem, PlanOp } from './ops.js';
+import type { GraphDeleteTarget, GraphEnd, GraphRelationshipRef, GraphSetItem, PlanOp } from './ops.js';
 
 function literal(v: SqlValue): string {
   if (v === null) return 'NULL';
@@ -55,6 +55,9 @@ export function printExpr(e: BoundExpr): string {
 }
 
 const relRef = (r: GraphRelationshipRef): string => `${printExpr(r.type)}:${printExpr(r.id)}`;
+
+const deleteTarget = (t: GraphDeleteTarget): string =>
+  'node' in t ? `node ${printExpr(t.node)}` : 'nodes' in t ? `nodes ${printExpr(t.nodes)}` : 'relationship' in t ? `relationship ${relRef(t.relationship)}` : `relationships ${printExpr(t.relationships.types)}:${printExpr(t.relationships.ids)}`;
 
 /** A `graphSet` item: its node or relationship, then what it changes. */
 function setItem(it: GraphSetItem): string {
@@ -129,9 +132,9 @@ export function printPlan(op: PlanOp, depth = 0): string {
     case 'graphSet':
       return `${pad}graphSet ${op.graph} [${op.items.map(setItem).join(', ')}]\n${sub(op.input)}`;
     case 'graphDelete':
-      return `${pad}graphDelete ${op.graph}${op.detach ? ' detach' : ''} nodes [${list(op.nodes)}] relationships [${op.relationships.map(relRef).join(', ')}]\n${sub(op.input)}`;
+      return `${pad}graphDelete ${op.graph}${op.detach ? ' detach' : ''} [${op.targets.map(deleteTarget).join(', ')}]\n${sub(op.input)}`;
     case 'graphMerge':
-      return `${pad}graphMerge ${op.graph} nodes ${op.nodes.length} relationships ${op.relationships.length} created [${list(op.created)}] onMatch [${op.onMatch.map(setItem).join(', ')}] onCreate [${op.onCreate.map(setItem).join(', ')}]\n${sub(op.input)}\n${sub(op.match)}`;
+      return `${pad}graphMerge #${op.id} ${op.graph} nodes ${op.nodes.length} relationships ${op.relationships.length} created [${list(op.created)}] onMatch [${op.onMatch.map(setItem).join(', ')}] onCreate [${op.onCreate.map(setItem).join(', ')}]\n${sub(op.input)}\n${sub(op.match)}`;
     case 'eager':
       return `${pad}eager\n${sub(op.input)}`;
     case 'window': {
