@@ -157,6 +157,20 @@ relation, reads a node's relationships of every type from it (`SEARCH RELATIONSH
   tables.
 - **Readers hold none:** a [parallel reader](../../ARCHITECTURE.md) reads the B+trees, and a statement that reads a
   graph index runs on the engine that writes.
+- **Written first, in memory.** In a database in memory, a [plan that writes a graph](plans#graph-writes) changes
+  the graph's index, and the graph's tables are written behind: before a statement reads one of them from its
+  B+tree or one of its indexes, before a statement of another kind runs, and before a cursor opens. Every statement
+  reads what was written, whichever way it reads it. A graph that is only read through its index (a node by its id,
+  whether a node has a label, the relationships at a node) is not written to its tables at all. A search of an
+  index on one property (`map_get(props, 'k')`) for a value reads the index as it is while the nodes written since
+  the tables were last up to date have that property as their rows in the table have it: no new node has it, none
+  got another value for it, and no node of the table was deleted. Any other read of such an index has the tables
+  written first. It is so for a graph made as a language for graphs makes one: a
+  node table of an id and `props`, the label index, edge tables of a start, an end and `props` or none, no other
+  node table with rows; without history, copies, foreign keys or checks; with no unique index but the label
+  index's, and indexes on columns or on a key of `props` only; and with no materialized view in the database. Any
+  other graph, and every graph in a database with a file, has its tables written as each statement runs. The
+  [option](../api/engine) `graphWriteBehind: false` turns it off.
 
 ### Adding labels and types
 

@@ -64,6 +64,7 @@ console.log(again.query('SELECT a FROM t').rows); // [['kept']]
 | `workMem` | `number` | 256 MiB | Bytes a sort or hash aggregate may use before it spills to the scratch file; `0` never spills. `PRAGMA work_mem` changes it at run time. |
 | `spillPath` | `string` \| `false` | `<path>-spill` | The scratch file, or `false` for none (operators then stay in memory). In-memory databases never spill. |
 | `graphIndexMem` | `number` | 256 MiB | Bytes a property graph's [index in memory](../engine/schema#the-graph-index) may take, the property maps it remembers included. A graph that needs more gives up the property maps first, and is then read from its B+trees; `0` turns graph indexes off. |
+| `graphWriteBehind` | `boolean` | `true` | In a database in memory, whether a plan that writes a property graph changes the graph's [index](../engine/schema#the-graph-index) first and its tables are written behind. `false` writes the tables as each statement runs, as a database with a file does. |
 | `statementCacheSize` | `number` | `64` | Compiled statements kept by `run` and `query`, by their text: this many for SQL, and for each other language whose text they are given. |
 | `verifyChecksums` | `boolean` | `true` | Check page checksums on every read from storage. |
 | `walAutoCheckpointBytes` | `number` | 4 MiB | Copy the write-ahead log into the database file once it reaches this size. |

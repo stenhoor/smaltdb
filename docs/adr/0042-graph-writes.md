@@ -1,7 +1,7 @@
 # ADR 0042: A graph's writes: run by smaltdb, in memory first, the tables written behind
 
 - **Status:** merged 2026-11-21 ([#292](https://github.com/stenhoor/smaltdb/pull/292)) without answers to its three
-  questions, so the steps follow what it proposes. Built: steps 1 and 2, and of step 3 the engine's side; see
+  questions, so the steps follow what it proposes. Built: steps 1, 2 and 4, and of step 3 the engine's side; see
   [As built](#as-built) for the pull requests, what they measured and where they differ from the text. The numbers in the Context come from a spike that
   was measured and thrown away (2026-11-21); what is an estimate is marked as one.
 - **Date:** 2026-11-21
@@ -271,7 +271,8 @@ Added 2026-11-22, with step 2. Each number says what it compares:
 |---|---|---|
 | 1 | [#293](https://github.com/stenhoor/smaltdb/pull/293), [#294](https://github.com/stenhoor/smaltdb/pull/294), [#295](https://github.com/stenhoor/smaltdb/pull/295), stenhoor/smaltcy#37 | Against smaltcy, before and after (smaltcy's `docs/research/benchmarks.md`, "Small labels, and nodes deleted"): a node of a small label found by a property 5.14x to 6.69x and 0.75x to 0.86x; one of 8 cities found by a property 1.06x to 1.09x and 0.83x to 0.85x; the 8 cities returned 1.23x to 1.43x and 1.15x to 1.16x, still over the bar; delete 1 node 7.50x to 9.75x and 2.23x to 2.66x |
 | 2 | [#297](https://github.com/stenhoor/smaltdb/pull/297) | Below |
-| 3 | stenhoor/smaltcy#38 (writes as one plan), the pull request that adds this row (section 4 in the engine); smaltcy registered as a language is to come | Below |
+| 3 | stenhoor/smaltcy#38 (writes as one plan), [#299](https://github.com/stenhoor/smaltdb/pull/299) (section 4 in the engine); smaltcy registered as a language is to come | Below |
+| 4 | The pull request that adds this row | Below |
 
 ### Step 2: its gate
 
@@ -565,3 +566,220 @@ one turn at 1.322), so this says no more than that.
 What section 4 says and is as built: a statement of a registered language is found by its text and kept as SQL's
 is; a statement whose values differ is found by its shape, and runs what the first of its shape bound to with its
 own values; what the shape of a statement is stays its language's to say.
+
+### Step 4: what was built
+
+In a database in memory, a plan that writes a property graph changes the graph's index and not its tables
+(`exec/graph-pending.ts`; `docs/QUERY_ENGINE.md`, section 10): a node's props go into the property maps, its labels
+into the label sets, a relationship into the lists of its two ends, with the graph's rules kept against the index and
+the errors the tables' writers give. Each change goes into a log with its values. A table with changes in the log is
+behind: a statement that reads it from its B+tree has the log written to the tables first, through their writers. A
+graph that is only read and written through its index writes no table.
+
+### Step 4: its gate
+
+"In memory: every write of 1,000 rows at or under smaltcy's time, or the numbers why not. With a file: no write slower
+than before the step."
+
+**In memory, against smaltcy.** smaltcy `main` (`c3303d8`, its writes as one plan) on smaltdb `main` (`8c8d3e1`) and
+on this pull request's source, the two in turns. The same text every run (`bench/writes.ts`; four turns each, the
+lowest and highest):
+
+| Write | `main` | This pull request | smaltdb, `main` and this (ms) | smaltcy (ms) |
+|---|---|---|---|---|
+| Create 1 node | 3.38x to 3.60x | 1.59x to 1.76x | 0.021 and 0.011 | 0.007 |
+| Create 1,000 nodes | 10.8x to 12.1x | 1.41x to 1.55x | 8.08 and 1.01 | 0.659 |
+| Create 1 relationship | 2.06x to 2.36x | 1.33x to 1.54x | 0.030 and 0.020 | 0.013 |
+| Create 1,000 relationships | 8.43x to 8.98x | 0.83x to 0.90x | 11.62 and 1.05 | 1.24 |
+| Set 1 property by name | 1.73x to 1.80x | 1.18x to 1.26x | 0.019 and 0.012 | 0.010 |
+| Set 1,000 properties | 10.8x to 11.4x | 2.18x to 2.56x | 5.76 and 1.34 | 0.561 |
+| Merge existing node | 1.08x to 1.10x | 1.09x to 1.13x | 0.011 and 0.011 | 0.010 |
+| Merge 1,000 new nodes | 0.61x to 0.68x | 0.12x to 0.13x | 8.88 and 1.69 | 14.19 |
+| Delete 1,000 nodes | 15.2x to 17.0x | 1.54x to 1.70x | 7.51 and 0.729 | 0.453 |
+
+Statements that differ each time (`bench/vary.ts`; four turns each), with a literal in the text and with a parameter:
+
+| Write | A literal: `main` | A literal: this | A parameter: `main` | A parameter: this |
+|---|---|---|---|---|
+| Create 1 node | 3.30x to 3.88x | 2.07x to 2.49x | 3.03x to 3.64x | 2.01x to 2.13x |
+| Create 1,000 nodes | 9.51x to 10.6x | 1.68x to 1.78x | 9.95x to 10.5x | 1.61x to 1.78x |
+| Create 1 relationship | 2.14x to 2.37x | 1.37x to 1.97x | 2.06x to 2.43x | 1.32x to 1.66x |
+| Create 1,000 relationships | 6.45x to 6.93x | 0.90x to 1.06x | 6.37x to 6.72x | 0.91x to 1.03x |
+| Set 1 property by name | 1.74x to 1.93x | 1.31x to 1.35x | 1.63x to 2.01x | 1.24x to 1.55x |
+| Set 1,000 properties | 9.15x to 9.65x | 6.87x to 7.15x | 8.67x to 9.64x | 6.49x to 6.75x |
+| Merge existing node | 0.94x to 1.05x | 1.00x to 1.21x | 1.01x to 1.05x | 1.01x to 1.22x |
+| Merge 1,000 new nodes | 0.55x to 0.61x | 0.13x to 0.14x | 0.59x to 0.64x | 0.13x to 0.14x |
+| Delete 1 node | 1.22x to 1.51x | 0.96x to 1.07x | 1.26x to 1.58x | 0.99x to 1.09x |
+| Delete 1,000 nodes | 12.1x to 12.7x | 2.78x to 3.03x | 12.1x to 12.7x | 2.78x to 2.92x |
+
+- **At or under the bar:** creating 1,000 relationships (0.83x to 0.90x with the same text; 0.90x to 1.06x and 0.91x
+  to 1.03x where the statements differ) and merging 1,000 new nodes (0.12x to 0.13x; 0.13x to 0.14x and 0.13x to
+  0.14x).
+- **Over the bar, with the numbers why** (each statement profiled on this source, the shares are of the statement's
+  time under the profiler):
+  - **Create 1,000 nodes:** 1.41x to 1.55x (1.01 ms against 0.659); 1.68x to 1.78x and 1.61x to 1.78x where the
+    statements differ. Writing the nodes into the index is 12% of the statement and their labels 3%. The rest is what
+    the operation does for each row whatever it writes to: the statement's rows (the `UNWIND`) 21%, the nodes'
+    property maps 22% (encoding them 14%), the create's own loop over the rows 13%, and smaltcy's compile of the text
+    5%.
+  - **Set 1,000 properties:** 2.18x to 2.56x (1.34 ms against 0.561). No table is written: the properties are set, and
+    taken away again by the benchmark's cleanup, in the index, and what a commit then finds left of the log is
+    nothing. Setting the key in each map's bytes is 22% of the statement, putting the map back into the property maps
+    10%, the log 3%, the set's own loop over the rows 13%, and reading the 1,000 nodes 19%. Where each statement sets
+    another value (6.87x to 7.15x and 6.49x to 6.75x; `main` 9.15x to 9.65x and 8.67x to 9.64x) nothing takes the
+    properties away in between, and the statement's read of its nodes is a scan of the node table: it writes the 1,000
+    rows of the statement before it to the table first (199 of 200 statements did, 1,000 rows each). Reading a label's
+    nodes from the index whatever the label's size, as step 1 does for a small label, would leave that table
+    unwritten.
+  - **Delete 1,000 nodes:** 1.54x to 1.70x (0.729 ms against 0.453); 2.78x to 3.03x and 2.78x to 2.92x where the
+    statements differ. No table is written: the nodes were made in the index and are deleted there. Deleting them in
+    the index is 21% of the statement (the log 5%), reading them 25% (6% is the copies of their property maps, which a
+    delete does not read), and the commit that takes them out of the log 12%.
+- **The single writes** are step 5's. Each that writes is faster than on `main`, and only the delete of a node is at
+  the bar: create 1 node 1.59x to 1.76x with the same text (2.07x to 2.49x and 2.01x to 2.13x where the statements
+  differ), create 1 relationship 1.33x to 1.54x (1.37x to 1.97x and 1.32x to 1.66x), set 1 property by name 1.18x to
+  1.26x (1.31x to 1.35x and 1.24x to 1.55x), delete 1 node 0.96x to 1.07x and 0.99x to 1.09x.
+- **The merge of a node that is there writes nothing, and reads a little higher than on `main` where the statements
+  differ:** 1.00x to 1.21x against 0.94x to 1.05x with a literal, 1.01x to 1.22x against 1.01x to 1.05x with a
+  parameter (1.09x to 1.13x against 1.08x to 1.10x with the same text). Measured alone on smaltdb, another name in
+  each statement, five turns each, it took 1.01x to 1.15x of `main`'s time (0.015 and 0.016 ms): up to a microsecond
+  or two more in a turn. A profile of the two shows no one place it goes. Three trims of what the step adds to that
+  path (a commit with nothing in the log, an internal plan run while no table is behind, a cursor's search past a
+  guard) did not measure faster, and are not in.
+- **The reads read as on `main`.** Of the 45 read lines of the three benchmarks (19 with the same text, 13 with a
+  literal and 13 with a parameter) the ranges on `main` and on this overlap on all but 1: seek by name with the same
+  text (0.82x to 0.84x on `main`, 0.85x to 0.88x on this); smaltdb took 0.013 to 0.015 ms for it on `main` and 0.014
+  to 0.016 ms on this. The series' tables are in the pull request.
+
+**With a file** (a database over the memory file store: a pager with a write-ahead log), smaltcy's write cases on
+smaltdb alone, as one plan; 6 turns each, a turn's time the lowest of the medians of its rounds:
+
+| Case | `main` (ms) | This pull request (ms) | This over `main` |
+|---|---|---|---|
+| Create 1 node | 0.123 | 0.129 | 0.93x to 1.07x |
+| Create 1,000 nodes | 9.12 | 8.99 | 0.95x to 1.05x |
+| Create 1 relationship | 0.187 | 0.186 | 0.93x to 1.04x |
+| Create 1,000 relationships | 12.36 | 12.04 | 0.90x to 1.05x |
+| Set 1 property by name | 0.054 | 0.054 | 0.90x to 1.06x |
+| Set 1,000 properties | 6.07 | 6.16 | 0.92x to 1.09x |
+| Merge existing node | 0.012 | 0.012 | 0.62x to 1.05x |
+| Merge 1,000 new nodes | 9.59 | 9.32 | 0.95x to 1.05x |
+| Delete 1,000 nodes | 7.51 | 7.43 | 0.93x to 1.06x |
+
+Every ratio is between 0.62x and 1.09x, and no case is slower in every turn. With a file a graph is written through
+its tables as before, so the step adds only its checks to these writes. One case leaned slower in the step's earlier
+turns, the merge of 1,000 new nodes, and was measured further: ten more turns, on the source before the step's last
+change, gave 0.95x to 1.06x, 1.02x on average.
+
+**A write, then a read.** A table is written when something reads it, so the write's cost can land on a read.
+Statements timed together, on smaltdb alone in memory, as one plan (3 turns each):
+
+| Case | `main` (ms) | This pull request (ms) | This over `main` |
+|---|---|---|---|
+| Create 1 node, a seek by name, delete the node | 0.057 | 0.056 | 0.87x to 1.06x |
+| Create 1,000 nodes, a seek by name, delete them | 16.72 | 2.27 | 0.13x to 0.14x |
+| Create 1,000 nodes and delete them | 16.37 | 2.14 | 0.12x to 0.14x |
+| Set 1 property by name and take it away | 0.038 | 0.027 | 0.67x to 0.96x |
+| Set 1,000 properties and take them away | 13.18 | 4.19 | 0.31x to 0.33x |
+| Create 1 node, a scan of the node table, delete the node | 5.08 | 2.20 | 0.43x to 0.44x |
+| Create 1,000 nodes, a scan of the node table, delete them | 20.34 | 15.44 | 0.72x to 0.78x |
+| Set 1,000 properties, a scan of the node table, take them away | 18.49 | 11.92 | 0.59x to 0.69x |
+| Create 1 node, then a scan of the node table (the tables up to date before) | 5.08 | 2.21 | 0.40x to 0.46x |
+| Create 1,000 nodes, then a scan of the node table (the tables up to date before) | 13.51 | 9.21 | 0.62x to 0.69x |
+| A scan of the node table alone | 4.92 | 2.19 | 0.40x to 0.46x |
+| A seek by name alone | 0.011 | 0.010 | 0.55x to 0.98x |
+
+Every case takes less time than on `main` or the same. A seek by name writes no table where the nodes made have no
+name. A scan of the node table has the tables written, and the cases with one say two things at once. Making 1,000
+nodes and then scanning takes 9.21 ms here where the scan alone takes 2.19: 7.0 ms more, most of it the scan writing
+the 1,000 nodes to their tables. On `main` the two take 13.51 ms and the scan alone 4.92: 8.6 ms more, the create
+writing them as it runs. And the scan alone is faster here after the cases before it, which make and delete nodes many
+times: on `main` every one of those nodes was written to the node table and deleted from it, here only those a read of
+the table came after. Run without the cases before it the scan takes 1.5 ms on both (two runs each).
+
+**Single writes whose earlier ones are kept** (200 statements one after the other, then what they made is deleted;
+smaltdb alone in memory; a statement's time the median of the 200, 3 turns each):
+
+| Case | `main` (ms) | This pull request (ms) | This over `main` |
+|---|---|---|---|
+| Create 1 relationship from another person each time | 0.052 | 0.036 | 0.60x to 1.00x |
+| Create 1 node with another value each time | 0.021 | 0.012 | 0.55x to 0.60x |
+| Set 1 property of another person each time | 0.024 | 0.017 | 0.67x to 0.82x |
+
+### Step 4: where it differs from sections 2 and 3
+
+1. **In a database in memory only.** Section 2 has a commit bring the tables up to date when the database has a file,
+   and for a table that keeps history. As built, such a graph is not written into its index first at all: its tables
+   are written as each statement runs, as before the step. Every row is written before the commit returns either way;
+   what a commit could gain is writing them in one pass, and that is not built.
+2. **Which graphs.** Section 2 names the graphs whose index is not held. As built, a graph is written into its index
+   first when, besides that, its tables are the plain ones a graph is made with (`Database.makeDirect`): a node table
+   of an id and `props`, the label index with its unique index, edge tables of a start, an end and `props` or none,
+   and no other node table with rows; no history, no copy of a label's nodes, no foreign key and no check on a table;
+   no unique index but the label index's; indexes on columns or on a key of `props` only, none partial; no table that
+   is in another graph; and no materialized view in the database. What those have in common: something other than the
+   graph's own rules decides whether a row may be written, or is told of it, and the tables' writers are where that is
+   done. smaltcy's graphs are of the kind that is written into its index first, with or without its indexes on
+   properties.
+3. **A table that is behind is found by a guard, and the statement runs again.** Section 2 says the tables are brought
+   up to date "before anything reads one of them from its B+tree or from one of its indexes". The planner does not say
+   which tables a plan will read. So the B+trees of a table with rows in the log are guarded (`BTree.guard`): a search
+   of one throws, the database writes the tables and runs the statement again from its start. A statement stopped so
+   is remembered, and has the tables written before it runs from then on. A statement that is neither a query nor a
+   plan that writes a graph (SQL that writes, a change of the schema) has them written before it starts. A cursor has
+   them written before it opens, since it cannot start again once it gave a row.
+4. **All the tables, not "that table".** When one table is needed the whole log is written, every graph's. A node, its
+   label entries and its relationships are entries of one log, and writing part of it would need each table's rows
+   told apart from the rest's at every read. What writing one table alone would save was not measured.
+5. **A search of a property's index for a value needs no table, while the nodes in the log have that property as their
+   table has it.** Section 3 keeps a seek on a property's index a B+tree seek, "so the node table is brought up to
+   date before it". Built so, the step's first series had one write slower than on `main`: creating a relationship
+   from a node found by its name, each statement another (3.07x to 4.29x against smaltcy with a literal, where `main`
+   read 2.28x to 2.54x; four turns each). Every such statement wrote the rows of the one before it, with code that had
+   not run since the graph was loaded: the benchmark's writes before it write no table any more. Measured alone the
+   same statements read level with `main` (12 turns each: 0.060 ms the lowest turn on both, 0.068 ms the median on
+   both), and level after 1,500 to 2,000 of them in the benchmark's order. So an index on one key of `props` is read
+   as it is by a search for a value of that key, while every node in the log has under the key what its row in the
+   table has (`DirectGraph.keyClear`): no new node has the key, no change gave a node another value under it, and no
+   node of the table that had it was deleted. The index then has every entry for a value that it would have with the
+   tables written, and no other. A row it leads to is given with the props the property maps hold for it, since its
+   row in the table may be an older one. A narrower rule was measured first, that no node in the log has the key at
+   all: it left the next such write slower than on `main` in its place (setting a property of a node found by its
+   name, 2.40x to 2.94x against 1.65x to 2.11x with a literal), since a node found by its name has one. A scan of the
+   index, a search of it for a range or for no value, and an index of more than the one key have the tables written as
+   any read of a table.
+6. **Rows that are gone again are never written, and the log does not grow for ever.** Section 2 has the index know
+   "which rows it holds that their tables do not have yet, in the order they were written". As built that is a log of
+   changes. A node or a relationship deleted before its table had it leaves nothing to write, and a commit takes such
+   rows out of the log once their deletes are a quarter of it. A row set several times is written once, with its last
+   properties, and not at all when they are what its table has. When the log has grown to twice what was last left of
+   it and 1,024 entries more, a commit makes it what is left of it.
+7. **A node or a relationship deleted while its table still has its row is marked gone** in the property maps, until
+   the table is written: no reader of the maps is given it, and none reads it from the table for them.
+8. **A rollback under an open cursor.** A rollback drops what it wrote from the log and the index, as section 2 has
+   it, and the rows of earlier commits still in the log are then written before the index is built again. Nothing can
+   be written while a cursor is open. So after a rollback that left such rows, with a cursor open, every statement
+   fails with `SMALT_BUSY` until the cursors are closed. It takes rows ahead of the tables from before the
+   transaction, a cursor opened inside it and a rollback before the cursor is closed.
+9. **An index over its limit, a database closed or copied.** An index that holds rows its tables have not is not let
+   go. Where a statement leaves it over its limit, the tables are written at the statement's end and it is held to the
+   limit then, as before. A database in memory is not copied anywhere, and closing it ends it, so nothing is written
+   for either.
+10. **The planner counts the rows that are ahead of a table** with the table's, so a plan is the same wherever a
+    table's rows are, and is made again when their number has changed fourfold. It reads its statistics and its counts
+    of an index's entries from the tables as they are.
+11. **A property is set in the map's bytes** (`setMapKey`). Section 5's estimates say a set "depends on changing a map
+    without encoding it whole, which is not measured". One key is put into, or taken out of, the encoded map with the
+    other entries' bytes copied as they are.
+12. **An option turns it off:** `graphWriteBehind: false` (`DatabaseOptions`) writes a graph's tables as each
+    statement runs in a database in memory too. The tests use it to compare the two.
+
+What section 2 says and is as built: the write changes the index first, with the graph's rules kept against the index;
+the rows are written behind through their tables' writers, with the rules already kept; a graph that is only read and
+written through its index never writes a B+tree; the file format, the log, recovery and snapshots do not change; and
+every plan means the same either way. The tests the consequences ask for are `test/graph-write-behind.test.ts`: random
+statements run on a database that writes behind and on one that does not, with the rows, the errors and the tables
+compared after each (6 seeds of each of its two comparisons in the suite, 150 run by hand), and ADR 0040's test
+setting writes the tables after every statement that writes and compares them with the index. smaltcy's tests on
+smaltdb (1,389, its writes among them, compared with its own engine after every statement) pass on this source with
+that setting and without it.
