@@ -228,7 +228,9 @@ Decisions and their rationale: [ADR 0005](adr/0005-cost-based-optimizer.md).
   plan takes are free again when it ends, so its next run takes the same ones: a statement that deletes 1,000 rows
   whose children go with them writes through two writers, where it made one for each row. A plan that writes the
   table a statement or a plan that has not ended is writing (a foreign key from a table to itself) still makes its
-  own.
+  own. A table that keeps history can so have several writers at once; they all report to one writer for each of
+  its history tables (`Database.historyWriter`), since a writer remembers its table's last rowid and two of them
+  would give a history row the same one.
 - **`EXPLAIN ANALYZE`** shows, per operator, the planner's estimate (rows per loop), loops, actual rows and
   inclusive time. Operators without an EXPLAIN QUERY PLAN line appear under their class name (FILTER, PROJECT, …).
 - **Generated code in joins.** Standalone scans of join sources run as fused scan + filter pipelines. Text

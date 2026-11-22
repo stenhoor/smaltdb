@@ -184,4 +184,52 @@ describe("a table written by a statement's internal plans", () => {
       expect(db.query('SELECT count(*) FROM emp').rows).toEqual([[0]]);
     });
   }
+
+  /** The same table, its rows going with the row of `emp` itself that their `boss` names. */
+  const reports = (history: string): PlanStatementInput => {
+    const t = emp(history) as unknown as { op: { table: { foreignKeys: { table: string }[] } } };
+    t.op.table.foreignKeys[0]!.table = 'emp';
+    return t as unknown as PlanStatementInput;
+  };
+
+  for (const history of ['log', 'versions']) {
+    it(`${history}: and every change they make to the table their statement is writing`, () => {
+      const db = Database.openMemory();
+      db.queryPlan(reports(history));
+      // 11 and 12 report to 1, 111 to 11, 21 to 2; no one reports to 3.
+      db.exec('INSERT INTO emp VALUES (1, NULL), (2, NULL), (3, NULL), (11, 1), (12, 1), (21, 2), (111, 11)');
+      const full = db.pager.commitId;
+      const kept = (): number => Number(db.query(`SELECT count(*) FROM smalt_${history}_emp`).rows[0]![0]);
+      const before = kept();
+      // The statement deletes 1 and 2 through its writer; the rows under them go in plans of their own, which take
+      // other writers of the table, since the statement's is in use.
+      db.exec('DELETE FROM emp WHERE id IN (1, 2)');
+      const one = db.pager.commitId;
+      db.exec('DELETE FROM emp WHERE id = 3');
+      expect(kept()).toBe(before + 7);
+      expect(asOf(db, 'emp', full)).toEqual([[1, null], [2, null], [3, null], [11, 1], [12, 1], [21, 2], [111, 11]]);
+      expect(asOf(db, 'emp', one)).toEqual([[3, null]]);
+      expect(db.query('SELECT count(*) FROM emp').rows).toEqual([[0]]);
+    });
+  }
+});
+
+describe('an index made on a history table', () => {
+  for (const history of ['log', 'versions']) {
+    it(`${history}: holds the changes made after it, and is not written once it is dropped`, () => {
+      const db = Database.openMemory();
+      db.queryPlan(create('t', history));
+      const past = `smalt_${history}_t`;
+      db.exec("INSERT INTO t VALUES (1, 'a')");
+      db.exec("UPDATE t SET v = 'b'");
+      db.exec(`CREATE INDEX past_rows ON ${past}("$rowid")`);
+      db.exec("UPDATE t SET v = 'c'");
+      expect(db.query('PRAGMA integrity_check').rows).toEqual([['ok']]);
+      db.exec('DROP INDEX past_rows');
+      db.exec("UPDATE t SET v = 'd'");
+      expect(db.query('PRAGMA integrity_check').rows).toEqual([['ok']]);
+      // The insert and the three updates in the log; the three versions the updates closed.
+      expect(Number(db.query(`SELECT count(*) FROM ${past}`).rows[0]![0])).toBe(history === 'log' ? 4 : 3);
+    });
+  }
 });

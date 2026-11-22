@@ -1015,7 +1015,7 @@ export class Database implements FunctionContext {
         if (!t) throw new SmaltError('SMALT_CORRUPT', `table ${table.name} keeps history, but its history table ${name} is missing`);
         return t;
       };
-      const writer = (t: TableSchema) => new TableWriter(t, this.pager, (root) => this.tree(root));
+      const writer = (t: TableSchema) => this.historyWriter(t);
       const now = () => this.pager.nextCommit().id;
       const touched = () => (this.historyTouched = true);
       w.history =
@@ -1039,6 +1039,23 @@ export class Database implements FunctionContext {
     this.writersBusy.add(w);
     this.writersTaken.push(w);
   }
+
+  /**
+   * The writer of history table `t`: one, whichever writer of its table reports to it. A table can have several
+   * writers at once (a plan run inside a statement that is writing the table takes its own), and a writer remembers
+   * the last rowid of its table, so two of them would give a history row the same rowid and the second would replace
+   * the first. It serves the schema it was made for: a history table can be given an index, as any table.
+   */
+  private historyWriter(t: TableSchema): TableWriter {
+    const e = this.historyWriters.get(t);
+    if (e !== undefined && e.version === this.schemaVersion) return e.w;
+    const w = new TableWriter(t, this.pager, (root) => this.tree(root));
+    this.historyWriters.set(t, { w, version: this.schemaVersion });
+    return w;
+  }
+
+  /** History tables' writers (see historyWriter), by schema object. */
+  private readonly historyWriters = new WeakMap<TableSchema, { w: TableWriter; version: number }>();
 
   /** Reusable row-table writers (see writerFor), by schema object: DDL replaces the object. */
   private readonly writers = new WeakMap<TableSchema, { w: TableWriter; version: number; indexes: TableSchema['indexes']; count: number }>();
