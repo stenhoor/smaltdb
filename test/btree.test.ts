@@ -285,3 +285,40 @@ describe('BTreeCursor.seekNear', () => {
     plain.close();
   });
 });
+
+describe('BTree.guard', () => {
+  it('stops what searches the tree or writes it, and lets through what is marked as right all the same', () => {
+    const { pager } = openMemoryPager();
+    const tree = new BTree(pager, BTree.create(pager));
+    for (let k = 0; k < 500; k++) tree.put(encodeKey([k]), new Uint8Array([k & 255]));
+    const stop = new Error('stopped');
+    let stops = 0;
+    tree.guard = () => {
+      stops++;
+      throw stop;
+    };
+    const c = tree.cursor();
+    for (const read of [() => tree.get(encodeKey([7])), () => tree.has(encodeKey([7])), () => tree.count(), () => c.first(), () => c.last(), () => c.seek(encodeKey([7])), () => c.seekNear(encodeKey([7])), () => c.seekForward(encodeKey([7]))]) {
+      expect(read).toThrow(stop);
+    }
+    for (const write of [() => tree.put(encodeKey([9000]), new Uint8Array(1)), () => tree.append(encodeKey([9000]), new Uint8Array(1)), () => tree.delete(encodeKey([7])), () => tree.clear(), () => tree.beyondLast(encodeKey([9000]))]) {
+      expect(write).toThrow(stop);
+    }
+    expect(stops).toBe(13);
+    expect(pager.pinnedCount()).toBe(0);
+    // An estimate may be behind: it is not stopped.
+    expect(tree.estimateCount()).toBeGreaterThan(0);
+    // A read that is right whatever the guard protects: through `trusted`, or a cursor marked so.
+    expect(tree.trusted(() => [tree.has(encodeKey([7])), tree.count()])).toEqual([true, 500]);
+    c.trusted = true;
+    expect([c.seek(encodeKey([7])) && c.compareKey(encodeKey([7])) === 0, c.last(), c.first()]).toEqual([true, true, true]);
+    c.close();
+    expect(stops).toBe(13);
+    // The guard is back after `trusted`, also when what it ran threw.
+    expect(() => tree.trusted(() => { throw new Error('inside'); })).toThrow('inside');
+    expect(() => tree.has(encodeKey([7]))).toThrow(stop);
+    tree.guard = null;
+    expect([tree.get(encodeKey([7])), tree.count()]).toEqual([new Uint8Array([7]), 500]);
+    expect(pager.pinnedCount()).toBe(0);
+  });
+});
