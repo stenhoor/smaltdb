@@ -366,7 +366,7 @@ See [ADR 0040](adr/0040-graph-index-and-relationships.md) and [ADR 0041](adr/004
 ## 10. Plans that write a property graph
 
 A plan that holds a `graphCreate`, `graphSet`, `graphDelete` or `graphMerge`
-([the plan format](reference/engine/plans.md#graph-writes); [ADR 0042](adr/0042-graph-writes.md), section 1) is not
+([the plan format](reference/plan/graph-writes.md); [ADR 0042](adr/0042-graph-writes.md), section 1) is not
 one physical plan. `GraphWrite` (`exec/graph-write.ts`) runs it in stages, so that a write handles its rows in order
 and what reads the graph above a write reads it as it is then.
 

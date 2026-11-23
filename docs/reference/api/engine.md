@@ -91,7 +91,7 @@ console.log(again.query('SELECT a FROM t').rows); // [['kept']]
 
 `language` names the [registered language](../engine/languages#running-statements) the text is written in; without it the text is SQL. A language's statements are kept by their text as SQL's are, and where the language says so by their shape and by the kinds of their values ([statements the engine keeps](../engine/languages#statements-the-engine-keeps)). A language that is not registered is `SMALT_MISUSE`.
 
-`BindParams` is `readonly (SqlValue | boolean | undefined)[] | Readonly<Record<string, SqlValue | boolean>>`, the same as the client's [`Params`](https://stenhoor.github.io/smaltql/reference/api/client#params). `TextParams` is `BindParams`, or the same with a JS array, an object or a `Map` for a parameter a language's statement reads as a list, a struct or a map; SQL's parameters are scalars. `QueryResult` is `{ columns: string[]; rows: SqlValue[][] }`; for a statement that [writes a property graph](../engine/plans#graph-writes) it also has `graph`: what it did, counted.
+`BindParams` is `readonly (SqlValue | boolean | undefined)[] | Readonly<Record<string, SqlValue | boolean>>`, the same as the client's [`Params`](https://stenhoor.github.io/smaltql/reference/api/client#params). `TextParams` is `BindParams`, or the same with a JS array, an object or a `Map` for a parameter a language's statement reads as a list, a struct or a map; SQL's parameters are scalars. `QueryResult` is `{ columns: string[]; rows: SqlValue[][] }`; for a statement that [writes a property graph](../plan/graph-writes) it also has `graph`: what it did, counted.
 
 Engine calls are synchronous: a long query blocks the thread until it finishes. There is no `signal`. A host can install an interrupt check with `setInterruptCheck(fn)`, which the engine calls every few hundred page reads; `fn` stops the statement by throwing a `SmaltError` with code `SMALT_INTERRUPT`, and must reset its own trigger before it throws.
 
@@ -127,7 +127,7 @@ console.log(rows); // [[2, 12]]
 
 ## Plans
 
-A statement can also be given as plan data instead of SQL: the engine's own description of a query or write, which every language builds and which the engine plans and runs. The plan format is **experimental** (`plan.PLAN_FORMAT_VERSION` is `0`). [The engine section](../engine/) describes it in full: [the plan format](../engine/plans), [running plans](../engine/running) and [schema definitions](../engine/schema).
+A statement can also be given as plan data instead of SQL: the engine's own description of a query or write, which every language builds and which the engine plans and runs. The plan format is **experimental** (`plan.PLAN_FORMAT_VERSION` is `1`). [The engine section](../engine/) describes it in full: [the plan language](../plan/), [running plans](../engine/running) and [schema definitions](../engine/schema).
 
 | Method | Description |
 |---|---|
@@ -144,7 +144,7 @@ A compiled statement, from `db.prepare()`. It compiles again by itself after sch
 
 | Member | Description |
 |---|---|
-| `run(params?: BindParams): RunResult` | Run for effect. A query is run to the end and its rows discarded. A plan that [writes a property graph](../engine/plans#graph-writes) also gives `graph`: what it did, counted. |
+| `run(params?: BindParams): RunResult` | Run for effect. A query is run to the end and its rows discarded. A plan that [writes a property graph](../plan/graph-writes) also gives `graph`: what it did, counted. |
 | `all(params?: BindParams): SqlValue[][]` | Run and return every row. |
 | `cursor(params?: BindParams): RowCursor` | Run and return a cursor over the rows. |
 | `columns: string[]` | Result column names (getter). |

@@ -9,7 +9,7 @@ it for its users ([ADR 0016](../../adr/0016-plan-api-for-every-language.md), sec
 
 | Field | |
 |---|---|
-| `origin` | The `origin` of the [plan node](../engine/plans#expressions) it arose in, the innermost one that has an origin, as the language that built the plan gave it (a SQL text span, a call site) |
+| `origin` | The `origin` of the [plan node](../plan/meaning-fields#origin) it arose in, the innermost one that has an origin, as the language that built the plan gave it (a SQL text span, a call site) |
 | `constraint` | For a constraint failure: `notNull`, `unique`, `primaryKey`, `check`, `foreignKey` or `datatype` |
 | `table` | The table the constraint is on |
 | `columns` | The columns it covers (none for an index on expressions; a foreign key counted across a statement names none) |

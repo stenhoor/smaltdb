@@ -19,6 +19,14 @@
  * the header row is the column names, `NULL` is NULL, blobs are x'hex', and a cell in backticks
  * is taken literally (so `' a '` keeps its spaces and quotes are dropped: write `'…'` for text with
  * surrounding spaces).
+ *
+ * The plan language and its functions (docs/reference/plan, its functions in docs/reference/plan/functions): each page starts from the
+ * sample data (docs/reference/plan/sample.json), and a json fence is a plan statement as JSON, which must match the
+ * grammar (docs/grammar.ebnf) and runs with queryPlan; a table after it is its result, as for SQL (truth values are
+ * true / false, lists, structs and maps their JSON). More markers there:
+ *   <!-- docs:params [..] -->    the statement's parameters, as JSON
+ *   <!-- docs:plan-setup {..} --> a hidden plan statement run before the next block
+ * A statement marked docs:error SMALT_PLAN shows an invalid plan, so it need not match the grammar.
  */
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -30,6 +38,9 @@ import io from '@smaltdb/io';
 import { Database } from '../src/engine/database.js';
 import { parse } from '@smaltworks/smaltql';
 import type { SqlValue } from '../src/engine/values.js';
+import { decodeDataJSON } from '../src/engine/plan/codec.js';
+import type { PlanStatementInput } from '../src/engine/plan/statement.js';
+import { GrammarMatcher, loadGrammar } from './helpers/plan-grammar.js';
 
 const DOCS = 'docs';
 const PAGE_DIRS = ['guide', 'reference'];
@@ -115,7 +126,7 @@ function blocks(md: string): Block[] {
     let j = i + 1;
     while (j < lines.length && lines[j].trim() === '') j++;
     let table: Block['table'] = null;
-    if (fence[3] === 'sql' && lines[j]?.trim().startsWith('|') && /^\s*\|?\s*:?-+/.test(lines[j + 1] ?? '')) {
+    if ((fence[3] === 'sql' || fence[3] === 'json') && lines[j]?.trim().startsWith('|') && /^\s*\|?\s*:?-+/.test(lines[j + 1] ?? '')) {
       const header = splitRow(lines[j]);
       const rows: string[][] = [];
       let k = j + 2;
@@ -129,10 +140,25 @@ function blocks(md: string): Block[] {
   return out;
 }
 
-function show(v: SqlValue): string {
+function show(v: unknown): string {
   if (v === null) return 'NULL';
   if (v instanceof Uint8Array) return `x'${Array.from(v, (b) => b.toString(16).padStart(2, '0')).join('')}'`;
+  // A list, struct or map (plan results): its JSON, integers beyond 2^53 with every digit.
+  if (typeof v === 'object') return JSON.stringify(v, (_k, x: unknown) => (typeof x === 'bigint' ? `${x}n` : x)).replace(/"(-?\d+)n"/g, '$1');
   return String(v);
+}
+
+/** Pages of the plan language: they start from the sample data, and their json fences are plan statements. */
+const PLAN_PAGES = /^docs[\\/]reference[\\/]plan[\\/]/;
+const SAMPLE = join(DOCS, 'reference', 'plan', 'sample.json');
+const matcher = new GrammarMatcher(loadGrammar());
+
+/** A plan statement written as JSON: it must match the grammar, unless it shows an invalid plan (SMALT_PLAN). */
+function planStatement(text: string, where: string, invalid = false): PlanStatementInput {
+  const raw = JSON.parse(text) as unknown;
+  const why = invalid ? null : matcher.explain('statement', raw);
+  if (why !== null) throw new Error(`${where}: the statement doesn't match the plan grammar at ${why}`);
+  return decodeDataJSON(text) as PlanStatementInput;
 }
 
 async function registerExamples(db: Database): Promise<void> {
@@ -154,6 +180,18 @@ async function runSql(db: Database, sql: string): Promise<{ columns: string[]; r
   return db.queryAsync(stmts[stmts.length - 1].text);
 }
 
+/** A block's result against the table printed under it. */
+function compare(result: { columns: string[]; rows: unknown[][] }, b: Block, where: string): void {
+  const table = b.table!;
+  expect(result.columns, `${where}: columns`).toEqual(table.header);
+  const got = result.rows.map((r) => r.map(show));
+  const want = table.rows;
+  if (b.markers.includes('docs:unordered')) {
+    const key = (r: string[]): string => JSON.stringify(r);
+    expect(got.map(key).sort(), `${where}: rows`).toEqual(want.map(key).sort());
+  } else expect(got, `${where}: rows`).toEqual(want);
+}
+
 const all = pages();
 
 describe('documentation SQL examples', () => {
@@ -165,15 +203,44 @@ describe('documentation SQL examples', () => {
       // The plugins this repository installs (ADR 0012), as an application that uses them would.
       const db = Database.openMemory({ plugins: [external, io] });
       await registerExamples(db);
+      const plans = PLAN_PAGES.test(page);
+      if (plans) for (const s of JSON.parse(readFileSync(SAMPLE, 'utf8')) as PlanStatementInput[]) db.queryPlan(s);
       try {
         for (const b of blocks(readFileSync(page, 'utf8'))) {
           const where = `${page}:${b.line}`;
           for (const m of b.markers) {
             const setup = /^docs:setup\s+([\s\S]*)$/.exec(m);
             if (setup) await db.execAsync(setup[1]);
+            const planSetup = /^docs:plan-setup\s+([\s\S]*)$/.exec(m);
+            if (planSetup) db.queryPlan(planStatement(planSetup[1], where));
           }
-          if (b.lang !== 'sql' || b.markers.includes('docs:skip') || needsOther(b)) continue;
+          if (b.markers.includes('docs:skip') || needsOther(b)) continue;
           const err = b.markers.map((m) => /^docs:error\s+(\S+)/.exec(m)?.[1]).find(Boolean);
+          if (b.lang === 'json' && plans) {
+            const params = b.markers.map((m) => /^docs:params\s+([\s\S]*)$/.exec(m)?.[1]).find(Boolean);
+            const args = params ? (decodeDataJSON(params) as SqlValue[]) : [];
+            const stmt = planStatement(b.code, where, err === 'SMALT_PLAN');
+            if (err) {
+              let got = 'no error';
+              try {
+                db.queryPlan(stmt, args);
+              } catch (e) {
+                got = (e as { code?: string }).code ?? (e as Error).message;
+              }
+              expect(got, `${where}: expected error ${err}`).toBe(err);
+              continue;
+            }
+            let result: { columns: string[]; rows: unknown[][] };
+            try {
+              result = db.queryPlan(stmt, args);
+            } catch (e) {
+              throw new Error(`${where}: ${(e as Error).message}\n${b.code}`);
+            }
+            if (!b.table) continue;
+            compare(result, b, where);
+            continue;
+          }
+          if (b.lang !== 'sql') continue;
           if (err) {
             // A syntax error anywhere in the block fails parse(): run the block as one script then.
             let stmts: { text: string }[];
@@ -197,13 +264,7 @@ describe('documentation SQL examples', () => {
             throw new Error(`${where}: ${(e as Error).message}\n${b.code}`);
           }
           if (!b.table) continue;
-          expect(result.columns, `${where}: columns`).toEqual(b.table.header);
-          const got = result.rows.map((r) => r.map(show));
-          const want = b.table.rows;
-          if (b.markers.includes('docs:unordered')) {
-            const key = (r: string[]): string => JSON.stringify(r);
-            expect(got.map(key).sort(), `${where}: rows`).toEqual(want.map(key).sort());
-          } else expect(got, `${where}: rows`).toEqual(want);
+          compare(result, b, where);
         }
       } finally {
         db.close();

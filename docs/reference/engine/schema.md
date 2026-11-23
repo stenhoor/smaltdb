@@ -36,7 +36,7 @@ engine binds every view with an interface again and refuses the operation (rolli
 - gives fewer columns, or more for a view with a column list (a view over `*` keeps the columns it had: one added to
   the table doesn't reach it);
 - gives a column whose type isn't the interface's and doesn't convert to it losslessly (`isLossless` in the
-  [conversion table](./plans#conversions)): `schema change breaks the interface of view v: column n: int → real is not
+  [conversion table](../plan/conversions)): `schema change breaks the interface of view v: column n: int → real is not
   lossless`;
 - gives a column that can be NULL where the interface's can't.
 
@@ -119,8 +119,8 @@ The engine keeps each property graph's relationships in memory, by node: a graph
 ([ADR 0040](../../adr/0040-graph-index-and-relationships.md)). Where a plan reads an edge table by its start or its end
 (`start = x`), the planner can answer from it instead of descending the endpoint index, and gives the same rows in the
 same order. `EXPLAIN` shows it as `SEARCH <table> USING GRAPH INDEX (start=?)`. Nothing in a plan names it: joins,
-[`paths`](./plans#paths) and the rules above use it where they would use the endpoint index, a `paths` that keeps
-one path per node searches it directly, and [`relationships`](./plans#relationships), the graph's relationships as one
+[`paths`](../plan/operations/paths) and the rules above use it where they would use the endpoint index, a `paths` that keeps
+one path per node searches it directly, and [`relationships`](../plan/operations/relationships), the graph's relationships as one
 relation, reads a node's relationships of every type from it (`SEARCH RELATIONSHIPS OF <graph> (node=?)`).
 
 - **What it needs:** an edge table with indexes on `(start, end)` and `(end, start)`, as the tables `addType` makes
@@ -157,7 +157,7 @@ relation, reads a node's relationships of every type from it (`SEARCH RELATIONSH
   tables.
 - **Readers hold none:** a [parallel reader](../../ARCHITECTURE.md) reads the B+trees, and a statement that reads a
   graph index runs on the engine that writes.
-- **Written first, in memory.** In a database in memory, a [plan that writes a graph](plans#graph-writes) changes
+- **Written first, in memory.** In a database in memory, a [plan that writes a graph](../plan/graph-writes) changes
   the graph's index, and the graph's tables are written behind: before a statement reads one of them from its
   B+tree or one of its indexes, before a statement of another kind runs, and before a cursor opens. Every statement
   reads what was written, whichever way it reads it. A graph that is only read through its index (a node by its id,
@@ -278,7 +278,7 @@ that does not exist yet): the table's language binds it from `text` where it is 
 
 A table created with `history: 'versions'` or `history: 'log'` keeps its past versions ([ADR 0033](../../adr/0033-property-graphs-and-history.md),
 step 6), and a plan reads it as it was after any commit, or at any time, with `asOf` on a `scan`
-([plans](./plans)). It is set when the table is created, for row tables in `main`.
+([plans](../plan/)). It is set when the table is created, for row tables in `main`.
 
 - **Versions are commits:** a version is valid from the commit that wrote it until the one that changed or deleted it.
   Changes within one transaction make one version: the states in between were never committed. A rolled-back

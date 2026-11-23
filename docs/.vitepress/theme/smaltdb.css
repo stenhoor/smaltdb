@@ -243,6 +243,8 @@ svg.sw-rr { display: block; max-width: none; }
 .vp-doc .sw-play-grid :is(th, td) { border-top: 0; border-left: 0; font-size: inherit; line-height: normal; }
 .sw-play-grid { position: relative; display: flex; margin: 12px 0; border: 1px solid var(--vp-c-divider); }
 .sw-play-note { font-size: 15px; color: var(--vp-c-text-2); }
+.sw-play-text { margin: 12px 0; padding: 10px 12px; overflow-x: auto; border-radius: 6px; font-family: var(--vp-font-family-mono); font-size: 13px; line-height: 1.5; white-space: pre; background: var(--vp-c-bg-soft); }
+.vp-doc .sw-play-result[data-tested] div[class*='language-'] { margin: 8px 0 12px; }
 .sw-play-error { margin: 12px 0; padding: 10px 12px; border-radius: 6px; font-size: 14px; color: var(--vp-c-danger-1); background: var(--vp-c-danger-soft); }
 .sw-play-error strong { font-family: var(--smalt-brand-font); font-size: 13px; }
 /* At rest, an example that runs in place looks like any example: its code, a small Run button and its tested result.
