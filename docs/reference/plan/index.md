@@ -86,7 +86,8 @@ where in the text they came from. `db.boundPlan(sql)` gives the plan SQL binds a
   [collation](./collations), and every conversion is a [`cast`](./expressions/cast) or a function
   [`call`](./expressions/call). Behaviour that differs between languages is in the engine's operations, named for
   what they do: a language picks the ones that give its meaning ([functions](./functions/)).
-- **NULL is three-valued.** Conditions are 1 (true), 0 (false) or NULL. A filter keeps the rows whose condition is 1.
+- **NULL is three-valued.** Conditions are 1 (true), 0 (false) or NULL. A filter keeps the rows whose condition is
+  true: any number other than 0.
 - **Plans are data.** No closures and no names to resolve: a plan survives JSON, and the engine
   [validates](../engine/running#validation) every plan it is given, built or written by hand, before it plans it.
 

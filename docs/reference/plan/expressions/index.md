@@ -18,8 +18,8 @@ Rules every expression follows:
   names.
 - **Nothing is implicit.** A conversion is a [`cast`](./cast) or a [`call`](./call), and every comparison names its
   [collation](../collations) or takes the one an operand [carries](../meaning-fields).
-- **Truth values are 1, 0 and NULL.** A condition is true when it is 1: a filter keeps a row whose condition is 1, and
-  drops it when it is 0 or NULL. Logic is three-valued.
+- **Truth values are 1, 0 and NULL.** A condition is true when it is a number other than 0: a filter keeps a row whose
+  condition is true, and drops it when it is 0, NULL or text that isn't a number. Logic is three-valued.
 - **Every expression may carry** the [meaning fields](../meaning-fields): `carries`, `affinity`, `inline` and
   `origin`.
 
