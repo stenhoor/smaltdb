@@ -4,15 +4,15 @@ description: 'Functions over a group of rows: counts, sums, extremes, first and 
 
 # Aggregate functions
 
-```railroad
-agg-call
-```
-
 An aggregate function gives one value for a group of rows. A plan calls one in an
 [`aggregate`](../../operations/aggregate)'s `aggs` (one value for each group), in a [`pivot`](../../operations/pivot)'s
 `aggs`, in a [`window`](../../operations/window)'s `calls` (over each row's frame), and in an
 [`each`](../../expressions/each) of mode `agg` (over the elements of a list). A call names the function (`fn`), gives
 its arguments (`args`, expressions over the input row) and the `type` of its result.
+
+```railroad
+agg-call
+```
 
 - **`star`.** SQL's `count(*)` is `count` with `"args": [], "star": true`: it counts every row. Every other call sets
   `"star": false`.

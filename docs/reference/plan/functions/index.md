@@ -37,9 +37,10 @@ where a function can give several (`coalesce`, `max`).
   (`SMALT_MISMATCH`). Text and numbers convert as SQLite converts them.
 - **The catalog lists them** with the number of arguments each takes and its result type: `db.catalog.functions()`
   ([the catalog](../../engine/catalog#functions)). A plugin can register more.
-- **Collations.** A function that compares text (`cmp_eq`, `in_list`, `min`, …) compares by the call's `collation`,
-  `binary` when it has none. The collation an argument [carries](../meaning-fields) doesn't change it: a language
-  reads that to choose the call's.
+- **Collations.** A scalar comparison (`cmp_eq`, `cmp_lt`, …) compares text by the call's `collation`, `binary` when
+  it has none; the collation an argument [carries](../meaning-fields) doesn't change it. A few functions differ:
+  [`in_list`](./comparison/in_list) and the [aggregates](./aggregate/) take the collation their first argument
+  carries. Each page says which.
 
 ## Groups
 

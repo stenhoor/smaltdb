@@ -4,21 +4,19 @@ description: 'Ranking and navigation over a window''s rows: row numbers, ranks, 
 
 # Window functions
 
-```railroad
-window-call
-frame
-frame-bound
-```
-
 A window function gives each row a value computed from other rows of its partition. A plan calls one in a
 [`window`](../../operations/window)'s `calls`; the operation gives its input's columns, then one column per call. The
 window's `partition` splits the rows, its `order` orders each partition, and its `frame` chooses, for each row, the rows
 that some functions read. A call names the function (`fn`), gives its arguments (`args`, expressions over the row) and
 the `type` of its result.
 
+```railroad
+window-call
+```
+
 - **Ranking functions** (`row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`) number the rows of a
-  partition in the window's `order`. Rows whose `order` keys are equal are peers, and share a rank. They don't read the
-  frame.
+  partition in the window's `order`. Rows whose `order` keys are equal are peers: `rank`, `dense_rank`, `percent_rank`
+  and `cume_dist` give peers the same value. They don't read the frame.
 - **Navigation functions** read the value of another row. `lag` and `lead` count rows back or forward from the current
   row in the partition, and don't read the frame. `first_value`, `last_value` and `nth_value` read the frame.
 - **Aggregates.** Any [aggregate function](../aggregate/) can be a call: it is computed over each row's frame. A window
@@ -32,6 +30,11 @@ the `type` of its result.
   offset) is `SMALT_ERROR`.
 
 ## Frames {#frames}
+
+```railroad
+frame
+frame-bound
+```
 
 A frame is `{unit, start, end, exclude}`: the rows from `start` to `end` around the current row, less those `exclude`
 names.

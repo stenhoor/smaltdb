@@ -32,7 +32,9 @@ A collation applies to text only: numbers, blobs and other values compare as the
 | A [`col`](./expressions/col) | `collation`: the column's own | required |
 | A [`subquery`](./expressions/subquery) or [`inSubquery`](./expressions/inSubquery) | `collation` | required |
 
-A comparison compares by its own `collation` and nothing else: the collation of a `col` it reads, and the one an
+An aggregate call, and [`in_list`](./functions/comparison/in_list), are the exceptions: they compare by the collation
+their first argument [carries](./meaning-fields), whatever the call's `collation` says (see their pages). Otherwise,
+a comparison compares by its own `collation` and nothing else: the collation of a `col` it reads, and the one an
 operand [carries](./meaning-fields), don't change it. They tell a language which collation to put on the comparisons
 it builds, as SQL's rules choose one from its operands.
 

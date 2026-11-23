@@ -87,7 +87,12 @@ Ranking the orders by day. Orders of one day are peers: `rank` and `dense_rank` 
     "input": {"op": "scan", "table": "orders", "columns": [0, 3]},
     "partition": [],
     "order": [
-      {"expr": {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "date", "collation": "binary"}, "desc": false, "nullsFirst": true, "collation": "binary"}
+      {
+        "expr": {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "date", "collation": "binary"},
+        "desc": false,
+        "nullsFirst": true,
+        "collation": "binary"
+      }
     ],
     "frame": {"unit": "RANGE", "start": {"kind": "unboundedPreceding"}, "end": {"kind": "currentRow"}, "exclude": "NO OTHERS"},
     "calls": [
@@ -100,7 +105,14 @@ Ranking the orders by day. Orders of one day are peers: `rank` and `dense_rank` 
 }
 ```
 
-FILL
+| id | day | rank | dense_rank | half |
+|---|---|---|---|---|
+| 1 | 2026-11-02 | 1 | 1 | 1 |
+| 2 | 2026-11-02 | 1 | 1 | 1 |
+| 3 | 2026-11-03 | 3 | 2 | 1 |
+| 4 | 2026-11-04 | 4 | 3 | 2 |
+| 5 | 2026-11-05 | 5 | 4 | 2 |
+| 6 | 2026-11-05 | 5 | 4 | 2 |
 
 Each fruit's orders by id: the order before, and a running total over a `ROWS` frame:
 
@@ -111,21 +123,39 @@ Each fruit's orders by id: the order before, and a running total over a `ROWS` f
   "plan": {
     "op": "window",
     "input": {"op": "scan", "table": "orders", "columns": [0, 1, 2]},
-    "partition": [{"expr": {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "int", "collation": "binary"}, "collation": "binary"}],
+    "partition": [
+      {"expr": {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "int", "collation": "binary"}, "collation": "binary"}
+    ],
     "order": [
-      {"expr": {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}, "desc": false, "nullsFirst": true, "collation": "binary"}
+      {
+        "expr": {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"},
+        "desc": false,
+        "nullsFirst": true,
+        "collation": "binary"
+      }
     ],
     "frame": {"unit": "ROWS", "start": {"kind": "unboundedPreceding"}, "end": {"kind": "currentRow"}, "exclude": "NO OTHERS"},
     "calls": [
-      {"fn": "lag", "args": [{"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "type": "int", "collation": "binary"},
-      {"fn": "sum", "args": [{"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "type": "int", "collation": "binary"}
+      {"fn": "lag", "args": [
+        {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "type": "int", "collation": "binary"},
+      {"fn": "sum", "args": [
+        {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "type": "int", "collation": "binary"}
     ]
   },
   "columns": [{"name": "id"}, {"name": "fruit"}, {"name": "n"}, {"name": "previous"}, {"name": "running"}]
 }
 ```
 
-FILL
+| id | fruit | n | previous | running |
+|---|---|---|---|---|
+| 1 | 1 | 3 | NULL | 3 |
+| 2 | 2 | 1 | NULL | 1 |
+| 3 | 1 | 2 | 3 | 5 |
+| 4 | 4 | 10 | NULL | 10 |
+| 5 | 3 | 5 | NULL | 5 |
+| 6 | 1 | 1 | 2 | 6 |
 
 A `RANGE` frame over a date: the items ordered that day and the day before:
 
@@ -138,18 +168,37 @@ A `RANGE` frame over a date: the items ordered that day and the day before:
     "input": {"op": "scan", "table": "orders", "columns": [0, 3, 2]},
     "partition": [],
     "order": [
-      {"expr": {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "date", "collation": "binary"}, "desc": false, "nullsFirst": true, "collation": "binary"}
+      {
+        "expr": {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "date", "collation": "binary"},
+        "desc": false,
+        "nullsFirst": true,
+        "collation": "binary"
+      }
     ],
-    "frame": {"unit": "RANGE", "start": {"kind": "preceding", "offset": {"k": "lit", "value": 1, "type": "int"}}, "end": {"kind": "currentRow"}, "exclude": "NO OTHERS"},
+    "frame": {
+      "unit": "RANGE",
+      "start": {"kind": "preceding", "offset": {"k": "lit", "value": 1, "type": "int"}},
+      "end": {"kind": "currentRow"},
+      "exclude": "NO OTHERS"
+    },
     "calls": [
-      {"fn": "sum", "args": [{"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "type": "int", "collation": "binary"}
+      {"fn": "sum", "args": [
+        {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "type": "int", "collation": "binary"}
     ]
   },
   "columns": [{"name": "id"}, {"name": "day"}, {"name": "n"}, {"name": "two_days"}]
 }
 ```
 
-FILL
+| id | day | n | two_days |
+|---|---|---|---|
+| 1 | 2026-11-02 | 3 | 4 |
+| 2 | 2026-11-02 | 1 | 4 |
+| 3 | 2026-11-03 | 2 | 6 |
+| 4 | 2026-11-04 | 10 | 12 |
+| 5 | 2026-11-05 | 5 | 16 |
+| 6 | 2026-11-05 | 1 | 16 |
 
 `ignoreNulls`: the stock of the fruit before, by id, and the last one known (plum's is NULL):
 
@@ -163,15 +212,25 @@ FILL
     "order": [],
     "frame": {"unit": "ROWS", "start": {"kind": "unboundedPreceding"}, "end": {"kind": "currentRow"}, "exclude": "NO OTHERS"},
     "calls": [
-      {"fn": "lag", "args": [{"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "type": "int", "collation": "binary"},
-      {"fn": "lag", "args": [{"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "type": "int", "collation": "binary", "ignoreNulls": true}
+      {"fn": "lag", "args": [
+        {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "type": "int", "collation": "binary"},
+      {"fn": "lag", "args": [
+        {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "type": "int", "collation": "binary", "ignoreNulls": true}
     ]
   },
   "columns": [{"name": "id"}, {"name": "name"}, {"name": "qty"}, {"name": "lag"}, {"name": "lag_known"}]
 }
 ```
 
-FILL
+| id | name | qty | lag | lag_known |
+|---|---|---|---|---|
+| 1 | apple | 10 | NULL | NULL |
+| 2 | pear | 4 | 10 | 10 |
+| 3 | plum | NULL | 4 | 4 |
+| 4 | cherry | 25 | NULL | 4 |
+| 5 | lime | 0 | 25 | 25 |
 
 `ignoreNulls` on an aggregate:
 
@@ -184,7 +243,9 @@ FILL
   "order": [],
   "frame": {"unit": "ROWS", "start": {"kind": "unboundedPreceding"}, "end": {"kind": "currentRow"}, "exclude": "NO OTHERS"},
   "calls": [
-    {"fn": "sum", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "type": "int", "collation": "binary", "ignoreNulls": true}
+    {"fn": "sum", "args": [
+      {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+    ], "star": false, "type": "int", "collation": "binary", "ignoreNulls": true}
   ]
 }
 ```
@@ -201,25 +262,50 @@ Each fruit beside its color's total stock and its rank by price within its color
     "input": {
       "op": "window",
       "input": {"op": "scan", "table": "fruit", "columns": [1, 2, 3, 4]},
-      "partition": [{"expr": {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "text", "collation": "binary"}, "collation": "binary"}],
-      "order": [
-        {"expr": {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "real", "collation": "binary"}, "desc": true, "nullsFirst": false, "collation": "binary"}
+      "partition": [
+        {"expr": {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "text", "collation": "binary"}, "collation": "binary"}
       ],
-      "frame": {"unit": "ROWS", "start": {"kind": "unboundedPreceding"}, "end": {"kind": "unboundedFollowing"}, "exclude": "NO OTHERS"},
+      "order": [
+        {
+          "expr": {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "real", "collation": "binary"},
+          "desc": true,
+          "nullsFirst": false,
+          "collation": "binary"
+        }
+      ],
+      "frame": {
+        "unit": "ROWS",
+        "start": {"kind": "unboundedPreceding"},
+        "end": {"kind": "unboundedFollowing"},
+        "exclude": "NO OTHERS"
+      },
       "calls": [
-        {"fn": "sum", "args": [{"k": "col", "input": 0, "index": 3, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "type": "int", "collation": "binary"},
+        {"fn": "sum", "args": [
+          {"k": "col", "input": 0, "index": 3, "depth": 0, "type": "int", "collation": "binary"}
+        ], "star": false, "type": "int", "collation": "binary"},
         {"fn": "row_number", "args": [], "star": false, "type": "int", "collation": "binary"}
       ]
     },
     "keys": [
-      {"expr": {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "text", "collation": "binary"}, "desc": false, "nullsFirst": true, "collation": "binary"}
+      {
+        "expr": {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "text", "collation": "binary"},
+        "desc": false,
+        "nullsFirst": true,
+        "collation": "binary"
+      }
     ]
   },
   "columns": [{"name": "name"}, {"name": "color"}, {"name": "price"}, {"name": "qty"}, {"name": "color_stock"}, {"name": "rank"}]
 }
 ```
 
-FILL
+| name | color | price | qty | color_stock | rank |
+|---|---|---|---|---|---|
+| apple | red | 0.5 | 10 | 35 | 2 |
+| cherry | red | 3 | 25 | 35 | 1 |
+| lime | green | 0.4 | 0 | 4 | 2 |
+| pear | green | 0.75 | 4 | 4 | 1 |
+| plum | purple | 1.25 | NULL | NULL | 1 |
 
 ## See also
 

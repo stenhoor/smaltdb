@@ -30,8 +30,7 @@ None.
 
 - NULL values are skipped. Other values are taken as numbers as [`sum`](./sum) takes them: text and blobs as the number
   they start with (0 when none).
-- They are computed in one pass with Welford's updates, which stay accurate when the values are large and close
-  together.
+- It is computed in one pass with Welford's updates, which stay accurate when the values are large and close together.
 - A result that is NaN (from an `Infinity` among the values) is NULL.
 
 ## Examples
