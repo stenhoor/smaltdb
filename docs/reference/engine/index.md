@@ -16,7 +16,7 @@ any release until a second language besides SQL has proven them ([ADR 0014](../.
 | Part | What it is |
 |---|---|
 | **Engine** | Storage, transactions, the catalog, the planner and execution. It plans and runs plans, and keeps each object's definition as language-neutral data. |
-| **Plans** | A query or a write as data: [operations and expressions](./plans) with columns referenced by position, explicit types and collations, and named functions. The engine [validates](./running#validation) every plan before it plans it. |
+| **Plans** | A query or a write as data: [operations and expressions](../plan/) with columns referenced by position, explicit types and collations, and named functions. The engine [validates](./running#validation) every plan before it plans it. |
 | **Languages** | Turn source text into plans, and bind the views and stored objects written in them. A language [registers](./languages) with the engine; engine code never imports one. |
 | **Plugins** | Add file formats, data sources and table functions ([ADR 0012](../../adr/0012-plugins.md), [writing plugins](../api/plugins)). |
 | **Workers** | In a page, the engine runs in a Web Worker. A worker entry registers the languages and installs the plugins it needs with [`defineWorker`](./languages#workers). |
@@ -73,7 +73,8 @@ const query = p.project(p.sort(p.filter(p.scan('fruit', [0, 1, 2]), p.call('cmp_
 console.log(db.queryPlan({ kind: 'query', plan: query, columns: [{ name: 'name', type: 'text' }] }, [4]).rows); // [['plum'], ['pear']]
 ```
 
-- [The plan format](./plans): every operation and expression, types, collations and functions.
+- [The plan language](../plan/): the plan format as a language, with a page for every operation, expression and
+  function.
 - [Running plans](./running): building them, running them in-process and through the client, validation, parameters,
   writes, and other statements.
 - [Schema definitions](./schema): tables, indexes, views and the rest, as data.

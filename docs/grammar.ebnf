@@ -1,0 +1,295 @@
+/* smaltdb's plan language, in W3C EBNF: the JSON a statement is. The syntax diagrams on the plan language pages are
+   drawn from this file, and the agent guide (/agents.md) prints it. It is written from the plan types
+   (src/engine/plan/ops.ts, expr.ts, statement.ts, bound.ts) and the validator (plan/validate.ts), and
+   test/plan-grammar.test.ts checks it against them: every operation and expression kind has a rule here, and every
+   plan on the reference pages matches it.
+
+   Reading it:
+   - A terminal that starts with { opens an object and names its first field: '{"op": "scan"' is an object whose field
+     "op" is "scan". A terminal ', "table":' is the next field's name; what follows it is the field's value. '}'
+     closes the object. Fields may come in any order in the JSON; the rules list them in the order the codec writes
+     them.
+   - A field in ( )? may be left out.
+   - string, integer, number and boolean are JSON's own values; json is any JSON value, object any JSON object.
+   - A schema operation (schema-op) is described on the schema definitions page. */
+
+/* Statements */
+
+statement ::= plan | query-statement | write-statement | explain-statement | transaction-statement
+            | setting-statement | maintenance-statement | schema-statement
+
+query-statement ::= '{"kind": "query"' ', "plan":' plan (', "columns":' '[' (result-column (',' result-column)*)? ']')? '}'
+
+result-column ::= '{"name":' string (', "type":' type)? (', "declaredType":' string)? (', "collation":' collation)?
+                  (', "affinity":' column-affinity)? '}'
+
+column-affinity ::= '"INTEGER"' | '"REAL"' | '"NUMERIC"' | '"TEXT"' | '"BLOB"' | '"NONE"'
+
+write-statement ::= '{"kind": "write"' ', "plan":' plan
+                    (', "returning":' '[' (returned-column (',' returned-column)*)? ']')?
+                    (', "source":' '[' (result-column (',' result-column)*)? ']')? '}'
+
+returned-column ::= '{"name":' string (', "type":' type)? '}'
+
+explain-statement ::= '{"kind": "explain"' ', "mode":' ('"plan"' | '"analyze"') ', "query":' query-statement '}'
+
+transaction-statement ::= '{"kind": "transaction"' ', "action":'
+                          ( '"begin"' ', "mode":' ('"deferred"' | '"immediate"' | '"exclusive"') commit-note
+                          | '"commit"' commit-note
+                          | '"rollback"' (', "savepoint":' string)?
+                          | ('"savepoint"' | '"release"') ', "name":' string ) '}'
+
+commit-note ::= (', "author":' string)? (', "message":' string)?
+
+setting-statement ::= '{"kind": "setting"' ', "name":' string (', "schema":' string)? (', "value":' expr)? '}'
+
+maintenance-statement ::= '{"kind": "maintenance"' ', "action":'
+                          ( '"analyze"' (', "target":' string)? (', "schema":' string)?
+                          | '"vacuum"'
+                          | '"forget"' ', "before":' as-of (', "table":' string)?
+                          | '"refresh"' ', "view":' string (', "schema":' string)? ', "concurrently":' boolean
+                            ', "withData":' boolean ', "ifChanged":' boolean ) '}'
+
+schema-statement ::= '{"kind": "schema"' ', "op":' schema-op '}'
+
+schema-op ::= object
+
+/* Operations */
+
+plan ::= scan | values | source | relationships | filter | project | sort | limit | sample | distinct | join
+       | setop | aggregate | window | pivot | unpivot | explode | paths | iterate | working
+       | append | update | delete | graph-create | graph-set | graph-delete | graph-merge | eager
+
+op-meaning ::= (', "decorrelate": false')? (', "origin":' json)?
+
+scan ::= '{"op": "scan"' ', "table":' string ', "columns":' '[' (integer (',' integer)*)? ']'
+         (', "db":' schema-name)? (', "indexedBy":' (string | 'null'))? (', "asOf":' as-of)? op-meaning '}'
+
+schema-name ::= '"main"' | '"temp"'
+
+as-of ::= '{"commit":' expr '}' | '{"time":' expr '}'
+
+values ::= '{"op": "values"' ', "rows":' '[' (row (',' row)*)? ']' ', "types":' '[' (type (',' type)*)? ']'
+           (', "columns":' '[' (value-column (',' value-column)*)? ']')? op-meaning '}'
+
+row ::= '[' (expr (',' expr)*)? ']'
+
+value-column ::= '[' (json (',' json)*)? ']' | typed-array | '{"data":' ('[' (json (',' json)*)? ']' | typed-array)
+                 ', "nulls":' blob '}'
+
+typed-array ::= '{"$typed":' ('"f64"' | '"f32"' | '"i32"' | '"i16"' | '"i8"' | '"u32"' | '"u16"' | '"i64"')
+                ', "data":' '[' ((number | string) (',' (number | string))*)? ']' '}'
+
+source ::= '{"op": "source"' ', "kind":' ('"function"' | '"virtual"' | '"external"') ', "name":' string
+           (', "schema":' string)? ', "args":' '[' (expr (',' expr)*)? ']' (', "named":' object)?
+           ', "types":' '[' (type (',' type)*)? ']' op-meaning '}'
+
+relationships ::= '{"op": "relationships"' ', "graph":' string ', "direction":' direction
+                  (', "types":' '[' (string (',' string)*)? ']')? (', "asOf":' as-of)? op-meaning '}'
+
+direction ::= '"out"' | '"in"' | '"both"'
+
+filter ::= '{"op": "filter"' ', "input":' plan ', "pred":' expr op-meaning '}'
+
+project ::= '{"op": "project"' ', "input":' plan ', "exprs":' '[' (expr (',' expr)*)? ']' op-meaning '}'
+
+sort ::= '{"op": "sort"' ', "input":' plan ', "keys":' '[' (sort-key (',' sort-key)*)? ']' op-meaning '}'
+
+sort-key ::= '{"expr":' expr ', "desc":' boolean ', "nullsFirst":' boolean ', "collation":' collation '}'
+
+limit ::= '{"op": "limit"' ', "input":' plan ', "count":' expr (', "offset":' expr)? (', "fromEnd": true')?
+          op-meaning '}'
+
+sample ::= '{"op": "sample"' ', "input":' plan (', "count":' expr | ', "fraction":' expr) ', "replace":' boolean
+           ', "seed":' integer op-meaning '}'
+
+distinct ::= '{"op": "distinct"' ', "input":' plan ', "collations":' '[' (collation (',' collation)*)? ']'
+             (', "ordered": "first"')? (', "on":' '[' integer (',' integer)* ']')?
+             (', "keep":' ('"first"' | '"last"'))? op-meaning '}'
+
+join ::= '{"op": "join"' ', "kind":' join-kind ', "inputs":' '[' plan ',' plan ']' (', "on":' expr)?
+         (', "ordered": true')? (', "asof":' asof-match)? op-meaning '}'
+
+join-kind ::= '"inner"' | '"left"' | '"right"' | '"full"' | '"cross"' | '"semi"' | '"anti"' | '"asof"'
+
+asof-match ::= '{"left":' expr ', "right":' expr ', "direction":' ('"backward"' | '"forward"' | '"nearest"')
+               (', "tolerance":' expr)? '}'
+
+setop ::= '{"op": "setop"' ', "kind":' ('"union"' | '"unionAll"' | '"intersect"' | '"except"')
+          ', "inputs":' '[' plan ',' plan ']' ', "collations":' '[' (collation (',' collation)*)? ']' op-meaning '}'
+
+aggregate ::= '{"op": "aggregate"' ', "input":' plan ', "keys":' '[' (group-key (',' group-key)*)? ']'
+              ', "aggs":' '[' (agg-call (',' agg-call)*)? ']' ', "carry":' '[' (expr (',' expr)*)? ']'
+              (', "ordered": "first"')? op-meaning '}'
+
+group-key ::= '{"expr":' expr ', "collation":' collation '}'
+
+agg-call ::= '{"fn":' string ', "args":' '[' (expr (',' expr)*)? ']' ', "star":' boolean ', "distinct":' boolean
+             (', "filter":' expr)? ', "collation":' collation ', "type":' type '}'
+
+window ::= '{"op": "window"' ', "input":' plan ', "partition":' '[' (group-key (',' group-key)*)? ']'
+           ', "order":' '[' (sort-key (',' sort-key)*)? ']' ', "frame":' frame
+           ', "calls":' '[' (window-call (',' window-call)*)? ']' op-meaning '}'
+
+frame ::= '{"unit":' ('"ROWS"' | '"RANGE"' | '"GROUPS"') ', "start":' frame-bound ', "end":' frame-bound
+          ', "exclude":' ('"NO OTHERS"' | '"CURRENT ROW"' | '"GROUP"' | '"TIES"') '}'
+
+frame-bound ::= '{"kind":' ('"unboundedPreceding"' | '"currentRow"' | '"unboundedFollowing"') '}'
+              | '{"kind":' ('"preceding"' | '"following"') ', "offset":' expr '}'
+
+window-call ::= '{"fn":' string ', "args":' '[' (expr (',' expr)*)? ']' ', "star":' boolean (', "filter":' expr)?
+                ', "type":' type ', "collation":' collation (', "ignoreNulls":' boolean)? '}'
+
+pivot ::= '{"op": "pivot"' ', "input":' plan ', "keys":' '[' (group-key (',' group-key)*)? ']' ', "on":' expr
+          ', "collation":' collation ', "values":' '[' value (',' value)* ']'
+          ', "aggs":' '[' agg-call (',' agg-call)* ']' (', "ordered": "first"')? op-meaning '}'
+
+unpivot ::= '{"op": "unpivot"' ', "input":' plan ', "keep":' '[' (integer (',' integer)*)? ']'
+            ', "columns":' '[' integer (',' integer)* ']' ', "names":' '[' string (',' string)* ']'
+            ', "type":' type op-meaning '}'
+
+explode ::= '{"op": "explode"' ', "input":' plan ', "column":' integer ', "type":' type
+            (', "also":' '[' (also-column (',' also-column)*)? ']')? (', "position":' boolean)?
+            (', "emptyAsNull":' boolean)? (', "keepNulls":' boolean)? op-meaning '}'
+
+also-column ::= '{"column":' integer ', "type":' type '}'
+
+paths ::= '{"op": "paths"' ', "input":' plan ', "start":' integer ', "edges":' '[' path-edges (',' path-edges)* ']'
+          ', "direction":' direction (', "minHops":' integer)? (', "maxHops":' integer)?
+          (', "mode":' ('"walk"' | '"trail"' | '"acyclic"' | '"simple"'))? (', "selector":' path-selector)?
+          (', "target":' integer)? op-meaning '}'
+
+path-edges ::= '{"table":' string (', "db":' schema-name)? ', "start":' integer ', "end":' integer '}'
+
+path-selector ::= '"all"' | '"any"' | '"anyShortest"' | '"allShortest"' | '{"shortest":' integer '}'
+
+iterate ::= '{"op": "iterate"' ', "id":' integer ', "name":' string ', "init":' plan
+            ', "steps":' '[' (plan (',' plan)*)? ']' ', "distinct":' boolean
+            ', "collations":' '[' (collation (',' collation)*)? ']' (', "order":' '[' (sort-key (',' sort-key)*)? ']')?
+            (', "limit":' expr)? (', "offset":' expr)? (', "key":' '[' integer (',' integer)* ']')?
+            (', "maxDepth":' integer)? op-meaning '}'
+
+working ::= '{"op": "working"' ', "id":' integer ', "types":' '[' (type (',' type)*)? ']' op-meaning '}'
+
+append ::= '{"op": "append"' ', "table":' string ', "db":' schema-name (', "onConflict":' conflict-action)?
+           ', "input":' (plan | 'null') ', "columns":' '[' (integer (',' integer)*)? ']'
+           ', "upserts":' '[' (upsert (',' upsert)*)? ']' (', "returning":' '[' (expr (',' expr)*)? ']')?
+           op-meaning '}'
+
+upsert ::= '{"target":' (integer | 'null')
+           (', "update":' '{"sets":' '[' (column-set (',' column-set)*)? ']' (', "where":' expr)? '}')? '}'
+
+column-set ::= '{"column":' integer ', "value":' expr '}'
+
+conflict-action ::= '"rollback"' | '"abort"' | '"fail"' | '"ignore"' | '"replace"'
+
+update ::= '{"op": "update"' ', "table":' string ', "db":' schema-name (', "onConflict":' conflict-action)?
+           ', "input":' plan ', "rowid":' integer ', "sets":' '[' (column-set (',' column-set)*)? ']'
+           ', "from":' boolean (', "returning":' '[' (expr (',' expr)*)? ']')? op-meaning '}'
+
+delete ::= '{"op": "delete"' ', "table":' string ', "db":' schema-name ', "input":' plan ', "rowid":' integer
+           (', "returning":' '[' (expr (',' expr)*)? ']')? op-meaning '}'
+
+graph-create ::= '{"op": "graphCreate"' ', "graph":' string ', "input":' plan
+                 ', "nodes":' '[' (new-node (',' new-node)*)? ']'
+                 ', "relationships":' '[' (new-relationship (',' new-relationship)*)? ']'
+                 (', "tables":' '[' (new-table (',' new-table)*)? ']')? op-meaning '}'
+
+new-node ::= '{"labels":' '[' (string (',' string)*)? ']' (', "props":' expr)? '}'
+
+new-relationship ::= '{"type":' string ', "start":' graph-end ', "end":' graph-end (', "props":' expr)? '}'
+
+graph-end ::= '{"node":' integer '}' | '{"id":' expr '}'
+
+new-table ::= '{"label":' string ', "table":' string '}' | '{"type":' string ', "table":' string '}'
+
+graph-set ::= '{"op": "graphSet"' ', "graph":' string ', "input":' plan ', "items":' '[' (set-item (',' set-item)*)? ']'
+              (', "tables":' '[' (new-table (',' new-table)*)? ']')? op-meaning '}'
+
+set-item ::= '{"kind":' ( '"property"' ', "key":' string ', "value":' expr
+                        | '"properties"' ', "value":' expr ', "merge":' boolean
+                        | '"labels"' ', "add":' '[' (string (',' string)*)? ']' ', "remove":' '[' (string (',' string)*)? ']' )
+             (', "node":' expr | ', "relationship":' relationship-ref) '}'
+
+relationship-ref ::= '{"type":' expr ', "id":' expr '}'
+
+graph-delete ::= '{"op": "graphDelete"' ', "graph":' string ', "input":' plan
+                 ', "targets":' '[' (delete-target (',' delete-target)*)? ']' ', "detach":' boolean op-meaning '}'
+
+delete-target ::= '{"node":' expr '}' | '{"nodes":' expr '}' | '{"relationship":' relationship-ref '}'
+                | '{"hops":' expr '}' | '{"path":' '{"start":' expr ', "hops":' expr '}' '}'
+
+graph-merge ::= '{"op": "graphMerge"' ', "graph":' string ', "id":' integer ', "input":' plan ', "match":' plan
+                ', "nodes":' '[' (new-node (',' new-node)*)? ']'
+                ', "relationships":' '[' (new-relationship (',' new-relationship)*)? ']'
+                ', "created":' '[' (expr (',' expr)*)? ']' ', "onMatch":' '[' (set-item (',' set-item)*)? ']'
+                ', "onCreate":' '[' (set-item (',' set-item)*)? ']'
+                (', "tables":' '[' (new-table (',' new-table)*)? ']')? (', "key":' '[' (expr (',' expr)*)? ']')?
+                op-meaning '}'
+
+eager ::= '{"op": "eager"' ', "input":' plan op-meaning '}'
+
+/* Expressions */
+
+expr ::= col | lit | param | call | cast | and | or | not | is-null | case | subquery | in-subquery
+       | each | element | each-agg
+
+expr-meaning ::= (', "carries":' carries)? (', "affinity":' affinity)? (', "inline": false')? (', "origin":' json)?
+
+carries ::= '{"collation":' collation ', "from":' ('"explicit"' | '"column"') '}'
+
+affinity ::= '"INTEGER"' | '"REAL"' | '"NUMERIC"' | '"TEXT"' | '"BLOB"'
+
+col ::= '{"k": "col"' ', "input":' integer ', "index":' integer ', "depth":' integer ', "type":' type
+        ', "collation":' collation expr-meaning '}'
+
+lit ::= '{"k": "lit"' ', "value":' value ', "type":' type expr-meaning '}'
+
+param ::= '{"k": "param"' ', "index":' integer ', "type":' type expr-meaning '}'
+
+call ::= '{"k": "call"' ', "fn":' string ', "args":' '[' (expr (',' expr)*)? ']' ', "type":' type
+         (', "collation":' collation)? expr-meaning '}'
+
+cast ::= '{"k": "cast"' ', "fn":' string ', "to":' type ', "arg":' expr expr-meaning '}'
+
+and ::= '{"k": "and"' ', "args":' '[' expr (',' expr)* ']' (', "type":' logic-type)? expr-meaning '}'
+
+or ::= '{"k": "or"' ', "args":' '[' expr (',' expr)* ']' (', "type":' logic-type)? expr-meaning '}'
+
+not ::= '{"k": "not"' ', "arg":' expr (', "type":' logic-type)? expr-meaning '}'
+
+is-null ::= '{"k": "isNull"' ', "arg":' expr ', "not":' boolean (', "type":' logic-type)? expr-meaning '}'
+
+logic-type ::= '"bool"' | '"int"'
+
+case ::= '{"k": "case"' ', "whens":' '[' (when (',' when)*)? ']' ', "else":' expr ', "type":' type expr-meaning '}'
+
+when ::= '{"when":' expr ', "then":' expr '}'
+
+subquery ::= '{"k": "subquery"' ', "mode":' ('"scalar"' | '"exists"') ', "plan":' plan ', "type":' type
+             ', "collation":' collation expr-meaning '}'
+
+in-subquery ::= '{"k": "inSubquery"' ', "probe":' expr ', "plan":' plan ', "collation":' collation expr-meaning '}'
+
+each ::= '{"k": "each"' ', "list":' expr ', "mode":' ('"map"' | '"filter"' | '"agg"') ', "body":' expr
+         (', "aggs":' '[' (agg-call (',' agg-call)*)? ']')? ', "type":' type expr-meaning '}'
+
+element ::= '{"k": "element"' ', "part":' ('"value"' | '"position"') ', "depth":' integer ', "type":' type
+            expr-meaning '}'
+
+each-agg ::= '{"k": "eachAgg"' ', "index":' integer ', "depth":' integer ', "type":' type expr-meaning '}'
+
+/* Values, types and collations */
+
+value ::= 'null' | number | string | '{"$bigint":' string '}' | '{"$real":' ('"NaN"' | '"Infinity"' | '"-Infinity"') '}'
+        | blob
+
+blob ::= '{"$blob":' string '}'
+
+type ::= '"' type-name '"'
+
+type-name ::= 'int' | 'real' | 'num' | 'text' | 'blob' | 'bool' | 'date' | 'datetime' | 'time' | 'duration'
+            | 'null' | 'any' | 'list<' type-name '>'
+            | 'struct<' field-name type-name (', ' field-name type-name)* '>' | 'map<text, ' type-name '>'
+
+collation ::= '"binary"' | '"nocase"' | '"rtrim"'

@@ -1,6 +1,6 @@
 # The catalog
 
-The catalog says what a database holds in plan terms: its tables and their columns as [plan types](./plans#types-and-collations),
+The catalog says what a database holds in plan terms: its tables and their columns as [plan types](../plan/types),
 collations and positions; its views; the functions a plan can call; and the settings that change what a statement
 means ([ADR 0016](../../adr/0016-plan-api-for-every-language.md), section 7). It is the same for every language, and
 the same wherever plans are built:
@@ -67,7 +67,7 @@ aggregate.
 | `deterministic` | the same arguments always give the same result: false for `random()` and for anything that reads the clock or time zone |
 | `dateTime` | set on the date and time functions: deterministic unless an argument asks for the current time (`'now'`), so allowed in index expressions and CHECK constraints, where reading the clock fails when it runs |
 | `result` | the result type when nothing is known of the arguments |
-| `operation` | `true` on the engine's own [operations](./plans#functions) |
+| `operation` | `true` on the engine's own [operations](../plan/functions/) |
 | `traits` | what the planner and code generation know of it: `compare`, `offset`, `inList`, `pattern`, … |
 
 ## Settings
@@ -84,7 +84,7 @@ In process, the catalog also answers what a language needs to know while it buil
 |---|---|
 | `resultType(name, args)` | function `name`'s result type for arguments of these plan types (or `{ type, collation }`) |
 | `typeOf(expr)` | the type the engine computes for an expression, which can be narrower than the type written on it |
-| `describe(expr)` | `{ type, carries?, affinity? }`: the type and the [meaning fields](./plans#expressions) the engine computes, given on the expression or passed up from what it is made of (a cast keeps its operand's collation) |
+| `describe(expr)` | `{ type, carries?, affinity? }`: the type and the [meaning fields](../plan/meaning-fields) the engine computes, given on the expression or passed up from what it is made of (a cast keeps its operand's collation) |
 | `constant(expr)` | `{ value }` when the expression depends on nothing but constants, else null |
 
 Declared column types map to storage and plan types by `declaredType(text)` (`storageTypeFor`, `planTypeOfStorage`

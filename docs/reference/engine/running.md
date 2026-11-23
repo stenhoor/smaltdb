@@ -11,7 +11,7 @@ A `PlanStatementInput` is one of:
 |---|---|
 | A plan operation | A query whose result columns are named `column1`, `column2`, … and typed from the plan |
 | `{ kind: 'query', plan, columns? }` | A query and its result columns |
-| `{ kind: 'write', plan, returning?, source? }` | An `append`, `update` or `delete` plan, or one that [writes a property graph](./plans#graph-writes); `returning` names and types what the plan gives back, each `{ name, type? }`, one for each column (`SMALT_PLAN` otherwise). A column without a `type` has the type the plan gives it; without `returning`, they are named `column1`, … and typed from the plan |
+| `{ kind: 'write', plan, returning?, source? }` | An `append`, `update` or `delete` plan, or one that [writes a property graph](../plan/graph-writes); `returning` names and types what the plan gives back, each `{ name, type? }`, one for each column (`SMALT_PLAN` otherwise). A column without a `type` has the type the plan gives it; without `returning`, they are named `column1`, … and typed from the plan |
 | `{ kind: 'explain', mode: 'plan' \| 'analyze', query }` | The query's physical plan, or the plan with run-time counts |
 | `{ kind: 'transaction', … }` | `begin` (with `mode` `deferred`, `immediate` or `exclusive`), `commit`, `rollback` (to an optional `savepoint`), `savepoint`, `release`. `begin` and `commit` take an optional `author` and `message` (text; `commit`'s win): a commit that changes something records them with its id and time in `smalt_commits` (`id`, `time` in milliseconds since 1970, `author`, `message`), which only the engine writes. The client's `db.transaction(fn, { author, message })` sends them |
 | `{ kind: 'setting', name, value? }` | Read a setting, or set it (`value` an expression over constants and parameters), as SQL's PRAGMA |
@@ -28,7 +28,7 @@ to `NONE`.
 | `Database` method | |
 |---|---|
 | `preparePlan(stmt): PlanStatement` | Compile a statement. A `PlanStatement` has the members of a [`Statement`](../api/engine#statement) (`run`, `all`, `cursor`, `columns`, `columnTypes`, `readonly`, `paramCount`), without `sql`. It compiles again by itself after schema changes. |
-| `queryPlan(stmt, params?): QueryResult` | Run a statement and return `{ columns, columnTypes, rows }`. A write's `rows` are its RETURNING rows, and it also gives `changes` and `lastInsertRowid`, as `run` does, and `graph` where it [wrote a property graph](./plans#graph-writes): what it did, counted. Compiled plans are cached by their canonical form, so running the same plan again, built anew or read from JSON, plans it once. |
+| `queryPlan(stmt, params?): QueryResult` | Run a statement and return `{ columns, columnTypes, rows }`. A write's `rows` are its RETURNING rows, and it also gives `changes` and `lastInsertRowid`, as `run` does, and `graph` where it [wrote a property graph](../plan/graph-writes): what it did, counted. Compiled plans are cached by their canonical form, so running the same plan again, built anew or read from JSON, plans it once. |
 | `queryPlanAsync(stmt, params?, options?)` | `queryPlan` for a plan that reads external data: fetches it first. |
 
 ```ts
@@ -56,13 +56,13 @@ In a page, the client runs plans in the engine's worker: `db.queryPlan(stmt, par
 reference](https://stenhoor.github.io/smaltql/reference/api/client#queryplan)). Build them with `smaltdb/plan`, the plan
 format without the engine, so that pages which don't build plans don't load it. The plan crosses to the worker as JSON;
 results, options, transactions and parallel readers work as for SQL queries. The typed arrays of
-[values given as columns](./plans#operations) travel beside the JSON as binary data, copied; with `{ transfer: true }`
+[values given as columns](../plan/values#columns) travel beside the JSON as binary data, copied; with `{ transfer: true }`
 (an option of `queryPlan`, `streamPlan` and `preparePlan`) their buffers are handed to the worker instead, and the
 arrays are unusable afterwards. A plan that carries data is not cached by the worker.
 
 Results carry each column's plan type: `columnTypes` on `rowMode: 'array'` and `'columnar'` results and on prepared
 statements. A write run with `queryPlan` gives `changes` and `lastInsertRowid` on its result, beside any RETURNING rows, and
-`graph` where it [wrote a property graph](./plans#graph-writes); they are not enumerable, so the rows compare and
+`graph` where it [wrote a property graph](../plan/graph-writes); they are not enumerable, so the rows compare and
 serialize as before. A prepared write's `run` gives the same three.
 
 Dates and times (`date`, `datetime`, `time`, `duration`) come back as text, such as `2026-11-07` or
@@ -98,7 +98,7 @@ Parameters are positional: a plan reads `param` 0, 1, …, and runs with an arra
 at most 32766). Integers beyond ±(2^53 − 1) are `bigint`s; blobs are `Uint8Array`s.
 
 A parameter the plan reads as a list, a struct or a map (`param(0, 'list<int>')`, `param(1, 'map<text, any>')`) takes
-a JS array, an object or a `Map`, as [a column of `values`](./plans#operations) of that type takes one: the engine
+a JS array, an object or a `Map`, as [a column of `values`](../plan/values#columns) of that type takes one: the engine
 makes the type's bytes of it each time the statement runs. So a statement prepared once takes another list or map
 each run, where a list written into the plan makes each a plan of its own, planned from nothing. `null` and
 `undefined` are NULL. Any other value, bytes included, is refused (`SMALT_MISMATCH`): the plan reads the parameter as
@@ -174,7 +174,7 @@ db.queryPlan(stmt);
 | `encodePlan(plan): EncodedPlan` / `decodePlan(e): PlanOp` | A plan as an object `structuredClone` can copy (`{ version, plan }`), for `postMessage`. |
 
 Both record `PLAN_FORMAT_VERSION` (1), and decoding refuses a plan of another version, except version 0, whose
-`$sql` / `$flattened` metadata it reads into the [meaning fields](./plans#expressions). A decoded plan runs exactly as the
+`$sql` / `$flattened` metadata it reads into the [meaning fields](../plan/meaning-fields). A decoded plan runs exactly as the
 original; the engine validates it like any other.
 
 ```ts

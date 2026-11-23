@@ -1,6 +1,6 @@
 # Writing a language
 
-A language turns its source text into [plans](./plans) and gives the engine what it needs of the objects written in
+A language turns its source text into [plans](../plan/) and gives the engine what it needs of the objects written in
 it. The engine never reads a language's syntax: it holds a view as `{ language, text }` and asks that language to bind
 it. SQL is a language in this sense ([smaltql](https://github.com/stenhoor/smaltql)); a dataframe library is another.
 
@@ -70,7 +70,7 @@ language's parameters are scalars.
 
 `smaltdb/language` also has `describeTableDef(def, source?)`, a table definition described as the catalog will
 describe the table it makes, and `comparisonRule(a, b)`: for two operands' types and [meaning
-fields](./plans#expressions), the collation a comparison of them uses and the conversion (`affinity_numeric`,
+fields](../plan/meaning-fields), the collation a comparison of them uses and the conversion (`affinity_numeric`,
 `affinity_text`) to apply to each side first, as the engine reads `carries` and `affinity`.
 
 ## Statements the engine keeps
@@ -150,7 +150,7 @@ rowid (`-1`).
 - SQL reads views written in SQL only, since it reads a view by parsing its text. A view in another language is read by
   plans, or through a materialized view, whose rows the engine fills by binding it with its language.
 - The plan `bindView` returns for a materialized view must be in the shape the planner reads: a projection over the
-  query's core, as SQL builds it (see [plan shapes](./plans#plan-shapes)). Views read by `scan` are rearranged as plans
+  query's core, as SQL builds it (see [plan shapes](../plan/shapes)). Views read by `scan` are rearranged as plans
   given to `preparePlan` are.
 
 An example: a language whose whole syntax is `table.column`, meaning that column of that table. It parses no
