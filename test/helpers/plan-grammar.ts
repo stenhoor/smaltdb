@@ -225,7 +225,7 @@ export function planKinds(): { ops: string[]; exprs: string[] } {
   const ops = [...readFileSync('src/engine/plan/ops.ts', 'utf8').matchAll(/readonly op: '(\w+)'/g)].map((m) => m[1]);
   const expr = readFileSync('src/engine/plan/expr.ts', 'utf8');
   const union = /export type PlanExpr =([\s\S]*?);/.exec(expr)![1];
-  const names = [...new Set([...union.matchAll(/(\w+)Expr\b/g)].map((m) => m[1]))].filter((n) => n !== "Plan");
+  const names = [...new Set([...union.matchAll(/(\w+)Expr\b/g)].map((m) => m[1]))].filter((n) => n !== 'Plan');
   const exprs: string[] = [];
   for (const n of names) {
     const def = new RegExp(`interface ${n}Expr\\b[^{]*\\{[^]*?readonly k: ([^;]+);`).exec(expr);

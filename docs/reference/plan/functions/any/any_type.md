@@ -65,7 +65,7 @@ values under `any`, `1`, `'a'`, a `bool`, NULL, a `list<int>` and a `map<text, i
 
 | any_type |
 |---|
-| ["int","text","bool","null","list<int>","map<text, int>"] |
+| `["int","text","bool","null","list<int>","map<text, int>"]` |
 
 ## Demo
 

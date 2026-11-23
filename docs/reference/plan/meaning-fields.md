@@ -26,9 +26,11 @@ op-meaning
 ## carries and affinity
 
 `carries` and `affinity` describe a value for the comparisons a language builds over it. They don't change what a
-comparison does: a [`cmp_eq`](./functions/comparison/cmp_eq) compares by its own `collation`, and converts an operand
-only where the plan calls [`affinity_numeric`](./functions/conversion/affinity_numeric) or
-[`affinity_text`](./functions/conversion/affinity_text) on it. A language reads them to choose those:
+comparison call does: a [`cmp_eq`](./functions/comparison/cmp_eq) compares by its own `collation`, and converts an
+operand only where the plan calls [`affinity_numeric`](./functions/conversion/affinity_numeric) or
+[`affinity_text`](./functions/conversion/affinity_text) on it. A few functions and operations do read `carries`: `in_list`, `min`, `max`, `nullif`, the aggregates,
+`inSubquery` and `setop` compare by the collation their first argument or input carries ([collations](./collations)).
+A language reads both fields to choose a comparison's collation and conversions:
 
 - `comparisonRule(a, b)` in `smaltdb/language` gives the comparison SQLite's rules make of two operands with these
   fields: the collation (an explicit one first, then a column's, the left operand's before the right's; `binary` with

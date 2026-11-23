@@ -18,7 +18,7 @@ arguments are expressions, and the call states its result type.
 | `fn` | string | The function's name, as the [functions reference](../functions/) and the [catalog](../../engine/catalog#functions) give it. |
 | `args` | expressions | Its arguments, in order. |
 | `type` | [type](../types) | The type of the call's value. A function that can give several types (`coalesce`, `max`) gives the one the plan declares. |
-| `collation` | [collation](../collations) | Optional: how a comparison-like function (`cmp_eq`, `in_list`, `min`, …) compares text. Without it: `binary`. The collation an operand [carries](../meaning-fields) doesn't change it: a language reads that to choose the call's. |
+| `collation` | [collation](../collations) | Optional: how a comparison (`cmp_eq`, `cmp_lt`, …) compares text. Without it: `binary`. The collation an operand [carries](../meaning-fields) doesn't change it. A few functions (`in_list`, `min`, `max`, `nullif`) compare by the collation their first argument carries instead: their pages say so. |
 
 and the [meaning fields](../meaning-fields) of an expression.
 
