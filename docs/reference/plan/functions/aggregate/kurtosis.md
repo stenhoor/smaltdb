@@ -49,29 +49,35 @@ None.
       "rows": [
         [{"k": "lit", "value": 1, "type": "int"}],
         [{"k": "lit", "value": 2, "type": "int"}],
-        [{"k": "lit", "value": 3, "type": "int"}],
         [{"k": "lit", "value": 4, "type": "int"}],
+        [{"k": "lit", "value": 10, "type": "int"}],
         [{"k": "lit", "value": null, "type": "int"}]
       ]
     },
     "keys": [],
     "aggs": [
-      {"fn": "kurtosis", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"},
-      {"fn": "kurtosis", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "filter": {"k": "call", "fn": "cmp_ne", "args": [
+      {"fn": "kurtosis", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"},
+      {"fn": "kurtosis", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "filter": {"k": "call", "fn": "cmp_lt", "args": [
         {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"},
-        {"k": "lit", "value": 4, "type": "int"}
+        {"k": "lit", "value": 10, "type": "int"}
       ], "type": "bool"}, "collation": "binary", "type": "real"},
-      {"fn": "kurtosis", "args": [{"k": "lit", "value": 5, "type": "int"}], "star": false, "distinct": false, "collation": "binary", "type": "real"}
+      {"fn": "kurtosis", "args": [
+        {"k": "lit", "value": 5, "type": "int"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"}
     ],
     "carry": []
   },
-  "columns": [{"name": "kurtosis"}, {"name": "without 4"}, {"name": "all equal"}]
+  "columns": [{"name": "kurtosis"}, {"name": "without 10"}, {"name": "all equal"}]
 }
 ```
 
-| kurtosis | without 4 | all equal |
+| kurtosis | without 10 | all equal |
 |---|---|---|
-| -1.200000000000001 | NULL | NULL |
+| 2.030769230769237 | NULL | NULL |
 
 ## Demo
 
@@ -89,7 +95,9 @@ The pieces of all orders:
     },
     "keys": [],
     "aggs": [
-      {"fn": "kurtosis", "args": [{"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"},
+      {"fn": "kurtosis", "args": [
+        {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"},
       {"fn": "count", "args": [], "star": true, "distinct": false, "collation": "binary", "type": "int"}
     ],
     "carry": []

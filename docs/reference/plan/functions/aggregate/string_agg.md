@@ -93,7 +93,9 @@ requires (PostgreSQL's name). NULL values are skipped. An aggregate: a call in a
     },
     "keys": [],
     "aggs": [
-      {"fn": "string_agg", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "text", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "text"}
+      {"fn": "string_agg", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "text", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "text"}
     ],
     "carry": []
   },

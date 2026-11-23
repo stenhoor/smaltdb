@@ -73,7 +73,9 @@ None.
     },
     "keys": [],
     "aggs": [
-      {"fn": "first", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "text", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "text"},
+      {"fn": "first", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "text", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "text"},
       {"fn": "first", "args": [
         {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "text", "collation": "binary"},
         {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "int", "collation": "binary"}
@@ -112,7 +114,9 @@ For each day, the fruit of its first order and of its smallest order:
       {"expr": {"k": "col", "input": 0, "index": 3, "depth": 0, "type": "date", "collation": "binary"}, "collation": "binary"}
     ],
     "aggs": [
-      {"fn": "first", "args": [{"k": "col", "input": 0, "index": 1, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "int"},
+      {"fn": "first", "args": [
+        {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "int"},
       {"fn": "first", "args": [
         {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "int", "collation": "binary"},
         {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}

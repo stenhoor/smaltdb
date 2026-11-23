@@ -52,12 +52,16 @@ None.
     },
     "keys": [],
     "aggs": [
-      {"fn": "group_concat", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "text", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "text"},
+      {"fn": "group_concat", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "text", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "text"},
       {"fn": "group_concat", "args": [
         {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "text", "collation": "binary"},
         {"k": "lit", "value": " + ", "type": "text"}
       ], "star": false, "distinct": false, "collation": "binary", "type": "text"},
-      {"fn": "group_concat", "args": [{"k": "col", "input": 0, "index": 1, "depth": 0, "type": "real", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "text"}
+      {"fn": "group_concat", "args": [
+        {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "real", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "text"}
     ],
     "carry": []
   },

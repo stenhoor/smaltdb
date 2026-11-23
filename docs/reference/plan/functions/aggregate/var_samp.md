@@ -56,13 +56,21 @@ None.
     },
     "keys": [],
     "aggs": [
-      {"fn": "var_samp", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"},
-      {"fn": "variance", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"},
-      {"fn": "var_samp", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "filter": {"k": "call", "fn": "cmp_eq", "args": [
+      {"fn": "var_samp", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"},
+      {"fn": "variance", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"},
+      {"fn": "var_samp", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "filter": {"k": "call", "fn": "cmp_eq", "args": [
         {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"},
         {"k": "lit", "value": 1, "type": "int"}
       ], "type": "bool"}, "collation": "binary", "type": "real"},
-      {"fn": "var_samp", "args": [{"k": "lit", "value": 5, "type": "int"}], "star": false, "distinct": false, "collation": "binary", "type": "real"}
+      {"fn": "var_samp", "args": [
+        {"k": "lit", "value": 5, "type": "int"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"}
     ],
     "carry": []
   },
@@ -92,7 +100,9 @@ How much the stock of each colour of fruit varies:
       {"expr": {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "text", "collation": "binary"}, "collation": "binary"}
     ],
     "aggs": [
-      {"fn": "var_samp", "args": [{"k": "col", "input": 0, "index": 4, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"}
+      {"fn": "var_samp", "args": [
+        {"k": "col", "input": 0, "index": 4, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"}
     ],
     "carry": [],
     "ordered": "first"

@@ -53,7 +53,9 @@ None.
     },
     "keys": [],
     "aggs": [
-      {"fn": "min", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "text", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "text"},
+      {"fn": "min", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "text", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "text"},
       {"fn": "min", "args": [
         {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "text", "collation": "binary", "carries": {"collation": "nocase", "from": "explicit"}}
       ], "star": false, "distinct": false, "collation": "binary", "type": "text"}
@@ -84,7 +86,9 @@ None.
     },
     "keys": [],
     "aggs": [
-      {"fn": "min", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "real", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"}
+      {"fn": "min", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "real", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"}
     ],
     "carry": []
   },
@@ -114,8 +118,12 @@ The cheapest price of each colour of fruit, and the first name in binary order:
       {"expr": {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "text", "collation": "binary"}, "collation": "binary"}
     ],
     "aggs": [
-      {"fn": "min", "args": [{"k": "col", "input": 0, "index": 3, "depth": 0, "type": "real", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"},
-      {"fn": "min", "args": [{"k": "col", "input": 0, "index": 1, "depth": 0, "type": "text", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "text"}
+      {"fn": "min", "args": [
+        {"k": "col", "input": 0, "index": 3, "depth": 0, "type": "real", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"},
+      {"fn": "min", "args": [
+        {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "text", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "text"}
     ],
     "carry": [],
     "ordered": "first"

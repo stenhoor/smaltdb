@@ -45,9 +45,15 @@ None.
     },
     "keys": [],
     "aggs": [
-      {"fn": "avg_float", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "real", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"},
-      {"fn": "avg_float", "args": [{"k": "col", "input": 0, "index": 1, "depth": 0, "type": "real", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"},
-      {"fn": "avg", "args": [{"k": "col", "input": 0, "index": 1, "depth": 0, "type": "real", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"}
+      {"fn": "avg_float", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "real", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"},
+      {"fn": "avg_float", "args": [
+        {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "real", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"},
+      {"fn": "avg", "args": [
+        {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "real", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"}
     ],
     "carry": []
   },
@@ -77,7 +83,9 @@ The mean price of each colour of fruit:
       {"expr": {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "text", "collation": "binary"}, "collation": "binary"}
     ],
     "aggs": [
-      {"fn": "avg_float", "args": [{"k": "col", "input": 0, "index": 3, "depth": 0, "type": "real", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"}
+      {"fn": "avg_float", "args": [
+        {"k": "col", "input": 0, "index": 3, "depth": 0, "type": "real", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"}
     ],
     "carry": [],
     "ordered": "first"

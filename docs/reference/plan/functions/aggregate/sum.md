@@ -56,9 +56,15 @@ when the group has no value that is not NULL, and when the sum of reals is NaN (
     },
     "keys": [],
     "aggs": [
-      {"fn": "sum", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "int"},
-      {"fn": "sum", "args": [{"k": "col", "input": 0, "index": 1, "depth": 0, "type": "real", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"},
-      {"fn": "sum", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "filter": {"k": "lit", "value": 0, "type": "bool"}, "collation": "binary", "type": "int"}
+      {"fn": "sum", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "int"},
+      {"fn": "sum", "args": [
+        {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "real", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"},
+      {"fn": "sum", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "filter": {"k": "lit", "value": 0, "type": "bool"}, "collation": "binary", "type": "int"}
     ],
     "carry": []
   },
@@ -88,7 +94,9 @@ An integer sum beyond the 64-bit range fails; `total` gives a real:
     },
     "keys": [],
     "aggs": [
-      {"fn": "sum", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "int"}
+      {"fn": "sum", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "int"}
     ],
     "carry": []
   },
@@ -114,7 +122,9 @@ The pieces ordered each day:
       {"expr": {"k": "col", "input": 0, "index": 3, "depth": 0, "type": "date", "collation": "binary"}, "collation": "binary"}
     ],
     "aggs": [
-      {"fn": "sum", "args": [{"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "int"}
+      {"fn": "sum", "args": [
+        {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "int"}
     ],
     "carry": [],
     "ordered": "first"

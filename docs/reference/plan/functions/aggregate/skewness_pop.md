@@ -49,29 +49,35 @@ None.
       "rows": [
         [{"k": "lit", "value": 1, "type": "int"}],
         [{"k": "lit", "value": 2, "type": "int"}],
-        [{"k": "lit", "value": 3, "type": "int"}],
         [{"k": "lit", "value": 4, "type": "int"}],
+        [{"k": "lit", "value": 10, "type": "int"}],
         [{"k": "lit", "value": null, "type": "int"}]
       ]
     },
     "keys": [],
     "aggs": [
-      {"fn": "skewness_pop", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"},
-      {"fn": "skewness_pop", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "filter": {"k": "call", "fn": "cmp_ne", "args": [
+      {"fn": "skewness_pop", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"},
+      {"fn": "skewness_pop", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "filter": {"k": "call", "fn": "cmp_lt", "args": [
         {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"},
-        {"k": "lit", "value": 4, "type": "int"}
+        {"k": "lit", "value": 10, "type": "int"}
       ], "type": "bool"}, "collation": "binary", "type": "real"},
-      {"fn": "skewness_pop", "args": [{"k": "lit", "value": 5, "type": "int"}], "star": false, "distinct": false, "collation": "binary", "type": "real"}
+      {"fn": "skewness_pop", "args": [
+        {"k": "lit", "value": 5, "type": "int"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"}
     ],
     "carry": []
   },
-  "columns": [{"name": "skewness_pop"}, {"name": "without 4"}, {"name": "all equal"}]
+  "columns": [{"name": "skewness_pop"}, {"name": "without 10"}, {"name": "all equal"}]
 }
 ```
 
-| skewness_pop | without 4 | all equal |
+| skewness_pop | without 10 | all equal |
 |---|---|---|
-| 0 | 0 | NULL |
+| 0.8483206969390205 | 0.3818017741606063 | NULL |
 
 ## Demo
 
@@ -89,7 +95,9 @@ The pieces of all orders:
     },
     "keys": [],
     "aggs": [
-      {"fn": "skewness_pop", "args": [{"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"},
+      {"fn": "skewness_pop", "args": [
+        {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"},
       {"fn": "count", "args": [], "star": true, "distinct": false, "collation": "binary", "type": "int"}
     ],
     "carry": []

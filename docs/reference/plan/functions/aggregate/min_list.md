@@ -65,7 +65,9 @@ None.
         {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"},
         {"k": "lit", "value": 0, "type": "int"}
       ], "type": "bool"}, "collation": "binary", "type": "list<any>"},
-      {"fn": "min_list", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "filter": {"k": "lit", "value": 0, "type": "bool"}, "collation": "binary", "type": "list<int>"}
+      {"fn": "min_list", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "filter": {"k": "lit", "value": 0, "type": "bool"}, "collation": "binary", "type": "list<int>"}
     ],
     "carry": []
   },

@@ -55,8 +55,12 @@ a [`window`](../../operations/window)'s `calls`, over a frame).
     "keys": [],
     "aggs": [
       {"fn": "count", "args": [], "star": true, "distinct": false, "collation": "binary", "type": "int"},
-      {"fn": "count", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "int"},
-      {"fn": "count", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": true, "collation": "binary", "type": "int"}
+      {"fn": "count", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "int"},
+      {"fn": "count", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": true, "collation": "binary", "type": "int"}
     ],
     "carry": []
   },
@@ -108,7 +112,9 @@ The orders of each day, and how many different fruit they were for:
     ],
     "aggs": [
       {"fn": "count", "args": [], "star": true, "distinct": false, "collation": "binary", "type": "int"},
-      {"fn": "count", "args": [{"k": "col", "input": 0, "index": 1, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": true, "collation": "binary", "type": "int"}
+      {"fn": "count", "args": [
+        {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": true, "collation": "binary", "type": "int"}
     ],
     "carry": [],
     "ordered": "first"

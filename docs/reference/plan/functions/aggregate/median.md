@@ -55,12 +55,18 @@ aggregate: a call in an [`aggregate`](../../operations/aggregate)'s `aggs` (or a
     },
     "keys": [],
     "aggs": [
-      {"fn": "median", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"},
-      {"fn": "median", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "filter": {"k": "call", "fn": "cmp_lt", "args": [
+      {"fn": "median", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"},
+      {"fn": "median", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "filter": {"k": "call", "fn": "cmp_lt", "args": [
         {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"},
         {"k": "lit", "value": 10, "type": "int"}
       ], "type": "bool"}, "collation": "binary", "type": "real"},
-      {"fn": "median", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "filter": {"k": "lit", "value": 0, "type": "bool"}, "collation": "binary", "type": "real"}
+      {"fn": "median", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "filter": {"k": "lit", "value": 0, "type": "bool"}, "collation": "binary", "type": "real"}
     ],
     "carry": []
   },
@@ -87,7 +93,9 @@ Text is not a number here:
     },
     "keys": [],
     "aggs": [
-      {"fn": "median", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "text", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"}
+      {"fn": "median", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "text", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"}
     ],
     "carry": []
   },
@@ -113,7 +121,9 @@ The median order of each fruit (by id):
       {"expr": {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "int", "collation": "binary"}, "collation": "binary"}
     ],
     "aggs": [
-      {"fn": "median", "args": [{"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"},
+      {"fn": "median", "args": [
+        {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"},
       {"fn": "count", "args": [], "star": true, "distinct": false, "collation": "binary", "type": "int"}
     ],
     "carry": [],

@@ -52,9 +52,15 @@ NULL.
     },
     "keys": [],
     "aggs": [
-      {"fn": "sum_float", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "real", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"},
-      {"fn": "sum_float", "args": [{"k": "col", "input": 0, "index": 1, "depth": 0, "type": "real", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"},
-      {"fn": "sum", "args": [{"k": "col", "input": 0, "index": 1, "depth": 0, "type": "real", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"}
+      {"fn": "sum_float", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "real", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"},
+      {"fn": "sum_float", "args": [
+        {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "real", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"},
+      {"fn": "sum", "args": [
+        {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "real", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"}
     ],
     "carry": []
   },
@@ -84,7 +90,9 @@ The price of one of each fruit, by colour:
       {"expr": {"k": "col", "input": 0, "index": 2, "depth": 0, "type": "text", "collation": "binary"}, "collation": "binary"}
     ],
     "aggs": [
-      {"fn": "sum_float", "args": [{"k": "col", "input": 0, "index": 3, "depth": 0, "type": "real", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "real"}
+      {"fn": "sum_float", "args": [
+        {"k": "col", "input": 0, "index": 3, "depth": 0, "type": "real", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "real"}
     ],
     "carry": [],
     "ordered": "first"

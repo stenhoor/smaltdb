@@ -52,9 +52,15 @@ None.
     },
     "keys": [],
     "aggs": [
-      {"fn": "implode", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "list<int>"},
-      {"fn": "implode", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": true, "collation": "binary", "type": "list<int>"},
-      {"fn": "implode", "args": [{"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "filter": {"k": "lit", "value": 0, "type": "bool"}, "collation": "binary", "type": "list<int>"}
+      {"fn": "implode", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "list<int>"},
+      {"fn": "implode", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": true, "collation": "binary", "type": "list<int>"},
+      {"fn": "implode", "args": [
+        {"k": "col", "input": 0, "index": 0, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "filter": {"k": "lit", "value": 0, "type": "bool"}, "collation": "binary", "type": "list<int>"}
     ],
     "carry": []
   },
@@ -84,7 +90,9 @@ The fruit ordered each day, in order:
       {"expr": {"k": "col", "input": 0, "index": 3, "depth": 0, "type": "date", "collation": "binary"}, "collation": "binary"}
     ],
     "aggs": [
-      {"fn": "implode", "args": [{"k": "col", "input": 0, "index": 1, "depth": 0, "type": "int", "collation": "binary"}], "star": false, "distinct": false, "collation": "binary", "type": "list<int>"}
+      {"fn": "implode", "args": [
+        {"k": "col", "input": 0, "index": 1, "depth": 0, "type": "int", "collation": "binary"}
+      ], "star": false, "distinct": false, "collation": "binary", "type": "list<int>"}
     ],
     "carry": [],
     "ordered": "first"
