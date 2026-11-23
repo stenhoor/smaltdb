@@ -43,7 +43,8 @@ One row for each row updated, with a column for each of `returning`; none withou
 - With `from`, a table row the join matches several times is updated once, from one of its matches. Without it,
   each input row updates its row: a row named twice is updated twice, and the last update stays.
 - A plan that holds an `update` is a `write` statement's ([statements](../statements)).
-- An `update`'s input may not hold a write of a property graph ([the order a plan that writes a graph runs in](../graph-writes#order)).
+- An `update`'s input may not hold a write of a property graph
+  ([the order a plan that writes a graph runs in](../graph-writes#order)).
 
 ## Examples
 

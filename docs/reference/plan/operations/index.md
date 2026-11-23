@@ -58,8 +58,8 @@ Rules every operation follows:
 ## Graphs and recursion {#graphs-and-recursion}
 
 - [`paths`](./paths): The paths through a graph from each input row's node, along relationship tables.
-- [`iterate`](./iterate): A recursive query: its first rows, then each step's over the step before, until a step gives none.
-- [`working`](./working): Inside an `iterate`, the previous step's rows; inside a `graphMerge`, the rows being matched.
+- [`iterate`](./iterate): A recursive query: its first rows, then the rows its steps give for each row in turn, until no row is left.
+- [`working`](./working): Inside an `iterate`, the row its steps run for; inside a `graphMerge`'s match, the rows being matched.
 
 ## Writing {#writing}
 
