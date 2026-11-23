@@ -28,11 +28,10 @@ next month.
 | Code | When |
 |---|---|
 | `SMALT_RANGE` | The date doesn't exist: a month outside 1 to 12, or a day the month hasn't (`2025, 2, 29`). |
-| `SMALT_MISMATCH` | An argument isn't an integer: a real or text, even `'2025'` or `2025.0`. |
+| `SMALT_MISMATCH` | An argument isn't a whole number: a real with a fraction, or text (even `'2025'`). |
 
 ## Notes
 
-- The errors come when a row reaches the call, as it runs, not when the plan is compiled.
 - SQLite's `date('2025-02-29')` rolls over to `2025-03-01`; `make_date` refuses it. [`offset_by`](./offset_by) moves
   by months and keeps to the month's last day.
 - Results write a year beyond 9999 with a sign: `+10000-01-01`.

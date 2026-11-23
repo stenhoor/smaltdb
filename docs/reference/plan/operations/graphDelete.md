@@ -86,7 +86,8 @@ Edsger (node 3) still has a relationship from Alan, so deleting him without `det
 }
 ```
 
-The relationships of the shortest path from Ada (node 0) to Edsger, which `paths` finds:
+The relationships of the shortest path from Ada (node 0) to Edsger, which `paths` finds. Its only edge table is
+`knows`, the graph's first relationship type, so a hop's `edge`, 0, is that type's position too:
 
 ```json
 {

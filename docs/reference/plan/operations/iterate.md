@@ -53,7 +53,7 @@ no row is left. A step reads the row it runs for through a [`working`](./working
 - Without `order`, a step's row whose key was seen may be dropped before its other columns are computed: an error one
   of them would raise is not raised.
 - [`paths`](./paths) runs as an `iterate`.
-- An `iterate` may not hold a write ([writing a property graph](../graph-writes)).
+- An `iterate` may not hold a write ([the order a plan that writes a graph runs in](../graph-writes#order)).
 
 ## Examples
 

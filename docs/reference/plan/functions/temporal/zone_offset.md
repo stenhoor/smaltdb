@@ -102,7 +102,7 @@ negative west of it.
 
 ## Demo
 
-New York's offset at midnight UTC of each order's day, and on 1 November, when its summer time ended:
+New York's offset at midnight UTC of each order's day: its winter time, which began on 1 November 2026:
 
 ```json
 {

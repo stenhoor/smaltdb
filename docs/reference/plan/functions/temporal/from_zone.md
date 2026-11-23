@@ -50,7 +50,7 @@ The default is what JavaScript's `Temporal` calls `compatible`.
 
 ## Examples
 
-A time in a gap, and a time in an overlap, each read four ways:
+A time in a gap and a time in an overlap, each read two ways:
 
 ```json
 {

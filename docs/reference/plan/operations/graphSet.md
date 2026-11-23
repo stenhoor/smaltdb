@@ -41,7 +41,7 @@ The input's columns.
   property is one.
 - A relationship whose type's table has no properties column takes no properties.
 - **Row by row.** Each row's items read the graph as the rows before it left it, so a property set from itself
-  counts up over rows that name the same node ([writing a property graph](../graph-writes)).
+  counts up over rows that name the same node ([the order a plan that writes a graph runs in](../graph-writes#order)).
 - The statement's result counts what it did: `propertiesSet` counts each key set or removed, whether or not its value
   changed; `labelsAdded` and `labelsRemoved` each label.
 

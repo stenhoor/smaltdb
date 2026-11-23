@@ -1,5 +1,5 @@
 ---
-description: 'Todays date in UTC, as YYYY-MM-DD text.'
+description: 'Today''s date in UTC, as YYYY-MM-DD text.'
 ---
 
 # current_date
@@ -60,11 +60,11 @@ Its value changes, so these show what it is rather than what it says:
       ], "type": "bool"}
     ]]
   },
-  "columns": [{"name": "length"}, {"name": "is_date"}, {"name": "same_as_date"}, {"name": "after_2026"}]
+  "columns": [{"name": "length"}, {"name": "is_date"}, {"name": "same_as_date"}, {"name": "from_2026_11_23"}]
 }
 ```
 
-| length | is_date | same_as_date | after_2026 |
+| length | is_date | same_as_date | from_2026_11_23 |
 |---|---|---|---|
 | 10 | true | true | true |
 

@@ -32,13 +32,12 @@ so three arguments give midnight.
 | Code | When |
 |---|---|
 | `SMALT_RANGE` | The date doesn't exist (`2025, 2, 29`), or a clock part is out of its range (hour 24, second 60). |
-| `SMALT_MISMATCH` | An argument isn't an integer: a real or text. |
+| `SMALT_MISMATCH` | An argument isn't a whole number: a real with a fraction, or text. |
 
 ## Notes
 
 - The value has no zone: it is the wall-clock time the parts give. To read it as the time in a zone and get the UTC
   instant, pass it to [`from_zone`](./from_zone).
-- The errors come when a row reaches the call, as it runs, not when the plan is compiled.
 
 ## Examples
 
