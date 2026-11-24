@@ -2819,28 +2819,100 @@ export class Planner {
   }
 
   /**
-   * The join for an ORDER BY with a LIMIT, read in order: the ordering source first, through an access path whose rows
-   * come in the order wanted, then every other source by its cheapest index lookup per row (a nested loop keeps the
-   * outer order). Its cost is scaled by the share of its rows the LIMIT reads. Null when a source has no index lookup,
-   * no access path gives the order, or the usual join (`order`) and a sort cost less. The access paths are named by
-   * label, for `planFrom` to build.
+   * The join for an ORDER BY with a LIMIT, read in order: a source whose rows come in the order wanted first, through
+   * an access path that gives them so, then every other source by its cheapest index lookup per row (a nested loop
+   * keeps the outer order). That source is the ordering one, or one with a column the plan's conditions make equal to
+   * the ordering column (`equalColumns`), whichever costs less. The cost is scaled by the share of the join's rows the
+   * LIMIT reads. Null when a source has no index lookup, no access path gives the order, or the usual join (`order`)
+   * and a sort cost less. The access paths are named by label, for `planFrom` to build.
    */
   private orderedJoin(scope: Scope, pool: ConjunctInfo[], ctx: FunctionContext, order: number[], wanted: OrderWanted): { order: number[]; labels: Map<number, string> } | null {
-    const n = scope.sources.length;
     if (scope.sources.some((s) => s.joinType !== 'INNER' && s.joinType !== 'CROSS') || scope.sources.some((s) => s.lateral || s.sub)) return null;
+    let best = this.orderedFrom(scope, pool, ctx, wanted, wanted.source, wanted.column, false);
+    for (const e of this.equalColumns(scope, pool, ctx, wanted)) {
+      const j = this.orderedFrom(scope, pool, ctx, wanted, e.source, e.column, true);
+      if (j && (!best || j.cost < best.cost)) best = j;
+    }
+    if (!best) return null;
+    // The usual join, and a sort of all its rows.
+    let usual = 0;
+    let usualRows = 1;
+    const done = new Set<number>();
+    for (const p of order) {
+      const step = this.joinStep(scope.sources[p], done, usualRows, pool, scope, ctx);
+      usual += step.cost;
+      usualRows = step.rows;
+      done.add(p);
+    }
+    usual += usualRows * Math.log2(Math.max(2, usualRows)) * COST.sortRow;
+    return best.cost < usual ? { order: best.order, labels: best.labels } : null;
+  }
+
+  /**
+   * The columns of other sources that the plan's conditions make equal to an ORDER BY's column: the other side of an
+   * equality between two plain columns of tables, compared as they are stored (neither converted for the comparison)
+   * under the ordering's collation. An equality holds between two values with one place in the value order (the
+   * `compare` trait), so rows that come in such a column's order, and pass the equality, are in the ordering column's.
+   *
+   * The two columns must hold one kind of value by their tables too (numbers, the rowid being one; text; or values
+   * as they are given), whatever types the plan gives them: a lookup by rowid reads a number out of text
+   * (`rowidProbe`), and text does not come in the order of the numbers it reads as.
+   */
+  private equalColumns(scope: Scope, pool: ConjunctInfo[], ctx: FunctionContext, wanted: OrderWanted): { source: number; column: number }[] {
     const first = scope.sources[wanted.source];
+    if (!first.table) return [];
+    const asOrdered = (col: number | 'rowid', t: TableSchema): number => (col === 'rowid' || col === t.rowidAlias ? -1 : col);
+    const holds = (x: { src: Source; col: number | 'rowid' | null }): string => {
+      if (x.col === 'rowid' || x.col === x.src.table!.rowidAlias) return 'number';
+      const a = x.src.cols[x.col!].affinity;
+      return a === 'INTEGER' || a === 'REAL' || a === 'NUMERIC' ? 'number' : a;
+    };
+    const column = asOrdered(wanted.column, first.table);
+    const out: { source: number; column: number }[] = [];
+    for (const c of pool) {
+      if (!c.compilable || c.deps === null || c.deps.size !== 2 || !c.deps.has(wanted.source) || !isEquality(c.bound)) continue;
+      const [x, y] = c.bound.args;
+      if (x.k !== 'slot' || y.k !== 'slot' || isOpaque(x) || isOpaque(y)) continue;
+      const a = this.slotSource(x.reg, scope);
+      const b = this.slotSource(y.reg, scope);
+      if (!a || !b || a.col === null || b.col === null || !a.src.table || !b.src.table) continue;
+      const [mine, other] = a.src === first ? [a, b] : [b, a];
+      if (mine.src !== first || other.src === first || asOrdered(mine.col!, first.table) !== column || holds(mine) !== holds(other)) continue;
+      // Costing only: reading the operands' metadata must not make a scan decode their columns.
+      this.dryCompile++;
+      try {
+        const mx = boundMetadata(x, ctx);
+        const my = boundMetadata(y, ctx);
+        const [cx, cy] = comparisonConverters(mx, my);
+        if (cx || cy || comparisonCollation(mx, my) !== wanted.collation) continue;
+      } finally {
+        this.dryCompile--;
+      }
+      const at = asOrdered(other.col!, other.src.table!);
+      if (!out.some((e) => e.source === other.src.position && e.column === at)) out.push({ source: other.src.position, column: at });
+    }
+    return out;
+  }
+
+  /**
+   * `orderedJoin` from one source: `source`, read in the order of its `column` (-1: the rowid). `equal`: the column is
+   * one the plan's conditions make equal to the ordering column, so no row the join gives has NULL in it.
+   */
+  private orderedFrom(scope: Scope, pool: ConjunctInfo[], ctx: FunctionContext, wanted: OrderWanted, source: number, at: number, equal: boolean): { order: number[]; labels: Map<number, string>; cost: number } | null {
+    const n = scope.sources.length;
+    const first = scope.sources[source];
     if (!first.table || isColumnar(first.table)) return null;
-    const column = wanted.column === first.table.rowidAlias ? -1 : wanted.column;
-    if (wanted.nullsLast && column !== -1 && !first.table.columns[column].notNull) return null;
+    const column = at === first.table.rowidAlias ? -1 : at;
+    if (!equal && wanted.nullsLast && column !== -1 && !first.table.columns[column].notNull) return null;
     const sameOrder = (o: AccessOption): boolean =>
       !o.dependsOnOuter && o.orderBy !== undefined && o.orderBy.column === column && (column === -1 || o.orderBy.collation === wanted.collation);
-    const cands = pool.filter((c) => c.deps !== null && c.deps.size === 1 && c.deps.has(wanted.source));
-    const opts = this.accessOptions(first, wanted.source, cands, scope, ctx).filter(sameOrder);
+    const cands = pool.filter((c) => c.deps !== null && c.deps.size === 1 && c.deps.has(source));
+    const opts = this.accessOptions(first, source, cands, scope, ctx).filter(sameOrder);
     if (!opts.length) return null;
     const start = opts.reduce((a, b) => (b.cost < a.cost ? b : a));
-    const labels = new Map<number, string>([[wanted.source, start.label]]);
-    const placed = new Set([wanted.source]);
-    const out = [wanted.source];
+    const labels = new Map<number, string>([[source, start.label]]);
+    const placed = new Set([source]);
+    const out = [source];
     let rows = Math.max(1, start.rows);
     let cost = start.cost;
     // Greedily, the source with the cheapest index lookup from those placed.
@@ -2861,19 +2933,7 @@ export class Planner {
       placed.add(pick.p);
       out.push(pick.p);
     }
-    const share = Math.min(1, wanted.rows / rows);
-    // The usual join, and a sort of all its rows.
-    let usual = 0;
-    let usualRows = 1;
-    const done = new Set<number>();
-    for (const p of order) {
-      const step = this.joinStep(scope.sources[p], done, usualRows, pool, scope, ctx);
-      usual += step.cost;
-      usualRows = step.rows;
-      done.add(p);
-    }
-    usual += usualRows * Math.log2(Math.max(2, usualRows)) * COST.sortRow;
-    return cost * share < usual ? { order: out, labels } : null;
+    return { order: out, labels, cost: cost * Math.min(1, wanted.rows / rows) };
   }
 
   /** Pick the cheapest standalone (not outer-dependent) access option. */
