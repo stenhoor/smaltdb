@@ -31,9 +31,30 @@ describe('setMapKey', () => {
     expect(read(setMapKey(m, key('c'), value(null)))).toEqual(['b', 1, 'c', null, 'd', 'x']);
     expect(read(setMapKey(m, key('e'), value(-1.5)))).toEqual(['b', 1, 'd', 'x', 'e', -1.5]);
     expect(read(setMapKey(m, key('d'), null))).toEqual(['b', 1]);
-    // Taking away a key the map has not gives the map itself.
+    // Taking away a key the map has not gives the map itself, and so does the value a key has already.
     expect(setMapKey(m, key('c'), null)).toBe(m);
+    expect(setMapKey(m, key('b'), value(1))).toBe(m);
+    expect(setMapKey(m, key('d'), value('x'))).toBe(m);
     expect(read(setMapKey(encodeKey([]), key('k'), value('v')))).toEqual(['k', 'v']);
+  });
+
+  it('a value of as many bytes, of more and of fewer, at the start, in the middle and at the end', () => {
+    const entries = new Map<string, SqlValue>([['a', 'one'], ['m', 500], ['z', 'last']]);
+    const m = mapOf(entries);
+    const copy = m.slice();
+    const bytes = (v: SqlValue) => encodeKey([v]).length;
+    // The numbers 500, 501 and 2 are two, three and one byte after their tag: a set of one over another changes the length.
+    expect([bytes(500), bytes(501), bytes(2)].every((n, i, all) => i === 0 || n !== all[i - 1])).toBe(true);
+    for (const k of ['a', 'm', 'z']) {
+      for (const v of [500, 501, 2, 'one', 'on', 'onee', '', null] as SqlValue[]) {
+        const want = new Map(entries).set(k, v);
+        const got = setMapKey(m, encodeKey([k]), encodeKey([v]));
+        expect([...got], `${k} = ${String(v)}`).toEqual([...mapOf(want)]);
+        // The map given is never written: what was read from it before is still what it holds.
+        expect([...m]).toEqual([...copy]);
+        if (entries.get(k) !== v) expect(got).not.toBe(m);
+      }
+    }
   });
 
   it('gives the bytes of the map encoded whole, for keys and values of every kind', () => {

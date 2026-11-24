@@ -233,7 +233,14 @@ export class GraphProps {
     if (this.dead * 2 < this.used) {
       next.set(this.buf.subarray(0, this.used));
     } else {
+      const buf = this.buf;
       let at = 0;
+      // Rows whose bytes lie one after another are copied as one run. A rewrite leaves the rows in the order of their
+      // rowids, and rows written one after another in that order lie so too: the rows not written since, and those
+      // one statement wrote, are a few long runs, where each row was a copy of its own.
+      let from = 0;
+      let to = 0;
+      let runAt = 0;
       for (let page = 0; page < this.starts.length; page++) {
         const p = this.starts[page];
         // A page none of whose rows has bytes is not read: rows that come and go leave many.
@@ -242,13 +249,19 @@ export class GraphProps {
         for (let i = 0; i < PAGE; i++) {
           const s = p[i]!;
           if (s < 0) continue;
-          const len = e[i]! - s;
-          next.set(this.buf.subarray(s, s + len), at);
+          const end = e[i]!;
+          if (s !== to) {
+            if (to > from) next.set(buf.subarray(from, to), runAt);
+            from = s;
+            runAt = at;
+          }
+          to = end;
           p[i] = at;
-          e[i] = at + len;
-          at += len;
+          at += end - s;
+          e[i] = at;
         }
       }
+      if (to > from) next.set(buf.subarray(from, to), runAt);
       this.used = at;
       this.dead = 0;
     }

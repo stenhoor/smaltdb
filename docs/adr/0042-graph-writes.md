@@ -810,3 +810,59 @@ compared after each (6 seeds of each of its two comparisons in the suite, 150 ru
 setting writes the tables after every statement that writes and compares them with the index. smaltcy's tests on
 smaltdb (1,389, its writes among them, compared with its own engine after every statement) pass on this source with
 that setting and without it.
+
+### After step 4: the writes of 1,000 rows
+
+Added 2026-11-24. Step 4 left writes of 1,000 rows over the bar (its gate, above), and smaltcy's benchmark of statements
+that differ had more of them. The work on those goes on after the ADR's steps, each change its own pull request,
+measured against smaltcy as above (smaltdb's time over the time of smaltcy's in-memory engine on the same Cypher; the
+bar is 1.00x). A range is the lowest and the highest of a series' turns, `main` and the change run in turns.
+
+| Change | Pull request | Against smaltcy, `main` and the change |
+|---|---|---|
+| The log's entries are made by a constructor | [#306](https://github.com/stenhoor/smaltdb/pull/306) | Deleting 1,000 nodes, statements that differ: 1.93x to 2.43x and 1.51x to 1.59x with a literal, 1.98x to 2.46x and 1.49x to 1.54x with a parameter |
+| A label's first nodes are read from the index in the order of their ids | The pull request that adds this row | Setting 1,000 properties, statements that differ: 5.66x to 5.93x and 2.33x to 2.44x with a literal, 5.17x to 5.65x and 2.10x to 2.24x with a parameter |
+
+1. **The log's entries are made by a constructor** (`exec/graph-pending.ts`, `Entry`). An entry of the log of rows the
+   index holds ahead of the tables was an object written out where it is logged. In smaltcy's benchmark of statements
+   that differ, deleting 1,000 nodes read 2.3x to 2.6x, and 1.2x to 1.4x when the benchmark ran that case alone: the
+   same statements doing the same work (440,000 lookups of the entry that made a node, 9.0 steps each in a list 1,000
+   long, counted both ways). A profile of the 440 timed deletes had 573 ms with the case alone and 940 ms at the end of
+   the whole benchmark, the lookups (`makerOf`) 3.6 and 173.7 ms of it and the sweep at each commit 37.9 and 199.2 ms.
+   Asked of V8 (`%HaveSameMap`), the list's entries had one hidden class with the case alone and two in the whole
+   benchmark, by which time the log had held entries of every kind. Made by a constructor that sets every field in one
+   order, they have one there too. Which write first gave the entries a second hidden class was not found. Measured with
+   `main` at `cb653b1` and smaltcy's branch `claude/statement-templates` (`79bd1e5`), four turns each way: smaltdb's own
+   time for the deletes 1.38 to 1.74 ms and 0.94 to 1.19 ms with a literal, 1.27 to 2.29 ms and 0.90 to 1.00 ms with a
+   parameter. With the same text every run, and in the reads, no line moved.
+2. **A label's first nodes are read from the index in the order of their ids** (`exec/planner.ts`, `orderedJoin`).
+   `MATCH (p:Person) WITH p LIMIT 1000 SET p.bench = …` reads the label's first 1,000 nodes by id. Its plan joins the
+   node table with the label index and sorts by the node's id, with a LIMIT, and the planner read the node table in the
+   order of its rowids, checking each row's label in the index: a scan of a B+tree. So the statement stopped at the
+   guard of a table that was behind (above, "where it differs", 3), the tables were written, and it ran again; from then
+   on it had them written before it started. Back to back, each such statement wrote the 1,000 rows of the one before it
+   first: the tables were written 220 times in 220 statements, 220,000 rows. The benchmark's case with the same text
+   every run does not show it: the cleanup between its runs takes the key away again, which leaves no row ahead of the
+   tables (they were written twice in 220 statements). Now the planner also reads an ORDER BY with a LIMIT through a
+   column the plan's conditions make equal to the ordering column (docs/QUERY_ENGINE.md, "`ORDER BY` with a `LIMIT`,
+   read in order"): here the label's entries in the index, which come in the order of their nodes, and each node then by
+   its rowid from the index's property maps. No table is read, and the tables are not written in the 220 statements,
+   either way. Measured with `main` at `39c32e2` and smaltcy's branch `claude/cypher-language` (`44ad602`,
+   stenhoor/smaltcy#40), four turns each way for the statements that differ and for the writes with the same text, three
+   for the reads:
+
+   | Setting 1,000 properties | `main` | The change | smaltdb's own time (ms), `main` and the change |
+   |---|---|---|---|
+   | A literal that differs | 5.66x to 5.93x | 2.33x to 2.44x | 6.05 to 6.63, 2.16 to 2.76 |
+   | A parameter that differs | 5.17x to 5.65x | 2.10x to 2.24x | 5.52 to 6.66, 1.94 to 2.08 |
+   | The same text every run | 1.77x to 2.03x | 1.74x to 2.41x | 1.55, 1.51 (medians) |
+
+   Of the plans of the benchmark's 20 queries, and of what its 10 writes read, two changed: this one and creating 1,000
+   relationships from a label's first 1,000 nodes, which reads the same way (0.83x to 0.92x and 0.80x to 0.82x with a
+   literal, 0.72x to 0.81x and 0.72x to 0.84x with a parameter, 0.65x to 0.73x and 0.61x to 0.79x with the same text).
+   Five other lines of the series' 74 had ranges apart: deleting 1,000 nodes with a literal, a small label with a filter
+   and the triangles with the same text (three turns), all three lower; 3 hops with a direction and a literal, and a
+   shortest path with a direction and a parameter, both higher. Their plans are the same, and each had ranges that
+   overlap when it was run again, four turns each way (the first and the last two alone, the two reads in their
+   benchmark). What is left of this statement, 2.1x to 2.4x, is the work of setting the key on each row: the map's bytes
+   are copied three times, and the buffer of the maps is rewritten when half of it is dead.

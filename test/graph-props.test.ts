@@ -159,6 +159,45 @@ describe('property maps', () => {
     expect(m.bytes()).toBeLessThan(4096 * 8 + 32 * 1024);
   });
 
+  it('keep every row its bytes when the buffer is written again, whatever order the rows were written in', () => {
+    // A rewrite copies rows that lie one after another as one run: rows written in rising order, in falling order,
+    // scattered, across pages of rowids, with rows of no props and rows that went among them.
+    const m = new GraphProps();
+    let seed = 11;
+    const pick = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    const ids = [...Array.from({ length: 300 }, (_, i) => i), ...Array.from({ length: 300 }, (_, i) => 4000 + i), 70000, 70001, 70002];
+    const want = new Map<number, Uint8Array | null>();
+    const put = (row: number, round: number): void => {
+      const v = pick(11) === 0 ? null : Uint8Array.from({ length: 1 + pick(60) }, (_, i) => (row * 13 + round * 5 + i) & 255);
+      m.set(row, v);
+      want.set(row, v);
+    };
+    for (const row of ids) put(row, 0);
+    const bytes0 = m.bytes();
+    for (let round = 1; round <= 400; round++) {
+      const how = pick(4);
+      const some = ids.filter(() => pick(3) === 0);
+      if (how === 1) some.reverse();
+      if (how === 2) some.sort(() => pick(3) - 1);
+      for (const row of some) {
+        if (how === 3 && pick(9) === 0) {
+          m.forget(row);
+          want.delete(row);
+        } else put(row, round);
+      }
+      if (round % 40 !== 0) continue;
+      for (const row of ids) expect(m.get(row), `round ${round}, row ${row}`).toEqual(want.get(row));
+      const seen = new Map<number, Uint8Array | null>();
+      m.forEach((rowid, props) => void seen.set(rowid, props === null ? null : props.slice()));
+      expect(seen).toEqual(want);
+    }
+    // The buffer was written again many times over: it holds a few times what is live, not what was written.
+    expect(m.bytes()).toBeLessThan(bytes0 * 6);
+  });
+
   it('know a row that is gone from the index while its table still has it, and take rows the table has not yet', () => {
     const m = new GraphProps();
     m.set(1, bytes(1, 1));

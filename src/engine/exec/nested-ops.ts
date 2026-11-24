@@ -650,8 +650,8 @@ export function findMapKey(m: Uint8Array, start: number, end: number, key: Uint8
 /**
  * The map whose bytes are `m`, with the key whose component is `key` (a text component, encoded) given the value
  * whose component is `value`, or taken away (`value` null): the other entries' bytes are copied as they are, in
- * their order, so no entry is decoded. The key is found as {@link findMapKey} finds it. `m` itself where taking the
- * key away changes nothing.
+ * their order, so no entry is decoded. The key is found as {@link findMapKey} finds it. `m` itself where nothing
+ * changes: the key has that value already, or is taken away and was not there.
  */
 export function setMapKey(m: Uint8Array, key: Uint8Array, value: Uint8Array | null): Uint8Array {
   const kl = key.length;
@@ -682,11 +682,33 @@ export function setMapKey(m: Uint8Array, key: Uint8Array, value: Uint8Array | nu
     return out;
   }
   const vl = value.length;
-  const out = new Uint8Array(at + kl + vl + end - after);
-  out.set(m.subarray(0, at));
-  out.set(key, at);
-  out.set(value, at + kl);
-  out.set(m.subarray(after), at + kl + vl);
+  if (after - at === kl + vl) {
+    // The key is there with a value of as many bytes: the map is copied whole, and the value written over its copy.
+    const v = at + kl;
+    let i = 0;
+    while (i < vl && m[v + i] === value[i]) i++;
+    if (i === vl) return m;
+    const same = m.slice();
+    for (; i < vl; i++) same[v + i] = value[i]!;
+    return same;
+  }
+  // The map is copied whole, the entries after the key's are moved to where they go, and the key and its value are
+  // written between: three copies of bytes and no view of a part of the map, which costs more to make than a small
+  // map does to copy.
+  const n = at + kl + vl + end - after;
+  let out: Uint8Array;
+  if (n >= end) {
+    out = new Uint8Array(n);
+    out.set(m);
+    if (after < end) out.copyWithin(at + kl + vl, after, end);
+  } else {
+    // A shorter map: its first bytes are a copy of the old one's, and the entries after the key's are read from the
+    // old one.
+    out = m.slice(0, n);
+    for (let from = after, to = at + kl + vl; from < end; from++, to++) out[to] = m[from]!;
+  }
+  if (at === after) out.set(key, at);
+  for (let i = 0; i < vl; i++) out[at + kl + i] = value[i]!;
   return out;
 }
 
