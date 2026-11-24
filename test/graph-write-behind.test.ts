@@ -317,6 +317,145 @@ describe('transactions', () => {
   });
 });
 
+describe('rows set again and again', () => {
+  // The 40 nodes by their ids, with no table read for them: a scan of the node table would have it written first.
+  const setAll = (db: Database, key: string, value: PlanExpr) => write(db, p.graphSet('g', numbers(40), [{ node: id, kind: 'property', key, value }]));
+  const setOne = (db: Database, node: number, key: string, value: number | null) => write(db, p.graphSet('g', one, [{ node: p.lit(node), kind: 'property', key, value: p.lit(value) }]));
+  /** 40 nodes whose rows their table has, each with its number under `i`. */
+  const forty = (): Database => {
+    const db = graph();
+    write(db, p.graphCreate('g', numbers(40), [{ labels: ['Person'], props: map('i', id) }]));
+    expect(nodes(db).length).toBe(40);
+    expect(pending(db).count).toBe(0);
+    return db;
+  };
+
+  it('keep one entry each in the log, whatever the number of statements, and nothing is written for them until a table is read', () => {
+    const db = forty();
+    for (let round = 0; round < 30; round++) {
+      setAll(db, 'k', p.lit(round));
+      // 40 rows are ahead of the node table: far fewer than would make the log its net effect, which is not what keeps it short.
+      expect(pending(db).count, `after ${round + 1} statements`).toBe(40);
+    }
+    expect(pending(db).settles).toBe(1);
+    expect([propsOf(db, 0), propsOf(db, 39)]).toEqual([[[{ i: 0, k: 29 }]], [[{ i: 39, k: 29 }]]]);
+    expect(nodes(db)).toEqual(Array.from({ length: 40 }, (_, i) => [i, { i, k: 29 }]));
+    expect([pending(db).count, pending(db).settles]).toEqual([0, 2]);
+    db.graphIndexState.check();
+  });
+
+  it('rows set back to what their table has leave the log once they are half of it, and are not written', () => {
+    const db = forty();
+    setOne(db, 3, 'i', 300);
+    setOne(db, 3, 'k', 1);
+    setOne(db, 3, 'k', null);
+    expect(pending(db).count).toBe(1);
+    // Back to what the table has: the one entry of the log says nothing, and goes.
+    setOne(db, 3, 'i', 3);
+    expect(pending(db).count).toBe(0);
+    expect(db.behind).toBe(false);
+    // One row of many set back stays in the log, and is looked at and not written when the table is.
+    setAll(db, 'k', p.lit(1));
+    setOne(db, 3, 'k', null);
+    setOne(db, 4, 'i', 400);
+    expect(pending(db).count).toBe(40);
+    expect(nodes(db).slice(3, 5)).toEqual([[3, { i: 3 }], [4, { i: 400, k: 1 }]]);
+    // All of them set back at once: nothing is left to write, and no table is behind.
+    setAll(db, 'k', p.lit(2));
+    expect(pending(db).count).toBe(40);
+    setAll(db, 'k', p.lit(1));
+    expect([pending(db).count, db.behind]).toEqual([1, true]);
+    setOne(db, 3, 'k', null);
+    expect([pending(db).count, db.behind]).toEqual([0, false]);
+    expect(nodes(db).slice(3, 5)).toEqual([[3, { i: 3 }], [4, { i: 400, k: 1 }]]);
+    db.graphIndexState.check();
+  });
+
+  it('a node made ahead of its table keeps its making and one set; a delete ends both', () => {
+    const db = forty();
+    const made = write(db, p.graphCreate('g', one, [{ labels: ['City'], props: map('a', p.lit(1)) }])).rows[0]![0] as number;
+    // The node and its label entry.
+    expect(pending(db).count).toBe(2);
+    for (let i = 0; i < 10; i++) setOne(db, made, 'a', 10 + i);
+    expect(pending(db).count).toBe(3);
+    expect(propsOf(db, made)).toEqual([[{ a: 19 }]]);
+    // A node its table has, set and then deleted: its set and its delete are what is left of it.
+    for (let i = 0; i < 5; i++) setOne(db, 7, 'k', i);
+    expect(pending(db).count).toBe(4);
+    write(db, p.graphDelete('g', one, [{ node: p.lit(7) }], { detach: true }));
+    write(db, p.graphDelete('g', one, [{ node: p.lit(made) }], { detach: true }));
+    expect([propsOf(db, 7), propsOf(db, made)]).toEqual([[], []]);
+    const rows = nodes(db);
+    expect(rows.length).toBe(39);
+    expect(rows.some((r) => r[0] === 7 || r[0] === made)).toBe(false);
+    db.graphIndexState.check();
+  });
+
+  it("a relationship's properties set again keep one entry", () => {
+    const db = graph();
+    write(db, p.graphCreate('g', numbers(2), [{ labels: [] }], [{ type: 'KNOWS', start: { node: 0 }, end: { node: 0 }, props: map('w', p.lit(1)) }]));
+    expect(rels(db, 'knows').length).toBe(2);
+    const set = (rowid: number, w: number) => write(db, p.graphSet('g', one, [{ relationship: { type: p.lit('KNOWS'), id: p.lit(rowid) }, kind: 'property', key: 'w', value: p.lit(w) }]));
+    for (let i = 0; i < 12; i++) set(0, i), set(1, -i);
+    expect(pending(db).count).toBe(2);
+    expect(rels(db, 'knows')).toEqual([[0, 0, 0, { w: 11 }], [1, 1, 1, { w: -11 }]]);
+    db.graphIndexState.check();
+  });
+
+  it('a rollback leaves a row what the commits before it made it, and a commit takes the last set of several', () => {
+    const db = forty();
+    setOne(db, 5, 'k', 1);
+    db.exec('BEGIN');
+    setOne(db, 5, 'k', 2);
+    setOne(db, 6, 'k', 2);
+    expect(propsOf(db, 5)).toEqual([[{ i: 5, k: 2 }]]);
+    db.exec('ROLLBACK');
+    expect([propsOf(db, 5), propsOf(db, 6)]).toEqual([[[{ i: 5, k: 1 }]], [[{ i: 6 }]]]);
+    db.exec('BEGIN');
+    setOne(db, 5, 'k', 3);
+    db.exec('SAVEPOINT s');
+    setOne(db, 5, 'k', 4);
+    setOne(db, 6, 'k', 4);
+    db.exec('ROLLBACK TO s');
+    setOne(db, 5, 'k', 5);
+    setOne(db, 5, 'k', 6);
+    db.exec('COMMIT');
+    expect([propsOf(db, 5), propsOf(db, 6)]).toEqual([[[{ i: 5, k: 6 }]], [[{ i: 6 }]]]);
+    setOne(db, 5, 'k', 7);
+    expect(pending(db).count).toBe(1);
+    expect(nodes(db).slice(5, 7)).toEqual([[5, { i: 5, k: 7 }], [6, { i: 6 }]]);
+    db.graphIndexState.check();
+  });
+
+  it('rows set again after the tables were written inside the transaction, or after the log was made its net effect', () => {
+    const db = forty();
+    setAll(db, 'k', p.lit(1));
+    db.exec('BEGIN');
+    setAll(db, 'k', p.lit(2));
+    // The scan writes the tables, inside the transaction: the sets after it are all that is ahead of them.
+    expect(nodes(db)[9]).toEqual([9, { i: 9, k: 2 }]);
+    setOne(db, 9, 'k', 3);
+    setOne(db, 9, 'k', 4);
+    db.exec('COMMIT');
+    expect(pending(db).count).toBe(1);
+    setOne(db, 9, 'k', 5);
+    expect(pending(db).count).toBe(1);
+    // Rows made and deleted again make the log its net effect; the rows set before and after it keep one entry.
+    pending(db).slack = 4;
+    for (let i = 0; i < 6; i++) {
+      const made = write(db, p.graphCreate('g', one, [{ labels: ['City'] }])).rows[0]![0] as number;
+      setOne(db, 10, 'k', 100 + i);
+      write(db, p.graphDelete('g', one, [{ node: p.lit(made) }]));
+    }
+    setOne(db, 9, 'k', 6);
+    setOne(db, 10, 'k', 7);
+    expect(pending(db).count).toBeLessThanOrEqual(6);
+    expect(nodes(db).slice(9, 11)).toEqual([[9, { i: 9, k: 6 }], [10, { i: 10, k: 7 }]]);
+    expect(nodes(db).length).toBe(40);
+    db.graphIndexState.check();
+  });
+});
+
 describe('with other statements', () => {
   it('a statement of another language that writes a table has the tables up to date first', () => {
     const db = graph();

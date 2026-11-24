@@ -189,6 +189,16 @@ export class GraphPending {
   private killed = 0;
   /** How long the log was when it was last made its net effect. */
   private compacted = 0;
+  /**
+   * By graph, then by table (0 for its nodes, an edge table's position and one): for each row whose props a committed
+   * entry sets, that entry, the first since the row's table was written. A row set again by a transaction that
+   * commits gives the entry its new props and leaves no entry of its own (`fold`), so rows set over and over keep one
+   * entry each: the log grew by one for every set, and was made its net effect each time it had doubled. Null until
+   * a set commits, and again whenever committed entries leave the log or are made anew. The entries of a table are a
+   * list by rowid: a graph's ids are whole numbers that mostly follow one another, and a list of them is read and
+   * written many times faster than a map of them.
+   */
+  private holders: Map<string, ((Entry | undefined)[] | undefined)[]> | null = null;
   /** The log is made its net effect once it is this much longer than twice what was left of it the last time (tests set it low). */
   slack = 1024;
   /** The graphs with entries not in their tables, by name in lower case. */
@@ -374,6 +384,7 @@ export class GraphPending {
     this.ops = next;
     this.committed = next.length;
     this.killed = 0;
+    this.holders = null;
     this.epoch++;
   }
 
@@ -396,12 +407,12 @@ export class GraphPending {
         if (unchanged(row)) continue;
         left.nodes = true;
         if (row.made !== null) (row.made.props = row.props), next.push(row.made), d?.made(row.made);
-        else next.push({ k: row.k === SET ? NODE_SET : NODE_DEL, g: graph, t: 0, id, a: 0, b: 0, props: row.props, kills: null, before: row.before });
+        else next.push(new Entry(row.k === SET ? NODE_SET : NODE_DEL, graph, 0, id, 0, 0, row.props, null, row.before));
       }
       for (const [label, of] of n.labels) {
         for (const [node, add] of of) {
           left.labels = true;
-          next.push({ k: add ? LABEL_ADD : LABEL_DEL, g: graph, t: 0, id: node, a: label, b: 0, props: null, kills: null, before: null });
+          next.push(new Entry(add ? LABEL_ADD : LABEL_DEL, graph, 0, node, label, 0, null, null, null));
         }
       }
       n.edges.forEach((rows, t) => {
@@ -410,7 +421,7 @@ export class GraphPending {
           if (unchanged(row)) continue;
           left.edges[t] = true;
           if (row.made !== null) (row.made.props = row.props), next.push(row.made);
-          else next.push({ k: row.k === SET ? EDGE_SET : EDGE_DEL, g: graph, t, id: rowid, a: 0, b: 0, props: row.props, kills: null, before: row.before });
+          else next.push(new Entry(row.k === SET ? EDGE_SET : EDGE_DEL, graph, t, rowid, 0, 0, row.props, null, row.before));
         }
       });
     }
@@ -425,6 +436,7 @@ export class GraphPending {
     this.ops = next;
     this.committed = this.compacted = next.length;
     this.killed = 0;
+    this.holders = null;
     this.epoch++;
   }
 
@@ -562,16 +574,83 @@ export class GraphPending {
   commit(): void {
     this.marks.length = 0;
     if (this.ops.length > this.committed && this.ops.length > this.settled) this.commits++;
-    if (this.settled > 0) this.epoch++;
+    // Where this transaction's entries begin in what is left: at the log's start once any of it was written to the
+    // tables, which wrote every entry of the transactions before it.
+    let from = this.committed;
+    if (this.settled > 0) {
+      this.epoch++;
+      this.holders = null;
+      from = 0;
+    }
     if (this.settled === this.ops.length) this.ops.length = 0;
     else if (this.settled > 0) this.ops.splice(0, this.settled);
     this.settled = 0;
+    const back = this.ops.length > from && this.fold(from);
     this.committed = this.ops.length;
     // Rows made and deleted again, or set again and again, would make the log longer for ever. The first are swept
     // away once they are a good part of it; then, when it has still grown to twice what its net effect last was,
     // it is made its net effect.
     if (this.killed > 0 && this.killed * 4 >= this.committed) this.sweep();
-    if (this.committed > 2 * this.compacted + this.slack) this.compact();
+    // Rows set back to what their tables have leave entries that say nothing: once they are half the log, it is made
+    // its net effect, which takes them out and leaves a table with no entry not behind.
+    if (back || this.committed > 2 * this.compacted + this.slack) this.compact();
+  }
+
+  /**
+   * The entries from `from` on are a transaction's that committed. A set of a row that a committed entry before it
+   * sets already gives that entry its props and leaves the log: what is left of the two is the same (`nets`), and the
+   * first one's `before` is what the table has. A delete ends what is held for its row. Nothing is held until a set
+   * comes: then every committed entry is read once.
+   *
+   * True when the rows this set back to what their tables have are half of the log or more: their entries say
+   * nothing now, and `commit` has the log made its net effect.
+   */
+  private fold(from: number): boolean {
+    const ops = this.ops;
+    let holders = this.holders;
+    if (holders === null) {
+      let sets = false;
+      for (let i = from; i < ops.length && !sets; i++) sets = ops[i]!.k === NODE_SET || ops[i]!.k === EDGE_SET;
+      if (!sets) return false;
+      holders = this.holders = new Map();
+      from = 0;
+    }
+    let to = from;
+    let back = 0;
+    let key = '';
+    let tables: ((Entry | undefined)[] | undefined)[] | undefined;
+    for (let i = from; i < ops.length; i++) {
+      const e = ops[i]!;
+      const k = e.k;
+      if (k === NODE_SET || k === EDGE_SET || k === NODE_DEL || k === EDGE_DEL) {
+        if (tables === undefined || e.g !== key) {
+          key = e.g;
+          tables = holders.get(key);
+          if (tables === undefined) holders.set(key, (tables = []));
+        }
+        const at = k <= NODE_DEL ? 0 : e.t + 1;
+        let rows = tables[at];
+        const id = e.id;
+        if (k === NODE_DEL || k === EDGE_DEL) {
+          if (rows !== undefined && id < rows.length) rows[id] = undefined;
+        } else {
+          if (rows === undefined) rows = tables[at] = [];
+          const held = id < rows.length ? rows[id] : undefined;
+          if (held !== undefined) {
+            held.props = e.props;
+            if (held.before !== null && e.props !== null && sameBytes(held.before, e.props)) back++;
+            continue;
+          }
+          rows[id] = e;
+        }
+      }
+      if (to !== i) ops[to] = e;
+      to++;
+    }
+    if (to === ops.length) return false;
+    ops.length = to;
+    this.epoch++;
+    return back > 0 && back * 2 >= to;
   }
 
   /** The transaction was rolled back: as `rollbackTo`, to its start. */
@@ -590,6 +669,7 @@ export class GraphPending {
     }
     this.ops.length = length;
     this.settled = settled;
+    this.holders = null;
     this.epoch++;
     // What the index holds is not what the log says any more: nothing of it is trusted (`Database` drops the
     // indexes once the entries left are in the tables), and no tree is guarded for it.
