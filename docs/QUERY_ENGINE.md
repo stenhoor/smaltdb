@@ -72,7 +72,9 @@ The ADR's section 5 gives the order of work, and [research/plan-layer-implementa
 schema version changes (any DDL, or a setting that changes planning). A statement of another registered language is
 cached by its text too, and where its language says so by its shape (the statement with the values written in it
 taken out) and by the kinds of the values it runs with (ADR 0042, section 4;
-[reference/engine/languages.md](reference/engine/languages.md#statements-the-engine-keeps)).
+[reference/engine/languages.md](reference/engine/languages.md#statements-the-engine-keeps)). A statement that runs
+what another of its shape bound to is cached by its text the second time that text comes: one whose text never comes
+again costs no entry, and puts none out.
 
 ## 2. Logical rewrites (rule-based)
 
