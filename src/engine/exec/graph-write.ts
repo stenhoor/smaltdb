@@ -317,6 +317,10 @@ export class GraphWrite {
   private stream(op: PlanOp, quiet: boolean): Stream {
     if (holdsWrite(op)) refuse('a write in a nested plan of an expression');
     if (!writesGraph(op)) return this.reads(op);
+    if (op.op === 'project') {
+      const picks = picksOf(op.exprs);
+      if (picks !== null) return this.picking(op, picks, this.stream(op.input, quiet));
+    }
     switch (op.op) {
       case 'graphCreate':
         return this.create(op, this.stream(op.input, false), quiet);
@@ -404,6 +408,19 @@ export class GraphWrite {
     return {
       op: types.length === 0 ? project(source, []) : source,
       give: (rows) => void (stage.rows = types.length === 0 ? rows.map(() => [0]) : rows),
+    };
+  }
+
+  /**
+   * A projection that only picks (`pickOf`): each row's values are taken from it as it comes, with no plan run for
+   * them, whether the input gives its rows one at a time or all at once.
+   */
+  private picking(op: PlanOp, picks: readonly number[], input: Stream): Stream {
+    const rows = input.rows;
+    return {
+      types: this.typesOf(op),
+      ...(rows ? { rows: (ctx: Ctx): Row[] => rows(ctx).map((row) => picked(picks, row, ctx.params)) } : {}),
+      run: (ctx, sink) => input.run(ctx, (row) => sink(picked(picks, row, ctx.params))),
     };
   }
 
@@ -1438,6 +1455,44 @@ function step(op: PlanOp): Step | null {
   }
 }
 
+/** A pick of nothing: NULL. */
+const PICK_NULL = -1;
+
+/**
+ * An expression that only picks a value that is there already, as a number: a column of its row (the column's
+ * index), a NULL literal (`PICK_NULL`) or one of the statement's parameters (-2 less its index). Null for any
+ * other expression: its value takes a plan. A plan would give the same for these: it reads a row's column and a
+ * parameter as they are given.
+ */
+function pickOf(e: PlanExpr): number | null {
+  if (e.k === 'col') return e.input === 0 && e.depth === 0 ? e.index : null;
+  if (e.k === 'lit') return e.value === null ? PICK_NULL : null;
+  if (e.k === 'param') return -2 - e.index;
+  return null;
+}
+
+/** `exprs` as picks, or null where one of them does more than pick. */
+function picksOf(exprs: readonly PlanExpr[]): number[] | null {
+  const out: number[] = [];
+  for (const e of exprs) {
+    const pick = pickOf(e);
+    if (pick === null) return null;
+    out.push(pick);
+  }
+  return out;
+}
+
+/** What `picks` name of `row` and the statement's parameters: a new row. */
+function picked(picks: readonly number[], row: Row, params: readonly SqlValue[]): Row {
+  const n = picks.length;
+  const out = new Array<SqlValue>(n);
+  for (let i = 0; i < n; i++) {
+    const pick = picks[i]!;
+    out[i] = pick >= 0 ? (row[pick] ?? null) : pick === PICK_NULL ? null : (params[-2 - pick] ?? null);
+  }
+  return out;
+}
+
 /** The name of the function a stage's plan reads its rows through, before the stage's number. */
 export const STAGE_ROWS = 'smalt_stage_rows_';
 
@@ -1581,11 +1636,29 @@ class Evaluator {
     return this.lateExprs.length === 0;
   }
 
+  /** The early expressions as picks (`pickOf`) where every one only picks, else null: looked at once, when first run. */
+  private picks: readonly number[] | null | undefined;
+
+  private picking(): readonly number[] | null {
+    if (this.picks === undefined) this.picks = picksOf(this.earlyExprs);
+    return this.picks;
+  }
+
   /** The early expressions for all the rows at once, or undefined when there are none. */
   early(ctx: Ctx, rows: Row[]): Row[] | undefined {
     if (this.earlyExprs.length === 0 || rows.length === 0) return undefined;
+    // Where they only pick, there is nothing to compute: no plan is run for them.
+    const picks = this.picking();
+    if (picks !== null) return rows.map((row) => picked(picks, row, ctx.params));
     this.source ??= this.owner.source(this.types.slice(0, this.width));
     return this.owner.evalRows(this.earlyExprs, this.source, ctx, rows);
+  }
+
+  /** The early expressions for one row. */
+  private earlyOf(ctx: Ctx, row: Row): Row {
+    const picks = this.picking();
+    if (picks !== null) return picked(picks, row, ctx.params);
+    return this.owner.evalRow(this.earlyExprs, this.types.slice(0, this.width), ctx, row.slice(0, this.width));
   }
 
   /** The values for `row` (which a write fills in as it goes): `early` when they were computed ahead. */
@@ -1594,7 +1667,7 @@ class Evaluator {
     return {
       get: (ref) => {
         if (ref.early) {
-          ahead ??= this.owner.evalRow(this.earlyExprs, this.types.slice(0, this.width), ctx, row.slice(0, this.width));
+          ahead ??= this.earlyOf(ctx, row);
           return ahead[ref.at]!;
         }
         const l = this.lateExprs[ref.at]!;

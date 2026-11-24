@@ -799,6 +799,117 @@ describe('what a write reads', () => {
   });
 });
 
+describe('values that are only picked', () => {
+  // A projection above a write whose columns are columns of its row, parameters or NULL, and a write's own values
+  // that are (a node's id from a column, a property's value from a parameter), take no plan: they are read where
+  // they lie. Each must give what the same plan gives where the values are computed.
+  const num = p.col(0, 0, 'int');
+  const name = p.col(0, 1, 'text');
+  /** Rows of a number and a name, some of either NULL. */
+  const rows = (): PlanOp => p.values([[p.lit(0), p.lit('a')], [p.lit(null, 'int'), p.lit('b')], [p.lit(2), p.lit(null, 'text')], [p.lit(3), p.lit('d')]], ['int', 'text']);
+  /** The same value, computed. */
+  const same = (e: PlanExpr, type: string): PlanExpr => p.call('coalesce', [e, e], type as never);
+  /** A node for each row: its columns are the row's number and name, then the node's id. */
+  const made = (): PlanOp => p.graphCreate('g', rows(), [{ labels: ['Person'], props: map('n', any(num)) }]);
+  const node = p.col(0, 2, 'int');
+  /** What a plan gives and leaves in a new graph: a statement is given as many parameters as its plan reads. */
+  const outcome = (plan: PlanOp, params: unknown[] = ['p', 7]): unknown[] => {
+    const db = graph();
+    const r = write(db, plan, params);
+    return [r.rows, r.graph, nodes(db), labels(db)];
+  };
+
+  it('a projection above a write: columns in any order and more than once, a parameter, NULL', () => {
+    const picks = [node, num, num, p.lit(null, 'text'), p.param(0, 'text'), name, p.param(1, 'int')];
+    const types = ['int', 'int', 'int', 'text', 'text', 'text', 'int'];
+    const computed = picks.map((e, i) => same(e, types[i]!));
+    const [got, , stored] = outcome(p.project(made(), picks));
+    expect(got).toEqual([[0, 0, 0, null, 'p', 'a', 7], [1, null, null, null, 'p', 'b', 7], [2, 2, 2, null, 'p', null, 7], [3, 3, 3, null, 'p', 'd', 7]]);
+    expect(stored).toEqual([[0, { n: 0 }], [1, {}], [2, { n: 2 }], [3, { n: 3 }]]);
+    const shapes: [string, (w: PlanOp, exprs: PlanExpr[]) => PlanOp][] = [
+      ['over all the rows', (w, e) => p.project(w, e)],
+      ['row by row, under a limit', (w, e) => p.limit(p.project(w, e), 1000)],
+      ['under a limit that stops the write', (w, e) => p.limit(p.project(w, e), 2)],
+      ['above an eager', (w, e) => p.project(p.eager(w), e)],
+      ['above an eager, under a limit', (w, e) => p.limit(p.project(p.eager(w), e), 3)],
+      ['above a filter', (w, e) => p.project(p.filter(w, p.isNotNull(num)), e)],
+      ['under a filter', (w, e) => p.filter(p.project(w, e), p.isNotNull(p.col(0, 5, 'text')))],
+      ['under a sort', (w, e) => p.sort(p.project(w, e), [{ expr: p.col(0, 0, 'int'), desc: true, nullsFirst: true, collation: 'binary' }])],
+      ['under another write', (w, e) => p.graphSet('g', p.project(w, e), [{ node: p.col(0, 0, 'int'), kind: 'property', key: 'seen', value: any(p.col(0, 4, 'text')) }])],
+      // Its rows asked for all at once: by an eager, and by a write that takes them so.
+      ['between two eagers', (w, e) => p.eager(p.project(p.eager(w), e))],
+      ['above an eager, under another write', (w, e) => p.graphSet('g', p.project(p.eager(w), e), [{ node: p.col(0, 0, 'int'), kind: 'property', key: 'seen', value: any(p.col(0, 4, 'text')) }])],
+    ];
+    for (const [what, shape] of shapes) expect(outcome(shape(made(), picks)), what).toEqual(outcome(shape(made(), computed)));
+    // A limit that stops the write stops it where it did: two nodes.
+    expect((outcome(p.limit(p.project(made(), picks), 2))[2] as unknown[]).length).toBe(2);
+  });
+
+  it('a projection of a projection, and one of no columns', () => {
+    // The first gives the name, the node and the number; the second picks from those.
+    const first = [name, node, num];
+    const second = [p.col(0, 2, 'int'), p.col(0, 0, 'text'), p.param(1, 'int'), p.col(0, 1, 'int')];
+    const twice = outcome(p.project(p.project(made(), first), second));
+    expect(twice[0]).toEqual([[0, 'a', 7, 0], [null, 'b', 7, 1], [2, null, 7, 2], [3, 'd', 7, 3]]);
+    expect(twice).toEqual(outcome(p.project(p.project(made(), first.map((e, i) => same(e, ['text', 'int', 'int'][i]!))), second)));
+    expect(twice).toEqual(outcome(p.project(p.project(made(), first), second.map((e, i) => same(e, ['int', 'text', 'int', 'int'][i]!)))));
+    // No columns: a row of none for each row, and the write has run.
+    const none = outcome(p.project(made(), []), []);
+    expect(none[0]).toEqual([[], [], [], []]);
+    expect((none[2] as unknown[]).length).toBe(4);
+    expect(outcome(p.limit(p.project(made(), []), 3), [])[0]).toEqual([[], [], []]);
+    expect(outcome(p.project(p.eager(made()), []), [])).toEqual(none);
+  });
+
+  /** Five nodes with `i` and `x`, each joined to the next. */
+  const world = (): Database => {
+    const db = graph();
+    write(db, p.graphCreate('g', numbers(5), [{ labels: ['Person'], props: map('i', any(p.col(0, 0, 'int')), 'x', any(p.lit('old'))) }]));
+    write(db, p.graphCreate('g', numbers(4), [], [{ type: 'KNOWS', start: { id: p.col(0, 0, 'int') }, end: { id: p.call('add', [p.col(0, 0, 'int'), p.lit(1)], 'int') } }]));
+    return db;
+  };
+  const state = (plan: PlanOp, params: unknown[]): unknown[] => {
+    const db = world();
+    const r = write(db, plan, params);
+    return [r.rows, r.graph, nodes(db), labels(db), rels(db, 'KNOWS')];
+  };
+  /** A write's plan with values that pick and with the same values computed, all its rows at once and row by row: all four give the same. */
+  const fourWays = (plan: (pick: (e: PlanExpr, type: string) => PlanExpr) => PlanOp, params: unknown[] = []): unknown[] => {
+    const ways = [state(plan((e) => e), params), state(plan(same), params), state(p.limit(plan((e) => e), 1000), params), state(p.limit(plan(same), 1000), params)];
+    for (const w of ways.slice(1)) expect(w).toEqual(ways[0]);
+    return ways[0]!;
+  };
+
+  it("a write's own values: what graphSet sets and on which node", () => {
+    const [, graphCounts, stored] = fourWays((pick) =>
+      p.graphSet('g', rows(), [
+        { node: pick(num, 'int'), kind: 'property', key: 'x', value: any(pick(p.param(0, 'text'), 'text')) },
+        { node: pick(num, 'int'), kind: 'property', key: 'name', value: any(pick(name, 'text')) },
+        { node: pick(num, 'int'), kind: 'property', key: 'i', value: pick(p.lit(null), 'any') },
+      ]),
+      ['p'],
+    );
+    expect(stored).toEqual([[0, { name: 'a', x: 'p' }], [1, { i: 1, x: 'old' }], [2, { x: 'p' }], [3, { name: 'd', x: 'p' }], [4, { i: 4, x: 'old' }]]);
+    // Three rows name a node, and each of the three items counts for each: a key taken away counts as one set.
+    expect((graphCounts as GraphWriteCounts).propertiesSet).toBe(9);
+  });
+
+  it("a write's own values: the nodes graphDelete deletes, the labels graphSet adds, and the ends of what graphCreate makes", () => {
+    // The node is the rows' second column: what is picked is not the row as it is.
+    const named = (): PlanOp => p.values([[p.lit('a'), p.lit(0)], [p.lit('b'), p.lit(null, 'int')], [p.lit('c'), p.lit(2)], [p.lit('d'), p.lit(3)]], ['text', 'int']);
+    const second = p.col(0, 1, 'int');
+    const deleted = fourWays((pick) => p.graphDelete('g', named(), [{ node: pick(second, 'int') }], { detach: true }));
+    expect((deleted[2] as unknown[][]).map((n) => n[0])).toEqual([1, 4]);
+    expect(deleted[1]).toEqual(counts({ nodesDeleted: 3, relationshipsDeleted: 4 }));
+    const tagged = fourWays((pick) => p.graphSet('g', named(), [{ node: pick(second, 'int'), kind: 'labels', add: ['Seen'], remove: ['Person'] }]));
+    expect(tagged[3]).toEqual([[0, 'Seen'], [1, 'Person'], [2, 'Seen'], [3, 'Seen'], [4, 'Person']]);
+    // A relationship from the second column's node to the first's.
+    const pairs = (): PlanOp => p.values([[p.lit(0), p.lit(4)], [p.lit(4), p.lit(1)], [p.lit(2), p.lit(2)]], ['int', 'int']);
+    const joined = fourWays((pick) => p.graphCreate('g', pairs(), [], [{ type: 'KNOWS', start: { id: pick(p.col(0, 1, 'int'), 'int') }, end: { id: pick(p.col(0, 0, 'int'), 'int') } }]));
+    expect((joined[4] as unknown[][]).slice(4).map((r) => r.slice(0, 3))).toEqual([[4, 4, 0], [5, 1, 4], [6, 2, 2]]);
+  });
+});
+
 describe('through the client', () => {
   class FakeWorker {
     onmessage: ((e: { data: Response }) => void) | null = null;
