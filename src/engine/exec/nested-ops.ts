@@ -824,6 +824,9 @@ const MAP_OPS: [string, ScalarFunction][] = [
   op('map_of', 0, -1, (a) => mapType(common(a.filter((_, i) => i % 2 === 1).map((x) => x.type))), (args) => {
     if (args.length % 2 !== 0) throw mismatch('map_of takes keys and values in pairs');
     const w = asElements(args, common(args.filter((_, i) => i % 2 === 1).map((x) => x.type))) ?? args.map(() => null);
+    // One pair is in key order and has no key twice, and its value is of the map's own type (nothing wraps it): the
+    // key and the value are the map's bytes, with no list of entries made for them.
+    if (args.length === 2) return (v) => encodeKey([keyArg(v[0]!, 'map_of'), v[1]!]);
     return (v) => {
       const entries: [string, SqlValue][] = [];
       for (let i = 0; i < v.length; i += 2) entries.push([keyArg(v[i]!, 'map_of'), w[i + 1] ? w[i + 1]!(v[i + 1]!) : v[i + 1]!]);

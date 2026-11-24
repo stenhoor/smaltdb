@@ -39,7 +39,7 @@ import { append, filter, join, limit as limitOf, project, remove, scan, update, 
 import { call, col, lit, param, type PlanExpr, typeOf } from '../plan/expr.js';
 import { GRAPH_WRITE_OPS, type GraphDeleteTarget, type GraphEnd, type GraphNewNode, type GraphNewRelationship, type GraphNewTable, type GraphSetItem, type GraphWriteCounts, type PlanOp } from '../plan/ops.js';
 import type { PlanType } from '../plan/types.js';
-import { decodeKey, encodeKey } from '../storage/key-codec.js';
+import { decodeKey, encodeKey, skipComponent } from '../storage/key-codec.js';
 import type { SqlValue } from '../values.js';
 import { compareCodePoints, parseNested } from '../../shared/nested.js';
 import { type DirectGraph, PASS } from './graph-pending.js';
@@ -174,6 +174,23 @@ function settable(m: Uint8Array): { map: Uint8Array; keys: string[]; nulls: stri
 }
 
 const EMPTY_MAP = encodeKey([]);
+
+/** The one byte a NULL is as a component: a map's value that begins with it is NULL. */
+const NULL_BYTE = encodeKey([null])[0]!;
+
+/**
+ * How many entries a map's bytes hold, read off the bytes with nothing decoded, or -1 where one of its values is
+ * NULL (`settable` then says which keys are set). A map is its entries' components, key then value.
+ */
+function entriesSet(m: Uint8Array): number {
+  let n = 0;
+  for (let pos = 0; pos < m.length; n++) {
+    pos = skipComponent(m, pos);
+    if (m[pos] === NULL_BYTE) return -1;
+    pos = skipComponent(m, pos);
+  }
+  return n;
+}
 
 /** A map's bytes from entries by key, in key order. */
 function mapOf(entries: Map<string, SqlValue>): Uint8Array {
@@ -758,23 +775,42 @@ export class GraphWrite {
         // The graph's next ids, asked for once for all the rows.
         const nodeIds = nodes.length > 0 ? this.idsOf(ctx, g, 'node') : null;
         const relIds = relParts.length > 0 ? this.idsOf(ctx, g, 'relationship') : null;
+        const counts = ctx.counts;
         const outs = rows.map((row, i) => {
           const out: Row = new Array(width + nodes.length + rels.length).fill(null);
           for (let c = 0; c < width; c++) out[c] = row[c]!;
-          const vals = ev.over(ctx, out, early?.[i]);
-          nodes.forEach((n, k) => {
-            const props = propsOf(nodeProps[k]!, vals);
+          const ahead = early?.[i];
+          // The row's values as they are read one by one: made where a relationship reads its ends and props so, or
+          // a node's props were not computed ahead.
+          let vals = relParts.length > 0 ? ev.over(ctx, out, ahead) : null;
+          for (let k = 0; k < nodes.length; k++) {
+            const p = nodeProps[k]!;
+            let map = EMPTY_MAP;
+            let set = 0;
+            if (p !== null) {
+              // Props computed ahead are read where they lie. Their entries are counted on the bytes, and decoded
+              // only where one holds NULL, which is no property.
+              const given = asMap(ahead !== undefined && p.ref.early ? ahead[p.ref.at]! : (vals ??= ev.over(ctx, out, ahead)).get(p.ref), op.graph);
+              map = p.typed ? p.typed(given) : given;
+              set = entriesSet(map);
+              if (set < 0) {
+                const kept = settable(map);
+                map = kept.map;
+                set = kept.keys.length;
+              }
+            }
             const id = nodeIds!.node++;
-            nodeRows.push([id, props.map]);
-            for (const l of labels[k]!) labelRows.push([id, l]);
+            nodeRows.push([id, map]);
+            const mine = labels[k]!;
+            for (let j = 0; j < mine.length; j++) labelRows.push([id, mine[j]!]);
             out[width + k] = id;
-            ctx.counts.nodesCreated++;
-            ctx.counts.labelsAdded += n.labels.length;
-            ctx.counts.propertiesSet += props.keys.length;
-          });
+            counts.nodesCreated++;
+            counts.labelsAdded += nodes[k]!.labels.length;
+            counts.propertiesSet += set;
+          }
           relParts.forEach((r, j) => {
-            const end = (e: { node: number } | { value: EvalRef }): SqlValue => ('node' in e ? out[width + e.node]! : vals.get(e.value));
-            const props = propsOf(r.props, vals);
+            const end = (e: { node: number } | { value: EvalRef }): SqlValue => ('node' in e ? out[width + e.node]! : vals!.get(e.value));
+            const props = propsOf(r.props, vals!);
             const e = edges[j]!;
             if (e.props < 0 && props.keys.length > 0) throw new SmaltError('SMALT_ERROR', `property graph ${g.name}: relationship type ${r.type} keeps no properties`);
             const rowid = relIds!.relationship++;
@@ -1245,20 +1281,32 @@ export class GraphWrite {
     // All the rows at once: what they name is read from the rows alone, and a node goes with its relationships (the
     // check that it has none left would see what later rows delete).
     const atOnce = ev.settled && op.targets.every((t) => 'relationship' in t || 'hops' in t || op.detach);
+    // Where every target is a node whose id was computed ahead, all the rows' ids are read where they lie.
+    const nodesAhead = parts.every((p) => 'node' in p && p.node!.early) ? parts.map((p) => p.node!.at) : null;
     const all = (ctx: Ctx, rows: Row[], early: Row[] | undefined): void => {
       const rels = new Map<string, Set<SqlValue>>();
       const nodes = new Set<SqlValue>();
-      rows.forEach((row, i) =>
-        named(
-          ev.over(ctx, row, early?.[i]),
-          (id) => void (id === null || nodes.add(id)),
-          (table, rowid) => {
-            const ids = rels.get(table);
-            if (ids === undefined) rels.set(table, new Set([rowid]));
-            else ids.add(rowid);
-          },
-        ),
-      );
+      if (nodesAhead !== null && early !== undefined) {
+        for (let i = 0; i < early.length; i++) {
+          const vals = early[i]!;
+          for (let j = 0; j < nodesAhead.length; j++) {
+            const id = vals[nodesAhead[j]!]!;
+            if (id !== null) nodes.add(id);
+          }
+        }
+      } else {
+        rows.forEach((row, i) =>
+          named(
+            ev.over(ctx, row, early?.[i]),
+            (id) => void (id === null || nodes.add(id)),
+            (table, rowid) => {
+              const ids = rels.get(table);
+              if (ids === undefined) rels.set(table, new Set([rowid]));
+              else ids.add(rowid);
+            },
+          ),
+        );
+      }
       const g = this.layoutOf(op.graph);
       for (const [table, ids] of rels) ctx.counts.relationshipsDeleted += this.deleteRows(g, table, [...ids]);
       if (nodes.size === 0) return;
