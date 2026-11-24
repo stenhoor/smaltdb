@@ -111,7 +111,7 @@ const NO_PROPS = new Uint8Array(0);
 const has = (props: Uint8Array | null, key: Uint8Array): boolean => props !== null && findMapKey(props, 0, props.length, key) >= 0;
 
 /** Whether two maps have the same value under the key with this component, or neither has the key. */
-function sameUnder(a: Uint8Array | null, b: Uint8Array | null, key: Uint8Array): boolean {
+export function sameUnder(a: Uint8Array | null, b: Uint8Array | null, key: Uint8Array): boolean {
   const i = a === null ? -1 : findMapKey(a, 0, a.length, key);
   const j = b === null ? -1 : findMapKey(b, 0, b.length, key);
   if (i < 0 || j < 0) return i < 0 && j < 0;
@@ -121,11 +121,15 @@ function sameUnder(a: Uint8Array | null, b: Uint8Array | null, key: Uint8Array):
   return true;
 }
 
-/** A graph's tables as the log is written to them (`settle`). */
+/**
+ * A graph's tables as the log is written to them (`settle`). `set` gives a row new props; `before`: the props its
+ * table has, where they are known (a row whose props have under every indexed key what they had moves no index
+ * entry, and is written without them).
+ */
 export interface SettleTables {
-  readonly node: { add(id: number, props: Uint8Array): void; set(id: number, props: Uint8Array): void; del(id: number): void };
+  readonly node: { add(id: number, props: Uint8Array): void; set(id: number, props: Uint8Array, before: Uint8Array | null): void; del(id: number): void };
   readonly label: { add(node: number, label: string): void; del(node: number, label: string): void };
-  edge(t: number): { add(rowid: number, start: number, end: number, props: Uint8Array | null): void; set(rowid: number, props: Uint8Array): void; del(rowid: number): void };
+  edge(t: number): { add(rowid: number, start: number, end: number, props: Uint8Array | null): void; set(rowid: number, props: Uint8Array, before: Uint8Array | null): void; del(rowid: number): void };
 }
 
 const ADD = 0;
@@ -444,7 +448,7 @@ export class GraphPending {
         for (const [id, row] of n.nodes) {
           if (row.k === ADD) t.node.add(id, row.props!);
           else if (row.k === DEL) t.node.del(id);
-          else if (!unchanged(row)) t.node.set(id, row.props!);
+          else if (!unchanged(row)) t.node.set(id, row.props!, row.before);
         }
         for (const [label, of] of n.labels) {
           for (const [node, add] of of) {
@@ -458,7 +462,7 @@ export class GraphPending {
           for (const [rowid, row] of rows) {
             if (row.k === ADD) edge.add(rowid, row.a, row.b, row.props);
             else if (row.k === DEL) edge.del(rowid);
-            else if (!unchanged(row)) edge.set(rowid, row.props!);
+            else if (!unchanged(row)) edge.set(rowid, row.props!, row.before);
           }
         });
       }
@@ -503,7 +507,7 @@ export class GraphPending {
         t.node.add(e.id, e.props!);
         break;
       case NODE_SET:
-        if (e.before === null || !sameBytes(e.before, e.props!)) t.node.set(e.id, e.props!);
+        if (e.before === null || !sameBytes(e.before, e.props!)) t.node.set(e.id, e.props!, e.before);
         break;
       case NODE_DEL:
         t.node.del(e.id);
@@ -518,7 +522,7 @@ export class GraphPending {
         t.edge(e.t).add(e.id, e.a as number, e.b, e.props);
         break;
       case EDGE_SET:
-        if (e.before === null || !sameBytes(e.before, e.props!)) t.edge(e.t).set(e.id, e.props!);
+        if (e.before === null || !sameBytes(e.before, e.props!)) t.edge(e.t).set(e.id, e.props!, e.before);
         break;
       default:
         t.edge(e.t).del(e.id);

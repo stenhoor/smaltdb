@@ -25,7 +25,7 @@ import { type Compiled, type Fn, collationName } from './exec/expr.js';
 import { type FunctionContext, aggregateFunctions, pureFunctionContext, scalarFunctions } from './exec/functions.js';
 import { type ExecState, type Operator, TableAccess, explainAnalyze, explainRows } from './exec/operators.js';
 import { GraphIndexes, endpointIndex, labelKeyIndex } from './exec/graph-index.js';
-import { type DirectEdge, DirectGraph, type DirectTable, GraphPending, PENDING_READ, type SettleTables } from './exec/graph-pending.js';
+import { type DirectEdge, DirectGraph, type DirectTable, GraphPending, PENDING_READ, sameUnder, type SettleTables } from './exec/graph-pending.js';
 import { searchPaths } from './exec/graph-paths.js';
 import { type ExternalScan, type PhysicalEnv, type PlannedGraph, Planner, type QueryPlan, Registers, type ResultColumnInfo } from './exec/planner.js';
 import { DEFAULT_WORK_MEM, SpillArea, openSpillFile } from './exec/spill.js';
@@ -1448,6 +1448,29 @@ export class Database implements FunctionContext {
     const put = (w: TableWriter, row: SqlValue[], rowid: number | bigint): void => {
       if (w.resolveConflicts(row, rowid, null, undefined)) w.writeRow(row, rowid);
     };
+    // The keys of props a table's indexes are on (`makeDirect`: an index of such a table is on columns, or on keys
+    // of props), as components; null where an index is on the props column itself. A row whose new props have under
+    // each of them what its old props had has the same key in every index: only the table's tree is written, and
+    // neither the old row nor a key of an index is worked out for it.
+    const indexedKeys = (t: TableSchema, column: number): Uint8Array[] | null => {
+      const keys: Uint8Array[] = [];
+      for (const x of t.indexes) {
+        for (const c of x.columns) {
+          if (c.column === column) return null;
+          if (c.column >= 0) continue;
+          const e = c.expr?.expr;
+          const key = e?.k === 'call' && e.fn === 'map_get' && e.args.length === 2 && e.args[1]!.k === 'lit' ? e.args[1]!.value : undefined;
+          if (typeof key !== 'string') return null;
+          keys.push(encodeKey([key]));
+        }
+      }
+      return keys;
+    };
+    const sameKeys = (keys: Uint8Array[] | null, before: Uint8Array | null, props: Uint8Array): boolean => {
+      if (keys === null || before === null) return false;
+      for (const key of keys) if (!sameUnder(before, props, key)) return false;
+      return true;
+    };
     const setProps = (w: TableWriter, column: number, rowid: number, props: Uint8Array): void => {
       const old = w.readRow(rowid);
       if (old === null) throw new SmaltError('SMALT_INTERNAL', `property graph ${def.name}: row ${rowid} of ${w.table.name}, whose properties its index holds, is not in the table`);
@@ -1459,6 +1482,7 @@ export class Database implements FunctionContext {
     const labelT = table(layout.labels.table);
     const unique = labelKeyIndex(labelT, layout.labels.node, layout.labels.label);
     const uniqueAt = unique ? labelT.indexes.indexOf(unique) : -1;
+    const nodeKeys = nodeT.columns.length === 2 ? indexedKeys(nodeT, layout.nodes.props) : null;
     let nodeW: TableWriter | undefined;
     let labelW: TableWriter | undefined;
     const labelRow = (node: number, label: string): SqlValue[] => {
@@ -1480,7 +1504,15 @@ export class Database implements FunctionContext {
           row[layout.nodes.props] = props;
           put((nodeW ??= this.writerFor(nodeT)), row, id);
         },
-        set: (id, props) => setProps((nodeW ??= this.writerFor(nodeT)), layout.nodes.props, id, props),
+        set: (id, props, before) => {
+          const w = (nodeW ??= this.writerFor(nodeT));
+          if (!sameKeys(nodeKeys, before, props)) return setProps(w, layout.nodes.props, id, props);
+          // The row is its id and its props: the one in the table is not read.
+          const row: SqlValue[] = [null, null];
+          row[layout.nodes.id] = id;
+          row[layout.nodes.props] = props;
+          w.overwriteRow(row, id);
+        },
         del: (id) => void (nodeW ??= this.writerFor(nodeT)).deleteRow(id),
       },
       label: {

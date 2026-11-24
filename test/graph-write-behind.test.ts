@@ -464,6 +464,45 @@ describe("an index on a key of the nodes' properties", () => {
     db.graphIndexState.check();
   });
 
+  it('a row whose props alone changed is written to its table with its index entries as they are, where no key an index is on changed', () => {
+    const db = people();
+    // A second index, on another key.
+    const ageOf = p.call('map_get', [p.col(0, 1, M), p.lit('age')], 'any');
+    schema(db, { op: 'createIndex', index: { name: 'node_age', table: 'node', unique: false, columns: [{ column: -1, expr: { text: "map_get(props, 'age')", expr: ageOf }, desc: false, collation: 'binary' }] }, ifNotExists: false });
+    const aged = (db: Database, age: number): unknown[][] => read(db, p.project(p.filter(p.scan('node', [0, 1]), eq(ageOf, p.param(0, 'int'))), [id]), [age]);
+    expect(explain(db, p.project(p.filter(p.scan('node', [0, 1]), eq(ageOf, p.param(0, 'int'))), [id]), [1])).toContain('INDEX node_age');
+    const settles = pending(db).settles;
+    // A key no index is on, for half of the nodes: their rows are written with no index entry touched.
+    write(db, p.graphSet('g', numbers(300), [{ node: id, kind: 'property', key: 'seen', value: p.lit(1) }]));
+    // Keys an index is on: an age for some, a new name for one, a name taken away, a name changed and changed back.
+    write(db, p.graphSet('g', numbers(20, 100), [{ node: id, kind: 'property', key: 'age', value: p.call('mod', [id, p.lit(3)], 'int') }]));
+    write(db, p.graphSet('g', node(7), [{ node: id, kind: 'property', key: 'name', value: p.lit('seven') }]));
+    write(db, p.graphSet('g', node(8), [{ node: id, kind: 'property', key: 'name', value: p.lit(null) }]));
+    write(db, p.graphSet('g', node(9), [{ node: id, kind: 'property', key: 'name', value: p.lit('nine') }]));
+    write(db, p.graphSet('g', node(9), [{ node: id, kind: 'property', key: 'name', value: p.lit('n9') }]));
+    expect([pending(db).count > 300, pending(db).settles]).toEqual([true, settles]);
+    // A scan of the table writes them all.
+    const all = nodes(db) as [number, { name?: string; age?: number; seen?: number }][];
+    expect([pending(db).count, pending(db).settles]).toEqual([0, settles + 1]);
+    expect(all.length).toBe(600);
+    expect(all.slice(6, 10)).toEqual([[6, { name: 'n6', seen: 1 }], [7, { name: 'seven', seen: 1 }], [8, { seen: 1 }], [9, { name: 'n9', seen: 1 }]]);
+    expect([all[100], all[101], all[450]]).toEqual([[100, { age: 1, name: 'n100', seen: 1 }], [101, { age: 2, name: 'n101', seen: 1 }], [450, { name: 'n450' }]]);
+    // Each index has every row under what the row has now: read through the indexes' own B+trees.
+    for (const [rowid, props] of all) if (props.name !== undefined) expect(byName(db, props.name), props.name).toEqual([[rowid, props]]);
+    expect([byName(db, 'n7'), byName(db, 'n8'), byName(db, 'nine')]).toEqual([[], [], []]);
+    for (const age of [0, 1, 2]) expect(aged(db, age), String(age)).toEqual(all.filter(([, props]) => props.age === age).map(([rowid]) => [rowid]));
+    expect(aged(db, 3)).toEqual([]);
+    expect(pending(db).settles).toBe(settles + 1);
+    // One row alone, a key no index is on, then a key one is on: each written as it is.
+    write(db, p.graphSet('g', node(450), [{ node: id, kind: 'property', key: 'seen', value: p.lit(0) }]));
+    expect((nodes(db) as unknown[][])[450]).toEqual([450, { name: 'n450', seen: 0 }]);
+    write(db, p.graphSet('g', node(450), [{ node: id, kind: 'property', key: 'age', value: p.lit(5) }]));
+    expect((nodes(db) as unknown[][])[450]).toEqual([450, { age: 5, name: 'n450', seen: 0 }]);
+    expect([byName(db, 'n450'), aged(db, 5)]).toEqual([[[450, { age: 5, name: 'n450', seen: 0 }]], [[450]]]);
+    expect(db.query('PRAGMA integrity_check').rows).toEqual([['ok']]);
+    db.graphIndexState.check();
+  });
+
   it('a kept statement stopped at such a search has the tables written before a later run only when the search needs them', () => {
     const db = people();
     const kept = db.preparePlan({ kind: 'query', plan: named(p.param(0, 'text')) } as PlanStatementInput);

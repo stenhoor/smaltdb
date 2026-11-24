@@ -360,6 +360,22 @@ export class TableWriter {
    * Replace row `oldRowid` (currently `old`, conflicts already resolved) with `next`. Index entries
    * whose key is unchanged are left alone and a same-size record is overwritten in place.
    */
+  /**
+   * Writes a row over the one the table has under this rowid, for a caller that knows the two have the same key in
+   * every index of the table: the table's tree alone is written. Nothing is told of it: for a table that keeps no
+   * history, written while its graph's index is not told (`Database.settle`).
+   */
+  overwriteRow(next: SqlValue[], rowid: number | bigint): void {
+    const alias = this.table.rowidAlias;
+    let saved: SqlValue = null;
+    if (alias >= 0) {
+      saved = next[alias];
+      next[alias] = null;
+    }
+    this.tree.put(this.key(rowid), this.enc.encode(next));
+    if (alias >= 0) next[alias] = saved;
+  }
+
   updateRow(old: readonly SqlValue[], oldRowid: number | bigint, next: SqlValue[], newRowid: number | bigint): void {
     if (oldRowid !== newRowid) {
       // One change for history, not a delete and an insert.
