@@ -29,7 +29,7 @@ One column for each of `columns`, in that order, with the table column's type an
 | Code | When |
 |---|---|
 | `SMALT_PLAN` | The table doesn't exist, it has no such column, an `asOf` table keeps no history, or `asOf` reads a TEMP table. |
-| `SMALT_RANGE` | `asOf` reads a commit older than the table's history keeps (it was [forgotten](../statements#maintenance)). |
+| `SMALT_RANGE` | `asOf` reads a commit older than the table's history keeps (it was [forgotten](../statements/maintenance)). |
 
 ## Notes
 

@@ -37,7 +37,7 @@ One row for each row deleted, with a column for each of `returning`; none withou
 - The scan gives the rowids, whatever table it reads: a plan deletes the rows of `table` with those rowids. A
   language's `DELETE` scans the table it deletes from.
 - A rowid that no row has deletes nothing.
-- A plan that holds a `delete` is a `write` statement's ([statements](../statements)).
+- A plan that holds a `delete` is a `write` statement's ([statements](../statements/write)).
 - A `delete`'s input may not hold a write of a property graph
   ([the order a plan that writes a graph runs in](../graph-writes#order)).
 

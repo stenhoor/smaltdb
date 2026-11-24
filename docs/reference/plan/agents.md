@@ -12,7 +12,7 @@ Markdown made for agents beside its pages:
   example in it is tested, with its result.
 - [`/llms.txt`](https://smaltdb.dev/llms.txt): an index of every page, each as Markdown.
 - Any page as Markdown: its address with `.md`, such as
-  [`reference/plan/statements.md`](https://smaltdb.dev/reference/plan/statements.md).
+  [`reference/plan/statements/query.md`](https://smaltdb.dev/reference/plan/statements/query.md).
 
 ## What a plan is
 
@@ -41,7 +41,7 @@ const rows = db.queryPlan({ kind: 'query', plan: { op: 'scan', table: 'sqlite_sc
 ```
 
 - `db.queryPlan(stmt, params?)` runs a statement and gives `{ columns, columnTypes, rows }`; `db.preparePlan(stmt)`
-  compiles it once to run many times. A statement is JSON-shaped data ([statements](./statements)).
+  compiles it once to run many times. A statement is JSON-shaped data ([statements](./statements/)).
 - **Validate by running.** The engine validates every plan before it plans it. A plan that breaks a rule fails with
   `SMALT_PLAN`, and the message gives the path of the node at fault (`plan.input.pred.args[0]`).
 - **Pass values as parameters** (`{"k": "param", "index": 0, "type": "text"}` and `queryPlan(stmt, ['Ada'])`) rather

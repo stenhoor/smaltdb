@@ -65,7 +65,6 @@ export default defineConfig({
       guide: [
         'reference/plan/',
         'reference/plan/sample-data',
-        'reference/plan/statements',
         'reference/plan/types',
         'reference/plan/collations',
         'reference/plan/conversions',
@@ -75,6 +74,7 @@ export default defineConfig({
         'reference/plan/shapes',
         'reference/plan/graph-writes',
         'reference/plan/builders',
+        'reference/plan/statements/',
         'reference/plan/operations/',
         'reference/plan/expressions/',
         'reference/plan/functions/',
@@ -147,7 +147,6 @@ export default defineConfig({
         items: [
           { text: 'Overview', link: '/reference/plan/' },
           { text: 'Sample data', link: '/reference/plan/sample-data' },
-          { text: 'Statements', link: '/reference/plan/statements' },
           { text: 'Types', link: '/reference/plan/types' },
           { text: 'Collations', link: '/reference/plan/collations' },
           { text: 'Conversions', link: '/reference/plan/conversions' },
@@ -158,6 +157,7 @@ export default defineConfig({
           { text: 'Writing a property graph', link: '/reference/plan/graph-writes' },
           { text: 'Builders', link: '/reference/plan/builders' },
           { text: 'For AI agents', link: '/reference/plan/agents' },
+          group('Statements', 'plan/statements'),
           group('Operations', 'plan/operations'),
           group('Expressions', 'plan/expressions'),
         ],
