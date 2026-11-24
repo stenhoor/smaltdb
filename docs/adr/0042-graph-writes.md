@@ -860,8 +860,9 @@ bar is 1.00x). A range is the lowest and the highest of a series' turns, `main` 
    Of the plans of the benchmark's 20 queries, and of what its 10 writes read, two changed: this one and creating 1,000
    relationships from a label's first 1,000 nodes, which reads the same way (0.83x to 0.92x and 0.80x to 0.82x with a
    literal, 0.72x to 0.81x and 0.72x to 0.84x with a parameter, 0.65x to 0.73x and 0.61x to 0.79x with the same text).
-   Three other lines of the series had ranges apart: deleting 1,000 nodes with a literal (lower), 3 hops with a
-   direction and a literal, and a shortest path with a direction and a parameter (both higher). Their plans are the
-   same, and run alone, four turns each way, each had ranges that overlap. What is left of this statement, 2.1x to 2.4x,
-   is the work of setting the key on each row: the map's bytes are copied three times, and the buffer of the maps is
-   rewritten when half of it is dead.
+   Five other lines of the series' 74 had ranges apart: deleting 1,000 nodes with a literal, a small label with a filter
+   and the triangles with the same text (three turns), all three lower; 3 hops with a direction and a literal, and a
+   shortest path with a direction and a parameter, both higher. Their plans are the same, and each had ranges that
+   overlap when it was run again, four turns each way (the first and the last two alone, the two reads in their
+   benchmark). What is left of this statement, 2.1x to 2.4x, is the work of setting the key on each row: the map's bytes
+   are copied three times, and the buffer of the maps is rewritten when half of it is dead.
