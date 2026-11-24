@@ -25,7 +25,11 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # The site's pages outgrew Node's default heap (about 4 GB) while VitePress bundles them; 6 GB was enough in
+      # November 2026, and the runner has 16 GB.
       - run: npm run docs:build
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
