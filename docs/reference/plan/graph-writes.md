@@ -8,7 +8,7 @@ description: 'The rules the graph writes share: the graph they need, ids, new la
 [`graphDelete`](./operations/graphDelete) and [`graphMerge`](./operations/graphMerge) write a
 [property graph](../engine/schema#property-graphs) ([ADR 0042](../../adr/0042-graph-writes.md), section 1). Each
 passes its input's rows on, so a write can sit in the middle of a plan and the plan can read on from it; a plan that
-holds one is a [write statement](./statements#write)'s. They write the graph's tables through the tables' writers, as
+holds one is a [write statement](./statements/write)'s. They write the graph's tables through the tables' writers, as
 an `append`, an `update` or a `delete` of them does, so the graph's rules, foreign keys, history and
 [the graph's index](../engine/schema#the-graph-index) are kept, and a statement that fails leaves nothing.
 

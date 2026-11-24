@@ -96,7 +96,7 @@ where in the text they came from. `db.boundPlan(sql)` gives the plan SQL binds a
 | Page | |
 |---|---|
 | [Sample data](./sample-data) | The tables and the graph the examples run on |
-| [Statements](./statements) | What a plan statement is: a query, a write, EXPLAIN, a transaction, a setting, maintenance, a schema change |
+| [Statements](./statements/) | A page for each kind of statement: a query, a write, EXPLAIN, a transaction, a setting, maintenance, a schema change |
 | [Types](./types) | The plan types, and how a list, struct or map type is written |
 | [Collations](./collations) | How text compares and sorts |
 | [Conversions](./conversions) | How a value of one type becomes one of another |

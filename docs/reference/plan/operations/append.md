@@ -39,7 +39,7 @@ One row for each row appended or updated by an upsert, with a column for each of
 
 ## Notes
 
-- A plan that holds an `append` is a `write` statement's ([statements](../statements)). Its `returning` names the
+- A plan that holds an `append` is a `write` statement's ([statements](../statements/write)). Its `returning` names the
   result's columns; the result also says how many rows changed.
 - Values are converted to the columns' types as the table's columns take them ([conversions](../conversions)).
 - An `append`'s input may not hold a write of a property graph
@@ -236,5 +236,5 @@ The table after the writes on this page:
 ## See also
 
 - [`update`](./update), [`delete`](./delete): the other writes of a table
-- [Statements](../statements): the `write` statement
+- [Statements](../statements/write): the `write` statement
 - [Operations](./)

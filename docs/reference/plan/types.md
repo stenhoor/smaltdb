@@ -41,7 +41,7 @@ Type names are lower case. In a list, struct or map type, a space after a comma 
   for a function that can give several (`coalesce`, `max`), the one the plan needs.
 - [`values`](./operations/values), [`source`](./operations/source) and [`working`](./operations/working) list the
   types of their columns; a [`scan`](./operations/scan) gives the types of the table's columns.
-- A query's [`columns`](./statements#query) may restate them; by default they are the plan's.
+- A query's [`columns`](./statements/query) may restate them; by default they are the plan's.
 
 The engine trusts the types a plan states. A `col` typed `text` over an integer column reads the integer, and code
 chosen for text may then treat it as text: state the types the plan's inputs give.
