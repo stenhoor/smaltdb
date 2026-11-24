@@ -939,31 +939,58 @@ export class GraphWrite {
     const atOnce = ev.settled && items.every((it) => it.kind !== 'properties');
     const rows = (ctx: Ctx, rows: Row[]): boolean => {
       if (!atOnce) return false;
+      // Every expression was computed ahead (`atOnce`): a row's values are read where `early` has them, and nothing
+      // is made for a row. With no expression, or no row, there is nothing to write.
       const early = ev.early(ctx, rows);
-      const vals = rows.map((r, i) => ev.over(ctx, r, early?.[i]));
-      const targets = parts.map((p) => vals.map((v) => targetOf(p, v)));
+      if (early === undefined) return true;
+      const n = early.length;
+      const layout = this.layoutOf(op.graph);
+      // A node's rows are the node table's, its rowid the node's id. A relationship's table is its type's.
+      const relTargets = parts.map((p) => {
+        const rel = p.rel;
+        return rel === null ? null : early.map((r) => this.target(layout, null, { type: r[rel.type.at]!, id: r[rel.id.at]! }));
+      });
       // Item by item over all the rows is not row by row over all the items where one thing is written twice: a key
       // of one node or relationship (by one item in two rows, or by two items), or the labels of one node. The
       // later write is over the earlier, and which is later differs. The rows then go one by one.
-      const seen = new Map<string, Set<SqlValue>>();
+      const seen = new Map<string, Written>();
+      const writtenOf = (what: string, table: string): Written => {
+        const key = `${what}:${table}`;
+        let w = seen.get(key);
+        if (w === undefined) seen.set(key, (w = new Written()));
+        return w;
+      };
       for (let k = 0; k < parts.length; k++) {
-        const it = parts[k]!.it;
-        const what = it.kind === 'property' ? `key:${it.key}` : 'labels';
-        for (const t of targets[k]!) {
+        const p = parts[k]!;
+        const what = p.it.kind === 'property' ? `key:${p.it.key}` : 'labels';
+        const rels = relTargets[k]!;
+        if (rels === null) {
+          if (p.node === null) continue;
+          const at = p.node.at;
+          const w = writtenOf(what, layout.nodes.table);
+          for (let i = 0; i < n; i++) {
+            const id = early[i]![at]!;
+            if (id !== null && !w.add(id)) return false;
+          }
+          continue;
+        }
+        let table: string | undefined;
+        let w: Written | undefined;
+        for (const t of rels) {
           if (t === null) continue;
-          const written = `${what}:${t.table}`;
-          let ids = seen.get(written);
-          if (ids === undefined) seen.set(written, (ids = new Set()));
-          if (ids.has(t.rowid)) return false;
-          ids.add(t.rowid);
+          if (t.table !== table) w = writtenOf(what, (table = t.table));
+          if (!w!.add(t.rowid)) return false;
         }
       }
       parts.forEach((p, k) => {
-        const ts = targets[k]!;
         const it = p.it;
         if (it.kind === 'labels') {
           if (p.node === null) return;
-          const ids = ts.flatMap((t) => (t === null ? [] : [t.rowid]));
+          const ids: SqlValue[] = [];
+          for (let i = 0; i < n; i++) {
+            const id = early[i]![p.node.at]!;
+            if (id !== null) ids.push(id);
+          }
           if (ids.length === 0) return;
           for (const l of it.add) {
             const label = this.labelOf(op, l);
@@ -983,12 +1010,30 @@ export class GraphWrite {
           return;
         }
         if (it.kind !== 'property') return;
-        // By table: each target's rowid, and the value its key gets (NULL takes the key away).
+        const value = p.value!.at;
+        const rels = relTargets[k]!;
+        if (rels === null) {
+          // A node's key: each node's id, and the value its key gets (NULL takes the key away).
+          if (p.node === null) return;
+          const g = this.layoutOf(op.graph);
+          const held: Row[] = [];
+          for (let i = 0; i < n; i++) {
+            const r = early[i]!;
+            const id = r[p.node.at]!;
+            if (id === null) continue;
+            if (g.nodes.props < 0) noProps({ table: g.nodes.table, props: g.nodes.props, rowid: id });
+            const given = r[value]!;
+            held.push([id, p.typed ? p.typed(given) : given]);
+          }
+          if (held.length > 0) ctx.counts.propertiesSet += this.setKey(g, g.nodes.table, g.nodes.props, it.key, held);
+          return;
+        }
+        // By table: each target's rowid, and the value its key gets.
         const byTable = new Map<string, { props: number; rows: Row[] }>();
-        ts.forEach((t, i) => {
+        rels.forEach((t, i) => {
           if (t === null) return;
           if (t.props < 0) noProps(t);
-          const given = vals[i]!.get(p.value!);
+          const given = early[i]![value]!;
           let held = byTable.get(t.table);
           if (held === undefined) byTable.set(t.table, (held = { props: t.props, rows: [] }));
           held.rows.push([t.rowid, p.typed ? p.typed(given) : given]);
@@ -1467,6 +1512,31 @@ interface Maker {
    * and nothing written, where that would not give what row by row gives.
    */
   rows(ctx: Ctx, rows: Row[], w: number, several?: boolean): Row[] | null;
+}
+
+/**
+ * The rows of one table that an all-rows write has written one thing of (`GraphWrite`'s SET): `add` says whether a
+ * rowid is new. Rowids that come in rising order, as a scan gives them, are only compared with the last; a set is
+ * made when one does not.
+ */
+class Written {
+  private last = -Infinity;
+  private readonly list: SqlValue[] = [];
+  private set: Set<SqlValue> | null = null;
+
+  add(rowid: SqlValue): boolean {
+    if (this.set === null) {
+      if (typeof rowid === 'number' && rowid > this.last) {
+        this.last = rowid;
+        this.list.push(rowid);
+        return true;
+      }
+      this.set = new Set(this.list);
+    }
+    if (this.set.has(rowid)) return false;
+    this.set.add(rowid);
+    return true;
+  }
 }
 
 /** An expression a write computes: where its value is found (`Values.get`). */
