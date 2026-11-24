@@ -65,7 +65,7 @@ import { Pager, type PagerOptions } from './storage/pager.js';
 import { RecordEncoder, RecordReader } from './storage/record.js';
 import { analyzeIndex, analyzeTable, sampleTable, type TableStats } from './exec/stats.js';
 import { type CatalogSnapshot, informationSchema } from './catalog/information-schema.js';
-import { type LanguageStatement, type SmaltLanguage, type StatementParams, languagePart, parseOneWith, registeredLanguage } from './plan/language.js';
+import { type LanguageStatement, type SmaltLanguage, type StatementParams, type StatementShape, languagePart, parseOneWith, registeredLanguage } from './plan/language.js';
 import { ForeignKeys } from './exec/fk.js';
 import { GraphRules } from './exec/graph-rules.js';
 import { type GraphIds, type GraphLayout, GraphWrite, type GraphWriteHost, STAGE_ROWS, writesGraph } from './exec/graph-write.js';
@@ -773,7 +773,7 @@ export class Database implements FunctionContext {
   /**
    * Run a single statement and return all rows; `temporal` gives dates and times as text (default), `Date`s or
    * `Temporal` objects (ADR 0019). `language`: the registered language it is written in (SQL without). The statement
-   * is kept by its text, so the same text binds once.
+   * is kept by its text, so the same text binds once (`cached`).
    */
   query(sql: string, params?: TextParams, options: { temporal?: TemporalForm; language?: string } = {}): QueryResult {
     const st = this.cached(sql, options.language);
@@ -1027,12 +1027,44 @@ export class Database implements FunctionContext {
       return st;
     }
     st = this.prepare(sql, { language });
+    // A statement that runs what another of its shape bound to costs little to make again, and an application's
+    // statements of one shape seldom have the same text twice: such a text is kept when it comes a second time.
+    if (st.runsKept && !this.cameBefore(st.parsed.shape!)) return st;
     // A language's statements are kept once it has one (a name that is not registered has failed above).
     if (cache === undefined) this.otherCaches.set(language!, (cache = new Map()));
     cache.set(sql, st);
     if (cache.size > this.cacheSize) cache.delete(cache.keys().next().value!);
     return st;
   }
+
+  /**
+   * Whether a statement of this shape with these values came before, as far as is remembered: by a number made of the
+   * shape's hash and its values, in one of 256 places. Two statements may have one number (the second is then kept by
+   * its text a run early), and one may give its place to another before it comes again (it is then kept a run late).
+   */
+  private cameBefore(shape: StatementShape): boolean {
+    let h = shape.hash | 0;
+    const values = shape.values;
+    for (let i = 0; i < values.length; i++) {
+      const v = values[i];
+      let x = 0;
+      if (typeof v === 'string') {
+        const n = v.length;
+        x = n;
+        // Its end tells most apart: names and ids that count up differ there.
+        for (let k = n > 8 ? n - 8 : 0; k < n; k++) x = (Math.imul(x, 31) + v.charCodeAt(k)) | 0;
+      } else if (typeof v === 'number') x = (v | 0) ^ ((v * 4096) | 0);
+      else if (typeof v === 'bigint') x = Number(BigInt.asIntN(32, v));
+      h = (Math.imul(h, 31) + x) | 0;
+    }
+    // 0 is a place nothing has come to.
+    if (h === 0) h = 1;
+    const at = h & 255;
+    if (this.cameOnce[at] === h) return true;
+    this.cameOnce[at] = h;
+    return false;
+  }
+  private readonly cameOnce = new Int32Array(256);
 
   /** The statements of the registered languages other than SQL, kept by their text: by the language's name. */
   private readonly otherCaches = new Map<string, Map<string, Statement>>();
@@ -6945,6 +6977,11 @@ export class Statement extends PreparedStatement {
   ) {
     super(db);
     this.language = language;
+  }
+
+  /** @internal Whether it runs what another statement of its shape bound to. */
+  get runsKept(): boolean {
+    return this.like !== undefined;
   }
 
   protected compileProgram(): Program {

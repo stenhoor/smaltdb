@@ -271,9 +271,40 @@ describe('a statement is kept by its shape', () => {
     expect(d.query('find fruit id 7', undefined, T).rows).toEqual([]);
     // Each text is parsed (that is where its shape comes from); one is bound.
     expect(asked).toEqual({ parsed: 3, bound: ['find fruit id 2'] });
-    // A text that comes again is found by its text, and still has its own values.
-    expect(d.query('find fruit id 3', undefined, T).rows).toEqual([[3, 'plum']]);
+    // The one that was bound is found by its text when it comes again.
+    expect(d.query('find fruit id 2', undefined, T).rows).toEqual([[2, 'pear']]);
     expect(asked.parsed).toBe(3);
+    // One that ran what it bound to is parsed the second time it comes, and found by its text from then on: each
+    // time with its own values.
+    for (let i = 0; i < 3; i++) expect(d.query('find fruit id 3', undefined, T).rows).toEqual([[3, 'plum']]);
+    expect(asked).toEqual({ parsed: 4, bound: ['find fruit id 2'] });
+  });
+
+  it('texts of a kept shape that come once are not kept by their text, and put none that is kept out', () => {
+    const d = fruit({ statementCacheSize: 2 });
+    d.query('all fruit', undefined, T);
+    d.query('find fruit id 1', undefined, T);
+    // 40 more statements of the shape, each another text: an application's statements, which differ in a value.
+    for (let i = 2; i < 42; i++) expect(d.query(`find fruit id ${i}`, undefined, T).rows).toEqual(i <= 3 ? [[i, i === 2 ? 'pear' : 'plum']] : []);
+    expect(asked).toEqual({ parsed: 42, bound: ['all fruit', 'find fruit id 1'] });
+    // The two texts the cache holds are still there.
+    d.query('all fruit', undefined, T);
+    d.query('find fruit id 1', undefined, T);
+    expect(asked.parsed).toBe(42);
+    // The last of the 40 comes again: parsed once more, then found by its text.
+    for (let i = 0; i < 3; i++) d.query('find fruit id 41', undefined, T);
+    expect(asked).toEqual({ parsed: 43, bound: ['all fruit', 'find fruit id 1'] });
+  });
+
+  it('a write of a kept shape that comes again writes again, whichever way it is found', () => {
+    const d = fruit();
+    d.exec('CREATE TABLE log(id INTEGER, name TEXT)');
+    // The same text four times: bound and kept by its text.
+    for (let i = 0; i < 4; i++) expect(d.run("add log 1 'a'", undefined, T).changes).toBe(1);
+    // Another text of the shape four times: not kept by its text the first time, kept from the second.
+    for (let i = 0; i < 4; i++) expect(d.run("add log 2 'b'", undefined, T).changes).toBe(1);
+    expect(d.query('SELECT id, name, count(*) FROM log GROUP BY id, name ORDER BY id').rows).toEqual([[1, 'a', 4], [2, 'b', 4]]);
+    expect(asked).toEqual({ parsed: 3, bound: ["add log 1 'a'"] });
   });
 
   it('shapes with one hash are told apart', () => {

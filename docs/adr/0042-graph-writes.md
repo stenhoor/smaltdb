@@ -562,6 +562,33 @@ one turn at 1.322), so this says no more than that.
    alone.
 8. **What is kept:** each language its own `statementCacheSize` texts; four times that many shapes a database, the
    oldest going first.
+9. **A text of a kept shape is kept by its text from the second time it comes** (added 2026-11-24, while smaltcy's
+   part of the step was built). A statement that runs what another of its shape bound to costs little to make again:
+   it is parsed, and nothing is bound. An application's statements of one shape differ in a value, so such a text
+   seldom comes twice; kept the first time, each cost an entry among the texts and put another out. So it is kept
+   when it comes a second time, which the engine tells from a number made of the shape's hash and the values (256 of
+   them remembered; one taken for another keeps a text a run early or late, no more). That text is parsed twice, and
+   not after. The first statement of a shape, and a statement with no shape, are kept by their text at once, as
+   before. Measured with Cypher given to smaltdb as text (smaltcy's branch `claude/cypher-language`, `24a9c66`), on
+   smaltcy's network of 20,008 nodes in memory, the engine before and after in one process, each with a database of
+   its own, taking turns in blocks of 100 statements (60 pairs of blocks a run, four runs; a run's figure is the
+   median of its pairs' ratios, after over before):
+
+   | Statement | A new text each time (a literal that differs) | The same text | One text, a parameter that differs |
+   |---|---|---|---|
+   | Seek by name | 0.92x to 0.97x | 0.96x to 1.02x | 0.98x to 1.04x |
+   | 1 hop | 0.95x to 1.00x | 1.00x to 1.02x | 0.97x to 1.05x |
+   | Node of a small label | 0.95x to 0.98x | 0.98x to 1.02x | 0.99x to 1.00x |
+   | Create 1 node | 0.94x to 0.98x | 0.99x to 1.06x | 1.00x to 1.03x |
+   | Create 1 relationship | 0.94x to 1.07x | 0.98x to 1.04x | 0.97x to 1.01x |
+   | Set 1 property by name | 0.98x to 1.00x | 1.01x to 1.06x | 0.97x to 1.04x |
+   | Merge a node that is there | 0.90x to 0.98x | 0.98x to 1.02x | 0.95x to 1.03x |
+
+   The same engine on both sides reads 0.96x to 1.01x (one run). A new text of a kept shape takes less time in every
+   run but those of creating a relationship, which spread to both sides of 1.00x. The other two columns do what they
+   did: nothing in them is found differently. The two cases that read highest with the same text were run again
+   alone, 300 pairs a run: setting a property 1.00x to 1.01x (three runs; 0.99x and 1.01x with the same engine on
+   both sides), creating a node 0.94x to 1.00x.
 
 What section 4 says and is as built: a statement of a registered language is found by its text and kept as SQL's
 is; a statement whose values differ is found by its shape, and runs what the first of its shape bound to with its

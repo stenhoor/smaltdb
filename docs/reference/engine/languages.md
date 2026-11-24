@@ -79,7 +79,9 @@ fields](../plan/meaning-fields), the collation a comparison of them uses and the
 again ([ADR 0042](../../adr/0042-graph-writes.md), section 4). A statement is found in three ways:
 
 - **By its text.** The same text in the same language is parsed and bound once. Each language has its own
-  `statementCacheSize` texts.
+  `statementCacheSize` texts. A statement that runs what another of its shape bound to (the next item) is kept by its
+  text from the second time it comes: an application's statements of one shape seldom have the same text twice, and
+  such a text kept once would only put another out. So that text is parsed twice, and not after.
 - **By its shape.** A language may take the values written in a statement out of it and give the statement a `shape`,
   `{ hash, values, same(other) }`. `values` are the values taken out: the plan the statement binds to reads them as
   the parameters after the statement's own, `param(paramCount)` on. `hash` is a number that statements of one shape
