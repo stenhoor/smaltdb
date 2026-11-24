@@ -501,6 +501,24 @@ describe('all the rows of a write at once', () => {
     expect(nodes(db).slice(0, 2)).toEqual([[0, { i: 0, last: 8 }], [1, { i: 1, last: 9 }]]);
   });
 
+  it('graphSet tells a node named twice whatever order the nodes come in, and passes rows that name none', () => {
+    const run = (ids: (number | null)[], shape: (w: PlanOp) => PlanOp): unknown => {
+      const db = people();
+      const rows = p.values(ids.map((n, i) => [p.lit(n), p.lit(i)]), ['int', 'int']);
+      const r = write(db, shape(p.graphSet('g', rows, [
+        { node: p.col(0, 0, 'int'), kind: 'property', key: 'at', value: any(p.col(0, 1, 'int')) },
+        { node: p.col(0, 0, 'int'), kind: 'labels', add: ['Seen'], remove: [] },
+      ])));
+      return [r.graph, nodes(db), labels(db)];
+    };
+    // Rising, falling and scattered ids; the same id twice, next to itself, far apart and after a smaller one; NULLs.
+    const orders: (number | null)[][] = [[0, 1, 2, 3], [3, 2, 1, 0], [2, 0, 3, 1], [0, 1, 2, 2], [0, 1, 1, 2], [5, 1, 5], [3, null, 1, null, 3], [null, null], [0, 2, 1, 2, 0], [9, 8, 9], [4]];
+    for (const ids of orders) expect(run(ids, (w) => w), JSON.stringify(ids)).toEqual(run(ids, (w) => p.limit(w, 1000)));
+    // The later row is over the earlier one, as row by row.
+    const [, after] = run([5, 1, 5], (w) => w) as [unknown, unknown[][]];
+    expect([after[1], after[5]]).toEqual([[1, { i: 1, at: 1 }], [5, { i: 5, at: 2 }]]);
+  });
+
   it('graphSet goes row by row where two items write one key of one node in different rows', () => {
     const run = (shape: (w: PlanOp) => PlanOp): unknown[][] => {
       const db = people();
