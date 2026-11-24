@@ -69,33 +69,41 @@ const EDGE_DEL = 7;
 /** A new row's entry, once the row was deleted again (`Entry.kills`). */
 const DEAD = -1;
 
-/** One change the index has and the tables have not. */
-interface Entry {
-  k: number;
-  /** The graph, by its name in lower case. */
-  readonly g: string;
-  /** For a relationship: its table's position among the graph's edge tables. */
-  readonly t: number;
-  /** The node's id, or the relationship's rowid. */
-  readonly id: number;
-  /** A relationship's start, or a label. */
-  readonly a: number | string;
-  /** A relationship's end. */
-  readonly b: number;
-  /** The row's props. A new row's are its last, once the log was made its net effect (`GraphPending.compact`). */
-  props: Uint8Array | null;
-  /**
-   * For the delete of a node or a relationship the tables never had: the entry that made it, which is `DEAD` from
-   * then on. Nothing of such a row is written, and a rollback of the delete gives the entry its kind back.
-   */
-  readonly kills: Entry | null;
-  /**
-   * For new props of a row: the props the index held for it before. Where no entry for the row comes before this
-   * one, they are what its table has: props set back to them are not written. For the delete of a node its table
-   * has: the props the index held for it (an empty map for none), where it held them and a search has asked what
-   * the nodes in the log have under a key (`DirectGraph.keyClear`).
-   */
-  readonly before: Uint8Array | null;
+/**
+ * One change the index has and the tables have not.
+ *
+ * A class, with every field set in its constructor and in one order, and not an object written out where it is
+ * logged: entries written out came to have two hidden classes in V8 once a database had made many kinds of them, and
+ * what reads a list of entries (`makerOf`, `sweep`) then took many times longer for the same list.
+ */
+class Entry {
+  constructor(
+    public k: number,
+    /** The graph, by its name in lower case. */
+    readonly g: string,
+    /** For a relationship: its table's position among the graph's edge tables. */
+    readonly t: number,
+    /** The node's id, or the relationship's rowid. */
+    readonly id: number,
+    /** A relationship's start, or a label. */
+    readonly a: number | string,
+    /** A relationship's end. */
+    readonly b: number,
+    /** The row's props. A new row's are its last, once the log was made its net effect (`GraphPending.compact`). */
+    public props: Uint8Array | null,
+    /**
+     * For the delete of a node or a relationship the tables never had: the entry that made it, which is `DEAD` from
+     * then on. Nothing of such a row is written, and a rollback of the delete gives the entry its kind back.
+     */
+    readonly kills: Entry | null,
+    /**
+     * For new props of a row: the props the index held for it before. Where no entry for the row comes before this
+     * one, they are what its table has: props set back to them are not written. For the delete of a node its table
+     * has: the props the index held for it (an empty map for none), where it held them and a search has asked what
+     * the nodes in the log have under a key (`DirectGraph.keyClear`).
+     */
+    readonly before: Uint8Array | null,
+  ) {}
 }
 
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
@@ -772,7 +780,7 @@ export class DirectGraph {
     ix.dirty = true;
     ix.propsDirty = true;
     ix.pinned = true;
-    const e: Entry = { k, g: this.key, t, id, a, b, props, kills, before };
+    const e = new Entry(k, this.key, t, id, a, b, props, kills, before);
     this.pending.push(this, e);
     if (k <= NODE_DEL) {
       if (!this.guardedNodes) (this.guardedNodes = true), this.pending.guard(this.nodes.trees);
