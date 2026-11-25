@@ -20,9 +20,8 @@ columns: id int, customer_id int, day int, status text, amount real
 
 > SELECT id FROM orders WHERE day = 4 ORDER BY status
 columns: id int
-  Sort: USE TEMP B-TREE FOR ORDER BY
-    Project
-      IndexScan: SEARCH orders USING COVERING INDEX orders_day_status (=?) [est 54.5]
+  Project
+    IndexScan: SEARCH orders USING COVERING INDEX orders_day_status (=?) [est 54.5]
 
 > SELECT name FROM customers ORDER BY region, name
 columns: name text
