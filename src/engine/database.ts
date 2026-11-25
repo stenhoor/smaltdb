@@ -5890,27 +5890,40 @@ export class Database implements FunctionContext {
 
   private readonly pastIdPlans = new Map<string, PlanOp>();
 
-  /** One more than the largest rowid a table has had: its rows', and where it keeps history its past versions'. 0 for none. */
   /**
    * A graph's next ids (`GraphWriteHost.ids`), `of` brought up to the graph's tables as they are now. A table's past
    * versions are read the first time the table is asked of: after that every id it has had was either in its rows,
    * or given through these ids.
+   *
+   * The tables' ends are read again only when a page was changed since they were read. A row comes to a table, and a
+   * table to a graph, by a change of a page of the database, and every such change is counted (`Pager.writes`): while
+   * the count stands, the graph's tables are the same ones and end where they did. A graph whose writes land in its
+   * index changes no page for a new node or relationship (ADR 0042, section 2), so its statements read no table for
+   * their ids.
    */
   private graphIdsOf(name: string, of: 'node' | 'relationship'): GraphIds {
     const g = this.graphLayout(name);
     const key = g.name.toLowerCase();
     let kept = this.graphIds.get(key);
-    if (!kept) this.graphIds.set(key, (kept = { ids: { node: 0, relationship: 0 }, past: new Set() }));
+    if (!kept) this.graphIds.set(key, (kept = { ids: { node: 0, relationship: 0 }, past: new Set(), read: { node: -1, relationship: -1 } }));
+    if (kept.read[of] === this.pager.writes) return kept.ids;
     for (const table of of === 'node' ? g.nodeTables : g.edgeTables) {
       const first = !kept.past.has(table);
       if (first) kept.past.add(table);
       kept.ids[of] = Math.max(kept.ids[of], this.nextIdOf(table, first));
     }
+    // The count as it is after the read: where the read brought the tables up to date on its way (a table's past
+    // versions are read by a plan), the rows that wrote have ids that were given through these.
+    kept.read[of] = this.pager.writes;
     return kept.ids;
   }
 
-  /** The graphs' next ids, by the graph's name in lower case, with the tables whose past versions were read for them. */
-  private readonly graphIds = new Map<string, { ids: GraphIds; past: Set<string> }>();
+  /**
+   * The graphs' next ids, by the graph's name in lower case, with the tables whose past versions were read for them
+   * and, for nodes and for relationships, the count of page changes (`Pager.writes`) at which their tables' ends were
+   * last read (-1: never).
+   */
+  private readonly graphIds = new Map<string, { ids: GraphIds; past: Set<string>; read: { node: number; relationship: number } }>();
 
   /** One more than the largest rowid of a table; with `past`, of its past versions too where it keeps history. */
   private nextIdOf(name: string, past: boolean): number {
