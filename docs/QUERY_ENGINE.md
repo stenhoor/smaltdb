@@ -219,18 +219,21 @@ Decisions and their rationale: [ADR 0005](adr/0005-cost-based-optimizer.md).
   penalized, so cross products come last.
 - **Join method per step**: index nested loop, hash join, or nested loop over a materialized inner side,
   whichever is cheapest for the estimated outer rows.
-- **`ORDER BY` with a `LIMIT`, read in order** (`orderedJoin`). Where a join is ordered by one column of one of its
-  tables, ascending, and its LIMIT is a literal, the planner also costs reading the join in that order: a table whose
-  rows come in the order wanted first (a scan by rowid, or an index after its equalities), every other table by an
-  index lookup per row, no sort, and the join stops at the LIMIT. The table read first is the one the ORDER BY names,
-  or one with a column the plan's conditions make equal to that column: the other side of an equality between two
-  plain columns that hold one kind of value by their tables (numbers, the rowid being one; text; or values as they
-  are given) and are compared as they are stored, under the ORDER BY's collation. So
-  `SELECT … FROM node JOIN lab ON lab.id = node.id WHERE label = 'B' ORDER BY node.id LIMIT 10` reads the B entries
-  of an index on `lab(label, id)`, which come by id, and looks each node up, where it scanned `node` and looked each
-  row up in `lab`. The first nodes of a label in a property graph are read so from the graph's index in memory, which
-  reads no table (ADR 0042, "After step 4"). The plan is taken where it costs less than the usual join and a sort of
-  all its rows.
+- **`ORDER BY` read in order** (`orderedJoin`). Where a query is ordered by one column of one of its tables,
+  ascending, with a literal LIMIT or with none, the planner also costs reading it in that order: a table whose rows
+  come in the order wanted first (a scan by rowid, or an index after its equalities), every other table by an index
+  lookup per row, and no sort. With a LIMIT the join stops there; without one every row is read, and the sort alone
+  is saved. The table read first is the one the ORDER BY names, or one with a column the plan's conditions make equal
+  to that column: the other side of an equality between two plain columns that hold one kind of value by their tables
+  (numbers, the rowid being one; text; or values as they are given) and are compared as they are stored, under the
+  ORDER BY's collation. So `SELECT … FROM node JOIN lab ON lab.id = node.id WHERE label = 'B' ORDER BY node.id LIMIT
+  10` reads the B entries of an index on `lab(label, id)`, which come by id, and looks each node up, where it scanned
+  `node` and looked each row up in `lab`; and `SELECT id FROM orders WHERE day = 4 ORDER BY status` reads an index on
+  `orders(day, status)` and sorts nothing. The nodes of a label in a property graph are read so from the graph's
+  index in memory, which reads no table (ADR 0042, "After step 4"). The plan is taken where it costs less than the
+  usual join and a sort of all its rows. An index gives its NULLs first and its values from the lowest, so `NULLS
+  LAST` on a column that may be NULL, `DESC`, another collation than the index's, and several values of the column
+  before (`IN`, a range) are sorted as before.
 - **Plan drift.** Cached plans record the table sizes they assumed and are re-planned when a table grows
   or shrinks 4×. A run looks at the sizes only when the file's or the memory store's change counter has moved.
 - **What a run costs besides its plan** (#289). A run checks those two counters (two numbers, once), makes its

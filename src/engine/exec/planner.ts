@@ -440,13 +440,13 @@ interface AccessOption {
   orderBy?: { column: number; collation: Collation };
 }
 
-/** An ORDER BY with a LIMIT that a join could give in order (`physical` to `planFrom`): which source and column. */
+/** An ORDER BY, with a LIMIT or without, that a join could give in order (`physical` to `planFrom`): its source and column. */
 interface OrderWanted {
   readonly source: number;
   /** The table column (-1: the rowid). */
   readonly column: number;
   readonly collation: Collation;
-  /** The rows the LIMIT (and OFFSET) read. */
+  /** The rows the LIMIT (and OFFSET) read: all of them (Infinity) without one. */
   readonly rows: number;
   /** NULLS LAST: an index gives NULLs first, so only a column without NULLs (the rowid, NOT NULL) is in order. */
   readonly nullsLast: boolean;
@@ -1002,14 +1002,15 @@ export class Planner {
   }
 
   /**
-   * An ORDER BY of one column of a FROM table, ascending, with a literal LIMIT, in a plan without grouping, DISTINCT or
-   * windows: what `planFrom` may give in order (`orderedJoin`). Null otherwise.
+   * An ORDER BY of one column of a FROM table, ascending, with a literal LIMIT or with none, in a plan without
+   * grouping, DISTINCT or windows: what `planFrom` may give in order (`orderedJoin`). Null otherwise. Without a LIMIT
+   * every row is read, and reading them in order saves the sort alone.
    */
   private orderWantedOf(s: FlatShape): OrderWanted | null {
-    if (!s.sort || s.sort.length !== 1 || !s.limit || !s.from || s.aggregate || s.distinct || s.windows.length || s.having) return null;
+    if (!s.sort || s.sort.length !== 1 || !s.from || s.aggregate || s.distinct || s.windows.length || s.having) return null;
     const literal = (e: PlanExpr | undefined): number | null => (e === undefined ? 0 : e.k === 'lit' && typeof e.value === 'number' && e.value >= 0 ? e.value : null);
-    const count = literal(s.limit.count);
-    const offset = literal(s.limit.offset);
+    const count = s.limit ? literal(s.limit.count) : Infinity;
+    const offset = s.limit ? literal(s.limit.offset) : 0;
     if (count === null || offset === null) return null;
     const k = s.sort[0];
     if (k.desc) return null;
@@ -2819,12 +2820,13 @@ export class Planner {
   }
 
   /**
-   * The join for an ORDER BY with a LIMIT, read in order: a source whose rows come in the order wanted first, through
-   * an access path that gives them so, then every other source by its cheapest index lookup per row (a nested loop
-   * keeps the outer order). That source is the ordering one, or one with a column the plan's conditions make equal to
-   * the ordering column (`equalColumns`), whichever costs less. The cost is scaled by the share of the join's rows the
-   * LIMIT reads. Null when a source has no index lookup, no access path gives the order, or the usual join (`order`)
-   * and a sort cost less. The access paths are named by label, for `planFrom` to build.
+   * The join for an ORDER BY, with a LIMIT or without, read in order: a source whose rows come in the order wanted
+   * first, through an access path that gives them so, then every other source by its cheapest index lookup per row (a
+   * nested loop keeps the outer order). That source is the ordering one, or one with a column the plan's conditions
+   * make equal to the ordering column (`equalColumns`), whichever costs less. The cost is scaled by the share of the
+   * join's rows a LIMIT reads (all of them without one). Null when a source has no index lookup, no access path gives
+   * the order, or the usual join (`order`) and a sort cost less. The access paths are named by label, for `planFrom`
+   * to build.
    */
   private orderedJoin(scope: Scope, pool: ConjunctInfo[], ctx: FunctionContext, order: number[], wanted: OrderWanted): { order: number[]; labels: Map<number, string> } | null {
     if (scope.sources.some((s) => s.joinType !== 'INNER' && s.joinType !== 'CROSS') || scope.sources.some((s) => s.lateral || s.sub)) return null;

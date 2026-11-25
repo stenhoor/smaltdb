@@ -4,7 +4,9 @@
  * its equalities), every other source by an index lookup per row, and no sort; the join stops at the LIMIT. That
  * source is the one the ORDER BY reads, or one with a column the plan's conditions make equal to the ordering column
  * (`equalColumns`): the other side of an equality between two plain columns, compared as they are stored, under the
- * ordering's collation. Used where it costs less than the join and a sort of all its rows.
+ * ordering's collation. Used where it costs less than the join and a sort of all its rows. An ORDER BY without a LIMIT
+ * is read the same way where that costs less: every row is read then, and the sort alone is saved. One table is a
+ * join of one: its rows after an equality come in the order of the index's next column.
  *
  * A plan from outside SQL often sorts a projection of its join (`project(sort(project(join)))`): the normalizer
  * composes the two projections (plan-normalize.ts `composed`), so the join is the block's FROM and the planner sees
@@ -45,6 +47,13 @@ function firstLabelled(label: string, count: number, nullsFirst = false, nodes =
   const sorted = { op: 'sort', input: projected, keys: [{ expr: col(2), desc: false, nullsFirst, collation: 'binary' }] };
   const plan = { op: 'limit', count: lit(count, 'int'), input: { op: 'project', input: sorted, exprs: [col(0), col(1, second)] } };
   return { kind: 'query', plan, columns: [{ name: 'id', type: 'int' }, { name: 'name', type: second }] } as unknown as PlanStatementInput;
+}
+
+/** `firstLabelled` without its LIMIT: every row of `nodes` labelled `label`, by id (`desc`: from the highest). */
+function allLabelled(label: string, nullsFirst = false, nodes = 'node', labels = 'lab', second = 'text', desc = false): PlanStatementInput {
+  const limited = firstLabelled(label, 1, nullsFirst, nodes, labels, second) as unknown as { plan: { input: { input: { keys: { desc: boolean }[] } } } };
+  limited.plan.input.input.keys[0]!.desc = desc;
+  return { ...limited, plan: limited.plan.input } as unknown as PlanStatementInput;
 }
 
 const explain = (db: Database, q: PlanStatementInput): string =>
@@ -260,5 +269,185 @@ describe("the first nodes of a label, in a graph whose tables are behind its ind
     expect(pending.settles).toBe(1);
     expect(db.queryPlan(firstPeople(5)).rows).toEqual([[0, { i: 0 }], [6, { i: 3 }], [8, { i: 4 }], [10, { i: 5 }], [12, { i: 6 }]]);
     db.graphIndexState.check();
+  });
+});
+
+describe('ORDER BY without a LIMIT over a join', () => {
+  /** 3,000 nodes: one in a hundred labelled C, of the others every third B, the rest A. */
+  const rare = (index = 'lab(label, id)'): Database => {
+    const db = Database.openMemory();
+    db.exec(`CREATE TABLE node(id INTEGER PRIMARY KEY, name TEXT); CREATE TABLE lab(id INTEGER, label TEXT); CREATE INDEX lab_label ON ${index}`);
+    db.exec("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000) INSERT INTO node SELECT i, 'n' || i FROM n");
+    db.exec("INSERT INTO lab SELECT id, CASE WHEN id % 100 = 0 THEN 'C' WHEN id % 3 = 0 THEN 'B' ELSE 'A' END FROM node");
+    db.exec('ANALYZE');
+    return db;
+  };
+  const all = (db: Database, label: string): unknown[][] => first(db, LABELLED(label), Infinity);
+
+  it("reads a rare label's ids in its index's order and looks up each node: the sort is saved", () => {
+    const db = rare();
+    for (const q of [allLabelled('C'), allLabelled('C', true)]) {
+      const plan = explain(db, q);
+      expect(plan).not.toContain('ORDER BY');
+      expect(plan).not.toContain('SCAN');
+      expect(plan).toContain('SEARCH lab USING COVERING INDEX lab_label (=?)');
+      expect(plan.indexOf('SEARCH lab')).toBeLessThan(plan.indexOf('SEARCH node USING INTEGER PRIMARY KEY (rowid=?)'));
+      expect(db.queryPlan(q).rows).toEqual(Array.from({ length: 30 }, (_, i) => [100 * (i + 1), `n${100 * (i + 1)}`]));
+    }
+    // SQL's ORDER BY with the same join is planned the same way.
+    const sql = `${LABELLED('C')} ORDER BY node.id`;
+    expect(explainSql(db, sql)).not.toContain('ORDER BY');
+    expect(explainSql(db, sql)).toContain('SEARCH lab USING COVERING INDEX lab_label (=?)');
+    expect(db.query(sql).rows).toEqual(all(db, 'C'));
+  });
+
+  it('gives the rows a sort gives, whichever way it reads them: every label, both indexes, NULLS FIRST and LAST, NULLs in the labels', () => {
+    for (const index of ['lab(label, id)', 'lab(id, label)']) {
+      const db = rare(index);
+      db.exec("INSERT INTO lab VALUES (NULL, 'C'), (NULL, 'B'), (NULL, 'A')");
+      for (const label of ['A', 'B', 'C', 'none']) {
+        const rows = all(db, label);
+        expect(db.queryPlan(allLabelled(label)).rows, `${index} ${label}`).toEqual(rows);
+        expect(db.queryPlan(allLabelled(label, true)).rows, `${index} ${label} nulls first`).toEqual(rows);
+        expect(db.query(`${LABELLED(label)} ORDER BY node.id`).rows, `${index} ${label} SQL`).toEqual(rows);
+      }
+    }
+  });
+
+  it('sorts as before where the join and a sort cost less, and where the order is from the highest', () => {
+    const db = rare();
+    // Two thirds of the nodes: the nodes are scanned, and the rows sorted.
+    expect(explain(db, allLabelled('A'))).toContain('ORDER BY');
+    // From the highest id: this path reads no order backwards.
+    const down = allLabelled('C', false, 'node', 'lab', 'text', true);
+    expect(explain(db, down)).toContain('ORDER BY');
+    expect(db.queryPlan(down).rows).toEqual(all(db, 'C').reverse());
+  });
+});
+
+describe('all the nodes of a label by id, in a graph whose tables are behind its index', () => {
+  const numbers = (n: number): PlanOp => p.values(Array.from({ length: n }, (_, i) => [p.lit(i)]), ['int']);
+  const map = (...entries: (string | PlanExpr)[]): PlanExpr => p.call('map_of', entries.map((e) => (typeof e === 'string' ? p.lit(e) : e)), M);
+  const write = (db: Database, plan: PlanOp) => db.queryPlan({ kind: 'write', plan } as PlanStatementInput);
+  const people = () => allLabelled('Person', false, 'node', 'g_labels', M);
+
+  it('are read from the index in the order of their ids, with no sort: the node table is not read, and nothing is written to it', () => {
+    const db = propertyGraph();
+    // 40 people, then 560 cities.
+    write(db, p.graphCreate('g', numbers(40), [{ labels: ['Person'], props: map('i', p.col(0, 0, 'int')) }]));
+    write(db, p.graphCreate('g', numbers(560), [{ labels: ['City'] }]));
+    const pending = db.graphPendingState;
+    expect([pending.count > 0, pending.settles]).toEqual([true, 0]);
+    const ahead = pending.count;
+    const plan = explain(db, people());
+    expect(plan).not.toContain('ORDER BY');
+    expect(plan).not.toContain('SCAN');
+    expect(plan).toContain('SEARCH g_labels USING GRAPH INDEX (label=?)');
+    expect(plan).toContain('SEARCH node USING GRAPH INDEX (rowid=?)');
+    expect(db.queryPlan(people()).rows).toEqual(Array.from({ length: 40 }, (_, id) => [id, { i: id }]));
+    expect([pending.count, pending.settles]).toEqual([ahead, 0]);
+    // After more writes: still from the index, with what was written, in the order of the ids.
+    write(db, p.graphDelete('g', p.values([[p.lit(2)], [p.lit(39)]], ['int']), [{ node: p.col(0, 0, 'int') }], { detach: true }));
+    write(db, p.graphCreate('g', numbers(1), [{ labels: ['Person'], props: map('new', p.lit(1)) }]));
+    const now = db.queryPlan(people()).rows;
+    expect(now.map((r) => r[0])).toEqual([0, 1, ...Array.from({ length: 36 }, (_, i) => i + 3), 600]);
+    expect(now.at(-1)).toEqual([600, { new: 1 }]);
+    expect(pending.settles).toBe(0);
+    // With the tables brought up to date the rows are the same.
+    expect(db.query('SELECT count(*) FROM node').rows).toEqual([[599]]);
+    expect(pending.settles).toBe(1);
+    expect(db.queryPlan(people()).rows).toEqual(now);
+    db.graphIndexState.check();
+  });
+});
+
+describe('ORDER BY without a LIMIT on one table', () => {
+  /** 2,000 orders over 40 days: a status that is NULL in every seventh, in two cases of letters. */
+  const orders = (index = 'orders(day, status)'): Database => {
+    const db = Database.openMemory();
+    db.exec(`CREATE TABLE orders(id INTEGER PRIMARY KEY, day INTEGER, status TEXT, note TEXT); CREATE INDEX orders_day ON ${index}`);
+    db.exec(
+      "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) INSERT INTO orders SELECT i, i % 40, CASE WHEN i % 7 = 0 THEN NULL WHEN i % 3 = 0 THEN 'S' || (i * 37 % 11) ELSE 's' || (i * 37 % 11) END, 'n' || i FROM n",
+    );
+    db.exec('ANALYZE');
+    return db;
+  };
+  interface Order {
+    readonly desc?: boolean;
+    readonly nullsLast?: boolean;
+    /** Letters compared without their case. */
+    readonly nocase?: boolean;
+  }
+  /**
+   * The rows of `sql` are the rows of `unordered`, and come in the order of their second column: NULLs first unless
+   * `nullsLast`, from the highest with `desc`. Rows with one value there may come in any order.
+   */
+  function expectOrdered(db: Database, sql: string, unordered: string, o: Order = {}, params: unknown[] = []): void {
+    const rows = db.query(sql, params as never).rows as unknown[][];
+    const fold = (v: unknown): unknown => (o.nocase && typeof v === 'string' ? v.toLowerCase() : v);
+    const before = (a: unknown, b: unknown): boolean => {
+      if (a === null || b === null) return a === b ? true : (a === null) === !o.nullsLast;
+      const [x, y] = [fold(a) as string, fold(b) as string];
+      return x === y || x < y === !o.desc;
+    };
+    for (let i = 1; i < rows.length; i++) expect(before(rows[i - 1]![1], rows[i]![1]), `${sql}: row ${i}`).toBe(true);
+    const all = (rs: unknown[][]): string[] => rs.map((r) => JSON.stringify(r)).sort();
+    expect(all(rows), sql).toEqual(all(db.query(unordered, params as never).rows as unknown[][]));
+    expect(rows.length, sql).toBeGreaterThan(0);
+  }
+  const DAY = 'SELECT id, status FROM orders WHERE day = 4';
+
+  it('reads the rows of an equality in the order of the index column after it, and sorts nothing', () => {
+    const db = orders();
+    for (const sql of [`${DAY} ORDER BY status`, `${DAY} ORDER BY status NULLS FIRST`, `${DAY} AND status > 's3' ORDER BY status`, `${DAY} AND status IS NOT NULL ORDER BY status`]) {
+      const plan = explainSql(db, sql);
+      expect(plan, sql).not.toContain('ORDER BY');
+      expect(plan, sql).toContain('SEARCH orders USING COVERING INDEX orders_day');
+      expectOrdered(db, sql, sql.slice(0, sql.indexOf(' ORDER BY')));
+    }
+    // With the day a parameter.
+    const sql = 'SELECT id, status FROM orders WHERE day = ? ORDER BY status';
+    expect(db.query(`EXPLAIN QUERY PLAN ${sql}`, [4]).rows.map((r) => r.join(' ')).join('\n')).not.toContain('ORDER BY');
+    for (const day of [0, 4, 39]) expectOrdered(db, sql, 'SELECT id, status FROM orders WHERE day = ?', {}, [day]);
+    expect(db.query(sql, [40]).rows).toEqual([]);
+  });
+
+  it('sorts where the index does not give the order asked for', () => {
+    const db = orders();
+    const sorted: [string, Order][] = [
+      // An index has its NULLs first.
+      [`${DAY} ORDER BY status NULLS LAST`, { nullsLast: true }],
+      // From the highest: this path reads no order backwards.
+      [`${DAY} ORDER BY status DESC`, { desc: true, nullsLast: true }],
+      // Another collation than the index's.
+      [`${DAY} ORDER BY status COLLATE NOCASE`, { nocase: true }],
+      // Several days: each day's rows are in order, the days' together are not.
+      ['SELECT id, status FROM orders WHERE day IN (4, 5) ORDER BY status', {}],
+      ['SELECT id, status FROM orders WHERE day = 4 OR day = 5 ORDER BY status', {}],
+      ['SELECT id, status FROM orders WHERE day >= 4 AND day <= 6 ORDER BY status', {}],
+      ['SELECT id, status FROM orders WHERE day > 37 ORDER BY status', {}],
+    ];
+    for (const [sql, o] of sorted) {
+      expect(explainSql(db, sql), sql).toContain('ORDER BY');
+      expectOrdered(db, sql, sql.slice(0, sql.indexOf(' ORDER BY')), o);
+    }
+  });
+
+  it('gives the rows a sort gives whatever it reads: other orderings, an index in the other order, no index for the order', () => {
+    for (const index of ['orders(day, status)', 'orders(status, day)', 'orders(day)', 'orders(note)']) {
+      const db = orders(index);
+      for (const where of ['WHERE day = 4', 'WHERE day = 4 AND status >= \'s5\'', "WHERE status = 's3'", 'WHERE day IN (4, 5)', '']) {
+        const from = `SELECT id, status FROM orders ${where}`;
+        expectOrdered(db, `${from} ORDER BY status`, from);
+        expectOrdered(db, `${from} ORDER BY status NULLS LAST`, from, { nullsLast: true });
+        expectOrdered(db, `${from} ORDER BY status DESC`, from, { desc: true, nullsLast: true });
+        expectOrdered(db, `${from} ORDER BY status DESC NULLS FIRST`, from, { desc: true });
+        // By the day, and by the rowid.
+        const days = `SELECT id, day FROM orders ${where}`;
+        expectOrdered(db, `${days} ORDER BY day`, days);
+        const ids = `SELECT status, id FROM orders ${where}`;
+        expectOrdered(db, `${ids} ORDER BY id`, ids);
+      }
+    }
   });
 });
