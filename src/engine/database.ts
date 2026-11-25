@@ -5808,6 +5808,12 @@ export class Database implements FunctionContext {
     deleteRows: (table, rowids) => this.deleteRowids(this.targetTable(table), rowids),
     ids: (graph, of) => this.graphIdsOf(graph, of),
     direct: (graph) => this.directGraph(graph),
+    compute: (exprs, params, width) => {
+      // As an index's expressions are compiled over its table's row (`indexEval`): the row's columns are registers.
+      const planner = new Planner({ getTable: (x) => this.getTable(x), openTree: (root) => this.tree(root), funcCtx: this, state: this.state }, new Registers(params + width));
+      const fns = planner.compileAt(exprs, (i) => params + i).map((c) => c.fn);
+      return { registers: planner.regs.count, fns };
+    },
     addLabel: (graph, label, table) => {
       // The graph is another from here on: what its index holds ahead of its tables is written first.
       this.settle();

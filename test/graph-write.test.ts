@@ -953,6 +953,186 @@ describe('values that are only picked', () => {
   });
 });
 
+describe('expressions that hold no nested plan', () => {
+  // A write's expressions over its row, and a projection's above a write, are compiled as expressions where they hold
+  // no nested plan: they are computed for each row with no plan run (`GraphWrite.program`). One that holds a plan is
+  // run as a plan. Each must give what a plan gives for it: the same expression as the one branch of a CASE whose
+  // condition is a nested plan that is always true.
+  const num = p.col(0, 0, 'int');
+  const name = p.col(0, 1, 'text');
+  /** Rows of a number and a name, some of either NULL. */
+  const rows = (): PlanOp => p.values([[p.lit(0), p.lit('a')], [p.lit(null, 'int'), p.lit('b')], [p.lit(2), p.lit(null, 'text')], [p.lit(3), p.lit('d')]], ['int', 'text']);
+  /** `e` computed by a plan: it holds one, which finds the one empty row. */
+  const planned = (e: PlanExpr, type: string): PlanExpr => p.caseWhen([{ when: p.exists(one), then: e }], type as never, p.lit(null, type as never));
+  type Way = (e: PlanExpr, type: string) => PlanExpr;
+  const compiled: Way = (e) => e;
+
+  /** Expressions over a number and a name, with their types: arithmetic, text, a CASE, a truth value, a list, a cast, a map. */
+  const EXPRS: [string, (n: PlanExpr, t: PlanExpr) => PlanExpr, string][] = [
+    ['a sum with a parameter', (n) => p.call('add', [n, p.param(1, 'int')], 'int'), 'int'],
+    ['text joined to a parameter', (_n, t) => p.call('concat', [t, p.lit('-'), p.param(0, 'text')], 'text'), 'text'],
+    ['a CASE', (n) => p.caseWhen([{ when: p.isNull(n), then: p.lit(-1) }], 'int', p.call('mul', [n, n], 'int')), 'int'],
+    ['a truth value', (n) => p.call('cmp_lt', [n, p.lit(2)], 'bool'), 'bool'],
+    ['a list', (n) => p.call('list_of', [n, p.lit(9)], 'list<int>'), 'list<int>'],
+    ['a number as text', (n) => p.cast('cast_text', n, 'text'), 'text'],
+    ['a map of two kinds', (n, t) => p.call('map_of', [p.lit('n'), any(n), p.lit('t'), any(t)], M), M],
+  ];
+
+  /** How many parameters a plan reads: a statement is given as many. */
+  const paramsOf = (x: unknown): number => {
+    if (x === null || typeof x !== 'object' || x instanceof Uint8Array) return 0;
+    if (Array.isArray(x)) return x.reduce((m: number, y) => Math.max(m, paramsOf(y)), 0);
+    const o = x as Record<string, unknown>;
+    return Object.values(o).reduce((m: number, y) => Math.max(m, paramsOf(y)), o.k === 'param' ? (o.index as number) + 1 : 0);
+  };
+  /** What a plan gives and leaves in a new graph, run with a text and a number for its parameters. */
+  const outcome = (plan: PlanOp, params: unknown[] = ['p', 7]): unknown[] => {
+    const db = graph();
+    const r = write(db, plan, params.slice(0, paramsOf(plan)));
+    return [r.rows, r.graph, nodes(db), labels(db)];
+  };
+  /** A plan with its expressions compiled and with them run as plans, all its rows at once and row by row: all four give the same. */
+  const fourWays = (plan: (way: Way) => PlanOp, params?: unknown[]): unknown[] => {
+    const ways = [outcome(plan(compiled), params), outcome(plan(planned), params), outcome(p.limit(plan(compiled), 1000), params), outcome(p.limit(plan(planned), 1000), params)];
+    ways.slice(1).forEach((w, i) => expect(w, ['run as plans', 'row by row', 'row by row, as plans'][i]).toEqual(ways[0]));
+    return ways[0]!;
+  };
+
+  it("the properties of what graphCreate makes: each kind of expression gives what its plan gives", () => {
+    for (const [what, expr, type] of EXPRS) {
+      const made = fourWays((way) => p.graphCreate('g', rows(), [{ labels: ['Person'], props: map('v', any(way(expr(num, name), type))) }]));
+      expect((made[2] as unknown[]).length, what).toBe(4);
+    }
+    // What two of them leave: a NULL is no property, and a truth value and a list keep their kinds.
+    const sum = fourWays((way) => p.graphCreate('g', rows(), [{ labels: [], props: map('v', any(way(EXPRS[0]![1](num, name), 'int'))) }]));
+    expect(sum[2]).toEqual([[0, { v: 7 }], [1, {}], [2, { v: 9 }], [3, { v: 10 }]]);
+    const truth = fourWays((way) => p.graphCreate('g', rows(), [{ labels: [], props: map('v', any(way(EXPRS[3]![1](num, name), 'bool')), 'l', any(way(EXPRS[4]![1](num, name), 'list<int>'))) }]));
+    expect(truth[2]).toEqual([[0, { l: [0, 9], v: true }], [1, { l: [null, 9] }], [2, { l: [2, 9], v: false }], [3, { l: [3, 9], v: false }]]);
+    // The whole map given by one expression, and a relationship's properties.
+    const whole = fourWays((way) => p.graphCreate('g', rows(), [{ labels: [], props: way(EXPRS[6]![1](num, name), M) }]));
+    expect(whole[2]).toEqual([[0, { n: 0, t: 'a' }], [1, { t: 'b' }], [2, { n: 2 }], [3, { n: 3, t: 'd' }]]);
+    const joined = (way: Way): unknown[] => {
+      const db = graph();
+      const r = write(db, p.graphCreate('g', rows(), [{ labels: [] }], [{ type: 'KNOWS', start: { node: 0 }, end: { node: 0 }, props: map('w', any(way(EXPRS[2]![1](num, name), 'int'))) }]));
+      return [r.rows, r.graph, rels(db, 'KNOWS')];
+    };
+    expect(joined(compiled)).toEqual(joined(planned));
+    expect((joined(compiled)[2] as unknown[][]).map((r) => r[3])).toEqual([{ w: 0 }, { w: -1 }, { w: 4 }, { w: 9 }]);
+  });
+
+  it('what graphSet sets, and a projection above a write', () => {
+    for (const [what, expr, type] of EXPRS) {
+      // On the nodes a first write made: the value reads the row's number and name, the node is the row's third column.
+      const set = fourWays((way) => p.graphSet('g', p.graphCreate('g', rows(), [{ labels: [] }]), [{ node: p.col(0, 2, 'int'), kind: 'property', key: 'v', value: any(way(expr(num, name), type)) }]));
+      expect((set[2] as unknown[]).length, what).toBe(4);
+    }
+    const set = fourWays((way) => p.graphSet('g', p.graphCreate('g', rows(), [{ labels: [] }]), [{ node: p.col(0, 2, 'int'), kind: 'property', key: 'v', value: any(way(EXPRS[2]![1](num, name), 'int')) }]));
+    expect(set[2]).toEqual([[0, { v: 0 }], [1, { v: -1 }], [2, { v: 4 }], [3, { v: 9 }]]);
+    // A projection of every one of them above a write, beside columns it only picks.
+    const all = fourWays((way) => p.project(p.graphCreate('g', rows(), [{ labels: [] }]), [p.col(0, 2, 'int'), ...EXPRS.map(([, expr, type]) => way(expr(num, name), type)), name]));
+    expect((all[0] as unknown[][])[0]).toEqual([0, 7, 'a-p', 0, true, [0, 9], '0', { n: 0, t: 'a' }, 'a']);
+    // A map that is a row's value keeps a NULL entry: it is as properties that a NULL is no property.
+    expect((all[0] as unknown[][])[1]).toEqual([1, null, 'b-p', -1, null, [null, 9], null, { n: null, t: 'b' }, 'b']);
+    // Under a limit that stops the write: two rows, two nodes.
+    const two = outcome(p.limit(p.project(p.graphCreate('g', rows(), [{ labels: [] }]), [EXPRS[0]![1](num, name)]), 2));
+    expect([two[0], (two[2] as unknown[]).length]).toEqual([[[7], [null]], 2]);
+  });
+
+  it('an expression that raises does so for the row it raises for, and nothing is left written', () => {
+    const loud = (n: PlanExpr): PlanExpr => p.caseWhen([{ when: p.call('cmp_eq', [n, p.lit(2)], 'bool'), then: p.call('raise_error', [p.lit('the third row')], 'int') }], 'int', n);
+    for (const way of [compiled, planned]) {
+      for (const shape of [(w: PlanOp) => w, (w: PlanOp) => p.limit(w, 1000)]) {
+        const db = graph();
+        expect(() => write(db, shape(p.graphCreate('g', rows(), [{ labels: [], props: map('v', any(way(loud(num), 'int'))) }])))).toThrow(/the third row/);
+        expect(() => write(db, shape(p.project(p.graphCreate('g', rows(), [{ labels: [] }]), [way(loud(num), 'int')])))).toThrow(/the third row/);
+        expect(nodes(db)).toEqual([]);
+        // A limit that stops before the row: it is not computed.
+        expect(write(db, p.limit(p.project(p.graphCreate('g', rows(), [{ labels: [] }]), [way(loud(num), 'int')]), 2)).rows).toEqual([[0], [null]]);
+      }
+    }
+  });
+
+  it('a statement kept and run again computes with the values of each run', () => {
+    const db = graph();
+    const plan = p.project(p.graphCreate('g', p.values([[p.param(0, 'int')]], ['int']), [{ labels: [], props: map('v', any(p.call('add', [num, p.param(1, 'int')], 'int'))) }]), [p.call('mul', [num, p.param(1, 'int')], 'int'), p.col(0, 1, 'int')]);
+    const kept = db.preparePlan({ kind: 'write', plan } as PlanStatementInput);
+    expect([kept.result([3, 10] as never).rows, kept.result([4, 100] as never).rows, kept.result([null, 5] as never).rows]).toEqual([[[30, 0]], [[400, 1]], [[null, 2]]]);
+    expect(nodes(db)).toEqual([[0, { v: 13 }], [1, { v: 104 }], [2, {}]]);
+  });
+
+  it('rows given as columns, and rows written out with parameters, are a write\'s input', () => {
+    // `values` whose rows are data in columns has no expressions: its rows are read by a plan.
+    const columns = outcome(p.graphCreate('g', p.fromColumns([[5, 6, 7]], ['int']), [{ labels: [], props: map('v', any(num)) }]));
+    expect(columns[2]).toEqual([[0, { v: 5 }], [1, { v: 6 }], [2, { v: 7 }]]);
+    // Rows of parameters and NULLs are made with no plan, under an eager or not; a row that computes is read by one.
+    const written = (input: PlanOp): unknown => outcome(p.graphCreate('g', input, [{ labels: [], props: map('v', any(num), 't', any(name)) }]))[2];
+    const params = p.values([[p.param(1, 'int'), p.param(0, 'text')], [p.lit(null, 'int'), p.param(0, 'text')], [p.param(1, 'int'), p.lit(null, 'text')]], ['int', 'text']);
+    const expected = [[0, { t: 'p', v: 7 }], [1, { t: 'p' }], [2, { v: 7 }]];
+    expect([written(params), written(p.eager(params)), written(p.eager(p.eager(params)))]).toEqual([expected, expected, expected]);
+    const computed = p.values([[p.call('add', [p.param(1, 'int'), p.lit(0)], 'int'), p.param(0, 'text')], [p.lit(null, 'int'), p.param(0, 'text')], [p.param(1, 'int'), p.lit(null, 'text')]], ['int', 'text']);
+    expect(written(computed)).toEqual(expected);
+  });
+
+  it('no plan is run for them, and one is for an expression that holds a plan', () => {
+    /** How many plans of its own the engine runs while `f` does (`Database.internalPlan`). */
+    const plansRun = (db: Database, f: () => void): number => {
+      const d = db as unknown as { internalPlan: (...a: unknown[]) => unknown };
+      const inner = d.internalPlan;
+      let n = 0;
+      d.internalPlan = function (this: unknown, ...a: unknown[]): unknown {
+        n++;
+        return inner.apply(this, a);
+      };
+      try {
+        f();
+      } finally {
+        delete (d as { internalPlan?: unknown }).internalPlan;
+      }
+      return n;
+    };
+    const db = graph();
+    // The tables are not written and compared at each statement's end, which runs plans of its own.
+    db.graphChecks = false;
+    const sum = (way: Way): PlanExpr => way(p.call('add', [p.param(0, 'int'), p.lit(1)], 'int'), 'int');
+    const node = (way: Way): PlanOp => p.graphCreate('g', one, [{ labels: ['Person'], props: map('v', any(sum(way))) }]);
+    write(db, node(compiled), [1]);
+    // One node with a computed property, from the one empty row: nothing is read, and nothing is run to compute.
+    expect(plansRun(db, () => write(db, node(compiled), [2]))).toBe(0);
+    // The one empty row under an eager, as a language gives it where the write has no input of its own.
+    expect(plansRun(db, () => write(db, p.graphCreate('g', p.eager(one), [{ labels: ['Person'], props: map('v', any(sum(compiled))) }]), [2]))).toBe(0);
+    expect(plansRun(db, () => write(db, p.project(node(compiled), [p.call('mul', [p.col(0, 0, 'int'), p.lit(2)], 'int')]), [3]))).toBe(0);
+    // Many rows: the plan that reads them, and none for what is computed for each.
+    const many = p.source('function', 'range', [p.lit(1), p.lit(50)], ['int']);
+    expect(plansRun(db, () => write(db, p.project(p.graphCreate('g', many, [{ labels: [], props: map('v', any(p.call('add', [num, p.param(0, 'int')], 'int'))) }]), [p.call('mul', [num, num], 'int')]), [4]))).toBe(1);
+    // A SET of a computed value, and of a parameter, on the rows of one read.
+    const ids = p.scan('node', [0]);
+    expect(plansRun(db, () => write(db, p.graphSet('g', ids, [{ node: num, kind: 'property', key: 'a', value: any(p.call('add', [num, p.param(0, 'int')], 'int')) }]), [5]))).toBe(1);
+    expect(plansRun(db, () => write(db, p.graphSet('g', ids, [{ node: num, kind: 'property', key: 'b', value: any(p.param(0, 'int')) }]), [6]))).toBe(1);
+    // What is compiled for a statement: its expressions once, when they are first computed, and nothing where they
+    // only pick (a SET's node from a column, its value a parameter).
+    const compiles = (f: () => void): number => {
+      const host = (db as unknown as { graphWriteHost: { compute: (...a: unknown[]) => unknown } }).graphWriteHost;
+      const inner = host.compute;
+      let n = 0;
+      host.compute = (...a: unknown[]): unknown => (n++, inner(...a));
+      try {
+        f();
+      } finally {
+        host.compute = inner;
+      }
+      return n;
+    };
+    const computed = p.graphSet('g', ids, [{ node: num, kind: 'property', key: 'c', value: any(p.call('mul', [num, p.param(0, 'int')], 'int')) }]);
+    expect([compiles(() => write(db, computed, [2])), compiles(() => write(db, computed, [3]))]).toEqual([1, 0]);
+    expect(compiles(() => write(db, p.graphSet('g', ids, [{ node: num, kind: 'property', key: 'd', value: any(p.param(0, 'int')) }]), [4]))).toBe(0);
+    // A stage no row reaches compiles nothing.
+    expect(compiles(() => write(db, p.graphSet('g', p.filter(ids, p.call('cmp_lt', [num, p.lit(0)], 'bool')), [{ node: num, kind: 'property', key: 'e', value: any(p.call('mul', [num, p.param(0, 'int')], 'int')) }]), [5]))).toBe(0);
+    // An expression that holds a plan is run as one, for each row.
+    expect(plansRun(db, () => write(db, node(planned), [7]))).toBeGreaterThan(0);
+    expect(plansRun(db, () => write(db, p.limit(p.project(p.graphCreate('g', many, [{ labels: [] }]), [planned(p.call('mul', [num, num], 'int'), 'int')]), 1000)))).toBeGreaterThanOrEqual(50);
+  });
+});
+
 describe('through the client', () => {
   class FakeWorker {
     onmessage: ((e: { data: Response }) => void) | null = null;

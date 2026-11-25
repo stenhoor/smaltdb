@@ -99,6 +99,12 @@ export interface GraphWriteHost {
    * section 2; exec/graph-pending.ts); null where they go to its tables as the statement runs. Asked for each write.
    */
   direct?(graph: string): DirectGraph | null;
+  /**
+   * Expressions over a row, compiled as a plan that projects them from the row compiles them, with no plan made: they
+   * hold no nested plan. Each function computes one of them from registers that hold the statement's `params`
+   * parameters, then the row's `width` values; `registers`: how many the functions work in.
+   */
+  compute(exprs: readonly PlanExpr[], params: number, width: number): { readonly registers: number; readonly fns: readonly ((regs: SqlValue[]) => SqlValue)[] };
 }
 
 /** A graph's next node id and relationship rowid (`GraphWriteHost.ids`). */
@@ -337,6 +343,7 @@ export class GraphWrite {
     if (op.op === 'project') {
       const picks = picksOf(op.exprs);
       if (picks !== null) return this.picking(op, picks, this.stream(op.input, quiet));
+      if (!holdsPlan(op.exprs)) return this.computing(op, this.stream(op.input, quiet));
     }
     switch (op.op) {
       case 'graphCreate':
@@ -395,8 +402,19 @@ export class GraphWrite {
     return this.perRow(op, this.query(steps[lowest]!.input), (leaf) => steps.slice(0, lowest + 1).reduceRight((below, s) => s.over(below), leaf));
   }
 
-  /** One query, all its rows read when they are first wanted. */
+  /**
+   * One query, all its rows read when they are first wanted. Rows that are written out with nothing to compute
+   * (`values` whose rows are expressions that are parameters and NULLs, under an `eager` or not: the one empty row a
+   * write with no input has) are made here, with no plan run for them. A row of `values` has no column to read.
+   */
   private query(op: PlanOp): Stream {
+    let leaf = op;
+    while (leaf.op === 'eager') leaf = leaf.input;
+    const written = leaf.op === 'values' && leaf.columns === undefined ? leaf.rows.map((r) => picksOf(r)) : null;
+    if (written !== null && written.every((picks) => picks !== null)) {
+      const made = (ctx: Ctx): Row[] => written.map((picks) => picked(picks!, NO_ROW, ctx.params));
+      return { types: this.typesOf(op), rows: made, run: (ctx, sink) => made(ctx).every(sink) };
+    }
     const rows = (ctx: Ctx): Row[] => this.host.run(op, ctx.params)!;
     return { types: this.typesOf(op), rows, run: (ctx, sink) => rows(ctx).every(sink) };
   }
@@ -438,6 +456,20 @@ export class GraphWrite {
       types: this.typesOf(op),
       ...(rows ? { rows: (ctx: Ctx): Row[] => rows(ctx).map((row) => picked(picks, row, ctx.params)) } : {}),
       run: (ctx, sink) => input.run(ctx, (row) => sink(picked(picks, row, ctx.params))),
+    };
+  }
+
+  /**
+   * A projection whose expressions hold no nested plan: computed for each row as it comes, as a plan over the row
+   * would compute them, with no plan run, whether the input gives its rows one at a time or all at once.
+   */
+  private computing(op: Op<'project'>, input: Stream): Stream {
+    const program = this.program(op.exprs, input.types.length);
+    const rows = input.rows;
+    return {
+      types: this.typesOf(op),
+      ...(rows ? { rows: (ctx: Ctx): Row[] => program.rows(ctx.params, rows(ctx)) } : {}),
+      run: (ctx, sink) => input.run(ctx, (row) => sink(program.row(ctx.params, row))),
     };
   }
 
@@ -498,11 +530,17 @@ export class GraphWrite {
 
   /**
    * How a write evaluates expressions over its row. Those that read only the input's columns and hold no nested plan
-   * are computed together, by one plan, for a row or for all the rows at once (they read nothing a write changes).
-   * The others are computed one by one, each when its turn comes, over the row as far as it is made.
+   * are computed together, for a row or for all the rows at once (they read nothing a write changes): compiled as
+   * expressions (`program`), with no plan run for them. The others are computed one by one, each when its turn comes,
+   * by a plan over the row as far as it is made.
    */
   private evaluator(types: readonly PlanType[], width: number): Evaluator {
     return new Evaluator(this, types, width);
+  }
+
+  /** @internal `exprs` over a row of `width` columns, compiled when they are first computed. They hold no nested plan. */
+  program(exprs: readonly PlanExpr[], width: number): RowProgram {
+    return new RowProgram(this.host, exprs, this.paramCount, width);
   }
 
   /** @internal Evaluates `exprs` over one row. */
@@ -511,23 +549,12 @@ export class GraphWrite {
     return this.host.run(plan, this.withRow(ctx, row))![0]!;
   }
 
-  /** @internal Evaluates `exprs` over all the rows at once: a row of values for each, in order. */
-  evalRows(exprs: PlanExpr[], source: { op: PlanOp; give: (rows: Row[]) => void }, ctx: Ctx, rows: Row[]): Row[] {
-    source.give(rows);
-    return this.host.run(this.kept(`rows:${this.planKey(exprs)}`, () => project(source.op, exprs)), ctx.params)!;
-  }
-
   private readonly keys = new Map<object, number>();
   /** A number for a list of expressions, by identity. */
   private planKey(x: object): number {
     let k = this.keys.get(x);
     if (k === undefined) this.keys.set(x, (k = this.keys.size));
     return k;
-  }
-
-  /** @internal */
-  source(types: readonly PlanType[]): { op: PlanOp; give: (rows: Row[]) => void } {
-    return this.stageSource(types);
   }
 
   // ---------------------------------------------------------------- ids
@@ -904,6 +931,9 @@ export class GraphWrite {
       const names = it.node !== undefined ? [it.node] : [it.relationship.type, it.relationship.id];
       if (!ahead(it.value)) return ev.add(it.value, w);
       if (!names.every(ahead)) return ev.late(it.value);
+      // A value that only picks has nothing to compute, so nothing to leave out for a NULL node or relationship: it
+      // is taken as it is, and the item is skipped at the NULL one before its value is read.
+      if (pickOf(it.value) !== null) return ev.add(it.value, w);
       const none: PlanExpr = names.length === 1 ? { k: 'isNull', arg: names[0]!, not: false } : { k: 'or', args: names.map((arg): PlanExpr => ({ k: 'isNull', arg, not: false })) };
       const type = typeOf(it.value);
       return ev.add({ k: 'case', whens: [{ when: none, then: lit(null) }], else: it.value, type: type === 'null' ? 'any' : type }, w);
@@ -1530,6 +1560,9 @@ function picksOf(exprs: readonly PlanExpr[]): number[] | null {
   return out;
 }
 
+/** The row of a pick that reads no column. */
+const NO_ROW: Row = [];
+
 /** What `picks` name of `row` and the statement's parameters: a new row. */
 function picked(picks: readonly number[], row: Row, params: readonly SqlValue[]): Row {
   const n = picks.length;
@@ -1642,6 +1675,58 @@ class Written {
   }
 }
 
+/**
+ * Expressions over a row, compiled as expressions (`GraphWriteHost.compute`) when they are first computed: a stage
+ * no row reaches compiles nothing, as its plan would not have been. The registers are the program's own: it is not
+ * entered while it computes, since its expressions hold no plan.
+ */
+class RowProgram {
+  private fns: readonly ((regs: SqlValue[]) => SqlValue)[] | null = null;
+  private regs: SqlValue[] = [];
+
+  constructor(
+    private readonly host: GraphWriteHost,
+    private readonly exprs: readonly PlanExpr[],
+    /** The statement's parameters, and the row's columns: the registers hold them in that order. */
+    private readonly params: number,
+    private readonly width: number,
+  ) {}
+
+  /** The registers with the statement's parameters in them. */
+  private ready(params: readonly SqlValue[]): SqlValue[] {
+    if (this.fns === null) {
+      const c = this.host.compute(this.exprs, this.params, this.width);
+      this.fns = c.fns;
+      this.regs = new Array<SqlValue>(c.registers).fill(null);
+    }
+    const regs = this.regs;
+    for (let i = 0; i < this.params; i++) regs[i] = params[i] ?? null;
+    return regs;
+  }
+
+  private of(regs: SqlValue[], row: Row): Row {
+    const fns = this.fns!;
+    const at = this.params;
+    for (let i = 0; i < this.width; i++) regs[at + i] = row[i] ?? null;
+    const out = new Array<SqlValue>(fns.length);
+    for (let k = 0; k < fns.length; k++) out[k] = fns[k]!(regs);
+    return out;
+  }
+
+  /** The expressions' values for one row. */
+  row(params: readonly SqlValue[], row: Row): Row {
+    return this.of(this.ready(params), row);
+  }
+
+  /** The expressions' values for each of the rows, in order. */
+  rows(params: readonly SqlValue[], rows: Row[]): Row[] {
+    const regs = this.ready(params);
+    const out = new Array<Row>(rows.length);
+    for (let i = 0; i < rows.length; i++) out[i] = this.of(regs, rows[i]!);
+    return out;
+  }
+}
+
 /** An expression a write computes: where its value is found (`Values.get`). */
 interface EvalRef {
   readonly early: boolean;
@@ -1660,7 +1745,8 @@ interface Values {
 class Evaluator {
   private readonly earlyExprs: PlanExpr[] = [];
   private readonly lateExprs: { expr: PlanExpr[]; width: number }[] = [];
-  private source: { op: PlanOp; give: (rows: Row[]) => void } | undefined;
+  /** The early expressions compiled, where one of them does more than pick: made when they are first computed. */
+  private program: RowProgram | undefined;
 
   constructor(
     private readonly owner: GraphWrite,
@@ -1695,18 +1781,17 @@ class Evaluator {
   /** The early expressions for all the rows at once, or undefined when there are none. */
   early(ctx: Ctx, rows: Row[]): Row[] | undefined {
     if (this.earlyExprs.length === 0 || rows.length === 0) return undefined;
-    // Where they only pick, there is nothing to compute: no plan is run for them.
+    // Where they only pick, there is nothing to compute. Either way no plan is run for them.
     const picks = this.picking();
     if (picks !== null) return rows.map((row) => picked(picks, row, ctx.params));
-    this.source ??= this.owner.source(this.types.slice(0, this.width));
-    return this.owner.evalRows(this.earlyExprs, this.source, ctx, rows);
+    return (this.program ??= this.owner.program(this.earlyExprs, this.width)).rows(ctx.params, rows);
   }
 
   /** The early expressions for one row. */
   private earlyOf(ctx: Ctx, row: Row): Row {
     const picks = this.picking();
     if (picks !== null) return picked(picks, row, ctx.params);
-    return this.owner.evalRow(this.earlyExprs, this.types.slice(0, this.width), ctx, row.slice(0, this.width));
+    return (this.program ??= this.owner.program(this.earlyExprs, this.width)).row(ctx.params, row);
   }
 
   /** The values for `row` (which a write fills in as it goes): `early` when they were computed ahead. */
