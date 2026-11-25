@@ -827,7 +827,7 @@ bar is 1.00x). A range is the lowest and the highest of a series' turns, `main` 
 | Creating and deleting many nodes: the work on each row | [#310](https://github.com/stenhoor/smaltdb/pull/310) | Creating 1,000 nodes: 0.95x to 1.01x and 0.69x to 0.77x with the same text, 1.06x to 1.17x and 0.79x to 0.90x with a parameter, 1.25x to 1.31x and 0.95x to 0.99x with a literal |
 | Rows set again and again keep one entry each in the log | [#311](https://github.com/stenhoor/smaltdb/pull/311) | Setting 1,000 properties, statements that differ: 1.17x to 1.22x and 1.09x to 1.12x with a parameter, 1.51x to 1.57x and 1.31x to 1.38x with a literal |
 | An ORDER BY without a LIMIT is read in order where that costs less | [#312](https://github.com/stenhoor/smaltdb/pull/312) | Deleting 1,000 nodes alone, a parameter that differs: 1.14x to 1.18x and 1.02x to 1.08x. With the same text: seek by name 0.26x to 0.28x and 0.23x to 0.24x, a small label's nodes 0.49x to 0.51x and 0.41x to 0.42x |
-| A graph's next ids are read from its tables' ends only when a page was changed | The pull request that adds this row | Creating 1 node, statements that differ: 1.11x to 1.18x and 0.88x to 0.96x with a parameter, 1.28x to 1.45x and 1.12x to 1.19x with a literal |
+| A graph's next ids are read from its tables' ends only when a page was changed | [#313](https://github.com/stenhoor/smaltdb/pull/313) | Creating 1 node, statements that differ: 1.11x to 1.18x and 0.88x to 0.96x with a parameter, 1.28x to 1.45x and 1.12x to 1.19x with a literal |
 
 1. **The log's entries are made by a constructor** (`exec/graph-pending.ts`, `Entry`). An entry of the log of rows the
    index holds ahead of the tables was an object written out where it is logged. In smaltcy's benchmark of statements
