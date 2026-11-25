@@ -824,7 +824,10 @@ bar is 1.00x). A range is the lowest and the highest of a series' turns, `main` 
 | A label's first nodes are read from the index in the order of their ids | [#307](https://github.com/stenhoor/smaltdb/pull/307) | Setting 1,000 properties, statements that differ: 5.66x to 5.93x and 2.33x to 2.44x with a literal, 5.17x to 5.65x and 2.10x to 2.24x with a parameter |
 | Setting a key on many rows: the work on each row | [#308](https://github.com/stenhoor/smaltdb/pull/308) | Setting 1,000 properties alone, on `main` with the row above: 2.03x to 2.31x and 1.03x to 1.10x with the same text, 2.05x to 2.23x and 1.25x to 1.30x with a literal, 1.98x to 2.31x and 1.32x to 1.41x with a parameter |
 | A write's values that are only picked take no plan | [#309](https://github.com/stenhoor/smaltdb/pull/309) | The statement alone, a parameter that differs: creating 1,000 nodes 1.57x to 1.60x and 1.34x to 1.40x, deleting 1,000 nodes 1.24x to 1.28x and 1.08x to 1.15x, creating 1 node 1.06x to 1.09x and 0.92x to 1.03x |
-| Creating and deleting many nodes: the work on each row | The pull request that adds this row | Creating 1,000 nodes: 0.95x to 1.01x and 0.69x to 0.77x with the same text, 1.06x to 1.17x and 0.79x to 0.90x with a parameter, 1.25x to 1.31x and 0.95x to 0.99x with a literal |
+| Creating and deleting many nodes: the work on each row | [#310](https://github.com/stenhoor/smaltdb/pull/310) | Creating 1,000 nodes: 0.95x to 1.01x and 0.69x to 0.77x with the same text, 1.06x to 1.17x and 0.79x to 0.90x with a parameter, 1.25x to 1.31x and 0.95x to 0.99x with a literal |
+| Rows set again and again keep one entry each in the log | [#311](https://github.com/stenhoor/smaltdb/pull/311) | Setting 1,000 properties, statements that differ: 1.17x to 1.22x and 1.09x to 1.12x with a parameter, 1.51x to 1.57x and 1.31x to 1.38x with a literal |
+| An ORDER BY without a LIMIT is read in order where that costs less | [#312](https://github.com/stenhoor/smaltdb/pull/312) | Deleting 1,000 nodes alone, a parameter that differs: 1.14x to 1.18x and 1.02x to 1.08x. With the same text: seek by name 0.26x to 0.28x and 0.23x to 0.24x, a small label's nodes 0.49x to 0.51x and 0.41x to 0.42x |
+| A graph's next ids are read from its tables' ends only when a page was changed | The pull request that adds this row | Creating 1 node, statements that differ: 1.11x to 1.18x and 0.88x to 0.96x with a parameter, 1.28x to 1.45x and 1.12x to 1.19x with a literal |
 
 1. **The log's entries are made by a constructor** (`exec/graph-pending.ts`, `Entry`). An entry of the log of rows the
    index holds ahead of the tables was an object written out where it is logged. In smaltcy's benchmark of statements
@@ -847,8 +850,8 @@ bar is 1.00x). A range is the lowest and the highest of a series' turns, `main` 
    first: the tables were written 220 times in 220 statements, 220,000 rows. The benchmark's case with the same text
    every run does not show it: the cleanup between its runs takes the key away again, which leaves no row ahead of the
    tables (they were written twice in 220 statements). Now the planner also reads an ORDER BY with a LIMIT through a
-   column the plan's conditions make equal to the ordering column (docs/QUERY_ENGINE.md, "`ORDER BY` with a `LIMIT`,
-   read in order"): here the label's entries in the index, which come in the order of their nodes, and each node then by
+   column the plan's conditions make equal to the ordering column (docs/QUERY_ENGINE.md, "`ORDER BY` read in order"):
+   here the label's entries in the index, which come in the order of their nodes, and each node then by
    its rowid from the index's property maps. No table is read, and the tables are not written in the 220 statements,
    either way. Measured with `main` at `39c32e2` and smaltcy's branch `claude/cypher-language` (`44ad602`,
    stenhoor/smaltcy#40), four turns each way for the statements that differ and for the writes with the same text, three
@@ -958,3 +961,68 @@ bar is 1.00x). A range is the lowest and the highest of a series' turns, `main` 
 
    Still over the bar among the writes of 1,000 rows in this series: deleting 1,000 nodes, and setting 1,000 properties
    with statements that differ (1.09x to 1.27x with a parameter, 1.49x to 1.66x with a literal).
+6. **Rows set again and again keep one entry each in the log** (`exec/graph-pending.ts`, `fold`). The log of rows the
+   index holds ahead of the tables grew by one entry for every row a committed transaction set, and was made its net
+   effect each time it had doubled. At a commit, a set of a row that a committed entry already sets now gives that
+   entry its props and leaves the log: what is left of the two is what was left before. The entries are held by rowid,
+   in a list for each table of each graph, and the lists are dropped whenever committed entries leave the log or are
+   made anew (the tables written, the log swept or made its net effect, a rollback). A log no longer than its slack
+   (1,024 entries) is not read: reading a commit's entries when none of their rows was set before took 3% of a
+   statement that sets 1,000 rows for the first time (smaltdb's own time 0.77 to 0.82 ms without it and 0.80 to 0.84 ms
+   with it, eight turns each way), so nothing is held until a set comes to a log longer than the slack, which is where
+   the log was made its net effect before. Rows set back to what their tables have leave entries that say nothing:
+   once they are half of the log it is made its net effect, as the doubling did before. Measured with `main` at
+   `e6ecabf` and smaltcy's `main` (`bfb8d43`), four turns each way for the statements that differ and for the writes
+   with the same text, three for the reads:
+
+   | Setting 1,000 properties | `main` | The change | smaltdb's own time (ms), `main` and the change |
+   |---|---|---|---|
+   | A parameter that differs | 1.17x to 1.22x | 1.09x to 1.12x | 0.93 to 1.04, 0.88 to 1.05 |
+   | A literal that differs | 1.51x to 1.57x | 1.31x to 1.38x | 1.21 to 1.27, 1.09 to 1.14 |
+   | The same text every run | 0.84x to 1.07x | 0.82x to 1.03x | 0.65 to 0.69, 0.67 to 0.69 |
+
+   Of the series' 74 lines two had ranges apart, both lower: the first two of the table. With the same text the
+   benchmark takes the key away again after each run, so every timed statement sets rows that no entry holds, and
+   there is nothing to fold.
+7. **An ORDER BY without a LIMIT is read in order where that costs less** (`exec/planner.ts`, `orderWantedOf`;
+   docs/QUERY_ENGINE.md, "`ORDER BY` read in order"). A language for graphs sorts what a write reads by
+   the nodes' ids, with no LIMIT, so that its rows come in one order, and a label's entries in the graph's index come
+   in that order already. The planner costed reading a join in the order of its ORDER BY only where the ORDER BY had a
+   literal LIMIT (change 2). It costs it without one too: every row is read then, and the sort alone is saved. Of the
+   plans of 35 statements of smaltcy's benchmarks (its 19 reads, and what 16 writes and cleanups read) 11 lose their
+   sort, and nothing else changes in any. Measured with `main` at `e6ecabf` and smaltcy's `main` (`bfb8d43`), four
+   turns each way for the statements that differ and for the writes with the same text, three for the reads. Three of
+   the series' 74 lines had ranges apart and lower: seek by name with the same text (0.26x to 0.28x and 0.23x to
+   0.24x), a small label's nodes with the same text (0.49x to 0.51x and 0.41x to 0.42x) and deleting 1,000 nodes with
+   a literal (1.34x to 1.49x and 1.26x to 1.33x). Two were apart and higher: 1 hop with the same text, whose plan is
+   the same, and creating 1 relationship with a parameter, whose plan lost its sort and nothing else. Both overlapped
+   when they were run again (the reads four turns each way, creating 1 relationship alone six). Deleting 1,000 nodes
+   alone, a parameter that differs, three turns each way: 1.14x to 1.18x and 1.02x to 1.08x, smaltdb's own time 0.85
+   to 0.91 ms and 0.78 to 0.88 ms.
+8. **A graph's next ids are read from its tables' ends only when a page was changed** (`database.ts`, `graphIdsOf`). A
+   plan that makes a node or a relationship asks the graph for its next ids, and each time it ran they were brought up
+   to the graph's tables: a B+tree cursor to the end of every node table for a node's id, of every type's table for a
+   relationship's rowid. A graph of smaltcy's has a node table and one more for each label, and its `CREATE (:Bench
+   {i: $i})` read the ends of four tables for its one id. The count of page changes (`Pager.writes`) at which the ends
+   were read is now kept with the ids, for nodes and for relationships. A row comes to a table, and a table to a
+   graph, by a change of a page, so while the count stands the ids kept are the ones the tables would give. A graph
+   whose writes land in its index changes no page for a new node or relationship (section 2): its statements read no
+   table for their ids until its tables are written. Where a graph's writes go to its tables each statement changes
+   pages, and the ends are read as before. Counted by V8's block coverage on a network of 2,000 people, the source
+   that statement runs each time went from 74,827 characters to 40,278, in 270 calls and 207. Measured with `main` at
+   `7769119` and smaltcy's `main` (`54dedc2`), four turns each way for the statements that differ and for the writes
+   with the same text, three for the reads:
+
+   | Creating 1 node | `main` | The change | smaltdb's own time (ms), `main` and the change |
+   |---|---|---|---|
+   | A parameter that differs | 1.11x to 1.18x | 0.88x to 0.96x | 0.014 to 0.016, 0.010 to 0.012 |
+   | A literal that differs | 1.28x to 1.45x | 1.12x to 1.19x | 0.018 to 0.021, 0.013 to 0.015 |
+   | The same text every run | 0.71x to 0.79x | 0.65x to 0.73x | 0.005, 0.005 (medians) |
+
+   Of the series' 74 lines three had ranges apart: the first two of the table, lower, and a read higher (1 hop with a
+   parameter, 0.20x to 0.25x and 0.26x to 0.28x), which runs none of the changed code. The benchmark of statements
+   that differ was run again, four turns each way: 1 hop overlapped (0.19x to 0.23x and 0.19x to 0.25x), and creating
+   1 node was apart again (1.09x to 1.24x and 0.91x to 1.01x with a parameter, 1.26x to 1.44x and 1.13x to 1.17x with
+   a literal). Creating 1 relationship, which asks for a node's id and a relationship's rowid, had ranges that overlap
+   (0.85x to 1.09x and 0.81x to 0.88x with a literal, 0.70x to 0.83x and 0.68x to 0.74x with a parameter). Creating 1
+   node is the first write the benchmark runs, and with a literal it is still over the bar.
