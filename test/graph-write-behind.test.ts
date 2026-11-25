@@ -349,10 +349,10 @@ describe('rows set again and again', () => {
   });
 
   it('a log no longer than its slack is left as it is; past it, rows set again keep one entry each', () => {
-    const db = forty(100);
+    const db = forty(80);
     setAll(db, 'k', p.lit(0));
     setAll(db, 'k', p.lit(1));
-    // 80 entries for 40 rows: a log this short is not read for them.
+    // 80 entries for 40 rows: a log no longer than its slack is not read for them.
     expect(pending(db).count).toBe(80);
     for (let round = 2; round < 12; round++) {
       setAll(db, 'k', p.lit(round));
@@ -431,7 +431,35 @@ describe('rows set again and again', () => {
     const set = (rowid: number, w: number) => write(db, p.graphSet('g', one, [{ relationship: { type: p.lit('KNOWS'), id: p.lit(rowid) }, kind: 'property', key: 'w', value: p.lit(w) }]));
     for (let i = 0; i < 12; i++) set(0, i), set(1, -i);
     expect(pending(db).count).toBe(2);
-    expect(rels(db, 'knows')).toEqual([[0, 0, 0, { w: 11 }], [1, 1, 1, { w: -11 }]]);
+    // The two nodes have the relationships' ids: a node and a relationship with one id are two rows.
+    const setNode = (node: number, v: number) => write(db, p.graphSet('g', one, [{ node: p.lit(node), kind: 'property', key: 'v', value: p.lit(v) }]));
+    for (let i = 0; i < 12; i++) set(0, 20 + i), setNode(0, 100 + i), set(1, -20 - i), setNode(1, 200 + i);
+    expect(pending(db).count).toBe(4);
+    expect(rels(db, 'knows')).toEqual([[0, 0, 0, { w: 31 }], [1, 1, 1, { w: -31 }]]);
+    expect(nodes(db)).toEqual([[0, { v: 111 }], [1, { v: 211 }]]);
+    db.graphIndexState.check();
+  });
+
+  it('two graphs keep their own entries for nodes with the same ids', () => {
+    const db = graph();
+    const key = [{ kind: 'primaryKey', columns: [{ column: 0, desc: false, collation: 'binary' }], ofColumn: 0 }];
+    schema(db, { op: 'createTable', table: { name: 'node2', columns: [column('id', 'INTEGER'), column('props', 'MAP', M)], keys: key, checks: [], foreignKeys: [], storage: 'row' }, temp: false, ifNotExists: false });
+    schema(db, { op: 'createPropertyGraph', ifNotExists: false, graph: { name: 'h', nodes: [{ label: 'Node', table: 'node2', id: 'id', props: 'props' }], edges: [] } });
+    schema(db, { op: 'alterPropertyGraph', name: 'h', action: { kind: 'addLabelIndex' } });
+    for (const g of ['g', 'h']) write(db, p.graphCreate(g, numbers(3), [{ labels: [], props: map('i', id) }]));
+    const nodes2 = (): unknown[][] => db.query('SELECT id, props FROM node2 ORDER BY id').rows;
+    expect([nodes(db).length, nodes2().length]).toEqual([3, 3]);
+    pending(db).slack = 0;
+    const set = (g: string, node: number, v: number) => write(db, p.graphSet(g, one, [{ node: p.lit(node), kind: 'property', key: 'v', value: p.lit(v) }]));
+    for (let i = 0; i < 6; i++) set('g', 1, i), set('h', 1, 10 + i);
+    expect(pending(db).count).toBe(2);
+    // Both graphs' rows in one transaction: its entries are read in the order they were logged.
+    db.exec('BEGIN');
+    for (let i = 0; i < 4; i++) set('h', 1, 30 + i), set('g', 1, 20 + i), set('g', 2, 40 + i);
+    db.exec('COMMIT');
+    expect(pending(db).count).toBe(3);
+    expect(nodes(db)).toEqual([[0, { i: 0 }], [1, { i: 1, v: 23 }], [2, { i: 2, v: 43 }]]);
+    expect(nodes2()).toEqual([[0, { i: 0 }], [1, { i: 1, v: 33 }], [2, { i: 2 }]]);
     db.graphIndexState.check();
   });
 
