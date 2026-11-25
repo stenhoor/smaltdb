@@ -554,6 +554,49 @@ describe('all the rows of a write at once', () => {
     expect(once.slice(1)).toEqual([counts({ nodesDeleted: 9, relationshipsDeleted: 10 }), [[9, { i: 9 }]], [[9, 'Person']], []]);
   });
 
+  it('graphCreate counts the properties each node gets: NULL ones are none, a map may be NULL, a node may have none', () => {
+    const [once, each] = bothWays((shape) => {
+      const db = graph();
+      const n = p.col(0, 0, 'int');
+      const name = p.col(0, 1, 'text');
+      const rows = p.values([[p.lit(1), p.lit('a')], [p.lit(null, 'int'), p.lit('b')], [p.lit(3), p.lit(null, 'text')], [p.lit(null, 'int'), p.lit(null, 'text')]], ['int', 'text']);
+      const made = p.graphCreate('g', rows, [
+        // Two keys, either of them NULL in some rows.
+        { labels: ['Person', 'Seen'], props: map('n', any(n), 'name', any(name)) },
+        // One key of a map of truth values: true, false or NULL.
+        { labels: [], props: p.call('map_of', [p.lit('big'), p.call('cmp_gt', [n, p.lit(2)], 'bool')], 'map<text, bool>') },
+        // No properties given; its labels are counted as given: one twice, and the node table's own.
+        { labels: ['Person', 'Node', 'Person'] },
+        // A map that is NULL where the row has no number.
+        { labels: [], props: p.caseWhen([{ when: p.isNull(n), then: p.lit(null, M) }], M, map('only', any(name))) },
+      ]);
+      const r = write(db, shape(made));
+      return [r.rows, r.graph, nodes(db), labels(db)];
+    });
+    expect(once).toEqual(each);
+    // Of the first row's four nodes: 2, 1, 0 and 1 properties; of the second's: 1 (its name); of the third's: 1 and 1.
+    expect(once[1]).toEqual(counts({ nodesCreated: 16, labelsAdded: 20, propertiesSet: 7 }));
+    expect((once[2] as unknown[]).slice(0, 8)).toEqual([[0, { n: 1, name: 'a' }], [1, { big: false }], [2, {}], [3, { only: 'a' }], [4, { name: 'b' }], [5, {}], [6, {}], [7, {}]]);
+    expect((once[2] as unknown[]).slice(8, 12)).toEqual([[8, { n: 3 }], [9, { big: true }], [10, {}], [11, {}]]);
+    expect((once[0] as unknown[])[2]).toEqual([3, null, 8, 9, 10, 11]);
+  });
+
+  it('graphDelete of nodes named by columns: a NULL, a node named twice, one that is no node, one with relationships', () => {
+    const pairs = (): PlanOp => p.values([[p.lit(3), p.lit(4)], [p.lit(null, 'int'), p.lit(3)], [p.lit(7), p.lit(null, 'int')], [p.lit(40), p.lit(7)], [p.lit(4), p.lit(4)]], ['int', 'int']);
+    for (const targets of [[{ node: p.col(0, 0, 'int') }], [{ node: p.col(0, 1, 'int') }, { node: p.col(0, 0, 'int') }]]) {
+      const [once, each] = bothWays((shape) => {
+        const db = people();
+        const r = write(db, shape(p.graphDelete('g', pairs(), targets, { detach: true })));
+        return state(db, r);
+      });
+      expect(once, `${targets.length} target(s)`).toEqual(each);
+      // Nodes 3, 4 and 7 with both targets (3, 7 and 4 with the first alone), each once, with the relationships at them.
+      expect((once[1] as GraphWriteCounts).nodesDeleted).toBe(3);
+      expect((once[2] as unknown[][]).map((n) => n[0])).toEqual([0, 1, 2, 5, 6, 8, 9]);
+      expect((once[4] as unknown[][]).map((r) => r[0])).toEqual([0, 1, 5, 8, 9]);
+    }
+  });
+
   it('graphDelete of many nodes that still have relationships fails as one of one does, and leaves the graph as it was', () => {
     const db = people();
     const before = state(db, { rows: null });

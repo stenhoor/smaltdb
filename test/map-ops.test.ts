@@ -33,6 +33,34 @@ describe('building maps', () => {
     expect(one(() => call('map_of', [], M), M)).toEqual({});
   });
 
+  it('map_of of one pair is the map of more with the others taken away, whatever its value is', () => {
+    // A value, what the map holds for it, and the value's type.
+    const values: [PlanExpr, unknown, string][] = [
+      [p.lit(7), 7, 'int'],
+      [p.lit('text'), 'text', 'text'],
+      [p.lit(1.5), 1.5, 'real'],
+      [p.lit(null), null, 'any'],
+      [call('cmp_eq', [p.lit(1), p.lit(1)], 'bool' as PlanType), true, 'bool'],
+      [call('list_of', [p.lit(1), p.lit(2)], 'list<int>' as PlanType), [1, 2], 'list<int>'],
+      [call('map_of', [p.lit('in'), p.lit(1)], MI), { in: 1 }, 'map<text, int>'],
+    ];
+    for (const [value, held, of] of values) {
+      const type = `map<text, ${of}>` as PlanType;
+      const single = call('map_of', [p.lit('k'), value], type);
+      expect(one(() => single, type), of).toEqual({ k: held });
+      // The same as the pair in a map made with two more keys of the same value, which are then taken away.
+      const others = call('map_remove', [call('map_of', [p.lit('z'), value, p.lit('k'), value, p.lit('a'), value], type), call('list_of', [p.lit('a'), p.lit('z')], 'list<text>' as PlanType)], type);
+      expect(one(() => others, type), of).toEqual({ k: held });
+      expect(one(() => call('cmp_eq', [single, others], 'bool' as PlanType), 'bool' as PlanType), of).toBe(true);
+    }
+    // A value of any kind beside the map's: each keeps its kind (ADR 0039).
+    expect(one(() => call('map_of', [p.lit('k'), { ...call('cmp_eq', [p.lit(1), p.lit(1)], 'bool' as PlanType), type: 'any' } as PlanExpr], M), M)).toEqual({ k: 1 });
+    // A key from a column: each row's own.
+    const key = (props: PlanExpr): PlanExpr => call('coalesce', [call('map_get', [props, p.lit('name')], 'text' as PlanType), p.lit('none')], 'text' as PlanType);
+    expect(one((props) => call('map_of', [key(props), p.lit(1)], MI), MI)).toEqual({ Ada: 1 });
+    expect(one((props) => call('map_of', [key(props), p.lit(1)], MI), MI, 1)).toEqual({ none: 1 });
+  });
+
   it('map_of refuses an odd number of arguments and keys that are not text', () => {
     expect(() => one(() => call('map_of', [p.lit('a')], M), M)).toThrow(/keys and values in pairs/);
     expect(() => one(() => call('map_of', [p.lit(1), p.lit(2)], M), M)).toThrow(/keys are text, not number/);

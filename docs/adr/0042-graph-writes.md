@@ -821,7 +821,10 @@ bar is 1.00x). A range is the lowest and the highest of a series' turns, `main` 
 | Change | Pull request | Against smaltcy, `main` and the change |
 |---|---|---|
 | The log's entries are made by a constructor | [#306](https://github.com/stenhoor/smaltdb/pull/306) | Deleting 1,000 nodes, statements that differ: 1.93x to 2.43x and 1.51x to 1.59x with a literal, 1.98x to 2.46x and 1.49x to 1.54x with a parameter |
-| A label's first nodes are read from the index in the order of their ids | The pull request that adds this row | Setting 1,000 properties, statements that differ: 5.66x to 5.93x and 2.33x to 2.44x with a literal, 5.17x to 5.65x and 2.10x to 2.24x with a parameter |
+| A label's first nodes are read from the index in the order of their ids | [#307](https://github.com/stenhoor/smaltdb/pull/307) | Setting 1,000 properties, statements that differ: 5.66x to 5.93x and 2.33x to 2.44x with a literal, 5.17x to 5.65x and 2.10x to 2.24x with a parameter |
+| Setting a key on many rows: the work on each row | [#308](https://github.com/stenhoor/smaltdb/pull/308) | Setting 1,000 properties alone, on `main` with the row above: 2.03x to 2.31x and 1.03x to 1.10x with the same text, 2.05x to 2.23x and 1.25x to 1.30x with a literal, 1.98x to 2.31x and 1.32x to 1.41x with a parameter |
+| A write's values that are only picked take no plan | [#309](https://github.com/stenhoor/smaltdb/pull/309) | The statement alone, a parameter that differs: creating 1,000 nodes 1.57x to 1.60x and 1.34x to 1.40x, deleting 1,000 nodes 1.24x to 1.28x and 1.08x to 1.15x, creating 1 node 1.06x to 1.09x and 0.92x to 1.03x |
+| Creating and deleting many nodes: the work on each row | The pull request that adds this row | Creating 1,000 nodes: 0.95x to 1.01x and 0.69x to 0.77x with the same text, 1.06x to 1.17x and 0.79x to 0.90x with a parameter, 1.25x to 1.31x and 0.95x to 0.99x with a literal |
 
 1. **The log's entries are made by a constructor** (`exec/graph-pending.ts`, `Entry`). An entry of the log of rows the
    index holds ahead of the tables was an object written out where it is logged. In smaltcy's benchmark of statements
@@ -866,3 +869,92 @@ bar is 1.00x). A range is the lowest and the highest of a series' turns, `main` 
    overlap when it was run again, four turns each way (the first and the last two alone, the two reads in their
    benchmark). What is left of this statement, 2.1x to 2.4x, is the work of setting the key on each row: the map's bytes
    are copied three times, and the buffer of the maps is rewritten when half of it is dead.
+3. **Setting a key on many rows: the work on each row** (`exec/nested-ops.ts`, `setMapKey`; `exec/graph-write.ts`,
+   `GraphWrite.set`; `exec/graph-props.ts`, `GraphProps.room`). Three changes to what `SET n.key = value` does for each
+   row when it sets many rows at once. A key is set in a map's bytes without a view of the map: the map is copied
+   whole, the entries after the key's are moved inside the copy, and the value is written byte by byte. It made a new
+   array and copied into it four times, twice through a view of a part of the map, and a view costs more to make than a
+   small map does to copy. The SET's all-rows path makes nothing for a row: it made an object with a function to read
+   the row's values, an object for the row's target and a text key for the check that no row is written twice. The
+   values were all computed ahead and are read where they lie, and the check compares a node's id with the last one
+   while the ids rise. And the buffer of the property maps, written again when half of it is dead, is copied in runs
+   of rows whose bytes lie one after another, where each row was a copy of its own. Measured with `main` at `39c32e2`,
+   which was without change 2, and smaltcy's branch `claude/cypher-language` (`44ad602`), four turns each way for the
+   statements that differ and for the writes with the same text, three for the reads:
+
+   | Setting 1,000 properties | `main` | The change | smaltdb's own time (ms), `main` and the change |
+   |---|---|---|---|
+   | The same text every run | 1.86x to 2.12x | 0.92x to 1.16x | 1.58 to 1.63, 0.83 to 0.88 |
+   | A literal that differs | 5.52x to 6.04x | 4.72x to 4.82x | 4.89 to 6.49, 4.00 to 4.84 |
+   | A parameter that differs | 4.94x to 5.49x | 4.35x to 4.57x | 4.69 to 5.93, 3.66 to 3.92 |
+
+   Of the other 71 lines none had ranges apart and higher. The statements that differ wait for change 2 there, so the
+   case was also run alone on `main` with change 2, and on that with this change, four turns each way: the row of the
+   table above. The third of the three does not show in the benchmark, which takes the median statement: the buffer is
+   written again in about one statement of twenty. Timed by itself (the maps alone, 20,008 rows of 46 bytes, the first
+   1,000 set over and over, ten runs each way), a round of 1,000 sets in which the buffer is written again took 1.38 to
+   1.67 ms and 0.53 to 0.67 ms. What was left with statements that differ, 1.25x to 1.41x, was the log of rows ahead
+   of the tables: every statement's 1,000 sets doubled it, and it was made its net effect after every second one.
+4. **A write's values that are only picked take no plan** (`exec/graph-write.ts`, `picking`; `Evaluator`). A stage of
+   a plan that writes ran an internal plan over its rows (section 1) even where it computed nothing. Two kinds of stage
+   did. One is a projection above a write whose columns are all columns of its row, parameters or NULL: what a language
+   puts above a write to shape its rows, and the projection of no columns above a statement that returns none. The
+   other is a write's own values where every one is a column or a parameter: the node a delete names, the ends of a
+   relationship, the node a label is set on. They take the values where they lie; a plan read a row's column and a
+   parameter as they are given, so nothing was converted on the way. Counted on the engine's runner of internal plans,
+   a statement of smaltcy's each: `UNWIND range($from, $to) AS i CREATE (:Bench {i: i})` ran 4 and runs 2, `CREATE
+   (:Bench {i: $i})` 4 and 2, `MATCH (n:Bench {batch: $batch}) DETACH DELETE n` 3 and 1, and `MATCH (p:Person) WITH p
+   LIMIT 100 SET p.bench = $i` 3 and 2 (a SET keeps the plan for its value, which is wrapped so that it is not computed
+   for a NULL node). Measured with `main` at `3e3c8b8` and smaltcy's `main` (`f20703c`), four turns each way for the
+   statements that differ and for the writes with the same text, three for the reads. Four writes of the series' 74
+   lines had ranges apart, all four lower: deleting 1,000 nodes with the same text (1.38x to 1.52x and 1.23x to 1.34x),
+   creating 1,000 nodes with a literal (1.55x to 1.67x and 1.42x to 1.47x), setting 1,000 properties with a parameter
+   (1.26x to 1.39x and 1.16x to 1.21x) and setting 1 property by name with the same text (0.40x to 0.44x and 0.36x to
+   0.38x). Four reads had ranges apart too, two lower and two higher: a read runs none of the changed code, and the two
+   higher overlapped when the reads were run again, four turns each way. The series' turns are wide beside this change,
+   so the statements were also run alone, with a parameter that differs, three turns each way:
+
+   | A parameter that differs, the statement alone | `main` | The change | smaltdb's own time (ms), `main` and the change |
+   |---|---|---|---|
+   | Create 1,000 nodes | 1.57x to 1.60x | 1.34x to 1.40x | 2.26 to 2.43, 1.63 to 1.84 |
+   | Delete 1,000 nodes | 1.24x to 1.28x | 1.08x to 1.15x | 1.18 to 1.33, 1.07 to 1.12 |
+   | Create 1 node | 1.06x to 1.09x | 0.92x to 1.03x | 0.019 to 0.022, 0.017 to 0.025 |
+   | Set 1,000 properties | 1.19x to 1.31x | 1.16x | 0.95 to 1.14, 0.89 to 1.12 |
+5. **Creating and deleting many nodes: the work on each row** (`exec/graph-write.ts`, the all-rows paths of
+   `graphCreate` and `graphDelete`; `exec/nested-ops.ts`, `map_of`). Three changes. `graphCreate` made an object for
+   each row to read the row's values one by one, and decoded each node's property map to count its entries. A node's
+   props, computed ahead, are now read where they lie, and their entries are counted on the bytes (`entriesSet`). The
+   map is still decoded where a value is NULL, which is no property, and the object is made only where a relationship
+   reads its ends and props, or a node's props were not computed ahead. `graphDelete`, where every target is a node
+   whose id was computed ahead, reads the ids where they lie: it made an object and called three closures for each row.
+   And `map_of` of one pair encodes its key and value as they come: one pair is in key order and has no key twice, so
+   no list of entries and no map is made to sort them. The `{i: i}` of `CREATE (:Bench {i: i})` is such a map. Measured
+   with `main` at `e6ecabf` and smaltcy's `main` (`bfb8d43`, which reads the numbers of `UNWIND range()` as rows of
+   smaltdb's `range`), four turns each way for the statements that differ and for the writes with the same text, three
+   for the reads:
+
+   | Creating 1,000 nodes | `main` | The change | smaltdb's own time (ms), `main` and the change |
+   |---|---|---|---|
+   | The same text every run | 0.95x to 1.01x | 0.69x to 0.77x | 1.19 to 1.28, 0.84 to 0.93 |
+   | A parameter that differs | 1.06x to 1.17x | 0.79x to 0.90x | 1.31 to 1.52, 0.99 to 1.07 |
+   | A literal that differs | 1.25x to 1.31x | 0.95x to 0.99x | 1.46 to 1.54, 1.04 to 1.12 |
+
+   The statement is under the bar in all three. Eleven of the series' 74 lines had ranges apart and lower: these three;
+   merging 1,000 new nodes in its three (0.13x to 0.14x and 0.10x to 0.11x with the same text); creating 1,000
+   relationships with statements that differ (0.76x to 0.79x and 0.61x to 0.67x with a literal, 0.70x to 0.77x and
+   0.52x to 0.57x with a parameter); creating 1 node with the same text (0.83x, and 0.72x to 0.80x); and two reads with
+   the same text (seek by name and 2 hops, three turns), which run none of the changed code. One line was apart and
+   higher, a read: 2 hops with a relationship filter and a literal (0.62x to 0.68x and 0.69x to 0.74x). Run again
+   alone, four turns each way, it overlapped (0.68x to 0.75x and 0.66x to 0.72x). Deleting 1,000 nodes had ranges that
+   overlap in the series in all three modes (1.21x to 1.28x and 1.04x to 1.27x with the same text, 1.21x to 1.39x and
+   1.19x to 1.31x with a parameter, 1.37x to 1.54x and 1.23x to 1.37x with a literal). The statements alone, with a
+   parameter that differs, three turns each way:
+
+   | A parameter that differs, the statement alone | `main` | The change | smaltdb's own time (ms), `main` and the change |
+   |---|---|---|---|
+   | Create 1,000 nodes | 1.16x to 1.32x | 0.81x to 0.88x | 1.49 to 1.59, 1.07 to 1.10 |
+   | Delete 1,000 nodes | 1.08x to 1.15x | 1.03x to 1.05x | 1.08 to 1.14, 0.98 to 1.02 |
+   | Create 1 node | 0.92x to 0.95x | 0.91x to 0.96x | 0.019 to 0.030, 0.017 to 0.018 |
+
+   Still over the bar among the writes of 1,000 rows in this series: deleting 1,000 nodes, and setting 1,000 properties
+   with statements that differ (1.09x to 1.27x with a parameter, 1.49x to 1.66x with a literal).
