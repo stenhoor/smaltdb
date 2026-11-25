@@ -194,12 +194,15 @@ export class GraphPending {
    * entry sets, that entry, the first since the row's table was written. A row set again by a transaction that
    * commits gives the entry its new props and leaves no entry of its own (`fold`), so rows set over and over keep one
    * entry each: the log grew by one for every set, and was made its net effect each time it had doubled. Null until
-   * a set commits, and again whenever committed entries leave the log or are made anew. The entries of a table are a
-   * list by rowid: a graph's ids are whole numbers that mostly follow one another, and a list of them is read and
-   * written many times faster than a map of them.
+   * a set commits to a log longer than `slack`, and again whenever committed entries leave the log or are made anew.
+   * The entries of a table are a list by rowid: a graph's ids are whole numbers that mostly follow one another, and a
+   * list of them is read and written many times faster than a map of them.
    */
   private holders: Map<string, ((Entry | undefined)[] | undefined)[]> | null = null;
-  /** The log is made its net effect once it is this much longer than twice what was left of it the last time (tests set it low). */
+  /**
+   * The log is made its net effect once it is this much longer than twice what was left of it the last time, and a log
+   * no longer than this is not read for rows set again (tests set it low).
+   */
   slack = 1024;
   /** The graphs with entries not in their tables, by name in lower case. */
   private readonly open = new Map<string, DirectGraph>();
@@ -600,7 +603,9 @@ export class GraphPending {
    * The entries from `from` on are a transaction's that committed. A set of a row that a committed entry before it
    * sets already gives that entry its props and leaves the log: what is left of the two is the same (`nets`), and the
    * first one's `before` is what the table has. A delete ends what is held for its row. Nothing is held until a set
-   * comes: then every committed entry is read once.
+   * comes to a log longer than `slack`: then every committed entry is read once. A shorter log is left as it is:
+   * reading a commit's entries when none of their rows was set before took 3% of a statement that sets 1,000 rows
+   * (ADR 0042, "After step 4"), and a log that short costs nothing to keep.
    *
    * True when the rows this set back to what their tables have are half of the log or more: their entries say
    * nothing now, and `commit` has the log made its net effect.
@@ -609,6 +614,7 @@ export class GraphPending {
     const ops = this.ops;
     let holders = this.holders;
     if (holders === null) {
+      if (ops.length <= this.slack) return false;
       let sets = false;
       for (let i = from; i < ops.length && !sets; i++) sets = ops[i]!.k === NODE_SET || ops[i]!.k === EDGE_SET;
       if (!sets) return false;

@@ -321,12 +321,16 @@ describe('rows set again and again', () => {
   // The 40 nodes by their ids, with no table read for them: a scan of the node table would have it written first.
   const setAll = (db: Database, key: string, value: PlanExpr) => write(db, p.graphSet('g', numbers(40), [{ node: id, kind: 'property', key, value }]));
   const setOne = (db: Database, node: number, key: string, value: number | null) => write(db, p.graphSet('g', one, [{ node: p.lit(node), kind: 'property', key, value: p.lit(value) }]));
-  /** 40 nodes whose rows their table has, each with its number under `i`. */
-  const forty = (): Database => {
+  /**
+   * 40 nodes whose rows their table has, each with its number under `i`. The log is read for rows set again once it
+   * is longer than its slack: with none, from its first entry.
+   */
+  const forty = (slack = 0): Database => {
     const db = graph();
     write(db, p.graphCreate('g', numbers(40), [{ labels: ['Person'], props: map('i', id) }]));
     expect(nodes(db).length).toBe(40);
     expect(pending(db).count).toBe(0);
+    pending(db).slack = slack;
     return db;
   };
 
@@ -334,13 +338,41 @@ describe('rows set again and again', () => {
     const db = forty();
     for (let round = 0; round < 30; round++) {
       setAll(db, 'k', p.lit(round));
-      // 40 rows are ahead of the node table: far fewer than would make the log its net effect, which is not what keeps it short.
+      // 40 rows are ahead of the node table. The log is made its net effect only past 80 entries: that is not what keeps it at 40.
       expect(pending(db).count, `after ${round + 1} statements`).toBe(40);
     }
     expect(pending(db).settles).toBe(1);
     expect([propsOf(db, 0), propsOf(db, 39)]).toEqual([[[{ i: 0, k: 29 }]], [[{ i: 39, k: 29 }]]]);
     expect(nodes(db)).toEqual(Array.from({ length: 40 }, (_, i) => [i, { i, k: 29 }]));
     expect([pending(db).count, pending(db).settles]).toEqual([0, 2]);
+    db.graphIndexState.check();
+  });
+
+  it('a log no longer than its slack is left as it is; past it, rows set again keep one entry each', () => {
+    const db = forty(100);
+    setAll(db, 'k', p.lit(0));
+    setAll(db, 'k', p.lit(1));
+    // 80 entries for 40 rows: a log this short is not read for them.
+    expect(pending(db).count).toBe(80);
+    for (let round = 2; round < 12; round++) {
+      setAll(db, 'k', p.lit(round));
+      expect(pending(db).count, `after ${round + 1} statements`).toBe(40);
+    }
+    expect(pending(db).settles).toBe(1);
+    expect(nodes(db)).toEqual(Array.from({ length: 40 }, (_, i) => [i, { i, k: 11 }]));
+    expect([pending(db).count, pending(db).settles]).toEqual([0, 2]);
+    db.graphIndexState.check();
+  });
+
+  it('one transaction that sets its rows many times leaves one entry each when it commits', () => {
+    const db = forty(100);
+    db.exec('BEGIN');
+    for (let round = 0; round < 5; round++) setAll(db, 'k', p.lit(round));
+    expect(pending(db).count).toBe(200);
+    db.exec('COMMIT');
+    expect(pending(db).count).toBe(40);
+    expect(pending(db).settles).toBe(1);
+    expect(nodes(db)).toEqual(Array.from({ length: 40 }, (_, i) => [i, { i, k: 4 }]));
     db.graphIndexState.check();
   });
 
@@ -395,6 +427,7 @@ describe('rows set again and again', () => {
     const db = graph();
     write(db, p.graphCreate('g', numbers(2), [{ labels: [] }], [{ type: 'KNOWS', start: { node: 0 }, end: { node: 0 }, props: map('w', p.lit(1)) }]));
     expect(rels(db, 'knows').length).toBe(2);
+    pending(db).slack = 0;
     const set = (rowid: number, w: number) => write(db, p.graphSet('g', one, [{ relationship: { type: p.lit('KNOWS'), id: p.lit(rowid) }, kind: 'property', key: 'w', value: p.lit(w) }]));
     for (let i = 0; i < 12; i++) set(0, i), set(1, -i);
     expect(pending(db).count).toBe(2);
